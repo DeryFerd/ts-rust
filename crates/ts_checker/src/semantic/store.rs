@@ -53,7 +53,9 @@ use super::{
         TypeResolutionCheckpoint, TypeResolutionStack, TypeResolutionTarget,
         TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
     },
-    mapped_types::{MappedIndexRecovery, MappedPropertyRecovery, MappedTypeModifiers},
+    mapped_types::{
+        MappedIndexRecovery, MappedPropertyRecovery, MappedTypeModifiers, SourceMappedLookupRequest,
+    },
     object_members::{
         ObjectLiteralGetterOrigin, ObjectLiteralGetterReturnProof, ObjectLiteralPropertyCloneOrigin,
     },
@@ -113,6 +115,7 @@ struct SourceNodeFacts {
     default_function_name: Option<NodeId>,
     prefix_unary_operator: Option<SyntaxKind>,
     type_operator: Option<SyntaxKind>,
+    type_parameter_annotations: Option<Box<TypeParameterAnnotationFacts>>,
     mapped_type: Option<Box<MappedTypeSyntaxFacts>>,
     plain_interface_heritage: Option<Box<PlainInterfaceHeritageFacts>>,
     exported: bool,
@@ -143,6 +146,19 @@ struct MappedTypeSyntaxFacts {
     name_type: Option<NodeId>,
     template: Option<NodeId>,
     modifiers: Option<MappedTypeModifiers>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TypeParameterAnnotationFacts {
+    constraint: Option<NodeId>,
+    default_type: Option<NodeId>,
+}
+
+/// Written operands stay separate from missing or changed type caches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceTypeParameterAnnotations {
+    pub constraint: Option<NodeRef>,
+    pub default_type: Option<NodeRef>,
 }
 
 /// Exact operand roles retained from one registered mapped declaration.
@@ -750,6 +766,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
         HashMap<(SemanticSymbolId, CacheHashKey), OrdinaryIntersectionAliasRequestRecovery>,
     mapped_property_recoveries: HashMap<SemanticSymbolId, MappedPropertyRecovery>,
     mapped_index_recoveries: HashMap<IndexInfoId, MappedIndexRecovery>,
+    source_mapped_lookup_requests: HashMap<TypeId, SourceMappedLookupRequest>,
     source_class_provenance: HashMap<TypeId, SourceClassProvenance>,
     source_classes_by_symbol: HashMap<SemanticSymbolId, TypeId>,
     class_instance_super_views: HashMap<TypeId, ClassInstanceSuperView>,
@@ -928,6 +945,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             ordinary_intersection_alias_request_recoveries: HashMap::new(),
             mapped_property_recoveries: HashMap::new(),
             mapped_index_recoveries: HashMap::new(),
+            source_mapped_lookup_requests: HashMap::new(),
             source_class_provenance: HashMap::new(),
             source_classes_by_symbol: HashMap::new(),
             class_instance_super_views: HashMap::new(),
@@ -4560,10 +4578,44 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .any(|group| group.sources.contains(&source))
     }
 
+    /// Separates canonical declaration merges from computed or instantiated methods.
+    pub(super) fn source_merged_method_has_exact_declarations(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> bool {
+        let Some(method) = self.symbol(symbol) else {
+            return false;
+        };
+        let Some(declarations) = method.declarations() else {
+            return false;
+        };
+        method.flags().contains(SymbolFlags::TRANSIENT)
+            && method
+                .flags()
+                .without(SymbolFlags::TRANSIENT | SymbolFlags::OPTIONAL)
+                == SymbolFlags::METHOD
+            && method.check_flags() == CheckFlags::NONE
+            && !method.name().is_reserved_member_name()
+            && !method.name().is_private_identifier()
+            && !method.name().is_late_bound()
+            && self.get_merged_symbol(symbol) == Some(symbol)
+            && !self.source_symbol_declarations.contains_key(&symbol)
+            && self.source_merged_symbol_declarations_match(symbol)
+            && method.value_declaration() == declarations.first().copied()
+            && self
+                .get_parent_of_symbol(symbol)
+                .and_then(|owner| self.symbol(owner))
+                .is_some_and(|owner| owner.flags() & SymbolFlags::TYPE == SymbolFlags::INTERFACE)
+            && declarations.iter().all(|declaration| {
+                self.source_node_kind(*declaration) == Some(SyntaxKind::MethodSignature)
+            })
+    }
+
     /// Checks the method's optional flag against each source declaration.
     pub(super) fn declared_method_optional_flag(&self, symbol: SemanticSymbolId) -> Option<bool> {
         let method = self.symbol(symbol)?;
-        let sources = if method.flags().contains(SymbolFlags::TRANSIENT)
+        let merged = self.source_merged_method_has_exact_declarations(symbol);
+        let sources = if method.flags().contains(SymbolFlags::TRANSIENT) && !merged
             || method.check_flags().contains(CheckFlags::LATE)
             || method.name().is_late_bound()
         {
@@ -4580,7 +4632,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         for source in sources {
             let source_method = self.symbol(source)?;
             let original = source_method.declarations()?;
-            if source_method.flags() != flags
+            if source_method.flags()
+                != flags
+                    | if merged {
+                        SymbolFlags::TRANSIENT
+                    } else {
+                        SymbolFlags::NONE
+                    }
                 || source_method.value_declaration() != original.first().copied()
                 || source_method.check_flags() != CheckFlags::NONE
             {
@@ -4677,8 +4735,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let interface = self.symbol(owner)?;
         let owner_declarations = interface.declarations()?;
         let interface_type = self.declared_type_links(owner)?.declared_type?;
+        let merged = self.source_merged_method_has_exact_declarations(symbol);
         let late = method.check_flags().contains(CheckFlags::LATE)
-            || method.flags().contains(SymbolFlags::TRANSIENT)
+            || method.flags().contains(SymbolFlags::TRANSIENT) && !merged
             || method.name().is_late_bound();
         let valid_late = !late || self.late_bound_method_has_exact_sources(symbol, owner);
         let members = if late {
@@ -4722,7 +4781,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || method.flags().without(
                 SymbolFlags::METHOD
                     | SymbolFlags::OPTIONAL
-                    | if late {
+                    | if late || merged {
                         SymbolFlags::TRANSIENT
                     } else {
                         SymbolFlags::NONE
@@ -6394,6 +6453,65 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.observe_relation_symbol_read(symbol);
         self.property_object_alias_request_recoveries
             .get(&(symbol, key))
+    }
+
+    pub(super) fn source_mapped_lookup_request(
+        &self,
+        mapped_type: TypeId,
+    ) -> Option<&SourceMappedLookupRequest> {
+        self.observe_relation_type_read(mapped_type);
+        self.source_mapped_lookup_requests.get(&mapped_type)
+    }
+
+    pub(super) fn try_reserve_source_mapped_lookup_requests(&mut self) -> bool {
+        self.source_mapped_lookup_requests.try_reserve(1).is_ok()
+    }
+
+    pub(super) fn publish_source_mapped_lookup_request(
+        &mut self,
+        request: SourceMappedLookupRequest,
+    ) -> bool {
+        if self.types.get(request.mapped_type).is_none()
+            || self.types.get(request.lookup).is_none()
+            || self.types.get(request.declared_lookup).is_none()
+            || self.types.get(request.parameter).is_none()
+            || self.types.get(request.argument).is_none()
+        {
+            return false;
+        }
+        match self
+            .source_mapped_lookup_requests
+            .entry(request.mapped_type)
+        {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get() == &request,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(request);
+                self.mark_relation_inputs_dirty();
+                self.mark_union_cache_validation_dirty();
+                true
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn source_mapped_lookup_request_count(&self) -> usize {
+        self.source_mapped_lookup_requests.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_source_mapped_lookup_request_for_test(
+        &mut self,
+        mapped_type: TypeId,
+        request: Option<SourceMappedLookupRequest>,
+    ) -> Option<SourceMappedLookupRequest> {
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        match request {
+            Some(request) => self
+                .source_mapped_lookup_requests
+                .insert(mapped_type, request),
+            None => self.source_mapped_lookup_requests.remove(&mapped_type),
+        }
     }
 
     pub(super) fn try_reserve_property_object_alias_request_recoveries(&mut self) -> bool {
@@ -8907,6 +9025,44 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_node_fact(node)?.type_operator
     }
 
+    /// Reads the actual constraint and default roles from registered source syntax.
+    pub(super) fn source_type_parameter_annotations(
+        &self,
+        parameter: NodeRef,
+    ) -> Option<SourceTypeParameterAnnotations> {
+        let facts = self.source_node_fact(parameter)?;
+        if facts.kind != SyntaxKind::TypeParameter {
+            return None;
+        }
+        let syntax = facts.type_parameter_annotations.as_deref()?;
+        let reference = |node| NodeRef::new(parameter.arena, parameter.file, node);
+        let annotations = SourceTypeParameterAnnotations {
+            constraint: syntax.constraint.map(reference),
+            default_type: syntax.default_type.map(reference),
+        };
+        let children = self.source_direct_children(parameter)?;
+        if annotations.constraint.is_some() && annotations.constraint == annotations.default_type {
+            return None;
+        }
+        annotations
+            .constraint
+            .into_iter()
+            .chain(annotations.default_type)
+            .all(|annotation| {
+                annotation != parameter
+                    && children.contains(&annotation)
+                    && self.source_node_parent(annotation)
+                        == Some(SourceNodeParent::Parent(parameter))
+                    && self.source_node_kind(annotation).is_some_and(|kind| {
+                        kind.is_keyword_type()
+                            || (SyntaxKind::FIRST_TYPE_NODE as u16
+                                ..=SyntaxKind::LAST_TYPE_NODE as u16)
+                                .contains(&(kind as u16))
+                    })
+            })
+            .then_some(annotations)
+    }
+
     /// Returns exact source roles, not mutable heritage or type-query caches.
     pub(super) fn source_plain_interface_heritage(
         &self,
@@ -9302,6 +9458,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 },
                 type_operator: match &node.data {
                     NodeData::TypeOperatorNode(operator) => Some(operator.operator),
+                    _ => None,
+                },
+                type_parameter_annotations: match &node.data {
+                    NodeData::TypeParameterDeclaration(parameter) => {
+                        Some(Box::new(TypeParameterAnnotationFacts {
+                            constraint: parameter.constraint,
+                            default_type: parameter.default_type,
+                        }))
+                    }
                     _ => None,
                 },
                 mapped_type: match &node.data {
@@ -13915,7 +14080,7 @@ mod tests {
 
     use super::{
         AstScope, CachedSignatureLookup, PlainInterfaceBaseFacts, PlainInterfaceHeritageFacts,
-        SemanticStore, type_list_key,
+        SemanticStore, SourceTypeParameterAnnotations, type_list_key,
     };
     use crate::semantic::{
         AccessibleChainCacheKey, AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks,
@@ -17089,6 +17254,97 @@ mod tests {
     }
 
     #[test]
+    fn merged_method_sources_reject_missing_declarations_and_forged_transient_flags() {
+        let first = parse_source_file(
+            "interface Reader { read(value: string): number; stable(): boolean; }",
+        );
+        let second = parse_source_file("interface Reader { read(value: number): string; }");
+        let files = [(FileId::new(64), &first), (FileId::new(65), &second)];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in files {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/reader-{}.d.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let declarations = files.map(|(file, parsed)| {
+            node_ref_of_kind(&parsed.arena, file, SyntaxKind::MethodSignature)
+        });
+        let raw = declarations.map(|node| binder.file(node.file).unwrap().symbol(node).unwrap());
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .into_iter()
+                .map(|(file, parsed)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let merged = store.get_merged_symbol(raw[0]).unwrap();
+        assert_ne!(raw[0], merged);
+        assert_ne!(raw[1], merged);
+        assert_eq!(store.get_merged_symbol(raw[1]), Some(merged));
+        assert_eq!(
+            store.symbol(merged).unwrap().declarations(),
+            Some(&declarations[..])
+        );
+        let owner = store.get_parent_of_symbol(merged).unwrap();
+        let stable = store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get_source("stable"))
+            .unwrap();
+        let before = format!("{store:?}");
+        for _ in 0..2 {
+            assert!(store.source_merged_method_has_exact_declarations(merged));
+            assert_eq!(store.declared_method_optional_flag(merged), Some(false));
+            assert!(!store.source_merged_method_has_exact_declarations(stable));
+            assert_eq!(store.declared_method_optional_flag(stable), Some(false));
+            assert_eq!(format!("{store:?}"), before);
+        }
+
+        assert!(store.set_symbol_declarations(
+            merged,
+            Some(vec![declarations[0]]),
+            Some(declarations[0]),
+        ));
+        assert!(!store.source_merged_method_has_exact_declarations(merged));
+        assert_eq!(store.declared_method_optional_flag(merged), None);
+        assert!(store.set_symbol_declarations(
+            merged,
+            Some(declarations.to_vec()),
+            Some(declarations[0]),
+        ));
+        assert!(store.source_merged_method_has_exact_declarations(merged));
+        assert_eq!(store.declared_method_optional_flag(merged), Some(false));
+
+        assert!(store.set_symbol_flags(
+            stable,
+            SymbolFlags::METHOD | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE,
+        ));
+        assert!(!store.source_merged_method_has_exact_declarations(stable));
+        assert_eq!(store.declared_method_optional_flag(stable), None);
+        assert!(store.set_symbol_flags(stable, SymbolFlags::METHOD, CheckFlags::NONE));
+        assert_eq!(store.declared_method_optional_flag(stable), Some(false));
+    }
+
+    #[test]
     fn declared_method_optional_counts_match_retained_fact_scan() {
         let parsed = parse_source_file(concat!(
             "interface Contract { ",
@@ -17293,6 +17549,140 @@ mod tests {
             ],
         );
         assert_eq!(format!("{store:?}"), before);
+    }
+
+    #[test]
+    fn source_type_parameter_annotations_keep_written_roles_and_missing_facts_distinct() {
+        let parsed = parse_source_file(concat!(
+            "interface Methods { absent<T>(): T; ",
+            "constrained<T extends string>(): T; ",
+            "defaulted<T = string>(): T; ",
+            "both<T extends string = string>(): T; }",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(63);
+        let parameters = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::TypeParameterDeclaration(parameter) = &record.data else {
+                    return None;
+                };
+                let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+                Some((
+                    reference(node),
+                    SourceTypeParameterAnnotations {
+                        constraint: parameter.constraint.map(reference),
+                        default_type: parameter.default_type.map(reference),
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(parameters.len(), 4);
+        let mut store = TestStore::new();
+        assert!(store.register_ast_scope(AstScope::new(file, &parsed.arena)));
+        for (parameter, _) in &parameters {
+            assert_eq!(store.source_type_parameter_annotations(*parameter), None);
+        }
+        store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let before = format!("{store:?}");
+        for _ in 0..2 {
+            for (parameter, expected) in &parameters {
+                assert_eq!(
+                    store.source_type_parameter_annotations(*parameter),
+                    Some(*expected)
+                );
+                assert_eq!(
+                    store.source_type_parameter_annotations(NodeRef::new(
+                        parameter.arena,
+                        FileId::new(64),
+                        parameter.node,
+                    )),
+                    None
+                );
+            }
+            assert_eq!(format!("{store:?}"), before);
+        }
+        assert_eq!(parameters[0].1.constraint, None);
+        assert_eq!(parameters[0].1.default_type, None);
+        assert!(parameters[1].1.constraint.is_some());
+        assert_eq!(parameters[1].1.default_type, None);
+        assert_eq!(parameters[2].1.constraint, None);
+        assert!(parameters[2].1.default_type.is_some());
+        assert_ne!(parameters[3].1.constraint, parameters[3].1.default_type);
+    }
+
+    #[test]
+    fn source_type_parameter_annotations_reject_changed_roles_and_broken_child_edges() {
+        let mut parsed = parse_source_file("interface Methods { run<T extends string>(): T; }");
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(65);
+        let parameter = node_ref_of_kind(&parsed.arena, file, SyntaxKind::TypeParameter);
+        let original = parsed.arena.get(parameter.node).unwrap().clone();
+        let mut store = TestStore::new();
+        let source = store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let annotations = store.source_type_parameter_annotations(parameter).unwrap();
+        let constraint = annotations.constraint.unwrap();
+        let before = format!("{store:?}");
+        let NodeData::TypeParameterDeclaration(data) =
+            &mut parsed.arena.get_mut(parameter.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        data.default_type = data.constraint.take();
+        assert_eq!(
+            store.register_source_file(&parsed.arena, parsed.source_file, file),
+            None
+        );
+        assert_eq!(
+            store.source_type_parameter_annotations(parameter),
+            Some(annotations)
+        );
+        assert_eq!(format!("{store:?}"), before);
+        *parsed.arena.get_mut(parameter.node).unwrap() = original;
+        assert_eq!(
+            store.register_source_file(&parsed.arena, parsed.source_file, file),
+            Some(source)
+        );
+
+        let parent = store.source_node_facts[&parameter.arena][constraint.node.index()]
+            .as_ref()
+            .unwrap()
+            .parent;
+        store.source_node_facts.get_mut(&parameter.arena).unwrap()[constraint.node.index()]
+            .as_mut()
+            .unwrap()
+            .parent = Some(source.node_ref().node);
+        let damaged = format!("{store:?}");
+        for _ in 0..2 {
+            assert_eq!(store.source_type_parameter_annotations(parameter), None);
+            assert_eq!(format!("{store:?}"), damaged);
+        }
+        store.source_node_facts.get_mut(&parameter.arena).unwrap()[constraint.node.index()]
+            .as_mut()
+            .unwrap()
+            .parent = parent;
+        let children = store.source_node_children[&parameter.arena][parameter.node.index()].clone();
+        store
+            .source_node_children
+            .get_mut(&parameter.arena)
+            .unwrap()[parameter.node.index()] = Box::new([]);
+        assert_eq!(store.source_type_parameter_annotations(parameter), None);
+        store
+            .source_node_children
+            .get_mut(&parameter.arena)
+            .unwrap()[parameter.node.index()] = children;
+        for _ in 0..2 {
+            assert_eq!(
+                store.source_type_parameter_annotations(parameter),
+                Some(annotations)
+            );
+            assert_eq!(format!("{store:?}"), before);
+        }
     }
 
     #[test]

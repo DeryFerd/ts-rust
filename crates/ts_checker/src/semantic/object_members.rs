@@ -15,8 +15,9 @@
 //! Other admitted construct signatures support optional `any` parameters.
 //! Interface call signatures may also retain one authenticated
 //! generic identifier predicate with its optional source type parameter.
-//! Named interface and type-literal methods retain their own binder symbols,
-//! authenticated method type parameters, annotated required or optional
+//! Named interface and type-literal methods retain their source declarations.
+//! Interface overloads from separate files share their canonical merged symbol.
+//! Signatures keep authenticated method type parameters, annotated required or optional
 //! parameters, and authenticated array, tuple, tuple-union, or inferred rest
 //! parameters. Strict optional methods keep a canonical union value separate
 //! from their callable object. Flat array rest bindings retain their anonymous
@@ -50,9 +51,8 @@ use super::{
     instantiated_members::{
         GenericInterfaceMemberError, demand_instantiated_property_type,
         demand_property_object_alias_property,
-        instantiate_published_generic_array_property_callable,
-        instantiate_published_generic_interface_method_with_session, property_instantiation_error,
-        resolve_members_with_array_targets,
+        instantiate_published_generic_array_property_callable, property_instantiation_error,
+        resolve_members_with_array_targets, resolve_members_with_array_targets_and_session,
         resolve_property_object_alias_members_with_array_targets,
         resolve_property_with_array_targets_and_session, validate_generic_interface_members,
         validate_property_object_alias_members_with_array_targets,
@@ -347,6 +347,33 @@ pub(super) fn resolve_object_property_by_key_with_source(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
+    let conditional_mapped = store.type_payload(receiver).is_some_and(|record| {
+        matches!(record.data(), TypeData::Mapped(mapped)
+        if mapped.template_type.is_some_and(|template| {
+            matches!(store.type_payload(template).map(TypeRecord::data),
+                Some(TypeData::Conditional(_)))
+        }))
+    });
+    if conditional_mapped {
+        return CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_type_of_mapped_property(receiver, name)
+        .map(|property| {
+            property.map(|property| ResolvedOwnProperty {
+                symbol: property.symbol(),
+                type_: property.type_id(),
+                optional: property.is_optional(),
+                readonly: property.is_readonly(),
+            })
+        })
+        .map_err(Into::into);
+    }
     if source_property_object_projection(store, receiver)?.is_some() {
         let members = match validate_property_object_alias_members_with_array_targets(
             store,
@@ -482,6 +509,28 @@ pub(super) fn resolve_object_property_by_key_with_source(
         .object_flags()
         .contains(ObjectFlags::MEMBERS_RESOLVED)
     {
+        let target = match record.data() {
+            TypeData::TypeReference(reference) => reference.object.target,
+            TypeData::Interface(interface) if generic => interface.reference.object.target,
+            _ => None,
+        };
+        if target.is_some_and(|target| {
+            store.type_payload(target).is_some_and(|record| {
+                matches!(record.data(), TypeData::Interface(_))
+                    && !record.object_flags().contains(ObjectFlags::CLASS)
+            })
+        }) {
+            return resolve_instantiated_object_property_by_key_with_source(
+                store,
+                host,
+                global_types,
+                options,
+                receiver,
+                name,
+                session,
+                diagnostics,
+            );
+        }
         return resolve_object_property_by_key(store, Some(global_types), receiver, name, session)
             .map_err(Into::into);
     }
@@ -505,14 +554,16 @@ pub(super) fn resolve_object_property_by_key_with_source(
             .map_err(Into::into);
         }
         if interface.declared_members_resolved {
-            return resolve_object_property_by_key(
+            return resolve_instantiated_object_property_by_key_with_source(
                 store,
-                Some(global_types),
+                host,
+                global_types,
+                options,
                 receiver,
                 name,
                 session,
-            )
-            .map_err(Into::into);
+                diagnostics,
+            );
         }
         if record
             .data()
@@ -653,14 +704,15 @@ pub(super) fn resolve_object_property_by_key_with_source(
     let type_ = if mapper_sources.is_empty() {
         template
     } else if method {
-        instantiate_published_generic_interface_method_with_session(
+        CanonicalTypeQuery::new_with_global_types_and_session(
             store,
+            host,
             global_types,
-            receiver,
-            symbol,
+            options,
             session,
-        )
-        .map_err(|error| source_generic_member_error(receiver, &error))?
+            diagnostics,
+        )?
+        .get_type_of_instantiated_interface_method(receiver, symbol)?
     } else if array.is_some() && store.type_has_function_type_provenance(template) {
         instantiate_published_generic_array_property_callable(store, global_types, receiver, symbol)
             .map_err(|error| source_generic_member_error(receiver, &error))?
@@ -676,6 +728,73 @@ pub(super) fn resolve_object_property_by_key_with_source(
         .map_err(|error| {
             source_generic_member_error(receiver, &property_instantiation_error(template, &error))
         })?
+    };
+    Ok(Some(ResolvedOwnProperty {
+        symbol,
+        type_,
+        optional,
+        readonly,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)] // Keep the source host and limits with the selected proxy.
+fn resolve_instantiated_object_property_by_key_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    receiver: TypeId,
+    name: EscapedNameRef<'_>,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
+    if store
+        .direct_interface_heritage_provenance(receiver)
+        .is_some()
+    {
+        return resolve_object_property_by_key(store, Some(global_types), receiver, name, session)
+            .map_err(Into::into);
+    }
+    let members = resolve_members_with_array_targets_and_session(
+        store,
+        receiver,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+        session,
+    )
+    .map_err(|error| source_generic_member_error(receiver, &error))?;
+    let Some(table) = members.members() else {
+        return Ok(None);
+    };
+    let table = store
+        .symbol_table(table)
+        .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+    let Some(symbol) = table.get(name) else {
+        return Ok(None);
+    };
+    let record = store
+        .symbol(symbol)
+        .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+    let optional = record.flags().contains(SymbolFlags::OPTIONAL);
+    let readonly = record.check_flags().contains(CheckFlags::READONLY);
+    let type_ = if record.flags().contains(SymbolFlags::METHOD) {
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_type_of_instantiated_interface_property(receiver, symbol)?
+    } else {
+        demand_instantiated_property_type(
+            store,
+            receiver,
+            symbol,
+            Some(CanonicalArrayTargets::from_global_types(global_types)),
+            session,
+        )
+        .map_err(|error| source_generic_member_error(receiver, &error))?
     };
     Ok(Some(ResolvedOwnProperty {
         symbol,
@@ -1135,7 +1254,7 @@ fn source_member_name_matches(
     Ok(suffix == Some(identity.to_string().as_bytes()))
 }
 
-fn source_generic_member_error(
+pub(super) fn source_generic_member_error(
     receiver: TypeId,
     error: &GenericInterfaceMemberError,
 ) -> SourceCheckError {
@@ -2706,9 +2825,17 @@ pub(super) struct PlannedInterfaceMethodTypeParameter {
     pub default_type: Option<NodeRef>,
 }
 
+/// A method parameter keeps source absence separate from an unresolved annotation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DeclaredMethodTypeParameterView {
+    pub type_parameter: TypeId,
+    pub constraint: Option<TypeId>,
+    pub default_type: Option<TypeId>,
+}
+
 /// One named method on an interface or type literal.
 ///
-/// Ordinary overloads share a binder symbol. Computed overloads keep separate
+/// Ordinary overloads share a canonical symbol. Computed overloads keep separate
 /// source symbols until their common member name is resolved.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PlannedInterfaceMethod {
@@ -3401,6 +3528,35 @@ pub(super) fn validate_stored_declared_call_set(
         }
     }
 
+    validate_declared_call_signature_records(
+        store,
+        type_,
+        owner,
+        owner_declaration,
+        owner_declarations,
+        signatures,
+        call_signature_count,
+        own_signature_count,
+        inherited_base,
+        constructor_interface,
+        member_edges,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Both interface forms share the same source signature proof.
+fn validate_declared_call_signature_records(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    owner_declarations: &[NodeRef],
+    signatures: &[SignatureId],
+    call_signature_count: usize,
+    own_signature_count: usize,
+    inherited_base: Option<TypeId>,
+    constructor_interface: bool,
+    member_edges: Vec<TypeId>,
+) -> StoredDeclaredCallSetValidation {
     let mut edges = Vec::new();
     let mut seen_signatures = HashSet::with_capacity(signatures.len());
     for (index, signature) in signatures.iter().copied().enumerate() {
@@ -3661,6 +3817,89 @@ pub(super) fn validate_stored_declared_call_set(
     StoredDeclaredCallSetValidation::Valid(edges)
 }
 
+/// Validates the ordered declared call templates before a reference substitutes their types.
+/// Generic member validation separately proves the interface's property table.
+pub(super) fn generic_declared_call_signature_edges(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+) -> Option<Vec<TypeId>> {
+    let record = store.type_payload(target)?;
+    let TypeData::Interface(interface) = record.data() else {
+        return None;
+    };
+    let owner = record.symbol()?;
+    let owner_record = store.symbol(owner)?;
+    let members = store.symbol_table(owner_record.members()?)?;
+    let call_symbol = members.get(InternalSymbolName::Call.as_ref());
+    if interface.declared_construct_signatures.is_some()
+        || members.get(InternalSymbolName::New.as_ref()).is_some()
+    {
+        return None;
+    }
+    let Some(signatures) = interface.declared_call_signatures.as_deref() else {
+        return (call_symbol.is_none() && !store.type_has_declared_call_set_provenance(target))
+            .then(Vec::new);
+    };
+    if signatures.is_empty() {
+        return None;
+    }
+    let [declaration] = owner_record.declarations()? else {
+        return None;
+    };
+    let symbol = call_symbol?;
+    let symbol_record = store.symbol(symbol)?;
+    let calls = signatures
+        .iter()
+        .map(|signature| {
+            let record = store.signature(*signature)?;
+            let declaration = record.declaration()?;
+            (record.type_parameters().is_empty()
+                && !record.has_rest_parameter()
+                && record.resolved_type_predicate().is_none()
+                && store.source_declaration_belongs_to_symbol(declaration, symbol))
+            .then_some(declaration)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if validate_direct_generic_reference(store, target)
+        .ok()?
+        .target
+        != target
+        || !store.type_has_declared_call_set_provenance(target)
+        || !interface.declared_members_resolved
+        || interface.resolved_base_types.is_some()
+        || symbol_record.flags() != SymbolFlags::SIGNATURE
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name() != InternalSymbolName::Call.as_ref()
+        || symbol_record.declarations() != Some(calls.as_slice())
+        || symbol_record.value_declaration().is_some()
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.export_symbol().is_some()
+        || store.get_parent_of_symbol(symbol) != Some(owner)
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || !store.source_symbol_declarations_match(symbol)
+        || !store.source_declaration_belongs_to_symbol(*declaration, owner)
+    {
+        return None;
+    }
+    match validate_declared_call_signature_records(
+        store,
+        target,
+        owner,
+        *declaration,
+        &[*declaration],
+        signatures,
+        signatures.len(),
+        signatures.len(),
+        None,
+        false,
+        Vec::new(),
+    ) {
+        StoredDeclaredCallSetValidation::Valid(edges) => Some(edges),
+        _ => None,
+    }
+}
+
 fn validate_declared_call_set_member_edges(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -3716,7 +3955,12 @@ fn validate_declared_call_set_member_edges(
                 .position(|&owner| owner == property_owner)?,
             declaration.node.index(),
         );
-        let method = record.flags().without(SymbolFlags::OPTIONAL) == SymbolFlags::METHOD;
+        let method = record
+            .flags()
+            .without(SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT)
+            == SymbolFlags::METHOD
+            && (!record.flags().contains(SymbolFlags::TRANSIENT)
+                || store.source_merged_method_has_exact_declarations(*property));
         let accessor = record.flags().intersects(SymbolFlags::ACCESSOR);
         let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::ACCESSOR;
         if !seen_properties.insert(*property)
@@ -9410,7 +9654,9 @@ pub(super) fn plan_generic_interface(
         TypeLiteralMemberPolicy::GenericInterface,
     )?;
     plan.heritage = heritage;
-    if let Some(call) = plan.call_signatures.first() {
+    if let Some(call) = plan.call_signatures.first()
+        && !supported_generic_interface_calls(&plan)
+    {
         return Err(PropertyObjectError::UnsupportedMember {
             node: call.declaration,
             kind: call.syntax_kind(),
@@ -9420,10 +9666,31 @@ pub(super) fn plan_generic_interface(
         != parameter_symbols.as_ref().map_or(0, Vec::len)
             + plan.raw_property_count()
             + usize::from(!plan.indexes.is_empty())
+            + usize::from(!plan.call_signatures.is_empty())
     {
         return Err(invalid());
     }
     Ok(plan)
+}
+
+/// The enclosing interface supplies one mapper for its ordered call signatures.
+/// Call-owned generics, constructors, and inherited calls remain unsupported.
+fn supported_generic_interface_calls(plan: &PropertyObjectPlan) -> bool {
+    plan.kind == PropertyObjectKind::Interface
+        && plan.declarations.len() == 1
+        && plan.heritage.is_none()
+        && plan.methods.is_empty()
+        && plan.accessors.is_empty()
+        && plan.indexes.is_empty()
+        && !plan.call_signatures.is_empty()
+        && plan.call_signatures.iter().all(|call| {
+            call.type_parameters.is_empty()
+                && call.type_predicate.is_none()
+                && !call.implicit_any_return
+                && !call.is_construct()
+                && !call.flags.contains(SignatureFlags::HAS_REST_PARAMETER)
+                && call.parameters.iter().all(|parameter| !parameter.optional)
+        })
 }
 
 /// Validates a reopened generic interface without reading its member annotations.
@@ -12278,12 +12545,18 @@ pub(super) fn plan_interface_method(
         .ok_or_else(unsupported)?;
     let method_symbol = store.symbol(symbol).ok_or_else(unsupported)?;
     let declarations = method_symbol.declarations().ok_or_else(unsupported)?;
-    if symbol != raw_symbol
+    let merged = store.source_merged_method_has_exact_declarations(symbol);
+    if symbol != raw_symbol && !merged
         || !host.symbol_matches(store, declaration, symbol)
         || method_symbol.flags()
             != SymbolFlags::METHOD
                 | if optional {
                     SymbolFlags::OPTIONAL
+                } else {
+                    SymbolFlags::NONE
+                }
+                | if merged {
+                    SymbolFlags::TRANSIENT
                 } else {
                     SymbolFlags::NONE
                 }
@@ -12816,6 +13089,7 @@ pub(super) fn plan_selected_interface_method(
     let selected = store.get_merged_symbol(selected).ok_or_else(invalid)?;
     let requested = store.symbol(selected).ok_or_else(invalid)?;
     let source = if requested.flags().contains(SymbolFlags::TRANSIENT)
+        && !store.source_merged_method_has_exact_declarations(selected)
         || requested.check_flags().contains(CheckFlags::LATE)
         || requested.name().is_late_bound()
     {
@@ -19231,8 +19505,22 @@ fn valid_planned_call_signature_set(
             .iter()
             .any(PlannedCallSignature::is_construct),
     );
+    let enclosing_parameter_count = if supported_generic_interface_calls(plan) {
+        members
+            .iter()
+            .filter(|(_, symbol)| {
+                store.symbol(*symbol).is_some_and(|record| {
+                    record.flags().contains(SymbolFlags::TYPE_PARAMETER)
+                        && store.get_parent_of_symbol(*symbol) == Some(plan.symbol)
+                })
+            })
+            .count()
+    } else {
+        0
+    };
     members.len()
         == family_count
+            .saturating_add(enclosing_parameter_count)
             .saturating_add(plan.properties.len())
             .saturating_add(usize::from(!plan.indexes.is_empty()))
         && (plan.kind == PropertyObjectKind::Interface
@@ -19761,8 +20049,9 @@ pub(super) fn declared_method_value_links(
     resolved_type: Option<TypeId>,
 ) -> Option<ValueSymbolLinks> {
     let method = store.symbol(symbol)?;
+    let merged = store.source_merged_method_has_exact_declarations(symbol);
     let late = method.check_flags().contains(CheckFlags::LATE)
-        || method.flags().contains(SymbolFlags::TRANSIENT)
+        || method.flags().contains(SymbolFlags::TRANSIENT) && !merged
         || method.name().is_late_bound();
     let name_type = if late {
         let owner = store.get_parent_of_symbol(symbol)?;
@@ -19782,7 +20071,14 @@ pub(super) fn declared_method_value_links(
         }
         links.name_type
     } else {
-        if method.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::METHOD
+        if method.flags()
+            != SymbolFlags::METHOD
+                | (method.flags() & SymbolFlags::OPTIONAL)
+                | if merged {
+                    SymbolFlags::TRANSIENT
+                } else {
+                    SymbolFlags::NONE
+                }
             || method.check_flags() != CheckFlags::NONE
         {
             return None;
@@ -19991,6 +20287,80 @@ fn resolved_interface_method_type_parameters(
     method: &PlannedInterfaceMethod,
 ) -> Option<Vec<TypeId>> {
     resolved_declared_signature_type_parameters(store, method.declaration, &method.type_parameters)
+}
+
+/// Replays the original parameter order and written annotation roles without a type query.
+pub(super) fn declared_method_type_parameter_view(
+    store: &CanonicalTypeMapperStore,
+    signature: &super::signatures::Signature,
+    declaration: NodeRef,
+) -> Option<Vec<DeclaredMethodTypeParameterView>> {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature) {
+        return None;
+    }
+    let mut declarations = store.source_direct_children(declaration)?;
+    declarations.retain(|parameter| {
+        parameter.node < declaration.node
+            && store.source_node_kind(*parameter) == Some(SyntaxKind::TypeParameter)
+    });
+    if declarations.len() != signature.type_parameters().len() {
+        return None;
+    }
+    let mut resolved = Vec::with_capacity(declarations.len());
+    let mut symbols = HashSet::with_capacity(declarations.len());
+    let mut default_seen = false;
+    for (&type_parameter, declaration_parameter) in
+        signature.type_parameters().iter().zip(declarations)
+    {
+        let symbol = cached_ordinary_type_parameter_owner(store, type_parameter)?;
+        let record = store.symbol(symbol)?;
+        let [parameter] = record.declarations()? else {
+            return None;
+        };
+        let TypeData::TypeParameter(data) = store.type_payload(type_parameter)?.data() else {
+            return None;
+        };
+        let annotations = store.source_type_parameter_annotations(*parameter)?;
+        let exact_annotation = |annotation| {
+            let type_ = ConstructorAnnotationMode::SourceResolvedFull.cached(store, annotation)?;
+            store.type_payload(type_).is_some().then_some(type_)
+        };
+        let constraint = match annotations.constraint {
+            Some(annotation) => Some(exact_annotation(annotation)?),
+            None => None,
+        };
+        let default_type = match annotations.default_type {
+            Some(annotation) => Some(exact_annotation(annotation)?),
+            None => None,
+        };
+        if !symbols.insert(symbol)
+            || record.flags() != SymbolFlags::TYPE_PARAMETER
+            || record.check_flags() != CheckFlags::NONE
+            || record.value_declaration().is_some()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.parent().is_some()
+            || record.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || *parameter != declaration_parameter
+            || store.source_node_parent(*parameter) != Some(SourceNodeParent::Parent(declaration))
+            || data.is_this_type
+            || data.target.is_some()
+            || data.mapper.is_some()
+            || data.constraint != constraint
+            || data.resolved_default_type != default_type
+            || default_seen && annotations.default_type.is_none()
+        {
+            return None;
+        }
+        default_seen |= annotations.default_type.is_some();
+        resolved.push(DeclaredMethodTypeParameterView {
+            type_parameter,
+            constraint,
+            default_type,
+        });
+    }
+    Some(resolved)
 }
 
 pub(super) fn resolved_declared_signature_type_parameters(
@@ -20823,6 +21193,22 @@ pub(super) fn publish_declared_members(
         return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
     }
     let type_ = state.type_id();
+    let generic_interface = store.type_payload(type_).is_some_and(|record| {
+        matches!(record.data(), TypeData::Interface(_))
+            && record.object_flags().contains(ObjectFlags::REFERENCE)
+    });
+    if generic_interface
+        && (!supported_generic_interface_calls(plan)
+            || state.is_resolved()
+            || store.type_payload(type_).is_none_or(|record| {
+                let TypeData::Interface(interface) = record.data() else {
+                    return true;
+                };
+                !valid_generic_publication_target(store, plan, type_, record, interface)
+            }))
+    {
+        return Err(invalid_cache(plan, type_));
+    }
     if !valid_planned_call_signature_set(store, plan) {
         return Err(invalid_cache(plan, type_));
     }
@@ -20973,7 +21359,17 @@ pub(super) fn publish_declared_members(
         .filter_map(|signature| signature.type_predicate)
         .filter(|predicate| store.symbol_node_links(predicate.parameter_name).is_none())
         .count();
+    let generic_member_table = if generic_interface && !plan.properties.is_empty() {
+        Some(
+            PreparedSymbolTable::new(plan.properties.len())
+                .ok_or(PropertyObjectError::Capacity(plan.node))?,
+        )
+    } else {
+        None
+    };
     if !store.try_reserve_index_infos(plan.indexes.len())
+        || !store
+            .try_reserve_checker_symbol_allocations(0, usize::from(generic_member_table.is_some()))
         || !store.try_reserve_signatures(cold_signature_count)
         || !store.try_reserve_value_symbol_links(missing_accessor_links)
         || !store.try_reserve_function_signature_return_annotations(annotated_signature_count)
@@ -21009,6 +21405,20 @@ pub(super) fn publish_declared_members(
         }
     }
 
+    let declared_members = if generic_interface {
+        generic_member_table.map(|table| {
+            let members = store.alloc_prepared_symbol_table(table);
+            for property in &plan.properties {
+                assert_eq!(
+                    store.insert_symbol(members, property.name.clone(), property.symbol),
+                    Some(None),
+                );
+            }
+            members
+        })
+    } else {
+        plan.members
+    };
     let index_infos = plan
         .indexes
         .iter()
@@ -21149,20 +21559,22 @@ pub(super) fn publish_declared_members(
             assert!(store.set_interface_declared_members(
                 type_,
                 true,
-                plan.members,
+                declared_members,
                 published_calls.clone(),
                 published_constructs.clone(),
                 published_index_infos.clone(),
             ));
-            assert!(store.set_interface_base_resolution(type_, true, None, None));
-            assert!(store.set_structured_type_members(
-                type_,
-                plan.members,
-                plan.expected_properties(),
-                published_calls,
-                published_constructs,
-                published_index_infos,
-            ));
+            if !generic_interface {
+                assert!(store.set_interface_base_resolution(type_, true, None, None));
+                assert!(store.set_structured_type_members(
+                    type_,
+                    plan.members,
+                    plan.expected_properties(),
+                    published_calls,
+                    published_constructs,
+                    published_index_infos,
+                ));
+            }
         }
         PropertyObjectKind::ObjectLiteral => {
             unreachable!("object-literal plans were rejected before publication")
@@ -21304,7 +21716,7 @@ fn publish_generic_interface_declared_members_worker(
     };
     if plan.kind != PropertyObjectKind::Interface
         || plan.alias_symbol.is_some()
-        || !plan.call_signatures.is_empty()
+        || !plan.call_signatures.is_empty() && !supported_generic_interface_calls(plan)
         || plan.properties.len() != property_types.len()
         || property_types
             .iter()
@@ -21383,6 +21795,31 @@ fn publish_generic_interface_declared_members_worker(
         || !unresolved_property_links(store, plan)
     {
         return Err(invalid());
+    }
+    if !plan.call_signatures.is_empty() {
+        let call_types = plan
+            .call_signatures
+            .iter()
+            .map(|call| {
+                Some(ResolvedCallSignatureTypes {
+                    parameter_types: call
+                        .parameters
+                        .iter()
+                        .map(|parameter| planned_call_parameter_type(store, parameter))
+                        .collect::<Option<Vec<_>>>()?,
+                    return_type: cached_planned_type_identity(store, call.return_type)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(invalid)?;
+        return publish_declared_members(
+            store,
+            plan,
+            PropertyObjectState::Shell(target),
+            property_types,
+            &index_types,
+            &call_types,
+        );
     }
     let prepared = if plan.properties.is_empty() {
         None
@@ -21628,7 +22065,12 @@ fn valid_generic_publication_target(
         || reference.type_arguments.is_empty()
         || !interface.base_types_resolved
         || interface.resolved_base_constructor_type.is_some()
-        || interface.declared_call_signatures.is_some()
+        || if interface.declared_members_resolved {
+            interface.declared_call_signatures.as_deref()
+                != resolved_call_signature_ids(store, plan).as_deref()
+        } else {
+            interface.declared_call_signatures.is_some()
+        }
         || interface.declared_construct_signatures.is_some()
         || if interface.declared_members_resolved {
             !valid_declared_index_infos(store, interface.declared_index_infos.as_deref(), plan)
@@ -21639,6 +22081,8 @@ fn valid_generic_publication_target(
             != reference.type_arguments.len()
                 + plan.raw_property_count()
                 + usize::from(!plan.indexes.is_empty())
+                + usize::from(!plan.call_signatures.is_empty())
+        || !valid_planned_call_signature_set(store, plan)
     {
         return false;
     }
@@ -21788,7 +22232,8 @@ fn valid_generic_publication_target(
         };
         let expected_flags = if method {
             SymbolFlags::METHOD
-                | if computed {
+                | if computed || store.source_merged_method_has_exact_declarations(property.symbol)
+                {
                     SymbolFlags::TRANSIENT
                 } else {
                     SymbolFlags::NONE
@@ -21894,6 +22339,12 @@ fn valid_generic_publication_target(
         {
             return false;
         }
+    }
+    // The validated Call symbol owns every overload declaration in this plan.
+    if let Some(call) = plan.call_signatures.first()
+        && !symbols.insert(call.symbol)
+    {
+        return false;
     }
     raw_table.iter().all(|(name, symbol)| {
         store
@@ -22038,8 +22489,12 @@ fn valid_generic_structured_members(
         return structured == &StructuredTypeData::default();
     }
     if structured.constrained != ConstrainedTypeData::default()
-        || structured.signatures.is_some()
-        || structured.call_signature_count != 0
+        || structured.signatures.as_deref() != interface.declared_call_signatures.as_deref()
+        || structured.call_signature_count
+            != interface
+                .declared_call_signatures
+                .as_ref()
+                .map_or(0, Vec::len)
         || structured
             .object_type_without_abstract_construct_signatures
             .is_some()

@@ -14,7 +14,7 @@ use super::{
         TypePredicateId, TypedArena,
     },
     links::ValueSymbolLinks,
-    mapper::CanonicalTypeMapperStore,
+    mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
     type_records::TypeData,
     types::{ObjectFlags, TypeFlags},
 };
@@ -767,6 +767,70 @@ impl CanonicalTypeMapperStore {
             data,
             name_type: links.and_then(|links| links.name_type),
         })
+    }
+
+    /// Checks a resolved source symbol with the same reuse and mapper rules as publication.
+    pub(super) fn instantiated_signature_symbol_matches(
+        &self,
+        source: SemanticSymbolId,
+        instantiated: SemanticSymbolId,
+        mapper: TypeMapperId,
+    ) -> bool {
+        let Some(source_type) = self
+            .value_symbol_links(source)
+            .and_then(|links| links.resolved_type)
+        else {
+            return false;
+        };
+        let Ok(plan) = self.prepare_instantiated_signature_symbol(source) else {
+            return false;
+        };
+        let (target, previous_mapper, data, name_type) = match plan {
+            SignatureSymbolPlan::Reuse(expected) => return instantiated == expected,
+            SignatureSymbolPlan::Instantiate {
+                target,
+                previous_mapper,
+                data,
+                name_type,
+            } => (target, previous_mapper, data, name_type),
+        };
+        let Some(record) = self.symbol(instantiated) else {
+            return false;
+        };
+        let Some(links) = self.value_symbol_links(instantiated) else {
+            return false;
+        };
+        let mapper_matches = match previous_mapper {
+            None => links.mapper == Some(mapper),
+            Some(previous) => links.mapper.is_some_and(|actual| {
+                self.mapper_application(actual, source_type)
+                    == Some(TypeMapperApplication::Composite {
+                        first: previous,
+                        second: mapper,
+                    })
+            }),
+        };
+        instantiated != source
+            && instantiated != target
+            && record.flags() == data.flags
+            && record.check_flags() == data.check_flags
+            && record.name() == data.name.as_ref()
+            && record.declarations() == data.declarations.as_deref()
+            && record.value_declaration() == data.value_declaration
+            && record.parent() == data.parent
+            && record.members() == data.members
+            && record.exports() == data.exports
+            && record.export_symbol() == data.export_symbol
+            && self.get_merged_symbol(instantiated) == Some(instantiated)
+            && mapper_matches
+            && links
+                == &ValueSymbolLinks {
+                    resolved_type: links.resolved_type,
+                    target: Some(target),
+                    mapper: links.mapper,
+                    name_type,
+                    ..ValueSymbolLinks::default()
+                }
     }
 
     fn publish_instantiated_signature_symbol(

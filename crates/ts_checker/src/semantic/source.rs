@@ -63946,6 +63946,28 @@ pub(super) fn check_source_file(
                 merge_retry_diagnostics(diagnostics, statement_diagnostics);
                 let target = target?;
 
+                for call in &interface.call_signatures {
+                    for annotation in call
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.type_node)
+                        .chain(std::iter::once(call.return_type))
+                    {
+                        session.reset_query();
+                        let mut call_diagnostics = CanonicalCheckerDiagnostics::default();
+                        let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            &mut call_diagnostics,
+                        )?
+                        .get_type_from_type_node(annotation);
+                        merge_retry_diagnostics(diagnostics, call_diagnostics);
+                        result?;
+                    }
+                }
                 let mut property_types = Vec::with_capacity(interface.properties.len());
                 for property in &interface.properties {
                     session.reset_query();

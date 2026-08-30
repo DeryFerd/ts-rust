@@ -11,8 +11,11 @@ use ts_jsnum::Number;
 
 use super::{
     CanonicalTypeMapperStore, TypeId,
+    array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
-    type_records::{LiteralValue, TypeData, TypeRecord},
+    instantiate::InstantiationSession,
+    type_nodes::SourceTemplateUnionConstraints,
+    type_records::{ConstituentMapState, LiteralValue, StructuredTypeData, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -1543,19 +1546,436 @@ impl CanonicalTypeMapperStore {
         &mut self,
         types: &[TypeId],
     ) -> Result<TypeId, TemplateTypeError> {
+        self.template_result_union_worker(types, None, None)
+    }
+
+    /// Keeps a mapped union's cache checks in the caller's query.
+    pub(super) fn template_result_union_with_array_targets_and_session(
+        &mut self,
+        types: &[TypeId],
+        array_targets: Option<CanonicalArrayTargets>,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, TemplateTypeError> {
+        self.template_result_union_worker(types, array_targets, Some(session))
+    }
+
+    /// Builds an unnamed return union after its source query proves every annotation.
+    /// The source query retains parameter ownership and publishes its own result links.
+    pub(super) fn source_template_result_union(
+        &mut self,
+        types: &[TypeId],
+        array_targets: Option<CanonicalArrayTargets>,
+        session: Option<&mut InstantiationSession>,
+        source: Option<&SourceTemplateUnionConstraints<'_>>,
+    ) -> Result<TypeId, TemplateTypeError> {
+        self.cached_source_template_result_union(types, array_targets, source)?;
+        // Even a warm literal reduction must use the caller's cache validation.
+        let result = if let Some(inputs) =
+            self.source_template_literal_union_inputs(types, array_targets)?
+        {
+            match session {
+                Some(session) => self.literal_union_type_with_alias_and_array_targets_and_session(
+                    &inputs,
+                    None,
+                    array_targets,
+                    session,
+                )?,
+                None => self.literal_union_type_with_alias_and_array_targets(
+                    &inputs,
+                    None,
+                    array_targets,
+                )?,
+            }
+        } else {
+            self.template_result_union_worker(types, array_targets, session)?
+        };
+        if self.cached_source_template_result_union(types, array_targets, source)? != Some(result) {
+            return Err(TemplateTypeError::InvalidUnion(result));
+        }
+        Ok(result)
+    }
+
+    /// Replays an unnamed source union without reducing away an unchecked child.
+    pub(super) fn cached_source_template_result_union(
+        &self,
+        types: &[TypeId],
+        array_targets: Option<CanonicalArrayTargets>,
+        source: Option<&SourceTemplateUnionConstraints<'_>>,
+    ) -> Result<Option<TypeId>, TemplateTypeError> {
+        let constraints = source
+            .copied()
+            .unwrap_or_else(|| SourceTemplateUnionConstraints::without_source(array_targets));
+        if constraints.array_targets() != array_targets {
+            return Err(TemplateTypeError::InvalidType(
+                array_targets
+                    .or(constraints.array_targets())
+                    .expect("different capabilities cannot both be absent")
+                    .array_type(),
+            ));
+        }
+        for type_ in types {
+            self.validate_source_template_union_constituent(
+                *type_,
+                array_targets,
+                &constraints,
+                &mut HashSet::new(),
+            )?;
+        }
+        if let Some(inputs) = self.source_template_literal_union_inputs(types, array_targets)? {
+            return self
+                .cached_literal_union_type_with_alias(&inputs, None, array_targets)
+                .map_err(Into::into);
+        }
+        self.cached_source_template_union_plan(
+            self.plan_template_result_union(types)?,
+            array_targets,
+            &constraints,
+        )
+    }
+
+    /// Keeps named ordinary inputs when template reduction reaches the literal factory.
+    fn source_template_literal_union_inputs(
+        &self,
+        types: &[TypeId],
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<Option<Vec<TypeId>>, TemplateTypeError> {
+        let Some(named) = self.source_template_named_union(types, &mut HashSet::new())? else {
+            return Ok(None);
+        };
+        let plan = self.plan_template_result_union(types)?;
+        let reduced = match &plan {
+            TemplateUnionPlan::Existing(existing) => std::slice::from_ref(existing),
+            TemplateUnionPlan::Constituents(types) => types,
+        };
+        if reduced.iter().any(|type_| {
+            matches!(
+                self.type_payload(*type_).map(TypeRecord::data),
+                Some(TypeData::TemplateLiteral(_) | TypeData::StringMapping(_))
+            )
+        }) {
+            return Err(TemplateTypeError::UnsupportedUnionConstituent(named));
+        }
+        let mut inputs = Vec::new();
+        self.collect_source_template_literal_inputs(
+            types,
+            array_targets,
+            &mut inputs,
+            &mut HashSet::new(),
+        )?;
+        Ok(Some(inputs))
+    }
+
+    fn source_template_named_union(
+        &self,
+        types: &[TypeId],
+        active: &mut HashSet<TypeId>,
+    ) -> Result<Option<TypeId>, TemplateTypeError> {
+        for &type_ in types {
+            let record = self
+                .type_payload(type_)
+                .ok_or(TemplateTypeError::InvalidType(type_))?;
+            let TypeData::Union(union) = record.data() else {
+                continue;
+            };
+            if record.alias().is_some() || union.origin.is_some() {
+                return Ok(Some(type_));
+            }
+            if !active.insert(type_) {
+                return Err(TemplateTypeError::RecursiveType(type_));
+            }
+            let named = self.source_template_named_union(&union.union.types, active)?;
+            active.remove(&type_);
+            if named.is_some() {
+                return Ok(named);
+            }
+        }
+        Ok(None)
+    }
+
+    fn collect_source_template_literal_inputs(
+        &self,
+        types: &[TypeId],
+        array_targets: Option<CanonicalArrayTargets>,
+        inputs: &mut Vec<TypeId>,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<(), TemplateTypeError> {
+        for &type_ in types {
+            let record = self
+                .type_payload(type_)
+                .ok_or(TemplateTypeError::InvalidType(type_))?;
+            if matches!(
+                record.data(),
+                TypeData::TemplateLiteral(_) | TypeData::StringMapping(_)
+            ) {
+                continue;
+            }
+            if let TypeData::Union(union) = record.data()
+                && array_targets
+                    .map_or_else(
+                        || self.validate_union_constituent(type_),
+                        |targets| {
+                            self.validate_union_constituent_with_array_targets(targets, type_)
+                        },
+                    )
+                    .is_err()
+            {
+                if !active.insert(type_) {
+                    return Err(TemplateTypeError::RecursiveType(type_));
+                }
+                self.collect_source_template_literal_inputs(
+                    &union.union.types,
+                    array_targets,
+                    inputs,
+                    active,
+                )?;
+                active.remove(&type_);
+            } else {
+                inputs.push(type_);
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)] // Each admitted child and cache shares the same recursion guard.
+    fn validate_source_template_union_constituent(
+        &self,
+        type_: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+        constraints: &SourceTemplateUnionConstraints<'_>,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<(), TemplateTypeError> {
+        let record = self
+            .type_payload(type_)
+            .ok_or(TemplateTypeError::InvalidType(type_))?;
+        let ordinary = || {
+            array_targets.map_or_else(
+                || self.validate_union_constituent(type_),
+                |targets| self.validate_union_constituent_with_array_targets(targets, type_),
+            )
+        };
+        if !matches!(
+            record.data(),
+            TypeData::TemplateLiteral(_) | TypeData::StringMapping(_) | TypeData::Union(_)
+        ) {
+            if matches!(record.data(), TypeData::TypeParameter(_)) {
+                constraints
+                    .parameter_base_constraint(self, type_)
+                    .map_err(|_| TemplateTypeError::InvalidType(type_))?;
+            }
+            return ordinary().map_err(Into::into);
+        }
+        let ordinary_union = matches!(record.data(), TypeData::Union(_)) && ordinary().is_ok();
+        if !active.insert(type_) {
+            return Err(TemplateTypeError::RecursiveType(type_));
+        }
+        let result = (|| {
+            match record.data() {
+                TypeData::TemplateLiteral(template) => {
+                    let lazy_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+                    if record.flags() != TypeFlags::TEMPLATE_LITERAL
+                        || record.object_flags() & !lazy_flags != ObjectFlags::NONE
+                        || !Self::valid_union_cache_lazy_object_flags(record.object_flags())
+                        || record.symbol().is_some()
+                        || record.alias().is_some()
+                    {
+                        return Err(TemplateTypeError::InvalidTemplate(type_));
+                    }
+                    for span in &template.types {
+                        self.validate_source_template_union_constituent(
+                            *span,
+                            array_targets,
+                            constraints,
+                            active,
+                        )?;
+                    }
+                    if self
+                        .cached_resolved_template_literal_type(&template.texts, &template.types)?
+                        != Some(type_)
+                    {
+                        return Err(TemplateTypeError::InvalidTemplate(type_));
+                    }
+                }
+                TypeData::StringMapping(mapping) => {
+                    let symbol = record
+                        .symbol()
+                        .ok_or(TemplateTypeError::InvalidType(type_))?;
+                    let lazy_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+                    if record.flags() != TypeFlags::STRING_MAPPING
+                        || record.object_flags() & !lazy_flags != ObjectFlags::NONE
+                        || !Self::valid_union_cache_lazy_object_flags(record.object_flags())
+                        || record.alias().is_some()
+                    {
+                        return Err(TemplateTypeError::InvalidType(type_));
+                    }
+                    self.validate_source_template_union_constituent(
+                        mapping.target,
+                        array_targets,
+                        constraints,
+                        active,
+                    )?;
+                    if self.cached_resolved_string_mapping_type(symbol, mapping.target)?
+                        != Some(type_)
+                    {
+                        return Err(TemplateTypeError::InvalidType(type_));
+                    }
+                }
+                TypeData::Union(union) => {
+                    if !ordinary_union && (record.alias().is_some() || union.origin.is_some()) {
+                        return Err(TemplateTypeError::InvalidUnion(type_));
+                    }
+                    for child in &union.union.types {
+                        self.validate_source_template_union_constituent(
+                            *child,
+                            array_targets,
+                            constraints,
+                            active,
+                        )?;
+                    }
+                    if !ordinary_union
+                        && self.cached_source_template_union_plan(
+                            self.plan_template_result_union(&union.union.types)?,
+                            array_targets,
+                            constraints,
+                        )? != Some(type_)
+                    {
+                        return Err(TemplateTypeError::InvalidUnion(type_));
+                    }
+                }
+                _ => unreachable!("ordinary constituents use their existing validator"),
+            }
+            self.validate_source_template_base_constraint(type_, constraints)?;
+            Ok(())
+        })();
+        active.remove(&type_);
+        result
+    }
+
+    fn cached_source_template_union_plan(
+        &self,
+        plan: TemplateUnionPlan,
+        array_targets: Option<CanonicalArrayTargets>,
+        constraints: &SourceTemplateUnionConstraints<'_>,
+    ) -> Result<Option<TypeId>, TemplateTypeError> {
+        let types = match plan {
+            TemplateUnionPlan::Existing(existing) => return Ok(Some(existing)),
+            TemplateUnionPlan::Constituents(types) => types,
+        };
+        if !types.iter().any(|type_| {
+            matches!(
+                self.type_payload(*type_).map(TypeRecord::data),
+                Some(TypeData::TemplateLiteral(_) | TypeData::StringMapping(_))
+            )
+        }) {
+            return self
+                .cached_literal_union_type_with_alias(&types, None, array_targets)
+                .map_err(Into::into);
+        }
+        let Some(result) = self.find_template_result_union(&types) else {
+            return Ok(None);
+        };
+        let record = self
+            .type_payload(result)
+            .ok_or(TemplateTypeError::InvalidUnion(result))?;
+        let TypeData::Union(union) = record.data() else {
+            return Err(TemplateTypeError::InvalidUnion(result));
+        };
+        let lazy_flags = Self::union_cache_lazy_object_flags() & !ObjectFlags::MEMBERS_RESOLVED;
+        if record.flags() != TypeFlags::UNION
+            || record.object_flags() & !lazy_flags != ObjectFlags::NONE
+            || !Self::valid_union_cache_lazy_object_flags(record.object_flags())
+            || record.symbol().is_some()
+            || record.alias().is_some()
+            || union.origin.is_some()
+            || union.union.types != types
+            || union.union.structured
+                != (StructuredTypeData {
+                    constrained: union.union.structured.constrained.clone(),
+                    ..StructuredTypeData::default()
+                })
+            || union.union.property_cache.is_some()
+            || union
+                .union
+                .property_cache_without_function_property_augment
+                .is_some()
+            || union.union.resolved_properties.is_some()
+            || union
+                .resolved_reduced_type
+                .is_some_and(|reduced| reduced != result)
+            || union.regular_type.is_some_and(|regular| regular != result)
+            || !union.key_property_name.is_empty()
+            || union.constituent_map != ConstituentMapState::Unallocated
+        {
+            return Err(TemplateTypeError::InvalidUnion(result));
+        }
+        self.validate_source_template_base_constraint(result, constraints)?;
+        Ok(Some(result))
+    }
+
+    fn validate_source_template_base_constraint(
+        &self,
+        type_: TypeId,
+        constraints: &SourceTemplateUnionConstraints<'_>,
+    ) -> Result<(), TemplateTypeError> {
+        let record = self
+            .type_payload(type_)
+            .ok_or(TemplateTypeError::InvalidType(type_))?;
+        let Some(cached) = record
+            .data()
+            .constrained()
+            .and_then(|data| data.resolved_base_constraint)
+        else {
+            return Ok(());
+        };
+        let invalid = || match record.data() {
+            TypeData::TemplateLiteral(_) => TemplateTypeError::InvalidTemplate(type_),
+            TypeData::Union(_) => TemplateTypeError::InvalidUnion(type_),
+            _ => TemplateTypeError::InvalidType(type_),
+        };
+        if constraints
+            .cached_base_constraint(self, type_)
+            .map_err(|_| invalid())?
+            != Some(cached)
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    fn template_result_union_worker(
+        &mut self,
+        types: &[TypeId],
+        array_targets: Option<CanonicalArrayTargets>,
+        session: Option<&mut InstantiationSession>,
+    ) -> Result<TypeId, TemplateTypeError> {
         let flattened = match self.plan_template_result_union(types)? {
             TemplateUnionPlan::Existing(existing) => return Ok(existing),
             TemplateUnionPlan::Constituents(types) => types,
         };
 
-        if flattened
-            .iter()
-            .all(|type_| self.validate_union_constituent(*type_).is_ok())
-        {
-            let mut prepared = self.prepare_type_query_types(&[], &[], &[], 1, 0)?;
-            return self
-                .literal_union_type_prepared(&flattened, None, &mut prepared)
-                .map_err(Into::into);
+        if flattened.iter().all(|type_| {
+            array_targets
+                .map_or_else(
+                    || self.validate_union_constituent(*type_),
+                    |targets| self.validate_union_constituent_with_array_targets(targets, *type_),
+                )
+                .is_ok()
+        }) {
+            return match session {
+                Some(session) => self.literal_union_type_with_alias_and_array_targets_and_session(
+                    &flattened,
+                    None,
+                    array_targets,
+                    session,
+                ),
+                None => self.literal_union_type_with_alias_and_array_targets(
+                    &flattened,
+                    None,
+                    array_targets,
+                ),
+            }
+            .map_err(Into::into);
         }
 
         if let Some(existing) = self.find_template_result_union(&flattened) {
@@ -1768,17 +2188,26 @@ impl CanonicalTypeMapperStore {
 
 #[cfg(test)]
 mod tests {
-    use ts_ast::{decode_js_string, encode_js_string};
-    use ts_binder::{CheckFlags, EscapedName, SymbolFlags};
+    use ts_ast::{FileId, NodeRef, SyntaxKind, decode_js_string, encode_js_string};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        CheckFlags, EscapedName, SymbolFlags,
+    };
     use ts_core::JsString;
+    use ts_parser::parse_source_file;
 
     use super::{
         CanonicalTypeMapperStore, MAX_TEMPLATE_UNION_SIZE, StringMappingKind, TemplateTypeError,
         split_first_template_code_point,
     };
     use crate::semantic::{
-        IntrinsicBootstrapOptions,
-        type_records::{LiteralValue, TypeData, TypeRecord},
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+        array_types::CanonicalArrayTargets,
+        constraints::get_base_constraint_of_type,
+        instantiate::{
+            InstantiationLimits, InstantiationSession, instantiate_type_with_vector_and_session,
+        },
+        type_records::{ConstituentMapState, LiteralValue, TypeData, TypeRecord},
         types::ObjectFlags,
     };
 
@@ -1794,6 +2223,305 @@ mod tests {
         store
             .get_template_literal_type(&[value.to_owned()], &[])
             .unwrap()
+    }
+
+    #[test]
+    fn source_template_unions_replay_patterns_and_literal_reductions() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let pattern = store
+            .get_template_literal_type(&["id-".to_owned(), String::new()], &[number])
+            .unwrap();
+        let before = store.type_len();
+        assert_eq!(
+            store.cached_source_template_result_union(&[number, pattern], None, None),
+            Ok(None)
+        );
+        assert_eq!(store.type_len(), before);
+        let result = store
+            .source_template_result_union(&[number, pattern], None, None, None)
+            .unwrap();
+        let reduced = store
+            .source_template_result_union(&[number, pattern, string], None, None, None)
+            .unwrap();
+        assert_eq!(
+            store.cached_literal_union_type_with_alias(&[number, string], None, None),
+            Ok(Some(reduced))
+        );
+        let warm = (store.type_len(), store.type_alias_len());
+        for _ in 0..2 {
+            assert_eq!(
+                store.cached_source_template_result_union(&[pattern, number], None, None),
+                Ok(Some(result))
+            );
+            assert_eq!(
+                store.source_template_result_union(&[pattern, number], None, None, None),
+                Ok(result)
+            );
+            assert_eq!(
+                store.source_template_result_union(&[result, string], None, None, None),
+                Ok(reduced)
+            );
+            assert_eq!((store.type_len(), store.type_alias_len()), warm);
+        }
+    }
+
+    #[test]
+    fn source_template_unions_reject_copied_or_foreign_patterns_before_absorption() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let texts = ["id-".to_owned(), String::new()];
+        let pattern = store.get_template_literal_type(&texts, &[number]).unwrap();
+        let copied = store
+            .alloc_template_literal_type(texts.to_vec(), vec![number])
+            .unwrap();
+        let mut foreign_store = initialized_store();
+        let foreign_number = foreign_store.intrinsic_bootstrap().unwrap().number_type;
+        let foreign = foreign_store
+            .get_template_literal_type(&texts, &[foreign_number])
+            .unwrap();
+        let before = (store.type_len(), store.type_alias_len());
+        for (type_, expected) in [
+            (copied, TemplateTypeError::InvalidTemplate(copied)),
+            (foreign, TemplateTypeError::InvalidType(foreign)),
+        ] {
+            assert_eq!(
+                store.cached_source_template_result_union(&[string, type_], None, None),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                store.source_template_result_union(&[string, type_], None, None, None),
+                Err(expected)
+            );
+            assert_eq!((store.type_len(), store.type_alias_len()), before);
+        }
+        assert_eq!(
+            store.source_template_result_union(&[string, pattern], None, None, None),
+            Ok(string)
+        );
+        assert_eq!((store.type_len(), store.type_alias_len()), before);
+    }
+
+    #[test]
+    fn source_template_unions_reject_changed_result_cache_links() {
+        let mut store = initialized_store();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let pattern = store
+            .get_template_literal_type(&["id-".to_owned(), String::new()], &[number])
+            .unwrap();
+        let result = store
+            .source_template_result_union(&[number, pattern], None, None, None)
+            .unwrap();
+        assert!(store.set_union_caches(
+            result,
+            Some(number),
+            None,
+            None,
+            EscapedName::source(""),
+            ConstituentMapState::Unallocated,
+        ));
+        let before = (store.type_len(), store.type_alias_len());
+        assert_eq!(
+            store.cached_source_template_result_union(&[number, pattern], None, None),
+            Err(TemplateTypeError::InvalidUnion(result))
+        );
+        assert_eq!(
+            store.source_template_result_union(&[number, pattern], None, None, None),
+            Err(TemplateTypeError::InvalidUnion(result))
+        );
+        assert_eq!((store.type_len(), store.type_alias_len()), before);
+        assert!(store.set_union_caches(
+            result,
+            Some(result),
+            Some(result),
+            None,
+            EscapedName::source(""),
+            ConstituentMapState::Unallocated,
+        ));
+        assert_eq!(
+            store.source_template_result_union(&[number, pattern], None, None, None),
+            Ok(result)
+        );
+        assert_eq!((store.type_len(), store.type_alias_len()), before);
+    }
+
+    #[test]
+    fn source_template_unions_check_warm_base_constraints_before_reduction() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let pattern = store
+            .get_template_literal_type(&["id-".to_owned(), String::new()], &[number])
+            .unwrap();
+        let result = store
+            .source_template_result_union(&[number, pattern], None, None, None)
+            .unwrap();
+        assert_eq!(
+            get_base_constraint_of_type(&mut store, result),
+            Ok(Some(result))
+        );
+        let before = (store.type_len(), store.type_alias_len());
+        assert_eq!(
+            store.cached_source_template_result_union(&[number, pattern], None, None),
+            Ok(Some(result))
+        );
+        for (damaged, expected) in [
+            (pattern, TemplateTypeError::InvalidTemplate(pattern)),
+            (result, TemplateTypeError::InvalidUnion(result)),
+        ] {
+            let original = store
+                .type_payload(damaged)
+                .unwrap()
+                .data()
+                .constrained()
+                .unwrap()
+                .resolved_base_constraint;
+            assert_eq!(original, Some(damaged));
+            assert!(store.set_resolved_base_constraint(damaged, Some(number)));
+            for types in [[number, pattern], [string, damaged]] {
+                assert_eq!(
+                    store.cached_source_template_result_union(&types, None, None),
+                    Err(expected.clone())
+                );
+                assert_eq!(
+                    store.source_template_result_union(&types, None, None, None),
+                    Err(expected.clone())
+                );
+                assert_eq!((store.type_len(), store.type_alias_len()), before);
+            }
+            assert!(store.set_resolved_base_constraint(damaged, original));
+            assert_eq!(
+                store.source_template_result_union(&[number, pattern], None, None, None),
+                Ok(result)
+            );
+            assert_eq!((store.type_len(), store.type_alias_len()), before);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The real array, foreign capability, and spent caller share one fixture.
+    fn source_template_unions_keep_real_array_targets_and_the_spent_caller() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {}\n",
+            "interface ReadonlyArray<T> {}\n",
+            "type Payload = { id: number };\n",
+            "type Payloads = Payload[];\n",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(20_316);
+        let make_context = || {
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source("\"/project/template-array.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            CanonicalCheckerContext::new(
+                binder.finish(),
+                [(file, &parsed.arena)].into_iter().collect(),
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap()
+        };
+        let mut context = make_context();
+        let foreign_context = make_context();
+        let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+        let foreign_targets =
+            CanonicalArrayTargets::from_global_types(foreign_context.global_types());
+        let array_node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrayType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let array = context.get_type_from_type_node(array_node).unwrap();
+        let store = context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let pattern = store
+            .get_template_literal_type(&["id-".to_owned(), String::new()], &[number])
+            .unwrap();
+        let TypeData::Interface(array_target) =
+            store.type_payload(targets.array_type()).unwrap().data()
+        else {
+            panic!("the source Array declaration must own its target")
+        };
+        let parameter = array_target
+            .reference
+            .resolved_type_arguments
+            .as_ref()
+            .unwrap()[0];
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                store,
+                parameter,
+                &[parameter],
+                &[number],
+                Some(targets),
+                &mut session,
+            ),
+            Ok(number)
+        );
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        let types = [array, number, string, pattern];
+        let result = store
+            .source_template_result_union(&types, Some(targets), Some(&mut session), None)
+            .unwrap();
+        let TypeData::Union(union) = store.type_payload(result).unwrap().data() else {
+            panic!("the source array must remain in the reduced union")
+        };
+        assert!(union.union.types.contains(&array));
+        assert!(!union.union.types.contains(&pattern));
+        let before = (store.type_len(), store.type_alias_len());
+        let wrong_targets = CanonicalArrayTargets::for_test(
+            targets.readonly_array_type(),
+            targets.readonly_array_type(),
+        );
+        for targets in [None, Some(wrong_targets), Some(foreign_targets)] {
+            assert!(
+                store
+                    .cached_source_template_result_union(&types, targets, None)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .source_template_result_union(&types, targets, Some(&mut session), None)
+                    .is_err()
+            );
+            assert_eq!((store.type_len(), store.type_alias_len()), before);
+            assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        }
+        assert_eq!(
+            store.source_template_result_union(&types, Some(targets), Some(&mut session), None),
+            Ok(result)
+        );
+        assert_eq!((store.type_len(), store.type_alias_len()), before);
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        assert_eq!(session.limit_event_count(), 0);
     }
 
     #[test]

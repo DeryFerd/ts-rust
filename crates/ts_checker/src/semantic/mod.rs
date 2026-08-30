@@ -31,6 +31,7 @@ mod enums;
 pub mod formatter;
 mod functions;
 mod generic_calls;
+mod generic_method_calls;
 mod global_types;
 mod helper_signatures;
 pub mod ids;
