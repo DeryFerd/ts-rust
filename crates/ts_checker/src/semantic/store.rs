@@ -1359,7 +1359,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || record.export_symbol().is_some()
             || !self.source_merged_symbol_declarations_match(owner)
             || self
-                .intrinsic_bootstrap()
+                .intrinsic_bootstrap
+                .as_ref()
                 .is_none_or(|bootstrap| bootstrap.globals != globals.table)
             || self.get_merged_symbol(original.table_symbol) != Some(owner)
             || self
