@@ -10613,7 +10613,7 @@ mod tests {
         (arrow, context.get_type_at_location(arrow).unwrap())
     }
 
-    fn source_expando_replay_state(store: &CanonicalTypeMapperStore) -> (String, bool, usize) {
+    fn source_expando_replay_state(store: &CanonicalTypeMapperStore) -> (String, bool, usize, u64) {
         let dirty = store.union_cache_needs_validation;
         let scans = store.union_cache_validation_scan_count();
         let bookkeeping = format!(
@@ -10622,9 +10622,18 @@ mod tests {
         let complete = format!("{store:?}");
         let state = complete
             .strip_suffix(&bookkeeping)
-            .expect("only the two final union validation fields are excluded")
-            .to_owned();
-        (state, dirty, scans)
+            .expect("the two final union validation fields are present");
+        let (prefix, token_and_suffix) = state
+            .split_once(", next_relation_observation_token: ")
+            .expect("the source observation counter is present");
+        let (token, suffix) = token_and_suffix
+            .split_once(", derived_types: ")
+            .expect("the counter is followed by the derived type caches");
+        let token = token.parse().expect("the observation counter is a u64");
+        let state = format!(
+            "{prefix}, next_relation_observation_token: <counter>, derived_types: {suffix}"
+        );
+        (state, dirty, scans, token)
     }
 
     #[test]
@@ -10923,30 +10932,36 @@ mod tests {
 
     #[test]
     fn source_arrow_expando_display_reuses_array_union_and_identifier_value_types() {
-        for (source, expected) in [
+        for (source, expected, observations) in [
             (
                 "interface Array<T> {} const foo = () => {}; foo.bar = [1, 2];",
                 "{ (): void; bar: number[]; }",
+                0,
             ),
             (
                 "interface Array<T> {} const foo = () => {}; foo.bar = [{ value: 1 }];",
                 "{ (): void; bar: { value: number; }[]; }",
+                0,
             ),
             (
                 "interface Array<T> {} const foo = () => {}; foo.bar = [];",
                 "{ (): void; bar: any[]; }",
+                0,
             ),
             (
                 "const condition = true; const payload = condition ? { value: 1 } : { value: 'x' }; const foo = () => {}; foo.bar = payload;",
                 "{ (): void; bar: { value: number; } | { value: string; }; }",
+                4,
             ),
             (
                 "const payload = { value: 1 }; const foo = () => {}; foo.bar = payload;",
                 "{ (): void; bar: { value: number; }; }",
+                0,
             ),
             (
                 "const payload = 42; const foo = () => {}; foo.bar = payload;",
                 "{ (): void; bar: number; }",
+                0,
             ),
         ] {
             for strict_null_checks in [false, true] {
@@ -10986,11 +11001,13 @@ mod tests {
                         "{source}, strict null checks: {strict_null_checks}"
                     );
                     assert_eq!(format!("{:?}", context.store()), before);
-                    let (state, dirty, scans) = source_expando_replay_state(context.store());
+                    let (state, dirty, scans, token) = source_expando_replay_state(context.store());
                     context.recheck_source_file(file).unwrap();
-                    let (replayed, replay_dirty, replay_scans) =
+                    let (replayed, replay_dirty, replay_scans, replay_token) =
                         source_expando_replay_state(context.store());
                     assert_eq!(replayed, state);
+                    // The union's source replay opens four subtype observation scopes.
+                    assert_eq!(replay_token, token + observations);
                     // A source replay can validate a dirty union cache once. Display cannot.
                     assert_eq!(
                         (replay_dirty, replay_scans),
