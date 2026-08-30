@@ -9490,8 +9490,25 @@ fn deferred_ambient_class_heritage(
 }
 
 /// Reuses the ambient class binding proof without resolving namespace or class types.
-#[allow(clippy::too_many_lines)] // Prove the namespace ancestry before checking the selected class.
 pub(super) fn validate_ambient_namespace_class_for_display(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<(), SourceCheckError> {
+    validate_ambient_namespace_class_bindings(store, host, symbol, declaration)?;
+    if store
+        .value_symbol_links(symbol)
+        .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return Err(SourceCheckError::Class(declaration));
+    }
+    Ok(())
+}
+
+/// Checks source ownership independently of the class value's resolution state.
+#[allow(clippy::too_many_lines)] // Prove the namespace ancestry before checking the selected class.
+pub(super) fn validate_ambient_namespace_class_bindings(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
@@ -9596,7 +9613,7 @@ pub(super) fn validate_ambient_namespace_class_for_display(
     if !ambient {
         return Err(invalid());
     }
-    let plan = plan_deferred_ambient_class(
+    let plan = plan_deferred_ambient_class_bindings(
         arena,
         bound,
         store,
@@ -9618,8 +9635,34 @@ pub(super) fn validate_ambient_namespace_class_for_display(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)] // Ambient classes retain all member and heritage declarations.
 fn plan_deferred_ambient_class(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: (NodeRef, SemanticSymbolId),
+    declaration: NodeRef,
+) -> Result<SourceNamespaceMemberPlan, SourceCheckError> {
+    let plan = plan_deferred_ambient_class_bindings(arena, bound, store, namespace, declaration)?;
+    let SourceNamespaceMemberPlan::DeferredAmbientClass { symbol, .. } = &plan else {
+        unreachable!("the ambient class planner retains a class plan")
+    };
+    if store
+        .value_symbol_links(*symbol)
+        .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        let host = DeclaredTypeHost::new([(arena, bound)]).map_err(DeclaredTypeError::from)?;
+        if super::classes::empty_ambient_namespace_class_shells(store, &host, *symbol)
+            .map_err(|_| SourceCheckError::Class(declaration))?
+            .is_none()
+        {
+            return Err(SourceCheckError::Class(declaration));
+        }
+    }
+    Ok(plan)
+}
+
+#[allow(clippy::too_many_lines)] // Ambient classes retain all member and heritage declarations.
+fn plan_deferred_ambient_class_bindings(
     arena: &NodeArena,
     bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
@@ -9748,9 +9791,6 @@ fn plan_deferred_ambient_class(
         || prototype_record.parent() != Some(symbol)
         || prototype_record.export_symbol().is_some()
         || store.get_merged_symbol(prototype) != Some(prototype)
-        || store
-            .value_symbol_links(symbol)
-            .is_some_and(|links| links != &ValueSymbolLinks::default())
     {
         return Err(SourceCheckError::Class(declaration));
     }

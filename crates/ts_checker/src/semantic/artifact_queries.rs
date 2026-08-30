@@ -297,6 +297,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some(type_) = self.javascript_class_heritage_artifact_type(node)? {
+            return Ok(type_);
+        }
+
         if let Some((type_, _)) = self.class_heritage_artifact_target(node)? {
             return Ok(type_);
         }
@@ -3289,6 +3293,117 @@ impl CanonicalCheckerContext<'_> {
             owner = self.merged_artifact_symbol(node, namespace)?;
         }
         Ok(Some(owner))
+    }
+
+    /// Demands an empty JavaScript class through the existing class member query.
+    /// The written qualified base selects the class, not its JSDoc annotation.
+    #[allow(clippy::too_many_lines)] // Keep source role selection and both exact class sides in one demand path.
+    fn javascript_class_heritage_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (whole, owner, value_leaf) = {
+            let (arena, bound, record) = self.validated_artifact_node(node)?;
+            if !bound.source_facts().is_some_and(|facts| {
+                facts.is_javascript_file()
+                    && !facts.is_declaration_file()
+                    && !facts.is_external_or_common_js_module()
+            }) {
+                return Ok(None);
+            }
+            let whole = if matches!(
+                record.data,
+                NodeData::QualifiedName(_) | NodeData::PropertyAccessExpression(_)
+            ) {
+                node
+            } else if record.kind == SyntaxKind::Identifier
+                && let Some(parent) = record.parent
+                && arena.get(parent).is_some_and(|record| match &record.data {
+                    NodeData::QualifiedName(name) => name.right == node.node,
+                    NodeData::PropertyAccessExpression(access) => access.name == node.node,
+                    _ => false,
+                })
+            {
+                NodeRef::new(node.arena, node.file, parent)
+            } else {
+                return Ok(None);
+            };
+            let Some(wrapper) = arena
+                .get(whole.node)
+                .and_then(|record| record.parent)
+                .and_then(|parent| arena.get(parent))
+            else {
+                return Ok(None);
+            };
+            let NodeData::ExpressionWithTypeArguments(expression) = &wrapper.data else {
+                return Ok(None);
+            };
+            if expression.expression != whole.node || expression.type_arguments.is_some() {
+                return Ok(None);
+            }
+            let Some(clause) = wrapper.parent.and_then(|parent| arena.get(parent)) else {
+                return Ok(None);
+            };
+            let NodeData::HeritageClause(heritage) = &clause.data else {
+                return Ok(None);
+            };
+            let Some(owner) = clause.parent else {
+                return Ok(None);
+            };
+            let Some(NodeData::ClassDeclaration(class)) =
+                arena.get(owner).map(|record| &record.data)
+            else {
+                return Ok(None);
+            };
+            if heritage.token != SyntaxKind::ExtendsKeyword
+                || class.type_parameters.is_some()
+                || class.modifiers.is_some()
+                || !class.members.nodes.is_empty()
+            {
+                return Ok(None);
+            }
+            let declaration = NodeRef::new(node.arena, node.file, owner);
+            let symbol = bound
+                .symbol(declaration)
+                .and_then(|symbol| self.store().get_merged_symbol(symbol))
+                .ok_or(CanonicalArtifactQueryError::ForeignNode(declaration))?;
+            (whole, symbol, node != whole)
+        };
+        let members = self
+            .get_nongeneric_class_members(owner)
+            .map_err(|error| CanonicalArtifactQueryError::Class { node, error })?;
+        let instance = members.shells().instance_type();
+        let Some((base, symbol)) = self.class_heritage_artifact_target(whole)? else {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: instance,
+            });
+        };
+        let provenance = self
+            .store()
+            .direct_class_heritage_provenance(instance)
+            .ok_or(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: instance,
+            })?;
+        if provenance.owner_symbol != owner
+            || provenance.base_symbol != symbol
+            || provenance.base_instance_type != base
+        {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: instance,
+            });
+        }
+        self.validate_artifact_type(
+            node,
+            if value_leaf {
+                provenance.base_value_type
+            } else {
+                base
+            },
+        )
+        .map(Some)
     }
 
     /// A class base name denotes its instance here, even when checking the
