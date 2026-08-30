@@ -2076,7 +2076,7 @@ mod tests {
                     original.check_flags()
                 )),
                 Damage::CheckFlags => {
-                    assert!(store.set_symbol_flags(property, original.flags(), CheckFlags::NONE))
+                    assert!(store.set_symbol_flags(property, original.flags(), CheckFlags::NONE));
                 }
                 Damage::DeclarationOrder => {
                     let mut declarations = original.declarations().unwrap().to_vec();
@@ -2084,7 +2084,7 @@ mod tests {
                     assert!(store.set_symbol_declarations(property, Some(declarations), None));
                 }
                 Damage::MissingDeclarations => {
-                    assert!(store.set_symbol_declarations(property, None, None))
+                    assert!(store.set_symbol_declarations(property, None, None));
                 }
                 Damage::ValueDeclaration => assert!(store.set_symbol_declarations(
                     property,
@@ -2092,7 +2092,13 @@ mod tests {
                     source_record.value_declaration()
                 )),
                 Damage::Parent => {
-                    assert!(store.set_symbol_relationships(property, None, None, Some(owner), None))
+                    assert!(store.set_symbol_relationships(
+                        property,
+                        None,
+                        None,
+                        Some(owner),
+                        None
+                    ));
                 }
                 Damage::MissingContainingType
                 | Damage::WrongContainingType
@@ -2101,7 +2107,7 @@ mod tests {
                     match damage {
                         Damage::MissingContainingType => links.containing_type = None,
                         Damage::WrongContainingType => {
-                            links.containing_type = Some(union.union.types[0])
+                            links.containing_type = Some(union.union.types[0]);
                         }
                         Damage::ResolvedType => links.resolved_type = Some(wrong_type),
                         _ => unreachable!(),
@@ -2109,7 +2115,12 @@ mod tests {
                     assert!(store.set_value_symbol_links(property, links));
                 }
                 Damage::MissingCache => {
-                    assert!(store.set_union_or_intersection_caches(fixture.union, None, None, None))
+                    assert!(store.set_union_or_intersection_caches(
+                        fixture.union,
+                        None,
+                        None,
+                        None
+                    ));
                 }
                 Damage::CacheEntry => assert_eq!(
                     store.insert_symbol(cache, EscapedName::source("msg"), source),

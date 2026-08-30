@@ -626,7 +626,8 @@ pub(super) fn published_union_property_source(
     if record
         .check_flags()
         .contains(CheckFlags::SYNTHETIC_PROPERTY)
-        && let Some(TypeData::Intersection(data)) = containing_data.map(|record| record.data())
+        && let Some(TypeData::Intersection(data)) =
+            containing_data.map(super::type_records::TypeRecord::data)
     {
         return if data
             .intersection
