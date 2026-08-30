@@ -350,7 +350,7 @@ fn assert_receiver_property(
         checker.get_symbol_at_location(this),
         Ok(Some(state.this_symbol))
     );
-    let NodeData::TypeLiteral(literal) = &parsed
+    let NodeData::TypeLiteralNode(literal) = &parsed
         .arena
         .get(nodes.this_parameter.annotation.node)
         .unwrap()
@@ -365,7 +365,7 @@ fn assert_receiver_property(
     let property_symbol = symbol(checker, property);
     assert_eq!(
         parsed.arena.get(property.node).unwrap().kind,
-        SyntaxKind::PropertySignature
+        SyntaxKind::PropertyDeclaration
     );
     for node in [nodes.body, name] {
         assert_eq!(
@@ -761,7 +761,7 @@ fn ordinary_this_missing_receiver_properties_keep_exact_sites_and_replay() {
         let (callee, _) = call_parts(&parsed, call);
         let (receiver, _) = property_parts(&parsed, callee);
         let (body_this, body_name) = property_parts(&parsed, nodes.body);
-        let NodeData::TypeLiteral(literal) = &parsed
+        let NodeData::TypeLiteralNode(literal) = &parsed
             .arena
             .get(nodes.this_parameter.annotation.node)
             .unwrap()
@@ -770,10 +770,10 @@ fn ordinary_this_missing_receiver_properties_keep_exact_sites_and_replay() {
             panic!("the required receiver properties must keep their source declarations");
         };
         let property = NodeRef::new(parsed.arena.id(), FILE, literal.members.nodes[0]);
-        let NodeData::PropertySignature(property_data) =
+        let NodeData::PropertyDeclaration(property_data) =
             &parsed.arena.get(property.node).unwrap().data
         else {
-            panic!("value must remain a PropertySignature");
+            panic!("value must remain a PropertyDeclaration");
         };
         let property_name = NodeRef::new(parsed.arena.id(), FILE, property_data.name);
         for first in [
