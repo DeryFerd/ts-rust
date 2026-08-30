@@ -51,15 +51,17 @@ struct CallIdentity {
     returned: TypeId,
 }
 
+type NodePublication = (
+    NodeRef,
+    Option<TypeNodeLinks>,
+    Option<SymbolNodeLinks>,
+    Option<SignatureLinks>,
+);
+
 #[derive(Debug, Eq, PartialEq)]
 struct Publication {
     counts: [usize; 5],
-    nodes: Vec<(
-        NodeRef,
-        Option<TypeNodeLinks>,
-        Option<SymbolNodeLinks>,
-        Option<SignatureLinks>,
-    )>,
+    nodes: Vec<NodePublication>,
     symbols: Vec<(
         SemanticSymbolId,
         Option<ValueSymbolLinks>,

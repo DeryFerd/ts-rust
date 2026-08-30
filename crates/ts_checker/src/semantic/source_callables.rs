@@ -6879,7 +6879,26 @@ fn inferred_query_constraint_name_is_missing(
                 false,
             );
     match resolved {
-        Ok(symbol) => Ok(symbol.is_none()),
+        Ok(Some(_)) => Ok(false),
+        Ok(None) => {
+            if [constraint, name].into_iter().any(|node| {
+                store
+                    .symbol_node_links(node)
+                    .is_some_and(|links| links != &SymbolNodeLinks::default())
+            }) || store.type_node_links(constraint).is_some_and(|links| {
+                links != &TypeNodeLinks::default()
+                    && links.resolved_type.is_none_or(|result| {
+                        !store
+                            .source_recovered_unresolved_type_reference_is_exact(constraint, result)
+                    })
+            }) {
+                return Err(DeclaredTypeError::TypeNodeUnavailable(
+                    super::type_nodes::TypeNodeUnavailable::InvalidTypeReference(constraint),
+                )
+                .into());
+            }
+            Ok(true)
+        }
         // Import capabilities are checked by the complete input-query plan.
         Err(ts_binder::CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => Ok(false),
         Err(error) => Err(DeclaredTypeError::from(error).into()),

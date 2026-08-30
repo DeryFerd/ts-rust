@@ -97605,31 +97605,109 @@ class Foo2 {
     }
 
     #[test]
-    fn unsupported_source_function_plans_are_atomic_and_missing_names_recover() {
+    #[allow(clippy::too_many_lines)] // Keep the original source cases and their replay checks together.
+    fn generic_source_function_returns_and_missing_names_replay() {
         let source = parsed(concat!(
             "function ready(): void {} ",
             "function generic<T>(value: T) { return value; }",
         ));
         let file = FileId::new(304);
-        let mut blocked = context(&[(file, &source)], CanonicalCheckerOptions::default());
-        let ready = function_symbol(&blocked, &source, file, "ready");
-        let before = observable_state(&blocked, file);
-
-        assert!(matches!(
-            blocked.check_source_file(file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::Callable(_))
-            ))
-        ));
-        assert_eq!(observable_state(&blocked, file), before);
-        assert!(blocked.store().value_symbol_links(ready).is_none());
-        assert!(
-            blocked
-                .store()
-                .source_callable_type_for_owner(ready)
-                .is_none()
+        let mut checked = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let ready = function_symbol(&checked, &source, file, "ready");
+        let declaration = function_declaration(&source, file, "generic");
+        let NodeData::FunctionDeclaration(function) =
+            &source.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        assert!(function.type_.is_none());
+        let type_parameter = NodeRef::new(
+            source.arena.id(),
+            file,
+            function.type_parameters.as_ref().unwrap().nodes[0],
         );
-        assert!(!is_type_checked(&blocked, file));
+        let parameter = NodeRef::new(source.arena.id(), file, function.parameters.nodes[0]);
+        let bound = checked.file(file).unwrap().1;
+        let type_parameter_symbol = bound.symbol(type_parameter).unwrap();
+        let parameter_symbol = bound.symbol(parameter).unwrap();
+
+        checked.check_source_file(file).unwrap();
+        let parameter_type = checked
+            .store()
+            .declared_type_links(type_parameter_symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let signature = checked
+            .store()
+            .signature_links(declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        let ready_type = checked
+            .store()
+            .source_callable_type_for_owner(ready)
+            .unwrap();
+        let ready_signature = checked
+            .store()
+            .source_callable_provenance(ready_type)
+            .unwrap()
+            .signature;
+        let warm = observable_state(&checked, file);
+        for replay in [false, true] {
+            if replay {
+                mark_source_unchecked(&mut checked, file);
+                checked.check_source_file(file).unwrap();
+            }
+            let store = checked.store();
+            let record = store.signature(signature).unwrap();
+            assert_eq!(
+                store
+                    .signature_links(declaration)
+                    .and_then(|links| links.resolved_signature.signature()),
+                Some(signature)
+            );
+            assert_eq!(record.declaration(), Some(declaration));
+            assert_eq!(record.type_parameters(), [parameter_type]);
+            assert_eq!(record.parameters(), [parameter_symbol]);
+            assert_eq!(record.resolved_return_type(), Some(parameter_type));
+            assert_eq!(
+                store.checked_source_callable_return_type(signature),
+                Some(parameter_type)
+            );
+            assert_eq!(
+                store.type_payload(parameter_type).unwrap().symbol(),
+                Some(type_parameter_symbol)
+            );
+            assert_eq!(
+                store
+                    .declared_type_links(type_parameter_symbol)
+                    .and_then(|links| links.declared_type),
+                Some(parameter_type)
+            );
+            assert_eq!(
+                store.symbol(type_parameter_symbol).unwrap().declarations(),
+                Some(&[type_parameter][..])
+            );
+            assert_eq!(
+                store
+                    .value_symbol_links(parameter_symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(parameter_type)
+            );
+            assert_eq!(
+                store
+                    .signature(ready_signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(store.intrinsic_bootstrap().unwrap().void_type)
+            );
+            assert_eq!(
+                store.source_callable_type_for_owner(ready),
+                Some(ready_type)
+            );
+            assert!(checked.diagnostics().is_empty());
+            assert!(is_type_checked(&checked, file));
+            assert_eq!(observable_state(&checked, file), warm);
+        }
 
         let unresolved = parsed("const value = missing;");
         let unresolved_file = FileId::new(305);
