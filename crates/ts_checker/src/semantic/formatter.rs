@@ -10937,7 +10937,7 @@ mod tests {
                 "{ (): void; bar: any[]; }",
             ),
             (
-                "const condition = true; const foo = () => {}; foo.bar = condition ? { value: 1 } : { value: 'x' };",
+                "const condition = true; const payload = condition ? { value: 1 } : { value: 'x' }; const foo = () => {}; foo.bar = payload;",
                 "{ (): void; bar: { value: number; } | { value: string; }; }",
             ),
             (
@@ -11004,6 +11004,39 @@ mod tests {
                 assert!(context.diagnostics().is_empty());
             }
         }
+    }
+
+    #[test]
+    fn source_arrow_expando_display_keeps_direct_conditional_rhs_unsupported() {
+        use crate::semantic::{SourceCheckError, SourceSyntaxRole, UnsupportedSourceSyntax};
+
+        let parsed = parse_source_file(
+            "const condition = true; const foo = () => {}; foo.bar = condition ? { value: 1 } : { value: 'x' };",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(278);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let conditional = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ConditionalExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    node: conditional,
+                    kind: SyntaxKind::ConditionalExpression,
+                    role: SourceSyntaxRole::VariableInitializer,
+                }
+            ))
+        );
     }
 
     #[test]
