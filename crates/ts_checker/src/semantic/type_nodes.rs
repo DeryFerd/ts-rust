@@ -35722,9 +35722,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 Some(&source),
             )
             .map_err(|error| match error {
-                TemplateTypeError::UnsupportedUnionConstituent(type_) => type_construction_error(
-                    LiteralTypeCacheError::UnsupportedUnionConstituent(type_),
-                ),
+                TemplateTypeError::UnsupportedUnionConstituent(constituent) => {
+                    type_construction_error(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                        constituent,
+                    ))
+                }
                 _ => invalid(),
             })?;
         if let Some(cached) = cached {

@@ -1644,7 +1644,7 @@ impl CanonicalTypeMapperStore {
         };
         let plan = self.plan_template_result_union(types)?;
         let reduced = match &plan {
-            TemplateUnionPlan::Existing(type_) => std::slice::from_ref(type_),
+            TemplateUnionPlan::Existing(existing) => std::slice::from_ref(existing),
             TemplateUnionPlan::Constituents(types) => types,
         };
         if reduced.iter().any(|type_| {
@@ -1774,7 +1774,7 @@ impl CanonicalTypeMapperStore {
                     let lazy_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
                         | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
                     if record.flags() != TypeFlags::TEMPLATE_LITERAL
-                        || record.object_flags().without(lazy_flags) != ObjectFlags::NONE
+                        || record.object_flags() & !lazy_flags != ObjectFlags::NONE
                         || !Self::valid_union_cache_lazy_object_flags(record.object_flags())
                         || record.symbol().is_some()
                         || record.alias().is_some()
@@ -1803,7 +1803,7 @@ impl CanonicalTypeMapperStore {
                     let lazy_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
                         | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
                     if record.flags() != TypeFlags::STRING_MAPPING
-                        || record.object_flags().without(lazy_flags) != ObjectFlags::NONE
+                        || record.object_flags() & !lazy_flags != ObjectFlags::NONE
                         || !Self::valid_union_cache_lazy_object_flags(record.object_flags())
                         || record.alias().is_some()
                     {
@@ -1881,10 +1881,9 @@ impl CanonicalTypeMapperStore {
         let TypeData::Union(union) = record.data() else {
             return Err(TemplateTypeError::InvalidUnion(result));
         };
-        let lazy_flags =
-            Self::union_cache_lazy_object_flags().without(ObjectFlags::MEMBERS_RESOLVED);
+        let lazy_flags = Self::union_cache_lazy_object_flags() & !ObjectFlags::MEMBERS_RESOLVED;
         if record.flags() != TypeFlags::UNION
-            || record.object_flags().without(lazy_flags) != ObjectFlags::NONE
+            || record.object_flags() & !lazy_flags != ObjectFlags::NONE
             || !Self::valid_union_cache_lazy_object_flags(record.object_flags())
             || record.symbol().is_some()
             || record.alias().is_some()
