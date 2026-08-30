@@ -4,8 +4,8 @@ use ts_binder::{
     CanonicalSourceLanguage, EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, SignatureId, TypeData, TypeId,
-    signatures::ElementFlags,
+    CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeFormatFlags, SignatureId,
+    TypeData, TypeId, signatures::ElementFlags,
 };
 use ts_options::ScriptTarget;
 use ts_parser::{ParseResult, parse_source_file};
@@ -168,6 +168,79 @@ fn assert_replay(context: &mut CanonicalCheckerContext<'_>, queries: &[NodeRef])
             .source_file(FILE)
             .and_then(|source| context.store().source_file_links(source))
             .is_some_and(|links| links.type_checked)
+    );
+}
+
+fn assert_class_method_overload_display(
+    context: &mut CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    group: &[NodeRef],
+    expected: &str,
+) {
+    let declarations: [NodeRef; 3] = group.try_into().unwrap();
+    let owner = merged_symbol(context, declarations[0]);
+    let signatures = declarations.map(|declaration| signature(context, declaration));
+    let types = declarations.map(|declaration| {
+        context
+            .get_type_at_location(method_name(parsed, declaration))
+            .unwrap()
+    });
+    let callable = types[0];
+    assert_eq!(types, [callable; 3]);
+    for (index, (&declaration, &signature)) in declarations.iter().zip(&signatures).enumerate() {
+        let NodeData::MethodDeclaration(method) = &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("class overloads retain their method declaration nodes")
+        };
+        assert_eq!(method.body.is_some(), index == 2);
+        assert_eq!(
+            context.store().signature(signature).unwrap().declaration(),
+            Some(declaration)
+        );
+    }
+    let record = context.store().type_payload(callable).unwrap();
+    assert_eq!(record.symbol(), Some(owner));
+    let TypeData::Object(object) = record.data() else {
+        panic!("the whole method type retains its callable object")
+    };
+    assert_eq!(
+        object.structured.signatures.as_deref(),
+        Some(&signatures[..2])
+    );
+    assert_eq!(object.structured.call_signature_count, 2);
+    assert!(
+        !object
+            .structured
+            .signatures
+            .as_ref()
+            .unwrap()
+            .contains(&signatures[2])
+    );
+
+    let before = (
+        format!("{:?}", context.store()),
+        context.diagnostics().clone(),
+    );
+    assert_eq!(context.type_to_string(callable).unwrap(), expected);
+    for declaration in declarations {
+        assert_eq!(
+            context
+                .type_to_string_at_location_with_flags(
+                    callable,
+                    declaration,
+                    CanonicalTypeFormatFlags::NO_TRUNCATION
+                        | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE,
+                )
+                .unwrap(),
+            expected
+        );
+    }
+    assert_eq!(
+        (
+            format!("{:?}", context.store()),
+            context.diagnostics().clone()
+        ),
+        before
     );
 }
 
@@ -518,6 +591,7 @@ fn method_body_calls_keep_array_overloads_and_their_shared_return() {
     );
     let declarations = nodes(&parsed, SyntaxKind::MethodDeclaration);
     assert_eq!(declarations.len(), 6);
+    let expected_display = "{ (x: string): number; (x: string[]): number; }";
     for group in declarations.chunks_exact(3) {
         let owner = merged_symbol(&context, group[0]);
         assert!(
@@ -567,6 +641,7 @@ fn method_body_calls_keep_array_overloads_and_their_shared_return() {
             array.resolved_type_arguments.as_deref(),
             Some(&[context.store().intrinsic_bootstrap().unwrap().string_type][..])
         );
+        assert_class_method_overload_display(&mut context, &parsed, group, expected_display);
     }
     let call = nodes(&parsed, SyntaxKind::CallExpression)[0];
     assert_eq!(
@@ -585,6 +660,9 @@ fn method_body_calls_keep_array_overloads_and_their_shared_return() {
         .chain([call, callee(&parsed, call)])
         .collect::<Vec<_>>();
     assert_replay(&mut context, &names);
+    for group in declarations.chunks_exact(3) {
+        assert_class_method_overload_display(&mut context, &parsed, group, expected_display);
+    }
 }
 
 #[test]
