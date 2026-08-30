@@ -83,7 +83,8 @@ use super::{
     store::{RelationObservationToken, SemanticStore, SourceNodeParent},
     structured_members::{
         InterfaceHeritageMembersValidation, inherited_generic_property_reference,
-        validate_interface_heritage_members, validate_planned_interface_heritage_members,
+        validate_interface_heritage_members_with_array_targets,
+        validate_planned_interface_heritage_members,
     },
     template_types::StringMappingKind,
     tuple_types::{CanonicalTupleTypeRequest, TupleShape, TupleTypeError},
@@ -315,9 +316,10 @@ impl std::error::Error for RelationUnavailable {}
 fn validate_direct_interface_heritage_relation_endpoint(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), RelationUnavailable> {
     if store.direct_interface_heritage_provenance(type_).is_some()
-        && validate_interface_heritage_members(store, type_)
+        && validate_interface_heritage_members_with_array_targets(store, type_, array_targets)
             != InterfaceHeritageMembersValidation::Valid
     {
         return Err(RelationUnavailable::InvalidStructuredMembers(type_));
@@ -2244,7 +2246,11 @@ impl<'store> RelaterSession<'store> {
         if original_target != original_source {
             self.observe_type_surface(original_target);
         }
-        validate_direct_interface_heritage_relation_endpoint(self.store, original_source)?;
+        validate_direct_interface_heritage_relation_endpoint(
+            self.store,
+            original_source,
+            self.global_types.map(|globals| globals.array_targets),
+        )?;
         validate_class_members_relation_endpoint(self.store, original_source)?;
         validate_property_object_alias_relation_endpoint(
             self.store,
@@ -2252,7 +2258,11 @@ impl<'store> RelaterSession<'store> {
             self.global_types.map(|globals| globals.array_targets),
         )?;
         if original_target != original_source {
-            validate_direct_interface_heritage_relation_endpoint(self.store, original_target)?;
+            validate_direct_interface_heritage_relation_endpoint(
+                self.store,
+                original_target,
+                self.global_types.map(|globals| globals.array_targets),
+            )?;
             validate_class_members_relation_endpoint(self.store, original_target)?;
             validate_property_object_alias_relation_endpoint(
                 self.store,
@@ -6860,7 +6870,11 @@ impl<'store> RelaterSession<'store> {
             .direct_interface_heritage_provenance(type_id)
             .is_some()
         {
-            validate_direct_interface_heritage_relation_endpoint(self.store, type_id)?;
+            validate_direct_interface_heritage_relation_endpoint(
+                self.store,
+                type_id,
+                self.global_types.map(|globals| globals.array_targets),
+            )?;
             return Ok(());
         }
         if record.object_flags().intersects(ObjectFlags::REFERENCE) {
@@ -7318,8 +7332,11 @@ impl<'store> RelaterSession<'store> {
                     .type_payload(type_id)
                     .and_then(|record| record.data().structured())
                     != Some(structured)
-                || validate_interface_heritage_members(self.store, type_id)
-                    != InterfaceHeritageMembersValidation::Valid
+                || validate_interface_heritage_members_with_array_targets(
+                    self.store,
+                    type_id,
+                    self.global_types.map(|globals| globals.array_targets),
+                ) != InterfaceHeritageMembersValidation::Valid
             {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
             }
@@ -7678,7 +7695,11 @@ impl<'store> RelaterSession<'store> {
         let heritage_members = if property_origin.is_declared()
             && class_members == ClassHeritageMembersValidation::NotClass
         {
-            validate_interface_heritage_members(self.store, type_id)
+            validate_interface_heritage_members_with_array_targets(
+                self.store,
+                type_id,
+                self.global_types.map(|globals| globals.array_targets),
+            )
         } else {
             InterfaceHeritageMembersValidation::NotHeritage
         };
@@ -9356,7 +9377,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         } else {
             target
         };
-        validate_direct_interface_heritage_relation_endpoint(self, source)?;
+        validate_direct_interface_heritage_relation_endpoint(
+            self,
+            source,
+            global_types.map(|globals| globals.array_targets),
+        )?;
         validate_class_members_relation_endpoint(self, source)?;
         validate_property_object_alias_relation_endpoint(
             self,
@@ -9364,7 +9389,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             global_types.map(|globals| globals.array_targets),
         )?;
         if target != source {
-            validate_direct_interface_heritage_relation_endpoint(self, target)?;
+            validate_direct_interface_heritage_relation_endpoint(
+                self,
+                target,
+                global_types.map(|globals| globals.array_targets),
+            )?;
             validate_class_members_relation_endpoint(self, target)?;
             validate_property_object_alias_relation_endpoint(
                 self,
@@ -24141,6 +24170,598 @@ mod tests {
                 .get_parent_of_symbol(resolved.properties[2].symbol),
             Some(base),
         );
+    }
+
+    const ARRAY_HERITAGE_LIBRARY: &str = concat!(
+        "interface Array<T> {} interface ReadonlyArray<T> {} ",
+        "interface Base<T> { value: T; [index: number]: Array<number>; }",
+    );
+    const ARRAY_HERITAGE_SOURCE: &str = concat!(
+        "interface Derived extends Base<number> {} ",
+        "interface Plain { value: number; }",
+    );
+
+    struct ArrayHeritageRelationTypes {
+        derived: TypeId,
+        plain: TypeId,
+        base_number: TypeId,
+        value: SemanticSymbolId,
+        index: super::IndexInfoId,
+    }
+
+    #[allow(clippy::too_many_lines)] // Check the source graph before any relation can warm its value.
+    fn array_heritage_relation_context<'arena>(
+        library: &'arena ParseResult,
+        source: &'arena ParseResult,
+    ) -> (CanonicalCheckerContext<'arena>, ArrayHeritageRelationTypes) {
+        let library_file = FileId::new(99_159);
+        let source_file = FileId::new(99_160);
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed, declaration, path) in [
+            (library_file, library, true, "\"/heritage-relations.d.ts\""),
+            (source_file, source, false, "\"/heritage-relations.ts\""),
+        ] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(library_file, &library.arena), (source_file, &source.arena)]
+                .into_iter()
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(source_file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let store = context.store();
+        let declared = |name| {
+            let owner = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .and_then(|globals| globals.get_source(name))
+                .and_then(|owner| store.get_merged_symbol(owner))
+                .unwrap();
+            store
+                .declared_type_links(owner)
+                .unwrap()
+                .declared_type
+                .unwrap()
+        };
+        let [derived, plain, base] = ["Derived", "Plain", "Base"].map(declared);
+        let TypeData::Interface(interface) = store.type_payload(derived).unwrap().data() else {
+            panic!("Derived must keep its source interface identity")
+        };
+        let [base_number] = interface.resolved_base_types.as_deref().unwrap() else {
+            panic!("Derived must keep its one written Base<number> edge")
+        };
+        let base_number = *base_number;
+        let reference = validate_direct_generic_reference(store, base_number).unwrap();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(reference.target, base);
+        assert_eq!(reference.type_arguments, [number]);
+        let structured = &interface.reference.object.structured;
+        let value = store
+            .symbol_table(structured.members.unwrap())
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let [index] = structured.index_infos.as_deref().unwrap() else {
+            panic!("Derived must keep the inherited numeric index")
+        };
+        let index = *index;
+        assert_eq!(
+            store
+                .type_payload(base_number)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .index_infos
+                .as_deref(),
+            Some([index].as_slice())
+        );
+        let info = store.index_info(index).unwrap();
+        let written_index = library
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::IndexSignature).then_some(NodeRef::new(
+                    library.arena.id(),
+                    library_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(info.declaration(), Some(written_index));
+        assert_eq!(info.key_type(), number);
+        assert_eq!(info.index_symbol(), None);
+        assert_eq!(
+            store.canonical_array_element_type(context.global_types(), info.value_type()),
+            Ok(Some(number))
+        );
+        assert_eq!(store.value_symbol_links(value).unwrap().resolved_type, None);
+        assert!(
+            !store
+                .type_payload(context.global_types().array_type)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED),
+            "global Array members must stay cold"
+        );
+        (
+            context,
+            ArrayHeritageRelationTypes {
+                derived,
+                plain,
+                base_number,
+                value,
+                index,
+            },
+        )
+    }
+
+    fn spent_array_heritage_relation_caller(
+        store: &mut TestStore,
+        globals: &CanonicalGlobalTypes,
+        value: SemanticSymbolId,
+    ) -> super::InstantiationSession {
+        let links = store.value_symbol_links(value).unwrap();
+        assert_eq!(links.resolved_type, None);
+        let mapper = links.mapper.unwrap();
+        let template = store
+            .value_symbol_links(links.target.unwrap())
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert!(matches!(
+            store.type_payload(template).unwrap().data(),
+            TypeData::TypeParameter(_)
+        ));
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let mut caller = super::InstantiationSession::new(super::InstantiationLimits::default());
+        assert_eq!(
+            crate::semantic::instantiate::instantiate_type_with_session(
+                store,
+                template,
+                mapper,
+                Some(CanonicalArrayTargets::from_global_types(globals)),
+                &mut caller,
+            ),
+            Ok(number)
+        );
+        assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+        assert_eq!(caller.limit_event_count(), 0);
+        assert_eq!(store.value_symbol_links(value).unwrap().resolved_type, None);
+        caller
+    }
+
+    fn array_heritage_relation_snapshot(
+        store: &TestStore,
+    ) -> (
+        [usize; 7],
+        [usize; 26],
+        crate::semantic::relation::RelationStateSnapshot,
+    ) {
+        (
+            [
+                store.type_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.index_info_len(),
+                store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_of_union_cache_len(),
+            ],
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep direct, recursive, and union reads on the same caller.
+    fn interface_heritage_relations_keep_caller_array_targets_and_session() {
+        use crate::semantic::bootstrap::UnionReduction;
+
+        let library = parse_source_file(ARRAY_HERITAGE_LIBRARY);
+        let source = parse_source_file(ARRAY_HERITAGE_SOURCE);
+        let (mut context, types) = array_heritage_relation_context(&library, &source);
+        let globals = context.global_types().clone();
+        let strict_function_types = Some(CanonicalCheckerOptions::default().strict_function_types);
+        let store = context.store_mut_for_test();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let TypeData::Interface(array) = store.type_payload(globals.array_type).unwrap().data()
+        else {
+            panic!("Array must keep the source global identity")
+        };
+        let array = array.clone();
+        let mut caller = spent_array_heritage_relation_caller(store, &globals, types.value);
+        let before = array_heritage_relation_snapshot(store);
+        {
+            let bootstrap = store.relation_bootstrap_facts().unwrap();
+            let structured = store
+                .type_payload(types.derived)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .clone();
+            let owner = store.type_payload(types.derived).unwrap().symbol();
+            let mut relation = super::RelaterSession::new_with_global_types_options_and_session(
+                store,
+                RelationKind::Assignable,
+                bootstrap,
+                Some(RelationGlobalTypes::from_global_types(&globals)),
+                strict_function_types,
+                Some(&mut caller),
+            );
+            assert_eq!(
+                relation.ensure_supported_object_kind(types.derived, false),
+                Ok(())
+            );
+            assert_eq!(
+                relation.validated_declared_index_infos(types.derived, owner, &structured),
+                Ok((vec![types.index], false))
+            );
+            let members = relation
+                .resolved_object_members(types.derived, false)
+                .unwrap();
+            assert_eq!(members.properties, [types.value]);
+            assert_eq!(members.index_infos, [types.index]);
+            assert_eq!(
+                relation.inherited_property_references.get(&types.value),
+                Some(&types.base_number)
+            );
+        }
+        assert_eq!(array_heritage_relation_snapshot(store), before);
+        assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+        assert_eq!(
+            store.is_type_assignable_to_with_session(
+                types.derived,
+                types.plain,
+                Some(&globals),
+                strict_function_types,
+                &mut caller,
+            ),
+            Ok(true)
+        );
+        assert!(caller.query_count() > 1);
+        assert_eq!(caller.query_count(), caller.total_count());
+        assert_eq!(
+            store.value_symbol_links(types.value).unwrap().resolved_type,
+            Some(number)
+        );
+        let source_union = store
+            .expression_union_type_with_global_types_and_session(
+                &globals,
+                &[number, types.derived],
+                UnionReduction::Literal,
+                &mut caller,
+            )
+            .unwrap();
+        let reduced = store
+            .expression_union_type_with_global_types_and_session(
+                &globals,
+                &[source_union, types.plain],
+                UnionReduction::Subtype,
+                &mut caller,
+            )
+            .unwrap();
+        let TypeData::Union(union) = store.type_payload(reduced).unwrap().data() else {
+            panic!("subtype reduction must keep number and Plain")
+        };
+        let mut expected = vec![number, types.plain];
+        expected.sort_unstable();
+        assert_eq!(union.union.types, expected);
+        let warm = array_heritage_relation_snapshot(store);
+        let work = (caller.query_count(), caller.total_count());
+        for _ in 0..2 {
+            assert_eq!(
+                store.is_type_assignable_to_with_session(
+                    types.derived,
+                    types.plain,
+                    Some(&globals),
+                    strict_function_types,
+                    &mut caller,
+                ),
+                Ok(true)
+            );
+            {
+                let bootstrap = store.relation_bootstrap_facts().unwrap();
+                let mut relation = super::RelaterSession::new_with_global_types_options_and_session(
+                    store,
+                    RelationKind::Assignable,
+                    bootstrap,
+                    Some(RelationGlobalTypes::from_global_types(&globals)),
+                    strict_function_types,
+                    Some(&mut caller),
+                );
+                assert_eq!(
+                    relation.is_related_to_ex(
+                        types.derived,
+                        types.plain,
+                        super::RecursionFlags::BOTH,
+                        super::IntersectionState::NONE,
+                    ),
+                    Ok(Ternary::True)
+                );
+            }
+            assert_eq!(
+                store.expression_union_type_with_global_types_and_session(
+                    &globals,
+                    &[source_union, types.plain],
+                    UnionReduction::Subtype,
+                    &mut caller,
+                ),
+                Ok(reduced)
+            );
+            assert_eq!(array_heritage_relation_snapshot(store), warm);
+            assert_eq!((caller.query_count(), caller.total_count()), work);
+            assert_eq!(caller.limit_event_count(), 0);
+        }
+        assert_eq!(
+            store.type_payload(globals.array_type).unwrap().data(),
+            &TypeData::Interface(array)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check every target handoff before and after a real cached relation.
+    fn interface_heritage_relations_reject_missing_wrong_and_foreign_array_targets() {
+        let library = parse_source_file(ARRAY_HERITAGE_LIBRARY);
+        let source = parse_source_file(ARRAY_HERITAGE_SOURCE);
+        let (mut context, types) = array_heritage_relation_context(&library, &source);
+        let (foreign, _) = array_heritage_relation_context(&library, &source);
+        let globals = context.global_types().clone();
+        let strict_function_types = Some(CanonicalCheckerOptions::default().strict_function_types);
+        let actual = RelationGlobalTypes::from_global_types(&globals);
+        let foreign_targets = CanonicalArrayTargets::from_global_types(foreign.global_types());
+        assert_ne!(actual.array_targets, foreign_targets);
+        let invalid = [
+            None,
+            Some(RelationGlobalTypes {
+                array_targets: CanonicalArrayTargets::for_test(
+                    globals.readonly_array_type,
+                    globals.readonly_array_type,
+                ),
+                ..actual
+            }),
+            Some(RelationGlobalTypes {
+                array_targets: foreign_targets,
+                ..actual
+            }),
+        ];
+        let store = context.store_mut_for_test();
+        let mut caller = spent_array_heritage_relation_caller(store, &globals, types.value);
+        for warm in [false, true] {
+            if warm {
+                assert_eq!(
+                    store.is_type_assignable_to_with_session(
+                        types.derived,
+                        types.plain,
+                        Some(&globals),
+                        strict_function_types,
+                        &mut caller,
+                    ),
+                    Ok(true)
+                );
+            }
+            let before = array_heritage_relation_snapshot(store);
+            let links = store.value_symbol_links(types.value).unwrap().clone();
+            let work = (
+                caller.query_count(),
+                caller.total_count(),
+                caller.limit_event_count(),
+            );
+            let structured = store
+                .type_payload(types.derived)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .clone();
+            let owner = store.type_payload(types.derived).unwrap().symbol();
+            for globals in invalid {
+                for (source, target) in [
+                    (types.derived, types.derived),
+                    (types.derived, types.plain),
+                    (types.plain, types.derived),
+                ] {
+                    assert_eq!(
+                        store.is_type_related_to_with_optional_global_types_options_and_session(
+                            source,
+                            target,
+                            RelationKind::Assignable,
+                            globals,
+                            strict_function_types,
+                            Some(&mut caller),
+                        ),
+                        Err(RelationUnavailable::InvalidStructuredMembers(types.derived))
+                    );
+                    let bootstrap = store.relation_bootstrap_facts().unwrap();
+                    let mut relation =
+                        super::RelaterSession::new_with_global_types_options_and_session(
+                            store,
+                            RelationKind::Assignable,
+                            bootstrap,
+                            globals,
+                            strict_function_types,
+                            Some(&mut caller),
+                        );
+                    assert_eq!(
+                        relation.is_related_to_ex(
+                            source,
+                            target,
+                            super::RecursionFlags::BOTH,
+                            super::IntersectionState::NONE,
+                        ),
+                        Err(RelationUnavailable::InvalidStructuredMembers(types.derived))
+                    );
+                    assert_eq!(
+                        relation.validated_declared_index_infos(types.derived, owner, &structured),
+                        Err(RelationUnavailable::InvalidStructuredMembers(types.derived))
+                    );
+                    assert_eq!(
+                        relation.resolved_object_members(types.derived, false).err(),
+                        Some(RelationUnavailable::InvalidStructuredMembers(types.derived))
+                    );
+                }
+                assert_eq!(array_heritage_relation_snapshot(store), before);
+                assert_eq!(store.value_symbol_links(types.value), Some(&links));
+                assert_eq!(
+                    (
+                        caller.query_count(),
+                        caller.total_count(),
+                        caller.limit_event_count()
+                    ),
+                    work
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Damage and restore the inherited graph without resetting the caller.
+    fn interface_heritage_relations_recheck_inherited_index_and_array_target_caches() {
+        let library = parse_source_file(ARRAY_HERITAGE_LIBRARY);
+        let source = parse_source_file(ARRAY_HERITAGE_SOURCE);
+        let (mut context, types) = array_heritage_relation_context(&library, &source);
+        let globals = context.global_types().clone();
+        let strict_function_types = Some(CanonicalCheckerOptions::default().strict_function_types);
+        let store = context.store_mut_for_test();
+        let mut caller = spent_array_heritage_relation_caller(store, &globals, types.value);
+        assert_eq!(
+            store.is_type_assignable_to_with_session(
+                types.derived,
+                types.plain,
+                Some(&globals),
+                strict_function_types,
+                &mut caller,
+            ),
+            Ok(true)
+        );
+        let key = store
+            .relation_key_if_available(
+                types.derived,
+                types.plain,
+                super::IntersectionState::NONE,
+                false,
+                false,
+            )
+            .unwrap()
+            .key();
+        assert!(
+            store
+                .relation_cache_get(RelationKind::Assignable, key)
+                .intersects(RelationComparisonResult::SUCCEEDED)
+        );
+        let original_value = store.value_symbol_links(types.value).unwrap().clone();
+        let index_state = |store: &TestStore| {
+            let index = store.index_info(types.index).unwrap();
+            (
+                index.id(),
+                index.key_type(),
+                index.value_type(),
+                index.is_readonly(),
+                index.declaration(),
+                index.index_symbol(),
+                index.components().to_vec(),
+            )
+        };
+        let original_index = index_state(store);
+        let array_owner = store.type_payload(globals.array_type).unwrap().symbol();
+        assert!(array_owner.is_some());
+        let work = (
+            caller.query_count(),
+            caller.total_count(),
+            caller.limit_event_count(),
+        );
+        for damage_index in [true, false] {
+            if damage_index {
+                assert!(store.set_index_info_symbol(types.index, Some(types.value)));
+            } else {
+                assert!(store.set_type_symbol(globals.array_type, None));
+            }
+            let damaged = array_heritage_relation_snapshot(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    store.is_type_assignable_to_with_session(
+                        types.derived,
+                        types.plain,
+                        Some(&globals),
+                        strict_function_types,
+                        &mut caller,
+                    ),
+                    Err(RelationUnavailable::InvalidStructuredMembers(types.derived))
+                );
+                assert_eq!(array_heritage_relation_snapshot(store), damaged);
+                assert_eq!(store.value_symbol_links(types.value), Some(&original_value));
+                assert_eq!(
+                    (
+                        caller.query_count(),
+                        caller.total_count(),
+                        caller.limit_event_count()
+                    ),
+                    work
+                );
+            }
+            if damage_index {
+                assert!(store.set_index_info_symbol(types.index, None));
+            } else {
+                assert!(store.set_type_symbol(globals.array_type, array_owner));
+            }
+            assert_eq!(
+                store.is_type_assignable_to_with_session(
+                    types.derived,
+                    types.plain,
+                    Some(&globals),
+                    strict_function_types,
+                    &mut caller,
+                ),
+                Ok(true)
+            );
+            assert_eq!(index_state(store), original_index);
+            assert_eq!(
+                store.type_payload(globals.array_type).unwrap().symbol(),
+                array_owner
+            );
+            assert_eq!(
+                (
+                    caller.query_count(),
+                    caller.total_count(),
+                    caller.limit_event_count()
+                ),
+                work
+            );
+            let restored = array_heritage_relation_snapshot(store);
+            assert_eq!(
+                store.is_type_assignable_to_with_session(
+                    types.derived,
+                    types.plain,
+                    Some(&globals),
+                    strict_function_types,
+                    &mut caller,
+                ),
+                Ok(true)
+            );
+            assert_eq!(array_heritage_relation_snapshot(store), restored);
+        }
     }
 
     #[test]
