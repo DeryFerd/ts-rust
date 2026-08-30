@@ -1090,6 +1090,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
+    /// Reads the retained file kind without treating missing facts as a module.
+    #[must_use]
+    pub(super) fn source_is_typescript_external_module(&self, node: NodeRef) -> bool {
+        self.source_node_fact(node).is_some()
+            && self
+                .source_file_facts
+                .get(&node.file)
+                .is_some_and(|facts| !facts.is_javascript_file() && facts.is_external_module())
+    }
+
     /// Checks immutable binder ownership, including canonical merged-symbol redirects.
     #[must_use]
     pub(super) fn source_declaration_belongs_to_symbol(
