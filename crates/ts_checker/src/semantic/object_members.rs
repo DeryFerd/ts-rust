@@ -12632,6 +12632,13 @@ pub(super) fn plan_interface_method(
             &method.parameters,
             numeric_math_rest,
         )?;
+        if preflight_node(store, host, planned.type_node)
+            .map_err(|_| unsupported())?
+            .kind
+            == SyntaxKind::LiteralType
+        {
+            flags |= SignatureFlags::HAS_LITERAL_TYPES;
+        }
         if rest && (optional || index + 1 != method.parameters.nodes.len())
             || !rest && !optional && optional_parameter_seen
         {
@@ -24431,6 +24438,231 @@ mod selected_source_member_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // The selected generic copy and both source orders share one fixture.
+    fn method_literal_priority_keeps_generic_copy_and_source_order() {
+        let source = parsed(concat!(
+            "interface Picker { ",
+            "pick(tag: string, value: string): number; ",
+            "pick<T>(tag: 'fixed', value: T): T; ",
+            "} ",
+            "declare const picker: Picker; declare const text: string; ",
+            "const inferred = picker.pick('fixed', text); ",
+            "const explicit = picker.pick<string>('fixed', text);",
+        ));
+        let file = FileId::new(28_190);
+        let nodes = source
+            .arena
+            .iter()
+            .map(|(node, _)| NodeRef::new(source.arena.id(), file, node))
+            .collect::<Vec<_>>();
+        let nodes_of_kind = |kind| {
+            let mut result = nodes
+                .iter()
+                .copied()
+                .filter(|node| source.arena.get(node.node).unwrap().kind == kind)
+                .collect::<Vec<_>>();
+            result.sort_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+            result
+        };
+        let methods = nodes_of_kind(SyntaxKind::MethodSignature);
+        let calls = nodes_of_kind(SyntaxKind::CallExpression);
+        assert_eq!(methods.len(), 2);
+        assert_eq!(calls.len(), 2);
+        for query_first in [false, true] {
+            let mut context = context_with_options(
+                &[(file, &source)],
+                0,
+                CanonicalCheckerOptions {
+                    no_implicit_any: true,
+                    strict_function_types: true,
+                    ..options()
+                },
+            );
+            let cold_callable =
+                query_first.then(|| context.get_type_at_location(methods[0]).unwrap());
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let callable = context.get_type_at_location(methods[0]).unwrap();
+            assert!(cold_callable.is_none_or(|cold| cold == callable));
+            assert_eq!(context.get_type_at_location(methods[1]), Ok(callable));
+            let signatures = context
+                .store()
+                .type_payload(callable)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .signatures
+                .clone()
+                .unwrap();
+            let &[broad, generic] = signatures.as_slice() else {
+                panic!("the callable must retain both original method rows")
+            };
+            assert_eq!(
+                context.store().signature(broad).unwrap().flags(),
+                SignatureFlags::NONE
+            );
+            let original = context.store().signature(generic).unwrap();
+            assert_eq!(original.flags(), SignatureFlags::HAS_LITERAL_TYPES);
+            assert_eq!(original.type_parameters().len(), 1);
+            let type_parameter = original.type_parameters()[0];
+            let original_parameters = original.parameters().to_vec();
+            let original_types = context
+                .store()
+                .callable_signature_parameter_types(generic)
+                .unwrap()
+                .to_vec();
+            assert_eq!(original_types.len(), 2);
+            assert_eq!(original_types[1], type_parameter);
+            assert_eq!(original.resolved_return_type(), Some(type_parameter));
+            for (&signature, &declaration) in signatures.iter().zip(&methods) {
+                assert_eq!(
+                    context.store().signature(signature).unwrap().declaration(),
+                    Some(declaration)
+                );
+                assert_eq!(
+                    context
+                        .store()
+                        .signature_links(declaration)
+                        .unwrap()
+                        .resolved_signature
+                        .signature(),
+                    Some(signature),
+                );
+            }
+            let NodeData::MethodSignatureDeclaration(method) =
+                &source.arena.get(methods[1].node).unwrap().data
+            else {
+                panic!("the generic row must retain its real method declaration")
+            };
+            let parameter_node = NodeRef::new(
+                source.arena.id(),
+                file,
+                method.type_parameters.as_ref().unwrap().nodes[0],
+            );
+            let parameter_symbol = context
+                .file(file)
+                .unwrap()
+                .1
+                .symbol(parameter_node)
+                .unwrap();
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(context.store(), type_parameter),
+                Some(parameter_symbol),
+            );
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            let mut selected = None;
+            for &call in &calls {
+                assert_eq!(context.get_type_at_location(call), Ok(string));
+                let signature = context
+                    .store()
+                    .signature_links(call)
+                    .unwrap()
+                    .resolved_signature
+                    .signature()
+                    .unwrap();
+                assert_ne!(signature, generic);
+                if let Some(previous) = selected {
+                    assert_eq!(signature, previous);
+                } else {
+                    selected = Some(signature);
+                }
+                let checked = context.store().signature(signature).unwrap();
+                assert_eq!(checked.target(), Some(generic));
+                assert_eq!(checked.flags(), SignatureFlags::HAS_LITERAL_TYPES);
+                assert!(checked.type_parameters().is_empty());
+                assert_eq!(
+                    context
+                        .store()
+                        .map_type(checked.mapper().unwrap(), type_parameter),
+                    Some(string)
+                );
+                assert_eq!(
+                    checked
+                        .parameters()
+                        .iter()
+                        .map(|symbol| {
+                            context
+                                .store()
+                                .value_symbol_links(*symbol)
+                                .unwrap()
+                                .resolved_type
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>(),
+                    [original_types[0], string],
+                );
+                assert_eq!(context.get_return_type_of_signature(signature), Ok(string));
+            }
+            let selected = selected.unwrap();
+            let symbols = nodes
+                .iter()
+                .filter_map(|node| context.file(file).unwrap().1.symbol(*node))
+                .collect::<Vec<_>>();
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                let store = context.store();
+                (
+                    state(store),
+                    store.type_alias_len(),
+                    nodes
+                        .iter()
+                        .map(|node| {
+                            (
+                                store.type_node_links(*node).cloned(),
+                                store.signature_links(*node).cloned(),
+                                store.symbol_node_links(*node).cloned(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    symbols
+                        .iter()
+                        .map(|symbol| store.value_symbol_links(*symbol).cloned())
+                        .collect::<Vec<_>>(),
+                    context.diagnostics().clone(),
+                )
+            };
+            let warm = snapshot(&context);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                for &method in &methods {
+                    assert_eq!(context.get_type_at_location(method), Ok(callable));
+                }
+                for &call in &calls {
+                    assert_eq!(context.get_type_at_location(call), Ok(string));
+                    assert_eq!(
+                        context
+                            .store()
+                            .signature_links(call)
+                            .unwrap()
+                            .resolved_signature
+                            .signature(),
+                        Some(selected),
+                    );
+                }
+                assert_eq!(context.get_return_type_of_signature(selected), Ok(string));
+                assert_eq!(snapshot(&context), warm);
+            }
+            assert_eq!(
+                context.store().signature(generic).unwrap().parameters(),
+                original_parameters
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .signature(generic)
+                    .unwrap()
+                    .type_parameters(),
+                [type_parameter]
+            );
+            assert_eq!(
+                context.store().callable_signature_parameter_types(generic),
+                Some(original_types.as_slice())
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn selected_source_member_authenticates_merged_global_augmentation_targets() {
         let library = parsed(&format!("{BASE} declare var Array: any;"));
@@ -33760,6 +33992,247 @@ mod generic_publication_tests {
             Some(1),
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn method_literal_priority_uses_only_the_written_parameter_node() {
+        let members = concat!(
+            "direct(value: 'fixed'): string; ",
+            "returned(value: string): 'fixed'; ",
+            "wrapped(value: ('fixed')): string; ",
+            "aliased(value: Label): string; ",
+            "union(value: 'fixed' | 'other'): string;",
+        );
+        for type_literal in [false, true] {
+            let source = if type_literal {
+                format!("interface Owner {{}} type Label = 'fixed'; type Shape = {{ {members} }};")
+            } else {
+                format!("type Label = 'fixed'; interface Shape {{ {members} }}")
+            };
+            let fixture = interface_fixture(&source, 3_955);
+            let host = host(&fixture.parsed, &fixture.bound);
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.type_alias_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.checker_link_allocated_lengths(),
+                )
+            };
+            let before = snapshot(&fixture.store);
+            let plan = if type_literal {
+                let (literal, alias) = fixture
+                    .parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == SyntaxKind::TypeLiteral).then(|| {
+                            let parent = NodeRef::new(
+                                fixture.parsed.arena.id(),
+                                fixture.file,
+                                record.parent.unwrap(),
+                            );
+                            (
+                                NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                                fixture.bound.symbol(parent).unwrap(),
+                            )
+                        })
+                    })
+                    .unwrap();
+                plan_type_literal(&fixture.store, &host, literal, Some(alias)).unwrap()
+            } else {
+                plan_interface(&fixture.store, &host, fixture.symbol).unwrap()
+            };
+
+            assert_eq!(
+                plan.methods
+                    .iter()
+                    .map(|method| method.flags)
+                    .collect::<Vec<_>>(),
+                [
+                    SignatureFlags::HAS_LITERAL_TYPES,
+                    SignatureFlags::NONE,
+                    SignatureFlags::NONE,
+                    SignatureFlags::NONE,
+                    SignatureFlags::NONE,
+                ],
+            );
+            let wrapped = plan.methods[2].parameters[0];
+            assert_eq!(
+                fixture.store.source_node_kind(wrapped.type_node),
+                Some(SyntaxKind::ParenthesizedType),
+            );
+            assert_eq!(
+                fixture.store.source_node_kind(wrapped.identity_node),
+                Some(SyntaxKind::LiteralType),
+            );
+            for method in &plan.methods {
+                assert_eq!(
+                    fixture.bound.symbol(method.declaration),
+                    Some(method.symbol)
+                );
+                assert!(fixture.store.value_symbol_links(method.symbol).is_none());
+                assert!(fixture.store.signature_links(method.declaration).is_none());
+                for parameter in &method.parameters {
+                    assert!(fixture.store.type_node_links(parameter.type_node).is_none());
+                    assert!(fixture.store.value_symbol_links(parameter.symbol).is_none());
+                }
+            }
+            assert_eq!(snapshot(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both owner states use the same real method cache and restoration.
+    fn method_literal_priority_rejects_changed_flags_before_and_after_owner_completion() {
+        use crate::semantic::{DeclaredTypeError, DeclaredTypeUnavailable};
+
+        for complete_owner in [false, true] {
+            let mut fixture = interface_fixture(
+                concat!(
+                    "interface Shape { ",
+                    "run(value: 'fixed'): string; ",
+                    "run(value: string): number; ",
+                    "}",
+                ),
+                3_956,
+            );
+            let host = host(&fixture.parsed, &fixture.bound);
+            let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+            let method = plan.methods[0].symbol;
+            assert_eq!(
+                interface_method_value_state(&fixture.store, &plan),
+                Ok(None)
+            );
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_of_interface_method(method)
+            .unwrap();
+            let owner = fixture
+                .store
+                .declared_type_links(fixture.symbol)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            if complete_owner {
+                assert_eq!(
+                    CanonicalTypeQuery::new(
+                        &mut fixture.store,
+                        &host,
+                        CanonicalCheckerOptions::default(),
+                        &mut diagnostics,
+                    )
+                    .unwrap()
+                    .get_declared_type_of_symbol(fixture.symbol),
+                    Ok(owner),
+                );
+            }
+            assert_eq!(
+                fixture
+                    .store
+                    .type_payload(owner)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED),
+                complete_owner,
+            );
+            let signatures = fixture
+                .store
+                .type_payload(callable)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .signatures
+                .clone()
+                .unwrap();
+            assert_eq!(signatures.len(), 2);
+            let nodes = fixture
+                .parsed
+                .arena
+                .iter()
+                .map(|(node, _)| NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+                .collect::<Vec<_>>();
+            let symbols = nodes
+                .iter()
+                .filter_map(|node| fixture.bound.symbol(*node))
+                .collect::<Vec<_>>();
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                (
+                    implicit_property_state(store, &plan, owner),
+                    nodes
+                        .iter()
+                        .map(|node| {
+                            (
+                                store.type_node_links(*node).cloned(),
+                                store.signature_links(*node).cloned(),
+                                store.symbol_node_links(*node).cloned(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    symbols
+                        .iter()
+                        .map(|symbol| store.value_symbol_links(*symbol).cloned())
+                        .collect::<Vec<_>>(),
+                    signatures
+                        .iter()
+                        .map(|signature| store.signature(*signature).unwrap().flags())
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let healthy = snapshot(&fixture.store);
+            for (&signature, changed) in signatures
+                .iter()
+                .zip([SignatureFlags::NONE, SignatureFlags::HAS_LITERAL_TYPES])
+            {
+                let original = fixture.store.signature(signature).unwrap().flags();
+                assert_ne!(original, changed);
+                assert!(fixture.store.set_signature_flags(signature, changed));
+                let damaged = snapshot(&fixture.store);
+                let expected = DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::InvalidInterfaceDeclaration(plan.node),
+                );
+                for _ in 0..2 {
+                    let mut query = CanonicalTypeQuery::new(
+                        &mut fixture.store,
+                        &host,
+                        CanonicalCheckerOptions::default(),
+                        &mut diagnostics,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        query.preflight_type_of_interface_method(method),
+                        Err(expected)
+                    );
+                    assert_eq!(query.get_type_of_interface_method(method), Err(expected));
+                    assert_eq!(snapshot(&fixture.store), damaged);
+                    assert!(diagnostics.is_empty());
+                }
+                assert!(fixture.store.set_signature_flags(signature, original));
+                assert_eq!(
+                    CanonicalTypeQuery::new(
+                        &mut fixture.store,
+                        &host,
+                        CanonicalCheckerOptions::default(),
+                        &mut diagnostics,
+                    )
+                    .unwrap()
+                    .get_type_of_interface_method(method),
+                    Ok(callable),
+                );
+                assert_eq!(snapshot(&fixture.store), healthy);
+            }
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]

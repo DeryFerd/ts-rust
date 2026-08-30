@@ -3,7 +3,7 @@
 //! This module owns nongeneric function types, authenticated implicit, explicit
 //! `any[]`, typed and variadic type-parameter rest parameters, identifier and
 //! assertion predicates, and generic function types with outer lexical
-//! constraints.
+//! constraints and source-owned conditional returns.
 //! The type-node planner/executor only supplies recursive annotation callbacks;
 //! binder proof, cache validation, shell publication, signatures, parameter
 //! value types, and lazy return-type validation stay here.
@@ -21,6 +21,7 @@ use super::{
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     callables::{ValidatedSingleCallParameterDisplay, ValidatedSingleCallSignatureDisplay},
+    conditional_types::conditional_query_alias,
     declared::{
         cached_ordinary_type_parameter_owner, execute_type_parameter,
         explicit_type_parameter_symbols, preflight_node, preflight_type_parameter_symbol,
@@ -850,6 +851,7 @@ pub(super) fn plan_function_type(
         array_targets,
     };
     function_type_state(store, &plan, true)?;
+    validate_source_conditional_return(store, &plan)?;
     Ok(plan)
 }
 
@@ -1600,9 +1602,7 @@ fn plan_function_type_parameters(
             None
         }
         NodeData::ConditionalTypeNode(conditional)
-            if return_record.kind == SyntaxKind::ConditionalType
-                && value_parameter_count == 0
-                && constraint.is_none() =>
+            if return_record.kind == SyntaxKind::ConditionalType && value_parameter_count == 0 =>
         {
             if return_record.parent != Some(function.node)
                 || return_record.range.start < function_record.range.start
@@ -1629,7 +1629,9 @@ fn plan_function_type_parameters(
                 }
                 previous_end = operand_record.range.end;
             }
-            Some(operands[0])
+            // The lazy conditional query owns its operands and lexical captures.
+            // Its check type need not be the signature's own type parameter.
+            None
         }
         _ => {
             return Err(FunctionTypeError::Unsupported(
@@ -2617,10 +2619,29 @@ pub(super) fn validate_lazy_return_signature(
             )));
         }
     }
+    validate_source_conditional_return(store, plan)?;
     Ok(store
         .signature(signature)
         .expect("the function cache was validated")
         .resolved_return_type())
+}
+
+/// Source queries validate the producer before they reuse or publish a return.
+fn validate_source_conditional_return(
+    store: &CanonicalTypeMapperStore,
+    plan: &FunctionTypePlan,
+) -> Result<(), FunctionTypeError> {
+    if store.source_node_kind(plan.return_identity_node) == Some(SyntaxKind::ConditionalType)
+        && store
+            .type_node_links(plan.return_identity_node)
+            .is_some_and(|links| links.resolved_type.is_some())
+        && conditional_query_alias(store, plan.return_identity_node) != Ok(None)
+    {
+        return Err(invariant(FunctionTypeInvariant::InvalidSignatureCache(
+            plan.node,
+        )));
+    }
+    Ok(())
 }
 
 pub(super) fn validate_function_type_signature_identity(
@@ -3313,7 +3334,6 @@ fn valid_stored_function_type_parameters(
         }
         SyntaxKind::ConditionalType => {
             if !signature.parameters().is_empty()
-                || explicit_constraint.is_some()
                 || store
                     .symbol_node_links(return_annotation)
                     .is_some_and(|links| links != &SymbolNodeLinks::default())
@@ -3326,18 +3346,23 @@ fn valid_stored_function_type_parameters(
                         let Some(resolved) = links.resolved_type else {
                             return links != &TypeNodeLinks::default();
                         };
-                        let Some(TypeData::Conditional(conditional)) =
-                            store.type_payload(resolved).map(TypeRecord::data)
-                        else {
-                            return true;
+                        let valid_return = match store.type_payload(resolved).map(TypeRecord::data)
+                        {
+                            Some(TypeData::Conditional(conditional)) => {
+                                // Keep the deferred type as a dependency. Its consumer
+                                // validates the root and reports errors on that type.
+                                store
+                                    .conditional_root(conditional.root)
+                                    .is_some_and(|root| {
+                                        root.node() == return_annotation
+                                            && root.check_type() == conditional.check_type
+                                            && root.extends_type() == conditional.extends_type
+                                    })
+                            }
+                            // Reduced results have no conditional dependency to validate.
+                            _ => conditional_query_alias(store, return_annotation) == Ok(None),
                         };
-                        let Some(root) = store.conditional_root(conditional.root) else {
-                            return true;
-                        };
-                        conditional.check_type != *type_parameter
-                            || root.node() != return_annotation
-                            || root.check_type() != *type_parameter
-                            || root.extends_type() != conditional.extends_type
+                        !valid_return
                             || signature
                                 .resolved_return_type()
                                 .is_some_and(|return_type| return_type != resolved)
@@ -3939,6 +3964,8 @@ const fn invariant(error: FunctionTypeInvariant) -> FunctionTypeError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use ts_ast::FileId;
     use ts_binder::{
         BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
@@ -3954,6 +3981,7 @@ mod tests {
             DirectCallApplicability, DirectCallForm, DirectCallRequest, get_min_argument_count,
             get_parameter_count, has_effective_rest_parameter, resolve_direct_call,
         },
+        conditional_types::ConditionalQueryKey,
         formatter::{CanonicalTypeFormatFlags, type_to_string_with_host_global_types_and_flags},
         global_types::initialize_global_library_types,
         production::GlobalMergeCompletion,
@@ -5005,6 +5033,303 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Damage and restore each part of one reduced return proof.
+    fn reduced_generic_conditional_returns_validate_source_results_and_root_caches() {
+        let mut fixture = fixture(
+            "declare let callback: <Value extends number>() => number extends number ? Value : string;",
+            FileId::new(95_009),
+        );
+        let function = generic_function_node(&fixture);
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan = plan_function_type(&fixture.store, &host, function, None, false, None).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let function_type = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(function)
+        .unwrap();
+        let FunctionTypeState::Resolved { signature, .. } =
+            function_type_state(&fixture.store, &plan, false).unwrap()
+        else {
+            panic!("the function must publish its signature without its return")
+        };
+        let record = fixture.store.signature(signature).unwrap();
+        let [inner] = record.type_parameters() else {
+            panic!("the function must retain its declared type parameter")
+        };
+        let inner = *inner;
+        assert!(record.resolved_return_type().is_none());
+        assert!(fixture.store.type_node_links(plan.return_type).is_none());
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_return_type_of_signature(signature),
+            Ok(inner),
+        );
+        assert!(matches!(
+            validate_stored_function_type(&fixture.store, function_type),
+            StoredFunctionTypeValidation::Valid(_)
+        ));
+        let root = fixture
+            .store
+            .conditional_query_production(ConditionalQueryKey::Node(plan.return_type))
+            .unwrap()
+            .root();
+        let root_cache = fixture
+            .store
+            .conditional_root(root)
+            .unwrap()
+            .instantiations()
+            .clone();
+        let exact_links = fixture
+            .store
+            .type_node_links(plan.return_type)
+            .unwrap()
+            .clone();
+        let poison = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let counts = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.conditional_root_len(),
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let warm = counts(&fixture.store);
+
+        for damage in ["return result", "root cache"] {
+            match damage {
+                "return result" => {
+                    assert!(fixture.store.set_type_node_links(
+                        plan.return_type,
+                        TypeNodeLinks {
+                            resolved_type: Some(poison),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                    assert!(
+                        fixture
+                            .store
+                            .set_signature_resolved_return_type(signature, Some(poison))
+                    );
+                }
+                "root cache" => assert!(fixture.store.set_conditional_root_instantiations(
+                    root,
+                    TypeCacheState::Allocated(HashMap::default()),
+                )),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                validate_stored_function_type(&fixture.store, function_type),
+                StoredFunctionTypeValidation::Malformed,
+                "{damage}",
+            );
+            assert_eq!(
+                begin_function_type(&mut fixture.store, &plan),
+                Err(invariant(FunctionTypeInvariant::InvalidSignatureCache(
+                    function
+                ))),
+                "{damage}",
+            );
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_return_type_of_signature(signature),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidFunctionType(function),
+                )),
+                "{damage}",
+            );
+            assert_eq!(counts(&fixture.store), warm, "{damage}");
+            assert!(
+                fixture
+                    .store
+                    .set_type_node_links(plan.return_type, exact_links.clone())
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_signature_resolved_return_type(signature, Some(inner))
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_conditional_root_instantiations(root, root_cache.clone())
+            );
+            assert_eq!(
+                begin_function_type(&mut fixture.store, &plan),
+                Ok(Err(function_type)),
+            );
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_return_type_of_signature(signature),
+                Ok(inner),
+            );
+            assert_eq!(counts(&fixture.store), warm);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check all source-query entry points against one damaged root.
+    fn deferred_generic_conditional_returns_validate_source_queries_before_reuse() {
+        let mut fixture = fixture(
+            "declare let callback: <Value>() => Value extends string ? 1 : 2;",
+            FileId::new(95_019),
+        );
+        let function = generic_function_node(&fixture);
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan = plan_function_type(&fixture.store, &host, function, None, false, None).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let function_type = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(function)
+        .unwrap();
+        let FunctionTypeState::Resolved { signature, .. } =
+            function_type_state(&fixture.store, &plan, false).unwrap()
+        else {
+            panic!("the function must publish its lazy signature")
+        };
+        let return_type = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_return_type_of_signature(signature)
+        .unwrap();
+        let TypeData::Conditional(conditional) =
+            fixture.store.type_payload(return_type).unwrap().data()
+        else {
+            panic!("the generic return must retain its conditional dependency")
+        };
+        let root = conditional.root;
+        let cache = fixture
+            .store
+            .conditional_root(root)
+            .unwrap()
+            .instantiations()
+            .clone();
+        let counts = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.conditional_root_len(),
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let warm = counts(&fixture.store);
+        assert!(fixture.store.set_conditional_root_instantiations(
+            root,
+            TypeCacheState::Allocated(HashMap::default()),
+        ));
+        let StoredFunctionTypeValidation::Valid(edges) =
+            validate_stored_function_type(&fixture.store, function_type)
+        else {
+            panic!("store-only validation must retain the deferred dependency")
+        };
+        assert!(edges.contains(&return_type));
+        let invalid = invariant(FunctionTypeInvariant::InvalidSignatureCache(function));
+        assert_eq!(
+            plan_function_type(&fixture.store, &host, function, None, false, None),
+            Err(invalid),
+        );
+        assert_eq!(
+            validate_lazy_return_signature(&fixture.store, &plan, signature),
+            Err(invalid),
+        );
+        let invalid_query = DeclaredTypeError::TypeNodeUnavailable(
+            TypeNodeUnavailable::InvalidFunctionType(function),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function),
+            Err(invalid_query),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_return_type_of_signature(signature),
+            Err(invalid_query),
+        );
+        assert_eq!(counts(&fixture.store), warm);
+        assert!(
+            fixture
+                .store
+                .set_conditional_root_instantiations(root, cache)
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function),
+            Ok(function_type),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_return_type_of_signature(signature),
+            Ok(return_type),
+        );
+        assert_eq!(counts(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn constrained_generic_function_value_parameters_preserve_outer_constraint() {
         let mut fixture = fixture(
             concat!(
@@ -5270,6 +5595,206 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Preserve both retired inputs and their exact owner checks.
+    fn outer_generic_conditional_returns_keep_source_captures_and_lazy_replay() {
+        for (index, (signature, checks_inner)) in [
+            ("<o extends x>() => o extends string ? 1 : 2", true),
+            ("<o>() => x extends string ? 1 : 2", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source =
+                format!("type Outer<x> = ({signature}) extends (() => infer o) ? o : never;");
+            let mut fixture = fixture(&source, FileId::new(95_017 + u32::try_from(index).unwrap()));
+            let function = generic_function_node(&fixture);
+            let outer_declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    Some(NodeRef::new(
+                        function.arena,
+                        function.file,
+                        alias.type_parameters.as_ref()?.nodes[0],
+                    ))
+                })
+                .unwrap();
+            let outer_symbol = fixture.bound.symbol(outer_declaration).unwrap();
+            let inferred_declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::InferTypeNode(inferred) = &record.data else {
+                        return None;
+                    };
+                    Some(NodeRef::new(
+                        function.arena,
+                        function.file,
+                        inferred.type_parameter,
+                    ))
+                })
+                .unwrap();
+            let inferred_symbol = fixture.bound.symbol(inferred_declaration).unwrap();
+            let counts = |store: &CanonicalTypeMapperStore| {
+                (
+                    store.type_len(),
+                    store.signature_len(),
+                    store.conditional_root_len(),
+                    store.checker_link_allocated_lengths(),
+                )
+            };
+            let before = counts(&fixture.store);
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let plan =
+                plan_function_type(&fixture.store, &host, function, None, false, None).unwrap();
+            assert_eq!(counts(&fixture.store), before);
+            let [parameter] = plan.type_parameters.as_slice() else {
+                panic!("the function must retain one declared parameter")
+            };
+            assert_eq!(parameter.outer_symbol, checks_inner.then_some(outer_symbol));
+            assert_ne!(parameter.symbol, outer_symbol);
+            assert_ne!(inferred_symbol, outer_symbol);
+            assert_ne!(inferred_symbol, parameter.symbol);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let function_type = CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .unwrap();
+            let FunctionTypeState::Resolved { signature, .. } =
+                function_type_state(&fixture.store, &plan, false).unwrap()
+            else {
+                panic!("the function must publish a lazy signature")
+            };
+            let signature_record = fixture.store.signature(signature).unwrap();
+            let [inner] = signature_record.type_parameters() else {
+                panic!("the signature must retain its real type parameter")
+            };
+            let inner = *inner;
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(&fixture.store, inner),
+                Some(parameter.symbol),
+            );
+            assert!(signature_record.parameters().is_empty());
+            assert!(signature_record.resolved_return_type().is_none());
+            assert!(fixture.store.type_node_links(plan.return_type).is_none());
+            assert_eq!(fixture.store.conditional_root_len(), before.2);
+            let return_type = CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_return_type_of_signature(signature)
+            .unwrap();
+            let outer = fixture
+                .store
+                .declared_type_links(outer_symbol)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(&fixture.store, outer),
+                Some(outer_symbol),
+            );
+            assert_ne!(inner, outer);
+            let inferred = fixture
+                .store
+                .declared_type_links(inferred_symbol)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(&fixture.store, inferred),
+                Some(inferred_symbol),
+            );
+            assert_ne!(inferred, inner);
+            assert_ne!(inferred, outer);
+            let TypeData::TypeParameter(inner_data) =
+                fixture.store.type_payload(inner).unwrap().data()
+            else {
+                panic!("the signature parameter must keep its constraint")
+            };
+            assert_eq!(
+                inner_data.constraint,
+                Some(if checks_inner {
+                    outer
+                } else {
+                    fixture
+                        .store
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .no_constraint_type
+                }),
+            );
+            let TypeData::Conditional(conditional) =
+                fixture.store.type_payload(return_type).unwrap().data()
+            else {
+                panic!("the generic check must remain deferred")
+            };
+            let root = fixture.store.conditional_root(conditional.root).unwrap();
+            let check = if checks_inner { inner } else { outer };
+            assert_eq!(conditional.check_type, check);
+            assert_eq!(root.node(), plan.return_type);
+            assert_eq!(root.check_type(), check);
+            // Go retains an enclosing infer whose declaration container is not an ancestor.
+            let captures = if checks_inner {
+                [inferred, inner]
+            } else {
+                [outer, inferred]
+            };
+            assert_eq!(root.outer_type_parameters(), Some(captures.as_slice()));
+            assert!(conditional.resolved_true_type.is_none());
+            assert!(conditional.resolved_false_type.is_none());
+            assert!(matches!(
+                validate_stored_function_type(&fixture.store, function_type),
+                StoredFunctionTypeValidation::Valid(_)
+            ));
+            let warm = counts(&fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    CanonicalTypeQuery::new(
+                        &mut fixture.store,
+                        &host,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    )
+                    .unwrap()
+                    .get_type_from_type_node(function),
+                    Ok(function_type),
+                );
+                assert_eq!(
+                    CanonicalTypeQuery::new(
+                        &mut fixture.store,
+                        &host,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    )
+                    .unwrap()
+                    .get_return_type_of_signature(signature),
+                    Ok(return_type),
+                );
+                assert_eq!(counts(&fixture.store), warm);
+            }
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
     fn unsupported_generic_function_signatures_fail_before_publication() {
         for (index, signature) in [
             "<o extends string>() => o",
@@ -5279,8 +5804,6 @@ mod tests {
             "<o extends x = x>() => o",
             "<o extends x, p extends x>() => o",
             "<o>(value: o) => o extends string ? 1 : 2",
-            "<o extends x>() => o extends string ? 1 : 2",
-            "<o>() => x extends string ? 1 : 2",
         ]
         .into_iter()
         .enumerate()

@@ -5238,6 +5238,7 @@ pub(super) fn check_source_constructor_overload_new(
     global_types: &CanonicalGlobalTypes,
     strict_function_types: bool,
     plan: &SourceDefaultNewPlan,
+    session: &mut InstantiationSession,
 ) -> Result<Option<CheckedSourceConstructorOverloadNew>, SourceNewError> {
     let SourceNewTarget::ConstructorOverloads(class) = &plan.target else {
         return Ok(None);
@@ -5268,12 +5269,17 @@ pub(super) fn check_source_constructor_overload_new(
         type_argument_count: 0,
         has_spread_argument: false,
     };
-    let resolution = super::calls::resolve_direct_call_candidates(
+    let existing_signature = store
+        .signature_links(plan.node)
+        .and_then(|links| links.resolved_signature.signature());
+    let resolution = super::calls::resolve_direct_call_candidates_with_session(
         store,
         global_types,
         strict_function_types,
         request,
         &group.signatures,
+        existing_signature,
+        session,
     )
     .map_err(|error| SourceNewError::Call {
         node: plan.node,
@@ -5293,6 +5299,7 @@ pub(super) fn check_source_constructor_overload_new(
         strict_function_types,
         request,
         &group.implementation,
+        session,
     )
     .map_err(|error| SourceNewError::Call {
         node: plan.node,

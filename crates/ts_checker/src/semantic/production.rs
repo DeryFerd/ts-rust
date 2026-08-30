@@ -1629,6 +1629,10 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             GlobalMergeCompletion::new(options.name_resolution),
         )
         .map_err(DeclaredTypeError::from)?;
+        if let Some(members) = super::classes::completed_source_class_members(store, &host, symbol)?
+        {
+            return Ok(members);
+        }
         let type_context = ClassTypeQueryContext::new(global_types, *options);
         let overload_plan = loop {
             match super::classes::plan_source_constructor_overload_class(

@@ -1,4 +1,4 @@
-//! Overload selection for published method signatures and their receiver copies.
+//! Overload selection for published methods, receiver copies, and source functions.
 //!
 //! The ordinary and generic call engines check each real candidate. This module
 //! owns declaration-group order, the two relation passes, and failure selection.
@@ -9,7 +9,7 @@ use super::{
     SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
-    callables::ValidatedSingleCallable,
+    callables::{CallableFamily, ValidatedSingleCallable},
     calls::{
         DirectCallApplicability, DirectCallError, DirectCallForm, DirectCallRequest,
         DirectCallResolution, DirectCallUnsupported, check_argument_applicability,
@@ -25,6 +25,7 @@ use super::{
     },
     instantiate::InstantiationSession,
     relation::RelationKind,
+    type_records::TypeData,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,6 +128,41 @@ impl CheckedMethodCandidate {
         matches!(self, Self::Generic(candidate) if matches!(candidate.applicability(),
             GenericCallVectorApplicability::ExplicitTypeArgumentConstraint { .. }))
     }
+}
+
+/// Methods use source absence. Source overloads keep their validated sentinel caches.
+fn type_argument_bounds(
+    store: &CanonicalTypeMapperStore,
+    callable: &ValidatedSingleCallable,
+    family: CallableFamily,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(usize, usize), GenericMethodCallError> {
+    if family != CallableFamily::SourceFunctionOverloads {
+        return generic_method_type_argument_bounds(store, callable, array_targets)
+            .map_err(GenericMethodCallError::from);
+    }
+    let signature = store
+        .signature(callable.signature)
+        .ok_or(GenericMethodCallError::Invalid(callable.owner))?;
+    let no_constraint = store
+        .intrinsic_bootstrap()
+        .ok_or(GenericMethodCallError::Invalid(callable.owner))?
+        .no_constraint_type;
+    let mut minimum = 0;
+    for (index, parameter) in signature.type_parameters().iter().enumerate() {
+        let Some(TypeData::TypeParameter(parameter)) = store
+            .type_payload(*parameter)
+            .map(super::type_records::TypeRecord::data)
+        else {
+            return Err(GenericMethodCallError::Invalid(callable.owner));
+        };
+        match parameter.resolved_default_type {
+            Some(default) if default != no_constraint => {}
+            Some(_) => minimum = index + 1,
+            None => return Err(GenericMethodCallError::Invalid(callable.owner)),
+        }
+    }
+    Ok((minimum, signature.type_parameters().len()))
 }
 
 fn has_type_argument_arity(bounds: (usize, usize), explicit: Option<&[TypeId]>) -> bool {
@@ -303,21 +339,27 @@ pub(super) fn resolve_generic_method_call(
         return Ok(None);
     }
     let array_targets = Some(CanonicalArrayTargets::from_global_types(globals));
-    for &signature in signatures {
-        if generic_method_signature_callee(store, signature, array_targets)? != Some(request.callee)
-        {
-            return Ok(None);
+    let source_overloads = store.source_overload_provenance(request.callee).is_some();
+    if !source_overloads {
+        for &signature in signatures {
+            if generic_method_signature_callee(store, signature, array_targets)?
+                != Some(request.callee)
+            {
+                return Ok(None);
+            }
         }
     }
     validate_generic_call_vector_request(store, request)?;
-    let projection =
+    let (family, projection) =
         match validate_stored_callable_set_with_array_targets(store, request.callee, array_targets)
         {
-            StoredCallableSetValidation::Valid { projection, .. }
-                if projection.construct_signatures.is_empty()
-                    && !projection.call_signatures.is_empty() =>
+            StoredCallableSetValidation::Valid {
+                family, projection, ..
+            } if projection.construct_signatures.is_empty()
+                && !projection.call_signatures.is_empty()
+                && (!source_overloads || family == CallableFamily::SourceFunctionOverloads) =>
             {
-                projection
+                (family, projection)
             }
             StoredCallableSetValidation::Malformed { .. } => {
                 return Err(GenericMethodCallError::Invalid(request.callee));
@@ -328,7 +370,7 @@ pub(super) fn resolve_generic_method_call(
         reorder_direct_call_candidates(store, request.callee, &projection.call_signatures)?;
     let bounds = ordered
         .iter()
-        .map(|candidate| generic_method_type_argument_bounds(store, candidate, array_targets))
+        .map(|candidate| type_argument_bounds(store, candidate, family, array_targets))
         .collect::<Result<Vec<_>, _>>()?;
     let passes = [
         GenericCallArgumentRelation::Subtype {
@@ -406,7 +448,7 @@ pub(super) fn resolve_generic_method_call(
         let mut eligible = Vec::new();
         for candidate in &projection.call_signatures {
             if has_type_argument_arity(
-                generic_method_type_argument_bounds(store, candidate, array_targets)?,
+                type_argument_bounds(store, candidate, family, array_targets)?,
                 request.explicit_type_arguments,
             ) {
                 eligible.push(candidate);
@@ -549,7 +591,6 @@ mod tests {
         structured_members::{
             InterfaceHeritageMembersValidation, validate_interface_heritage_members,
         },
-        type_records::TypeData,
         types::ObjectFlags,
     };
 

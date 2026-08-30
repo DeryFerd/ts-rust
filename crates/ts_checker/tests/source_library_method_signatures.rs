@@ -6,7 +6,7 @@ use ts_binder::{
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
     IntrinsicBootstrapOptions, SignatureId, SignatureLinks, SourceFileLinks, TypeData, TypeId,
-    TypeNodeLinks, ValueSymbolLinks,
+    TypeNodeLinks, ValueSymbolLinks, signatures::SignatureFlags,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -167,6 +167,88 @@ fn parameter_types(context: &CanonicalCheckerContext<'_>, signature: SignatureId
                 .unwrap()
         })
         .collect()
+}
+
+#[allow(clippy::too_many_lines)] // Check the recovery against both real merged declarations.
+fn assert_merged_method_failure(
+    context: &mut CanonicalCheckerContext<'_>,
+    callable: TypeId,
+    call: NodeRef,
+    visible: [SignatureId; 2],
+) -> SignatureId {
+    let TypeData::Object(object) = context.store().type_payload(callable).unwrap().data() else {
+        panic!("the merged method must keep its callable object");
+    };
+    assert_eq!(object.structured.signatures.as_deref(), Some(&visible[..]));
+    assert_eq!(object.structured.call_signature_count, 2);
+    let recovered = signature(context, call);
+    assert!(!visible.contains(&recovered));
+    // Merged declaration groups are searched in reverse source order.
+    let ordered = [visible[1], visible[0]];
+    let record = context.store().signature(recovered).unwrap();
+    assert_eq!(
+        record.flags(),
+        SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE,
+    );
+    assert!(record.type_parameters().is_empty());
+    assert!(record.this_parameter().is_none());
+    assert!(record.target().is_none());
+    assert!(record.mapper().is_none());
+    assert!(record.composite().is_none());
+    assert_eq!(
+        record.declaration(),
+        context.store().signature(ordered[0]).unwrap().declaration(),
+    );
+    let originals = ordered.map(|signature| {
+        let record = context.store().signature(signature).unwrap();
+        assert_eq!(record.flags(), SignatureFlags::NONE);
+        record.parameters().to_vec()
+    });
+    assert_eq!(
+        usize::try_from(record.min_argument_count()).unwrap(),
+        originals.iter().map(Vec::len).min().unwrap(),
+    );
+    assert_eq!(
+        record.parameters().len(),
+        originals.iter().map(Vec::len).max().unwrap(),
+    );
+    for (index, &parameter) in record.parameters().iter().enumerate() {
+        let source = originals
+            .iter()
+            .find_map(|parameters| parameters.get(index))
+            .copied()
+            .unwrap();
+        assert!(
+            originals
+                .iter()
+                .all(|parameters| !parameters.contains(&parameter))
+        );
+        assert_eq!(
+            context.store().get_merged_symbol(parameter),
+            Some(parameter)
+        );
+        let original = context.store().symbol(source).unwrap();
+        let combined = context.store().symbol(parameter).unwrap();
+        assert_eq!(combined.flags(), original.flags() | SymbolFlags::TRANSIENT);
+        assert_eq!(combined.name(), original.name());
+        assert_eq!(combined.declarations(), original.declarations());
+        assert_eq!(combined.value_declaration(), original.value_declaration());
+        assert_eq!(combined.parent(), original.parent());
+        let links = context.store().value_symbol_links(parameter).unwrap();
+        assert_eq!(links.target, Some(source));
+        assert!(links.resolved_type.is_some());
+    }
+    let return_type = record.resolved_return_type().unwrap();
+    assert_eq!(
+        context.store().type_node_links(call).unwrap().resolved_type,
+        Some(return_type),
+    );
+    // This public query validates the recovery receipt and its reverse owner.
+    assert_eq!(
+        context.get_return_type_of_signature(recovered),
+        Ok(return_type)
+    );
+    recovered
 }
 
 fn nodes(parsed: &ParseResult, kind: SyntaxKind) -> Vec<NodeRef> {
@@ -424,9 +506,22 @@ fn real_library_keys_calls_preserve_overload_selection_arrays_and_arity_errors()
     assert_eq!(calls.len(), 3);
     assert_eq!(accesses.len(), 3);
     let callable = context.get_type_at_location(methods[0].name).unwrap();
+    let visible = methods
+        .each_ref()
+        .map(|method| signature(&context, method.declaration));
+    let recovered = assert_merged_method_failure(&mut context, callable, calls[2], visible);
+    assert_eq!(
+        parameter_types(&context, recovered),
+        parameter_types(&context, selected),
+    );
+    assert_eq!(context.get_return_type_of_signature(recovered), Ok(result));
     let mut queries = Vec::new();
-    for (call, access) in calls.into_iter().zip(accesses) {
-        assert_eq!(signature(&context, call), selected);
+    for ((call, access), expected) in calls.into_iter().zip(accesses).zip([
+        signature(&context, methods[0].declaration),
+        selected,
+        recovered,
+    ]) {
+        assert_eq!(signature(&context, call), expected);
         assert_eq!(context.get_type_at_location(call), Ok(result));
         assert_eq!(context.get_type_at_location(access), Ok(callable));
         assert_eq!(context.get_symbol_at_location(access), Ok(Some(merged)));
@@ -499,11 +594,25 @@ fn split_method_overloads_select_real_signatures_and_preserve_bad_calls() {
         }
         let calls = nodes(&source, SyntaxKind::CallExpression);
         assert_eq!(calls.len(), 3);
+        let recovered = assert_merged_method_failure(
+            &mut context,
+            callable,
+            calls[2],
+            [signatures[0], signatures[1]],
+        );
+        let combined = parameter_types(&context, recovered);
+        assert_eq!(combined.len(), 2);
+        assert_eq!(combined[1], number);
+        let TypeData::Union(union) = context.store().type_payload(combined[0]).unwrap().data()
+        else {
+            panic!("the first recovery parameter must retain string and number");
+        };
+        let mut constituents = [string, number];
+        constituents.sort_unstable();
+        assert_eq!(union.union.types, constituents);
+        assert_eq!(context.get_return_type_of_signature(recovered), Ok(number));
         let mut queries = Vec::new();
-        for (&call, expected) in calls
-            .iter()
-            .zip([signatures[0], signatures[1], signatures[0]])
-        {
+        for (&call, expected) in calls.iter().zip([signatures[0], signatures[1], recovered]) {
             assert_eq!(signature(&context, call), expected);
             assert_eq!(context.get_type_at_location(call), Ok(number));
             queries.push((call, number));

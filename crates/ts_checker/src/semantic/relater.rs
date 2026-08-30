@@ -80,6 +80,7 @@ use super::{
     },
     signatures::{ElementFlags, SignatureFlags, Ternary, TupleElementInfo},
     source_callables::validate_source_callable_signature_identity,
+    source_overloads::source_overload_signature_type_query,
     store::{RelationObservationToken, SemanticStore, SourceNodeParent},
     structured_members::{
         InterfaceHeritageMembersValidation, inherited_generic_property_reference,
@@ -88,6 +89,7 @@ use super::{
     },
     template_types::StringMappingKind,
     tuple_types::{CanonicalTupleTypeRequest, TupleShape, TupleTypeError},
+    type_nodes::SourceCallableTypeQueryEvidence,
     type_records::{
         CacheHashKey, ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord,
     },
@@ -502,6 +504,55 @@ fn authenticated_any_array_nonmatch(
     Ok(true)
 }
 
+/// Reads the real declaration's query proof without treating a group as a singleton.
+fn source_parameter_query_evidence(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    callable_declaration: ts_ast::NodeRef,
+) -> Result<Option<&SourceCallableTypeQueryEvidence>, RelationUnavailable> {
+    if let Some(callable) = store.source_callable_type_for_declaration(callable_declaration) {
+        let Some(provenance) = store.source_callable_provenance(callable) else {
+            return Ok(None);
+        };
+        let Some(evidence) = store.source_callable_type_query(provenance.signature) else {
+            return Ok(None);
+        };
+        if evidence.callable().declaration != callable_declaration
+            || validate_source_callable_signature_identity(
+                store,
+                evidence.callable(),
+                provenance.signature,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+        Ok(Some(evidence))
+    } else if let Some(callable) = store
+        .source_overload_type_for_declaration(callable_declaration)
+        .or_else(|| {
+            store
+                .source_declaration_symbol(callable_declaration)
+                .and_then(|owner| store.source_overload_type_for_owner(owner))
+        })
+    {
+        let invalid = || RelationUnavailable::MalformedFunctionType(callable);
+        let row = store
+            .source_overload_provenance(callable)
+            .and_then(|provenance| {
+                provenance
+                    .signatures
+                    .iter()
+                    .find(|row| row.declaration == callable_declaration)
+            })
+            .ok_or_else(invalid)?;
+        source_overload_signature_type_query(store, callable, row.signature)
+            .map(Some)
+            .ok_or_else(invalid)
+    } else {
+        Ok(None)
+    }
+}
+
 /// After simple relations, a concrete scalar and an unconstrained source parameter
 /// cannot be assigned in either direction. The signature proof excludes recovery.
 fn authenticated_scalar_source_parameter_nonmatch(
@@ -551,21 +602,10 @@ fn authenticated_scalar_source_parameter_nonmatch(
     else {
         return Ok(false);
     };
-    let Some(callable) = store.source_callable_type_for_declaration(callable_declaration) else {
-        return Ok(false);
-    };
-    let Some(provenance) = store.source_callable_provenance(callable) else {
-        return Ok(false);
-    };
-    let Some(evidence) = store.source_callable_type_query(provenance.signature) else {
+    let Some(evidence) = source_parameter_query_evidence(store, callable_declaration)? else {
         return Ok(false);
     };
     let plan = evidence.callable();
-    if plan.declaration != callable_declaration
-        || validate_source_callable_signature_identity(store, plan, provenance.signature).is_err()
-    {
-        return Ok(false);
-    }
     let Some(index) = evidence.type_parameters().iter().position(|row| {
         row.provenance.type_parameter == parameter
             && row.provenance.symbol == symbol
@@ -9182,6 +9222,94 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             strict_function_types,
             instantiation_session,
         )
+    }
+
+    /// Pinned `isImplementationCompatibleWithOverload` for a source-owned group.
+    pub(super) fn is_source_overload_implementation_compatible(
+        &mut self,
+        owner: TypeId,
+        overload: SignatureId,
+        global_types: &CanonicalGlobalTypes,
+        strict_function_types: bool,
+        instantiation_session: &mut InstantiationSession,
+    ) -> Result<bool, RelationUnavailable> {
+        let invalid = || RelationUnavailable::MalformedFunctionType(owner);
+        let provenance = self.source_overload_provenance(owner).ok_or_else(invalid)?;
+        let implementation = provenance.implementation.ok_or_else(invalid)?;
+        let body_row = provenance.signatures.last().ok_or_else(invalid)?;
+        if body_row.declaration != implementation.declaration
+            || body_row.signature == overload
+            || !provenance
+                .signatures
+                .iter()
+                .any(|row| row.signature == overload)
+        {
+            return Err(invalid());
+        }
+        let body_signature = body_row.signature;
+        if let Err(established) = self.claim_strict_function_types(strict_function_types) {
+            return Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                established,
+                requested: strict_function_types,
+            });
+        }
+        let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
+        let source = super::source_overloads::source_overload_compatibility_projection(
+            self,
+            owner,
+            body_signature,
+            array_targets,
+            instantiation_session,
+        )?;
+        let target = super::source_overloads::source_overload_compatibility_projection(
+            self,
+            owner,
+            overload,
+            array_targets,
+            instantiation_session,
+        )?;
+        self.admit_callable_relation_type_with_array_targets(
+            owner,
+            Some(strict_function_types),
+            Some(CanonicalArrayTargets::from_global_types(global_types)),
+        )?;
+        let bootstrap = self.relation_bootstrap_facts()?;
+        let source_return = source.return_type.ok_or_else(invalid)?;
+        let target_return = target.return_type.ok_or_else(invalid)?;
+        if target_return != bootstrap.void_type
+            && !self.is_type_assignable_to_with_session(
+                target_return,
+                source_return,
+                Some(global_types),
+                Some(strict_function_types),
+                instantiation_session,
+            )?
+            && !self.is_type_assignable_to_with_session(
+                source_return,
+                target_return,
+                Some(global_types),
+                Some(strict_function_types),
+                instantiation_session,
+            )?
+        {
+            return Ok(false);
+        }
+        let mut session = RelaterSession::new_with_global_types_options_and_session(
+            self,
+            RelationKind::Assignable,
+            bootstrap,
+            Some(RelationGlobalTypes::from_global_types(global_types)),
+            Some(strict_function_types),
+            Some(instantiation_session),
+        );
+        session.observe_type_surface(owner);
+        let result = session.compare_signatures_related(
+            &source,
+            &target,
+            SignatureCheckMode::IGNORE_RETURN_TYPES,
+            IntersectionState::NONE,
+        )?;
+        Ok(session.finish_without_specialized_root_cache(result))
     }
 
     /// Pinned implementation compatibility, using the caller's signature relation session.

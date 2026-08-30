@@ -5,7 +5,7 @@
 //! declaration, and validates the complete reverse-map/cache graph before the
 //! shared call resolver may observe it.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use ts_ast::{Node, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
@@ -14,20 +14,27 @@ use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
+    callables::ValidatedSingleCallable,
+    instantiate::{InstantiationSession, instantiate_type_with_vector_and_session},
     links::{
         DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
         ValueSymbolLinks,
     },
+    relater::RelationUnavailable,
+    relation::RelationKind,
     signatures::SignatureFlags,
     source_callables::{
-        CallableTypePredicatePlan, SourceCallableError, SourceCallablePlan,
+        CallableTypePredicatePlan, SourceCallableBodyMode, SourceCallableError, SourceCallablePlan,
         SourceCallableReturnPlan, cached_annotation_identity, plan_callable_type_predicate,
-        plan_source_ambient_overload_declaration, valid_optional_type,
+        plan_source_ambient_overload_declaration, plan_source_jsdoc_overload_declaration,
+        valid_optional_type,
     },
     store::{
         PreparedSourceOverloadParameter, PreparedSourceOverloadPublication,
-        PreparedSourceOverloadSignature, SourceNodeParent,
+        PreparedSourceOverloadSignature, SourceCallableFamily, SourceNodeParent,
+        SourceOverloadImplementation,
     },
+    type_nodes::SourceCallableTypeQueryEvidence,
     type_records::{ConstrainedTypeData, TypeCacheState, TypeData},
     types::{ObjectFlags, TypeFlags},
 };
@@ -36,6 +43,7 @@ use super::{
 pub(super) struct SourceOverloadPlan {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) declarations: Vec<SourceCallablePlan>,
+    pub(super) implementation: Option<SourceOverloadImplementation>,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
 }
 
@@ -106,8 +114,9 @@ impl SourceNamespaceAmbientOverloadPlan {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(super) struct ResolvedSourceOverloadSignature {
+    pub(super) query_evidence: Option<Arc<SourceCallableTypeQueryEvidence>>,
     pub(super) parameter_types: Vec<TypeId>,
     pub(super) return_type: TypeId,
 }
@@ -668,6 +677,60 @@ pub(super) fn plan_source_ambient_overload_group(
     declarations: &[NodeRef],
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<SourceOverloadPlan, SourceOverloadError> {
+    plan_source_overload_group(store, host, owner_symbol, declarations, None, array_targets)
+}
+
+pub(super) fn plan_source_jsdoc_overload_group(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner_symbol: SemanticSymbolId,
+    declarations: &[NodeRef],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceOverloadPlan, SourceOverloadError> {
+    let first = declarations
+        .first()
+        .copied()
+        .ok_or(SourceOverloadError::Invariant(
+            SourceOverloadInvariant::EmptyGroup,
+        ))?;
+    let (arena, _) = host.source(first).ok_or(SourceOverloadError::Invariant(
+        SourceOverloadInvariant::Group(first),
+    ))?;
+    let group = super::jsdoc::authenticated_jsdoc_overload_group(arena, first)
+        .filter(|group| group.declarations == declarations)
+        .ok_or(SourceOverloadError::Unsupported(first))?;
+    let Some(NodeData::FunctionDeclaration(function)) =
+        arena.get(group.implementation.node).map(|node| &node.data)
+    else {
+        return Err(SourceOverloadError::Invariant(
+            SourceOverloadInvariant::Group(first),
+        ));
+    };
+    let body = function.body.ok_or(SourceOverloadError::Invariant(
+        SourceOverloadInvariant::Group(group.implementation),
+    ))?;
+    let implementation = SourceOverloadImplementation {
+        declaration: group.implementation,
+        body: NodeRef::new(first.arena, first.file, body),
+    };
+    plan_source_overload_group(
+        store,
+        host,
+        owner_symbol,
+        declarations,
+        Some(implementation),
+        array_targets,
+    )
+}
+
+fn plan_source_overload_group(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner_symbol: SemanticSymbolId,
+    declarations: &[NodeRef],
+    implementation: Option<SourceOverloadImplementation>,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceOverloadPlan, SourceOverloadError> {
     let Some(first) = declarations.first().copied() else {
         return Err(SourceOverloadError::Invariant(
             SourceOverloadInvariant::EmptyGroup,
@@ -727,7 +790,12 @@ pub(super) fn plan_source_ambient_overload_group(
         if bound.local_symbol(*declaration).is_some() {
             return Err(SourceOverloadError::Unsupported(*declaration));
         }
-        plans.push(plan_source_ambient_overload_declaration(
+        let planner = if implementation.is_some() {
+            plan_source_jsdoc_overload_declaration
+        } else {
+            plan_source_ambient_overload_declaration
+        };
+        plans.push(planner(
             store,
             host,
             *declaration,
@@ -736,9 +804,15 @@ pub(super) fn plan_source_ambient_overload_group(
             array_targets,
         )?);
     }
+    if plans.iter().any(|plan| !plan.type_parameters.is_empty())
+        && plans.iter().any(|plan| plan.type_parameters.len() != 1)
+    {
+        return Err(SourceOverloadError::Unsupported(first));
+    }
     let plan = SourceOverloadPlan {
         owner_symbol,
         declarations: plans,
+        implementation,
         array_targets,
     };
     validate_plan_state(store, &plan)?;
@@ -850,6 +924,12 @@ pub(super) fn prepare_source_overload_publication(
     for (declaration, resolved) in plan.declarations.iter().zip(resolved) {
         if declaration.parameters.len() != resolved.parameter_types.len()
             || store.type_payload(resolved.return_type).is_none()
+            || resolved
+                .query_evidence
+                .as_ref()
+                .map_or(!declaration.type_parameters.is_empty(), |evidence| {
+                    !evidence.matches_plan(declaration) || !evidence.is_exact(store)
+                })
         {
             return Err(SourceOverloadError::Invariant(
                 SourceOverloadInvariant::Publication(declaration.declaration),
@@ -913,6 +993,7 @@ pub(super) fn prepare_source_overload_publication(
         }
         signatures.push(PreparedSourceOverloadSignature {
             declaration: declaration.declaration,
+            query_evidence: resolved.query_evidence.clone(),
             parameters,
             flags: declaration.flags,
             min_argument_count: declaration.min_argument_count,
@@ -924,6 +1005,7 @@ pub(super) fn prepare_source_overload_publication(
     Ok(PreparedSourceOverloadPublication {
         owner_symbol: plan.owner_symbol,
         signatures,
+        implementation: plan.implementation,
         array_targets: plan.array_targets,
     })
 }
@@ -1008,6 +1090,25 @@ fn source_overload_state(
         .ok_or(SourceOverloadError::Invariant(
             SourceOverloadInvariant::EmptyGroup,
         ))?;
+    if plan.declarations.len() < 2
+        || plan
+            .declarations
+            .iter()
+            .enumerate()
+            .any(|(index, declaration)| match plan.implementation {
+                Some(implementation) if index + 1 == plan.declarations.len() => {
+                    declaration.declaration != implementation.declaration
+                        || declaration.body != implementation.body
+                        || declaration.body_mode != SourceCallableBodyMode::Present
+                }
+                Some(_) => declaration.body_mode != SourceCallableBodyMode::OverloadDeclaration,
+                None => declaration.body_mode != SourceCallableBodyMode::AmbientDeclaration,
+            })
+    {
+        return Err(SourceOverloadError::Invariant(
+            SourceOverloadInvariant::Group(first.declaration),
+        ));
+    }
     let owner_links = store.value_symbol_links(plan.owner_symbol);
     let declarations_cold = plan.declarations.iter().all(|declaration| {
         store
@@ -1077,6 +1178,7 @@ fn source_overload_state(
                 SourceOverloadInvariant::Cache(first.declaration),
             ))?;
     if provenance.owner_symbol != plan.owner_symbol
+        || provenance.implementation != plan.implementation
         || provenance.array_targets != plan.array_targets
         || provenance.signatures.len() != plan.declarations.len()
     {
@@ -1097,6 +1199,12 @@ fn source_overload_state(
             || row.return_annotation != return_annotation
             || row.return_annotation_null_literal_identity != return_null_literal_identity
             || row.parameters.len() != declaration.parameters.len()
+            || row.type_parameters.len() != declaration.type_parameters.len()
+            || store
+                .source_callable_type_query(row.signature)
+                .map_or(!declaration.type_parameters.is_empty(), |evidence| {
+                    !evidence.matches_plan(declaration)
+                })
         {
             return Err(SourceOverloadError::Invariant(
                 SourceOverloadInvariant::Cache(declaration.declaration),
@@ -1131,6 +1239,7 @@ fn prepared_matches_plan(
     prepared: &PreparedSourceOverloadPublication,
 ) -> bool {
     plan.owner_symbol == prepared.owner_symbol
+        && plan.implementation == prepared.implementation
         && plan.array_targets == prepared.array_targets
         && plan.declarations.len() == prepared.signatures.len()
         && plan
@@ -1139,6 +1248,12 @@ fn prepared_matches_plan(
             .zip(&prepared.signatures)
             .all(|(plan, prepared)| {
                 plan.declaration == prepared.declaration
+                    && prepared
+                        .query_evidence
+                        .as_ref()
+                        .map_or(plan.type_parameters.is_empty(), |evidence| {
+                            evidence.matches_plan(plan)
+                        })
                     && plan.flags == prepared.flags
                     && plan.min_argument_count == prepared.min_argument_count
                     && plan.parameters.len() == prepared.parameters.len()
@@ -1197,6 +1312,9 @@ pub(super) fn validate_stored_source_overload(
         .iter()
         .map(|signature| signature.signature)
         .collect::<Vec<_>>();
+    let public_count = signatures
+        .len()
+        .saturating_sub(usize::from(provenance.implementation.is_some()));
     let TypeData::Object(object) = record.data() else {
         return StoredSourceOverloadValidation::Malformed;
     };
@@ -1226,8 +1344,14 @@ pub(super) fn validate_stored_source_overload(
         || object.structured.constrained != ConstrainedTypeData::default()
         || object.structured.members.is_some()
         || object.structured.properties.is_some()
-        || object.structured.signatures.as_deref() != Some(signatures.as_slice())
-        || object.structured.call_signature_count != signatures.len()
+        || object.structured.signatures.as_deref() != Some(&signatures[..public_count])
+        || object.structured.call_signature_count != public_count
+        || provenance.implementation.is_some_and(|implementation| {
+            declarations.last().copied() != Some(implementation.declaration)
+                || store.source_node_kind(implementation.body) != Some(SyntaxKind::Block)
+                || store.source_node_parent(implementation.body)
+                    != Some(SourceNodeParent::Parent(implementation.declaration))
+        })
         || object.structured.index_infos.is_some()
         || object
             .structured
@@ -1250,6 +1374,7 @@ pub(super) fn validate_stored_source_overload(
     };
     let mut unique_signatures = HashSet::with_capacity(signatures.len());
     let mut unique_parameters = HashSet::new();
+    let mut unique_type_parameters = HashSet::new();
     for row in &provenance.signatures {
         if !unique_signatures.insert(row.signature)
             || store.source_node_kind(row.declaration) != Some(SyntaxKind::FunctionDeclaration)
@@ -1287,10 +1412,15 @@ pub(super) fn validate_stored_source_overload(
             .iter()
             .map(|parameter| parameter.call_type)
             .collect::<Vec<_>>();
+        let type_parameters = row
+            .type_parameters
+            .iter()
+            .map(|parameter| parameter.type_parameter)
+            .collect::<Vec<_>>();
         if row.flags.bits() & !SignatureFlags::HAS_LITERAL_TYPES.bits() != 0
             || signature.flags() != row.flags
             || signature.declaration() != Some(row.declaration)
-            || !signature.type_parameters().is_empty()
+            || signature.type_parameters() != type_parameters.as_slice()
             || signature.this_parameter().is_some()
             || signature.parameters() != parameter_symbols.as_slice()
             || signature.resolved_return_type() != Some(row.return_type)
@@ -1307,6 +1437,91 @@ pub(super) fn validate_stored_source_overload(
                 != Some(parameter_types.as_slice())
         {
             return StoredSourceOverloadValidation::Malformed;
+        }
+        if row.type_parameters.is_empty() {
+            if store
+                .source_callable_type_parameters(row.signature)
+                .is_some()
+                || store.source_callable_type_query(row.signature).is_some()
+            {
+                return StoredSourceOverloadValidation::Malformed;
+            }
+        } else {
+            let Some(evidence) = store.source_callable_type_query(row.signature) else {
+                return StoredSourceOverloadValidation::Malformed;
+            };
+            let plan = evidence.callable();
+            let Some(implementation) = provenance.implementation else {
+                return StoredSourceOverloadValidation::Malformed;
+            };
+            let (body, body_mode) = if row.declaration == implementation.declaration {
+                (implementation.body, SourceCallableBodyMode::Present)
+            } else {
+                (row.declaration, SourceCallableBodyMode::OverloadDeclaration)
+            };
+            if row.type_parameters.len() != 1
+                || !plan.requires_type_query_evidence()
+                || plan.family != SourceCallableFamily::FunctionDeclaration
+                || plan.declaration != row.declaration
+                || plan.owner_symbol != owner_symbol
+                || plan.owner_parent.is_some()
+                || plan.export_local.is_some()
+                || plan.body != body
+                || plan.body_mode != body_mode
+                || plan.is_async
+                || plan.type_predicate.is_some()
+                || plan.flags != row.flags
+                || plan.min_argument_count != signature.min_argument_count()
+                || plan.array_targets != provenance.array_targets
+                || store.source_callable_type_for_owner(owner_symbol).is_some()
+                || store
+                    .source_callable_type_for_declaration(row.declaration)
+                    .is_some()
+                || store
+                    .source_callable_type_for_signature(row.signature)
+                    .is_some()
+                || plan.return_type.annotation_identity()
+                    != Some((
+                        row.return_annotation,
+                        row.return_annotation_null_literal_identity,
+                    ))
+                || !evidence.is_exact(store)
+                || store.source_callable_type_parameters(row.signature)
+                    != Some(row.type_parameters.as_ref())
+                || evidence.type_parameters().len() != row.type_parameters.len()
+                || plan.parameters.len() != row.parameters.len()
+            {
+                return StoredSourceOverloadValidation::Malformed;
+            }
+            for (parameter, resolved) in row.type_parameters.iter().zip(evidence.type_parameters())
+            {
+                if *parameter != resolved.provenance
+                    || parameter.constraint.is_some()
+                    || parameter.default_type.is_some()
+                    || !unique_type_parameters.insert(parameter.symbol)
+                {
+                    return StoredSourceOverloadValidation::Malformed;
+                }
+                edges.push(parameter.type_parameter);
+            }
+            for (parameter, planned) in row.parameters.iter().zip(&plan.parameters) {
+                if parameter.declaration != planned.declaration
+                    || parameter.symbol != planned.symbol
+                    || parameter.optional != planned.optional
+                    || planned.optional
+                    || planned.rest
+                    || planned.initializer.is_some()
+                    || planned.explicit_type_node().is_none()
+                    || planned.annotation_identity()
+                        != (
+                            parameter.annotation,
+                            parameter.annotation_null_literal_identity,
+                        )
+                    || evidence.annotation_type(parameter.annotation) != Some(parameter.base_type)
+                {
+                    return StoredSourceOverloadValidation::Malformed;
+                }
+            }
         }
         let minimum =
             usize::try_from(signature.min_argument_count()).expect("the minimum was validated");
@@ -1366,6 +1581,233 @@ pub(super) fn validate_stored_source_overload(
     StoredSourceOverloadValidation::Valid(edges)
 }
 
+/// Reads a real generic row's query proof, including the hidden implementation.
+/// Call consumers must also prove membership in the public call list.
+pub(super) fn source_overload_signature_type_query(
+    store: &CanonicalTypeMapperStore,
+    owner: TypeId,
+    signature: SignatureId,
+) -> Option<&SourceCallableTypeQueryEvidence> {
+    if !matches!(
+        validate_stored_source_overload(store, owner),
+        StoredSourceOverloadValidation::Valid(_)
+    ) {
+        return None;
+    }
+    let provenance = store.source_overload_provenance(owner)?;
+    let row = provenance
+        .signatures
+        .iter()
+        .find(|row| row.signature == signature)?;
+    store.source_callable_type_query(row.signature)
+}
+
+/// Projects one real cached signature, including the hidden implementation.
+/// This does not allocate a callable type or change the public call list.
+pub(super) fn source_overload_signature_projection(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    signature: SignatureId,
+) -> Option<super::callables::ValidatedSingleCallable> {
+    if !matches!(
+        validate_stored_source_overload(store, type_),
+        StoredSourceOverloadValidation::Valid(_)
+    ) {
+        return None;
+    }
+    let row = store
+        .source_overload_provenance(type_)?
+        .signatures
+        .iter()
+        .find(|row| row.signature == signature)?;
+    let record = store.signature(signature)?;
+    Some(super::callables::ValidatedSingleCallable {
+        owner: type_,
+        signature,
+        parameters: row
+            .parameters
+            .iter()
+            .map(|parameter| parameter.call_type)
+            .collect(),
+        rest_parameter: None,
+        min_argument_count: usize::try_from(record.min_argument_count()).ok()?,
+        return_type: Some(row.return_type),
+        strict_variance_exempt: false,
+    })
+}
+
+/// Pinned `getErasedSignature` for implementation compatibility only.
+/// The real declaration signatures and their templates remain unchanged.
+#[allow(clippy::too_many_lines)] // Validate the complete mapped row before publishing its cache.
+pub(super) fn source_overload_compatibility_projection(
+    store: &mut CanonicalTypeMapperStore,
+    owner: TypeId,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<ValidatedSingleCallable, RelationUnavailable> {
+    let invalid = || RelationUnavailable::MalformedFunctionType(owner);
+    let original =
+        source_overload_signature_projection(store, owner, signature).ok_or_else(invalid)?;
+    let original_record = store.signature(signature).ok_or_else(invalid)?;
+    let sources = original_record.type_parameters().to_vec();
+    if sources.is_empty() {
+        return Ok(original);
+    }
+    let original_parameters = original_record.parameters().to_vec();
+    let declaration = original_record.declaration();
+    let flags = original_record.flags() & SignatureFlags::PROPAGATING_FLAGS;
+    let minimum = original_record.min_argument_count();
+    let any = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?
+        .any_type;
+    let targets = vec![any; sources.len()];
+    let limit_mark = session.limit_event_mark();
+    let mut types = Vec::with_capacity(original.parameters.len() + 1);
+    for type_ in original
+        .parameters
+        .iter()
+        .copied()
+        .chain(original.return_type)
+    {
+        types.push(
+            instantiate_type_with_vector_and_session(
+                store,
+                type_,
+                &sources,
+                &targets,
+                array_targets,
+                session,
+            )
+            .map_err(|_| RelationUnavailable::StructuralRelation {
+                source: owner,
+                target: owner,
+                relation: RelationKind::Assignable,
+            })?,
+        );
+    }
+    if session.limit_event_occurred_since(limit_mark) {
+        return Err(RelationUnavailable::StructuralRelation {
+            source: owner,
+            target: owner,
+            relation: RelationKind::Assignable,
+        });
+    }
+    if types.len() != original.parameters.len() + 1 {
+        return Err(invalid());
+    }
+    let returned = types.pop().ok_or_else(invalid)?;
+    let cached = store.source_overload_erased_signature(signature);
+    let erased = if let Some(cached) = cached {
+        cached
+    } else {
+        if !store.try_reserve_source_overload_erased_signatures(1) || !store.try_reserve_mappers(1)
+        {
+            return Err(RelationUnavailable::UnionValidationCapacity(owner));
+        }
+        let mapper = store
+            .new_type_mapper(sources.clone(), targets.clone())
+            .ok_or_else(invalid)?;
+        store
+            .instantiate_signature_ex(signature, mapper, true)
+            .map_err(|error| match error {
+                super::signatures::SignatureInstantiationError::Capacity(_) => {
+                    RelationUnavailable::UnionValidationCapacity(owner)
+                }
+                _ => invalid(),
+            })?
+    };
+    let record = store.signature(erased).ok_or_else(invalid)?;
+    let mapper = record.mapper().ok_or_else(invalid)?;
+    if record.target() != Some(signature)
+        || record.declaration() != declaration
+        || record.flags() != flags
+        || record.min_argument_count() != minimum
+        || !record.type_parameters().is_empty()
+        || record.this_parameter().is_some()
+        || record.resolved_type_predicate().is_some()
+        || record.isolated_signature_type().is_some()
+        || record.composite().is_some()
+        || record.parameters().len() != original_parameters.len()
+        || store.type_mapper_has_exact_endpoints(mapper, &sources, &targets) != Some(true)
+        || record
+            .resolved_return_type()
+            .is_some_and(|value| value != returned)
+        || cached.is_some() && record.resolved_return_type() != Some(returned)
+    {
+        return Err(invalid());
+    }
+    let parameters = record.parameters().to_vec();
+    let mut publications = Vec::new();
+    for ((source, parameter), type_) in original_parameters.iter().zip(&parameters).zip(&types) {
+        if source == parameter {
+            if store
+                .value_symbol_links(*source)
+                .and_then(|links| links.resolved_type)
+                != Some(*type_)
+            {
+                return Err(invalid());
+            }
+            continue;
+        }
+        let source_record = store.symbol(*source).ok_or_else(invalid)?;
+        let parameter_record = store.symbol(*parameter).ok_or_else(invalid)?;
+        let links = store.value_symbol_links(*parameter).ok_or_else(invalid)?;
+        let expected = ValueSymbolLinks {
+            resolved_type: links.resolved_type,
+            target: Some(*source),
+            mapper: Some(mapper),
+            ..ValueSymbolLinks::default()
+        };
+        if parameter_record.flags() != source_record.flags() | SymbolFlags::TRANSIENT
+            || parameter_record.check_flags() != CheckFlags::INSTANTIATED
+            || parameter_record.name() != source_record.name()
+            || parameter_record.declarations() != source_record.declarations()
+            || parameter_record.value_declaration() != source_record.value_declaration()
+            || parameter_record.parent() != source_record.parent()
+            || parameter_record.members().is_some()
+            || parameter_record.exports().is_some()
+            || parameter_record.export_symbol().is_some()
+            || store.get_merged_symbol(*parameter) != Some(*parameter)
+            || *links != expected
+            || links.resolved_type.is_some_and(|value| value != *type_)
+            || cached.is_some() && links.resolved_type != Some(*type_)
+        {
+            return Err(invalid());
+        }
+        if links.resolved_type.is_none() {
+            publications.push((
+                *parameter,
+                ValueSymbolLinks {
+                    resolved_type: Some(*type_),
+                    ..expected
+                },
+            ));
+        }
+    }
+    for (parameter, links) in publications {
+        if !store.set_value_symbol_links(parameter, links) {
+            return Err(invalid());
+        }
+    }
+    if cached.is_none()
+        && (!store.set_signature_resolved_return_type(erased, Some(returned))
+            || !store.set_source_overload_erased_signature(signature, erased))
+    {
+        return Err(invalid());
+    }
+    Ok(ValidatedSingleCallable {
+        owner,
+        signature: erased,
+        parameters: types,
+        rest_parameter: None,
+        min_argument_count: original.min_argument_count,
+        return_type: Some(returned),
+        strict_variance_exempt: original.strict_variance_exempt,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use ts_ast::{FileId, NodeData};
@@ -1380,6 +1822,234 @@ mod tests {
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
         SourceCheckError, TypeNodeLinks, bootstrap::UnionReduction, signatures::TypePredicateKind,
     };
+
+    fn generic_jsdoc_context(
+        parsed: &ts_parser::ParseResult,
+        file: FileId,
+    ) -> CanonicalCheckerContext<'_> {
+        assert!(parsed.diagnostics.is_empty());
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/generic-overload-ownership.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                no_emit: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn generic_jsdoc_source() -> ts_parser::ParseResult {
+        ts_parser::parse_javascript_source_file(concat!(
+            "/** @template T @param {T} value @returns {T}\n",
+            " * @overload @param {T} value @returns {T}\n",
+            " * @overload @param {T} value @param {number} count @returns {T} */\n",
+            "function keep(value) { return value; }\n",
+        ))
+    }
+
+    #[test]
+    fn jsdoc_generic_rows_keep_query_owners_and_reuse_compatibility_signatures() {
+        let parsed = generic_jsdoc_source();
+        let file = FileId::new(8_227);
+        for query_first in [false, true] {
+            let mut context = generic_jsdoc_context(&parsed, file);
+            let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+            else {
+                unreachable!()
+            };
+            let first = NodeRef::new(parsed.arena.id(), file, source.statements.nodes[0]);
+            let early = if query_first {
+                let NodeData::FunctionDeclaration(function) =
+                    &parsed.arena.get(first.node).unwrap().data
+                else {
+                    unreachable!()
+                };
+                Some(
+                    context
+                        .get_type_from_type_node(NodeRef::new(
+                            first.arena,
+                            first.file,
+                            function.type_.unwrap(),
+                        ))
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let owner = context.file(file).unwrap().1.symbol(first).unwrap();
+            let callable = context
+                .store()
+                .source_overload_type_for_owner(owner)
+                .unwrap();
+            let rows = context
+                .store()
+                .source_overload_provenance(callable)
+                .unwrap()
+                .signatures
+                .clone();
+            assert_eq!(rows.len(), 3);
+            if let Some(early) = early {
+                assert_eq!(early, rows[0].type_parameters[0].type_parameter);
+            }
+            let parameters = rows
+                .iter()
+                .map(|row| row.type_parameters[0].type_parameter)
+                .collect::<HashSet<_>>();
+            assert_eq!(parameters.len(), 3);
+            let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+            for row in &rows {
+                let evidence = context
+                    .store()
+                    .source_callable_type_query(row.signature)
+                    .unwrap();
+                assert!(evidence.is_exact(context.store()));
+                assert_eq!(evidence.callable().declaration, row.declaration);
+                assert_eq!(row.return_type, row.type_parameters[0].type_parameter);
+                assert_ne!(row.return_type, any);
+                let erased = context
+                    .store()
+                    .source_overload_erased_signature(row.signature)
+                    .unwrap();
+                let record = context.store().signature(erased).unwrap();
+                assert_eq!(record.target(), Some(row.signature));
+                assert_eq!(record.resolved_return_type(), Some(any));
+                assert!(record.type_parameters().is_empty());
+                assert_eq!(
+                    context.store().cached_signatures_contain(erased),
+                    Some(true)
+                );
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+            );
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert!(matches!(
+                    validate_stored_source_overload(context.store(), callable),
+                    StoredSourceOverloadValidation::Valid(_)
+                ));
+                assert_eq!(
+                    context
+                        .store()
+                        .source_overload_provenance(callable)
+                        .unwrap()
+                        .signatures,
+                    rows
+                );
+                assert_eq!(
+                    before,
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().signature_len(),
+                        context.store().mapper_len(),
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jsdoc_generic_rows_reject_cross_row_query_and_compatibility_cache_changes() {
+        let parsed = generic_jsdoc_source();
+        let file = FileId::new(8_228);
+        let mut context = generic_jsdoc_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+        else {
+            unreachable!()
+        };
+        let first = NodeRef::new(parsed.arena.id(), file, source.statements.nodes[0]);
+        let owner = context.file(file).unwrap().1.symbol(first).unwrap();
+        let callable = context
+            .store()
+            .source_overload_type_for_owner(owner)
+            .unwrap();
+        let rows = context
+            .store()
+            .source_overload_provenance(callable)
+            .unwrap()
+            .signatures
+            .clone();
+        let evidence = context
+            .store_mut_for_test()
+            .replace_source_callable_type_query_for_test(rows[0].signature, None)
+            .unwrap();
+        context
+            .store_mut_for_test()
+            .replace_source_callable_type_query_for_test(
+                rows[0].signature,
+                Some(Arc::clone(&evidence)),
+            );
+        let original = context
+            .store_mut_for_test()
+            .replace_source_callable_type_query_for_test(rows[1].signature, Some(evidence));
+        assert_eq!(
+            validate_stored_source_overload(context.store(), callable),
+            StoredSourceOverloadValidation::Malformed
+        );
+        context
+            .store_mut_for_test()
+            .replace_source_callable_type_query_for_test(rows[1].signature, original);
+        assert!(matches!(
+            validate_stored_source_overload(context.store(), callable),
+            StoredSourceOverloadValidation::Valid(_)
+        ));
+
+        let erased = context
+            .store()
+            .source_overload_erased_signature(rows[0].signature)
+            .unwrap();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(erased, Some(wrong))
+        );
+        let mut session =
+            InstantiationSession::new(crate::semantic::instantiate::InstantiationLimits::default());
+        assert_eq!(
+            source_overload_compatibility_projection(
+                context.store_mut_for_test(),
+                callable,
+                rows[0].signature,
+                None,
+                &mut session,
+            ),
+            Err(RelationUnavailable::MalformedFunctionType(callable))
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature(rows[0].signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(rows[0].return_type)
+        );
+    }
 
     fn namespace_overload_context(
         parsed: &ts_parser::ParseResult,
