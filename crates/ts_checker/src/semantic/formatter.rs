@@ -4069,10 +4069,7 @@ fn source_arrow_expando_display_properties(
     let Some(provenance) = store.source_callable_provenance(type_id) else {
         return Ok(Vec::new());
     };
-    if !matches!(
-        provenance.family,
-        SourceCallableFamily::ArrowFunction | SourceCallableFamily::FunctionExpression
-    ) {
+    if provenance.family != SourceCallableFamily::ArrowFunction {
         return Ok(Vec::new());
     }
     let owner = store.symbol(provenance.owner_symbol).ok_or_else(invalid)?;
@@ -4101,7 +4098,7 @@ fn source_arrow_expando_display_properties(
         .source_facts()
         .is_none_or(|facts| facts.is_javascript_file())
         || !store
-            .source_file_links(bound.source_file())
+            .source_file_links(super::SourceFileRef::new(store.id(), bound.source_file()))
             .is_some_and(|links| links.type_checked)
     {
         return Err(TypeDisplayUnavailable::FunctionType {
