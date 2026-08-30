@@ -435,6 +435,35 @@ fn later_tuple_method_forms_keep_explicit_class_boundaries() {
         let [declaration] = declarations.as_slice() else {
             panic!("each boundary has one class")
         };
+        let NodeData::ClassDeclaration(class) = &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the class keeps its declaration")
+        };
+        let unsupported = if let Some(clauses) = &class.heritage_clauses {
+            let [clause] = clauses.nodes.as_slice() else {
+                panic!("the class has one implements clause")
+            };
+            let NodeData::HeritageClause(clause) = &parsed.arena.get(*clause).unwrap().data else {
+                panic!("the implements clause keeps its declaration")
+            };
+            assert_eq!(clause.token, SyntaxKind::ImplementsKeyword);
+            let [target] = clause.types.nodes.as_slice() else {
+                panic!("the class implements one interface")
+            };
+            let NodeData::ExpressionWithTypeArguments(target) =
+                &parsed.arena.get(*target).unwrap().data
+            else {
+                panic!("the implements target keeps its expression")
+            };
+            let NodeData::Identifier(name) = &parsed.arena.get(target.expression).unwrap().data
+            else {
+                panic!("the implements target is an identifier")
+            };
+            assert_eq!(name.text, "Shape");
+            NodeRef::new(parsed.arena.id(), FILE, target.expression)
+        } else {
+            method(&parsed, "take").declaration
+        };
         let mut context = context(&parsed);
         let owner = symbol(&context, *declaration);
         let cold = counts(&context);
@@ -442,7 +471,7 @@ fn later_tuple_method_forms_keep_explicit_class_boundaries() {
             assert_eq!(
                 context.check_source_file(FILE),
                 Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Class(*declaration)
+                    UnsupportedSourceSyntax::Class(unsupported)
                 )),
                 "{source}",
             );
