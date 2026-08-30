@@ -2163,8 +2163,31 @@ mod tests {
             Ok(subscription)
         );
         assert_eq!(context.get_declared_type_of_symbol(alias), Ok(subscription));
+        let noop_owner = context
+            .store()
+            .type_payload(noop)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let noop_declaration = context
+            .store()
+            .symbol(noop_owner)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        let noop_signature = context
+            .store()
+            .signature_links(noop_declaration)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+        assert_eq!(
+            context.get_return_type_of_signature(noop_signature),
+            Ok(void)
+        );
         let store = context.store();
-        let void = store.intrinsic_bootstrap().unwrap().void_type;
         assert_eq!(
             validate_resolved_declared_property_object(store, subscription),
             DeclaredPropertyObjectValidation::NotDeclared
@@ -2300,6 +2323,7 @@ mod tests {
         );
         assert_eq!(context.get_declared_type_of_symbol(alias), Ok(closed));
         let store = context.store_mut_for_test();
+        assert!(store.ensure_type_node_links(property.type_node));
         let string = store.intrinsic_bootstrap().unwrap().string_type;
         let flags = store.type_payload(closed).unwrap().object_flags();
         let alias_flags = store.symbol(alias).unwrap().flags();
@@ -2307,6 +2331,7 @@ mod tests {
         let alias_links = store.type_alias_links(alias).unwrap().clone();
         let literal_links = store.type_node_links(literal).unwrap().clone();
         let annotation_links = store.type_node_links(property.type_node).unwrap().clone();
+        assert_eq!(annotation_links, crate::semantic::TypeNodeLinks::default());
         let value_links = store.value_symbol_links(property.symbol).unwrap().clone();
         assert_eq!(
             validate_resolved_declared_property_object(store, closed),

@@ -356,7 +356,7 @@ fn declared_alias(context: &CanonicalCheckerContext<'_>, alias: Alias) -> TypeId
     let links = context.store().type_alias_links(owner).unwrap();
     let type_ = links.declared_type.unwrap();
     let arguments = alias.parameter.map(|node| [parameter(context, node)]);
-    let arguments = arguments.as_ref().map(|parameters| parameters.as_slice());
+    let arguments = arguments.as_ref().map(<[TypeId; 1]>::as_slice);
     assert_eq!(links.type_parameters.as_deref(), arguments);
     if arguments.is_none() {
         assert!(links.instantiations.is_none());
@@ -576,15 +576,15 @@ fn assert_mapped_callable(
     let source = value_type(context, original);
     assert_eq!(node_type(context, property.annotation), Some(source));
     let proxy = member(context, receiver, name);
-    let mapper = object(context, receiver).mapper.unwrap();
+    let substitution = object(context, receiver).mapper.unwrap();
     assert_ne!(proxy, original);
     let links = context.store().value_symbol_links(proxy).unwrap();
     assert_eq!(links.target, Some(original));
-    assert_eq!(links.mapper, Some(mapper));
+    assert_eq!(links.mapper, Some(substitution));
     let mapped = links.resolved_type.unwrap();
     assert_ne!(mapped, source);
     assert_eq!(object(context, mapped).target, Some(source));
-    assert_eq!(object(context, mapped).mapper, Some(mapper));
+    assert_eq!(object(context, mapped).mapper, Some(substitution));
     let source_signature = signature(context, source);
     let mapped_signature = signature(context, mapped);
     let NodeData::FunctionTypeNode(function) = &context
@@ -618,7 +618,7 @@ fn assert_mapped_callable(
     let mapped_record = context.store().signature(mapped_signature).unwrap();
     assert_eq!(mapped_record.declaration(), Some(property.annotation));
     assert_eq!(mapped_record.target(), Some(source_signature));
-    assert_eq!(mapped_record.mapper(), Some(mapper));
+    assert_eq!(mapped_record.mapper(), Some(substitution));
     assert!(mapped_record.type_parameters().is_empty());
     assert_eq!(mapped_record.parameters().len(), 1);
     assert_ne!(mapped_record.parameters()[0], source_record.parameters()[0]);
@@ -743,7 +743,8 @@ fn snapshot(context: &CanonicalCheckerContext<'_>) -> Snapshot {
                     type_,
                     owner: record.symbol(),
                     alias: record.alias(),
-                    alias_owner: alias.and_then(|alias| alias.symbol()),
+                    alias_owner: alias
+                        .and_then(ts_checker::semantic::type_records::TypeAlias::symbol),
                     alias_arguments: alias
                         .and_then(|alias| alias.type_arguments().map(<[TypeId]>::to_vec)),
                     structure,
