@@ -1146,7 +1146,6 @@ impl CanonicalCheckerContext<'_> {
             && links
                 != &(super::SymbolNodeLinks {
                     resolved_symbol: Some(symbol),
-                    ..super::SymbolNodeLinks::default()
                 })
         {
             return Err(CanonicalArtifactQueryError::InvalidSymbol {
@@ -4695,7 +4694,6 @@ mod tests {
                     key,
                     SymbolNodeLinks {
                         resolved_symbol: Some(local_symbol),
-                        ..SymbolNodeLinks::default()
                     }
                 )),
                 _ => assert!(context.store_mut_for_test().set_type_node_links(

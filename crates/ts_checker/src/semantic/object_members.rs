@@ -22230,16 +22230,14 @@ fn valid_object_literal_property_declarations(
         return bound.declarations() == Some(&[property.declaration])
             && bound.value_declaration() == Some(property.declaration);
     };
-    let mut actual_members = match store.source_direct_children(plan.node) {
-        Some(children) => children,
-        None => return false,
+    let Some(mut actual_members) = store.source_direct_children(plan.node) else {
+        return false;
     };
     actual_members.sort_by_key(|member| store.source_node_start(*member));
     if plan.kind != PropertyObjectKind::ObjectLiteral
-        || !actual_members
+        || !actual_members.iter().copied().eq(assignment
             .iter()
-            .copied()
-            .eq(assignment.iter().map(|member| member.binding()))
+            .map(super::source_properties::ClassBindingPropertyPlan::binding))
         || assignment.iter().any(|member| {
             store.source_node_parent(member.binding()) != Some(SourceNodeParent::Parent(plan.node))
                 || store.source_node_parent(member.property())
