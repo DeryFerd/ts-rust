@@ -1247,6 +1247,12 @@ fn validate_symbol(
         validate_symbol(store, host, wrapper.source.alias)?;
         return Ok(symbol);
     }
+    if super::source_imports::validated_synthetic_namespace_symbol(store, host, symbol)
+        .map_err(|_| SymbolDisplayError::InvalidSymbol(symbol))?
+        .is_some()
+    {
+        return Ok(symbol);
+    }
     // Namespace wrappers reuse exports. They do not own source declarations.
     if store.get_parent_of_symbol(symbol).is_some_and(|parent| {
         store

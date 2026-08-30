@@ -1150,7 +1150,7 @@ fn review_artifact_cli_separates_typed_failures_from_diagnostics_only_runs() {
 }
 
 #[test]
-fn review_artifact_cli_fatal_preserves_diagnostic_mismatches_and_related_records() {
+fn review_artifact_cli_supported_mismatches_preserve_diagnostics_and_related_records() {
     let repository = TestRepository::new();
     repository.write_case(
         "reviewFatalArtifact",
@@ -1175,17 +1175,30 @@ fn review_artifact_cli_fatal_preserves_diagnostic_mismatches_and_related_records
         serde_json::from_slice(&fs::read(&scorecard_path).unwrap()).unwrap();
     assert_eq!(scorecard["summary"]["executedVariants"], 1);
     assert_eq!(scorecard["summary"]["exactMatches"], 0);
-    assert_eq!(scorecard["summary"]["fatalInvariants"], 1);
+    assert_eq!(scorecard["summary"]["fatalInvariants"], 0);
     assert_eq!(scorecard["summary"]["unsupportedDetails"], 0);
     assert_eq!(scorecard["summary"]["headerMismatches"], 1);
+    assert_eq!(scorecard["summary"]["artifactMismatches"], 0);
     assert_eq!(scorecard["summary"]["actualDiagnostics"], 2);
     let result = &scorecard["variants"][0];
-    assert_eq!(result["status"], "fatal_invariant");
-    assert_eq!(result["outcomeClass"], "fatal_invariant");
-    assert_eq!(result["frontierBlocker"]["code"], "INV.SOURCE.TYPE_DISPLAY");
+    assert_eq!(result["status"], "header_mismatch");
+    assert_eq!(result["outcomeClass"], "supported_mismatch");
+    assert_eq!(
+        result["frontierBlocker"]["outcomeClass"],
+        "supported_mismatch"
+    );
+    assert!(result["frontierBlocker"]["code"].is_null());
+    assert_eq!(result["mismatchKinds"], serde_json::json!(["header"]));
+    assert_eq!(result["unsupportedDetails"], serde_json::json!([]));
+    let difference = &result["firstDifference"];
     assert_eq!(
         result["frontierBlocker"]["detail"],
-        result["semanticArtifacts"]["types"]["unsupportedDetail"]
+        format!(
+            "artifact line {} differs: expected {:?}, actual {:?}",
+            difference["line"].as_u64().unwrap(),
+            difference["expected"].as_str().unwrap(),
+            difference["actual"].as_str().unwrap(),
+        )
     );
     assert!(result["actualHeader"].as_str().unwrap().contains("TS2451"));
     let diagnostics = result["diagnostics"].as_array().unwrap();
@@ -1198,13 +1211,31 @@ fn review_artifact_cli_fatal_preserves_diagnostic_mismatches_and_related_records
         );
         assert_eq!(diagnostic["relatedInformation"][0]["code"], 6203);
     }
-    assert_eq!(scorecard["semanticArtifacts"]["types"]["unsupported"], 1);
-    assert_eq!(scorecard["semanticArtifacts"]["symbols"]["mismatches"], 1);
+    for (kind, expected) in [("types", "expected types"), ("symbols", "expected symbols")] {
+        assert_eq!(scorecard["semanticArtifacts"][kind]["expectedBaselines"], 1);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["exactMatches"], 0);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["mismatches"], 1);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["unsupported"], 0);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["notReached"], 0);
+        let artifact = &result["semanticArtifacts"][kind];
+        assert_eq!(artifact["status"], "mismatch");
+        assert!(artifact["visitedNodes"].as_u64().unwrap() > 0);
+        assert!(artifact.get("unsupportedDetail").is_none());
+        assert_eq!(artifact["firstDifference"]["line"], 1);
+        assert_eq!(artifact["firstDifference"]["expected"], expected);
+        assert_eq!(
+            artifact["firstDifference"]["actual"],
+            "//// [tests/cases/compiler/reviewFatalArtifact.ts] ////\r"
+        );
+    }
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains(
-        "FATAL testdata/tests/cases/compiler/reviewFatalArtifact.ts: INV.SOURCE.TYPE_DISPLAY:"
+        "MISMATCH testdata/tests/cases/compiler/reviewFatalArtifact.ts: HeaderMismatch at artifact line "
     ));
-    assert!(stdout.contains(result["frontierBlocker"]["detail"].as_str().unwrap()));
+    assert!(stdout.contains("header_mismatches=1"));
+    assert!(stdout.contains("unsupported_details=0"));
+    assert!(stdout.contains("fatal_invariants=0"));
+    assert!(!stdout.contains("FATAL "));
 }
 
 #[test]
