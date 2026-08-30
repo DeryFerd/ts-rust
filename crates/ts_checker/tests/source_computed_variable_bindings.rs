@@ -416,13 +416,13 @@ fn annotated_computed_defaults_keep_declared_types_and_default_errors() {
         ("inferred", "observedInferred", "number | \"fallback\""),
     ] {
         let binding = binding_parts(&parsed, name);
-        let (type_, symbol) = assert_binding(&mut context, &binding, expected);
+        let (resolved, symbol) = assert_binding(&mut context, &binding, expected);
         let observed = variable_initializer(&parsed, observed);
-        assert_eq!(context.get_type_at_location(observed).unwrap(), type_);
+        assert_eq!(context.get_type_at_location(observed).unwrap(), resolved);
         types.extend([
-            (binding.element, type_),
-            (binding.name, type_),
-            (observed, type_),
+            (binding.element, resolved),
+            (binding.name, resolved),
+            (observed, resolved),
         ]);
         symbols.extend([
             (binding.element, symbol),
