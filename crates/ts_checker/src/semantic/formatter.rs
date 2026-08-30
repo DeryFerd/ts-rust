@@ -14583,10 +14583,23 @@ mod tests {
         let signature_record = context.store().signature(signature).unwrap();
         assert!(signature_record.target().is_some());
         assert!(signature_record.mapper().is_some());
-        let effective = context
-            .store()
-            .callable_signature_parameter_types(signature)
-            .unwrap()[0];
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(context.store(), callable)
+        else {
+            panic!("the copied method retains its validated callable projection");
+        };
+        assert_eq!(projection.owner, callable);
+        assert!(projection.construct_signatures.is_empty());
+        let [projected] = projection.call_signatures.as_ref() else {
+            panic!("the copied method has one call signature");
+        };
+        assert_eq!(projected.owner, callable);
+        assert_eq!(projected.signature, signature);
+        assert!(projected.rest_parameter.is_none());
+        let [effective] = projected.parameters.as_slice() else {
+            panic!("the copied method has one effective parameter");
+        };
+        let effective = *effective;
         let source = context
             .store()
             .type_node_links(annotation)
