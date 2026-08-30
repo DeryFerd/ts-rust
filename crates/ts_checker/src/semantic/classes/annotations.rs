@@ -6,8 +6,9 @@ use super::{
     NodeData, NodeRef, ObjectFlags, SemanticSymbolId, SourceClassPlan, StructuredTypeData,
     SymbolFlags, SyntaxKind, TypeData, TypeId, TypeRecord, ValueSymbolLinks, bound_symbol,
     exact_class_instance_identity, invariant, preflight_class_or_interface_reference,
-    source_class_binding, source_class_plan_is_current, validate_class_heritage_members,
-    validate_source_class_header, validate_source_class_stored_header,
+    preflight_source_class_annotation, source_class_binding, source_class_plan_is_current,
+    validate_class_heritage_members, validate_source_class_header,
+    validate_source_class_stored_header,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,12 +129,21 @@ pub(in crate::semantic) fn class_instance_type_edges(
 
 pub(super) fn validate_source_annotation_value_cache(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    context: &ClassTypeQueryContext,
+    owner: SemanticSymbolId,
     annotation: NodeRef,
     symbol: SemanticSymbolId,
 ) -> Result<(), ClassError> {
-    let expected = store
-        .type_node_links(annotation)
-        .and_then(|links| links.resolved_type);
+    let expected = preflight_source_class_annotation(
+        store,
+        host,
+        &context.global_types,
+        context.options,
+        annotation,
+        owner,
+    )?
+    .cached_type(store, host, Some(&context.global_types))?;
     if store.value_symbol_links(symbol).is_some_and(|links| {
         links != &ValueSymbolLinks::default()
             && expected.is_none_or(|type_| {
@@ -259,6 +269,85 @@ pub(in crate::semantic) fn begin_retained_source_class_annotations(
     }
     let plan = plan.clone();
     begin_source_class_annotations(store, host, &context.global_types, &plan)
+}
+
+/// Keeps same-source pending headers valid during a member query's union-cache scan.
+pub(in crate::semantic) fn with_retained_source_class_annotation_scopes<T>(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    context: &ClassTypeQueryContext,
+    symbol: SemanticSymbolId,
+    query: impl FnOnce(&mut CanonicalTypeMapperStore) -> Result<T, ClassError>,
+) -> Result<T, ClassError> {
+    // Other routes keep the original requested-owner scope without gaining peers.
+    let peers = (|| {
+        let declaration = store.symbol(symbol)?.value_declaration()?;
+        let (_, bound) = host.source(declaration)?;
+        let root = bound.source_file();
+        let record = host.node(declaration)?;
+        let source = host.node(root)?;
+        let NodeData::SourceFile(data) = &source.data else {
+            return None;
+        };
+        if record.kind != SyntaxKind::ClassDeclaration
+            || record.parent != Some(root.node)
+            || source.kind != SyntaxKind::SourceFile
+            || source.parent.is_some()
+            || !store.contains_node_ref(root)
+            || bound_symbol(store, host, declaration) != Some(symbol)
+            || !data.statements.nodes.contains(&declaration.node)
+        {
+            return None;
+        }
+        Some((root, &data.statements.nodes))
+    })();
+    let mut owners = Vec::new();
+    owners
+        .try_reserve(peers.map_or(1, |(_, statements)| statements.len()))
+        .map_err(|_| invariant(ClassInvariant::InvalidInstanceMembers(symbol)))?;
+    if let Some((root, statements)) = peers {
+        for &node in statements {
+            let declaration = NodeRef::new(root.arena, root.file, node);
+            let Some(record) = host.node(declaration) else {
+                continue;
+            };
+            if record.kind != SyntaxKind::ClassDeclaration || record.parent != Some(root.node) {
+                continue;
+            }
+            if let Some(owner) = bound_symbol(store, host, declaration)
+                && store
+                    .symbol(owner)
+                    .and_then(|owner| owner.value_declaration())
+                    == Some(declaration)
+            {
+                owners.push(owner);
+            }
+        }
+    } else {
+        owners.push(symbol);
+    }
+    let mut scopes = Vec::new();
+    let result = (|| {
+        for owner in owners {
+            scopes
+                .try_reserve(1)
+                .map_err(|_| invariant(ClassInvariant::InvalidInstanceMembers(owner)))?;
+            if let Some(instance) =
+                begin_retained_source_class_annotations(store, host, context, owner)?
+            {
+                scopes.push((owner, instance));
+            }
+        }
+        query(store)
+    })();
+    let mut cleanup_error = None;
+    for (owner, instance) in scopes.into_iter().rev() {
+        if !store.end_source_class_annotation_scope(instance) {
+            cleanup_error
+                .get_or_insert_with(|| invariant(ClassInvariant::InvalidConstructSignature(owner)));
+        }
+    }
+    cleanup_error.map_or(result, Err)
 }
 
 pub(in crate::semantic) fn source_class_annotation_scope_targets(
@@ -455,6 +544,580 @@ mod tests {
                 .source_file_links(context.source_file(FILE).unwrap())
                 .cloned(),
             diagnostics: context.diagnostics().clone(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both producer orders and exact cache damage with their restores.
+    fn transparent_source_annotation_values_keep_child_and_owner_proofs() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parse_source_file(concat!(
+            "interface Token { value: number; } ",
+            "class Model { constructor(readonly token: (Token)) {} }",
+        ));
+        for source_first in [false, true] {
+            let mut context = context(&library, &source);
+            let (_, owner) = self_class_owner(&context, &source);
+            let (parameter, syntax) = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| match &record.data {
+                    NodeData::ParameterDeclaration(parameter) => {
+                        Some((NodeRef::new(source.arena.id(), FILE, node), parameter))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let annotation = NodeRef::new(source.arena.id(), FILE, syntax.type_.unwrap());
+            let NodeData::ParenthesizedTypeNode(parenthesized) =
+                &source.arena.get(annotation.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let child = NodeRef::new(source.arena.id(), FILE, parenthesized.type_);
+            let constructor = NodeRef::new(
+                source.arena.id(),
+                FILE,
+                source.arena.get(parameter.node).unwrap().parent.unwrap(),
+            );
+            let library_bound = context.file(LIBRARY_FILE).unwrap().1.clone();
+            let source_bound = context.file(FILE).unwrap().1.clone();
+            let local = context
+                .store()
+                .symbol_table(source_bound.locals(constructor).unwrap())
+                .unwrap()
+                .get_source("token")
+                .unwrap();
+            let property = source_bound.symbol(parameter).unwrap();
+            assert_ne!(local, property);
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&source.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let query_context =
+                ClassTypeQueryContext::new(context.global_types(), context.options());
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                let store = context.store();
+                (
+                    [
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.mapper_len(),
+                    ],
+                    store.checker_link_allocated_lengths(),
+                    [annotation, child].map(|node| {
+                        (
+                            store.type_node_links(node).cloned(),
+                            store.symbol_node_links(node).cloned(),
+                        )
+                    }),
+                    [local, property].map(|symbol| store.value_symbol_links(symbol).cloned()),
+                    context.diagnostics().clone(),
+                )
+            };
+            let cold = snapshot(&context);
+            assert_eq!(
+                validate_source_annotation_value_cache(
+                    context.store(),
+                    &host,
+                    &query_context,
+                    owner,
+                    annotation,
+                    local,
+                ),
+                Ok(())
+            );
+            assert_eq!(snapshot(&context), cold);
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                local,
+                ValueSymbolLinks {
+                    resolved_type: Some(number),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+            let cold_damage = snapshot(&context);
+            assert_eq!(
+                validate_source_annotation_value_cache(
+                    context.store(),
+                    &host,
+                    &query_context,
+                    owner,
+                    annotation,
+                    local,
+                ),
+                Err(invariant(ClassInvariant::InvalidPropertyValueCache(local)))
+            );
+            assert_eq!(snapshot(&context), cold_damage);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(local, ValueSymbolLinks::default())
+            );
+            if source_first {
+                context.check_source_file(FILE).unwrap();
+            }
+            let members = context.get_nongeneric_class_members(owner).unwrap();
+            let value = context
+                .store()
+                .value_symbol_links(local)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(property)
+                    .unwrap()
+                    .resolved_type,
+                Some(value)
+            );
+            assert!(context.store().type_node_links(annotation).is_none());
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(child)
+                    .unwrap()
+                    .resolved_type,
+                Some(value)
+            );
+            let warm = snapshot(&context);
+            for symbol in [local, property] {
+                assert_eq!(
+                    validate_source_annotation_value_cache(
+                        context.store(),
+                        &host,
+                        &query_context,
+                        owner,
+                        annotation,
+                        symbol,
+                    ),
+                    Ok(())
+                );
+            }
+            assert_eq!(snapshot(&context), warm);
+            for node in [child, annotation] {
+                let original = context
+                    .store()
+                    .type_node_links(node)
+                    .cloned()
+                    .unwrap_or_default();
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    node,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+                let damaged = snapshot(&context);
+                for _ in 0..2 {
+                    assert!(matches!(
+                        validate_source_annotation_value_cache(
+                            context.store(),
+                            &host,
+                            &query_context,
+                            owner,
+                            annotation,
+                            local,
+                        ),
+                        Err(ClassError::DeclaredType(_))
+                    ));
+                    assert_eq!(snapshot(&context), damaged);
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(node, original)
+                );
+            }
+            for symbol in [local, property] {
+                let original = context.store().value_symbol_links(symbol).unwrap().clone();
+                assert!(context.store_mut_for_test().set_value_symbol_links(
+                    symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..ValueSymbolLinks::default()
+                    }
+                ));
+                let damaged = snapshot(&context);
+                assert_eq!(
+                    validate_source_annotation_value_cache(
+                        context.store(),
+                        &host,
+                        &query_context,
+                        owner,
+                        annotation,
+                        symbol,
+                    ),
+                    Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)))
+                );
+                assert_eq!(snapshot(&context), damaged);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(symbol, original)
+                );
+            }
+            let restored = snapshot(&context);
+            assert_eq!(context.get_nongeneric_class_members(owner), Ok(members));
+            assert_eq!(snapshot(&context), restored);
+            assert!(context.store().type_resolution_is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both query orders share scope ownership, failure cleanup, and restore checks.
+    fn member_queries_reopen_same_source_headers_and_close_only_owned_scopes() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parse_source_file(concat!(
+            "class First { next: First | null = null; constructor(value: First | null) {} }\n",
+            "class Second { next: Second | null = null; constructor(value: Second | null) {} }\n",
+        ));
+        for reverse in [false, true] {
+            let mut context = context(&library, &source);
+            let declarations = source
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                        source.arena.id(),
+                        FILE,
+                        node,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let [first, second] = declarations.as_slice() else {
+                unreachable!()
+            };
+            let owners =
+                [*first, *second].map(|node| context.file(FILE).unwrap().1.symbol(node).unwrap());
+            let order = if reverse { [1, 0] } else { [0, 1] };
+            for index in order {
+                context.get_nongeneric_class_members(owners[index]).unwrap();
+            }
+            let members = owners.map(|owner| context.get_nongeneric_class_members(owner).unwrap());
+            let instances = members
+                .each_ref()
+                .map(|members| members.shells().instance_type());
+            let before = owners.map(|owner| header_replay_snapshot(&context, &source, owner));
+            for instance in instances {
+                assert_eq!(
+                    validate_class_heritage_members(context.store(), instance),
+                    ClassHeritageMembersValidation::Malformed
+                );
+                assert!(
+                    context
+                        .store()
+                        .source_class_annotation_scope(instance)
+                        .is_none()
+                );
+            }
+            let library_bound = context.file(LIBRARY_FILE).unwrap().1.clone();
+            let source_bound = context.file(FILE).unwrap().1.clone();
+            let globals = context.global_types().clone();
+            let query_context = ClassTypeQueryContext::new(&globals, context.options());
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&source.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let mut wrong = query_context.clone();
+            wrong.options.strict_function_types = Some(!context.options().strict_function_types);
+            let mut entered = false;
+            assert_eq!(
+                with_retained_source_class_annotation_scopes(
+                    context.store_mut_for_test(),
+                    &host,
+                    &wrong,
+                    owners[1],
+                    |_| {
+                        entered = true;
+                        Ok(())
+                    },
+                ),
+                Err(invariant(ClassInvariant::InvalidPlan(*first)))
+            );
+            assert!(!entered);
+            assert_eq!(
+                owners.map(|owner| header_replay_snapshot(&context, &source, owner)),
+                before
+            );
+
+            assert_eq!(
+                begin_retained_source_class_annotations(
+                    context.store_mut_for_test(),
+                    &host,
+                    &query_context,
+                    owners[0],
+                ),
+                Ok(Some(instances[0]))
+            );
+            assert_eq!(
+                context.get_nongeneric_class_members(owners[1]),
+                Ok(members[1].clone())
+            );
+            assert!(
+                context
+                    .store()
+                    .source_class_annotation_scope(instances[0])
+                    .is_some()
+            );
+            assert!(
+                context
+                    .store()
+                    .source_class_annotation_scope(instances[1])
+                    .is_none()
+            );
+            let failure = invariant(ClassInvariant::InvalidPlan(*second));
+            assert_eq!(
+                with_retained_source_class_annotation_scopes(
+                    context.store_mut_for_test(),
+                    &host,
+                    &query_context,
+                    owners[1],
+                    |store| {
+                        for instance in instances {
+                            assert_eq!(
+                                source_class_annotation_scope_targets(store, instance),
+                                Some(CanonicalArrayTargets::from_global_types(&globals))
+                            );
+                        }
+                        Err::<(), _>(failure)
+                    },
+                ),
+                Err(failure)
+            );
+            assert!(
+                context
+                    .store()
+                    .source_class_annotation_scope(instances[0])
+                    .is_some()
+            );
+            assert!(
+                context
+                    .store()
+                    .source_class_annotation_scope(instances[1])
+                    .is_none()
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .end_source_class_annotation_scope(instances[0])
+            );
+
+            let annotation = context
+                .store()
+                .source_class_provenance_for_symbol(owners[1])
+                .unwrap()
+                .prepared
+                .plan
+                .initialized_properties[0]
+                .type_node;
+            let original = context.store().type_node_links(annotation).unwrap().clone();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert!(context.store_mut_for_test().set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(number),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+            let damaged = owners.map(|owner| header_replay_snapshot(&context, &source, owner));
+            for _ in 0..2 {
+                assert!(context.get_nongeneric_class_members(owners[0]).is_err());
+                for instance in instances {
+                    assert!(
+                        context
+                            .store()
+                            .source_class_annotation_scope(instance)
+                            .is_none()
+                    );
+                }
+                assert_eq!(
+                    owners.map(|owner| header_replay_snapshot(&context, &source, owner)),
+                    damaged
+                );
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(annotation, original)
+            );
+            for (owner, members) in owners.into_iter().zip(members) {
+                assert_eq!(context.get_nongeneric_class_members(owner), Ok(members));
+            }
+            assert_eq!(
+                owners.map(|owner| header_replay_snapshot(&context, &source, owner)),
+                before
+            );
+            assert!(context.store().type_resolution_is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the independently bound foreign source and both authority checks together.
+    fn member_query_scopes_do_not_admit_pending_headers_from_other_sources() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parse_source_file(
+            "class Local { next: Local | null = null; constructor(value: Local | null) {} }",
+        );
+        let foreign = parse_source_file(
+            "class Foreign { next: Foreign | null = null; constructor(value: Foreign | null) {} }",
+        );
+        let foreign_file = FileId::new(202_454);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, path, is_library) in [
+            (&library, LIBRARY_FILE, "\"/lib.d.ts\"", true),
+            (&source, FILE, "\"/local.ts\"", false),
+            (&foreign, foreign_file, "\"/foreign.ts\"", false),
+        ] {
+            assert!(parsed.diagnostics.is_empty());
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_library,
+                        is_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            strict_property_initialization: true,
+            no_implicit_any: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (LIBRARY_FILE, &library.arena),
+                (FILE, &source.arena),
+                (foreign_file, &foreign.arena),
+            ],
+            options,
+        )
+        .unwrap();
+        let (_, local_owner) = self_class_owner(&context, &source);
+        let foreign_declaration = foreign
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    foreign.arena.id(),
+                    foreign_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let foreign_owner = context
+            .file(foreign_file)
+            .unwrap()
+            .1
+            .symbol(foreign_declaration)
+            .unwrap();
+        let members = context.get_nongeneric_class_members(foreign_owner).unwrap();
+        let instance = members.shells().instance_type();
+        let globals = context.global_types().clone();
+        let query_context = ClassTypeQueryContext::new(&globals, options);
+        let library_bound = context.file(LIBRARY_FILE).unwrap().1.clone();
+        let source_bound = context.file(FILE).unwrap().1.clone();
+        let foreign_bound = context.file(foreign_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+                (&foreign.arena, &foreign_bound),
+            ],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.checker_link_allocated_lengths(),
+                store
+                    .source_class_provenance_for_symbol(foreign_owner)
+                    .cloned(),
+                store.declared_type_links(local_owner).cloned(),
+                context.diagnostics().clone(),
+            )
+        };
+        let before = snapshot(&context);
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        for _ in 0..2 {
+            assert_eq!(
+                with_retained_source_class_annotation_scopes(
+                    context.store_mut_for_test(),
+                    &host,
+                    &query_context,
+                    local_owner,
+                    |store| {
+                        assert!(store.source_class_annotation_scope(instance).is_none());
+                        assert_eq!(
+                            validate_class_heritage_members(store, instance),
+                            ClassHeritageMembersValidation::Malformed
+                        );
+                        assert_eq!(
+                            store.validate_union_constituent_with_array_targets(targets, instance),
+                            Err(LiteralTypeCacheError::InvalidCachedUnion(instance))
+                        );
+                        Ok(())
+                    },
+                ),
+                Ok(())
+            );
+            assert_eq!(snapshot(&context), before);
+            assert_eq!(
+                with_retained_source_class_annotation_scopes(
+                    context.store_mut_for_test(),
+                    &host,
+                    &query_context,
+                    foreign_owner,
+                    |store| {
+                        assert_eq!(
+                            source_class_annotation_scope_targets(store, instance),
+                            Some(targets)
+                        );
+                        assert_eq!(
+                            store.validate_union_constituent_with_array_targets(targets, instance),
+                            Ok(())
+                        );
+                        Ok(())
+                    },
+                ),
+                Ok(())
+            );
+            assert!(
+                context
+                    .store()
+                    .source_class_annotation_scope(instance)
+                    .is_none()
+            );
+            assert_eq!(snapshot(&context), before);
         }
     }
 
