@@ -27249,85 +27249,90 @@ fn collect_eager_logical_truthiness_conditions(
     }
 }
 
-fn expression_has_object_literal_getters(expression: &PlannedExpression) -> bool {
+fn expression_has_deferred_object_members(expression: &PlannedExpression) -> bool {
     match &expression.kind {
         PlannedExpressionKind::Object { plan, properties } => {
             !plan.object_literal_getters.is_empty()
                 || properties
                     .iter()
                     .filter_map(PlannedObjectMember::eager_expression)
-                    .any(expression_has_object_literal_getters)
+                    .any(expression_has_deferred_object_members)
                 || expression
                     .object_spreads
                     .iter()
-                    .any(expression_has_object_literal_getters)
+                    .any(expression_has_deferred_object_members)
         }
         PlannedExpressionKind::Array(elements) => {
-            elements.iter().any(expression_has_object_literal_getters)
+            elements.iter().any(expression_has_deferred_object_members)
         }
         PlannedExpressionKind::Parenthesized(inner)
         | PlannedExpressionKind::Assertion { operand: inner, .. } => {
-            expression_has_object_literal_getters(inner)
+            expression_has_deferred_object_members(inner)
         }
         PlannedExpressionKind::Property(property) => {
-            expression_has_object_literal_getters(&property.receiver)
+            expression_has_deferred_object_members(&property.receiver)
         }
         PlannedExpressionKind::Element(element) => {
-            expression_has_object_literal_getters(&element.receiver)
-                || expression_has_object_literal_getters(&element.index)
+            expression_has_deferred_object_members(&element.receiver)
+                || expression_has_deferred_object_members(&element.index)
         }
         PlannedExpressionKind::Call(call) => {
-            expression_has_object_literal_getters(&call.callee)
+            expression_has_deferred_object_members(&call.callee)
                 || call
                     .arguments
                     .iter()
-                    .any(expression_has_object_literal_getters)
+                    .any(expression_has_deferred_object_members)
         }
         PlannedExpressionKind::Binary(binary) => {
-            expression_has_object_literal_getters(&binary.left)
-                || expression_has_object_literal_getters(&binary.right)
+            expression_has_deferred_object_members(&binary.left)
+                || expression_has_deferred_object_members(&binary.right)
                 || binary
                     .prefix
                     .iter()
-                    .any(|step| expression_has_object_literal_getters(&step.right))
+                    .any(|step| expression_has_deferred_object_members(&step.right))
         }
         PlannedExpressionKind::Logical(binary) => {
-            expression_has_object_literal_getters(&binary.left)
-                || expression_has_object_literal_getters(&binary.right)
+            expression_has_deferred_object_members(&binary.left)
+                || expression_has_deferred_object_members(&binary.right)
         }
         PlannedExpressionKind::Conditional(conditional) => {
-            expression_has_object_literal_getters(&conditional.condition)
-                || expression_has_object_literal_getters(&conditional.when_true)
-                || expression_has_object_literal_getters(&conditional.when_false)
+            expression_has_deferred_object_members(&conditional.condition)
+                || expression_has_deferred_object_members(&conditional.when_true)
+                || expression_has_deferred_object_members(&conditional.when_false)
         }
         PlannedExpressionKind::Template(template) => template
             .substitutions
             .iter()
-            .any(expression_has_object_literal_getters),
+            .any(expression_has_deferred_object_members),
+        PlannedExpressionKind::Arrow(arrow) => {
+            arrow.callable.family == SourceCallableFamily::ObjectLiteralMethod
+                && arrow.callable.declaration == expression.node
+                && arrow.callable.body_mode == SourceCallableBodyMode::Present
+        }
         _ => false,
     }
 }
 
-fn arrow_has_object_literal_getters(arrow: &PlannedArrow) -> bool {
+fn arrow_has_deferred_object_members(arrow: &PlannedArrow) -> bool {
     matches!(&arrow.body, PlannedArrowBody::Return { expression, .. }
-        if expression_has_object_literal_getters(expression))
+        if expression_has_deferred_object_members(expression))
         || arrow
             .expression_statement
             .as_ref()
-            .is_some_and(|statement| expression_has_object_literal_getters(&statement.expression))
+            .is_some_and(|statement| expression_has_deferred_object_members(&statement.expression))
         || arrow.linear_body.as_ref().is_some_and(|body| {
             body.return_expression
                 .as_ref()
-                .is_some_and(expression_has_object_literal_getters)
+                .is_some_and(expression_has_deferred_object_members)
                 || body.locals.iter().any(|local| {
                     matches!(&local.initializer,
                     PlannedVariableInitializer::Expression(expression)
-                        if expression_has_object_literal_getters(expression))
+                        if expression_has_deferred_object_members(expression))
                 })
                 || body.statements.iter().any(|statement| match statement {
                     PlannedLinearFunctionStatement::Expression { expression, .. }
                     | PlannedLinearFunctionStatement::Throw { expression, .. } => {
-                        expression_has_object_literal_getters(expression)
+                        expression_has_deferred_object_members(expression)
                     }
                     _ => false,
                 })
@@ -43878,9 +43883,9 @@ fn check_planned_async_captured_loop(
     Ok(())
 }
 
-/// Keeps checked local entry types alive through an inferred getter-bearing return.
+/// Keeps local entry types alive while a returned object's deferred members are checked.
 #[allow(clippy::too_many_arguments)]
-fn check_inferred_linear_getter_return(
+fn check_inferred_linear_deferred_object_return(
     bound: &BoundFile,
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -44188,9 +44193,9 @@ fn check_planned_linear_function_statements_with_capture_entries(
                     && nested
                         .return_expression
                         .as_ref()
-                        .is_some_and(expression_has_object_literal_getters)
+                        .is_some_and(expression_has_deferred_object_members)
                 {
-                    check_inferred_linear_getter_return(
+                    check_inferred_linear_deferred_object_return(
                         bound,
                         store,
                         host,
@@ -50012,7 +50017,7 @@ fn publish_checked_source_callable_return_with_contextual_return(
         contextual_return
     };
     let parameter_entries = if arrow_capture.is_none()
-        && expression.is_some_and(expression_has_object_literal_getters)
+        && expression.is_some_and(expression_has_deferred_object_members)
     {
         Some(source_arrow_parameter_entry_types(store, callable)?)
     } else {
@@ -62376,9 +62381,9 @@ pub(super) fn check_source_file(
                 if statements
                     .return_expression
                     .as_ref()
-                    .is_some_and(expression_has_object_literal_getters)
+                    .is_some_and(expression_has_deferred_object_members)
                 {
-                    check_inferred_linear_getter_return(
+                    check_inferred_linear_deferred_object_return(
                         bound,
                         store,
                         host,
@@ -63606,7 +63611,7 @@ pub(super) fn check_source_file(
             }
             PlannedStatement::DefaultObject(export)
             | PlannedStatement::DefaultAssertion(export) => {
-                let capture = expression_has_object_literal_getters(&export.expression).then_some(
+                let capture = expression_has_deferred_object_members(&export.expression).then_some(
                     SourceArrowCaptureContext {
                         declared_types: &top_level_declared_types,
                         mutable_symbols: Some(&mutable_variables),
@@ -64362,7 +64367,7 @@ pub(super) fn check_source_file(
                         javascript_jsdoc.as_ref(),
                     )?;
                 }
-                if callback.is_none() && arrow_has_object_literal_getters(arrow) {
+                if callback.is_none() && arrow_has_deferred_object_members(arrow) {
                     let expression = PlannedArrowExpression {
                         callable: callable.clone(),
                         parameter_initializers: arrow.parameter_initializers.clone(),
@@ -65214,7 +65219,7 @@ pub(super) fn check_source_file(
                 for variable in variables {
                     let capture = match &variable.initializer {
                         PlannedVariableInitializer::Expression(expression)
-                            if expression_has_object_literal_getters(expression)
+                            if expression_has_deferred_object_members(expression)
                                 || matches!(&expression.unparenthesized().kind,
                                     PlannedExpressionKind::Arrow(arrow)
                                         if store.source_node_kind(arrow.callable.declaration)
@@ -68390,7 +68395,7 @@ pub(super) fn check_source_file(
                 )?;
             }
             PlannedStatement::ExpressionValue(expression) => {
-                let capture = expression_has_object_literal_getters(&expression).then_some(
+                let capture = expression_has_deferred_object_members(&expression).then_some(
                     SourceArrowCaptureContext {
                         declared_types: &top_level_declared_types,
                         mutable_symbols: Some(&mutable_variables),
@@ -68447,7 +68452,7 @@ pub(super) fn check_source_file(
 
     for arrow in &arrows {
         if arrow.source.callable.return_type.is_inferred()
-            || arrow_has_object_literal_getters(arrow)
+            || arrow_has_deferred_object_members(arrow)
         {
             continue;
         }
@@ -70318,6 +70323,134 @@ mod tests {
                 assert_eq!(observable_state(&context, file), warm);
                 assert_eq!(resolved_node_type(&context, eager), number);
                 assert_eq!(resolved_node_type(&context, later), declared);
+            }
+        }
+    }
+
+    #[test]
+    fn object_methods_keep_eager_reads_and_deferred_capture_entries() {
+        for (index, (text, keeps_union)) in [
+            (
+                concat!(
+                    "let value: string | number = 1; ",
+                    "const object = ({ eager: value, read() { return value; } }); ",
+                    "value = 'later';",
+                ),
+                true,
+            ),
+            (
+                concat!(
+                    "function make() { let value: string | number = 1; ",
+                    "return ({ eager: value, read() { return value; } }); }",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "const make = () => { let value: string | number = 1; ",
+                    "return ({ eager: value, read() { return value; } }); };",
+                ),
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(202_320 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let method = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::MethodDeclaration).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let NodeData::MethodDeclaration(method_data) =
+                &source.arena.get(method.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let NodeData::Block(body) = &source.arena.get(method_data.body.unwrap()).unwrap().data
+            else {
+                unreachable!()
+            };
+            let [statement] = body.statements.nodes.as_slice() else {
+                panic!("the method must keep its one return statement")
+            };
+            let NodeData::ReturnStatement(returned) = &source.arena.get(*statement).unwrap().data
+            else {
+                unreachable!()
+            };
+            let read = NodeRef::new(source.arena.id(), file, returned.expression.unwrap());
+            let eager = source
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::PropertyAssignment(property) = &record.data else {
+                        return None;
+                    };
+                    Some(NodeRef::new(source.arena.id(), file, property.initializer))
+                })
+                .unwrap();
+            let owner = context.file(file).unwrap().1.symbol(method).unwrap();
+            let captured = variable_symbol(&context, &source, file, "value");
+            let declared = variable_value_type(&context, &source, file, "value");
+            assert!(matches!(
+                context.store().type_payload(declared).unwrap().data(),
+                TypeData::Union(_)
+            ));
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let expected = if keeps_union { declared } else { number };
+            let callable = resolved_node_type(&context, method);
+            let provenance = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap();
+            assert_eq!(provenance.family, SourceCallableFamily::ObjectLiteralMethod);
+            assert_eq!(provenance.owner_symbol, owner);
+            assert_eq!(provenance.declaration, method);
+            assert_eq!(
+                context.get_return_type_of_signature(provenance.signature),
+                Ok(expected)
+            );
+            assert_eq!(resolved_node_type(&context, eager), number);
+            assert_eq!(resolved_node_type(&context, read), expected);
+            for node in [eager, read] {
+                assert_eq!(
+                    context.store().symbol_node_links(node),
+                    Some(&SymbolNodeLinks {
+                        resolved_symbol: Some(captured)
+                    }),
+                );
+            }
+            let warm = observable_state(&context, file);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(context.get_type_at_location(method), Ok(callable));
+                assert_eq!(
+                    context.get_return_type_of_signature(provenance.signature),
+                    Ok(expected),
+                );
+                assert_eq!(resolved_node_type(&context, eager), number);
+                assert_eq!(resolved_node_type(&context, read), expected);
+                assert_eq!(observable_state(&context, file), warm);
+                assert!(context.diagnostics().is_empty());
             }
         }
     }
