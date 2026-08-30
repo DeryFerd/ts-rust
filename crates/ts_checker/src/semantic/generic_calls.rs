@@ -7655,7 +7655,7 @@ mod tests {
     ) -> (
         ValidatedSingleCallable,
         ValidatedSingleCallable,
-        ValidatedSingleCallable,
+        SignatureId,
     ) {
         context.check_source_file(file).unwrap();
         assert!(context.diagnostics().is_empty());
@@ -7678,7 +7678,7 @@ mod tests {
             panic!("expected the separate written constructor")
         };
         let call = call.clone();
-        let construct = construct.clone();
+        let construct = *construct;
         let annotation = property_alias_variable_nodes(parsed, file, "contextual")
             .0
             .unwrap();
@@ -7753,9 +7753,9 @@ mod tests {
         assert_eq!(store.signature(source.signature).unwrap().target(), None);
         assert_eq!(store.signature(source.signature).unwrap().mapper(), None);
         assert_eq!(
-            fixed_contextual_call_candidate(store, source.owner, construct.signature, targets),
+            fixed_contextual_call_candidate(store, source.owner, construct, targets),
             Err(GenericCallVectorError::Invariant(
-                GenericCallVectorInvariant::CallableSignatureMismatch(construct.signature)
+                GenericCallVectorInvariant::CallableSignatureMismatch(construct)
             ))
         );
         assert_eq!(
@@ -7821,17 +7821,22 @@ mod tests {
         let no_constraint = store.intrinsic_bootstrap().unwrap().no_constraint_type;
         let mut session = InstantiationSession::new(InstantiationLimits::default());
         let before = vector_cache_graph_counts(store);
+        // Use the real constructor ID as a deliberately invalid selected call.
+        let invalid_selected_call = ValidatedSingleCallable {
+            signature: construct,
+            ..source.clone()
+        };
         assert_eq!(
             instantiate_generic_signature_in_fixed_context(
                 store,
                 &globals,
                 strict,
-                &construct,
+                &invalid_selected_call,
                 &contextual,
                 &mut session,
             ),
             Err(GenericCallVectorError::Invariant(
-                GenericCallVectorInvariant::CallableSignatureMismatch(construct.signature)
+                GenericCallVectorInvariant::CallableSignatureMismatch(construct)
             ))
         );
         assert_eq!(vector_cache_graph_counts(store), before);

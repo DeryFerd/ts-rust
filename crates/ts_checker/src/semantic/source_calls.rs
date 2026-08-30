@@ -12207,7 +12207,7 @@ mod tests {
                 let bootstrap = context.store().intrinsic_bootstrap().unwrap();
                 let boolean = bootstrap.boolean_type;
                 assert_eq!(
-                    union.union.types.as_ref(),
+                    union.union.types.as_slice(),
                     &[bootstrap.null_type, bootstrap.string_type]
                 );
                 let NodeData::CallExpression(data) = &source.arena.get(call.node).unwrap().data
