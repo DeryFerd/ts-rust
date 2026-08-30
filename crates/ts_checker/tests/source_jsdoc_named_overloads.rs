@@ -7,9 +7,7 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, SignatureId, TypeData, TypeId,
-    jsdoc::{
-        JsDocCommentError, JsDocTagKind, parse_jsdoc_comment_at, plan_javascript_source_jsdoc,
-    },
+    jsdoc::{JsDocTagKind, parse_jsdoc_comment_at, plan_javascript_source_jsdoc},
 };
 use ts_core::{TextPos, TextRange};
 use ts_parser::{ParseResult, parse_javascript_source_file};
@@ -685,7 +683,8 @@ fn named_jsdoc_overloads_report_the_first_incompatible_signature_and_implementat
 }
 
 #[test]
-fn named_jsdoc_generic_overloads_remain_unsupported_without_nongeneric_fallback() {
+#[allow(clippy::too_many_lines)] // Keep the unchanged generic input and its source/query identities together.
+fn named_jsdoc_generic_overloads_keep_separate_templates_without_nongeneric_fallback() {
     let parsed = parse_javascript_source_file(concat!(
         "/** @template T @param {T} value @returns {T}\n",
         " * @overload @param {T} value @returns {T} */\n",
@@ -693,17 +692,180 @@ fn named_jsdoc_generic_overloads_remain_unsupported_without_nongeneric_fallback(
     ));
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let declarations = nodes(&parsed, SyntaxKind::FunctionDeclaration);
-    let [declaration] = declarations.as_slice() else {
-        panic!("unsupported generic overloads must not create nongeneric rows")
+    let [overload, implementation] = declarations.as_slice() else {
+        panic!("expected one real generic overload and its implementation")
     };
     let source = NodeRef::new(parsed.arena.id(), FILE, parsed.source_file);
-    for _ in 0..2 {
+    let planned = plan_javascript_source_jsdoc(&parsed.arena, source).unwrap();
+    assert!(planned.diagnostics().is_empty());
+    let template_range = planned
+        .declaration(*implementation)
+        .unwrap()
+        .template_parameters()[0]
+        .range();
+    let source_text = parsed.arena.source_text().unwrap();
+    let template_list_range = range(
+        source_text.find("@template").unwrap(),
+        source_text.find("@param").unwrap(),
+    );
+    let annotations = source_text
+        .match_indices("{T}")
+        .map(|(start, _)| range(start + 1, start + 2))
+        .collect::<Vec<_>>();
+    assert_eq!(annotations.len(), 4);
+    let mut context = context(&parsed);
+    context.check_source_file(FILE).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+    let owner = symbol(&context, *overload);
+    assert_eq!(symbol(&context, *implementation), owner);
+    assert_eq!(
+        context.get_symbol_declarations(owner).unwrap(),
+        declarations
+    );
+    assert_eq!(
+        context.store().symbol(owner).unwrap().value_declaration(),
+        Some(*overload)
+    );
+    let callable = context.get_type_at_location(*implementation).unwrap();
+    let row_signatures = declarations
+        .iter()
+        .map(|&node| signature(&context, node))
+        .collect::<Vec<_>>();
+    let TypeData::Object(object) = context.store().type_payload(callable).unwrap().data() else {
+        panic!("expected the source overload object")
+    };
+    assert_eq!(object.structured.call_signature_count, 1);
+    assert_eq!(
+        object.structured.signatures.as_deref(),
+        Some(&row_signatures[..1])
+    );
+    assert_ne!(row_signatures[0], row_signatures[1]);
+    let mut template_symbols = Vec::new();
+    let mut template_types = Vec::new();
+    let mut parameter_symbols = Vec::new();
+    let mut queries = Vec::new();
+    for (index, &declaration) in declarations.iter().enumerate() {
+        let record = parsed.arena.get(declaration.node).unwrap();
+        let NodeData::FunctionDeclaration(function) = &record.data else {
+            unreachable!()
+        };
+        assert_eq!(function.body.is_some(), declaration == *implementation);
+        if declaration == *overload {
+            assert_eq!(record.flags, NodeFlags::REPARSED);
+            assert_eq!(node_text(&parsed, declaration), "overload");
+            let start = source_text.find("@overload").unwrap() + 1;
+            assert_eq!(record.range, range(start, start + "overload".len()));
+        }
+        let node_ref = |node| NodeRef::new(parsed.arena.id(), FILE, node);
+        let templates = function.type_parameters.as_ref().unwrap();
+        assert_eq!(templates.range, template_list_range);
+        let [template] = templates.nodes.as_slice() else {
+            panic!("the overload and host must each retain one template")
+        };
+        let template_record = parsed.arena.get(*template).unwrap();
+        assert_eq!(template_record.flags, NodeFlags::REPARSED);
+        assert_eq!(template_record.parent, Some(declaration.node));
+        assert_eq!(template_record.range, template_range);
+        let NodeData::TypeParameterDeclaration(template) = &template_record.data else {
+            unreachable!()
+        };
         assert_eq!(
-            plan_javascript_source_jsdoc(&parsed.arena, source),
-            Err(JsDocCommentError::UnsupportedOverloadDeclaration(
-                *declaration
-            )),
+            parsed.arena.get(template.name).unwrap().range,
+            template_range
         );
+        let template_symbol = symbol(&context, node_ref(templates.nodes[0]));
+        let template_type = context
+            .get_type_at_location(node_ref(template.name))
+            .unwrap();
+        let type_record = context.store().type_payload(template_type).unwrap();
+        assert_eq!(type_record.symbol(), Some(template_symbol));
+        assert!(matches!(type_record.data(), TypeData::TypeParameter(_)));
+        assert_eq!(
+            context.get_symbol_declarations(template_symbol).unwrap(),
+            [node_ref(templates.nodes[0])]
+        );
+        let [parameter_node] = function.parameters.nodes.as_slice() else {
+            panic!("the unchanged source has one value parameter")
+        };
+        let parameter_symbol = symbol(&context, node_ref(*parameter_node));
+        let NodeData::ParameterDeclaration(parameter) =
+            &parsed.arena.get(*parameter_node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let parameter_annotation = parameter.type_.unwrap();
+        let return_annotation = function.type_.unwrap();
+        let annotation_index = if index == 0 { 2 } else { 0 };
+        assert_eq!(
+            parsed.arena.get(parameter_annotation).unwrap().range,
+            annotations[annotation_index]
+        );
+        assert_eq!(
+            parsed.arena.get(return_annotation).unwrap().range,
+            annotations[annotation_index + 1]
+        );
+        for node in [
+            template.name,
+            parameter.name,
+            parameter_annotation,
+            return_annotation,
+        ] {
+            let node = node_ref(node);
+            assert_eq!(context.get_type_at_location(node).unwrap(), template_type);
+            queries.push((node, template_type));
+        }
+        let signature = context.store().signature(row_signatures[index]).unwrap();
+        assert_eq!(signature.declaration(), Some(declaration));
+        assert_eq!(signature.type_parameters(), [template_type]);
+        assert_eq!(signature.parameters(), [parameter_symbol]);
+        assert_eq!(signature.target(), None);
+        assert_eq!(signature.mapper(), None);
+        assert_eq!(
+            context
+                .get_return_type_of_signature(row_signatures[index])
+                .unwrap(),
+            template_type
+        );
+        template_symbols.push(template_symbol);
+        template_types.push(template_type);
+        parameter_symbols.push(parameter_symbol);
+    }
+    assert_ne!(template_symbols[0], template_symbols[1]);
+    assert_ne!(template_types[0], template_types[1]);
+    assert_ne!(parameter_symbols[0], parameter_symbols[1]);
+    assert_eq!(
+        context.type_to_string(callable).unwrap(),
+        "<T>(value: T) => T"
+    );
+    let before = counts(&context);
+    for _ in 0..2 {
+        context.recheck_source_file(FILE).unwrap();
+        assert_eq!(
+            context.get_type_at_location(*implementation).unwrap(),
+            callable
+        );
+        assert_eq!(
+            context.type_to_string(callable).unwrap(),
+            "<T>(value: T) => T"
+        );
+        for (index, &declaration) in declarations.iter().enumerate() {
+            assert_eq!(signature(&context, declaration), row_signatures[index]);
+            assert_eq!(
+                context
+                    .get_return_type_of_signature(row_signatures[index])
+                    .unwrap(),
+                template_types[index]
+            );
+        }
+        for &(node, type_) in &queries {
+            assert_eq!(context.get_type_at_location(node).unwrap(), type_);
+        }
+        assert_eq!(counts(&context), before);
+        assert!(context.diagnostics().is_empty());
     }
 }
 

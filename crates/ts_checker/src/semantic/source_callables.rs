@@ -2810,7 +2810,20 @@ pub(super) fn plan_enclosing_source_callable_annotation(
                 .bound_file(current)
                 .and_then(|bound| bound.symbol(current))
                 .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(current)))?;
-            let plan = plan_source_callable(store, host, current, owner, array_targets)?;
+            let plan = if let Some(group) = host.source(current).and_then(|(arena, _)| {
+                super::jsdoc::authenticated_jsdoc_overload_group(arena, current)
+            }) {
+                plan_source_jsdoc_overload_declaration(
+                    store,
+                    host,
+                    current,
+                    owner,
+                    &group.declarations,
+                    array_targets,
+                )?
+            } else {
+                plan_source_callable(store, host, current, owner, array_targets)?
+            };
             return Ok(plan.requires_type_query_evidence().then_some(plan));
         }
         let Some(parent) = record.parent else {
@@ -4044,7 +4057,10 @@ fn plan_source_callable_with_owner_shape(
                     plan.body_mode,
                     SourceCallableBodyMode::Present | SourceCallableBodyMode::OverloadDeclaration
                 )
-                || !plan.type_parameters.is_empty()
+                || plan.type_parameters.len() > 1
+                || plan.type_parameters.iter().any(|parameter| {
+                    parameter.constraint.is_some() || parameter.default_type.is_some()
+                })
                 || plan.return_type.type_node().is_none()
                 || plan.type_predicate.is_some()
                 || plan.export_local.is_some()
@@ -6692,6 +6708,15 @@ pub(super) fn is_reparsed_jsdoc_generic_callable(
         || parameters.nodes.is_empty()
     {
         return Ok(false);
+    }
+    if super::jsdoc::authenticated_jsdoc_overload_group(arena, declaration).is_some() {
+        return Ok(matches!(
+            &preflight_node(store, host, declaration)?.data,
+            NodeData::FunctionDeclaration(function)
+                if function.type_parameters.as_ref().is_some_and(|actual| {
+                    actual.range == parameters.range && actual.nodes == parameters.nodes
+                })
+        ));
     }
     let comments = plan_javascript_source_jsdoc(arena, bound.source_file())
         .map_err(|_| invariant(SourceCallableInvariant::InvalidSyntax(declaration)))?;

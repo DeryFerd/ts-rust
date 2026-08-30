@@ -403,6 +403,7 @@ pub(super) struct SourceOverloadSignatureProvenance {
     pub(super) declaration: NodeRef,
     pub(super) signature: SignatureId,
     pub(super) flags: SignatureFlags,
+    pub(super) type_parameters: Box<[SourceCallableTypeParameterProvenance]>,
     pub(super) parameters: Box<[SourceOverloadParameterProvenance]>,
     pub(super) return_annotation: NodeRef,
     pub(super) return_annotation_null_literal_identity: bool,
@@ -438,9 +439,10 @@ pub(super) struct PreparedSourceOverloadParameter {
 }
 
 /// Fully resolved signature row staged before overload publication.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(super) struct PreparedSourceOverloadSignature {
     pub(super) declaration: NodeRef,
+    pub(super) query_evidence: Option<Arc<SourceCallableTypeQueryEvidence>>,
     pub(super) parameters: Vec<PreparedSourceOverloadParameter>,
     pub(super) flags: SignatureFlags,
     pub(super) min_argument_count: i32,
@@ -450,7 +452,7 @@ pub(super) struct PreparedSourceOverloadSignature {
 }
 
 /// Dependency-closed transaction input for one source overload group.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(super) struct PreparedSourceOverloadPublication {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) signatures: Vec<PreparedSourceOverloadSignature>,
@@ -714,6 +716,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     /// Pinned checker `cachedSignatures`, keyed by generic target and the
     /// ordered type-argument hash.
     cached_signatures: HashMap<(SignatureId, CacheHashKey), CachedSignatureEntry>,
+    /// Pinned `SignatureKeyErased` entries used only for implementation checks.
+    source_overload_erased_signatures: HashMap<SignatureId, SignatureId>,
     unresolved_symbols: HashMap<UnresolvedSymbolKey, SemanticSymbolId>,
     unresolved_symbol_keys: HashMap<SemanticSymbolId, UnresolvedSymbolKey>,
     /// Pinned checker `propertiesTypes`, including its WIP unresolved-members
@@ -880,6 +884,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_overload_types_by_owner: HashMap::new(),
             source_overload_types_by_signature: HashMap::new(),
             cached_signatures: HashMap::new(),
+            source_overload_erased_signatures: HashMap::new(),
             unresolved_symbols: HashMap::new(),
             unresolved_symbol_keys: HashMap::new(),
             properties_types: HashMap::new(),
@@ -7409,7 +7414,49 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub(super) fn cached_signature_len(&self) -> usize {
-        self.cached_signatures.len()
+        self.cached_signatures.len() + self.source_overload_erased_signatures.len()
+    }
+
+    pub(super) fn source_overload_erased_signature(
+        &self,
+        target: SignatureId,
+    ) -> Option<SignatureId> {
+        self.observe_relation_signature_read(target);
+        self.source_overload_erased_signatures.get(&target).copied()
+    }
+
+    pub(super) fn try_reserve_source_overload_erased_signatures(
+        &mut self,
+        additional: usize,
+    ) -> bool {
+        self.source_overload_erased_signatures
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    pub(super) fn set_source_overload_erased_signature(
+        &mut self,
+        target: SignatureId,
+        erased: SignatureId,
+    ) -> bool {
+        if self.source_overload_type_for_signature(target).is_none()
+            || self.source_overload_erased_signatures.contains_key(&target)
+            || self
+                .cached_signatures
+                .values()
+                .any(|entry| entry.instantiated == erased)
+            || self.signature(erased).is_none_or(|signature| {
+                signature.target() != Some(target)
+                    || signature.mapper().is_none()
+                    || !signature.type_parameters().is_empty()
+                    || signature.resolved_return_type().is_none()
+            })
+        {
+            return false;
+        }
+        self.source_overload_erased_signatures
+            .insert(target, erased);
+        true
     }
 
     /// Reports whether an owned signature is published by any authoritative
@@ -7422,7 +7469,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         Some(
             self.cached_signatures
                 .values()
-                .any(|entry| entry.instantiated == signature),
+                .any(|entry| entry.instantiated == signature)
+                || self
+                    .source_overload_erased_signatures
+                    .values()
+                    .any(|entry| *entry == signature),
         )
     }
 
@@ -9617,7 +9668,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         }
         Some(type_)
     }
+}
 
+impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
     /// Publishes a dependency-closed batch of local overload groups.
     ///
     /// Every source, binder, cache, and capacity edge is checked before the
@@ -9641,6 +9694,8 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         let mut declarations = HashSet::with_capacity(signature_count);
         let mut parameter_declarations = HashSet::with_capacity(parameter_count);
         let mut parameter_symbols = HashSet::with_capacity(parameter_count);
+        let mut type_parameter_declarations = HashSet::new();
+        let mut type_parameter_symbols = HashSet::new();
 
         for group in &prepared {
             let owner = self.symbol(group.owner_symbol)?;
@@ -9717,6 +9772,68 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 {
                     return None;
                 }
+                let declared_type_parameters = self
+                    .source_direct_children(signature.declaration)?
+                    .into_iter()
+                    .filter(|node| self.source_node_kind(*node) == Some(SyntaxKind::TypeParameter))
+                    .collect::<Vec<_>>();
+                let resolved_type_parameters =
+                    signature
+                        .query_evidence
+                        .as_ref()
+                        .map_or_else(Vec::new, |evidence| {
+                            evidence
+                                .type_parameters()
+                                .iter()
+                                .map(|parameter| parameter.provenance.declaration)
+                                .collect()
+                        });
+                if declared_type_parameters != resolved_type_parameters {
+                    return None;
+                }
+                if let Some(evidence) = &signature.query_evidence {
+                    let plan = evidence.callable();
+                    if group.implementation.is_none()
+                        || plan.declaration != signature.declaration
+                        || plan.owner_symbol != group.owner_symbol
+                        || plan.array_targets != group.array_targets
+                        || plan.flags != signature.flags
+                        || !evidence.is_exact(self)
+                        || plan.type_parameters.len() != 1
+                        || plan.type_parameters.iter().any(|parameter| {
+                            parameter.constraint.is_some() || parameter.default_type.is_some()
+                        })
+                        || plan.parameters.len() != signature.parameters.len()
+                        || plan.return_type.annotation_identity()
+                            != Some((
+                                signature.return_annotation,
+                                signature.return_annotation_null_literal_identity,
+                            ))
+                    {
+                        return None;
+                    }
+                    for parameter in evidence.type_parameters() {
+                        if !type_parameter_declarations.insert(parameter.provenance.declaration)
+                            || !type_parameter_symbols.insert(parameter.provenance.symbol)
+                        {
+                            return None;
+                        }
+                    }
+                    for (planned, parameter) in plan.parameters.iter().zip(&signature.parameters) {
+                        if planned.declaration != parameter.declaration
+                            || planned.symbol != parameter.symbol
+                            || planned.annotation_identity()
+                                != (
+                                    parameter.annotation,
+                                    parameter.annotation_null_literal_identity,
+                                )
+                            || evidence.annotation_type(parameter.annotation)
+                                != Some(parameter.base_type)
+                        {
+                            return None;
+                        }
+                    }
+                }
                 let mut optional_seen = false;
                 for parameter in &signature.parameters {
                     let symbol = self.symbol(parameter.symbol)?;
@@ -9760,6 +9877,14 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             )
             || !self.try_reserve_function_signature_return_annotations(signature_count)
             || !self.try_reserve_callable_signature_parameter_types(signature_count)
+            || self
+                .source_callable_type_parameters
+                .try_reserve(signature_count)
+                .is_err()
+            || self
+                .source_callable_type_queries
+                .try_reserve(signature_count)
+                .is_err()
             || !self.links.signature.try_reserve(signature_count)
             || !self.links.value_symbol.try_reserve(value_link_count)
         {
@@ -9780,7 +9905,16 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     .alloc_signature(
                         signature.flags,
                         Some(signature.declaration),
-                        Vec::new(),
+                        signature
+                            .query_evidence
+                            .as_ref()
+                            .map_or_else(Vec::new, |evidence| {
+                                evidence
+                                    .type_parameters()
+                                    .iter()
+                                    .map(|parameter| parameter.provenance.type_parameter)
+                                    .collect()
+                            }),
                         None,
                         signature
                             .parameters
@@ -9803,6 +9937,16 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                         declaration: signature.declaration,
                         signature: *signature_id,
                         flags: signature.flags,
+                        type_parameters: signature.query_evidence.as_ref().map_or_else(
+                            Box::default,
+                            |evidence| {
+                                evidence
+                                    .type_parameters()
+                                    .iter()
+                                    .map(|parameter| parameter.provenance)
+                                    .collect()
+                            },
+                        ),
                         parameters: signature
                             .parameters
                             .iter()
@@ -9853,6 +9997,25 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                         .insert(*signature_id, type_)
                         .is_none()
                 );
+                if let Some(evidence) = &signature.query_evidence {
+                    assert!(
+                        self.source_callable_type_parameters
+                            .insert(
+                                *signature_id,
+                                evidence
+                                    .type_parameters()
+                                    .iter()
+                                    .map(|parameter| parameter.provenance)
+                                    .collect(),
+                            )
+                            .is_none()
+                    );
+                    assert!(
+                        self.source_callable_type_queries
+                            .insert(*signature_id, Arc::clone(evidence))
+                            .is_none()
+                    );
+                }
             }
             assert!(self.set_value_symbol_links(
                 group.owner_symbol,
@@ -9923,7 +10086,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         }
         Some(published)
     }
+}
 
+impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
     pub(super) fn try_reserve_properties_type_cache(&mut self, additional: usize) -> bool {
         self.properties_types.try_reserve(additional).is_ok()
     }

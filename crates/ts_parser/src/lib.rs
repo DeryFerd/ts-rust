@@ -147,8 +147,15 @@ struct JavaScriptJsDocCallableParameter {
     type_: JavaScriptJsDocCallableType,
 }
 
+#[derive(Clone)]
+struct JavaScriptJsDocCallableTemplate {
+    name: String,
+    name_range: TextRange,
+    list_range: TextRange,
+}
+
 struct JavaScriptJsDocCallableSignature {
-    template: Option<(String, TextRange)>,
+    template: Option<JavaScriptJsDocCallableTemplate>,
     parameters: Vec<JavaScriptJsDocCallableParameter>,
     return_type: JavaScriptJsDocCallableType,
 }
@@ -549,7 +556,11 @@ fn javascript_jsdoc_callable_signature(
                     return None;
                 }
                 let name = javascript_jsdoc_identifier(source, body_start, comment_end)?;
-                template = Some((token_value(&name), name.range));
+                template = Some(JavaScriptJsDocCallableTemplate {
+                    name: token_value(&name),
+                    name_range: name.range,
+                    list_range: name.range,
+                });
             }
             "param" | "arg" | "argument" => {
                 let type_ = javascript_jsdoc_callable_type(source, body_start, comment_end)?;
@@ -597,6 +608,7 @@ fn javascript_jsdoc_overload_group(
     let mut implementation = None;
     for (index, &(comment_start, comment_end)) in comments.iter().enumerate() {
         let tags = javascript_jsdoc_callable_tags(source.get(comment_start..comment_end)?)?;
+        let mut template = None;
         let mut host_parameters = Vec::new();
         let mut host_return = None;
         let mut current: Option<(TextRange, Vec<JavaScriptJsDocCallableParameter>)> = None;
@@ -616,6 +628,21 @@ fn javascript_jsdoc_overload_group(
                     })?;
             let tag_range = text_range(tag_start.checked_sub(1)?, tag_end);
             match token_value(tag).as_str() {
+                "template" if tag_index == 0 => {
+                    let name = javascript_jsdoc_identifier(source, body_start, tag_end)?;
+                    let tail = source.get(usize::try_from(name.range.end.get()).ok()?..tag_end)?;
+                    if !tail
+                        .chars()
+                        .all(|character| character.is_whitespace() || character == '*')
+                    {
+                        return None;
+                    }
+                    template = Some(JavaScriptJsDocCallableTemplate {
+                        name: token_value(&name),
+                        name_range: name.range,
+                        list_range: tag_range,
+                    });
+                }
                 "overload" => {
                     if current.is_some() {
                         return None;
@@ -660,7 +687,7 @@ fn javascript_jsdoc_overload_group(
                             range,
                             parameters_range: TextRange::new(parameters_start, tag_range.start),
                             signature: JavaScriptJsDocCallableSignature {
-                                template: None,
+                                template: template.clone(),
                                 parameters,
                                 return_type,
                             },
@@ -679,7 +706,7 @@ fn javascript_jsdoc_overload_group(
         }
         if index + 1 == comments.len() {
             implementation = Some(JavaScriptJsDocCallableSignature {
-                template: None,
+                template,
                 parameters: host_parameters,
                 return_type: host_return?,
             });
@@ -1494,39 +1521,13 @@ impl<'a> Parser<'a> {
         annotations: Vec<NodeId>,
         return_type: NodeId,
     ) {
-        let type_parameters = signature.template.map(|(text, range)| {
-            let name = self.alloc_node(
-                SyntaxKind::Identifier,
-                range,
-                NodeData::Identifier(Box::new(IdentifierData {
-                    flow_node: None,
-                    text,
-                })),
-                &[],
-            );
-            let parameter = self.alloc_node_with_flags(
-                SyntaxKind::TypeParameter,
-                NodeFlags::REPARSED,
-                range,
-                NodeData::TypeParameterDeclaration(Box::new(TypeParameterDeclarationData {
-                    constraint: None,
-                    default_type: None,
-                    expression: None,
-                    symbol: None,
-                    modifiers: None,
-                    name,
-                })),
-                &[name],
-            );
+        let type_parameters = signature.template.map(|template| {
+            let parameters = self.reparse_javascript_jsdoc_template(template);
             self.arena
-                .get_mut(parameter)
+                .get_mut(parameters.nodes[0])
                 .expect("the type parameter was allocated")
                 .parent = Some(callable);
-            NodeList {
-                range,
-                nodes: vec![parameter],
-                has_trailing_comma: false,
-            }
+            parameters
         });
         for (parameter, annotation) in parameters.iter().copied().zip(annotations) {
             let Some(annotation_node) = self.arena.get_mut(annotation) else {
@@ -1555,6 +1556,40 @@ impl<'a> Parser<'a> {
                 function.type_ = Some(return_type);
             }
             _ => unreachable!("the source-owned callable was checked before reparsing"),
+        }
+    }
+
+    fn reparse_javascript_jsdoc_template(
+        &mut self,
+        template: JavaScriptJsDocCallableTemplate,
+    ) -> NodeList {
+        let name = self.alloc_node(
+            SyntaxKind::Identifier,
+            template.name_range,
+            NodeData::Identifier(Box::new(IdentifierData {
+                flow_node: None,
+                text: template.name,
+            })),
+            &[],
+        );
+        let parameter = self.alloc_node_with_flags(
+            SyntaxKind::TypeParameter,
+            NodeFlags::REPARSED,
+            template.name_range,
+            NodeData::TypeParameterDeclaration(Box::new(TypeParameterDeclarationData {
+                constraint: None,
+                default_type: None,
+                expression: None,
+                symbol: None,
+                modifiers: None,
+                name,
+            })),
+            &[name],
+        );
+        NodeList {
+            range: template.list_range,
+            nodes: vec![parameter],
+            has_trailing_comma: false,
         }
     }
 
@@ -1599,6 +1634,10 @@ impl<'a> Parser<'a> {
         }
         let mut declarations = Vec::with_capacity(parsed.len());
         for (overload, annotations, return_type) in parsed {
+            let type_parameters = overload
+                .signature
+                .template
+                .map(|template| self.reparse_javascript_jsdoc_template(template));
             let name = self.alloc_node_with_flags(
                 SyntaxKind::Identifier,
                 NodeFlags::REPARSED,
@@ -1641,6 +1680,9 @@ impl<'a> Parser<'a> {
             }
             self.mark_javascript_jsdoc_reparsed(return_type);
             let mut children = vec![name];
+            if let Some(type_parameters) = &type_parameters {
+                children.extend(type_parameters.nodes.iter().copied());
+            }
             children.extend(parameters.iter().copied());
             children.push(return_type);
             declarations.push(self.alloc_node_with_flags(
@@ -1664,7 +1706,7 @@ impl<'a> Parser<'a> {
                     return_flow_node: None,
                     symbol: None,
                     type_: Some(return_type),
-                    type_parameters: None,
+                    type_parameters,
                     facts: 0,
                     modifiers: None,
                     name: Some(name),

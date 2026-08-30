@@ -2668,65 +2668,18 @@ fn display_generic_source_callable(
         return Err(TypeDisplayUnavailable::CyclicType(type_id));
     }
     let result = (|| {
-        let mut result = String::from("<");
-        state.add(2);
-        for (index, parameter) in type_parameters.iter().enumerate() {
-            if signature.type_parameters()[index] != parameter.type_parameter
-                || !host.symbol_matches(store, parameter.declaration, parameter.symbol)
-            {
-                return Err(TypeDisplayUnavailable::MalformedType(type_id));
-            }
-            if index != 0 {
-                result.push_str(", ");
-                state.add(2);
-            }
-            result.push_str(&display_type_worker(
-                store,
-                Some(host),
-                global_types,
-                parameter.type_parameter,
-                flags,
-                state,
-                visiting,
-            )?);
-            let Some(TypeData::TypeParameter(parameter_type)) = store
-                .type_payload(parameter.type_parameter)
-                .map(TypeRecord::data)
-            else {
-                return Err(TypeDisplayUnavailable::MalformedType(type_id));
-            };
-            for (node, type_, prefix) in [
-                (parameter.constraint, parameter_type.constraint, " extends "),
-                (
-                    parameter.default_type,
-                    parameter_type.resolved_default_type,
-                    " = ",
-                ),
-            ] {
-                if let Some(node) = node {
-                    let type_ = type_.ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-                    if store
-                        .type_node_links(node)
-                        .and_then(|links| links.resolved_type)
-                        .is_some_and(|cached| cached != type_)
-                    {
-                        return Err(TypeDisplayUnavailable::MalformedType(type_id));
-                    }
-                    result.push_str(prefix);
-                    state.add(prefix.len());
-                    result.push_str(&display_type_worker(
-                        store,
-                        Some(host),
-                        global_types,
-                        type_,
-                        flags,
-                        state,
-                        visiting,
-                    )?);
-                }
-            }
-        }
-        result.push('>');
+        let mut result = String::new();
+        append_source_signature_type_parameters(
+            store,
+            host,
+            global_types,
+            type_id,
+            provenance.signature,
+            flags,
+            state,
+            visiting,
+            &mut result,
+        )?;
         append_source_signature_parameters(
             store,
             host,
@@ -2760,6 +2713,92 @@ fn display_generic_source_callable(
     })();
     visiting.remove(&type_id);
     result
+}
+
+#[allow(clippy::too_many_arguments)] // Share the exact signature display state.
+fn append_source_signature_type_parameters(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+    signature_id: SignatureId,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+    result: &mut String,
+) -> Result<(), TypeDisplayUnavailable> {
+    let signature = store
+        .signature(signature_id)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if signature.type_parameters().is_empty() {
+        return Ok(());
+    }
+    let type_parameters = store
+        .source_callable_type_parameters(signature_id)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if type_parameters.len() != signature.type_parameters().len() {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    result.push('<');
+    state.add(2);
+    for (index, parameter) in type_parameters.iter().enumerate() {
+        if signature.type_parameters()[index] != parameter.type_parameter
+            || !host.symbol_matches(store, parameter.declaration, parameter.symbol)
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        if index != 0 {
+            result.push_str(", ");
+            state.add(2);
+        }
+        result.push_str(&display_type_worker(
+            store,
+            Some(host),
+            global_types,
+            parameter.type_parameter,
+            flags,
+            state,
+            visiting,
+        )?);
+        let Some(TypeData::TypeParameter(parameter_type)) = store
+            .type_payload(parameter.type_parameter)
+            .map(TypeRecord::data)
+        else {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        };
+        for (node, type_, prefix) in [
+            (parameter.constraint, parameter_type.constraint, " extends "),
+            (
+                parameter.default_type,
+                parameter_type.resolved_default_type,
+                " = ",
+            ),
+        ] {
+            if let Some(node) = node {
+                let type_ = type_.ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                if store
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type)
+                    .is_some_and(|cached| cached != type_)
+                {
+                    return Err(TypeDisplayUnavailable::MalformedType(type_id));
+                }
+                result.push_str(prefix);
+                state.add(prefix.len());
+                result.push_str(&display_type_worker(
+                    store,
+                    Some(host),
+                    global_types,
+                    type_,
+                    flags,
+                    state,
+                    visiting,
+                )?);
+            }
+        }
+    }
+    result.push('>');
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // Keep recursive formatter state explicit.
@@ -2806,6 +2845,17 @@ fn display_source_overload_set(
             if !host.symbol_matches(store, row.declaration, provenance.owner_symbol) {
                 return Err(TypeDisplayUnavailable::MalformedType(type_id));
             }
+            append_source_signature_type_parameters(
+                store,
+                host,
+                global_types,
+                type_id,
+                row.signature,
+                flags,
+                state,
+                visiting,
+                &mut result,
+            )?;
             append_source_signature_parameters(
                 store,
                 host,

@@ -49354,6 +49354,19 @@ fn materialize_source_overloads(
             .map_or(batch_fallback, |plan| plan.declaration);
         let mut resolved = Vec::with_capacity(overload.declarations.len());
         for declaration in &overload.declarations {
+            session.reset_query();
+            let mut generic_diagnostics = CanonicalCheckerDiagnostics::default();
+            let query_evidence = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                &mut generic_diagnostics,
+            )?
+            .get_source_overload_type_query(declaration);
+            merge_retry_diagnostics(diagnostics, generic_diagnostics);
+            let query_evidence = query_evidence?;
             let mut parameter_types = Vec::with_capacity(declaration.parameters.len());
             for parameter in &declaration.parameters {
                 session.reset_query();
@@ -49420,6 +49433,7 @@ fn materialize_source_overloads(
             .get_type_from_type_node(return_node);
             merge_retry_diagnostics(diagnostics, return_diagnostics);
             resolved.push(ResolvedSourceOverloadSignature {
+                query_evidence,
                 parameter_types,
                 return_type: return_type?,
             });

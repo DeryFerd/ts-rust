@@ -27649,6 +27649,56 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(plan)
     }
 
+    /// Resolves a real overload row without publishing a singleton callable.
+    pub(super) fn get_source_overload_type_query(
+        &mut self,
+        callable: &SourceCallablePlan,
+    ) -> Result<Option<Arc<SourceCallableTypeQueryEvidence>>, DeclaredTypeError> {
+        if callable.type_parameters.is_empty() {
+            return Ok(None);
+        }
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(
+                callable.declaration,
+            ))
+        };
+        let group = self
+            .host
+            .source(callable.declaration)
+            .and_then(|(arena, _)| {
+                super::jsdoc::authenticated_jsdoc_overload_group(arena, callable.declaration)
+            })
+            .ok_or_else(invalid)?;
+        let actual = source_callables::plan_source_jsdoc_overload_declaration(
+            self.store,
+            self.host,
+            callable.declaration,
+            callable.owner_symbol,
+            &group.declarations,
+            callable.array_targets,
+        )
+        .map_err(|error| source_callable_error(error, callable.family))?;
+        if actual != *callable || !callable.requires_type_query_evidence() {
+            return Err(invalid());
+        }
+        let plan = self.plan_source_callable_type_inputs(callable)?;
+        let cold = callable
+            .type_parameters
+            .iter()
+            .filter(|parameter| {
+                self.store
+                    .declared_type_links(parameter.symbol)
+                    .and_then(|links| links.declared_type)
+                    .is_none()
+            })
+            .count();
+        if !self.store.try_reserve_declared_type_links(cold) {
+            return Err(invalid());
+        }
+        self.resolve_source_callable_type_inputs_with_capacities(callable, plan, cold, 0)
+            .map(|(evidence, _)| Some(evidence))
+    }
+
     fn resolve_source_callable_type_inputs(
         &mut self,
         callable: &SourceCallablePlan,
@@ -27658,6 +27708,22 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let (cold_types, optional_unions) =
             source_callables::reserve_source_callable_capacities(self.store, &[callable])
                 .map_err(|error| source_callable_error(error, callable.family))?;
+        self.resolve_source_callable_type_inputs_with_capacities(
+            callable,
+            plan,
+            cold_types,
+            optional_unions,
+        )
+    }
+
+    fn resolve_source_callable_type_inputs_with_capacities(
+        &mut self,
+        callable: &SourceCallablePlan,
+        plan: TypeQueryPlan,
+        cold_types: usize,
+        optional_unions: usize,
+    ) -> Result<(Arc<SourceCallableTypeQueryEvidence>, PreparedTypeQueryTypes), DeclaredTypeError>
+    {
         let mut prepared =
             self.prepare_literal_types_with_additional(&plan, optional_unions, cold_types)?;
         let parameters = callable

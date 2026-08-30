@@ -1581,11 +1581,20 @@ pub fn plan_javascript_source_jsdoc(
                     augments_type: None,
                     implements_types: Vec::new(),
                 };
-                for comment in comments {
+                let comment_count = comments.len();
+                for (index, comment) in comments.into_iter().enumerate() {
                     for diagnostic in comment.diagnostics() {
                         diagnostics.push(canonical_parser_diagnostic(source, diagnostic)?);
                     }
-                    apply_comment_tags(arena, source, &mut planned, &comment, &mut diagnostics)?;
+                    if planned.overload_declarations.is_empty() || index + 1 == comment_count {
+                        apply_comment_tags(
+                            arena,
+                            source,
+                            &mut planned,
+                            &comment,
+                            &mut diagnostics,
+                        )?;
+                    }
                 }
                 for alias in &mut planned.typedefs {
                     alias.source_declaration = source_typedefs
@@ -1689,7 +1698,6 @@ pub(super) fn authenticated_jsdoc_overload_group(
         || host.body.is_none()
         || host.modifiers.is_some()
         || host.asterisk_token.is_some()
-        || host.type_parameters.is_some()
         || host_name.kind != SyntaxKind::Identifier
         || host_name.parent != Some(implementation.node)
         || host_identifier.flow_node.is_some()
@@ -1700,13 +1708,22 @@ pub(super) fn authenticated_jsdoc_overload_group(
     let mut overloads = Vec::new();
     let mut host_parameters = Vec::new();
     let mut host_return = None;
+    let mut host_template = None;
     for (index, comment) in comments.iter().enumerate() {
         if !comment.diagnostics().is_empty() {
             return None;
         }
-        for tag in comment.tags() {
+        let template = comment
+            .tags()
+            .first()
+            .filter(|tag| tag.kind() == JsDocTagKind::Template);
+        if index + 1 == comments.len() {
+            host_template = template;
+        }
+        for (tag_index, tag) in comment.tags().iter().enumerate() {
             match tag.kind() {
-                JsDocTagKind::Overload => overloads.push(tag),
+                JsDocTagKind::Template if tag_index == 0 => {}
+                JsDocTagKind::Overload => overloads.push((tag, template)),
                 JsDocTagKind::Parameter if index + 1 == comments.len() => host_parameters.push(tag),
                 JsDocTagKind::Return if index + 1 == comments.len() && host_return.is_none() => {
                     host_return = Some(tag)
@@ -1728,6 +1745,7 @@ pub(super) fn authenticated_jsdoc_overload_group(
         return None;
     }
     let mut range_edges = Vec::new();
+    authenticate_jsdoc_signature_template(arena, implementation, host_template, &mut range_edges)?;
     authenticate_jsdoc_signature_nodes(
         arena,
         implementation,
@@ -1736,7 +1754,7 @@ pub(super) fn authenticated_jsdoc_overload_group(
         false,
         &mut range_edges,
     )?;
-    for (declaration, tag) in declarations.iter().copied().zip(overloads) {
+    for (declaration, (tag, template)) in declarations.iter().copied().zip(overloads) {
         let node = arena.get(declaration.node)?;
         let NodeData::FunctionDeclaration(function) = &node.data else {
             return None;
@@ -1753,7 +1771,6 @@ pub(super) fn authenticated_jsdoc_overload_group(
             || function.body.is_some()
             || function.modifiers.is_some()
             || function.asterisk_token.is_some()
-            || function.type_parameters.is_some()
             || function.facts != 0
             || name_id == host.name?
             || name.kind != SyntaxKind::Identifier
@@ -1783,6 +1800,7 @@ pub(super) fn authenticated_jsdoc_overload_group(
             declaration,
             NodeRef::new(declaration.arena, declaration.file, name_id),
         ));
+        authenticate_jsdoc_signature_template(arena, declaration, template, &mut range_edges)?;
         authenticate_jsdoc_signature_nodes(
             arena,
             declaration,
@@ -1797,6 +1815,62 @@ pub(super) fn authenticated_jsdoc_overload_group(
         declarations,
         range_edges,
     })
+}
+
+fn authenticate_jsdoc_signature_template(
+    arena: &NodeArena,
+    declaration: NodeRef,
+    tag: Option<&JsDocTag<'_>>,
+    range_edges: &mut Vec<(NodeRef, NodeRef)>,
+) -> Option<()> {
+    let NodeData::FunctionDeclaration(function) = &arena.get(declaration.node)?.data else {
+        return None;
+    };
+    let Some(tag) = tag else {
+        return function.type_parameters.is_none().then_some(());
+    };
+    let [template] = tag.template_parameters() else {
+        return None;
+    };
+    let parameters = function.type_parameters.as_ref()?;
+    let [parameter_id] = parameters.nodes.as_slice() else {
+        return None;
+    };
+    let parameter = arena.get(*parameter_id)?;
+    let NodeData::TypeParameterDeclaration(data) = &parameter.data else {
+        return None;
+    };
+    let name = arena.get(data.name)?;
+    let NodeData::Identifier(identifier) = &name.data else {
+        return None;
+    };
+    if template.constraint().is_some()
+        || template.default_type().is_some()
+        || parameters.range != tag.range()
+        || parameters.has_trailing_comma
+        || parameter.kind != SyntaxKind::TypeParameter
+        || parameter.flags != NodeFlags::REPARSED
+        || parameter.parent != Some(declaration.node)
+        || parameter.range != template.name().range()
+        || data.constraint.is_some()
+        || data.default_type.is_some()
+        || data.expression.is_some()
+        || data.modifiers.is_some()
+        || data.symbol.is_some()
+        || name.kind != SyntaxKind::Identifier
+        || name.flags != NodeFlags::default()
+        || name.parent != Some(*parameter_id)
+        || name.range != template.name().range()
+        || identifier.text != template.name().text()
+        || identifier.flow_node.is_some()
+    {
+        return None;
+    }
+    range_edges.push((
+        declaration,
+        NodeRef::new(declaration.arena, declaration.file, *parameter_id),
+    ));
+    Some(())
 }
 
 fn authenticate_jsdoc_signature_nodes(

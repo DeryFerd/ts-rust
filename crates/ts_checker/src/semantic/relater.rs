@@ -8920,8 +8920,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
-    /// Pinned `isImplementationCompatibleWithOverload` for a source-owned,
-    /// non-generic group. Both views retain their real declaration signatures.
+    /// Pinned `isImplementationCompatibleWithOverload` for a source-owned group.
     pub(super) fn is_source_overload_implementation_compatible(
         &mut self,
         owner: TypeId,
@@ -8943,21 +8942,28 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         {
             return Err(invalid());
         }
-        let source = super::source_overloads::source_overload_signature_projection(
-            self,
-            owner,
-            body_row.signature,
-        )
-        .ok_or_else(invalid)?;
-        let target =
-            super::source_overloads::source_overload_signature_projection(self, owner, overload)
-                .ok_or_else(invalid)?;
+        let body_signature = body_row.signature;
         if let Err(established) = self.claim_strict_function_types(strict_function_types) {
             return Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
                 established,
                 requested: strict_function_types,
             });
         }
+        let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
+        let source = super::source_overloads::source_overload_compatibility_projection(
+            self,
+            owner,
+            body_signature,
+            array_targets,
+            instantiation_session,
+        )?;
+        let target = super::source_overloads::source_overload_compatibility_projection(
+            self,
+            owner,
+            overload,
+            array_targets,
+            instantiation_session,
+        )?;
         self.admit_callable_relation_type_with_array_targets(
             owner,
             Some(strict_function_types),
