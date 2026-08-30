@@ -329,6 +329,9 @@ impl CanonicalTypeMapperStore {
                 (Some(symbol), arguments.to_vec())
             }
         };
+        if let Some(reduced) = self.reduce_numeric_literal_intersection(input)? {
+            return Ok(reduced);
+        }
 
         let mut types = Vec::with_capacity(input.len());
         for type_ in input {
@@ -337,6 +340,9 @@ impl CanonicalTypeMapperStore {
                 &mut types,
                 array_targets,
             )?;
+        }
+        if let Some(reduced) = self.reduce_numeric_literal_intersection(&types)? {
+            return Ok(reduced);
         }
         if types.is_empty() {
             return Ok(unknown);
@@ -477,12 +483,113 @@ impl CanonicalTypeMapperStore {
         if validated != key.types {
             return Err(invalid());
         }
+        if self
+            .reduce_numeric_literal_intersection(&validated)
+            .map_err(|_| invalid())?
+            .is_some()
+        {
+            return Err(invalid());
+        }
 
         Ok(DeferredIntersectionTypeProjection {
             types: key.types,
             alias_symbol,
             alias_arguments,
         })
+    }
+
+    /// Uses the scalar reducer after a numeric intersection parameter is mapped.
+    /// Only an unconstrained source alias parameter stays unresolved.
+    pub(super) fn reduce_numeric_literal_intersection(
+        &self,
+        input: &[TypeId],
+    ) -> Result<Option<TypeId>, IntersectionTypeError> {
+        let Some(numeric) = input.iter().copied().find(|type_| {
+            self.type_payload(*type_)
+                .is_some_and(|record| record.flags() == TypeFlags::NUMBER_LITERAL)
+        }) else {
+            return Ok(None);
+        };
+        if input.len() != 2 {
+            return Err(IntersectionTypeError::UnsupportedConstituent(numeric));
+        }
+        let bootstrap = self
+            .intrinsic_bootstrap()
+            .ok_or(IntersectionTypeError::BootstrapUninitialized)?;
+        let mut types = Vec::with_capacity(input.len());
+        let mut unresolved = false;
+        for &type_ in input {
+            let record = self
+                .type_payload(type_)
+                .ok_or(IntersectionTypeError::MalformedConstituent(type_))?;
+            if let TypeData::TypeParameter(parameter) = record.data() {
+                let owner = cached_ordinary_type_parameter_owner(self, type_)
+                    .ok_or(IntersectionTypeError::MalformedConstituent(type_))?;
+                let Some([declaration]) = self.symbol(owner).and_then(|owner| owner.declarations())
+                else {
+                    return Err(IntersectionTypeError::MalformedConstituent(type_));
+                };
+                let annotations = self
+                    .source_alias_type_parameter_annotations(*declaration)
+                    .ok_or(IntersectionTypeError::UnsupportedConstituent(type_))?;
+                if annotations.constraint.is_some() {
+                    return Err(IntersectionTypeError::UnsupportedConstituent(type_));
+                }
+                if self.get_merged_symbol(owner) != Some(owner)
+                    || !self.source_declaration_belongs_to_symbol(*declaration, owner)
+                    || parameter
+                        .constraint
+                        .is_some_and(|constraint| constraint != bootstrap.no_constraint_type)
+                {
+                    return Err(IntersectionTypeError::MalformedConstituent(type_));
+                }
+                unresolved = true;
+                types.push(type_);
+                continue;
+            }
+            if !matches!(
+                record.data(),
+                TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::Union(_)
+            ) || matches!(record.data(), TypeData::Union(_)) && type_ != bootstrap.boolean_type
+            {
+                return Err(IntersectionTypeError::UnsupportedConstituent(type_));
+            }
+            self.validate_union_constituent(type_)
+                .map_err(|_| IntersectionTypeError::MalformedConstituent(type_))?;
+            types.push(match record.data() {
+                TypeData::Literal(literal) => literal.regular_type,
+                _ => type_,
+            });
+        }
+        if unresolved {
+            return Ok(None);
+        }
+        if types.contains(&bootstrap.wildcard_type) {
+            return Ok(Some(bootstrap.wildcard_type));
+        }
+        if types.contains(&bootstrap.error_type) {
+            return Ok(Some(bootstrap.error_type));
+        }
+        intersect_property_types(self, &types).map(Some)
+    }
+
+    /// Selects the numeric parameter form only after the full interner proof.
+    pub(super) fn numeric_parameter_intersection_projection(
+        &self,
+        type_: TypeId,
+    ) -> Result<Option<DeferredIntersectionTypeProjection>, IntersectionTypeError> {
+        let Some(TypeData::Intersection(intersection)) =
+            self.type_payload(type_).map(TypeRecord::data)
+        else {
+            return Ok(None);
+        };
+        if !intersection.intersection.types.iter().any(|type_| {
+            self.type_payload(*type_)
+                .is_some_and(|record| record.flags() == TypeFlags::NUMBER_LITERAL)
+        }) {
+            return Ok(None);
+        }
+        self.validate_deferred_intersection_type(type_).map(Some)
     }
 
     fn validate_deferred_intersection_alias(
@@ -537,6 +644,14 @@ impl CanonicalTypeMapperStore {
             .type_payload(type_)
             .ok_or(IntersectionTypeError::MalformedConstituent(type_))?;
         match record.data() {
+            TypeData::Literal(literal) if record.flags() == TypeFlags::NUMBER_LITERAL => {
+                self.validate_union_constituent(type_)
+                    .map_err(|_| IntersectionTypeError::MalformedConstituent(type_))?;
+                if !output.contains(&literal.regular_type) {
+                    output.push(literal.regular_type);
+                }
+                return Ok(());
+            }
             TypeData::Intersection(_) => {
                 let constituents = if record
                     .object_flags()

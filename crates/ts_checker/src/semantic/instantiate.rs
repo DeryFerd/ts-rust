@@ -3449,6 +3449,12 @@ fn cached_deferred_intersection_result(
             return Err(invalid());
         }
     }
+    if let Some(reduced) = store
+        .reduce_numeric_literal_intersection(constituents)
+        .map_err(|error| deferred_intersection_error(source, error))?
+    {
+        return Ok(Some(reduced));
+    }
     let mut types = Vec::with_capacity(constituents.len());
     for constituent in constituents {
         store
@@ -3458,6 +3464,12 @@ fn cached_deferred_intersection_result(
                 array_targets,
             )
             .map_err(|error| deferred_intersection_error(source, error))?;
+    }
+    if let Some(reduced) = store
+        .reduce_numeric_literal_intersection(&types)
+        .map_err(|error| deferred_intersection_error(source, error))?
+    {
+        return Ok(Some(reduced));
     }
     match types.as_slice() {
         [] => {
