@@ -21,6 +21,10 @@
 //! plus unannotated private instance fields with the implicit `any` type.
 //! Invalid method overload chains preserve their merged binder symbols and
 //! report exact implementation-name, missing-body, and duplicate-body errors.
+//! Direct source classes retain ordered nongeneric method overloads separately
+//! from the checked implementation. Calls expose only the overload signatures.
+//! Optional primitive parameters and required primitive-array parameters reuse
+//! canonical annotation queries and retain their exact cached types.
 //! Abstract classes retain annotated abstract members and abstract constructors;
 //! invalid abstract methods retain their exact modifier and implementation errors.
 //! Abstract properties read by later field initializers retain both exact errors.
@@ -95,10 +99,10 @@ use ts_options::ScriptTarget;
 
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
-    CanonicalCheckerOptions, CanonicalGlobalTypes, CanonicalSemanticStore,
-    CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
-    IndexInfoId, ResolvedSignatureState, SignatureId, SignatureLinks, SourceCheckError, TypeId,
-    TypeMapperId,
+    CanonicalCheckerOptions, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
+    CanonicalSemanticStore, CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeError,
+    DeclaredTypeHost, IndexInfoId, ResolvedSignatureState, SignatureId, SignatureLinks,
+    SourceCheckError, TypeId, TypeMapperId,
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
@@ -300,6 +304,7 @@ pub(super) struct ClassMemberSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceClassPlan {
     header: ClassDeclarationHeader,
+    array_targets: Option<CanonicalArrayTargets>,
     revision: ts_ast::NodeArenaRevision,
     properties: Vec<(ClassPropertyPlan, TypeId)>,
     function_properties: Vec<(ClassPropertyPlan, super::functions::FunctionTypePlan)>,
@@ -488,6 +493,7 @@ pub(super) struct ClassBodyCallable {
     class_symbol: SemanticSymbolId,
     declaration: Option<NodeRef>,
     callable: ValidatedSingleCallable,
+    overloads: Option<SourceClassMethodOverloads>,
     pending_return_body: Option<NodeRef>,
 }
 
@@ -508,9 +514,19 @@ impl ClassBodyCallable {
         &self.callable
     }
 
+    pub(super) const fn overloads(&self) -> Option<&SourceClassMethodOverloads> {
+        self.overloads.as_ref()
+    }
+
     pub(super) const fn pending_return_body(&self) -> Option<NodeRef> {
         self.pending_return_body
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassMethodOverloads {
+    pub(super) signatures: Vec<ValidatedSingleCallable>,
+    pub(super) implementation: ValidatedSingleCallable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -924,10 +940,20 @@ fn source_property_origin(
 }
 
 /// Plans owned members and body nodes. Body expressions are planned by the source provider.
+#[cfg(test)]
 pub(super) fn plan_source_class_members(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
+) -> Result<SourceClassPlan, ClassError> {
+    plan_source_class_members_with_array_targets(store, host, symbol, None)
+}
+
+pub(super) fn plan_source_class_members_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<SourceClassPlan, ClassError> {
     let header = plan_class_declaration_header(store, host, symbol, true)?;
     let record = preflight_node(store, host, header.declaration)?;
@@ -957,6 +983,7 @@ pub(super) fn plan_source_class_members(
         .revision();
     let mut plan = SourceClassPlan {
         header,
+        array_targets,
         revision,
         properties: Vec::new(),
         function_properties: Vec::new(),
@@ -1012,6 +1039,7 @@ pub(super) fn plan_source_class_members(
                     (plan.header.instance_members, plan.header.static_members),
                     plan.header.ambient,
                     true,
+                    array_targets,
                 )?;
                 let return_type = method
                     .return_type_node
@@ -1033,27 +1061,33 @@ pub(super) fn plan_source_class_members(
                 let (arena, _) = host
                     .source(member)
                     .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(member)))?;
-                plan.sources.push(ClassMemberSource {
-                    symbol: method.symbol,
-                    declaring_class: symbol,
-                    declaration: member,
-                    origin: ClassMemberOrigin::Method,
-                    side: method.side,
-                    visibility: if store
-                        .symbol(method.symbol)
-                        .is_some_and(|symbol| symbol.name().is_private_identifier())
-                    {
-                        ClassConstructorVisibility::Private
-                    } else {
-                        class_member_visibility(store, member)
-                    },
-                    readonly: false,
-                    abstract_: ts_binder::canonical_has_syntactic_modifier(
-                        arena,
-                        member.node,
-                        SyntaxKind::AbstractKeyword,
-                    ),
-                });
+                if !plan
+                    .sources
+                    .iter()
+                    .any(|source| source.symbol == method.symbol)
+                {
+                    plan.sources.push(ClassMemberSource {
+                        symbol: method.symbol,
+                        declaring_class: symbol,
+                        declaration: member,
+                        origin: ClassMemberOrigin::Method,
+                        side: method.side,
+                        visibility: if store
+                            .symbol(method.symbol)
+                            .is_some_and(|symbol| symbol.name().is_private_identifier())
+                        {
+                            ClassConstructorVisibility::Private
+                        } else {
+                            class_member_visibility(store, member)
+                        },
+                        readonly: false,
+                        abstract_: ts_binder::canonical_has_syntactic_modifier(
+                            arena,
+                            member.node,
+                            SyntaxKind::AbstractKeyword,
+                        ),
+                    });
+                }
                 if let Some(body) = method.body {
                     let mut parameters = Vec::new();
                     for parameter in &method.parameters {
@@ -1070,8 +1104,10 @@ pub(super) fn plan_source_class_members(
                             property_symbol: None,
                             annotation: parameter.type_node,
                             initializer: None,
-                            type_: ClassBodyParameterType::Known(parameter.type_),
-                            optional: false,
+                            type_: ClassBodyParameterType::Known(class_method_parameter_type(
+                                store, *parameter,
+                            )?),
+                            optional: parameter.optional,
                         });
                     }
                     plan.bodies.push(ClassBodyPlan {
@@ -1477,6 +1513,49 @@ fn source_class_object_valid(
     })
 }
 
+fn source_class_method_signatures(
+    prepared: &PreparedSourceClass,
+    symbol: SemanticSymbolId,
+) -> Vec<SignatureId> {
+    prepared
+        .plan
+        .methods
+        .iter()
+        .zip(&prepared.methods)
+        .filter(|(method, _)| {
+            method.method.symbol == symbol
+                && (!method.method.overload || method.method.body.is_none())
+        })
+        .map(|(_, (_, signature))| *signature)
+        .collect()
+}
+
+fn class_method_parameter_type(
+    store: &CanonicalTypeMapperStore,
+    parameter: ClassMethodParameterPlan,
+) -> Result<TypeId, ClassError> {
+    optional_constructor_parameter_type(
+        store,
+        parameter.type_,
+        parameter.optional,
+        parameter.declaration,
+    )?
+    .ok_or_else(|| {
+        invariant(ClassInvariant::InvalidPropertyTypeCache(
+            parameter.declaration,
+        ))
+    })
+}
+
+fn class_method_minimum(method: &ClassMethodPlan) -> Result<i32, ClassError> {
+    let count = method
+        .parameters
+        .iter()
+        .rposition(|parameter| !parameter.optional)
+        .map_or(0, |index| index + 1);
+    i32::try_from(count).map_err(|_| invariant(ClassInvariant::Capacity(method.declaration)))
+}
+
 fn source_table_matches(
     store: &CanonicalTypeMapperStore,
     table: Option<SymbolTableId>,
@@ -1500,7 +1579,9 @@ fn validate_source_class_header(
 ) -> Result<(), ClassError> {
     let prepared = &provenance.prepared;
     let plan = &prepared.plan;
-    if plan_source_class_members(store, host, plan.symbol())? != *plan {
+    if plan_source_class_members_with_array_targets(store, host, plan.symbol(), plan.array_targets)?
+        != *plan
+    {
         return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
     }
     if source_class_base_members(store, host, plan)? != provenance.base_members {
@@ -1865,6 +1946,8 @@ fn validate_source_class_stored_layout(
     }
     for (index, method) in plan.methods.iter().enumerate() {
         let (type_, signature) = prepared.methods[index];
+        let signatures = source_class_method_signatures(prepared, method.method.symbol);
+        let signature_count = signatures.len();
         let parameters = method
             .method
             .parameters
@@ -1891,15 +1974,15 @@ fn validate_source_class_stored_layout(
                 SignatureFlags::NONE,
                 &parameters,
                 returned,
-                i32::try_from(parameters.len()).map_err(|_| reject())?,
+                class_method_minimum(&method.method)?,
             )
             || !source_class_object_valid(
                 store,
                 type_,
                 method.method.symbol,
                 &StructuredTypeData {
-                    signatures: Some(vec![signature]),
-                    call_signature_count: 1,
+                    signatures: Some(signatures),
+                    call_signature_count: signature_count,
                     ..StructuredTypeData::default()
                 },
             )
@@ -1907,9 +1990,10 @@ fn validate_source_class_stored_layout(
             return Err(reject());
         }
         for parameter in &method.method.parameters {
+            let parameter_type = class_method_parameter_type(store, *parameter)?;
             if store.value_symbol_links(parameter.symbol)
                 != Some(&ValueSymbolLinks {
-                    resolved_type: Some(parameter.type_),
+                    resolved_type: Some(parameter_type),
                     ..ValueSymbolLinks::default()
                 })
                 || parameter.type_node.is_some_and(|node| {
@@ -1917,6 +2001,23 @@ fn validate_source_class_stored_layout(
                         != Some(&TypeNodeLinks {
                             resolved_type: Some(parameter.type_),
                             ..TypeNodeLinks::default()
+                        })
+                })
+            {
+                return Err(reject());
+            }
+            if parameter
+                .type_node
+                .is_some_and(|node| store.source_node_kind(node) == Some(SyntaxKind::ArrayType))
+                && plan.array_targets.is_none_or(|targets| {
+                    store
+                        .canonical_array_reference_with_targets(targets, parameter.type_)
+                        .ok()
+                        .flatten()
+                        .is_none_or(|reference| {
+                            reference.readonly
+                                || reference.array_literal
+                                || reference.base_type != parameter.type_
                         })
                 })
             {
@@ -1949,7 +2050,9 @@ pub(super) fn prepare_source_class_members(
     host: &DeclaredTypeHost<'_>,
     plan: &SourceClassPlan,
 ) -> Result<PreparedSourceClass, ClassError> {
-    if plan_source_class_members(store, host, plan.symbol())? != *plan {
+    if plan_source_class_members_with_array_targets(store, host, plan.symbol(), plan.array_targets)?
+        != *plan
+    {
         return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
     }
     let instance = store
@@ -2336,10 +2439,13 @@ pub(super) fn prepare_source_class_members(
         }
         assert!(store.set_source_property_readonly(property.symbol, property.readonly));
     }
+    let mut method_types = HashMap::new();
     for method in &plan.methods {
-        let type_ = store
-            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method.method.symbol))
-            .expect("source method value capacity was reserved");
+        let type_ = *method_types.entry(method.method.symbol).or_insert_with(|| {
+            store
+                .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method.method.symbol))
+                .expect("source method value capacity was reserved")
+        });
         let parameters = method
             .method
             .parameters
@@ -2355,10 +2461,11 @@ pub(super) fn prepare_source_class_members(
                 parameters,
                 method.return_type,
                 None,
-                i32::try_from(method.method.parameters.len()).expect("method arity was bounded"),
+                class_method_minimum(&method.method).expect("method arity was bounded"),
             )
             .expect("source method signature capacity was reserved");
         for parameter in &method.method.parameters {
+            let parameter_type = class_method_parameter_type(store, *parameter)?;
             if let Some(type_node) = parameter.type_node {
                 assert!(store.set_type_node_links(
                     type_node,
@@ -2371,7 +2478,7 @@ pub(super) fn prepare_source_class_members(
             assert!(store.set_value_symbol_links(
                 parameter.symbol,
                 ValueSymbolLinks {
-                    resolved_type: Some(parameter.type_),
+                    resolved_type: Some(parameter_type),
                     ..ValueSymbolLinks::default()
                 }
             ));
@@ -2401,15 +2508,20 @@ pub(super) fn prepare_source_class_members(
                 ..ValueSymbolLinks::default()
             }
         ));
-        assert!(store.set_structured_type_members(
-            type_,
-            None,
-            None,
-            Some(vec![signature]),
-            None,
-            None
-        ));
         methods.push((type_, signature));
+    }
+    for (symbol, type_) in method_types {
+        let signatures = plan
+            .methods
+            .iter()
+            .zip(&methods)
+            .filter(|(method, _)| {
+                method.method.symbol == symbol
+                    && (!method.method.overload || method.method.body.is_none())
+            })
+            .map(|(_, (_, signature))| *signature)
+            .collect::<Vec<_>>();
+        assert!(store.set_structured_type_members(type_, None, None, Some(signatures), None, None));
     }
     let members = ClassMembers {
         shells: ClassShells {
@@ -2549,7 +2661,9 @@ fn source_class_body_token(
                 .plan
                 .methods
                 .iter()
-                .position(|method| method.method.symbol == symbol)
+                .position(|method| {
+                    method.method.symbol == symbol && method.method.declaration == body.declaration
+                })
                 .ok_or_else(|| {
                     invariant(ClassInvariant::InvalidPropertySymbol(body.declaration))
                 })?;
@@ -3671,7 +3785,9 @@ pub(super) fn complete_source_class_body(
                 .plan
                 .methods
                 .iter()
-                .position(|method| method.method.symbol == symbol)
+                .position(|method| {
+                    method.method.symbol == symbol && method.method.declaration == body.declaration
+                })
                 .ok_or_else(|| {
                     invariant(ClassInvariant::InvalidPropertySymbol(body.declaration))
                 })?;
@@ -3798,6 +3914,114 @@ pub(super) fn finish_source_class_members(
             .complete = true;
     }
     Ok(members)
+}
+
+/// Reuses checked source members without asking the legacy planner to rebuild them.
+pub(super) fn completed_source_class_members(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Option<ClassMembers>, ClassError> {
+    let Some(provenance) = store.source_class_provenance_for_symbol(symbol) else {
+        return Ok(None);
+    };
+    validate_source_class_header(store, host, provenance)?;
+    if !provenance.complete {
+        return Err(invariant(ClassInvariant::InvalidInstanceMembers(symbol)));
+    }
+    Ok(Some(provenance.members.clone()))
+}
+
+fn completed_source_class_method_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Option<TypeId>, ClassError> {
+    let Some(provenance) = store
+        .symbol(symbol)
+        .and_then(Symbol::parent)
+        .and_then(|owner| store.source_class_provenance_for_symbol(owner))
+    else {
+        return Ok(None);
+    };
+    if !provenance
+        .prepared
+        .plan
+        .methods
+        .iter()
+        .any(|method| method.method.symbol == symbol && method.method.overload)
+    {
+        return Ok(None);
+    }
+    validate_source_class_header(store, host, provenance)?;
+    if !provenance.complete {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+    }
+    store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type)
+        .map(Some)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(symbol)))
+}
+
+/// Checks each overload against its checked implementation, in binder order.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_source_class_method_overloads(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    prepared: &PreparedSourceClass,
+) -> Result<Vec<(NodeRef, CanonicalCheckerDiagnostic)>, SourceCheckError> {
+    let mut groups = Vec::new();
+    let mut diagnostics = Vec::new();
+    for (method, &(type_, _)) in prepared.plan.methods.iter().zip(&prepared.methods) {
+        if method.method.overload && method.method.body.is_some() {
+            let overloads = source_class_method_overloads(store, type_)
+                .map_err(|_| SourceCheckError::Class(method.method.declaration))?
+                .ok_or(SourceCheckError::Class(method.method.declaration))?;
+            groups.push((method.method.declaration, overloads));
+        }
+    }
+    for (implementation, overloads) in groups {
+        for overload in &overloads.signatures {
+            let compatible = store.is_implementation_compatible_with_overload(
+                &overloads.implementation,
+                overload,
+                global_types,
+                options.strict_function_types,
+                session,
+            )?;
+            if compatible {
+                continue;
+            }
+            let declaration = store
+                .signature(overload.signature)
+                .and_then(|signature| signature.declaration())
+                .filter(|declaration| host.node(*declaration).is_some())
+                .ok_or(SourceCheckError::Class(implementation))?;
+            diagnostics.push((
+                implementation,
+                CanonicalCheckerDiagnostic {
+                    node: Some(declaration),
+                    range_override: None,
+                    diagnostic: Diagnostic::new(
+                        message_by_code(2394).ok_or(SourceCheckError::MissingDiagnostic(2394))?,
+                    ),
+                    related_information: vec![CanonicalCheckerRelatedInformation {
+                        node: Some(implementation),
+                        diagnostic: Diagnostic::new(
+                            message_by_code(2750)
+                                .ok_or(SourceCheckError::MissingDiagnostic(2750))?,
+                        ),
+                    }],
+                },
+            ));
+            break;
+        }
+    }
+    Ok(diagnostics)
 }
 
 /// Checks local members against declared or inherited class index signatures.
@@ -4408,6 +4632,59 @@ fn source_class_callable_projection(
     })
 }
 
+/// Reads the separate overload and implementation signatures from the class receipt.
+pub(super) fn source_class_method_overloads(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<SourceClassMethodOverloads>, ClassError> {
+    let Some(symbol) = store.type_payload(type_).and_then(TypeRecord::symbol) else {
+        return Ok(None);
+    };
+    let Some(provenance) = store
+        .symbol(symbol)
+        .and_then(Symbol::parent)
+        .and_then(|owner| store.source_class_provenance_for_symbol(owner))
+    else {
+        return Ok(None);
+    };
+    let methods = provenance
+        .prepared
+        .plan
+        .methods
+        .iter()
+        .zip(&provenance.prepared.methods)
+        .filter(|(method, _)| method.method.symbol == symbol)
+        .collect::<Vec<_>>();
+    if !methods.iter().any(|(method, _)| method.method.overload) {
+        return Ok(None);
+    }
+    validate_source_class_stored_header(store, provenance)?;
+    let mut signatures = Vec::new();
+    let mut implementation = None;
+    for (method, &(owner, signature)) in methods {
+        if owner != type_ || !method.method.overload {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+        }
+        let callable = source_class_callable_projection(store, owner, signature, symbol)?;
+        if method.method.body.is_some() {
+            if implementation.replace(callable).is_some() {
+                return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+            }
+        } else {
+            signatures.push(callable);
+        }
+    }
+    if signatures.is_empty() {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+    }
+    let implementation = implementation
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(symbol)))?;
+    Ok(Some(SourceClassMethodOverloads {
+        signatures,
+        implementation,
+    }))
+}
+
 fn source_constructor_call_parameter(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -4582,6 +4859,7 @@ pub(super) fn class_body_super_constructor_callable(
         class_symbol: base.shells.symbol,
         declaration,
         callable,
+        overloads: None,
         pending_return_body: None,
     })
 }
@@ -4615,6 +4893,7 @@ pub(super) fn class_body_method_callable(
             class_symbol: source.declaring_class,
             declaration: Some(source.declaration),
             callable,
+            overloads: None,
             pending_return_body: None,
         });
     }
@@ -4667,6 +4946,16 @@ pub(super) fn class_body_method_callable(
         .value_symbol_links(member)
         .and_then(|links| links.resolved_type)
         .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(member)))?;
+    if let Some(overloads) = source_class_method_overloads(store, owner)? {
+        return Ok(ClassBodyCallable {
+            kind: SignatureKind::Call,
+            class_symbol: source.declaring_class,
+            declaration: Some(source.declaration),
+            callable: overloads.signatures[0].clone(),
+            overloads: Some(overloads),
+            pending_return_body: None,
+        });
+    }
     let signature = store
         .signature_links(source.declaration)
         .and_then(|links| links.resolved_signature.signature())
@@ -4722,6 +5011,7 @@ pub(super) fn class_body_method_callable(
         class_symbol: source.declaring_class,
         declaration: Some(source.declaration),
         callable,
+        overloads: None,
         pending_return_body,
     })
 }
@@ -4953,6 +5243,7 @@ struct ClassMethodPlan {
     name: String,
     side: ClassPropertySide,
     ambient: bool,
+    overload: bool,
     body: Option<NodeRef>,
     return_type_node: Option<NodeRef>,
     private_return: Option<ClassMethodPrivateReturnPlan>,
@@ -5000,6 +5291,7 @@ struct ClassMethodParameterPlan {
     symbol: SemanticSymbolId,
     type_node: Option<NodeRef>,
     type_: TypeId,
+    optional: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8735,6 +9027,7 @@ fn plan_class_method_rest_parameter(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // Parameter ownership and array authority come from the method plan.
 fn plan_class_method_parameter_with_body_mode(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -8743,6 +9036,7 @@ fn plan_class_method_parameter_with_body_mode(
     parameters: &ts_ast::NodeList,
     previous_end: ts_core::TextPos,
     source_body: bool,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<ClassMethodParameterPlan, ClassError> {
     let reject = || accessor_member_error(method, SyntaxKind::MethodDeclaration);
     let record = preflight_node(store, host, parameter)?;
@@ -8763,7 +9057,7 @@ fn plan_class_method_parameter_with_body_mode(
         || record.range.end > parameters.range.end
         || data.dot_dot_dot_token.is_some()
         || data.initializer.is_some()
-        || data.question_token.is_some()
+        || data.question_token.is_some() && !source_body
         || data.symbol.is_some()
         || data.facts != 0
     {
@@ -8830,18 +9124,61 @@ fn plan_class_method_parameter_with_body_mode(
             || type_record.parent != Some(parameter.node)
             || type_record.range.start < name_record.range.end
             || type_record.range.end != record.range.end
-            || !matches!(type_record.data, NodeData::KeywordTypeNode(_))
         {
             return Err(reject());
         }
-        let type_ =
+        let type_ = if let NodeData::ArrayTypeNode(array) = &type_record.data {
+            if !source_body || data.question_token.is_some() {
+                return Err(reject());
+            }
+            let element = NodeRef::new(type_node.arena, type_node.file, array.element_type);
+            let element_record = preflight_node(store, host, element)?;
+            if type_record.kind != SyntaxKind::ArrayType
+                || element_record.parent != Some(type_node.node)
+                || element_record.flags.0 != 0
+                || element_record.range.start != type_record.range.start
+                || element_record.range.end > type_record.range.end
+                || !matches!(element_record.data, NodeData::KeywordTypeNode(_))
+            {
+                return Err(reject());
+            }
+            let element_type = primitive_keyword_type(store, element, element_record.kind)?;
+            let Some(type_) = store
+                .type_node_links(type_node)
+                .and_then(|links| links.resolved_type)
+            else {
+                return Err(unsupported(ClassUnsupported::PropertyType {
+                    node: type_node,
+                    kind: SyntaxKind::Parameter,
+                }));
+            };
+            let targets = array_targets.ok_or_else(reject)?;
+            let reference = store
+                .canonical_array_reference_with_targets(targets, type_)
+                .map_err(|_| invariant(ClassInvariant::InvalidPropertyTypeCache(type_node)))?
+                .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyTypeCache(type_node)))?;
+            if reference.element_type != element_type
+                || reference.readonly
+                || reference.array_literal
+                || reference.base_type != type_
+            {
+                return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                    type_node,
+                )));
+            }
+            validate_index_type_cache(store, element, element_type)?;
+            type_
+        } else if matches!(type_record.data, NodeData::KeywordTypeNode(_)) {
             primitive_keyword_type(store, type_node, type_record.kind).map_err(|error| {
                 if matches!(error, ClassError::Unsupported(_)) {
                     reject()
                 } else {
                     error
                 }
-            })?;
+            })?
+        } else {
+            return Err(reject());
+        };
         validate_index_type_cache(store, type_node, type_)?;
         (Some(type_node), type_)
     } else if javascript && name_record.range.end == record.range.end {
@@ -8853,6 +9190,32 @@ fn plan_class_method_parameter_with_body_mode(
     } else {
         return Err(reject());
     };
+
+    let optional = data.question_token.is_some();
+    if let Some(question) = data.question_token {
+        let question = NodeRef::new(parameter.arena, parameter.file, question);
+        let question_record = preflight_node(store, host, question)?;
+        if question_record.kind != SyntaxKind::QuestionToken
+            || question_record.parent != Some(parameter.node)
+            || question_record.flags.0 != 0
+            || question_record.range.start < name_record.range.end
+            || question_record.range.end > record.range.end
+            || type_node.is_some_and(|node| {
+                host.node(node)
+                    .is_none_or(|annotation| question_record.range.end > annotation.range.start)
+            })
+            || !matches!(question_record.data, NodeData::Token(_))
+        {
+            return Err(reject());
+        }
+    }
+    let value_type = optional_constructor_parameter_type(store, type_, optional, parameter)?
+        .ok_or_else(|| {
+            unsupported(ClassUnsupported::PropertyType {
+                node: type_node.unwrap_or(parameter),
+                kind: SyntaxKind::Parameter,
+            })
+        })?;
 
     let symbol = bound_symbol(store, host, parameter)
         .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
@@ -8884,7 +9247,7 @@ fn plan_class_method_parameter_with_body_mode(
         links != &ValueSymbolLinks::default()
             && links
                 != &(ValueSymbolLinks {
-                    resolved_type: Some(type_),
+                    resolved_type: Some(value_type),
                     ..ValueSymbolLinks::default()
                 })
     }) {
@@ -8896,6 +9259,7 @@ fn plan_class_method_parameter_with_body_mode(
         symbol,
         type_node,
         type_,
+        optional,
     })
 }
 
@@ -9411,9 +9775,11 @@ fn plan_method(
         (instance_members, static_members),
         ambient,
         false,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Source bodies retain their caller's array authority.
 fn plan_method_with_body_mode(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -9422,6 +9788,7 @@ fn plan_method_with_body_mode(
     member_tables: (Option<SymbolTableId>, SymbolTableId),
     ambient: bool,
     source_body: bool,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<ClassMethodPlan, ClassError> {
     let (instance_members, static_members) = member_tables;
     let record = preflight_node(store, host, declaration)?;
@@ -9463,12 +9830,31 @@ fn plan_method_with_body_mode(
             kind: SyntaxKind::MethodDeclaration,
         }));
     }
+    let symbol = bound_symbol(store, host, declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(declaration)))?;
+    let symbol_record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(declaration)))?;
+    let declarations = symbol_record
+        .declarations()
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(declaration)))?;
+    let overload = declarations.len() > 1;
+    if overload {
+        validate_source_class_method_overload_group(store, host, owner, symbol, declaration)?;
+        if !source_body || ambient {
+            return Err(accessor_member_error(
+                declaration,
+                SyntaxKind::MethodDeclaration,
+            ));
+        }
+    }
     let mut parameters = Vec::new();
     let rest_parameter = if ambient || source_body {
         parameters
             .try_reserve_exact(method.parameters.nodes.len())
             .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
         let mut previous_end = method.parameters.range.start;
+        let mut optional_seen = false;
         for parameter in &method.parameters.nodes {
             let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
             let planned = plan_class_method_parameter_with_body_mode(
@@ -9479,7 +9865,15 @@ fn plan_method_with_body_mode(
                 &method.parameters,
                 previous_end,
                 source_body,
+                array_targets,
             )?;
+            if optional_seen && !planned.optional {
+                return Err(accessor_member_error(
+                    declaration,
+                    SyntaxKind::MethodDeclaration,
+                ));
+            }
+            optional_seen |= planned.optional;
             previous_end = preflight_node(store, host, parameter)?.range.end;
             parameters.push(planned);
         }
@@ -9540,6 +9934,7 @@ fn plan_method_with_body_mode(
     if readonly
         || private
             && (ambient
+                || overload
                 || side == ClassPropertySide::Instance && method.modifiers.is_some()
                 || side == ClassPropertySide::Static
                     && method
@@ -9574,7 +9969,7 @@ fn plan_method_with_body_mode(
     }
     let mut private_return = None;
     let mut private_tagged_call = None;
-    if ambient {
+    if ambient || overload && method.body.is_none() {
         if method.body.is_some() || return_type_node.is_none() || body_start != record.range.end {
             return Err(unsupported(ClassUnsupported::Member {
                 node: declaration,
@@ -9666,46 +10061,6 @@ fn plan_method_with_body_mode(
         }
     }
 
-    let symbol = bound_symbol(store, host, declaration)
-        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(declaration)))?;
-    let symbol_record = store
-        .symbol(symbol)
-        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(declaration)))?;
-    if let Some(declarations) = symbol_record.declarations()
-        && declarations.len() > 1
-        && declarations.contains(&declaration)
-    {
-        let owner_declaration = store
-            .symbol(owner)
-            .and_then(Symbol::value_declaration)
-            .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(declaration)))?;
-        let owner_record = preflight_node(store, host, owner_declaration)?;
-        let NodeData::ClassDeclaration(class) = &owner_record.data else {
-            return Err(invariant(ClassInvariant::InvalidPropertySymbol(
-                declaration,
-            )));
-        };
-        let expected = class.members.nodes.iter().filter_map(|member| {
-            let member = NodeRef::new(owner_declaration.arena, owner_declaration.file, *member);
-            (host
-                .node(member)
-                .is_some_and(|record| record.kind == SyntaxKind::MethodDeclaration)
-                && bound_symbol(store, host, member) == Some(symbol))
-            .then_some(member)
-        });
-        if symbol_record.flags() == SymbolFlags::METHOD
-            && symbol_record.check_flags() == CheckFlags::NONE
-            && declarations.iter().copied().eq(expected)
-        {
-            return Err(unsupported(ClassUnsupported::Member {
-                node: declaration,
-                kind: SyntaxKind::MethodDeclaration,
-            }));
-        }
-        return Err(invariant(ClassInvariant::InvalidPropertySymbol(
-            declaration,
-        )));
-    }
     let table = match side {
         ClassPropertySide::Instance => instance_members,
         ClassPropertySide::Static => Some(static_members),
@@ -9714,8 +10069,8 @@ fn plan_method_with_body_mode(
     if symbol_record.flags() != SymbolFlags::METHOD
         || symbol_record.check_flags() != CheckFlags::NONE
         || !class_member_symbol_name_matches(store, owner, symbol, method_name, private)
-        || symbol_record.declarations() != Some(&[declaration])
-        || symbol_record.value_declaration() != Some(declaration)
+        || !overload && declarations != [declaration]
+        || symbol_record.value_declaration() != declarations.first().copied()
         || symbol_record.members().is_some()
         || symbol_record.exports().is_some()
         || symbol_record.parent() != Some(owner)
@@ -9735,6 +10090,7 @@ fn plan_method_with_body_mode(
         name: method_name.to_owned(),
         side,
         ambient,
+        overload,
         body: method
             .body
             .map(|body| NodeRef::new(declaration.arena, declaration.file, body)),
@@ -9744,6 +10100,67 @@ fn plan_method_with_body_mode(
         parameters,
         rest_parameter,
     })
+}
+
+/// Keeps one contiguous binder-owned overload list and its final implementation.
+fn validate_source_class_method_overload_group(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<(), ClassError> {
+    let invalid = || invariant(ClassInvariant::InvalidPropertySymbol(declaration));
+    let unsupported = || accessor_member_error(declaration, SyntaxKind::MethodDeclaration);
+    let declarations = store
+        .symbol(symbol)
+        .and_then(Symbol::declarations)
+        .ok_or_else(invalid)?;
+    let class_declaration = store
+        .symbol(owner)
+        .and_then(Symbol::value_declaration)
+        .ok_or_else(invalid)?;
+    let NodeData::ClassDeclaration(class) = &preflight_node(store, host, class_declaration)?.data
+    else {
+        return Err(invalid());
+    };
+    let expected = class
+        .members
+        .nodes
+        .iter()
+        .filter_map(|member| {
+            let member = NodeRef::new(class_declaration.arena, class_declaration.file, *member);
+            (bound_symbol(store, host, member) == Some(symbol)).then_some(member)
+        })
+        .collect::<Vec<_>>();
+    if declarations != expected || !declarations.contains(&declaration) {
+        return Err(invalid());
+    }
+    if class.type_parameters.is_some() || class.heritage_clauses.is_some() {
+        return Err(unsupported());
+    }
+    let first = declarations.first().copied().ok_or_else(invalid)?;
+    let start = class
+        .members
+        .nodes
+        .iter()
+        .position(|member| *member == first.node)
+        .ok_or_else(invalid)?;
+    let visibility = class_member_visibility(store, first);
+    for (index, &member) in declarations.iter().enumerate() {
+        let record = preflight_node(store, host, member)?;
+        let NodeData::MethodDeclaration(method) = &record.data else {
+            return Err(invalid());
+        };
+        if record.parent != Some(class_declaration.node)
+            || class.members.nodes.get(start + index) != Some(&member.node)
+            || method.body.is_some() != (index + 1 == declarations.len())
+            || class_member_visibility(store, member) != visibility
+        {
+            return Err(unsupported());
+        }
+    }
+    Ok(())
 }
 
 fn accessor_member_error(node: NodeRef, kind: SyntaxKind) -> ClassError {
@@ -28260,6 +28677,7 @@ fn exact_stored_ambient_class_method_parameters(
             symbol,
             type_node: Some(type_node),
             type_,
+            optional: false,
         });
     }
     Some(planned)

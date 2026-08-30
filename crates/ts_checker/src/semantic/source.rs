@@ -79,6 +79,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
+use super::classes::plan_source_class_members;
+
 use ts_ast::{
     FileId, ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind,
 };
@@ -117,8 +120,8 @@ use super::{
         plan_anonymous_abstract_class_expression_grammar, plan_class_grammar_diagnostics,
         plan_exported_jsx_arrow_class, plan_exported_static_member_name_grammar_diagnostics,
         plan_nongeneric_class_member_query, plan_nongeneric_class_member_query_with_type_context,
-        plan_source_class_members, preflight_nongeneric_class_member_query,
-        prepare_source_class_members, validate_class_heritage_members,
+        preflight_nongeneric_class_member_query, prepare_source_class_members,
+        validate_class_heritage_members,
     },
     contextual::{
         LiteralTreatment, PreparedExpression, PreparedObjectMember, mutable_literal_treatment,
@@ -8751,7 +8754,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         {
             return Ok(None);
         }
-        let source = match plan_source_class_members(store, host, symbol) {
+        let source = match super::classes::plan_source_class_members_with_array_targets(
+            store,
+            host,
+            symbol,
+            self.array_targets,
+        ) {
             Ok(source) => source,
             Err(
                 error @ super::classes::ClassError::Unsupported(
@@ -33408,6 +33416,16 @@ fn check_planned_source_class(
     }
     let members = finish_source_class_members(store, host, &class.source, &prepared)
         .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
+    let mut method_overload_diagnostics = super::classes::check_source_class_method_overloads(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        &prepared,
+    )?
+    .into_iter()
+    .collect::<HashMap<_, _>>();
     check_class_heritage_compatibility(
         store,
         host,
@@ -33418,6 +33436,9 @@ fn check_planned_source_class(
         &members,
     )?;
     for body in class.source.bodies() {
+        if let Some(diagnostic) = method_overload_diagnostics.remove(&body.declaration) {
+            merge_retry_diagnostic(diagnostics, diagnostic);
+        }
         let checked = state
             .body_diagnostics
             .remove(&body.declaration)
@@ -33449,6 +33470,9 @@ fn check_planned_source_class(
         if properties.next().is_some() {
             return Err(SourceCheckError::Class(body.declaration));
         }
+    }
+    if !method_overload_diagnostics.is_empty() {
+        return Err(SourceCheckError::Class(declaration));
     }
     let uninitialized = match state.uninitialized_properties {
         Some(properties) => properties,
@@ -58712,10 +58736,10 @@ pub(super) fn recover_strict_arguments_source(
     }
 }
 
-// A source constructor plan needs the real optional parameter type. Only an
+// A source class plan needs real array and optional parameter types. Only an
 // authenticated class-provider request can start this preparation.
 #[allow(clippy::too_many_arguments)] // Retains the caller's source and query session.
-fn prepare_source_constructor_parameter(
+fn prepare_source_class_parameter(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
@@ -58744,7 +58768,7 @@ fn prepare_source_constructor_parameter(
     let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
         return Ok(false);
     };
-    if parameter_data.type_ != Some(annotation.node) || parameter_data.question_token.is_none() {
+    if parameter_data.type_ != Some(annotation.node) {
         return Ok(false);
     }
     let Some(constructor) = parameter_record
@@ -58756,7 +58780,15 @@ fn prepare_source_constructor_parameter(
     let Some(constructor_record) = host.node(constructor) else {
         return Ok(false);
     };
-    if !matches!(constructor_record.data, NodeData::ConstructorDeclaration(_)) {
+    if !matches!(
+        constructor_record.data,
+        NodeData::ConstructorDeclaration(_) | NodeData::MethodDeclaration(_)
+    ) || parameter_data.question_token.is_none()
+        && !matches!(
+            host.node(annotation).map(|node| &node.data),
+            Some(NodeData::ArrayTypeNode(_))
+        )
+    {
         return Ok(false);
     }
     let Some(declaration) = constructor_record
@@ -58771,7 +58803,7 @@ fn prepare_source_constructor_parameter(
     else {
         return Ok(false);
     };
-    if !matches!(plan_source_class_members(store, host, symbol),
+    if !matches!(super::classes::plan_source_class_members_with_array_targets(store, host, symbol, Some(CanonicalArrayTargets::from_global_types(global_types))),
         Err(super::classes::ClassError::Unsupported(
             super::classes::ClassUnsupported::PropertyType { node, kind: SyntaxKind::Parameter }
         )) if node == annotation)
@@ -58789,6 +58821,9 @@ fn prepare_source_constructor_parameter(
         diagnostics,
     )?
     .get_type_from_type_node(annotation)?;
+    if parameter_data.question_token.is_none() {
+        return Ok(true);
+    }
     let undefined = store
         .intrinsic_bootstrap()
         .ok_or(SourceCheckError::LiteralCache(
@@ -58840,6 +58875,7 @@ pub(super) fn check_source_file(
         return Ok(());
     }
 
+    let mut prepared_class_parameters = HashSet::new();
     let plan = loop {
         match SourcePlanner::new_semantic_with_global_types(
             arena,
@@ -58854,7 +58890,13 @@ pub(super) fn check_source_file(
         {
             Ok(plan) => break plan,
             Err(error) => {
-                if !prepare_source_constructor_parameter(
+                if let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(annotation)) =
+                    error
+                    && !prepared_class_parameters.insert(annotation)
+                {
+                    return Err(error);
+                }
+                if !prepare_source_class_parameter(
                     store,
                     host,
                     global_types,

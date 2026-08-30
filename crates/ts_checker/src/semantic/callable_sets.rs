@@ -2303,10 +2303,8 @@ fn validate_stored_class_method_callable_set(
 
     let family = CallableFamily::DeclaredCallSignatures;
     let authenticated = (|| {
-        let [declaration] = method.declarations()? else {
-            return None;
-        };
-        let declaration = *declaration;
+        let declarations = method.declarations()?;
+        let declaration = *declarations.first()?;
         let owner = method.parent()?;
         let class = store.symbol(owner)?;
         let [class_declaration] = class.declarations()? else {
@@ -2326,9 +2324,11 @@ fn validate_stored_class_method_callable_set(
             || store.get_merged_symbol(method_symbol) != Some(method_symbol)
             || !class.flags().contains(SymbolFlags::CLASS)
             || store.get_merged_symbol(owner) != Some(owner)
-            || store.source_node_kind(declaration) != Some(SyntaxKind::MethodDeclaration)
-            || store.source_node_parent(declaration)
-                != Some(SourceNodeParent::Parent(*class_declaration))
+            || declarations.iter().any(|declaration| {
+                store.source_node_kind(*declaration) != Some(SyntaxKind::MethodDeclaration)
+                    || store.source_node_parent(*declaration)
+                        != Some(SourceNodeParent::Parent(*class_declaration))
+            })
             || store.value_symbol_links(method_symbol)
                 != Some(&ValueSymbolLinks {
                     resolved_type: Some(type_),
@@ -2360,24 +2360,40 @@ fn validate_stored_class_method_callable_set(
             validate_stored_callable_set_projection_with(store, type_, true, |signature| {
                 validated_method_signature_parameter_types(store, signature)
             })?;
-        let [callable] = projection.call_signatures.as_ref() else {
-            return None;
+        let overloads = super::classes::source_class_method_overloads(store, type_).ok()?;
+        let visible = if let Some(overloads) = &overloads {
+            if projection.call_signatures.as_ref() != overloads.signatures.as_slice() {
+                return None;
+            }
+            declarations.get(..declarations.len().checked_sub(1)?)?
+        } else {
+            if declarations.len() != 1 {
+                return None;
+            }
+            declarations
         };
-        let signature = callable.signature;
-        let return_type = callable.return_type?;
         if !projection.construct_signatures.is_empty()
-            || store.signature(signature)?.declaration() != Some(declaration)
-            || store.signature_links(declaration)
-                != Some(&SignatureLinks {
-                    resolved_signature: ResolvedSignatureState::Resolved(signature),
-                    ..SignatureLinks::default()
-                })
+            || projection.call_signatures.len() != visible.len()
         {
             return None;
         }
-        let mut edges = callable.parameters.clone();
-        edges.extend(callable.rest_parameter);
-        edges.push(return_type);
+        let mut edges = Vec::new();
+        for (callable, declaration) in projection.call_signatures.iter().zip(visible) {
+            let signature = callable.signature;
+            let return_type = callable.return_type?;
+            if store.signature(signature)?.declaration() != Some(*declaration)
+                || store.signature_links(*declaration)
+                    != Some(&SignatureLinks {
+                        resolved_signature: ResolvedSignatureState::Resolved(signature),
+                        ..SignatureLinks::default()
+                    })
+            {
+                return None;
+            }
+            edges.extend(&callable.parameters);
+            edges.extend(callable.rest_parameter);
+            edges.push(return_type);
+        }
         Some((projection, edges))
     })();
 

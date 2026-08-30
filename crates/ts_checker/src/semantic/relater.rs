@@ -8902,6 +8902,71 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    /// Pinned implementation compatibility, using the caller's signature relation session.
+    pub(super) fn is_implementation_compatible_with_overload(
+        &mut self,
+        implementation: &ValidatedSingleCallable,
+        overload: &ValidatedSingleCallable,
+        global_types: &CanonicalGlobalTypes,
+        strict_function_types: bool,
+        instantiation_session: &mut InstantiationSession,
+    ) -> Result<bool, RelationUnavailable> {
+        let source_return =
+            implementation
+                .return_type
+                .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
+                    implementation.signature,
+                ))?;
+        let target_return =
+            overload
+                .return_type
+                .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
+                    overload.signature,
+                ))?;
+        if let Err(established) = self.claim_strict_function_types(strict_function_types) {
+            return Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                established,
+                requested: strict_function_types,
+            });
+        }
+        let bootstrap = self.relation_bootstrap_facts()?;
+        if target_return != bootstrap.void_type
+            && !self.is_type_assignable_to_with_session(
+                target_return,
+                source_return,
+                Some(global_types),
+                Some(strict_function_types),
+                instantiation_session,
+            )?
+            && !self.is_type_assignable_to_with_session(
+                source_return,
+                target_return,
+                Some(global_types),
+                Some(strict_function_types),
+                instantiation_session,
+            )?
+        {
+            return Ok(false);
+        }
+        let mut session = RelaterSession::new_with_global_types_options_and_session(
+            self,
+            RelationKind::Assignable,
+            bootstrap,
+            Some(RelationGlobalTypes::from_global_types(global_types)),
+            Some(strict_function_types),
+            Some(instantiation_session),
+        );
+        session.observe_type_surface(implementation.owner);
+        session.observe_type_surface(overload.owner);
+        let result = session.compare_signatures_related(
+            implementation,
+            overload,
+            SignatureCheckMode::IGNORE_RETURN_TYPES,
+            IntersectionState::NONE,
+        )?;
+        Ok(session.finish_without_specialized_root_cache(result))
+    }
+
     /// Borrows the checker query's instantiation session for any relation.
     pub(super) fn is_type_related_to_with_session(
         &mut self,

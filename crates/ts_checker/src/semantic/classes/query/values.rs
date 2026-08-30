@@ -1,6 +1,9 @@
 //! Class value queries compose the existing annotation and expression kernels.
 
-use super::super::{completed_source_class_property_type, emit_standard_class_fields};
+use super::super::{
+    completed_source_class_method_type, completed_source_class_property_type,
+    emit_standard_class_fields,
+};
 use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, CanonicalTypeQuery, CheckFlags, ClassError, ClassInvariant,
@@ -557,6 +560,9 @@ impl ClassValueQuery<'_, '_, '_> {
         symbol: SemanticSymbolId,
         active: &mut HashSet<SemanticSymbolId>,
     ) -> Result<TypeId, ClassError> {
+        if let Some(type_) = completed_source_class_method_type(self.store, self.host, symbol)? {
+            return Ok(type_);
+        }
         match plan_selected_class_member(self.store, self.host, symbol) {
             Ok(plan) => return execute_selected_class_member(self.store, self.host, &plan),
             Err(ClassError::Unsupported(_)) => {}
