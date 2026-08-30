@@ -47,7 +47,9 @@ use super::{
     functions::{FunctionTypeDisplayError, FunctionTypeUnsupported},
     instantiated_members::validate_property_object_alias_members_with_array_targets,
     keyof_types,
-    links::{ResolvedSignatureState, SignatureLinks, ValueSymbolLinks},
+    links::{
+        ResolvedSignatureState, SignatureLinks, SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks,
+    },
     mapped_types::plan_mapped_type_declaration,
     object_aliases::property_object_alias_projection,
     object_members,
@@ -3930,6 +3932,238 @@ fn append_function_type_parameters(
     Ok(())
 }
 
+fn source_expando_literal_display_types(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: TypeId,
+    expression: NodeRef,
+) -> Result<(TypeId, TypeId), TypeDisplayUnavailable> {
+    let invalid = || TypeDisplayUnavailable::MalformedType(owner);
+    let node = host.node(expression).ok_or_else(invalid)?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(TypeDisplayUnavailable::MissingBootstrap)?;
+    if node.flags.0 != 0 {
+        return Err(invalid());
+    }
+    let regular = match &node.data {
+        NodeData::NumericLiteral(literal) => {
+            if node.kind != SyntaxKind::NumericLiteral || literal.token_flags.0 != 0 {
+                return Err(invalid());
+            }
+            bootstrap.cached_number_literal_type(ts_jsnum::from_string(&literal.text))
+        }
+        NodeData::StringLiteral(literal) => {
+            if node.kind != SyntaxKind::StringLiteral || literal.token_flags.0 != 0 {
+                return Err(invalid());
+            }
+            bootstrap.cached_string_literal_type(&literal.text)
+        }
+        NodeData::KeywordExpression(keyword)
+            if matches!(
+                node.kind,
+                SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword
+            ) =>
+        {
+            if keyword.flow_node.is_some() {
+                return Err(invalid());
+            }
+            Some(if node.kind == SyntaxKind::TrueKeyword {
+                bootstrap.regular_true_type
+            } else {
+                bootstrap.regular_false_type
+            })
+        }
+        _ => {
+            return Err(TypeDisplayUnavailable::FunctionType {
+                type_id: owner,
+                reason: FunctionTypeDisplayUnavailable::CallableProperties,
+            });
+        }
+    }
+    .ok_or_else(invalid)?;
+    let fresh = store
+        .fresh_type_of_literal_type(regular)
+        .map_err(|_| invalid())?;
+    let widened = super::source::widened_fresh_literal_type(store, fresh).map_err(|_| invalid())?;
+    Ok((fresh, widened))
+}
+
+fn source_arrow_expando_display_plans(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_id: TypeId,
+    declaration: NodeRef,
+) -> Result<Vec<super::assignment::ArrowExpandoAssignmentPlan>, TypeDisplayUnavailable> {
+    let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let Some(variable_id) = host.node(declaration).and_then(|node| node.parent) else {
+        return Ok(Vec::new());
+    };
+    let variable_node = arena.get(variable_id).ok_or_else(invalid)?;
+    let NodeData::VariableDeclaration(variable) = &variable_node.data else {
+        return Ok(Vec::new());
+    };
+    let top_level = variable_node
+        .parent
+        .and_then(|list| arena.get(list))
+        .filter(|node| node.kind == SyntaxKind::VariableDeclarationList)
+        .and_then(|list| list.parent)
+        .and_then(|statement| arena.get(statement))
+        .is_some_and(|statement| {
+            statement.kind == SyntaxKind::VariableStatement
+                && statement.parent == Some(bound.source_file().node)
+        });
+    if !top_level {
+        return Ok(Vec::new());
+    }
+    let Some(NodeData::Identifier(name)) = arena.get(variable.name).map(|node| &node.data) else {
+        return Ok(Vec::new());
+    };
+    let Some(NodeData::SourceFile(source)) =
+        arena.get(bound.source_file().node).map(|node| &node.data)
+    else {
+        return Err(invalid());
+    };
+    let mut plans = Vec::new();
+    for statement in &source.statements.nodes {
+        let Some(NodeData::ExpressionStatement(statement_data)) =
+            arena.get(*statement).map(|node| &node.data)
+        else {
+            continue;
+        };
+        let Some(NodeData::BinaryExpression(assignment)) =
+            arena.get(statement_data.expression).map(|node| &node.data)
+        else {
+            continue;
+        };
+        let Some(NodeData::PropertyAccessExpression(access)) =
+            arena.get(assignment.left).map(|node| &node.data)
+        else {
+            continue;
+        };
+        if arena
+            .get(assignment.operator_token)
+            .is_none_or(|node| node.kind != SyntaxKind::EqualsToken)
+            || !matches!(arena.get(access.expression).map(|node| &node.data),
+                Some(NodeData::Identifier(receiver)) if receiver.text == name.text)
+        {
+            continue;
+        }
+        let statement = NodeRef::new(declaration.arena, declaration.file, *statement);
+        plans.push(
+            super::assignment::plan_arrow_expando_assignment(arena, bound, store, statement)
+                .map_err(|_| invalid())?
+                .ok_or_else(invalid)?,
+        );
+    }
+    Ok(plans)
+}
+
+fn source_arrow_expando_display_properties(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    type_id: TypeId,
+) -> Result<Vec<StructuralPropertyDisplay>, TypeDisplayUnavailable> {
+    let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
+    let Some(provenance) = store.source_callable_provenance(type_id) else {
+        return Ok(Vec::new());
+    };
+    if !matches!(
+        provenance.family,
+        SourceCallableFamily::ArrowFunction | SourceCallableFamily::FunctionExpression
+    ) {
+        return Ok(Vec::new());
+    }
+    let owner = store.symbol(provenance.owner_symbol).ok_or_else(invalid)?;
+    let host = host.ok_or_else(invalid)?;
+    let plans = source_arrow_expando_display_plans(store, host, type_id, provenance.declaration)?;
+    if plans.is_empty() {
+        return if owner.exports().is_none() {
+            Ok(Vec::new())
+        } else {
+            Err(invalid())
+        };
+    }
+    let exports = store
+        .symbol_table(owner.exports().ok_or_else(invalid)?)
+        .ok_or_else(invalid)?;
+    if !super::source_callables::source_arrow_owner_expando_exports_are_valid(
+        store,
+        provenance.owner_symbol,
+        provenance.declaration,
+    ) || plans.len() != exports.len()
+    {
+        return Err(invalid());
+    }
+    let (_, bound) = host.source(provenance.declaration).ok_or_else(invalid)?;
+    if bound
+        .source_facts()
+        .is_none_or(|facts| facts.is_javascript_file())
+        || !store
+            .source_file_links(bound.source_file())
+            .is_some_and(|links| links.type_checked)
+    {
+        return Err(TypeDisplayUnavailable::FunctionType {
+            type_id,
+            reason: FunctionTypeDisplayUnavailable::CallableProperties,
+        });
+    }
+    let mut properties = Vec::with_capacity(exports.len());
+    let mut seen = HashSet::new();
+    for plan in plans {
+        let symbol = plan.property_symbol;
+        let property = store.symbol(symbol).ok_or_else(invalid)?;
+        let assignment = property.value_declaration().ok_or_else(invalid)?;
+        if plan.owner_symbol != provenance.owner_symbol
+            || plan.expression != assignment
+            || exports.get(property.name()) != Some(symbol)
+            || !seen.insert(symbol)
+        {
+            return Err(invalid());
+        }
+        let (assigned_type, property_type) =
+            source_expando_literal_display_types(store, host, type_id, plan.right)?;
+        if store.value_symbol_links(symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(property_type),
+                ..ValueSymbolLinks::default()
+            })
+            || store
+                .value_symbol_links(plan.variable_symbol)
+                .and_then(|links| links.resolved_type)
+                != Some(type_id)
+            || store.symbol_node_links(plan.receiver)
+                != Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(plan.variable_symbol),
+                })
+            || [
+                (plan.receiver, type_id),
+                (plan.left, property_type),
+                (plan.right, assigned_type),
+                (plan.expression, assigned_type),
+            ]
+            .iter()
+            .any(|(node, expected)| {
+                store.type_node_links(*node)
+                    != Some(&TypeNodeLinks {
+                        resolved_type: Some(*expected),
+                        outer_type_parameters: None,
+                    })
+            })
+        {
+            return Err(invalid());
+        }
+        properties.push(StructuralPropertyDisplay::Property {
+            name: property.name().as_utf8().ok_or_else(invalid)?.to_owned(),
+            type_id: property_type,
+            optional: false,
+            readonly: false,
+        });
+    }
+    Ok(properties)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn display_single_call_signature(
     store: &CanonicalTypeMapperStore,
@@ -3940,10 +4174,15 @@ fn display_single_call_signature(
     state: &mut DisplayState,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
+    let properties = source_arrow_expando_display_properties(store, host, projection.owner)?;
     // Pinned `signatureToSignatureDeclarationHelper`: three units is the
     // minimum signature contribution, independent of the emitted punctuation.
     state.add(3);
     let mut result = String::new();
+    if !properties.is_empty() {
+        result.push_str("{ ");
+        state.add(2);
+    }
     append_function_type_parameters(
         store,
         host,
@@ -3983,7 +4222,11 @@ fn display_single_call_signature(
             visiting,
         )?);
     }
-    result.push_str(") => ");
+    result.push_str(if properties.is_empty() {
+        ") => "
+    } else {
+        "): "
+    });
     let return_type = projection
         .return_type
         .ok_or(TypeDisplayUnavailable::FunctionType {
@@ -4001,6 +4244,23 @@ fn display_single_call_signature(
         state,
         visiting,
     )?);
+    if !properties.is_empty() {
+        result.push_str("; ");
+        for property in &properties {
+            append_structural_property(
+                store,
+                host,
+                global_types,
+                property,
+                flags,
+                state,
+                visiting,
+                &mut result,
+            )?;
+        }
+        result.push('}');
+        state.add(2);
+    }
     Ok(result)
 }
 
@@ -9970,6 +10230,270 @@ mod tests {
             "Model | undefined"
         );
         assert!(context.diagnostics().is_empty());
+    }
+
+    const SOURCE_ARROW_EXPANDO_DISPLAY: &str = concat!(
+        "// @declaration: true\r\n\r\n",
+        "const foo = () => {}\r\n",
+        "foo.bar = 42\r\n",
+        "export {}",
+    );
+
+    fn source_arrow_display_type(
+        context: &mut CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (NodeRef, TypeId) {
+        let arrow = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(
+                    record.kind,
+                    SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression
+                )
+                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        (arrow, context.get_type_at_location(arrow).unwrap())
+    }
+
+    #[test]
+    fn source_arrow_expando_display_keeps_original_properties_and_warm_identity() {
+        let parsed = parse_source_file(SOURCE_ARROW_EXPANDO_DISPLAY);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(270);
+        let mut context = external_parsed_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let (arrow, callable) = source_arrow_display_type(&mut context, &parsed, file);
+        let mut locations = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                matches!(&record.data, NodeData::Identifier(name) if name.text == "foo")
+                    .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .collect::<Vec<_>>();
+        locations.push(arrow);
+        assert_eq!(locations.len(), 3);
+        let expected = "{ (): void; bar: number; }";
+        let flags = CanonicalTypeFormatFlags::NO_TRUNCATION
+            | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE;
+        for replay in [false, true] {
+            if replay {
+                context.recheck_source_file(file).unwrap();
+            }
+            for &location in &locations {
+                assert_eq!(context.get_type_at_location(location).unwrap(), callable);
+                let parent = parsed.arena.get(location.node).unwrap().parent.unwrap();
+                let parent = NodeRef::new(location.arena, location.file, parent);
+                let before = format!("{:?}", context.store());
+                assert_eq!(context.type_to_string(callable).unwrap(), expected);
+                assert_eq!(
+                    context
+                        .type_to_string_at_location_with_flags(callable, parent, flags)
+                        .unwrap(),
+                    expected
+                );
+                assert_eq!(format!("{:?}", context.store()), before);
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn source_arrow_expando_display_preserves_order_and_plain_function_syntax() {
+        for (source, expected) in [
+            ("const foo = () => {}; export {};", "() => void"),
+            (
+                "const foo = (value: string): number => 1; export {};",
+                "(value: string) => number",
+            ),
+            (
+                "const foo = (value: string): number => 1; foo.zebra = true; foo.alpha = 'ready'; foo.count = 42; export {};",
+                "{ (value: string): number; zebra: boolean; alpha: string; count: number; }",
+            ),
+            (
+                "const foo = function (): void {}; foo.bar = 42; export {};",
+                "{ (): void; bar: number; }",
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(271);
+            let mut context = external_parsed_context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            let (arrow, callable) = source_arrow_display_type(&mut context, &parsed, file);
+            let before = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    context.type_to_string(callable).unwrap(),
+                    expected,
+                    "{source}"
+                );
+                assert_eq!(
+                    context
+                        .type_to_string_at_location_with_flags(
+                            callable,
+                            arrow,
+                            CanonicalTypeFormatFlags::NO_TRUNCATION,
+                        )
+                        .unwrap(),
+                    expected,
+                    "{source}"
+                );
+                assert_eq!(format!("{:?}", context.store()), before);
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep each property, expression, and owner poison with its restore.
+    fn source_arrow_expando_display_rejects_changed_property_caches_without_writes() {
+        for poison in 0..5 {
+            let parsed = parse_source_file(SOURCE_ARROW_EXPANDO_DISPLAY);
+            let file = FileId::new(272);
+            let mut context = external_parsed_context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            let (arrow, callable) = source_arrow_display_type(&mut context, &parsed, file);
+            let provenance = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap();
+            let owner = context.store().symbol(provenance.owner_symbol).unwrap();
+            let relationships = (
+                owner.members(),
+                owner.exports(),
+                owner.parent(),
+                owner.export_symbol(),
+            );
+            let property = context
+                .store()
+                .symbol_table(owner.exports().unwrap())
+                .unwrap()
+                .get_source("bar")
+                .unwrap();
+            let assignment = context
+                .store()
+                .symbol(property)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            let NodeData::BinaryExpression(data) = &parsed.arena.get(assignment.node).unwrap().data
+            else {
+                panic!("the property must retain its source assignment");
+            };
+            let left = NodeRef::new(assignment.arena, assignment.file, data.left);
+            let right = NodeRef::new(assignment.arena, assignment.file, data.right);
+            let original_property = context
+                .store()
+                .value_symbol_links(property)
+                .unwrap()
+                .clone();
+            let original_left = context.store().type_node_links(left).unwrap().clone();
+            let original_right = context.store().type_node_links(right).unwrap().clone();
+            let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+            if poison <= 2 {
+                let mut changed = original_property.clone();
+                changed.resolved_type = if poison == 2 { None } else { Some(wrong) };
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(property, changed)
+                );
+                if poison == 1 {
+                    let mut changed = original_left.clone();
+                    changed.resolved_type = Some(wrong);
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_type_node_links(left, changed)
+                    );
+                }
+            } else if poison == 3 {
+                let mut changed = original_right.clone();
+                changed.resolved_type = Some(wrong);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(right, changed)
+                );
+            } else {
+                assert!(context.store_mut_for_test().set_symbol_relationships(
+                    provenance.owner_symbol,
+                    relationships.0,
+                    None,
+                    relationships.2,
+                    relationships.3,
+                ));
+            }
+            let damaged = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    context.type_to_string(callable),
+                    Err(TypeDisplayUnavailable::MalformedType(callable)),
+                    "poison {poison}"
+                );
+                assert_eq!(
+                    context.type_to_string_at_location_with_flags(
+                        callable,
+                        arrow,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION,
+                    ),
+                    Err(TypeDisplayUnavailable::MalformedType(callable)),
+                    "poison {poison}"
+                );
+                assert_eq!(format!("{:?}", context.store()), damaged);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, original_property)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(left, original_left)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(right, original_right)
+            );
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                provenance.owner_symbol,
+                relationships.0,
+                relationships.1,
+                relationships.2,
+                relationships.3,
+            ));
+            let restored = format!("{:?}", context.store());
+            assert_eq!(
+                context.type_to_string(callable).unwrap(),
+                "{ (): void; bar: number; }"
+            );
+            assert_eq!(format!("{:?}", context.store()), restored);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn source_arrow_expando_display_does_not_omit_unsupported_property_values() {
+        let parsed = parse_source_file("const foo = () => {}; foo.bar = { value: 1 }; export {};");
+        let file = FileId::new(273);
+        let mut context = external_parsed_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let (_, callable) = source_arrow_display_type(&mut context, &parsed, file);
+        let before = format!("{:?}", context.store());
+        assert_eq!(
+            context.type_to_string(callable),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: callable,
+                reason: FunctionTypeDisplayUnavailable::CallableProperties,
+            })
+        );
+        assert_eq!(format!("{:?}", context.store()), before);
     }
 
     #[test]
