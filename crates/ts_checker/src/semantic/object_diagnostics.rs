@@ -31,6 +31,7 @@ use super::{
         ClassConstructorVisibility, ClassHeritageMembersValidation, class_member_visibility,
         validate_class_heritage_members, validated_class_derives_from,
     },
+    derived_types::DerivedObjectLiteralValidation,
     formatter::{
         FunctionTypeDisplayUnavailable,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
@@ -41,13 +42,14 @@ use super::{
         validate_stored_function_type,
     },
     indexed_access_types::{is_template_pattern_index_key, template_pattern_index_matches_name},
-    instantiate::InstantiationSession,
+    instantiate::{InstantiationLimits, InstantiationSession},
     object_members::{
         DeclaredPropertyTypeGraphValidation, PropertyObjectPlan,
-        object_literal_getter_projection_with_host, plan_object_literal,
+        object_literal_getter_projection_with_host, object_literal_state, plan_object_literal,
         validate_resolved_declared_property_type_graph,
     },
-    relater::{ResolvedDeclaredProperty, ResolvedDeclaredPropertyObject},
+    relater::{CallableRelationFailure, ResolvedDeclaredProperty, ResolvedDeclaredPropertyObject},
+    relation::SignatureCheckMode,
     signatures::ElementFlags,
     source::{
         CheckedExpressionShape, CheckedExpressionTypes, CheckedObjectMember, PlannedExpression,
@@ -58,6 +60,30 @@ use super::{
     type_records::{StructuredTypeData, TypeCacheState, TypeData},
     types::{ObjectFlags, TypeFlags},
 };
+
+fn detail_message(code: u32, arguments: Vec<String>) -> Result<Diagnostic, SourceCheckError> {
+    Ok(Diagnostic::with_arguments(
+        message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
+        arguments,
+    ))
+}
+
+fn render_detail_chain(chain: Vec<Diagnostic>, indentation: usize) -> Vec<String> {
+    chain
+        .into_iter()
+        .filter(|detail| !detail.message.elided_in_compatibility_pyramid())
+        .enumerate()
+        .map(|(depth, detail)| {
+            format!(
+                "{}{}",
+                "  ".repeat(indentation + depth),
+                detail
+                    .render()
+                    .expect("diagnostic details retain their catalog arguments")
+            )
+        })
+        .collect()
+}
 
 /// Builds the complete diagnostic batch for one already-failed assignment.
 #[allow(clippy::too_many_arguments)] // Keeps diagnostic inputs explicit and immutable.
@@ -196,6 +222,7 @@ fn diagnostics_for_failed_assignment_once(
         fallback_node,
         flags,
         options,
+        session,
     )?);
     Ok(elaborated)
 }
@@ -610,6 +637,7 @@ fn elaborate_known_properties(
                 source_property.name_node,
                 flags,
                 options,
+                session,
             )?
         } else {
             generic_assignability_diagnostic(
@@ -621,8 +649,21 @@ fn elaborate_known_properties(
                 source_property.name_node,
                 flags,
                 options,
+                session,
             )?
         };
+        if diagnostic.diagnostic.details.is_empty() {
+            diagnostic.diagnostic.details = callable_assignability_details_with_session(
+                store,
+                host,
+                global_types,
+                source_property_type,
+                target_property.type_,
+                flags,
+                options,
+                session,
+            )?;
+        }
         append_expected_property_related(
             &mut diagnostic,
             store,
@@ -835,6 +876,7 @@ fn elaborate_indexed_property(
         name_node,
         flags,
         options,
+        session,
     )?;
     let (_, bound) = host
         .source(target.declaration)
@@ -861,6 +903,7 @@ fn shape_or_generic_diagnostic(
     fallback_node: NodeRef,
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
 ) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
     let expression = expression.unparenthesized();
     let PlannedExpressionKind::Object { plan, properties } = &expression.kind else {
@@ -873,6 +916,7 @@ fn shape_or_generic_diagnostic(
             fallback_node,
             flags,
             options,
+            session,
         );
     };
     if let Some(diagnostic) = discriminated_union_excess_property_diagnostic(
@@ -901,6 +945,7 @@ fn shape_or_generic_diagnostic(
             fallback_node,
             flags,
             options,
+            session,
         );
     };
 
@@ -956,6 +1001,7 @@ fn shape_or_generic_diagnostic(
         fallback_node,
         flags,
         options,
+        session,
     )?;
     if diagnostic.diagnostic.details.is_empty() {
         for (source_property, target_property) in prototype_properties {
@@ -1503,10 +1549,97 @@ pub(super) fn callable_assignability_details(
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
 ) -> Result<Vec<String>, SourceCheckError> {
+    callable_assignability_details_with_session(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+        &mut InstantiationSession::new(InstantiationLimits::default()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Diagnostic children share the source query's session.
+pub(super) fn callable_assignability_details_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+) -> Result<Vec<String>, SourceCheckError> {
+    recursive_callable_mismatch_chain(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+        SignatureCheckMode::NONE,
+        &mut HashSet::new(),
+        false,
+        session,
+    )
+    .map(|chain| render_detail_chain(chain.unwrap_or_default(), 1))
+}
+
+#[allow(clippy::too_many_arguments)] // Keep callback mode and the active relation path together.
+fn recursive_callable_mismatch_chain(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    check_mode: SignatureCheckMode,
+    active: &mut HashSet<(TypeId, TypeId)>,
+    allow_source_literals: bool,
+    session: &mut InstantiationSession,
+) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
+    if active.len() >= 64 || !active.insert((source_type, target_type)) {
+        return Ok(None);
+    }
+    let result = recursive_callable_mismatch_chain_inner(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+        check_mode,
+        active,
+        allow_source_literals,
+        session,
+    );
+    assert!(active.remove(&(source_type, target_type)));
+    result
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Validate the display before using the relater's failed edge.
+fn recursive_callable_mismatch_chain_inner(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    check_mode: SignatureCheckMode,
+    active: &mut HashSet<(TypeId, TypeId)>,
+    allow_source_literals: bool,
+    session: &mut InstantiationSession,
+) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
     let source_callable = match validate_stored_single_callable(store, source_type) {
         StoredSingleCallableValidation::Valid { callable, .. } => callable,
         StoredSingleCallableValidation::NotCallable
-        | StoredSingleCallableValidation::Pending { .. } => return Ok(Vec::new()),
+        | StoredSingleCallableValidation::Pending { .. } => return Ok(None),
         StoredSingleCallableValidation::Malformed { .. } => {
             return Err(invalid_structure(source_type));
         }
@@ -1514,7 +1647,7 @@ pub(super) fn callable_assignability_details(
     let target_callable = match validate_stored_single_callable(store, target_type) {
         StoredSingleCallableValidation::Valid { callable, .. } => callable,
         StoredSingleCallableValidation::NotCallable
-        | StoredSingleCallableValidation::Pending { .. } => return Ok(Vec::new()),
+        | StoredSingleCallableValidation::Pending { .. } => return Ok(None),
         StoredSingleCallableValidation::Malformed { .. } => {
             return Err(invalid_structure(target_type));
         }
@@ -1524,7 +1657,7 @@ pub(super) fn callable_assignability_details(
     let target = single_callable_display_projection(store, host, target_type, Some(global_types))
         .map_err(|_| invalid_structure(target_type))?;
     let (Some(source), Some(target)) = (source, target) else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     if source_callable.owner != source_type
         || target_callable.owner != target_type
@@ -1549,103 +1682,119 @@ pub(super) fn callable_assignability_details(
         || source.return_type != source_callable.return_type
         || target.return_type != target_callable.return_type
     {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
-    match (source.parameters.as_slice(), target.parameters.as_slice()) {
-        (source_parameters, []) if target_callable.min_argument_count == 0 => {
-            if source_callable.min_argument_count > 0 {
-                let detail = Diagnostic::with_arguments(
-                    message_by_code(2849).ok_or(SourceCheckError::MissingDiagnostic(2849))?,
-                    [
-                        source_callable.min_argument_count.to_string(),
-                        target_callable.parameters.len().to_string(),
-                    ],
-                )
-                .render()
-                .expect("TS2849 has two formatting arguments");
-                return Ok(vec![format!("  {detail}")]);
-            }
-            if !source_parameters.is_empty() {
-                return Ok(Vec::new());
-            }
-        }
-        ([source_parameter], [target_parameter])
-            if source_callable.min_argument_count == 1
-                && target_callable.min_argument_count == 1 =>
-        {
-            let contravariant = store
-                .is_type_assignable_to_with_global_types_and_strict_function_types(
-                    target_parameter.value_type,
-                    source_parameter.value_type,
-                    global_types,
-                    options.strict_function_types,
-                )?;
-            let parameter_compatible = contravariant
-                || !options.strict_function_types
-                    && store.is_type_assignable_to_with_global_types_and_strict_function_types(
-                        source_parameter.value_type,
-                        target_parameter.value_type,
-                        global_types,
-                        options.strict_function_types,
-                    )?;
-            if !parameter_compatible {
-                let detail = Diagnostic::with_arguments(
-                    message_by_code(2328).ok_or(SourceCheckError::MissingDiagnostic(2328))?,
-                    [
-                        source_parameter.name.as_str(),
-                        target_parameter.name.as_str(),
-                    ],
-                )
-                .render()
-                .expect("TS2328 has two formatting arguments");
-                return Ok(vec![
-                    format!("  {detail}"),
-                    nested_assignability_message(
-                        store,
-                        host,
-                        global_types,
-                        target_parameter.value_type,
-                        source_parameter.value_type,
-                        flags,
-                        2,
-                    )?,
-                ]);
-            }
-        }
-        _ => return Ok(Vec::new()),
+    if !(matches!(
+        (source.parameters.as_slice(), target.parameters.as_slice()),
+        (_, []) if target_callable.min_argument_count == 0
+    ) || (source.parameters.len() == 1
+        && target.parameters.len() == 1
+        && source_callable.min_argument_count == 1
+        && target_callable.min_argument_count == 1))
+    {
+        return Ok(None);
     }
-
-    let source_return =
-        source_callable
-            .return_type
-            .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
-                source_callable.signature,
-            ))?;
-    let target_return =
-        target_callable
-            .return_type
-            .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
-                target_callable.signature,
-            ))?;
-    if store.is_type_assignable_to_with_global_types_and_strict_function_types(
-        source_return,
-        target_return,
+    let Some(failure) = store.callable_relation_failure_with_session(
+        source_type,
+        target_type,
         global_types,
         options.strict_function_types,
-    )? {
-        return Ok(Vec::new());
-    }
-
-    Ok(vec![nested_assignability_message(
-        store,
-        host,
-        global_types,
-        source_return,
-        target_return,
-        flags,
-        1,
-    )?])
+        check_mode,
+        session,
+    )?
+    else {
+        return Ok(None);
+    };
+    let chain = match failure {
+        CallableRelationFailure::Arity {
+            required,
+            available,
+        } => {
+            vec![detail_message(
+                2849,
+                vec![required.to_string(), available.to_string()],
+            )?]
+        }
+        CallableRelationFailure::Parameter {
+            index,
+            source: source_parameter,
+            target: target_parameter,
+            callback_mode,
+        } => {
+            let source_name = source
+                .parameters
+                .get(index)
+                .ok_or_else(|| invalid_structure(source_type))?
+                .name
+                .clone();
+            let target_name = target
+                .parameters
+                .get(index)
+                .ok_or_else(|| invalid_structure(target_type))?
+                .name
+                .clone();
+            let mut chain = vec![detail_message(2328, vec![source_name, target_name])?];
+            if let Some(callback_mode) = callback_mode {
+                let Some(child) = recursive_callable_mismatch_chain(
+                    store,
+                    host,
+                    global_types,
+                    target_parameter,
+                    source_parameter,
+                    flags,
+                    options,
+                    callback_mode,
+                    active,
+                    allow_source_literals,
+                    session,
+                )?
+                else {
+                    return Ok(None);
+                };
+                chain.extend(child);
+            } else {
+                chain.extend(nested_assignability_chain(
+                    store,
+                    host,
+                    global_types,
+                    target_parameter,
+                    source_parameter,
+                    flags,
+                    options,
+                    active,
+                    allow_source_literals,
+                    session,
+                )?);
+            }
+            chain
+        }
+        CallableRelationFailure::Return {
+            source,
+            target,
+            no_arguments,
+        } => {
+            let mut chain = nested_assignability_chain(
+                store,
+                host,
+                global_types,
+                source,
+                target,
+                flags,
+                options,
+                active,
+                allow_source_literals,
+                session,
+            )?;
+            let arguments = chain[0].arguments.clone();
+            chain.insert(
+                0,
+                detail_message(if no_arguments { 2204 } else { 2202 }, arguments)?,
+            );
+            chain
+        }
+    };
+    Ok(Some(chain))
 }
 
 #[allow(clippy::too_many_arguments)] // The complete diagnostic record is built transactionally.
@@ -1758,6 +1907,7 @@ fn generic_assignability_diagnostic(
     node: NodeRef,
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
 ) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
     let AssignabilityErrorDisplay { source, target } =
         get_type_names_for_assignability_error_with_host_global_types_and_flags(
@@ -1780,7 +1930,7 @@ fn generic_assignability_diagnostic(
     )? {
         details
     } else {
-        declared_property_mismatch_details(
+        declared_property_mismatch_details_with_session(
             store,
             host,
             global_types,
@@ -1788,6 +1938,7 @@ fn generic_assignability_diagnostic(
             target_type,
             flags,
             options,
+            session,
         )?
     };
     if diagnostic.diagnostic.details.is_empty()
@@ -1797,7 +1948,7 @@ fn generic_assignability_diagnostic(
                 store.source_node_kind(callable.declaration) == Some(SyntaxKind::FunctionExpression)
             })
     {
-        diagnostic.diagnostic.details = callable_assignability_details(
+        diagnostic.diagnostic.details = callable_assignability_details_with_session(
             store,
             host,
             global_types,
@@ -1805,6 +1956,7 @@ fn generic_assignability_diagnostic(
             target_type,
             flags,
             options,
+            session,
         )?;
     }
     if diagnostic.diagnostic.details.is_empty() {
@@ -1985,7 +2137,7 @@ pub(super) fn declared_property_mismatch_details(
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
 ) -> Result<Vec<String>, SourceCheckError> {
-    recursive_declared_property_mismatch_details(
+    declared_property_mismatch_details_with_session(
         store,
         host,
         global_types,
@@ -1993,17 +2145,129 @@ pub(super) fn declared_property_mismatch_details(
         target_type,
         flags,
         options,
-        1,
-        &mut HashSet::new(),
+        &mut InstantiationSession::new(InstantiationLimits::default()),
     )
-    .map(Option::unwrap_or_default)
 }
 
+#[allow(clippy::too_many_arguments)] // Recursive child checks retain the caller's session.
+fn declared_property_mismatch_details_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+) -> Result<Vec<String>, SourceCheckError> {
+    recursive_declared_property_mismatch_chain(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+        &mut HashSet::new(),
+        false,
+        session,
+    )
+    .map(|chain| render_detail_chain(chain.unwrap_or_default(), 1))
+}
+
+/// Receiver errors also compare proven source object literals and their widened types.
+#[allow(clippy::too_many_arguments)] // Keep the call's options and session together.
+pub(super) fn this_context_mismatch_diagnostic(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    node: NodeRef,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
+    let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+    )?;
+    if let Some(source) =
+        diagnostic_properties(store, host, global_types, source_type, Some(session))?
+        && let Some(target) =
+            diagnostic_properties(store, host, global_types, target_type, Some(session))?
+    {
+        let mut missing = Vec::new();
+        for property in &target {
+            if !property.optional
+                && !source.iter().any(|source| source.name == property.name)
+                && store
+                    .global_object_property_symbol(property.name.as_ref())?
+                    .is_none()
+            {
+                missing.push(property);
+            }
+        }
+        if !missing.is_empty() {
+            return missing_property_diagnostic(
+                store,
+                host,
+                global_types,
+                source_type,
+                target_type,
+                node,
+                &missing,
+                flags,
+            );
+        }
+        let property_only_target = store
+            .type_payload(target_type)
+            .and_then(|record| record.data().structured())
+            .is_some_and(|structured| {
+                structured.signatures.as_ref().is_none_or(Vec::is_empty)
+                    && structured.index_infos.as_ref().is_none_or(Vec::is_empty)
+            });
+        if source_type != global_types.object_type
+            && !source.is_empty()
+            && !target.is_empty()
+            && property_only_target
+            && target.iter().all(|property| property.optional)
+            && !source
+                .iter()
+                .any(|source| target.iter().any(|target| target.name == source.name))
+        {
+            return primary(2559, node, vec![display.source, display.target]);
+        }
+    }
+    let details = recursive_declared_property_mismatch_chain(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+        &mut HashSet::new(),
+        true,
+        session,
+    )
+    .map(|chain| render_detail_chain(chain.unwrap_or_default(), 1))?;
+    let mut diagnostic = primary(2684, node, vec![display.source, display.target])?;
+    diagnostic.diagnostic.details = details;
+    Ok(diagnostic)
+}
+
+/// A caller session does not grant source-literal diagnostic authority.
 fn diagnostic_properties(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     type_: TypeId,
+    source_literal_session: Option<&mut InstantiationSession>,
 ) -> Result<Option<Vec<ResolvedDeclaredProperty>>, SourceCheckError> {
     match validate_class_heritage_members(store, type_) {
         ClassHeritageMembersValidation::Malformed => return Err(invalid_structure(type_)),
@@ -2042,7 +2306,14 @@ fn diagnostic_properties(
     }
     match validate_resolved_declared_property_type_graph(store, type_) {
         DeclaredPropertyTypeGraphValidation::Traversable(_) => {}
-        DeclaredPropertyTypeGraphValidation::Opaque => return Ok(None),
+        DeclaredPropertyTypeGraphValidation::Opaque => {
+            return match source_literal_session {
+                Some(session) => {
+                    diagnostic_source_literal_properties(store, host, global_types, type_, session)
+                }
+                None => Ok(None),
+            };
+        }
         DeclaredPropertyTypeGraphValidation::Malformed => return Err(invalid_structure(type_)),
     }
     store
@@ -2050,6 +2321,81 @@ fn diagnostic_properties(
         .map(|properties| properties.properties().to_vec())
         .ok_or_else(|| invalid_structure(type_))
         .map(Some)
+}
+
+fn diagnostic_source_literal_properties(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    type_: TypeId,
+    session: &mut InstantiationSession,
+) -> Result<Option<Vec<ResolvedDeclaredProperty>>, SourceCheckError> {
+    let Some(owner) = store
+        .type_payload(type_)
+        .and_then(super::type_records::TypeRecord::symbol)
+        .and_then(|symbol| store.symbol(symbol))
+        .filter(|owner| owner.flags() == SymbolFlags::OBJECT_LITERAL)
+    else {
+        return Ok(None);
+    };
+    let Some([declaration]) = owner.declarations() else {
+        return Err(invalid_structure(type_));
+    };
+    let plan =
+        plan_object_literal(store, host, *declaration).map_err(|_| invalid_structure(type_))?;
+    let fresh = object_literal_state(store, &plan)
+        .map_err(|_| invalid_structure(type_))?
+        .ok_or_else(|| invalid_structure(type_))?
+        .type_id();
+    let mut current = type_;
+    let mut visited = HashSet::new();
+    while current != fresh {
+        if !visited.insert(current) {
+            return Err(invalid_structure(type_));
+        }
+        let DerivedObjectLiteralValidation::Valid { source, .. } =
+            store.validate_derived_object_literal_with_global_types(current, global_types)
+        else {
+            return Err(invalid_structure(type_));
+        };
+        current = source;
+    }
+    let symbols = store
+        .type_payload(type_)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(|| invalid_structure(type_))?
+        .properties
+        .clone()
+        .unwrap_or_default();
+    let mut properties = Vec::with_capacity(symbols.len());
+    for symbol in symbols {
+        let property = store
+            .symbol(symbol)
+            .ok_or_else(|| invalid_structure(type_))?;
+        let name = property.name().to_owned();
+        let declaration = property
+            .value_declaration()
+            .ok_or_else(|| invalid_structure(type_))?;
+        let resolved = store
+            .resolved_own_property_by_key_with_context(
+                type_,
+                name.as_ref(),
+                Some(global_types),
+                session,
+            )?
+            .ok_or_else(|| invalid_structure(type_))?;
+        if resolved.symbol != symbol {
+            return Err(invalid_structure(type_));
+        }
+        properties.push(ResolvedDeclaredProperty {
+            symbol,
+            name,
+            type_: resolved.type_,
+            optional: resolved.optional,
+            declaration,
+        });
+    }
+    Ok(Some(properties))
 }
 
 fn diagnostic_property_visibility(
@@ -2084,6 +2430,40 @@ pub(super) fn property_visibility_mismatch_detail(
     flags: CanonicalTypeFormatFlags,
     indentation: usize,
 ) -> Result<Option<String>, SourceCheckError> {
+    property_visibility_mismatch_message(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        source_property,
+        target_property,
+        flags,
+    )
+    .map(|message| {
+        message.map(|message| {
+            format!(
+                "{}{}",
+                "  ".repeat(indentation),
+                message
+                    .render()
+                    .expect("visibility diagnostics retain their catalog arguments")
+            )
+        })
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // The message keeps both property and declaring-type identities.
+fn property_visibility_mismatch_message(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    source_property: &ResolvedDeclaredProperty,
+    target_property: &ResolvedDeclaredProperty,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<Option<Diagnostic>, SourceCheckError> {
     let (source_visibility, source_class) =
         diagnostic_property_visibility(store, source_type, source_property)?;
     let (target_visibility, target_class) =
@@ -2137,16 +2517,11 @@ pub(super) fn property_visibility_mismatch_detail(
     } else {
         return Ok(None);
     };
-    let detail = Diagnostic::with_arguments(
-        message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
-        arguments,
-    )
-    .render()
-    .expect("visibility diagnostics retain their catalog arguments");
-    Ok(Some(format!("{}{detail}", "  ".repeat(indentation))))
+    detail_message(code, arguments).map(Some)
 }
 
 #[allow(clippy::too_many_arguments)] // Keep recursive relation identity and formatting explicit.
+#[cfg(test)]
 fn recursive_declared_property_mismatch_details(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2157,12 +2532,12 @@ fn recursive_declared_property_mismatch_details(
     options: CanonicalCheckerOptions,
     indentation: usize,
     active: &mut HashSet<(TypeId, TypeId)>,
+    source_literal_session: Option<&mut InstantiationSession>,
 ) -> Result<Option<Vec<String>>, SourceCheckError> {
-    if active.len() >= 64 || !active.insert((source_type, target_type)) {
-        return Ok(None);
-    }
-
-    let result = recursive_declared_property_mismatch_details_inner(
+    let allow_source_literals = source_literal_session.is_some();
+    let mut compatibility_session = InstantiationSession::new(InstantiationLimits::default());
+    let session = source_literal_session.unwrap_or(&mut compatibility_session);
+    recursive_declared_property_mismatch_chain(
         store,
         host,
         global_types,
@@ -2170,15 +2545,15 @@ fn recursive_declared_property_mismatch_details(
         target_type,
         flags,
         options,
-        indentation,
         active,
-    );
-    assert!(active.remove(&(source_type, target_type)));
-    result
+        allow_source_literals,
+        session,
+    )
+    .map(|chain| chain.map(|chain| render_detail_chain(chain, indentation)))
 }
 
-#[allow(clippy::too_many_arguments)] // Keep recursive relation identity and formatting explicit.
-fn recursive_declared_property_mismatch_details_inner(
+#[allow(clippy::too_many_arguments)] // Share the active path across property and callable children.
+fn recursive_declared_property_mismatch_chain(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
@@ -2186,13 +2561,61 @@ fn recursive_declared_property_mismatch_details_inner(
     target_type: TypeId,
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
-    indentation: usize,
     active: &mut HashSet<(TypeId, TypeId)>,
-) -> Result<Option<Vec<String>>, SourceCheckError> {
-    let Some(source) = diagnostic_properties(store, host, global_types, source_type)? else {
+    allow_source_literals: bool,
+    session: &mut InstantiationSession,
+) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
+    if active.len() >= 64 || !active.insert((source_type, target_type)) {
+        return Ok(None);
+    }
+
+    let result = recursive_declared_property_mismatch_chain_inner(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+        active,
+        allow_source_literals,
+        session,
+    );
+    assert!(active.remove(&(source_type, target_type)));
+    result
+}
+
+#[allow(clippy::too_many_arguments)] // Keep recursive relation identity and formatting explicit.
+fn recursive_declared_property_mismatch_chain_inner(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    active: &mut HashSet<(TypeId, TypeId)>,
+    allow_source_literals: bool,
+    session: &mut InstantiationSession,
+) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
+    let Some(source) = diagnostic_properties(
+        store,
+        host,
+        global_types,
+        source_type,
+        allow_source_literals.then_some(&mut *session),
+    )?
+    else {
         return Ok(None);
     };
-    let Some(target) = diagnostic_properties(store, host, global_types, target_type)? else {
+    let Some(target) = diagnostic_properties(
+        store,
+        host,
+        global_types,
+        target_type,
+        allow_source_literals.then_some(&mut *session),
+    )?
+    else {
         return Ok(None);
     };
     if target
@@ -2209,7 +2632,7 @@ fn recursive_declared_property_mismatch_details_inner(
         else {
             continue;
         };
-        if let Some(detail) = property_visibility_mismatch_detail(
+        if let Some(detail) = property_visibility_mismatch_message(
             store,
             host,
             global_types,
@@ -2218,19 +2641,19 @@ fn recursive_declared_property_mismatch_details_inner(
             source_property,
             target_property,
             flags,
-            indentation,
         )? {
             return Ok(Some(vec![detail]));
         }
-        if store.is_type_assignable_to_with_global_types_and_strict_function_types(
+        if store.is_type_assignable_to_with_session(
             source_property.type_,
             target_property.type_,
-            global_types,
-            options.strict_function_types,
+            Some(global_types),
+            Some(options.strict_function_types),
+            session,
         )? {
             continue;
         }
-        return recursive_property_mismatch_details(
+        return recursive_property_mismatch_chain(
             store,
             host,
             global_types,
@@ -2239,15 +2662,16 @@ fn recursive_declared_property_mismatch_details_inner(
             target_property.type_,
             flags,
             options,
-            indentation,
             active,
+            allow_source_literals,
+            session,
         );
     }
     Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)] // Each recursive edge retains its exact source and target.
-fn recursive_property_mismatch_details(
+fn recursive_property_mismatch_chain(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
@@ -2256,31 +2680,133 @@ fn recursive_property_mismatch_details(
     target_type: TypeId,
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
-    indentation: usize,
     active: &mut HashSet<(TypeId, TypeId)>,
-) -> Result<Option<Vec<String>>, SourceCheckError> {
-    let nested = if is_terminal_scalar_relation_leaf(store, source_type)
+    allow_source_literals: bool,
+    session: &mut InstantiationSession,
+) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
+    let Some(nested) = recursive_assignability_child_chain(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+        active,
+        allow_source_literals,
+        session,
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut chain = vec![assignability_message(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+    )?];
+    chain.extend(nested);
+    prepend_property_detail(&mut chain, name)?;
+    Ok(Some(chain))
+}
+
+/// Return markers stay typed until a containing property can fold its path.
+/// Ordinary property-only chains keep their existing rendering policy.
+fn prepend_property_detail(
+    chain: &mut Vec<Diagnostic>,
+    name: &str,
+) -> Result<(), SourceCheckError> {
+    let suffix = match chain.get(1).map(Diagnostic::code) {
+        Some(2204) => "()",
+        Some(2202) => "(...)",
+        _ => {
+            chain.insert(0, detail_message(2326, vec![name.to_owned()])?);
+            return Ok(());
+        }
+    };
+    chain.drain(..2);
+    let mut path = format!("{}{suffix}", diagnostic_property_path(name));
+    if chain
+        .get(1)
+        .is_some_and(|message| matches!(message.code(), 2326 | 2200 | 2201))
+    {
+        let tail = chain[1]
+            .arguments
+            .first()
+            .expect("property details retain their path argument");
+        path = append_diagnostic_property_path(&path, &diagnostic_property_path(tail));
+        chain.drain(..2);
+    }
+    chain.insert(0, detail_message(2201, vec![path])?);
+    Ok(())
+}
+
+fn diagnostic_property_path(name: &str) -> String {
+    if name.starts_with(['\'', '"', '`']) {
+        format!("[{name}]")
+    } else {
+        name.to_owned()
+    }
+}
+
+fn append_diagnostic_property_path(head: &str, tail: &str) -> String {
+    let head = if head.starts_with("new ") {
+        format!("({head})")
+    } else {
+        head.to_owned()
+    };
+    let mut offset = 0;
+    loop {
+        if tail[offset..].starts_with('(') {
+            offset += 1;
+        } else if tail[offset..].starts_with("new ") {
+            offset += 4;
+        } else {
+            break;
+        }
+    }
+    let (prefix, suffix) = tail.split_at(offset);
+    let separator = if suffix.starts_with('[') { "" } else { "." };
+    format!("{prefix}{head}{separator}{suffix}")
+}
+
+#[allow(clippy::too_many_arguments)] // The child retains its relation path and caller session.
+fn recursive_assignability_child_chain(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    active: &mut HashSet<(TypeId, TypeId)>,
+    allow_source_literals: bool,
+    session: &mut InstantiationSession,
+) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
+    if is_terminal_scalar_relation_leaf(store, source_type)
         && is_terminal_scalar_relation_leaf(store, target_type)
     {
-        Vec::new()
-    } else if let Some((source_element, target_element)) =
+        return Ok(Some(Vec::new()));
+    }
+    if let Some((source_element, target_element)) =
         nested_collection_element_types(store, global_types, source_type, target_type)?
     {
-        if store.is_type_assignable_to_with_global_types_and_strict_function_types(
-            source_element,
-            target_element,
-            global_types,
-            options.strict_function_types,
-        )? {
+        if active.len() >= 64 || !active.insert((source_type, target_type)) {
             return Ok(None);
         }
-
-        let tail = if is_terminal_scalar_relation_leaf(store, source_element)
-            && is_terminal_scalar_relation_leaf(store, target_element)
-        {
-            Vec::new()
-        } else {
-            let Some(nested) = recursive_declared_property_mismatch_details(
+        let result = (|| {
+            if store.is_type_assignable_to_with_session(
+                source_element,
+                target_element,
+                Some(global_types),
+                Some(options.strict_function_types),
+                session,
+            )? {
+                return Ok(None);
+            }
+            let Some(tail) = recursive_assignability_child_chain(
                 store,
                 host,
                 global_types,
@@ -2288,62 +2814,92 @@ fn recursive_property_mismatch_details(
                 target_element,
                 flags,
                 options,
-                indentation + 3,
                 active,
+                allow_source_literals,
+                session,
             )?
             else {
                 return Ok(None);
             };
-            nested
-        };
-
-        let mut nested = vec![nested_assignability_message(
-            store,
-            host,
-            global_types,
-            source_element,
-            target_element,
-            flags,
-            indentation + 2,
-        )?];
-        nested.extend(tail);
-        nested
-    } else {
-        let Some(nested) = recursive_declared_property_mismatch_details(
-            store,
-            host,
-            global_types,
-            source_type,
-            target_type,
-            flags,
-            options,
-            indentation + 2,
-            active,
-        )?
-        else {
-            return Ok(None);
-        };
-        nested
-    };
-
-    let property_message = Diagnostic::with_arguments(
-        message_by_code(2326).ok_or(SourceCheckError::MissingDiagnostic(2326))?,
-        [name],
-    )
-    .render()
-    .expect("TS2326 has one formatting argument");
-    let mut details = vec![format!("{}{property_message}", "  ".repeat(indentation))];
-    details.push(nested_assignability_message(
+            let mut chain = vec![assignability_message(
+                store,
+                host,
+                global_types,
+                source_element,
+                target_element,
+                flags,
+            )?];
+            chain.extend(tail);
+            Ok(Some(chain))
+        })();
+        assert!(active.remove(&(source_type, target_type)));
+        return result;
+    }
+    if let Some(chain) = recursive_declared_property_mismatch_chain(
         store,
         host,
         global_types,
         source_type,
         target_type,
         flags,
-        indentation + 1,
-    )?);
-    details.extend(nested);
-    Ok(Some(details))
+        options,
+        active,
+        allow_source_literals,
+        session,
+    )? {
+        return Ok(Some(chain));
+    }
+    recursive_callable_mismatch_chain(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+        SignatureCheckMode::NONE,
+        active,
+        allow_source_literals,
+        session,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Keep the original relation message above its child details.
+fn nested_assignability_chain(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    active: &mut HashSet<(TypeId, TypeId)>,
+    allow_source_literals: bool,
+    session: &mut InstantiationSession,
+) -> Result<Vec<Diagnostic>, SourceCheckError> {
+    let mut chain = vec![assignability_message(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+    )?];
+    if let Some(child) = recursive_assignability_child_chain(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+        active,
+        allow_source_literals,
+        session,
+    )? {
+        chain.extend(child);
+    }
+    Ok(chain)
 }
 
 fn nested_collection_element_types(
@@ -2403,6 +2959,21 @@ fn nested_assignability_message(
     flags: CanonicalTypeFormatFlags,
     indentation: usize,
 ) -> Result<String, SourceCheckError> {
+    let message =
+        assignability_message(store, host, global_types, source_type, target_type, flags)?
+            .render()
+            .expect("TS2322 has two formatting arguments");
+    Ok(format!("{}{message}", "  ".repeat(indentation)))
+}
+
+fn assignability_message(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<Diagnostic, SourceCheckError> {
     let AssignabilityErrorDisplay { source, target } =
         get_type_names_for_assignability_error_with_host_global_types_and_flags(
             store,
@@ -2412,13 +2983,7 @@ fn nested_assignability_message(
             target_type,
             flags,
         )?;
-    let message = Diagnostic::with_arguments(
-        message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
-        [source, target],
-    )
-    .render()
-    .expect("TS2322 has two formatting arguments");
-    Ok(format!("{}{message}", "  ".repeat(indentation)))
+    detail_message(2322, vec![source, target])
 }
 
 /// Returns the exact property relation chain for an optional value that
@@ -2791,6 +3356,9 @@ mod tests {
     use super::*;
     use crate::semantic::{
         ArrayTypeError, CanonicalCheckerContext, IntrinsicBootstrapOptions, MappedTypeModifiers,
+        RelationComparisonResult, RelationKind,
+        instantiate::instantiate_type_with_vector_and_session,
+        relation::IntersectionState,
         source::{PlannedIdentifierRead, PlannedIdentifierReadKind, SourceLiteralCacheError},
     };
 
@@ -2818,6 +3386,501 @@ mod tests {
             CanonicalCheckerOptions::default(),
         )
         .unwrap()
+    }
+
+    fn checked_diagnostic_variable_type(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        name: &str,
+    ) -> TypeId {
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(variable.name)?.data
+                else {
+                    return None;
+                };
+                (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        context
+            .store()
+            .value_symbol_links(symbol)
+            .unwrap()
+            .resolved_type
+            .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One callback proof covers cold, warm, and guarded queries.
+    fn callable_child_details_keep_callback_mode_and_warm_failure_proofs() {
+        let cases: [(&str, &[&str], bool); 2] = [
+            (
+                concat!(
+                    "interface TextBox { value: string; } ",
+                    "interface NumberBox { value: number; } ",
+                    "declare const source: (left: (item: TextBox) => void) => void; ",
+                    "declare const target: (right: (value: NumberBox) => void) => void; ",
+                    "declare function identity<T>(value: T): T;",
+                ),
+                &[
+                    "  Types of parameters 'left' and 'right' are incompatible.",
+                    "    Types of parameters 'value' and 'item' are incompatible.",
+                    "      Type 'TextBox' is not assignable to type 'NumberBox'.",
+                    "        Types of property 'value' are incompatible.",
+                    "          Type 'string' is not assignable to type 'number'.",
+                ],
+                false,
+            ),
+            (
+                concat!(
+                    "declare const source: (left: (item: number) => void) => void; ",
+                    "declare const target: (right: (value: 0) => void) => void; ",
+                    "declare function identity<T>(value: T): T;",
+                ),
+                &[
+                    "  Types of parameters 'left' and 'right' are incompatible.",
+                    "    Types of parameters 'value' and 'item' are incompatible.",
+                    "      Type 'number' is not assignable to type '0'.",
+                ],
+                true,
+            ),
+        ];
+        for (text, expected_details, ordinary_inner_relation) in cases {
+            let parsed = parse_source_file(text);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(221);
+            let mut context = diagnostic_context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            let source = checked_diagnostic_variable_type(&context, &parsed, file, "source");
+            let target = checked_diagnostic_variable_type(&context, &parsed, file, "target");
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+            let globals = context.global_types().clone();
+            let options = CanonicalCheckerOptions::default();
+            let flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+            let [source_callable, target_callable] = [source, target].map(|owner| {
+                let StoredSingleCallableValidation::Valid { callable, .. } =
+                    validate_stored_single_callable(context.store(), owner)
+                else {
+                    panic!("the checked annotation must retain its real callable")
+                };
+                callable
+            });
+            let expected_failure = Some(CallableRelationFailure::Parameter {
+                index: 0,
+                source: source_callable.parameters[0],
+                target: target_callable.parameters[0],
+                callback_mode: Some(SignatureCheckMode::BIVARIANT_CALLBACK),
+            });
+            for callback in [source_callable.parameters[0], target_callable.parameters[0]] {
+                let StoredSingleCallableValidation::Valid { callable, .. } =
+                    validate_stored_single_callable(context.store(), callback)
+                else {
+                    panic!("the parameter must retain its nested callable")
+                };
+                context
+                    .get_return_type_of_signature(callable.signature)
+                    .unwrap();
+            }
+            let identity = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let signature = context
+                .store()
+                .signature_links(identity)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            let parameter = context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .type_parameters()[0];
+            let store = context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (number, error) = (bootstrap.number_type, bootstrap.error_type);
+            let mut session = InstantiationSession::new_recovering(
+                store,
+                InstantiationLimits {
+                    max_depth: 100,
+                    max_count: 1,
+                },
+                error,
+            )
+            .unwrap();
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    store,
+                    parameter,
+                    &[parameter],
+                    &[number],
+                    None,
+                    &mut session,
+                ),
+                Ok(number)
+            );
+            assert_eq!(
+                store.is_type_assignable_to_with_session(
+                    target_callable.parameters[0],
+                    source_callable.parameters[0],
+                    Some(&globals),
+                    Some(false),
+                    &mut session,
+                ),
+                Ok(ordinary_inner_relation),
+            );
+            assert_eq!(
+                store.callable_relation_failure_with_session(
+                    source,
+                    target,
+                    &globals,
+                    false,
+                    SignatureCheckMode::NONE,
+                    &mut session,
+                ),
+                Ok(expected_failure)
+            );
+            assert_eq!(
+                callable_assignability_details_with_session(
+                    store,
+                    &host,
+                    &globals,
+                    source,
+                    target,
+                    flags,
+                    options,
+                    &mut session,
+                )
+                .unwrap(),
+                expected_details
+            );
+            assert_eq!(
+                store.is_type_assignable_to_with_session(
+                    source,
+                    target,
+                    Some(&globals),
+                    Some(false),
+                    &mut session,
+                ),
+                Ok(false)
+            );
+            let key = store
+                .relation_key_if_available(source, target, IntersectionState::NONE, false, false)
+                .unwrap()
+                .key();
+            assert!(
+                store
+                    .relation_cache_get(RelationKind::Assignable, key)
+                    .intersects(RelationComparisonResult::FAILED)
+            );
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                )
+            };
+            let warm = snapshot(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    store.callable_relation_failure_with_session(
+                        source,
+                        target,
+                        &globals,
+                        false,
+                        SignatureCheckMode::NONE,
+                        &mut session,
+                    ),
+                    Ok(expected_failure)
+                );
+                assert_eq!(
+                    callable_assignability_details_with_session(
+                        store,
+                        &host,
+                        &globals,
+                        source,
+                        target,
+                        flags,
+                        options,
+                        &mut session,
+                    )
+                    .unwrap(),
+                    expected_details
+                );
+                assert_eq!(
+                    store.is_type_assignable_to_with_session(
+                        source,
+                        target,
+                        Some(&globals),
+                        Some(false),
+                        &mut session,
+                    ),
+                    Ok(false)
+                );
+                assert_eq!(snapshot(store), warm);
+            }
+            let mut active = HashSet::from([(source, target)]);
+            assert!(
+                recursive_callable_mismatch_chain(
+                    store,
+                    &host,
+                    &globals,
+                    source,
+                    target,
+                    flags,
+                    options,
+                    SignatureCheckMode::NONE,
+                    &mut active,
+                    false,
+                    &mut session,
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert_eq!(active, HashSet::from([(source, target)]));
+            assert_eq!(snapshot(store), warm);
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (1, 1, 0),
+            );
+            assert_eq!(session.recovery_error_type(), Some(error));
+            for callable in [source_callable, target_callable] {
+                assert_eq!(
+                    store
+                        .signature(callable.signature)
+                        .unwrap()
+                        .resolved_return_type(),
+                    callable.return_type
+                );
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn callable_return_children_fold_the_method_path_before_rendering() {
+        let parsed = parse_source_file(concat!(
+            "interface NumberBox { value: number; } ",
+            "interface TextBox { value: string; } ",
+            "interface Source { run(): NumberBox; } ",
+            "interface Target { run(): TextBox; } ",
+            "declare const source: Source; declare const target: Target;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(222);
+        let mut context = diagnostic_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let source = checked_diagnostic_variable_type(&context, &parsed, file, "source");
+        let target = checked_diagnostic_variable_type(&context, &parsed, file, "target");
+        let signatures = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                if record.kind != SyntaxKind::MethodSignature {
+                    return None;
+                }
+                Some(
+                    context
+                        .store()
+                        .signature_links(NodeRef::new(parsed.arena.id(), file, node))
+                        .unwrap()
+                        .resolved_signature
+                        .signature()
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(signatures.len(), 2);
+        for signature in signatures {
+            context.get_return_type_of_signature(signature).unwrap();
+        }
+        assert_eq!(context.is_type_assignable_to(source, target), Ok(false));
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let globals = context.global_types().clone();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut active = HashSet::new();
+        let chain = recursive_declared_property_mismatch_chain(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            source,
+            target,
+            CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            CanonicalCheckerOptions::default(),
+            &mut active,
+            false,
+            &mut session,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(active.is_empty());
+        assert_eq!(
+            chain.iter().map(Diagnostic::code).collect::<Vec<_>>(),
+            [2201, 2322]
+        );
+        assert_eq!(chain[0].arguments, ["run().value"]);
+        assert_eq!(
+            render_detail_chain(chain, 1),
+            [
+                "  The types returned by 'run().value' are incompatible between these types.",
+                "    Type 'number' is not assignable to type 'string'.",
+            ]
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // A warm failure must still reject changed parameter evidence.
+    fn callable_child_details_reject_changed_parameter_links_and_release_the_path() {
+        let parsed = parse_source_file(concat!(
+            "declare const source: (value: string) => void; ",
+            "declare const target: (value: number) => void;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(223);
+        let mut context = diagnostic_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let source = checked_diagnostic_variable_type(&context, &parsed, file, "source");
+        let target = checked_diagnostic_variable_type(&context, &parsed, file, "target");
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let globals = context.global_types().clone();
+        let flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+        let options = CanonicalCheckerOptions::default();
+        let StoredSingleCallableValidation::Valid { callable, .. } =
+            validate_stored_single_callable(context.store(), target)
+        else {
+            panic!("the target annotation must have one checked signature")
+        };
+        let store = context.store_mut_for_test();
+        let parameter = store.signature(callable.signature).unwrap().parameters()[0];
+        let original = store.value_symbol_links(parameter).unwrap().clone();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        assert_eq!(
+            store.is_type_assignable_to_with_session(
+                source,
+                target,
+                Some(&globals),
+                Some(false),
+                &mut session,
+            ),
+            Ok(false)
+        );
+        let expected = [
+            "  Types of parameters 'value' and 'value' are incompatible.",
+            "    Type 'number' is not assignable to type 'string'.",
+        ];
+        assert_eq!(
+            callable_assignability_details_with_session(
+                store,
+                &host,
+                &globals,
+                source,
+                target,
+                flags,
+                options,
+                &mut session,
+            )
+            .unwrap(),
+            expected
+        );
+        let key = store
+            .relation_key_if_available(source, target, IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        assert!(
+            store
+                .relation_cache_get(RelationKind::Assignable, key)
+                .intersects(RelationComparisonResult::FAILED)
+        );
+        let mut changed = original.clone();
+        changed.resolved_type = Some(store.intrinsic_bootstrap().unwrap().string_type);
+        assert!(store.set_value_symbol_links(parameter, changed));
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE
+        );
+        let before = store.relation_state_snapshot();
+        let mut active = HashSet::new();
+        for _ in 0..2 {
+            assert_eq!(
+                store.callable_relation_failure_with_session(
+                    source,
+                    target,
+                    &globals,
+                    false,
+                    SignatureCheckMode::NONE,
+                    &mut session,
+                ),
+                Err(RelationUnavailable::MalformedFunctionType(target))
+            );
+            assert!(matches!(recursive_callable_mismatch_chain(
+                store, &host, &globals, source, target, flags, options,
+                SignatureCheckMode::NONE, &mut active, false, &mut session,
+            ), Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::InvalidStructuredMembers(actual)
+            )) if actual == target));
+            assert!(active.is_empty());
+            assert_eq!(store.relation_state_snapshot(), before);
+        }
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            (0, 0, 0),
+        );
+        assert!(store.set_value_symbol_links(parameter, original));
+        assert_eq!(
+            store.is_type_assignable_to_with_session(
+                source,
+                target,
+                Some(&globals),
+                Some(false),
+                &mut session,
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            callable_assignability_details_with_session(
+                store,
+                &host,
+                &globals,
+                source,
+                target,
+                flags,
+                options,
+                &mut session,
+            )
+            .unwrap(),
+            expected
+        );
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
@@ -3691,6 +4754,7 @@ mod tests {
                 CanonicalCheckerOptions::default(),
                 1,
                 &mut active,
+                None,
             )
             .unwrap(),
             None,

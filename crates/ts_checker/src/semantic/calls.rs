@@ -15,8 +15,8 @@ use ts_ast::NodeRef;
 use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
 
 use super::{
-    CanonicalGlobalTypes, CanonicalTypeMapperStore, MinArgumentCountFlags, RelationUnavailable,
-    SignatureId, TypeId,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, MinArgumentCountFlags, RelationKind,
+    RelationUnavailable, SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callable_sets::{
@@ -31,7 +31,6 @@ use super::{
     instantiate::{InstantiationLimits, InstantiationSession},
     intersection_types::{IntersectionTypeError, intersect_property_types},
     links::ValueSymbolLinks,
-    relation::RelationKind,
     signatures::{ElementFlags, Signature, SignatureFlags, SignatureKind, TupleElementInfo},
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_records::{ObjectTypeData, TypeData, TypeRecord},
@@ -85,6 +84,8 @@ pub(super) enum DirectCallInvariant {
         index: usize,
         type_: TypeId,
     },
+    InvalidThisArgumentType(TypeId),
+    InvalidThisParameter(SignatureId),
     CallableOwnerMismatch {
         callee: TypeId,
         owner: TypeId,
@@ -177,6 +178,12 @@ pub(super) struct DirectCallArgumentTarget {
     pub(super) parameter_type: TypeId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectCallThisTarget {
+    argument_type: TypeId,
+    parameter_type: TypeId,
+}
+
 /// Signature and return projection retained for both valid and erroneous calls.
 /// A failed overload group has a separate marked recovery signature. Its
 /// diagnostic still names the real overload that failed applicability.
@@ -187,6 +194,7 @@ pub(super) struct DirectCallProjection {
     pub(super) minimum_argument_count: usize,
     pub(super) maximum_argument_count: usize,
     pub(super) has_effective_rest: bool,
+    this_target: Option<DirectCallThisTarget>,
     pub(super) argument_targets: Vec<DirectCallArgumentTarget>,
     pub(super) rest_argument_target: Option<DirectCallArgumentTarget>,
     pub(super) return_type: TypeId,
@@ -204,6 +212,10 @@ pub(super) enum DirectCallApplicability {
     TooManyArguments {
         expected_at_most: usize,
         actual: usize,
+    },
+    ThisContextNotAssignable {
+        argument_type: TypeId,
+        parameter_type: TypeId,
     },
     ArgumentNotAssignable {
         index: usize,
@@ -343,6 +355,7 @@ impl DirectCallArgumentResolution {
                 minimum_argument_count: self.minimum_argument_count,
                 maximum_argument_count: self.maximum_argument_count,
                 has_effective_rest: self.has_effective_rest,
+                this_target: None,
                 argument_targets: self.argument_targets,
                 rest_argument_target: self.rest_argument_target,
                 return_type,
@@ -390,11 +403,59 @@ pub(super) fn resolve_direct_call_with_session(
     existing_signature: Option<SignatureId>,
     session: &mut InstantiationSession,
 ) -> Result<DirectCallResolution, DirectCallError> {
+    resolve_direct_call_with_receiver_and_session(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        None,
+        existing_signature,
+        session,
+    )
+}
+
+/// Checks the real receiver without a retained call-node signature.
+#[cfg(test)]
+pub(super) fn resolve_direct_call_with_receiver(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: DirectCallRequest<'_>,
+    receiver: Option<TypeId>,
+    session: Option<&mut InstantiationSession>,
+) -> Result<DirectCallResolution, DirectCallError> {
+    let mut local_session = InstantiationSession::new(InstantiationLimits::default());
+    resolve_direct_call_with_receiver_and_session(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        receiver,
+        None,
+        session.unwrap_or(&mut local_session),
+    )
+}
+
+/// Keeps the actual receiver, saved signature and caller session together.
+pub(super) fn resolve_direct_call_with_receiver_and_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: DirectCallRequest<'_>,
+    receiver: Option<TypeId>,
+    existing_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
+) -> Result<DirectCallResolution, DirectCallError> {
     validate_direct_call_form(request)?;
     if store.type_payload(request.callee).is_none() {
         return Err(DirectCallInvariant::InvalidCalleeType(request.callee).into());
     }
     validate_argument_types(store, request.arguments)?;
+    if let Some(receiver) = receiver
+        && store.type_payload(receiver).is_none()
+    {
+        return Err(DirectCallInvariant::InvalidThisArgumentType(receiver).into());
+    }
     validate_tagged_template_argument(store, request)?;
 
     let projection = match validate_stored_callable_set_with_array_targets(
@@ -419,12 +480,13 @@ pub(super) fn resolve_direct_call_with_session(
     {
         return Err(DirectCallUnsupported::NotExactSingleCallable(request.callee).into());
     }
-    resolve_direct_call_candidates_with_session(
+    resolve_direct_call_candidates_with_receiver(
         store,
         global_types,
         strict_function_types,
         request,
         &projection.call_signatures,
+        receiver,
         existing_signature,
         session,
     )
@@ -436,6 +498,29 @@ pub(super) fn resolve_direct_call_candidates_with_session(
     strict_function_types: bool,
     request: DirectCallRequest<'_>,
     callables: &[ValidatedSingleCallable],
+    existing_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
+) -> Result<DirectCallResolution, DirectCallError> {
+    resolve_direct_call_candidates_with_receiver(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        callables,
+        None,
+        existing_signature,
+        session,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_direct_call_candidates_with_receiver(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: DirectCallRequest<'_>,
+    callables: &[ValidatedSingleCallable],
+    receiver: Option<TypeId>,
     existing_signature: Option<SignatureId>,
     session: &mut InstantiationSession,
 ) -> Result<DirectCallResolution, DirectCallError> {
@@ -463,7 +548,20 @@ pub(super) fn resolve_direct_call_candidates_with_session(
         let mut candidates = Vec::with_capacity(candidate_count);
         for callable in &callables {
             match project_validated_direct_call(store, Some(global_types), request, callable) {
-                Ok(candidate) => candidates.push(candidate),
+                Ok(mut candidate) => {
+                    if let Some(parameter_type) = source_this_parameter_type(store, callable)? {
+                        let bootstrap = store.intrinsic_bootstrap().ok_or(
+                            DirectCallInvariant::InvalidThisParameter(callable.signature),
+                        )?;
+                        if parameter_type != bootstrap.void_type {
+                            candidate.projection.this_target = Some(DirectCallThisTarget {
+                                argument_type: receiver.unwrap_or(bootstrap.void_type),
+                                parameter_type,
+                            });
+                        }
+                    }
+                    candidates.push(candidate);
+                }
                 Err(DirectCallError::Unsupported(DirectCallUnsupported::Form(
                     DirectCallForm::TaggedTemplate,
                 ))) if candidate_count > 1 => {}
@@ -2022,6 +2120,41 @@ struct PreparedDirectCallParameters {
     maximum_argument_count: usize,
 }
 
+fn source_this_parameter_type(
+    store: &CanonicalTypeMapperStore,
+    callable: &ValidatedSingleCallable,
+) -> Result<Option<TypeId>, DirectCallError> {
+    let signature = store
+        .signature(callable.signature)
+        .ok_or(DirectCallInvariant::InvalidSignature(callable.signature))?;
+    let Some(parameter) = signature.this_parameter() else {
+        return Ok(None);
+    };
+    let provenance = store.source_callable_provenance(callable.owner).ok_or(
+        DirectCallUnsupported::ExplicitThisParameter(callable.signature),
+    )?;
+    let written =
+        super::source_callables::source_callable_this_parameter(store, provenance.declaration)
+            .map_err(|_| DirectCallInvariant::InvalidThisParameter(callable.signature))?
+            .ok_or(DirectCallInvariant::InvalidThisParameter(
+                callable.signature,
+            ))?;
+    if provenance.signature != callable.signature
+        || written.symbol != parameter
+        || signature.parameters().contains(&parameter)
+    {
+        return Err(DirectCallInvariant::InvalidThisParameter(callable.signature).into());
+    }
+    let type_ = store
+        .value_symbol_links(parameter)
+        .and_then(|links| links.resolved_type)
+        .filter(|type_| store.type_payload(*type_).is_some())
+        .ok_or(DirectCallInvariant::InvalidThisParameter(
+            callable.signature,
+        ))?;
+    Ok(Some(type_))
+}
+
 fn prepare_direct_call_parameters(
     store: &CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
@@ -2039,9 +2172,7 @@ fn prepare_direct_call_parameters(
     if !signature.type_parameters().is_empty() {
         return Err(DirectCallUnsupported::GenericSignature(callable.signature).into());
     }
-    if signature.this_parameter().is_some() {
-        return Err(DirectCallUnsupported::ExplicitThisParameter(callable.signature).into());
-    }
+    source_this_parameter_type(store, callable)?;
     let rest = callable_rest_shape(
         store,
         global_types.map(CanonicalArrayTargets::from_global_types),
@@ -2687,8 +2818,16 @@ fn type_contains_void(
 
 pub(super) fn check_argument_applicability(
     projection: &DirectCallProjection,
-    is_assignable: impl FnMut(TypeId, TypeId) -> Result<bool, RelationUnavailable>,
+    mut is_assignable: impl FnMut(TypeId, TypeId) -> Result<bool, RelationUnavailable>,
 ) -> Result<DirectCallApplicability, RelationUnavailable> {
+    if let Some(target) = projection.this_target
+        && !is_assignable(target.argument_type, target.parameter_type)?
+    {
+        return Ok(DirectCallApplicability::ThisContextNotAssignable {
+            argument_type: target.argument_type,
+            parameter_type: target.parameter_type,
+        });
+    }
     check_argument_target_applicability(
         &projection.argument_targets,
         projection.rest_argument_target,

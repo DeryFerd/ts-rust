@@ -790,6 +790,7 @@ pub(super) struct SourceCallablePlan {
     pub(super) type_parameters: Vec<SourceCallableTypeParameterPlan>,
     pub(super) type_parameter_syntax: Box<SourceCallableTypeParameterSyntaxProof>,
     generic_return_type_parameter_index: Option<usize>,
+    pub(super) this_parameter: Option<SourceCallableParameterPlan>,
     pub(super) parameters: Vec<SourceCallableParameterPlan>,
     pub(super) return_type: SourceCallableReturnPlan,
     pub(super) type_predicate: Option<CallableTypePredicatePlan>,
@@ -815,6 +816,15 @@ impl SourceCallablePlan {
     pub(super) fn contextual_function_expression_return(&self) -> Option<TypeId> {
         self.contextual_function_expression
             .map(|context| context.return_type)
+    }
+
+    /// Source parameters include the receiver, but signature value parameters do not.
+    pub(super) fn all_parameters(&self) -> impl Iterator<Item = &SourceCallableParameterPlan> {
+        self.this_parameter.iter().chain(&self.parameters)
+    }
+
+    pub(super) fn parameter_count(&self) -> usize {
+        self.parameters.len() + usize::from(self.this_parameter.is_some())
     }
 
     pub(super) const fn captured_assignment(&self) -> Option<SourceCapturedLocal> {
@@ -3364,6 +3374,7 @@ fn plan_source_callable_with_owner_shape(
                 })
             });
 
+    let mut this_parameter = None;
     let mut parameters = Vec::with_capacity(view.parameters.nodes.len());
     let mut previous_end = view.parameters.range.start;
     let mut optional_seen = false;
@@ -3373,10 +3384,11 @@ fn plan_source_callable_with_owner_shape(
     } else {
         SignatureFlags::NONE
     };
-    for parameter_id in &view.parameters.nodes {
+    for (source_index, parameter_id) in view.parameters.nodes.iter().enumerate() {
         let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter_id);
-        if parameters
+        if this_parameter
             .iter()
+            .chain(&parameters)
             .any(|planned: &SourceCallableParameterPlan| planned.declaration == parameter)
         {
             return Err(invariant(SourceCallableInvariant::InvalidParameter(
@@ -3430,7 +3442,7 @@ fn plan_source_callable_with_owner_shape(
                         )
                         .is_some() =>
             {
-                format!("__{}", parameters.len())
+                format!("__{source_index}")
             }
             (NodeData::BindingPattern(_), SyntaxKind::ObjectBindingPattern)
                 if view.family == SourceCallableFamily::FunctionDeclaration
@@ -3444,7 +3456,7 @@ fn plan_source_callable_with_owner_shape(
                     )
                     .is_some() =>
             {
-                format!("__{}", parameters.len())
+                format!("__{source_index}")
             }
             _ => {
                 return Err(SourceCallableError::Unsupported(
@@ -3481,7 +3493,23 @@ fn plan_source_callable_with_owner_shape(
                 SourceCallableUnsupported::ParameterModifiers(parameter),
             ));
         }
+        let explicit_this = parameter_name == "this"
+            && source_index == 0
+            && body_mode == SourceCallableBodyMode::Present
+            && matches!(
+                record.kind,
+                SyntaxKind::FunctionDeclaration | SyntaxKind::FunctionExpression
+            )
+            && data.type_.is_some()
+            && data.modifiers.is_none()
+            && data.question_token.is_none()
+            && data.dot_dot_dot_token.is_none()
+            && data.initializer.is_none()
+            && bound
+                .source_facts()
+                .is_some_and(|facts| !facts.is_javascript_file());
         if parameter_name == "this"
+            && !explicit_this
             && !(view.family == SourceCallableFamily::FunctionDeclaration
                 && view.parameters.nodes.len() == 1
                 && data.type_.is_none()
@@ -3516,7 +3544,7 @@ fn plan_source_callable_with_owner_shape(
         } else {
             false
         };
-        if rest && parameters.len() + 1 != view.parameters.nodes.len() {
+        if rest && source_index + 1 != view.parameters.nodes.len() {
             return Err(SourceCallableError::Unsupported(
                 SourceCallableUnsupported::RestParameterNotLast(parameter),
             ));
@@ -3654,7 +3682,7 @@ fn plan_source_callable_with_owner_shape(
                 SourceCallableUnsupported::RequiredAfterOptional(parameter),
             ));
         }
-        if !optional && initializer.is_none() && !rest {
+        if !explicit_this && !optional && initializer.is_none() && !rest {
             min_argument_count = parameters.len() + 1;
         }
         let raw_symbol = bound
@@ -3710,7 +3738,7 @@ fn plan_source_callable_with_owner_shape(
                 parameter,
             )));
         }
-        parameters.push(SourceCallableParameterPlan {
+        let planned = SourceCallableParameterPlan {
             declaration: parameter,
             symbol,
             type_node,
@@ -3725,7 +3753,12 @@ fn plan_source_callable_with_owner_shape(
             optional,
             initializer,
             rest,
-        });
+        };
+        if explicit_this {
+            this_parameter = Some(planned);
+        } else {
+            parameters.push(planned);
+        }
     }
 
     let mut type_predicate = None;
@@ -3964,6 +3997,7 @@ fn plan_source_callable_with_owner_shape(
         type_parameters,
         type_parameter_syntax: Box::new(type_parameter_syntax),
         generic_return_type_parameter_index: None,
+        this_parameter,
         parameters,
         return_type,
         type_predicate,
@@ -8141,7 +8175,7 @@ fn validate_exact_generic_annotation_shape(
                 SourceCallableUnsupported::GenericSignature(plan.declaration),
             ));
         }
-        for parameter in &plan.parameters {
+        for parameter in plan.all_parameters() {
             let rest_is_exact = !parameter.rest
                 || match plan.array_targets {
                     Some(targets) => is_exact_source_generic_array_annotation(
@@ -8180,7 +8214,7 @@ fn validate_exact_generic_annotation_shape(
             .bound_file(plan.declaration)
             .and_then(ts_binder::BoundFile::source_facts)
             .is_some_and(CanonicalSourceFileFacts::is_declaration_file);
-    for parameter in &plan.parameters {
+    for parameter in plan.all_parameters() {
         let mut exact = false;
         let mut exact_array = false;
         for type_parameter in &plan.type_parameters {
@@ -10319,6 +10353,27 @@ fn valid_source_callable_plan_owner(
     };
     let ordinary_arrow = plan.family == SourceCallableFamily::ArrowFunction
         && store.source_arrow_has_ordinary_type_parameters(plan.declaration);
+    let this_parameter_is_exact = source_callable_this_parameter(store, plan.declaration)
+        .is_ok_and(|written| {
+            written
+                == plan
+                    .this_parameter
+                    .map(|parameter| SourceCallableThisParameter {
+                        declaration: parameter.declaration,
+                        symbol: parameter.symbol,
+                        annotation: parameter.type_node,
+                    })
+                && plan.this_parameter.is_none_or(|parameter| {
+                    !parameter.implicit_any
+                        && !parameter.optional
+                        && !parameter.rest
+                        && parameter.initializer.is_none()
+                        && !plan
+                            .parameters
+                            .iter()
+                            .any(|value| value.symbol == parameter.symbol)
+                })
+        });
     if store
         .source_node_kind(plan.declaration)
         .is_none_or(|kind| !plan.family.matches_syntax_kind(kind))
@@ -10328,6 +10383,7 @@ fn valid_source_callable_plan_owner(
         || owner.export_symbol().is_some()
         || owner.parent() != plan.owner_parent
         || !function_expression_context_is_exact(store, plan)
+        || !this_parameter_is_exact
         || plan.type_parameter_syntax.is_ordinary_typescript_arrow() != ordinary_arrow
         || ordinary_arrow
             && (!plan.requires_type_query_evidence()
@@ -10459,6 +10515,195 @@ fn source_expression_owner_name_is_exact(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableThisParameter {
+    pub(super) declaration: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) annotation: NodeRef,
+}
+
+/// Reads the written receiver from retained source and binder facts.
+pub(super) fn source_callable_this_parameter(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> Result<Option<SourceCallableThisParameter>, SourceCallableError> {
+    let invalid = || invariant(SourceCallableInvariant::InvalidSignatureCache(declaration));
+    let children = store
+        .source_direct_children(declaration)
+        .ok_or_else(invalid)?;
+    let Some(parameter) = children
+        .into_iter()
+        .filter(|child| store.source_node_kind(*child) == Some(SyntaxKind::Parameter))
+        .min_by_key(|child| store.source_node_start(*child))
+    else {
+        return Ok(None);
+    };
+    let Some(name) = store.source_child_with_kind(parameter, SyntaxKind::Identifier) else {
+        return Ok(None);
+    };
+    if store.source_identifier_text(name) != Some("this") {
+        return Ok(None);
+    }
+    let Some(annotation) = store.source_direct_type_annotation(parameter) else {
+        return Ok(None);
+    };
+    let symbol = store
+        .source_declaration_symbol(parameter)
+        .ok_or_else(invalid)?;
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
+    let parameter_children = store
+        .source_direct_children(parameter)
+        .ok_or_else(invalid)?;
+    if !store.source_is_typescript(declaration)
+        || !matches!(
+            store.source_node_kind(declaration),
+            Some(SyntaxKind::FunctionDeclaration | SyntaxKind::FunctionExpression)
+        )
+        || store
+            .source_child_with_kind(declaration, SyntaxKind::Block)
+            .is_none()
+        || parameter_children.len() != 2
+        || !parameter_children.contains(&name)
+        || !parameter_children.contains(&annotation)
+        || record.name().as_utf8() != Some("this")
+        || record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || record.check_flags() != CheckFlags::NONE
+        || record.declarations() != Some(&[parameter])
+        || record.value_declaration() != Some(parameter)
+        || record.parent().is_some()
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+    {
+        return Err(invalid());
+    }
+    Ok(Some(SourceCallableThisParameter {
+        declaration: parameter,
+        symbol,
+        annotation,
+    }))
+}
+
+/// Proves a body read against its direct ordinary function and real receiver symbol.
+pub(super) fn plan_source_callable_this_read(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<SourceCallableParameterPlan>, SourceCallableError> {
+    let record = preflight_node(store, host, node)?;
+    let NodeData::KeywordExpression(keyword) = &record.data else {
+        return Ok(None);
+    };
+    if record.kind != SyntaxKind::ThisKeyword || record.flags.0 != 0 || keyword.flow_node.is_some()
+    {
+        return Ok(None);
+    }
+    let bound = host
+        .bound_file(node)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidSyntax(node)))?;
+    let Some(owner) = bound.this_container(node) else {
+        return Ok(None);
+    };
+    if bound.container(node) != Some(owner)
+        || !matches!(
+            store.source_node_kind(owner),
+            Some(SyntaxKind::FunctionDeclaration | SyntaxKind::FunctionExpression)
+        )
+        || source_callable_this_parameter(store, owner)?.is_none()
+    {
+        return Ok(None);
+    }
+    let symbol = bound
+        .symbol(owner)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(owner)))?;
+    let plan = plan_source_callable(store, host, owner, symbol, array_targets)?;
+    let Some(parameter) = plan.this_parameter else {
+        return Err(invariant(SourceCallableInvariant::InvalidParameter(node)));
+    };
+    if plan.body_mode != SourceCallableBodyMode::Present {
+        return Ok(None);
+    }
+    let mut current = node;
+    let mut visited = HashSet::new();
+    while visited.insert(current) {
+        if current == plan.body {
+            let expected = SymbolNodeLinks {
+                resolved_symbol: Some(parameter.symbol),
+            };
+            if store
+                .symbol_node_links(node)
+                .is_some_and(|links| links != &SymbolNodeLinks::default() && links != &expected)
+            {
+                return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
+                    node,
+                )));
+            }
+            return Ok(Some(parameter));
+        }
+        if current == owner {
+            return Ok(None);
+        }
+        let Some(parent) = preflight_node(store, host, current)?.parent else {
+            return Ok(None);
+        };
+        current = NodeRef::new(current.arena, current.file, parent);
+    }
+    Err(invariant(SourceCallableInvariant::InvalidSyntax(node)))
+}
+
+fn source_callable_this_type_is_exact(
+    store: &CanonicalTypeMapperStore,
+    annotation: NodeRef,
+    type_: TypeId,
+) -> bool {
+    let mut annotation = annotation;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(annotation) {
+            return false;
+        }
+        if store.source_node_kind(annotation) == Some(SyntaxKind::TypeLiteral) {
+            let Some(symbol) = store.source_declaration_symbol(annotation) else {
+                return false;
+            };
+            if store
+                .type_node_links(annotation)
+                .is_none_or(|links| links.resolved_type != Some(type_))
+                || store
+                    .symbol(symbol)
+                    .is_none_or(|symbol| symbol.declarations() != Some(&[annotation]))
+            {
+                return false;
+            }
+            return store.type_payload(type_).and_then(TypeRecord::symbol) == Some(symbol)
+                || store
+                    .intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| bootstrap.empty_type_literal_type == type_)
+                    && store
+                        .source_direct_children(annotation)
+                        .is_some_and(|children| children.is_empty());
+        }
+        if !store.source_direct_type_annotation_is_exact(annotation, type_) {
+            return false;
+        }
+        match store.source_node_kind(annotation) {
+            Some(SyntaxKind::ParenthesizedType) => {
+                let Some(children) = store.source_direct_children(annotation) else {
+                    return false;
+                };
+                let [inner] = children.as_slice() else {
+                    return false;
+                };
+                annotation = *inner;
+            }
+            _ => return store.type_payload(type_).is_some(),
+        }
+    }
+}
+
 fn valid_inferred_generic_source_callable(
     store: &CanonicalTypeMapperStore,
     plan: &SourceCallablePlan,
@@ -10567,8 +10812,7 @@ pub(super) fn source_callable_state(
         if owner_links.is_some_and(|links| links != &ValueSymbolLinks::default())
             || !default_signature_links(store, plan.declaration)
             || plan
-                .parameters
-                .iter()
+                .all_parameters()
                 .any(|parameter| !default_parameter_links(store, parameter.symbol))
             || store
                 .source_callable_type_for_owner(plan.owner_symbol)
@@ -10671,8 +10915,7 @@ pub(super) fn source_callable_state(
                 .is_some()
             || published_parameter_types.is_some()
             || plan
-                .parameters
-                .iter()
+                .all_parameters()
                 .any(|parameter| !default_parameter_links(store, parameter.symbol))
         {
             return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
@@ -10697,10 +10940,9 @@ pub(super) fn source_callable_state(
             plan.declaration,
         )));
     }
-    if !plan.parameters.is_empty()
+    if plan.parameter_count() != 0
         && plan
-            .parameters
-            .iter()
+            .all_parameters()
             .all(|parameter| default_parameter_links(store, parameter.symbol))
     {
         if !allow_active_barrier
@@ -10721,13 +10963,29 @@ pub(super) fn source_callable_state(
             plan.declaration,
         )));
     };
-    if published_parameter_types.len() != plan.parameters.len() {
+    let published_this_type = store.callable_signature_this_parameter_type(signature);
+    if published_parameter_types.len() != plan.parameters.len()
+        || published_this_type.is_some() != plan.this_parameter.is_some()
+    {
         return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
             plan.declaration,
         )));
     }
     for (parameter, expected) in plan.parameters.iter().zip(published_parameter_types) {
         validate_parameter_links(store, plan, signature, parameter, *expected)?;
+    }
+    if let Some(parameter) = &plan.this_parameter {
+        let expected = published_this_type.ok_or_else(|| {
+            invariant(SourceCallableInvariant::InvalidParameterCache(
+                parameter.declaration,
+            ))
+        })?;
+        validate_parameter_links(store, plan, signature, parameter, expected)?;
+        if !source_callable_this_type_is_exact(store, parameter.type_node, expected) {
+            return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
+                parameter.declaration,
+            )));
+        }
     }
     validate_cached_return_type(store, plan, signature)?;
     if plan.return_type.is_inferred() && resolved_return_type.is_none() {
@@ -12156,6 +12414,7 @@ pub(super) fn begin_source_callable(
                 export_local: plan.export_local,
                 type_parameters: resolved_type_parameters.to_vec(),
                 query_evidence,
+                this_parameter: plan.this_parameter.map(|parameter| parameter.symbol),
                 parameters: plan
                     .parameters
                     .iter()
@@ -12181,7 +12440,7 @@ pub(super) fn begin_source_callable(
             plan.flags,
             Some(plan.declaration),
             Vec::new(),
-            None,
+            plan.this_parameter.map(|parameter| parameter.symbol),
             plan.parameters
                 .iter()
                 .map(|parameter| parameter.symbol)
@@ -12285,7 +12544,7 @@ pub(super) fn finalize_source_callable_structure(
             plan.declaration,
         )));
     }
-    if plan.parameters.is_empty() {
+    if plan.parameter_count() == 0 {
         let published = store
             .set_callable_signature_parameter_types_batch(vec![(pending.signature, Vec::new())]);
         assert!(
@@ -12306,7 +12565,7 @@ pub(super) fn materialize_parameterless_source_function_expression(
 ) -> Result<(TypeId, SignatureId), SourceCallableError> {
     if plan.family != SourceCallableFamily::ArrowFunction
         || store.source_node_kind(plan.declaration) != Some(SyntaxKind::FunctionExpression)
-        || !plan.parameters.is_empty()
+        || plan.parameter_count() != 0
         || !plan.type_parameters.is_empty()
         || !plan.return_type.is_inferred()
         || plan.body_mode != SourceCallableBodyMode::Present
@@ -12411,7 +12670,7 @@ pub(super) fn publish_source_callable_parameter_types(
         .undefined_type;
     let parameter_count = pending.iter().try_fold(0usize, |count, callable| {
         count
-            .checked_add(callable.plan.parameters.len())
+            .checked_add(callable.plan.parameter_count())
             .ok_or_else(|| invariant(SourceCallableInvariant::Capacity(callable.plan.declaration)))
     })?;
     let mut owners = HashSet::with_capacity(pending.len());
@@ -12419,7 +12678,7 @@ pub(super) fn publish_source_callable_parameter_types(
     let mut signatures = HashSet::with_capacity(pending.len());
     let mut parameter_symbols = HashSet::with_capacity(parameter_count);
     for callable in pending {
-        if callable.base_types.len() != callable.plan.parameters.len() {
+        if callable.base_types.len() != callable.plan.parameter_count() {
             return Err(invariant(SourceCallableInvariant::Publication(
                 callable.plan.declaration,
             )));
@@ -12463,7 +12722,7 @@ pub(super) fn publish_source_callable_parameter_types(
         } else {
             None
         };
-        for (parameter, base) in callable.plan.parameters.iter().zip(&callable.base_types) {
+        for (parameter, base) in callable.plan.all_parameters().zip(&callable.base_types) {
             if !parameter_symbols.insert(parameter.symbol) {
                 return Err(invariant(SourceCallableInvariant::InvalidParameterSymbol(
                     parameter.declaration,
@@ -12500,6 +12759,12 @@ pub(super) fn publish_source_callable_parameter_types(
                 *base
             };
             if cached != supplied_base
+                || callable.plan.this_parameter.as_ref() == Some(parameter)
+                    && !source_callable_this_type_is_exact(
+                        store,
+                        parameter.type_node,
+                        supplied_base,
+                    )
                 || store
                     .validate_cached_array_capability_prepared(
                         supplied_base,
@@ -12543,8 +12808,9 @@ pub(super) fn publish_source_callable_parameter_types(
     let mut expected_parameter_types = Vec::with_capacity(pending.len());
     for callable in pending {
         let signature = exact_signature_link(store, callable.plan.declaration)?;
+        let mut this_type = None;
         let mut callable_parameter_types = Vec::with_capacity(callable.plan.parameters.len());
-        for (parameter, base) in callable.plan.parameters.iter().zip(&callable.base_types) {
+        for (parameter, base) in callable.plan.all_parameters().zip(&callable.base_types) {
             let base = if parameter.is_implicit_any() && parameter.rest {
                 parameter.base_type(store).ok_or_else(|| {
                     invariant(SourceCallableInvariant::InvalidParameterCache(
@@ -12594,11 +12860,16 @@ pub(super) fn publish_source_callable_parameter_types(
                 call_type
             };
             resolved.push((parameter.symbol, value_type));
-            callable_parameter_types.push(call_type);
+            if callable.plan.this_parameter.as_ref() == Some(parameter) {
+                this_type = Some(call_type);
+            } else {
+                callable_parameter_types.push(call_type);
+            }
         }
-        expected_parameter_types.push((signature, callable_parameter_types));
+        expected_parameter_types.push((signature, this_type, callable_parameter_types));
     }
-    let provenance = store.set_callable_signature_parameter_types_batch(expected_parameter_types);
+    let provenance =
+        store.set_callable_signature_parameter_types_with_this_batch(expected_parameter_types);
     assert!(
         provenance,
         "prevalidated source parameter provenance publication is infallible"
@@ -13361,7 +13632,19 @@ pub(super) fn source_callable_display_projection(
         .resolved_return_type();
     let minimum = usize::try_from(plan.min_argument_count)
         .map_err(|_| SourceCallableDisplayError::Malformed)?;
-    let mut parameters = Vec::with_capacity(plan.parameters.len());
+    let mut parameters = Vec::with_capacity(plan.parameter_count());
+    if let Some(parameter) = plan.this_parameter {
+        let value_type = parameter
+            .base_type(store)
+            .ok_or(SourceCallableDisplayError::Malformed)?;
+        parameters.push(ValidatedSingleCallParameterDisplay {
+            name: "this".to_owned(),
+            value_type,
+            annotation_type: Some(value_type),
+            optional: false,
+            rest: false,
+        });
+    }
     for (index, parameter) in plan.parameters.iter().enumerate() {
         let optional = parameter.optional || parameter.initializer.is_some() && index >= minimum;
         let value_type = if parameter.initializer.is_some() && !optional {
@@ -13669,6 +13952,32 @@ fn source_object_binding_property_display(
     if let NodeData::Identifier(identifier) = &record.data {
         return Ok(identifier.text.clone());
     }
+    if let NodeData::CallExpression(call) = &record.data {
+        let callee = NodeRef::new(node.arena, node.file, call.expression);
+        let callee_record = host
+            .node(callee)
+            .ok_or(SourceCallableDisplayError::Malformed)?;
+        let NodeData::Identifier(identifier) = &callee_record.data else {
+            return Err(SourceCallableDisplayError::Malformed);
+        };
+        if record.kind != SyntaxKind::CallExpression
+            || record.flags.0 != 0
+            || call.question_dot_token.is_some()
+            || call.type_arguments.is_some()
+            || call.symbol.is_some()
+            || call.facts != 0
+            || !call.arguments.nodes.is_empty()
+            || call.arguments.has_trailing_comma
+            || callee_record.kind != SyntaxKind::Identifier
+            || callee_record.parent != Some(node.node)
+            || callee_record.flags.0 != 0
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(SourceCallableDisplayError::Malformed);
+        }
+        return Ok(format!("{}()", identifier.text));
+    }
     if !matches!(
         record.kind,
         SyntaxKind::StringLiteral
@@ -13788,6 +14097,28 @@ pub(super) fn validate_stored_source_callable(
     let Some(signature_record) = store.signature(signature) else {
         return StoredSourceCallableValidation::Malformed;
     };
+    let Ok(this_parameter) = source_callable_this_parameter(store, declaration) else {
+        return StoredSourceCallableValidation::Malformed;
+    };
+    if signature_record.this_parameter() != this_parameter.map(|parameter| parameter.symbol)
+        || this_parameter.is_some_and(|parameter| {
+            signature_record.parameters().contains(&parameter.symbol)
+                || store
+                    .source_direct_children(declaration)
+                    .is_none_or(|children| {
+                        !children
+                            .into_iter()
+                            .filter(|child| {
+                                store.source_node_kind(*child) == Some(SyntaxKind::Parameter)
+                            })
+                            .filter(|child| *child != parameter.declaration)
+                            .map(|child| store.source_declaration_symbol(child))
+                            .eq(signature_record.parameters().iter().copied().map(Some))
+                    })
+        })
+    {
+        return StoredSourceCallableValidation::Malformed;
+    }
     if signature_record.flags() != provenance.flags {
         return StoredSourceCallableValidation::Malformed;
     }
@@ -13879,6 +14210,12 @@ pub(super) fn validate_stored_source_callable(
         return StoredSourceCallableValidation::Malformed;
     };
     let expected_parameter_types = store.callable_signature_parameter_types(signature);
+    let expected_this_type = store.callable_signature_this_parameter_type(signature);
+    if expected_this_type.is_some()
+        != (expected_parameter_types.is_some() && this_parameter.is_some())
+    {
+        return StoredSourceCallableValidation::Malformed;
+    }
     let Some(type_parameter_edges) = valid_stored_source_type_parameters(
         store,
         declaration,
@@ -13926,6 +14263,34 @@ pub(super) fn validate_stored_source_callable(
         edges.push(context.owner);
     }
     let mut default_parameter_count = 0usize;
+    let this_parameter_valid =
+        this_parameter.is_none_or(
+            |parameter| match store.value_symbol_links(parameter.symbol) {
+                None => {
+                    default_parameter_count += 1;
+                    true
+                }
+                Some(links) if links == &ValueSymbolLinks::default() => {
+                    default_parameter_count += 1;
+                    true
+                }
+                Some(links) => links.resolved_type.is_some_and(|type_| {
+                    let valid = expected_this_type == Some(type_)
+                        && links
+                            == &ValueSymbolLinks {
+                                resolved_type: Some(type_),
+                                ..ValueSymbolLinks::default()
+                            }
+                        && source_callable_this_type_is_exact(store, parameter.annotation, type_);
+                    if valid {
+                        edges.push(type_);
+                    }
+                    valid
+                }),
+            },
+        );
+    let source_parameter_count =
+        signature_record.parameters().len() + usize::from(this_parameter.is_some());
     let parameters_valid =
         signature_record
             .parameters()
@@ -14107,7 +14472,10 @@ pub(super) fn validate_stored_source_callable(
         })
         || signature_record.resolved_min_argument_count() != -1
         || signature_record.declaration() != Some(declaration)
-        || signature_record.this_parameter().is_some()
+        || !this_parameter_valid
+        || contextual.is_some()
+            && contextual_function_expression.is_none()
+            && this_parameter.is_some()
         || !valid_stored_callable_type_predicate(
             store,
             signature_record,
@@ -14128,8 +14496,7 @@ pub(super) fn validate_stored_source_callable(
         || !generic_return_provenance_valid
         || !return_provenance_valid
         || !parameters_valid
-        || default_parameter_count != 0
-            && default_parameter_count != signature_record.parameters().len()
+        || default_parameter_count != 0 && default_parameter_count != source_parameter_count
         || !parameters_unique
         || contextual.is_some()
             && contextual_function_expression.is_none()
@@ -14142,7 +14509,7 @@ pub(super) fn validate_stored_source_callable(
         return StoredSourceCallableValidation::Malformed;
     }
     if object.structured == StructuredTypeData::default() {
-        return if default_parameter_count == signature_record.parameters().len()
+        return if default_parameter_count == source_parameter_count
             && expected_parameter_types.is_none()
             && signature_record.resolved_return_type().is_none()
             && !store.signature_has_circular_return_type(signature)
@@ -15724,6 +16091,7 @@ fn validated_source_callable_type_query(
         || record.declaration() != Some(plan.declaration)
         || record.flags() != plan.flags
         || record.min_argument_count() != plan.min_argument_count
+        || record.this_parameter() != plan.this_parameter.map(|parameter| parameter.symbol)
         || !record
             .parameters()
             .iter()
@@ -15910,7 +16278,7 @@ fn validate_signature(
         .as_deref()
             != Some(expected_type_parameters.as_slice())
         || record.parameters() != expected_parameters
-        || record.this_parameter().is_some()
+        || record.this_parameter() != plan.this_parameter.map(|parameter| parameter.symbol)
         || !valid_planned_callable_type_predicate(
             store,
             record,
@@ -20575,6 +20943,7 @@ mod tests {
                     export_local: self.export_local,
                     type_parameters: self.resolved.clone(),
                     query_evidence: self.query_evidence.clone(),
+                    this_parameter: None,
                     parameters: self.parameters.clone(),
                     flags: SignatureFlags::NONE,
                     min_argument_count: i32::try_from(self.parameters.len()).unwrap(),
@@ -20600,6 +20969,7 @@ mod tests {
                     export_local: self.export_local,
                     type_parameters: resolved,
                     query_evidence: self.query_evidence.clone(),
+                    this_parameter: None,
                     parameters: self.parameters.clone(),
                     flags: SignatureFlags::NONE,
                     min_argument_count: i32::try_from(self.parameters.len()).unwrap(),
@@ -20733,6 +21103,7 @@ mod tests {
             export_local: plan.export_local,
             type_parameters: resolved.to_vec(),
             query_evidence,
+            this_parameter: plan.this_parameter.map(|parameter| parameter.symbol),
             parameters: plan
                 .parameters
                 .iter()
@@ -27024,6 +27395,598 @@ mod tests {
             );
             assert_eq!(publication_state(&fixture.store), warm);
             assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Owner and cache swaps use the same real source graph.
+    fn ordinary_this_parameters_keep_written_owners_and_reject_cache_swaps() {
+        let mut fixture = QueryFixture::new(
+            concat!(
+                "function first(this: { value: number }, input: string): number { return this.value; }\n",
+                "const second = function(this: { value: number }, input: string): number { return this.value; };\n",
+                "function outer(this: { value: number }): number { const inner = () => this.value; return 1; }",
+            ),
+            FileId::new(202_830),
+        );
+        let source = fixture
+            .store
+            .register_source_file(
+                &fixture.parsed.arena,
+                fixture.parsed.source_file,
+                fixture.file,
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .register_source_file_facts(source, fixture.bound.source_facts().unwrap(),)
+        );
+        let declarations = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                matches!(
+                    record.kind,
+                    SyntaxKind::FunctionDeclaration | SyntaxKind::FunctionExpression
+                )
+                .then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let reads = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ThisKeyword).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(declarations.len(), 3);
+        assert_eq!(reads.len(), 3);
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let cold = generic_transaction_state(&fixture.store);
+        let plans = declarations[..2]
+            .iter()
+            .map(|declaration| {
+                plan_source_callable(
+                    &fixture.store,
+                    &host,
+                    *declaration,
+                    fixture.bound.symbol(*declaration).unwrap(),
+                    None,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for (plan, read) in plans.iter().zip(&reads) {
+            let parameter = plan.this_parameter.unwrap();
+            assert_eq!(
+                fixture.bound.symbol(parameter.declaration),
+                Some(parameter.symbol)
+            );
+            assert_eq!(plan.parameters.len(), 1);
+            assert_eq!(plan.parameter_count(), 2);
+            assert_eq!(plan.min_argument_count, 1);
+            assert_ne!(plan.parameters[0].symbol, parameter.symbol);
+            assert_eq!(
+                plan_source_callable_this_read(&fixture.store, &host, *read, None),
+                Ok(Some(parameter)),
+            );
+        }
+        assert_ne!(
+            plans[0].this_parameter.unwrap().symbol,
+            plans[1].this_parameter.unwrap().symbol
+        );
+        assert_ne!(
+            fixture.bound.container(reads[2]),
+            fixture.bound.this_container(reads[2])
+        );
+        assert_eq!(
+            fixture.bound.this_container(reads[2]),
+            Some(declarations[2])
+        );
+        assert_eq!(
+            plan_source_callable_this_read(&fixture.store, &host, reads[2], None),
+            Ok(None)
+        );
+        assert_eq!(generic_transaction_state(&fixture.store), cold);
+        drop(host);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let types = plans
+            .iter()
+            .map(|plan| {
+                fixture
+                    .query_callable(plan.declaration, plan.owner_symbol, &mut diagnostics)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let first = plans[0].this_parameter.unwrap();
+        let second = plans[1].this_parameter.unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(types[0])
+            .unwrap()
+            .signature;
+        let first_type = first.base_type(&fixture.store).unwrap();
+        let second_type = second.base_type(&fixture.store).unwrap();
+        assert_ne!(first_type, second_type);
+        let record = fixture.store.signature(signature).unwrap();
+        assert_eq!(record.this_parameter(), Some(first.symbol));
+        assert_eq!(record.parameters(), [plans[0].parameters[0].symbol]);
+        assert_eq!(record.min_argument_count(), 1);
+        assert_eq!(
+            fixture
+                .store
+                .callable_signature_parameter_types(signature)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, types[0]),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        for replacement in [
+            None,
+            Some(second.symbol),
+            Some(plans[0].parameters[0].symbol),
+        ] {
+            assert!(
+                fixture
+                    .store
+                    .set_signature_this_parameter(signature, replacement)
+            );
+            let damaged = generic_transaction_state(&fixture.store);
+            assert_eq!(
+                validate_stored_source_callable(&fixture.store, types[0]),
+                StoredSourceCallableValidation::Malformed
+            );
+            assert_eq!(
+                source_callable_state(&fixture.store, &plans[0], false),
+                Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+                    plans[0].declaration
+                )))
+            );
+            assert!(
+                fixture
+                    .query_callable(
+                        plans[0].declaration,
+                        plans[0].owner_symbol,
+                        &mut diagnostics
+                    )
+                    .is_err()
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), damaged);
+            assert!(
+                fixture
+                    .store
+                    .set_signature_this_parameter(signature, Some(first.symbol))
+            );
+        }
+        let annotation_links = fixture
+            .store
+            .type_node_links(first.type_node)
+            .unwrap()
+            .clone();
+        let value_links = fixture
+            .store
+            .value_symbol_links(first.symbol)
+            .unwrap()
+            .clone();
+        assert!(fixture.store.set_type_node_links(
+            first.type_node,
+            TypeNodeLinks {
+                resolved_type: Some(second_type),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        assert!(fixture.store.set_value_symbol_links(
+            first.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(second_type),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let damaged = generic_transaction_state(&fixture.store);
+        assert_eq!(
+            validate_stored_source_callable(&fixture.store, types[0]),
+            StoredSourceCallableValidation::Malformed
+        );
+        assert_eq!(
+            source_callable_state(&fixture.store, &plans[0], false),
+            Err(invariant(SourceCallableInvariant::InvalidParameterCache(
+                first.declaration
+            )))
+        );
+        assert_eq!(generic_transaction_state(&fixture.store), damaged);
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(first.type_node, annotation_links)
+        );
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(first.symbol, value_links)
+        );
+        let warm = generic_transaction_state(&fixture.store);
+        for (plan, expected) in plans.iter().zip(types) {
+            assert_eq!(
+                fixture.query_callable(plan.declaration, plan.owner_symbol, &mut diagnostics),
+                Ok(expected)
+            );
+            assert!(matches!(
+                validate_stored_source_callable(&fixture.store, expected),
+                StoredSourceCallableValidation::Valid(_)
+            ));
+        }
+        assert_eq!(generic_transaction_state(&fixture.store), warm);
+        assert!(
+            reads
+                .iter()
+                .all(|read| fixture.store.type_node_links(*read).is_none())
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One receiver matrix covers call priority and variance.
+    fn ordinary_this_calls_keep_receiver_priority_and_signature_variance() {
+        use crate::semantic::calls::{
+            DirectCallApplicability, DirectCallForm, DirectCallRequest,
+            resolve_direct_call_with_receiver,
+        };
+
+        let parsed = parse_source_file(concat!(
+            "function narrow(this: number, input: string): number { return this; }\n",
+            "function wide(this: unknown, input: string): number { return 1; }\n",
+            "function ignored(this: void, input: string): number { return 1; }",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_831);
+        let mut context = bind_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let declarations = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let types = declarations
+            .iter()
+            .map(|declaration| context.get_type_at_location(*declaration).unwrap())
+            .collect::<Vec<_>>();
+        let globals = context.global_types().clone();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let void = bootstrap.void_type;
+        let cases = [
+            (
+                types[0],
+                Some(number),
+                vec![string],
+                DirectCallApplicability::Applicable,
+            ),
+            (
+                types[0],
+                Some(string),
+                vec![number],
+                DirectCallApplicability::ThisContextNotAssignable {
+                    argument_type: string,
+                    parameter_type: number,
+                },
+            ),
+            (
+                types[0],
+                Some(number),
+                vec![number],
+                DirectCallApplicability::ArgumentNotAssignable {
+                    index: 0,
+                    argument_type: number,
+                    parameter_type: string,
+                },
+            ),
+            (
+                types[0],
+                None,
+                vec![string],
+                DirectCallApplicability::ThisContextNotAssignable {
+                    argument_type: void,
+                    parameter_type: number,
+                },
+            ),
+            (
+                types[0],
+                Some(string),
+                vec![],
+                DirectCallApplicability::TooFewArguments {
+                    expected_at_least: 1,
+                    actual: 0,
+                },
+            ),
+            (
+                types[2],
+                Some(string),
+                vec![string],
+                DirectCallApplicability::Applicable,
+            ),
+        ];
+        for _ in 0..2 {
+            for (callee, receiver, arguments, expected) in &cases {
+                let result = resolve_direct_call_with_receiver(
+                    context.store_mut_for_test(),
+                    &globals,
+                    true,
+                    DirectCallRequest {
+                        form: DirectCallForm::Call,
+                        optional_chain: false,
+                        type_argument_count: 0,
+                        has_spread_argument: false,
+                        callee: *callee,
+                        arguments,
+                    },
+                    *receiver,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(result.applicability, *expected);
+                assert_eq!(result.projection.return_type, number);
+                assert_eq!(result.projection.minimum_argument_count, 1);
+                assert_eq!(result.projection.maximum_argument_count, 1);
+            }
+            for (source, target, expected) in [
+                (types[1], types[0], true),
+                (types[0], types[1], false),
+                (types[2], types[0], true),
+                (types[0], types[2], false),
+            ] {
+                assert_eq!(
+                    context
+                        .store_mut_for_test()
+                        .is_type_assignable_to_with_global_types_and_strict_function_types(
+                            source, target, &globals, true
+                        ),
+                    Ok(expected)
+                );
+            }
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .is_type_identical_to_with_global_types(types[0], types[1], &globals),
+                Ok(false)
+            );
+        }
+
+        let parsed = parse_source_file(concat!(
+            "function read(this: { value?: number }, input: string): number { return 1; }\n",
+            "const wrong = { run: read }; wrong.run('x');",
+        ));
+        let file = FileId::new(202_834);
+        let mut context = bind_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("a weak receiver without a shared property needs one diagnostic");
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2559);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type '{ run: (this: { value?: number; }, input: string) => number; }' has no properties in common with type '{ value?: number; }'."
+        );
+        assert!(diagnostic.related_information.is_empty());
+        let node = diagnostic.node.unwrap();
+        assert!(matches!(&parsed.arena.get(node.node).unwrap().data,
+            NodeData::Identifier(identifier) if identifier.text == "wrong"));
+        let diagnostics = context.diagnostics().clone();
+        let warm = generic_transaction_state(context.store());
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.diagnostics(), &diagnostics);
+        assert_eq!(generic_transaction_state(context.store()), warm);
+    }
+
+    #[test]
+    fn generic_this_annotations_keep_the_declared_type_parameter_and_lazy_return() {
+        let mut fixture = QueryFixture::new(
+            "function keep<T>(this: T, input: T): T { return this; }",
+            FileId::new(202_832),
+        );
+        let source = fixture
+            .store
+            .register_source_file(
+                &fixture.parsed.arena,
+                fixture.parsed.source_file,
+                fixture.file,
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .register_source_file_facts(source, fixture.bound.source_facts().unwrap())
+        );
+        let (declaration, parameter, _, _) = fixture.generic_parts();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let type_parameter_symbol = fixture.bound.symbol(parameter).unwrap();
+        let type_parameter = fixture
+            .store
+            .declared_type_links(type_parameter_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let record = fixture.store.signature(signature).unwrap();
+        assert_eq!(record.type_parameters(), [type_parameter]);
+        assert_eq!(record.parameters().len(), 1);
+        assert_eq!(record.min_argument_count(), 1);
+        let this = record.this_parameter().unwrap();
+        assert_ne!(this, type_parameter_symbol);
+        assert_ne!(this, record.parameters()[0]);
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(this)
+                .unwrap()
+                .resolved_type,
+            Some(type_parameter)
+        );
+        assert_eq!(record.resolved_return_type(), None);
+        assert_eq!(
+            fixture.query_return(signature, &mut diagnostics),
+            Ok(type_parameter)
+        );
+        let warm = generic_transaction_state(&fixture.store);
+        assert_eq!(
+            fixture.query_callable(declaration, owner, &mut diagnostics),
+            Ok(callable)
+        );
+        assert_eq!(
+            fixture.query_return(signature, &mut diagnostics),
+            Ok(type_parameter)
+        );
+        assert_eq!(generic_transaction_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn ordinary_this_annotations_reuse_existing_type_query_identities() {
+        for source in [
+            "function read(this: {}): {} { return this; }",
+            "type Receiver = { value: number }; function read(this: Receiver): Receiver { return this; }",
+            "function read(this: (number | string)): number | string { return this; }",
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty());
+            let file = FileId::new(202_833);
+            let mut context = bind_context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let body_this = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ThisKeyword).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let parameter = source_callable_this_parameter(context.store(), declaration)
+                .unwrap()
+                .unwrap();
+            let type_ = context.get_type_at_location(parameter.annotation).unwrap();
+            assert_eq!(context.get_type_at_location(body_this), Ok(type_));
+            assert_eq!(
+                context.get_symbol_at_location(body_this),
+                Ok(Some(parameter.symbol))
+            );
+            let callable = context.get_type_at_location(declaration).unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let record = context.store().signature(signature).unwrap();
+            assert_eq!(record.this_parameter(), Some(parameter.symbol));
+            assert!(record.parameters().is_empty());
+            assert_eq!(record.min_argument_count(), 0);
+            assert_eq!(record.resolved_return_type(), Some(type_));
+            assert_eq!(
+                context
+                    .store()
+                    .callable_signature_this_parameter_type(signature),
+                Some(type_)
+            );
+            assert!(context.diagnostics().is_empty());
+            let annotation_links = context
+                .store()
+                .type_node_links(parameter.annotation)
+                .unwrap()
+                .clone();
+            let value_links = context
+                .store()
+                .value_symbol_links(parameter.symbol)
+                .unwrap()
+                .clone();
+            let wrong = context.store().intrinsic_bootstrap().unwrap().boolean_type;
+            assert!(context.store_mut_for_test().set_type_node_links(
+                parameter.annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                parameter.symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(wrong),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+            let damaged = generic_transaction_state(context.store());
+            assert_eq!(
+                validate_stored_source_callable(context.store(), callable),
+                StoredSourceCallableValidation::Malformed
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .callable_signature_this_parameter_type(signature),
+                Some(type_)
+            );
+            assert_eq!(generic_transaction_state(context.store()), damaged);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(parameter.annotation, annotation_links)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(parameter.symbol, value_links)
+            );
+            let warm = generic_transaction_state(context.store());
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(context.get_type_at_location(body_this), Ok(type_));
+            assert_eq!(generic_transaction_state(context.store()), warm);
+            assert!(context.diagnostics().is_empty());
         }
     }
 

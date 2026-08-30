@@ -21,7 +21,7 @@ use super::{
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     callables::{ValidatedSingleCallParameterDisplay, ValidatedSingleCallSignatureDisplay},
-    conditional_types::conditional_query_alias,
+    conditional_types::{conditional_query_alias, conditional_query_alias_with_array_targets},
     declared::{
         cached_ordinary_type_parameter_owner, execute_type_parameter,
         explicit_type_parameter_symbols, preflight_node, preflight_type_parameter_symbol,
@@ -2635,7 +2635,11 @@ fn validate_source_conditional_return(
         && store
             .type_node_links(plan.return_identity_node)
             .is_some_and(|links| links.resolved_type.is_some())
-        && conditional_query_alias(store, plan.return_identity_node) != Ok(None)
+        && conditional_query_alias_with_array_targets(
+            store,
+            plan.return_identity_node,
+            plan.array_targets,
+        ) != Ok(None)
     {
         return Err(invariant(FunctionTypeInvariant::InvalidSignatureCache(
             plan.node,
