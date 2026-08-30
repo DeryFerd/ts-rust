@@ -1769,6 +1769,29 @@ pub(super) fn check_direct_source_property_with_source(
                         if !interface.declared_members_resolved
                             && !record.object_flags().contains(ObjectFlags::CLASS))
                 });
+            // A declared method table does not resolve a copied conditional return.
+            // Keep source demand for the selected method; the resolver below still
+            // authenticates the target, member proxy, mapper, and source signature.
+            let warm_generic_method = target
+                .and_then(|target| store.type_payload(target))
+                .is_some_and(|record| {
+                    let TypeData::Interface(interface) = record.data() else {
+                        return false;
+                    };
+                    !record.object_flags().contains(ObjectFlags::CLASS)
+                        && interface.declared_members_resolved
+                        && interface
+                            .reference
+                            .resolved_type_arguments
+                            .as_ref()
+                            .is_some_and(|parameters| !parameters.is_empty())
+                        && interface
+                            .declared_members
+                            .and_then(|members| store.symbol_table(members))
+                            .and_then(|members| members.get_source(name))
+                            .and_then(|method| store.symbol(method))
+                            .is_some_and(|method| method.flags().contains(SymbolFlags::METHOD))
+                });
             let conditional_mapped = store.type_payload(receiver).is_some_and(|record| {
                 matches!(record.data(), TypeData::Mapped(mapped)
                 if mapped.template_type.is_some_and(|template| {
@@ -1778,6 +1801,7 @@ pub(super) fn check_direct_source_property_with_source(
             });
             if !property_alias
                 && !cold_interface
+                && !warm_generic_method
                 && !conditional_mapped
                 && !is_cold_direct_nongeneric_interface(store, receiver)
             {
@@ -5830,6 +5854,604 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    mod warm_generic_method_source_tests {
+        use super::*;
+        use crate::semantic::{
+            SignatureId, instantiate::instantiate_type_with_vector_and_session,
+            instantiated_members::resolve_members_with_array_targets_and_session,
+        };
+
+        struct Fixture<'arena> {
+            context: CanonicalCheckerContext<'arena>,
+            files: [(FileId, &'arena ParseResult); 3],
+            plan: SourcePropertyPlan,
+            receiver: TypeId,
+            method: SemanticSymbolId,
+            source_signature: SignatureId,
+            template: TypeId,
+            branches: [NodeRef; 2],
+        }
+
+        #[allow(clippy::too_many_lines)] // Warm the real declaration without reading its method value.
+        fn prepare<'arena>(
+            library: &'arena ParseResult,
+            declarations: &'arena ParseResult,
+            source: &'arena ParseResult,
+        ) -> Fixture<'arena> {
+            let files = [
+                (FileId::new(202_310), library),
+                (FileId::new(202_311), declarations),
+                (FileId::new(202_312), source),
+            ];
+            let mut context = source_property_context(&files, 1);
+            let declaration_file = files[1].0;
+            context.check_source_file(declaration_file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let method_node = declarations
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::MethodSignature).then_some(NodeRef::new(
+                        declarations.arena.id(),
+                        declaration_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let method = context
+                .file(declaration_file)
+                .unwrap()
+                .1
+                .symbol(method_node)
+                .unwrap();
+            let source_signature = context
+                .store()
+                .signature_links(method_node)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            let template = context
+                .store()
+                .signature(source_signature)
+                .unwrap()
+                .resolved_return_type()
+                .unwrap();
+            let TypeData::Conditional(conditional) =
+                context.store().type_payload(template).unwrap().data()
+            else {
+                panic!("the source method must retain its conditional return")
+            };
+            assert!(conditional.resolved_true_type.is_none());
+            assert!(conditional.resolved_false_type.is_none());
+            let conditional_node = context
+                .store()
+                .conditional_root(conditional.root)
+                .unwrap()
+                .node();
+            let NodeData::ConditionalTypeNode(conditional) =
+                &declarations.arena.get(conditional_node.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let branches = [conditional.true_type, conditional.false_type]
+                .map(|node| NodeRef::new(conditional_node.arena, conditional_node.file, node));
+            assert!(branches.iter().all(|branch| {
+                context
+                    .store()
+                    .type_node_links(*branch)
+                    .and_then(|links| links.resolved_type)
+                    .is_none()
+            }));
+            let (variable, annotation) = declarations
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(declarations.arena.id(), declaration_file, node),
+                        NodeRef::new(declarations.arena.id(), declaration_file, variable.type_?),
+                    ))
+                })
+                .unwrap();
+            let variable = context
+                .store()
+                .get_merged_symbol(
+                    context
+                        .file(declaration_file)
+                        .unwrap()
+                        .1
+                        .symbol(variable)
+                        .unwrap(),
+                )
+                .unwrap();
+            let receiver = context.get_type_from_type_node(annotation).unwrap();
+            let TypeData::TypeReference(reference) =
+                context.store().type_payload(receiver).unwrap().data()
+            else {
+                panic!("the annotation must produce the real generic receiver")
+            };
+            let TypeData::Interface(target) = context
+                .store()
+                .type_payload(reference.object.target.unwrap())
+                .unwrap()
+                .data()
+            else {
+                unreachable!()
+            };
+            assert!(target.declared_members_resolved);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_table(target.declared_members.unwrap())
+                    .unwrap()
+                    .get_source("choose"),
+                Some(method)
+            );
+            let access = property_access(source, files[2].0);
+            let syntax =
+                plan_direct_source_property_syntax(&source.arena, context.store(), access).unwrap();
+            let plan =
+                finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, variable))
+                    .unwrap();
+            Fixture {
+                context,
+                files,
+                plan,
+                receiver,
+                method,
+                source_signature,
+                template,
+                branches,
+            }
+        }
+
+        fn read(
+            fixture: &mut Fixture<'_>,
+            session: &mut InstantiationSession,
+        ) -> Result<CheckedSourceProperty, SourcePropertyQueryError> {
+            let bound = fixture
+                .files
+                .map(|(file, _)| fixture.context.file(file).unwrap().1.clone());
+            let globals = fixture.context.global_types().clone();
+            let options = fixture.context.options();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                fixture
+                    .files
+                    .iter()
+                    .zip(&bound)
+                    .map(|((_, source), bound)| (&source.arena, bound)),
+                crate::semantic::production::GlobalMergeCompletion::for_test(
+                    options.name_resolution,
+                ),
+            )
+            .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = check_direct_source_property_with_source(
+                fixture.context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &fixture.plan,
+                fixture.receiver,
+                session,
+                &mut diagnostics,
+            );
+            assert!(diagnostics.is_empty());
+            result
+        }
+
+        fn signature(fixture: &Fixture<'_>, callable: TypeId) -> SignatureId {
+            let [signature] = fixture
+                .context
+                .store()
+                .type_payload(callable)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .signatures
+                .as_deref()
+                .unwrap()
+            else {
+                panic!("the selected method must keep its one copied signature")
+            };
+            *signature
+        }
+
+        fn returned(fixture: &Fixture<'_>, callable: TypeId) -> TypeId {
+            fixture
+                .context
+                .store()
+                .signature(signature(fixture, callable))
+                .unwrap()
+                .resolved_return_type()
+                .unwrap()
+        }
+
+        fn budget(session: &InstantiationSession) -> (usize, usize, u64) {
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count(),
+            )
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Check the real capture, array capability, options, and warm replay together.
+        fn warm_generic_method_reads_keep_source_branches_arrays_and_options() {
+            let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+            let declarations = parsed(concat!(
+                "interface Choice<T> { choose<S>(): ",
+                "T extends any ? (T | undefined)[] : S[]; } ",
+                "declare const receiver: Choice<number>;",
+            ));
+            let source = parsed("const selected = receiver.choose;");
+            let mut fixture = prepare(&library, &declarations, &source);
+            let globals = fixture.context.global_types().clone();
+            assert!(fixture.context.options().intrinsic.strict_null_checks);
+            let bootstrap = fixture.context.store().intrinsic_bootstrap().unwrap();
+            let (number, undefined) = (bootstrap.number_type, bootstrap.undefined_type);
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let checked = read(&mut fixture, &mut session).unwrap();
+            assert!(checked.diagnostics.is_empty());
+            assert!(session.query_count() > 0);
+            assert_eq!(session.query_count(), session.total_count());
+            assert_eq!(session.limit_event_count(), 0);
+            let copied = signature(&fixture, checked.type_);
+            let copied_record = fixture.context.store().signature(copied).unwrap();
+            assert_eq!(copied_record.target(), Some(fixture.source_signature));
+            assert!(copied_record.mapper().is_some());
+            let [fresh] = copied_record.type_parameters() else {
+                panic!("the copied method must retain its fresh type parameter")
+            };
+            assert_ne!(
+                *fresh,
+                fixture
+                    .context
+                    .store()
+                    .signature(fixture.source_signature)
+                    .unwrap()
+                    .type_parameters()[0]
+            );
+            let result = returned(&fixture, checked.type_);
+            let array = fixture
+                .context
+                .store()
+                .canonical_array_reference(&globals, result)
+                .unwrap()
+                .unwrap();
+            assert!(!array.readonly);
+            let TypeData::Union(element) = fixture
+                .context
+                .store()
+                .type_payload(array.element_type)
+                .unwrap()
+                .data()
+            else {
+                panic!("the caller's strict-null option must retain undefined")
+            };
+            assert_eq!(element.union.types.len(), 2);
+            assert!(element.union.types.contains(&number));
+            assert!(element.union.types.contains(&undefined));
+            let store = fixture.context.store();
+            assert_eq!(
+                store
+                    .signature(fixture.source_signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(fixture.template)
+            );
+            let TypeData::Conditional(conditional) =
+                store.type_payload(fixture.template).unwrap().data()
+            else {
+                unreachable!()
+            };
+            assert!(conditional.resolved_true_type.is_none());
+            assert!(conditional.resolved_false_type.is_none());
+            assert!(
+                store
+                    .type_node_links(fixture.branches[0])
+                    .unwrap()
+                    .resolved_type
+                    .is_some()
+            );
+            assert!(
+                store
+                    .type_node_links(fixture.branches[1])
+                    .and_then(|links| links.resolved_type)
+                    .is_none()
+            );
+            let property = store
+                .symbol_node_links(fixture.plan.node)
+                .unwrap()
+                .resolved_symbol
+                .unwrap();
+            let links = store.value_symbol_links(property).unwrap();
+            assert_eq!(links.target, Some(fixture.method));
+            assert!(links.mapper.is_some());
+            assert_eq!(links.resolved_type, Some(checked.type_));
+            fixture
+                .context
+                .check_source_file(fixture.files[2].0)
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .context
+                    .get_type_at_location(fixture.plan.node)
+                    .unwrap(),
+                checked.type_
+            );
+            assert_eq!(
+                fixture
+                    .context
+                    .get_return_type_of_signature(copied)
+                    .unwrap(),
+                result
+            );
+            let state = format!("{:?}", fixture.context.store());
+            let work = budget(&session);
+            for _ in 0..2 {
+                assert_eq!(read(&mut fixture, &mut session).unwrap(), checked);
+                assert_eq!(budget(&session), work);
+                assert_eq!(
+                    fixture
+                        .context
+                        .get_type_at_location(fixture.plan.node)
+                        .unwrap(),
+                    checked.type_
+                );
+                assert_eq!(
+                    fixture
+                        .context
+                        .get_return_type_of_signature(copied)
+                        .unwrap(),
+                    result
+                );
+                assert_eq!(format!("{:?}", fixture.context.store()), state);
+                assert!(fixture.context.diagnostics().is_empty());
+            }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // A prepared proxy must preserve both fail-fast and recovering caller budgets.
+        fn warm_generic_method_reads_keep_spent_limits_and_recovery() {
+            let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+            let declarations = parsed(concat!(
+                "interface Choice<T> { choose(): T extends any ? Choice<any> : number; } ",
+                "declare const receiver: Choice<any>;",
+            ));
+            let source = parsed("const selected = receiver.choose;");
+            for recovering in [false, true] {
+                let mut fixture = prepare(&library, &declarations, &source);
+                let targets =
+                    CanonicalArrayTargets::from_global_types(fixture.context.global_types());
+                let members = resolve_members_with_array_targets_and_session(
+                    fixture.context.store_mut_for_test(),
+                    fixture.receiver,
+                    Some(targets),
+                    &mut InstantiationSession::new(InstantiationLimits::default()),
+                )
+                .unwrap();
+                let [property] = members.properties() else {
+                    panic!("the source receiver must have one lazy method proxy")
+                };
+                let property = *property;
+                let links = fixture
+                    .context
+                    .store()
+                    .value_symbol_links(property)
+                    .unwrap()
+                    .clone();
+                assert_eq!(links.target, Some(fixture.method));
+                assert!(links.mapper.is_some());
+                assert!(links.resolved_type.is_none());
+                let TypeData::Conditional(conditional) = fixture
+                    .context
+                    .store()
+                    .type_payload(fixture.template)
+                    .unwrap()
+                    .data()
+                else {
+                    unreachable!()
+                };
+                let (parameter, root) = (conditional.check_type, conditional.root);
+                let root_cache = fixture
+                    .context
+                    .store()
+                    .conditional_root(root)
+                    .unwrap()
+                    .instantiations()
+                    .clone();
+                let bootstrap = fixture.context.store().intrinsic_bootstrap().unwrap();
+                let (any, error) = (bootstrap.any_type, bootstrap.error_type);
+                let limits = InstantiationLimits {
+                    max_count: 1,
+                    ..InstantiationLimits::default()
+                };
+                let mut session = if recovering {
+                    InstantiationSession::new_recovering(fixture.context.store(), limits, error)
+                        .unwrap()
+                } else {
+                    InstantiationSession::new(limits)
+                };
+                assert_eq!(
+                    instantiate_type_with_vector_and_session(
+                        fixture.context.store_mut_for_test(),
+                        parameter,
+                        &[parameter],
+                        &[any],
+                        Some(targets),
+                        &mut session,
+                    ),
+                    Ok(any)
+                );
+                assert_eq!(budget(&session), (1, 1, 0));
+                let result = read(&mut fixture, &mut session);
+                assert_eq!(budget(&session), (1, 1, 1));
+                assert_eq!(
+                    fixture
+                        .context
+                        .store()
+                        .conditional_root(root)
+                        .unwrap()
+                        .instantiations(),
+                    &root_cache
+                );
+                assert!(fixture.branches.iter().all(|branch| {
+                    fixture
+                        .context
+                        .store()
+                        .type_node_links(*branch)
+                        .and_then(|links| links.resolved_type)
+                        .is_none()
+                }));
+                let checked = if recovering {
+                    let checked = result.unwrap();
+                    assert_eq!(returned(&fixture, checked.type_), error);
+                    assert!(
+                        fixture
+                            .context
+                            .store()
+                            .instantiated_property_recovery(property)
+                            .is_some()
+                    );
+                    checked
+                } else {
+                    assert!(matches!(result,
+                        Err(SourcePropertyQueryError::Source(SourceCheckError::RelationUnavailable(
+                            RelationUnavailable::UnionValidationCapacity(type_)
+                        ))) if type_ == fixture.template
+                    ));
+                    assert_eq!(
+                        fixture.context.store().value_symbol_links(property),
+                        Some(&links)
+                    );
+                    assert!(
+                        fixture
+                            .context
+                            .store()
+                            .type_node_links(fixture.plan.node)
+                            .is_none()
+                    );
+                    assert!(
+                        fixture
+                            .context
+                            .store()
+                            .symbol_node_links(fixture.plan.node)
+                            .is_none()
+                    );
+                    let checked = read(
+                        &mut fixture,
+                        &mut InstantiationSession::new(InstantiationLimits::default()),
+                    )
+                    .unwrap();
+                    assert_eq!(returned(&fixture, checked.type_), fixture.receiver);
+                    checked
+                };
+                assert_eq!(
+                    fixture.context.store().value_symbol_links(property),
+                    Some(&ValueSymbolLinks {
+                        resolved_type: Some(checked.type_),
+                        ..links
+                    })
+                );
+                let state = format!("{:?}", fixture.context.store());
+                let work = budget(&session);
+                for _ in 0..2 {
+                    assert_eq!(read(&mut fixture, &mut session).unwrap(), checked);
+                    assert_eq!(budget(&session), work);
+                    assert_eq!(format!("{:?}", fixture.context.store()), state);
+                }
+            }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Reject each changed copied edge before a warm cache or budget is touched.
+        fn warm_generic_method_reads_reject_and_restore_cached_return_and_mapper() {
+            let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+            let declarations = parsed(concat!(
+                "interface Choice<T> { choose(): T extends any ? Choice<any> : number; } ",
+                "declare const receiver: Choice<any>;",
+            ));
+            let source = parsed("const selected = receiver.choose;");
+            let mut fixture = prepare(&library, &declarations, &source);
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let checked = read(&mut fixture, &mut session).unwrap();
+            let copied = signature(&fixture, checked.type_);
+            let expected_return = returned(&fixture, checked.type_);
+            let string = fixture
+                .context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .string_type;
+            let property = fixture
+                .context
+                .store()
+                .symbol_node_links(fixture.plan.node)
+                .unwrap()
+                .resolved_symbol
+                .unwrap();
+            let links = fixture
+                .context
+                .store()
+                .value_symbol_links(property)
+                .unwrap()
+                .clone();
+            let work = budget(&session);
+            for damage_return in [true, false] {
+                if damage_return {
+                    assert!(
+                        fixture
+                            .context
+                            .store_mut_for_test()
+                            .set_signature_resolved_return_type(copied, Some(string))
+                    );
+                } else {
+                    assert!(fixture.context.store_mut_for_test().set_value_symbol_links(
+                        property,
+                        ValueSymbolLinks {
+                            mapper: None,
+                            ..links.clone()
+                        }
+                    ));
+                }
+                let damaged = format!("{:?}", fixture.context.store());
+                for _ in 0..2 {
+                    assert!(matches!(read(&mut fixture, &mut session),
+                        Err(SourcePropertyQueryError::Source(SourceCheckError::RelationUnavailable(
+                            RelationUnavailable::InvalidStructuredMembers(type_)
+                        ))) if type_ == fixture.receiver
+                    ));
+                    assert_eq!(budget(&session), work);
+                    assert_eq!(format!("{:?}", fixture.context.store()), damaged);
+                }
+                if damage_return {
+                    assert!(
+                        fixture
+                            .context
+                            .store_mut_for_test()
+                            .set_signature_resolved_return_type(copied, Some(expected_return))
+                    );
+                } else {
+                    assert!(
+                        fixture
+                            .context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(property, links.clone())
+                    );
+                }
+                let restored = format!("{:?}", fixture.context.store());
+                assert_eq!(read(&mut fixture, &mut session).unwrap(), checked);
+                assert_eq!(budget(&session), work);
+                assert_eq!(format!("{:?}", fixture.context.store()), restored);
+            }
+        }
     }
 
     #[test]
