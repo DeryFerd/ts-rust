@@ -24,7 +24,7 @@ use super::{
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
     callable_sets::{
-        StoredCallableSetValidation, validate_stored_callable_set,
+        CallableSetProjection, StoredCallableSetValidation, validate_stored_callable_set,
         validate_stored_callable_set_with_array_targets,
         validate_stored_declared_method_callable_set,
     },
@@ -465,6 +465,39 @@ fn authenticated_nullish_object_nonmatch(
             | GenericInterfaceMemberError::InvalidCachedProperty(_),
         ) => Err(RelationUnavailable::InvalidStructuredMembers(target)),
     }
+}
+
+/// Canonical any is not a subtype of an authenticated array.
+/// Keep array authority and cache validation even though no elements are compared.
+fn authenticated_any_array_nonmatch(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    source: TypeId,
+    target: TypeId,
+    relation: RelationKind,
+    bootstrap: RelationBootstrapFacts,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, RelationUnavailable> {
+    if relation != RelationKind::Subtype || source != bootstrap.any_type {
+        return Ok(false);
+    }
+    let Some(targets) = array_targets else {
+        return Ok(false);
+    };
+    let Some(TypeData::TypeReference(reference)) = store.type_payload(target).map(TypeRecord::data)
+    else {
+        return Ok(false);
+    };
+    if reference.object.target != Some(targets.array_type())
+        && reference.object.target != Some(targets.readonly_array_type())
+    {
+        return Ok(false);
+    }
+    for endpoint in [source, target] {
+        store
+            .validate_union_constituent_with_array_targets(targets, endpoint)
+            .map_err(|error| union_validation_unavailable(endpoint, error))?;
+    }
+    Ok(true)
 }
 
 /// Concrete scalars cannot satisfy a source parameter with no constraint or default.
@@ -2442,6 +2475,17 @@ impl<'store> RelaterSession<'store> {
             source,
             target,
             self.relation,
+        )? {
+            return Ok(Ternary::False);
+        }
+
+        if authenticated_any_array_nonmatch(
+            self.store,
+            source,
+            target,
+            self.relation,
+            self.bootstrap,
+            self.global_types.map(|globals| globals.array_targets),
         )? {
             return Ok(Ternary::False);
         }
@@ -6415,7 +6459,7 @@ impl<'store> RelaterSession<'store> {
         if matches!(origin, ObjectPropertyOrigin::ValidatedClass)
             && record.flags() == SymbolFlags::METHOD
         {
-            self.validated_class_method_callable(symbol)?;
+            self.validated_class_method_callable_set(symbol)?;
             return Ok(record);
         }
         if matches!(origin, ObjectPropertyOrigin::Declared)
@@ -6483,13 +6527,13 @@ impl<'store> RelaterSession<'store> {
         Ok(record)
     }
 
-    fn validated_class_method_callable(
+    fn validated_class_method_callable_set(
         &self,
         symbol: SemanticSymbolId,
-    ) -> Result<ValidatedSingleCallable, RelationUnavailable> {
+    ) -> Result<CallableSetProjection, RelationUnavailable> {
         let unsupported = || RelationUnavailable::UnsupportedProperty(symbol);
         let method = self.store.symbol(symbol).ok_or_else(unsupported)?;
-        let Some([declaration]) = method.declarations() else {
+        let Some(declarations @ [declaration, ..]) = method.declarations() else {
             return Err(unsupported());
         };
         let declaration = *declaration;
@@ -6514,9 +6558,11 @@ impl<'store> RelaterSession<'store> {
             || method.export_symbol().is_some()
             || self.store.get_merged_symbol(symbol) != Some(symbol)
             || !class.flags().intersects(SymbolFlags::CLASS)
-            || self.store.source_node_kind(declaration) != Some(SyntaxKind::MethodDeclaration)
-            || self.store.source_node_parent(declaration)
-                != Some(SourceNodeParent::Parent(*class_declaration))
+            || declarations.iter().any(|declaration| {
+                self.store.source_node_kind(*declaration) != Some(SyntaxKind::MethodDeclaration)
+                    || self.store.source_node_parent(*declaration)
+                        != Some(SourceNodeParent::Parent(*class_declaration))
+            })
             || validate_class_heritage_members(self.store, instance)
                 != ClassHeritageMembersValidation::Valid
         {
@@ -6537,27 +6583,35 @@ impl<'store> RelaterSession<'store> {
             return Err(unsupported());
         }
         let StoredCallableSetValidation::Valid { projection, .. } =
-            validate_stored_callable_set(self.store, owner_type)
+            validate_stored_callable_set_with_array_targets(
+                self.store,
+                owner_type,
+                self.global_types.map(|globals| globals.array_targets),
+            )
         else {
             return Err(unsupported());
         };
-        let [callable] = projection.call_signatures.as_ref() else {
-            return Err(unsupported());
-        };
-        if !projection.construct_signatures.is_empty()
+        if projection.call_signatures.is_empty()
+            || !projection.construct_signatures.is_empty()
             || self
                 .store
                 .type_payload(owner_type)
                 .and_then(TypeRecord::symbol)
                 != Some(symbol)
-            || self
-                .store
-                .signature(callable.signature)
-                .and_then(super::signatures::Signature::declaration)
-                != Some(declaration)
         {
             return Err(unsupported());
         }
+        Ok(projection)
+    }
+
+    fn validated_class_method_callable(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<ValidatedSingleCallable, RelationUnavailable> {
+        let projection = self.validated_class_method_callable_set(symbol)?;
+        let [callable] = projection.call_signatures.as_ref() else {
+            return Err(RelationUnavailable::UnsupportedProperty(symbol));
+        };
         Ok(callable.clone())
     }
 
@@ -9409,6 +9463,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
 
         if authenticated_scalar_source_parameter_nonmatch(self, source, target, relation)? {
+            return Ok(false);
+        }
+
+        if authenticated_any_array_nonmatch(
+            self,
+            source,
+            target,
+            relation,
+            bootstrap,
+            global_types.map(|globals| globals.array_targets),
+        )? {
             return Ok(false);
         }
 
@@ -12798,6 +12863,123 @@ mod tests {
             Err(RelationUnavailable::InvalidStructuredMembers(target_type))
         );
         assert_eq!(fixture.store.relation_state_snapshot(), stale);
+    }
+
+    #[test]
+    fn class_overload_properties_validate_the_full_set_and_hidden_implementation() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parse_source_file(concat!(
+            "class Choice { ",
+            "choose(value: string): string; ",
+            "choose(value: number): number; ",
+            "choose(value: any): any { return value; } ",
+            "}",
+        ));
+        let file = FileId::new(97_004);
+        let mut context =
+            source_relation_context(&library, &source, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let store = context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let wrong_return = bootstrap.boolean_type;
+        let owner = store
+            .symbol_table(bootstrap.globals)
+            .unwrap()
+            .get_source("Choice")
+            .unwrap();
+        let instance = store
+            .declared_type_links(owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let method = store
+            .symbol(owner)
+            .unwrap()
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("choose"))
+            .unwrap();
+        let method_type = store
+            .value_symbol_links(method)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let declarations = store.symbol(method).unwrap().declarations().unwrap();
+        assert_eq!(declarations.len(), 3);
+        let signatures = declarations
+            .iter()
+            .map(|declaration| {
+                store
+                    .signature_links(*declaration)
+                    .unwrap()
+                    .resolved_signature
+                    .signature()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let counts = (store.type_len(), store.symbol_len(), store.signature_len());
+        for _ in 0..2 {
+            assert_eq!(
+                store.resolved_own_property(instance, "choose"),
+                Ok(Some(ResolvedOwnProperty {
+                    symbol: method,
+                    type_: method_type,
+                    optional: false,
+                    readonly: false,
+                }))
+            );
+            let bootstrap = store.relation_bootstrap_facts().unwrap();
+            let relation = super::RelaterSession::new(store, RelationKind::Assignable, bootstrap);
+            let projection = relation
+                .validated_class_method_callable_set(method)
+                .unwrap();
+            assert_eq!(projection.owner, method_type);
+            assert_eq!(
+                projection
+                    .call_signatures
+                    .iter()
+                    .map(|callable| callable.signature)
+                    .collect::<Vec<_>>(),
+                signatures[..2]
+            );
+            assert!(projection.construct_signatures.is_empty());
+            assert_eq!(
+                relation.validated_class_method_callable(method),
+                Err(RelationUnavailable::UnsupportedProperty(method)),
+                "an exact-single consumer must not select one overload"
+            );
+        }
+        assert_eq!(
+            (store.type_len(), store.symbol_len(), store.signature_len()),
+            counts
+        );
+
+        for signature in [signatures[1], signatures[2]] {
+            let original_return = store.signature(signature).unwrap().resolved_return_type();
+            assert!(store.set_signature_resolved_return_type(signature, Some(wrong_return)));
+            let stale = store.relation_state_snapshot();
+            let bootstrap = store.relation_bootstrap_facts().unwrap();
+            {
+                let relation =
+                    super::RelaterSession::new(store, RelationKind::Assignable, bootstrap);
+                assert_eq!(
+                    relation.validated_class_method_callable_set(method),
+                    Err(RelationUnavailable::UnsupportedProperty(method)),
+                    "the full proof includes later overloads and the hidden implementation"
+                );
+            }
+            assert_eq!(store.relation_state_snapshot(), stale);
+            assert!(store.set_signature_resolved_return_type(signature, original_return));
+            assert_eq!(
+                store
+                    .resolved_own_property(instance, "choose")
+                    .unwrap()
+                    .unwrap()
+                    .type_,
+                method_type
+            );
+        }
     }
 
     #[test]
@@ -19977,6 +20159,174 @@ mod tests {
             Ok(false),
             "different canonical array targets are never identical"
         );
+    }
+
+    #[test]
+    fn canonical_any_array_subtype_checks_keep_authority_and_the_caller_session() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parse_source_file("");
+        let mut context = source_relation_context(
+            &library,
+            &source,
+            FileId::new(97_005),
+            CanonicalCheckerOptions::default(),
+        );
+        let globals = context.global_types().clone();
+        let relation_globals = RelationGlobalTypes::from_global_types(&globals);
+        let store = context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (any, string, error) = (
+            bootstrap.any_type,
+            bootstrap.string_type,
+            bootstrap.error_type,
+        );
+        let array = store
+            .create_canonical_array_type(&globals, string, false)
+            .unwrap();
+        let readonly = store
+            .create_canonical_array_type(&globals, string, true)
+            .unwrap();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, string).unwrap();
+        let mut instantiations = super::InstantiationSession::new(super::InstantiationLimits {
+            max_depth: 100,
+            max_count: 1,
+        });
+        assert_eq!(
+            crate::semantic::instantiate::instantiate_type_with_session(
+                store,
+                parameter,
+                mapper,
+                None,
+                &mut instantiations,
+            ),
+            Ok(string)
+        );
+        assert_eq!(
+            (instantiations.query_count(), instantiations.total_count()),
+            (1, 1)
+        );
+        let counts = (
+            store.type_len(),
+            store.symbol_len(),
+            store.signature_len(),
+            store.mapper_len(),
+        );
+        let before = store.relation_state_snapshot();
+        for _ in 0..2 {
+            for target in [array, readonly] {
+                assert_eq!(
+                    store.is_type_related_to_with_optional_global_types_options_and_session(
+                        any,
+                        target,
+                        RelationKind::Subtype,
+                        Some(relation_globals),
+                        None,
+                        Some(&mut instantiations),
+                    ),
+                    Ok(false)
+                );
+                let bootstrap = store.relation_bootstrap_facts().unwrap();
+                {
+                    let mut relation =
+                        super::RelaterSession::new_with_global_types_options_and_session(
+                            store,
+                            RelationKind::Subtype,
+                            bootstrap,
+                            Some(relation_globals),
+                            None,
+                            Some(&mut instantiations),
+                        );
+                    assert_eq!(
+                        relation.is_related_to_ex(
+                            any,
+                            target,
+                            super::RecursionFlags::BOTH,
+                            super::IntersectionState::NONE,
+                        ),
+                        Ok(Ternary::False)
+                    );
+                }
+                assert_eq!(
+                    store.is_type_related_to_with_optional_global_types_options_and_session(
+                        any,
+                        target,
+                        RelationKind::Assignable,
+                        Some(relation_globals),
+                        None,
+                        Some(&mut instantiations),
+                    ),
+                    Ok(true)
+                );
+            }
+        }
+        assert_eq!(
+            (instantiations.query_count(), instantiations.total_count()),
+            (1, 1)
+        );
+        assert_eq!(instantiations.limit_event_count(), 0);
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len()
+            ),
+            counts
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+        assert_eq!(
+            store.is_type_subtype_of(any, array),
+            Err(RelationUnavailable::StructuralRelation {
+                source: any,
+                target: array,
+                relation: RelationKind::Subtype,
+            }),
+            "the global-aware result must not leak to a caller without Array authority"
+        );
+        assert_eq!(
+            store.is_type_related_to_with_global_types(
+                error,
+                array,
+                RelationKind::Subtype,
+                &globals
+            ),
+            Err(RelationUnavailable::StructuralRelation {
+                source: error,
+                target: array,
+                relation: RelationKind::Subtype,
+            }),
+            "an error type is not the canonical any source"
+        );
+        let lookalike = alloc_canonical_array_target(store, "OtherArray");
+        let lookalike_array = canonical_array_reference(store, lookalike.target, string);
+        assert_eq!(
+            store.is_type_related_to_with_global_types(
+                any,
+                lookalike_array,
+                RelationKind::Subtype,
+                &globals,
+            ),
+            Err(RelationUnavailable::StructuralRelation {
+                source: any,
+                target: lookalike_array,
+                relation: RelationKind::Subtype,
+            })
+        );
+        let forged = alloc_reference(store, globals.array_type, vec![string]);
+        let before_forged = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_related_to_with_global_types(
+                any,
+                forged,
+                RelationKind::Subtype,
+                &globals
+            ),
+            Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                forged
+            ))
+        );
+        assert_eq!(store.relation_state_snapshot(), before_forged);
     }
 
     #[test]

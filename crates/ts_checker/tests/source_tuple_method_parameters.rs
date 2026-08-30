@@ -591,6 +591,7 @@ fn later_tuple_method_forms_keep_explicit_class_boundaries() {
         let [declaration] = declarations.as_slice() else {
             panic!("each boundary has one class")
         };
+        let unsupported = method(&parsed, "take").declaration;
         let mut context = context(&parsed);
         let owner = symbol(&context, *declaration);
         let cold = counts(&context);
@@ -598,7 +599,7 @@ fn later_tuple_method_forms_keep_explicit_class_boundaries() {
             assert_eq!(
                 context.check_source_file(FILE),
                 Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Class(*declaration)
+                    UnsupportedSourceSyntax::Class(unsupported)
                 )),
                 "{source}",
             );
