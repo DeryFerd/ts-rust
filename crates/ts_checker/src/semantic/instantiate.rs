@@ -4546,10 +4546,11 @@ fn resolve_instantiated_indexed_access(
     match indexed_access_resolution(store, object, index, flags, array_targets)? {
         IndexedAccessResolution::Type(type_) => Ok(type_),
         IndexedAccessResolution::TypeWithSentinel(type_, sentinel) => store
-            .literal_union_type_with_alias_and_array_targets(
+            .literal_union_type_with_alias_and_array_targets_and_session(
                 &[type_, sentinel],
                 None,
                 array_targets,
+                session,
             )
             .map_err(Into::into),
         IndexedAccessResolution::Deferred => {
@@ -4608,10 +4609,11 @@ fn resolve_instantiated_indexed_access(
             match indexed_access_property_optional_sentinel(store, property.symbol, property.type_)?
             {
                 Some(sentinel) => store
-                    .literal_union_type_with_alias_and_array_targets(
+                    .literal_union_type_with_alias_and_array_targets_and_session(
                         &[property.type_, sentinel],
                         None,
                         array_targets,
+                        session,
                     )
                     .map_err(Into::into),
                 None => Ok(property.type_),
@@ -5854,7 +5856,11 @@ fn instantiate_union(
         )
     }) {
         store
-            .template_result_union(&mapped_types)
+            .template_result_union_with_array_targets_and_session(
+                &mapped_types,
+                array_targets,
+                session,
+            )
             .map_err(Into::into)
     } else {
         store
@@ -5883,6 +5889,7 @@ mod tests {
         CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
         DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore, SignatureId,
         ValueSymbolLinks,
+        bootstrap::UnionReduction,
         conditional_types::{
             conditional_alias_projection, conditional_remap_projection,
             conditional_signature_projection,
@@ -13334,5 +13341,379 @@ mod tests {
             Err(InstantiationError::DepthLimit { depth: 1, limit: 1 })
         );
         assert_eq!(store.type_len(), before);
+    }
+
+    const MAPPED_RESULT_SESSION_FILE: FileId = FileId::new(202_811);
+
+    fn mapped_result_session_context<'arena>(
+        library: &'arena ParseResult,
+        source: &'arena ParseResult,
+    ) -> CanonicalCheckerContext<'arena> {
+        let library_file = FileId::new(202_810);
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed, declaration, path) in [
+            (
+                library_file,
+                library,
+                true,
+                "\"/result-session-library.d.ts\"",
+            ),
+            (
+                MAPPED_RESULT_SESSION_FILE,
+                source,
+                false,
+                "\"/result-session.ts\"",
+            ),
+        ] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (library_file, &library.arena),
+                (MAPPED_RESULT_SESSION_FILE, &source.arena),
+            ],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn mapped_result_interface(store: &CanonicalTypeMapperStore, name: &str) -> TypeId {
+        let owner = store
+            .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+            .and_then(|globals| globals.get_source(name))
+            .and_then(|owner| store.get_merged_symbol(owner))
+            .unwrap();
+        store
+            .declared_type_links(owner)
+            .unwrap()
+            .declared_type
+            .unwrap()
+    }
+
+    fn mapped_result_return(
+        context: &mut CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        name: &str,
+    ) -> (TypeId, Vec<TypeId>) {
+        let name = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::FunctionDeclaration(function) = &record.data else {
+                    return None;
+                };
+                let node = function.name?;
+                let NodeData::Identifier(identifier) = &parsed.arena.get(node)?.data else {
+                    return None;
+                };
+                (identifier.text == name).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    MAPPED_RESULT_SESSION_FILE,
+                    node,
+                ))
+            })
+            .unwrap();
+        let callable = context.get_type_at_location(name).unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let parameters = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        let returned = context.get_return_type_of_signature(signature).unwrap();
+        (returned, parameters)
+    }
+
+    fn dirty_mapped_result_union(
+        context: &mut CanonicalCheckerContext<'_>,
+    ) -> (SemanticSymbolId, TypeId) {
+        let globals = context.global_types().clone();
+        let derived = mapped_result_interface(context.store(), "Derived");
+        let plain = mapped_result_interface(context.store(), "Plain");
+        let store = context.store_mut_for_test();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let mut setup = InstantiationSession::new(InstantiationLimits::default());
+        let source_union = store
+            .expression_union_type_with_global_types_and_session(
+                &globals,
+                &[number, derived],
+                UnionReduction::Literal,
+                &mut setup,
+            )
+            .unwrap();
+        store
+            .expression_union_type_with_global_types_and_session(
+                &globals,
+                &[source_union, plain],
+                UnionReduction::Subtype,
+                &mut setup,
+            )
+            .unwrap();
+        let members = store
+            .type_payload(derived)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .members
+            .unwrap();
+        let proxy = store
+            .symbol_table(members)
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let links = store.value_symbol_links(proxy).unwrap().clone();
+        assert_eq!(links.resolved_type, Some(number));
+        assert!(links.target.is_some());
+        assert!(links.mapper.is_some());
+        assert!(store.set_value_symbol_links(
+            proxy,
+            ValueSymbolLinks {
+                resolved_type: None,
+                ..links
+            }
+        ));
+        store.mark_union_cache_validation_dirty();
+        (proxy, derived.max(plain))
+    }
+
+    #[allow(clippy::too_many_lines)] // Each result path shares the same dirty-cache limit and retry proof.
+    fn assert_mapped_result_union_budget(interface_name: Option<&str>) {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Base<T> { value: T; [index: number]: number; }",
+        ));
+        let source = parse_source_file(concat!(
+            "interface Derived extends Base<number> {} ",
+            "interface Plain { value: number; } ",
+            "interface Optional { item?: number; } ",
+            "interface OptionalIndexed { item?: number; [key: string]: number | undefined; } ",
+            "declare function read<Model, Key extends keyof Model>(): Model[Key]; ",
+            "declare function build<Value>(): Value | number | `id-${number}`;",
+        ));
+        let mut context = mapped_result_session_context(&library, &source);
+        context
+            .check_source_file(MAPPED_RESULT_SESSION_FILE)
+            .unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (template, parameters) = mapped_result_return(
+            &mut context,
+            &source,
+            if interface_name.is_some() {
+                "read"
+            } else {
+                "build"
+            },
+        );
+        let array_targets = CanonicalArrayTargets::from_global_types(context.global_types());
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let undefined = bootstrap.undefined_type;
+        let arguments = interface_name.map_or_else(
+            || vec![string],
+            |name| vec![mapped_result_interface(context.store(), name)],
+        );
+        let store = context.store_mut_for_test();
+        let mut arguments = arguments;
+        if let Some(name) = interface_name {
+            let key = store.regular_string_literal_type("item".into()).unwrap();
+            arguments.push(key);
+            let resolution = indexed_access_resolution(
+                store,
+                arguments[0],
+                key,
+                AccessFlags::NONE,
+                Some(array_targets),
+            )
+            .unwrap();
+            if name == "Optional" {
+                assert!(matches!(resolution, IndexedAccessResolution::Property(_)));
+            } else {
+                assert!(matches!(
+                    resolution,
+                    IndexedAccessResolution::TypeWithSentinel(value, sentinel)
+                        if value == number && sentinel == undefined
+                ));
+            }
+        }
+        let mapper = store
+            .new_type_mapper(parameters.clone(), arguments.clone())
+            .unwrap();
+        let expected = store
+            .literal_union_type_with_alias_and_array_targets(
+                &[
+                    number,
+                    if interface_name.is_some() {
+                        undefined
+                    } else {
+                        string
+                    },
+                ],
+                None,
+                Some(array_targets),
+            )
+            .unwrap();
+        let (proxy, failed_constituent) = dirty_mapped_result_union(&mut context);
+        let store = context.store_mut_for_test();
+        let max_count = if interface_name.is_some() { 4 } else { 3 };
+        let mut limited = InstantiationSession::new(InstantiationLimits {
+            max_count,
+            ..InstantiationLimits::default()
+        });
+        assert_eq!(
+            instantiate_type_with_session(
+                store,
+                parameters[0],
+                mapper,
+                Some(array_targets),
+                &mut limited,
+            ),
+            Ok(arguments[0])
+        );
+        assert_eq!((limited.query_count(), limited.total_count()), (1, 1));
+        let before = deferred_intersection_store_state(store);
+        let scans = store.union_cache_validation_scan_count();
+        let expected_error = if interface_name.is_some() {
+            InstantiationError::Union(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                failed_constituent,
+            ))
+        } else {
+            InstantiationError::Template(TemplateTypeError::UnsupportedUnionConstituent(
+                failed_constituent,
+            ))
+        };
+        assert_eq!(
+            instantiate_type_with_session(
+                store,
+                template,
+                mapper,
+                Some(array_targets),
+                &mut limited,
+            ),
+            Err(expected_error)
+        );
+        assert_eq!(
+            (limited.depth, limited.query_count(), limited.total_count()),
+            (0, max_count, max_count)
+        );
+        assert_eq!(limited.limit_event_count(), 1);
+        assert!(limited.active_mappers.is_empty());
+        assert_eq!(store.value_symbol_links(proxy).unwrap().resolved_type, None);
+        assert_eq!(deferred_intersection_store_state(store), before);
+        assert_eq!(store.union_cache_validation_scan_count(), scans + 1);
+        assert_eq!(
+            instantiate_type_with_session(
+                store,
+                template,
+                mapper,
+                Some(array_targets),
+                &mut limited,
+            ),
+            Err(InstantiationError::CountLimit {
+                count: max_count,
+                limit: max_count,
+            })
+        );
+        assert_eq!(limited.limit_event_count(), 2);
+        assert_eq!(
+            (limited.depth, limited.query_count(), limited.total_count()),
+            (0, max_count, max_count)
+        );
+        assert_eq!(store.union_cache_validation_scan_count(), scans + 1);
+        assert_eq!(store.value_symbol_links(proxy).unwrap().resolved_type, None);
+        assert_eq!(deferred_intersection_store_state(store), before);
+
+        let mut healthy = InstantiationSession::new(InstantiationLimits::default());
+        healthy.active_mappers.push(ActiveMapperFrame {
+            mapping: InstantiationMappingIdentity::Stored(mapper),
+            cache: HashMap::new(),
+        });
+        assert_eq!(
+            instantiate_type_with_session(
+                store,
+                template,
+                mapper,
+                Some(array_targets),
+                &mut healthy,
+            ),
+            Ok(expected)
+        );
+        assert_eq!(
+            store.value_symbol_links(proxy).unwrap().resolved_type,
+            Some(number)
+        );
+        assert_eq!(healthy.limit_event_count(), 0);
+        assert_eq!(healthy.depth, 0);
+        assert_eq!(healthy.active_mappers.len(), 1);
+        assert!(healthy.query_count() >= max_count);
+        let count = healthy.total_count();
+        let warm = deferred_intersection_store_state(store);
+        for _ in 0..2 {
+            assert_eq!(
+                instantiate_type_with_session(
+                    store,
+                    template,
+                    mapper,
+                    Some(array_targets),
+                    &mut healthy,
+                ),
+                Ok(expected)
+            );
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    store,
+                    template,
+                    &parameters,
+                    &arguments,
+                    Some(array_targets),
+                    None,
+                ),
+                Ok(Some(expected))
+            );
+            assert_eq!(healthy.total_count(), count);
+            assert_eq!(healthy.query_count(), count);
+            assert_eq!(healthy.limit_event_count(), 0);
+            assert_eq!(deferred_intersection_store_state(store), warm);
+        }
+    }
+
+    #[test]
+    fn indexed_sentinel_unions_validate_dirty_caches_with_the_caller() {
+        for interface in ["Optional", "OptionalIndexed"] {
+            assert_mapped_result_union_budget(Some(interface));
+        }
+    }
+
+    #[test]
+    fn reduced_template_unions_validate_dirty_caches_with_the_caller() {
+        assert_mapped_result_union_budget(None);
     }
 }

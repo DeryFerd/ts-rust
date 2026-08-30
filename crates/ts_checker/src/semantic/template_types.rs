@@ -11,7 +11,9 @@ use ts_jsnum::Number;
 
 use super::{
     CanonicalTypeMapperStore, TypeId,
+    array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
+    instantiate::InstantiationSession,
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -1543,19 +1545,52 @@ impl CanonicalTypeMapperStore {
         &mut self,
         types: &[TypeId],
     ) -> Result<TypeId, TemplateTypeError> {
+        self.template_result_union_worker(types, None, None)
+    }
+
+    /// Keeps a mapped union's cache checks in the caller's query.
+    pub(super) fn template_result_union_with_array_targets_and_session(
+        &mut self,
+        types: &[TypeId],
+        array_targets: Option<CanonicalArrayTargets>,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, TemplateTypeError> {
+        self.template_result_union_worker(types, array_targets, Some(session))
+    }
+
+    fn template_result_union_worker(
+        &mut self,
+        types: &[TypeId],
+        array_targets: Option<CanonicalArrayTargets>,
+        session: Option<&mut InstantiationSession>,
+    ) -> Result<TypeId, TemplateTypeError> {
         let flattened = match self.plan_template_result_union(types)? {
             TemplateUnionPlan::Existing(existing) => return Ok(existing),
             TemplateUnionPlan::Constituents(types) => types,
         };
 
-        if flattened
-            .iter()
-            .all(|type_| self.validate_union_constituent(*type_).is_ok())
-        {
-            let mut prepared = self.prepare_type_query_types(&[], &[], &[], 1, 0)?;
-            return self
-                .literal_union_type_prepared(&flattened, None, &mut prepared)
-                .map_err(Into::into);
+        if flattened.iter().all(|type_| {
+            array_targets
+                .map_or_else(
+                    || self.validate_union_constituent(*type_),
+                    |targets| self.validate_union_constituent_with_array_targets(targets, *type_),
+                )
+                .is_ok()
+        }) {
+            return match session {
+                Some(session) => self.literal_union_type_with_alias_and_array_targets_and_session(
+                    &flattened,
+                    None,
+                    array_targets,
+                    session,
+                ),
+                None => self.literal_union_type_with_alias_and_array_targets(
+                    &flattened,
+                    None,
+                    array_targets,
+                ),
+            }
+            .map_err(Into::into);
         }
 
         if let Some(existing) = self.find_template_result_union(&flattened) {
