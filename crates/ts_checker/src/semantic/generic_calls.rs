@@ -30,6 +30,7 @@ use super::{
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
     callables::{
         StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
+        validate_stored_single_callable_with_array_targets,
     },
     calls::{
         DirectCallApplicability, DirectCallArgumentTarget, DirectCallError, DirectCallForm,
@@ -914,6 +915,271 @@ pub(super) fn instantiate_generic_signature_in_context_of(
     })
 }
 
+/// Selects a call without discarding the other calls or constructors of its owner.
+fn fixed_contextual_call_candidate(
+    store: &CanonicalTypeMapperStore,
+    owner: TypeId,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<ValidatedSingleCallable, GenericCallVectorError> {
+    match validate_stored_callable_set_with_array_targets(store, owner, array_targets) {
+        StoredCallableSetValidation::NotCallable => {
+            Err(GenericCallVectorUnsupported::NotExactSingleCallable(owner).into())
+        }
+        StoredCallableSetValidation::Pending { .. } => {
+            Err(GenericCallVectorUnsupported::PendingCallable(owner).into())
+        }
+        StoredCallableSetValidation::Malformed { .. } => {
+            Err(GenericCallVectorInvariant::MalformedCallable(owner).into())
+        }
+        StoredCallableSetValidation::Valid { projection, .. } => {
+            if projection.owner != owner {
+                return Err(GenericCallVectorInvariant::CallableOwnerMismatch {
+                    callee: owner,
+                    owner: projection.owner,
+                }
+                .into());
+            }
+            projection
+                .call_signatures
+                .into_vec()
+                .into_iter()
+                .find(|candidate| candidate.signature == signature)
+                .ok_or_else(|| {
+                    GenericCallVectorInvariant::CallableSignatureMismatch(signature).into()
+                })
+        }
+    }
+}
+
+/// A selected declared call can keep genuinely unwritten parameter slots cold.
+fn fixed_contextual_call_parameter_view(
+    store: &CanonicalTypeMapperStore,
+    callable: &ValidatedSingleCallable,
+) -> Result<Option<Vec<DeclaredMethodTypeParameterView>>, GenericCallVectorError> {
+    let Some(owner) = store.declared_call_set_type_for_signature(callable.signature) else {
+        return Ok(None);
+    };
+    let invalid = || GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature);
+    let signature = store.signature(callable.signature).ok_or_else(invalid)?;
+    let declaration = signature.declaration().ok_or_else(invalid)?;
+    if owner != callable.owner
+        || store.source_node_kind(declaration) != Some(SyntaxKind::CallSignature)
+        || signature.target().is_some()
+        || signature.mapper().is_some()
+    {
+        return Err(invalid().into());
+    }
+    let declarations = store
+        .source_direct_children(declaration)
+        .ok_or_else(invalid)?
+        .into_iter()
+        .filter(|node| store.source_node_kind(*node) == Some(SyntaxKind::TypeParameter))
+        .collect::<Vec<_>>();
+    if declarations.len() != signature.type_parameters().len() {
+        return Err(invalid().into());
+    }
+    let mut parameters = Vec::with_capacity(declarations.len());
+    for (&type_parameter, parameter) in signature.type_parameters().iter().zip(declarations) {
+        let invalid = || GenericCallVectorInvariant::InvalidTypeParameter(type_parameter);
+        let symbol =
+            cached_ordinary_type_parameter_owner(store, type_parameter).ok_or_else(invalid)?;
+        let record = store.symbol(symbol).ok_or_else(invalid)?;
+        let annotations = store
+            .source_type_parameter_annotations(parameter)
+            .ok_or_else(invalid)?;
+        let Some(TypeData::TypeParameter(data)) = store
+            .type_payload(type_parameter)
+            .map(super::TypeRecord::data)
+        else {
+            return Err(invalid().into());
+        };
+        if record.flags() != SymbolFlags::TYPE_PARAMETER
+            || record.check_flags() != CheckFlags::NONE
+            || record.declarations() != Some(&[parameter])
+            || record.value_declaration().is_some()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.parent().is_some()
+            || record.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || store.source_node_parent(parameter) != Some(SourceNodeParent::Parent(declaration))
+            || data.is_this_type
+            || data.target.is_some()
+            || data.mapper.is_some()
+        {
+            return Err(invalid().into());
+        }
+        if annotations.constraint.is_some() || annotations.default_type.is_some() {
+            return Err(
+                GenericCallVectorUnsupported::ContextualSignature(callable.signature).into(),
+            );
+        }
+        if data.constraint.is_some() || data.resolved_default_type.is_some() {
+            return Err(invalid().into());
+        }
+        parameters.push(DeclaredMethodTypeParameterView {
+            type_parameter,
+            constraint: None,
+            default_type: None,
+        });
+    }
+    Ok(Some(parameters))
+}
+
+fn fixed_contextual_call_shape(
+    store: &CanonicalTypeMapperStore,
+    callable: &ValidatedSingleCallable,
+    array_targets: Option<CanonicalArrayTargets>,
+    allow_unresolved_return: bool,
+) -> Result<GenericCallSignatureShape, GenericCallVectorError> {
+    let parameters = fixed_contextual_call_parameter_view(store, callable)?;
+    let shape = validate_generic_call_signature_shape_worker(
+        store,
+        callable.owner,
+        callable,
+        array_targets,
+        allow_unresolved_return,
+        parameters.as_deref(),
+    )?;
+    // Generic returns need Go's lower return-inference priority, not another argument bucket.
+    if !valid_fixed_generic_source_parameter_type(store, shape.return_type) {
+        return Err(GenericCallVectorUnsupported::ContextualSignature(callable.signature).into());
+    }
+    Ok(shape)
+}
+
+/// Infers a selected generic call from the shared fixed contextual positions.
+/// Both original signatures remain unchanged. The checked copy uses the caller's session.
+#[allow(clippy::too_many_lines)] // Prove both source signatures before inference and checked publication.
+pub(super) fn instantiate_generic_signature_in_fixed_context(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    source: &ValidatedSingleCallable,
+    contextual: &ValidatedSingleCallable,
+    session: &mut InstantiationSession,
+) -> Result<ValidatedSingleCallable, GenericCallVectorError> {
+    let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
+    if fixed_contextual_call_candidate(store, source.owner, source.signature, array_targets)?
+        != *source
+    {
+        return Err(GenericCallVectorInvariant::CallableSignatureMismatch(source.signature).into());
+    }
+    match validate_stored_single_callable_with_array_targets(store, contextual.owner, array_targets)
+    {
+        StoredSingleCallableValidation::NotCallable => {
+            return Err(
+                GenericCallVectorUnsupported::NotExactSingleCallable(contextual.owner).into(),
+            );
+        }
+        StoredSingleCallableValidation::Pending { .. } => {
+            return Err(GenericCallVectorUnsupported::PendingCallable(contextual.owner).into());
+        }
+        StoredSingleCallableValidation::Malformed { .. } => {
+            return Err(GenericCallVectorInvariant::MalformedCallable(contextual.owner).into());
+        }
+        StoredSingleCallableValidation::Valid { callable, .. } if callable == *contextual => {}
+        StoredSingleCallableValidation::Valid { .. } => {
+            return Err(GenericCallVectorInvariant::CallableSignatureMismatch(
+                contextual.signature,
+            )
+            .into());
+        }
+    }
+    let contextual_record = store.signature(contextual.signature).ok_or(
+        GenericCallVectorInvariant::InvalidSignature(contextual.signature),
+    )?;
+    if !contextual_record.type_parameters().is_empty()
+        || contextual_record.this_parameter().is_some()
+        || contextual_record.flags() != SignatureFlags::NONE
+        || contextual.rest_parameter.is_some()
+        || source.rest_parameter.is_some()
+        || source.min_argument_count > contextual.parameters.len()
+    {
+        return Err(GenericCallVectorUnsupported::ContextualSignature(contextual.signature).into());
+    }
+    let shape = fixed_contextual_call_shape(store, source, array_targets, false)?;
+    let sources = shape
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.type_)
+        .collect::<Vec<_>>();
+    let count = shape
+        .parameter_templates
+        .len()
+        .min(contextual.parameters.len());
+    let mut inference_shape = shape.clone();
+    inference_shape.parameter_templates.truncate(count);
+    let type_arguments = infer_generic_call_type_arguments(
+        store,
+        &inference_shape,
+        &contextual.parameters[..count],
+        Some(global_types),
+        &mut |store, session, left, right| {
+            store.is_type_assignable_to_with_session(
+                left,
+                right,
+                Some(global_types),
+                Some(strict_function_types),
+                session,
+            )
+        },
+        &mut |store, session, left, right| {
+            store.is_type_related_to_with_session(
+                left,
+                right,
+                RelationKind::StrictSubtype,
+                Some(global_types),
+                Some(strict_function_types),
+                session,
+            )
+        },
+        &mut |store, session, left, right| {
+            store.is_type_related_to_with_session(
+                left,
+                right,
+                RelationKind::Subtype,
+                Some(global_types),
+                Some(strict_function_types),
+                session,
+            )
+        },
+        session,
+    )?;
+    let (instantiation, _) =
+        get_or_create_checked_generic_call_vector_shell(store, &shape, &sources, &type_arguments)?;
+    let mut parameters = Vec::with_capacity(shape.parameter_templates.len());
+    for index in 0..shape.parameter_templates.len() {
+        parameters.push(demand_generic_call_vector_parameter(
+            store,
+            &shape,
+            &sources,
+            &type_arguments,
+            instantiation.signature,
+            index,
+            session,
+        )?);
+    }
+    let return_type = demand_generic_call_vector_return(
+        store,
+        &shape,
+        &sources,
+        &type_arguments,
+        instantiation.signature,
+        session,
+    )?;
+    Ok(ValidatedSingleCallable {
+        owner: source.owner,
+        signature: instantiation.signature,
+        parameters,
+        rest_parameter: None,
+        min_argument_count: source.min_argument_count,
+        return_type: Some(return_type),
+        strict_variance_exempt: source.strict_variance_exempt,
+    })
+}
+
 /// Materializes the exact checked signature globally cached by pinned
 /// `getSignatureInstantiation`. Applicable calls and TS2345 candidates use the
 /// checked vector; every recovery-only diagnostic class remains untouched.
@@ -1040,9 +1306,7 @@ pub(super) fn preflight_generic_call_signature_return_target(
     let mapper = instantiated
         .mapper()
         .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })?;
-    let callee = generic_call_signature_callee(store, target, array_targets)?
-        .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })?;
-    let callable = generic_call_signature_candidate(store, callee, target, array_targets)?;
+    let callable = generic_call_return_candidate(store, target, signature, array_targets)?;
     if callable.signature != target
         || callable.return_type.is_none() && instantiated.resolved_return_type().is_some()
     {
@@ -1050,25 +1314,7 @@ pub(super) fn preflight_generic_call_signature_return_target(
             GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature }.into(),
         );
     }
-    let shape = match validate_generic_call_signature_shape_with_unresolved_return(
-        store,
-        callee,
-        &callable,
-        array_targets,
-        true,
-    ) {
-        Ok(shape) => shape,
-        Err(vector_error) => {
-            let provenance = identity_type_parameter_cache_provenance(store, callee, &callable);
-            match validate_identity_signature_shape(store, callee, &callable, provenance)
-                .ok()
-                .and_then(|identity| identity_generic_call_vector_shape(store, identity).ok())
-            {
-                Some(shape) => shape,
-                None => return Err(vector_error),
-            }
-        }
-    };
+    let shape = generic_call_return_shape(store, &callable, array_targets, true)?;
     let sources = shape
         .type_parameters
         .iter()
@@ -1085,6 +1331,7 @@ pub(super) fn preflight_generic_call_signature_return_target(
     if store.type_mapper_has_exact_endpoints(mapper, &sources, &type_arguments) != Some(true)
         || validate_generic_call_vector_shell(store, &shape, &sources, &type_arguments, signature)?
             != mapper
+        || !fixed_contextual_return_cache_is_exact(store, target, &type_arguments, signature)
     {
         return Err(
             GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature }.into(),
@@ -1121,28 +1368,13 @@ pub(super) fn demand_generic_call_signature_return_with_session(
     let mapper = instantiated
         .mapper()
         .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })?;
-    let callee = generic_call_signature_callee(store, target, array_targets)?
-        .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })?;
-    let callable = generic_call_signature_candidate(store, callee, target, array_targets)?;
+    let callable = generic_call_return_candidate(store, target, signature, array_targets)?;
     if callable.signature != target {
         return Err(
             GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature }.into(),
         );
     }
-    let shape = match validate_generic_call_signature_shape(store, callee, &callable, array_targets)
-    {
-        Ok(shape) => shape,
-        Err(vector_error) => {
-            let provenance = identity_type_parameter_cache_provenance(store, callee, &callable);
-            match validate_identity_signature_shape(store, callee, &callable, provenance)
-                .ok()
-                .and_then(|identity| identity_generic_call_vector_shape(store, identity).ok())
-            {
-                Some(shape) => shape,
-                None => return Err(vector_error),
-            }
-        }
-    };
+    let shape = generic_call_return_shape(store, &callable, array_targets, false)?;
     let sources = shape
         .type_parameters
         .iter()
@@ -1156,12 +1388,90 @@ pub(super) fn demand_generic_call_signature_return_with_session(
                 .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if store.type_mapper_has_exact_endpoints(mapper, &sources, &type_arguments) != Some(true) {
+    if store.type_mapper_has_exact_endpoints(mapper, &sources, &type_arguments) != Some(true)
+        || !fixed_contextual_return_cache_is_exact(store, target, &type_arguments, signature)
+    {
         return Err(
             GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature }.into(),
         );
     }
     demand_generic_call_vector_return(store, &shape, &sources, &type_arguments, signature, session)
+}
+
+/// Revalidates the original owner of a checked signature, including a contextual call.
+fn generic_call_return_candidate(
+    store: &CanonicalTypeMapperStore,
+    target: SignatureId,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<ValidatedSingleCallable, GenericCallVectorError> {
+    if let Some(owner) = fixed_contextual_declared_call_owner(store, target) {
+        return fixed_contextual_call_candidate(store, owner, target, array_targets);
+    }
+    let callee = generic_call_signature_callee(store, target, array_targets)?
+        .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })?;
+    generic_call_signature_candidate(store, callee, target, array_targets)
+}
+
+fn generic_call_return_shape(
+    store: &CanonicalTypeMapperStore,
+    callable: &ValidatedSingleCallable,
+    array_targets: Option<CanonicalArrayTargets>,
+    allow_unresolved_return: bool,
+) -> Result<GenericCallSignatureShape, GenericCallVectorError> {
+    if fixed_contextual_declared_call_owner(store, callable.signature).is_some() {
+        return fixed_contextual_call_shape(
+            store,
+            callable,
+            array_targets,
+            allow_unresolved_return,
+        );
+    }
+    match validate_generic_call_signature_shape_with_unresolved_return(
+        store,
+        callable.owner,
+        callable,
+        array_targets,
+        allow_unresolved_return,
+    ) {
+        Ok(shape) => Ok(shape),
+        Err(vector_error) => {
+            let provenance =
+                identity_type_parameter_cache_provenance(store, callable.owner, callable);
+            match validate_identity_signature_shape(store, callable.owner, callable, provenance)
+                .ok()
+                .and_then(|identity| identity_generic_call_vector_shape(store, identity).ok())
+            {
+                Some(shape) => Ok(shape),
+                None => Err(vector_error),
+            }
+        }
+    }
+}
+
+fn fixed_contextual_declared_call_owner(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+) -> Option<TypeId> {
+    let record = store.signature(signature)?;
+    (store.source_node_kind(record.declaration()?) == Some(SyntaxKind::CallSignature)
+        && !record.type_parameters().is_empty())
+    .then(|| store.declared_call_set_type_for_signature(signature))
+    .flatten()
+}
+
+/// This new declared-call path publishes checked copies, never call-local recovery shells.
+fn fixed_contextual_return_cache_is_exact(
+    store: &CanonicalTypeMapperStore,
+    target: SignatureId,
+    arguments: &[TypeId],
+    signature: SignatureId,
+) -> bool {
+    fixed_contextual_declared_call_owner(store, target).is_none()
+        || matches!(
+            store.cached_signature(target, type_list_key(arguments), arguments),
+            CachedSignatureLookup::Hit(cached) if cached == signature
+        )
 }
 
 fn generic_call_vector_resolution(
@@ -1716,6 +2026,24 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
     array_targets: Option<CanonicalArrayTargets>,
     allow_unresolved_return: bool,
 ) -> Result<GenericCallSignatureShape, GenericCallVectorError> {
+    validate_generic_call_signature_shape_worker(
+        store,
+        callee,
+        callable,
+        array_targets,
+        allow_unresolved_return,
+        None,
+    )
+}
+
+fn validate_generic_call_signature_shape_worker(
+    store: &CanonicalTypeMapperStore,
+    callee: TypeId,
+    callable: &ValidatedSingleCallable,
+    array_targets: Option<CanonicalArrayTargets>,
+    allow_unresolved_return: bool,
+    contextual_parameters: Option<&[DeclaredMethodTypeParameterView]>,
+) -> Result<GenericCallSignatureShape, GenericCallVectorError> {
     if callable.owner != callee {
         return Err(GenericCallVectorInvariant::CallableOwnerMismatch {
             callee,
@@ -1840,7 +2168,11 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
             instantiated_method,
             method_parameters
                 .as_ref()
-                .and_then(|view| view.parameters.get(type_parameters.len())),
+                .and_then(|view| view.parameters.get(type_parameters.len()))
+                .or_else(|| {
+                    contextual_parameters
+                        .and_then(|parameters| parameters.get(type_parameters.len()))
+                }),
         )?;
         type_parameters.push(GenericCallTypeParameter {
             type_: type_parameter,
@@ -7308,6 +7640,500 @@ mod tests {
         .unwrap()
         .unwrap();
         (callee, signature)
+    }
+
+    const FIXED_CONTEXTUAL_SOURCE: &str = concat!(
+        "interface Callback { <T>(value: T): boolean; new(value: number): string; } ",
+        "declare const callback: Callback; ",
+        "declare const contextual: (value: string, index: number) => unknown;",
+    );
+
+    fn fixed_contextual_source_calls(
+        context: &mut CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (
+        ValidatedSingleCallable,
+        ValidatedSingleCallable,
+        ValidatedSingleCallable,
+    ) {
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let annotation = property_alias_variable_nodes(parsed, file, "callback")
+            .0
+            .unwrap();
+        let owner = context.get_type_from_type_node(annotation).unwrap();
+        let targets = Some(CanonicalArrayTargets::from_global_types(
+            context.global_types(),
+        ));
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set_with_array_targets(context.store(), owner, targets)
+        else {
+            panic!("the written callback must retain its complete call and construct set")
+        };
+        let [call] = projection.call_signatures.as_ref() else {
+            panic!("expected the written generic call")
+        };
+        let [construct] = projection.construct_signatures.as_ref() else {
+            panic!("expected the separate written constructor")
+        };
+        let call = call.clone();
+        let construct = construct.clone();
+        let annotation = property_alias_variable_nodes(parsed, file, "contextual")
+            .0
+            .unwrap();
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let StoredSingleCallableValidation::Valid { callable, .. } =
+            validate_stored_single_callable(context.store(), target)
+        else {
+            panic!("expected the actual fixed contextual function type")
+        };
+        (call, callable, construct)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the source owner, checked mapper, and warm return proof together.
+    fn fixed_contextual_generic_calls_keep_complete_owners_and_warm_signature_identity() {
+        let parsed = parse_source_file(FIXED_CONTEXTUAL_SOURCE);
+        let file = FileId::new(96_560);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        let (source, contextual, construct) =
+            fixed_contextual_source_calls(&mut context, &parsed, file);
+        let globals = context.global_types().clone();
+        let strict = context.options().strict_function_types;
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let store = context.store_mut_for_test();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let boolean = store.intrinsic_bootstrap().unwrap().boolean_type;
+        let parameters = store
+            .signature(source.signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        let original_parameter = store.signature(source.signature).unwrap().parameters()[0];
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let result = instantiate_generic_signature_in_fixed_context(
+            store,
+            &globals,
+            strict,
+            &source,
+            &contextual,
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(result.owner, source.owner);
+        assert_eq!(result.parameters, [string]);
+        assert_eq!(result.return_type, Some(boolean));
+        assert_eq!(result.min_argument_count, 1);
+        let signature = store.signature(result.signature).unwrap();
+        let mapper = signature.mapper().unwrap();
+        assert_eq!(signature.target(), Some(source.signature));
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(mapper, &parameters, &[string]),
+            Some(true)
+        );
+        assert_eq!(
+            store
+                .value_symbol_links(original_parameter)
+                .unwrap()
+                .resolved_type,
+            Some(parameters[0])
+        );
+        assert_eq!(
+            store.signature(source.signature).unwrap().type_parameters(),
+            parameters
+        );
+        assert_eq!(
+            store
+                .signature(source.signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(boolean)
+        );
+        assert_eq!(store.signature(source.signature).unwrap().target(), None);
+        assert_eq!(store.signature(source.signature).unwrap().mapper(), None);
+        assert_eq!(
+            fixed_contextual_call_candidate(store, source.owner, construct.signature, targets),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::CallableSignatureMismatch(construct.signature)
+            ))
+        );
+        assert_eq!(
+            generic_call_signature_candidate(store, source.owner, source.signature, targets),
+            Err(GenericCallVectorError::Unsupported(
+                GenericCallVectorUnsupported::NotExactSingleCallable(source.owner)
+            ))
+        );
+        let after = vector_cache_graph_counts(store);
+        for _ in 0..2 {
+            assert_eq!(
+                instantiate_generic_signature_in_fixed_context(
+                    store,
+                    &globals,
+                    strict,
+                    &source,
+                    &contextual,
+                    &mut session,
+                ),
+                Ok(result.clone())
+            );
+            assert_eq!(
+                preflight_generic_call_signature_return_target(store, targets, result.signature),
+                Ok(source.signature)
+            );
+            assert_eq!(
+                demand_generic_call_signature_return_with_session(
+                    store,
+                    targets,
+                    result.signature,
+                    &mut session
+                ),
+                Ok(boolean)
+            );
+            assert_eq!(
+                fixed_contextual_call_candidate(store, source.owner, source.signature, targets),
+                Ok(source.clone())
+            );
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set_with_array_targets(store, source.owner, targets)
+            else {
+                panic!("the original set must remain complete")
+            };
+            assert_eq!(
+                projection.construct_signatures.as_ref(),
+                std::slice::from_ref(&construct)
+            );
+            assert_eq!(vector_cache_graph_counts(store), after);
+        }
+    }
+
+    #[test]
+    fn fixed_contextual_generic_calls_reject_changed_source_slots_and_selected_calls() {
+        let parsed = parse_source_file(FIXED_CONTEXTUAL_SOURCE);
+        let file = FileId::new(96_561);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        let (source, contextual, construct) =
+            fixed_contextual_source_calls(&mut context, &parsed, file);
+        let globals = context.global_types().clone();
+        let strict = context.options().strict_function_types;
+        let store = context.store_mut_for_test();
+        let parameter = store.signature(source.signature).unwrap().type_parameters()[0];
+        let no_constraint = store.intrinsic_bootstrap().unwrap().no_constraint_type;
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let before = vector_cache_graph_counts(store);
+        assert_eq!(
+            instantiate_generic_signature_in_fixed_context(
+                store,
+                &globals,
+                strict,
+                &construct,
+                &contextual,
+                &mut session,
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::CallableSignatureMismatch(construct.signature)
+            ))
+        );
+        assert_eq!(vector_cache_graph_counts(store), before);
+        assert_eq!(
+            instantiate_generic_signature_in_fixed_context(
+                store,
+                &globals,
+                strict,
+                &source,
+                &source,
+                &mut session,
+            ),
+            Err(GenericCallVectorError::Unsupported(
+                GenericCallVectorUnsupported::NotExactSingleCallable(source.owner),
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(store), before);
+        for (constraint, default_type) in [(Some(no_constraint), None), (None, Some(no_constraint))]
+        {
+            assert!(store.set_type_parameter_resolution(
+                parameter,
+                constraint,
+                None,
+                None,
+                default_type
+            ));
+            let damaged = vector_cache_graph_counts(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    instantiate_generic_signature_in_fixed_context(
+                        store,
+                        &globals,
+                        strict,
+                        &source,
+                        &contextual,
+                        &mut session,
+                    ),
+                    Err(GenericCallVectorError::Invariant(
+                        GenericCallVectorInvariant::InvalidTypeParameter(parameter)
+                    ))
+                );
+                assert_eq!(vector_cache_graph_counts(store), damaged);
+                assert_eq!(session.total_count(), 0);
+            }
+            assert!(store.set_type_parameter_resolution(parameter, None, None, None, None));
+        }
+        assert_eq!(
+            instantiate_generic_signature_in_fixed_context(
+                store,
+                &globals,
+                strict,
+                &source,
+                &contextual,
+                &mut session,
+            )
+            .unwrap()
+            .parameters,
+            contextual.parameters[..1]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check separate and coherent cache damage against both return readers.
+    fn fixed_contextual_generic_calls_reject_changed_mapper_and_parameter_caches() {
+        let parsed = parse_source_file(FIXED_CONTEXTUAL_SOURCE);
+        let file = FileId::new(96_562);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        let (source, contextual, _) = fixed_contextual_source_calls(&mut context, &parsed, file);
+        let globals = context.global_types().clone();
+        let strict = context.options().strict_function_types;
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let store = context.store_mut_for_test();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let result = instantiate_generic_signature_in_fixed_context(
+            store,
+            &globals,
+            strict,
+            &source,
+            &contextual,
+            &mut session,
+        )
+        .unwrap();
+        let parameter = store.signature(source.signature).unwrap().type_parameters()[0];
+        let signature = store.signature(result.signature).unwrap();
+        let mapper = signature.mapper().unwrap();
+        let copied_parameter = signature.parameters()[0];
+        let saved = store.value_symbol_links(copied_parameter).unwrap().clone();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let wrong = store
+            .new_type_mapper(vec![parameter], vec![number])
+            .unwrap();
+        for mode in 0..3 {
+            if mode != 1 {
+                assert!(store.set_signature_target_and_mapper(
+                    result.signature,
+                    Some(source.signature),
+                    Some(wrong)
+                ));
+            }
+            if mode != 0 {
+                assert!(store.set_value_symbol_links(
+                    copied_parameter,
+                    ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        mapper: if mode == 2 { Some(wrong) } else { saved.mapper },
+                        ..saved.clone()
+                    }
+                ));
+            }
+            let damaged = vector_cache_graph_counts(store);
+            for _ in 0..2 {
+                assert!(matches!(
+                    instantiate_generic_signature_in_fixed_context(
+                        store,
+                        &globals,
+                        strict,
+                        &source,
+                        &contextual,
+                        &mut session,
+                    ),
+                    Err(GenericCallVectorError::Invariant(
+                        GenericCallVectorInvariant::InvalidCachedInstantiation { .. }
+                    ))
+                ));
+                assert!(matches!(
+                    preflight_generic_call_signature_return_target(
+                        store,
+                        targets,
+                        result.signature
+                    ),
+                    Err(GenericCallVectorError::Invariant(
+                        GenericCallVectorInvariant::InvalidCachedInstantiation { .. }
+                    ))
+                ));
+                assert!(matches!(
+                    demand_generic_call_signature_return_with_session(
+                        store,
+                        targets,
+                        result.signature,
+                        &mut session,
+                    ),
+                    Err(GenericCallVectorError::Invariant(
+                        GenericCallVectorInvariant::InvalidCachedInstantiation { .. },
+                    )),
+                ));
+                assert_eq!(vector_cache_graph_counts(store), damaged);
+            }
+            assert!(store.set_signature_target_and_mapper(
+                result.signature,
+                Some(source.signature),
+                Some(mapper)
+            ));
+            assert!(store.set_value_symbol_links(copied_parameter, saved.clone()));
+            assert_eq!(
+                instantiate_generic_signature_in_fixed_context(
+                    store,
+                    &globals,
+                    strict,
+                    &source,
+                    &contextual,
+                    &mut session,
+                ),
+                Ok(result.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_contextual_generic_calls_leave_generic_return_priority_unsupported() {
+        let parsed = parse_source_file(concat!(
+            "declare function choose<T>(value: T): T; ",
+            "declare const contextual: (value: string) => unknown;",
+        ));
+        let file = FileId::new(96_564);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        context.check_source_file(file).unwrap();
+        let owner = context
+            .store()
+            .symbol_table(context.globals())
+            .unwrap()
+            .get_source("choose")
+            .unwrap();
+        let type_ = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let StoredSingleCallableValidation::Valid {
+            callable: source, ..
+        } = validate_stored_single_callable(context.store(), type_)
+        else {
+            unreachable!()
+        };
+        let annotation = property_alias_variable_nodes(&parsed, file, "contextual")
+            .0
+            .unwrap();
+        let type_ = context.get_type_from_type_node(annotation).unwrap();
+        let StoredSingleCallableValidation::Valid {
+            callable: contextual,
+            ..
+        } = validate_stored_single_callable(context.store(), type_)
+        else {
+            unreachable!()
+        };
+        let globals = context.global_types().clone();
+        let strict = context.options().strict_function_types;
+        let store = context.store_mut_for_test();
+        let before = vector_cache_graph_counts(store);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        for _ in 0..2 {
+            assert_eq!(
+                instantiate_generic_signature_in_fixed_context(
+                    store,
+                    &globals,
+                    strict,
+                    &source,
+                    &contextual,
+                    &mut session,
+                ),
+                Err(GenericCallVectorError::Unsupported(
+                    GenericCallVectorUnsupported::ContextualSignature(source.signature)
+                ))
+            );
+            assert_eq!(vector_cache_graph_counts(store), before);
+            assert_eq!(session.total_count(), 0);
+        }
+    }
+
+    #[test]
+    fn fixed_contextual_generic_calls_keep_the_callers_spent_limit() {
+        let parsed = parse_source_file(FIXED_CONTEXTUAL_SOURCE);
+        let file = FileId::new(96_563);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        let (source, contextual, _) = fixed_contextual_source_calls(&mut context, &parsed, file);
+        let globals = context.global_types().clone();
+        let strict = context.options().strict_function_types;
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let store = context.store_mut_for_test();
+        let parameter = store.signature(source.signature).unwrap().type_parameters()[0];
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_count: 1,
+            max_depth: 1,
+        });
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                store,
+                parameter,
+                &[parameter],
+                &[number],
+                targets,
+                &mut session
+            ),
+            Ok(number)
+        );
+        assert_eq!(session.query_count(), 1);
+        for _ in 0..2 {
+            assert_eq!(
+                instantiate_generic_signature_in_fixed_context(
+                    store,
+                    &globals,
+                    strict,
+                    &source,
+                    &contextual,
+                    &mut session,
+                ),
+                Err(GenericCallVectorError::Instantiation(
+                    InstantiationError::CountLimit { count: 1, limit: 1 }
+                ))
+            );
+            assert_eq!((session.query_count(), session.total_count()), (1, 1));
+            assert_eq!(
+                store.signature(source.signature).unwrap().type_parameters(),
+                &[parameter]
+            );
+        }
+        session.reset_query();
+        let mark = session.limit_event_mark();
+        let result = instantiate_generic_signature_in_fixed_context(
+            store,
+            &globals,
+            strict,
+            &source,
+            &contextual,
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(result.parameters, contextual.parameters[..1]);
+        assert!(!session.limit_event_occurred_since(mark));
+        assert_eq!((session.query_count(), session.total_count()), (1, 2));
+        let warm = vector_cache_graph_counts(store);
+        assert_eq!(
+            instantiate_generic_signature_in_fixed_context(
+                store,
+                &globals,
+                strict,
+                &source,
+                &contextual,
+                &mut session,
+            ),
+            Ok(result)
+        );
+        assert_eq!(vector_cache_graph_counts(store), warm);
     }
 
     #[test]

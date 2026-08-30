@@ -27,9 +27,13 @@ use super::{
     TypeNodeLinks, ValueSymbolLinks,
     array_types::CanonicalArrayTargets,
     bootstrap::UnionReduction,
-    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
+    callable_sets::{
+        StoredCallableSetValidation, validate_stored_callable_set,
+        validate_stored_callable_set_with_array_targets,
+    },
     callables::{
         StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
+        validate_stored_single_callable_with_array_targets,
     },
     calls::{
         ClassBodyInvocationResolution, DirectCallApplicability, DirectCallError, DirectCallForm,
@@ -55,7 +59,8 @@ use super::{
         IdentityGenericCallRequest, IdentityGenericCallResolution, IdentityGenericCallUnsupported,
         demand_generic_call_vector_return_with_session,
         demand_identity_generic_call_return_with_session,
-        generic_call_signature_minimum_argument_count, materialize_generic_call_vector_source,
+        generic_call_signature_minimum_argument_count,
+        instantiate_generic_signature_in_fixed_context, materialize_generic_call_vector_source,
         resolve_generic_call_vector_with_session,
         resolve_source_identity_generic_call_with_session,
         source_declared_inference_candidate_is_exported,
@@ -1887,6 +1892,7 @@ pub(super) fn authenticated_array_callback_contextual_target(
 fn check_authenticated_array_callback_call(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
     session: &mut InstantiationSession,
     plan: &SourceCallPlan,
     callee_type: TypeId,
@@ -1946,8 +1952,9 @@ fn check_authenticated_array_callback_call(
     {
         return Err(SourceCheckError::Call(plan.node));
     }
+    let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
     let StoredCallableSetValidation::Valid { projection, .. } =
-        validate_stored_callable_set(store, callee_type)
+        validate_stored_callable_set_with_array_targets(store, callee_type, array_targets)
     else {
         return Err(SourceCheckError::Call(plan.node));
     };
@@ -1957,7 +1964,7 @@ fn check_authenticated_array_callback_call(
     let StoredCallableSetValidation::Valid {
         projection: callback_projection,
         ..
-    } = validate_stored_callable_set(store, callback)
+    } = validate_stored_callable_set_with_array_targets(store, callback, array_targets)
     else {
         return Ok(None);
     };
@@ -1986,8 +1993,6 @@ fn check_authenticated_array_callback_call(
             predicate.type_id().ok_or(SourceCheckError::Call(plan.node))
         })
         .transpose()?;
-    let callback_parameter = callback_callable.parameters.first().copied();
-    let callback_return = callback_callable.return_type;
     let callback_context = store
         .source_callable_provenance(callback)
         .and_then(|provenance| provenance.contextual_target);
@@ -2008,25 +2013,6 @@ fn check_authenticated_array_callback_call(
     }) {
         return Err(SourceCheckError::Call(plan.node));
     }
-    if let Some(callback_parameter) = callback_parameter
-        && !store
-            .is_type_assignable_to_with_global_types(
-                array.element_type,
-                callback_parameter,
-                global_types,
-            )
-            .map_err(SourceCheckError::RelationUnavailable)?
-    {
-        return Ok(None);
-    }
-    if let Some(narrowed) = callback_predicate
-        && !store
-            .is_type_assignable_to_with_global_types(narrowed, array.element_type, global_types)
-            .map_err(SourceCheckError::RelationUnavailable)?
-    {
-        return Ok(None);
-    }
-
     let mut selected = None;
     for candidate in &projection.call_signatures {
         if argument_types.len() > candidate.parameters.len() {
@@ -2037,7 +2023,7 @@ fn check_authenticated_array_callback_call(
         };
         let StoredSingleCallableValidation::Valid {
             callable: target, ..
-        } = validate_stored_single_callable(store, context)
+        } = validate_stored_single_callable_with_array_targets(store, context, array_targets)
         else {
             return Err(SourceCheckError::Call(plan.node));
         };
@@ -2052,6 +2038,32 @@ fn check_authenticated_array_callback_call(
     let Some((signature, callback_target)) = selected else {
         return Ok(None);
     };
+    let Some(callback_callable) = check_array_callback_in_fixed_context(
+        store,
+        global_types,
+        options,
+        session,
+        plan.node,
+        callback_callable,
+        &callback_target,
+    )?
+    else {
+        return Ok(None);
+    };
+    if let Some(narrowed) = callback_predicate
+        && !store
+            .is_type_assignable_to_with_session(
+                narrowed,
+                array.element_type,
+                Some(global_types),
+                Some(options.strict_function_types),
+                session,
+            )
+            .map_err(SourceCheckError::RelationUnavailable)?
+    {
+        return Ok(None);
+    }
+    let callback_return = callback_callable.return_type;
     let declaration_signature = store
         .signature(signature.signature)
         .ok_or(SourceCheckError::Call(plan.node))?;
@@ -2217,6 +2229,58 @@ fn check_authenticated_array_callback_call(
     };
     publish_call_links(store, plan.node, call_signature, return_type)?;
     Ok(Some(CheckedSourceCall { return_type }))
+}
+
+/// Compares source-validated callback projections before the Array call can publish.
+fn check_array_callback_in_fixed_context(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    site: NodeRef,
+    source: &ValidatedSingleCallable,
+    contextual: &ValidatedSingleCallable,
+) -> Result<Option<ValidatedSingleCallable>, SourceCheckError> {
+    if source.min_argument_count > contextual.parameters.len() {
+        return Ok(None);
+    }
+    let signature = store
+        .signature(source.signature)
+        .ok_or(SourceCheckError::Call(site))?;
+    let source = if signature.type_parameters().is_empty() {
+        source.clone()
+    } else {
+        instantiate_generic_signature_in_fixed_context(
+            store,
+            global_types,
+            options.strict_function_types,
+            source,
+            contextual,
+            session,
+        )
+        .map_err(|error| match error {
+            GenericCallVectorError::Relation(error)
+            | GenericCallVectorError::Inference(NakedTypeCandidateError::Relation(error)) => {
+                SourceCheckError::RelationUnavailable(error)
+            }
+            _ => SourceCheckError::Call(site),
+        })?
+    };
+    for (&contextual, &parameter) in contextual.parameters.iter().zip(&source.parameters) {
+        if !store
+            .is_type_assignable_to_with_session(
+                contextual,
+                parameter,
+                Some(global_types),
+                Some(options.strict_function_types),
+                session,
+            )
+            .map_err(SourceCheckError::RelationUnavailable)?
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(source))
 }
 
 #[allow(clippy::too_many_arguments)] // Factory calls retain their source and diagnostic context.
@@ -7815,6 +7879,7 @@ pub(super) fn check_direct_source_call(
     if let Some(checked) = check_authenticated_array_callback_call(
         store,
         global_types,
+        options,
         session,
         plan,
         callee_type,
@@ -12084,6 +12149,377 @@ mod tests {
                 call_publication_state(&context, call),
             ),
             warm,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both source owners use the same nullable callback and replay proof.
+    fn array_fixed_generic_callbacks_keep_nullable_elements_and_real_call_owners() {
+        let library = parsed(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let library_file = FileId::new(96_580);
+        let file = FileId::new(96_581);
+        for text in [
+            "declare const values: (string | null)[]; const filtered = values.filter(Boolean);",
+            concat!(
+                "interface Callback { <T>(value: T): boolean; new(value: number): string; } ",
+                "declare const callback: Callback; declare const values: (string | null)[]; ",
+                "const filtered = values.filter(callback);",
+            ),
+        ] {
+            let source = parsed(text);
+            let [call] = calls(&source, file).try_into().unwrap();
+            for query_first in [false, true] {
+                let mut context = context_with_default_library_and_options(
+                    &library,
+                    library_file,
+                    &source,
+                    file,
+                    CanonicalCheckerOptions {
+                        strict_function_types: true,
+                        no_implicit_any: true,
+                        intrinsic: IntrinsicBootstrapOptions {
+                            strict_null_checks: true,
+                            exact_optional_property_types: false,
+                        },
+                        ..CanonicalCheckerOptions::default()
+                    },
+                );
+                if query_first {
+                    context.get_type_at_location(call).unwrap();
+                }
+                context.check_source_file(file).unwrap();
+                assert!(
+                    context.diagnostics().is_empty(),
+                    "{:?}",
+                    context.diagnostics()
+                );
+                let result = context.get_type_at_location(call).unwrap();
+                let element = context
+                    .store()
+                    .canonical_array_reference(context.global_types(), result)
+                    .unwrap()
+                    .unwrap()
+                    .element_type;
+                let TypeData::Union(union) = context.store().type_payload(element).unwrap().data()
+                else {
+                    panic!("ordinary truthiness must keep both nullable element constituents")
+                };
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                let boolean = bootstrap.boolean_type;
+                assert_eq!(
+                    union.union.types.as_ref(),
+                    &[bootstrap.null_type, bootstrap.string_type]
+                );
+                let NodeData::CallExpression(data) = &source.arena.get(call.node).unwrap().data
+                else {
+                    unreachable!()
+                };
+                let callback_node = NodeRef::new(call.arena, file, data.arguments.nodes[0]);
+                let callback = context.get_type_at_location(callback_node).unwrap();
+                let targets = Some(CanonicalArrayTargets::from_global_types(
+                    context.global_types(),
+                ));
+                let StoredCallableSetValidation::Valid { projection, .. } =
+                    validate_stored_callable_set_with_array_targets(
+                        context.store(),
+                        callback,
+                        targets,
+                    )
+                else {
+                    panic!("the callback must retain its written call and constructor")
+                };
+                let [original] = projection.call_signatures.as_ref() else {
+                    unreachable!()
+                };
+                assert_eq!(projection.construct_signatures.len(), 1);
+                let parameter = context
+                    .store()
+                    .signature(original.signature)
+                    .unwrap()
+                    .type_parameters()[0];
+                assert_eq!(original.parameters, [parameter]);
+                let CachedSignatureLookup::Hit(instantiated) = context.store().cached_signature(
+                    original.signature,
+                    type_list_key(&[element]),
+                    &[element],
+                ) else {
+                    panic!("the selected callback must use the shared checked-signature cache")
+                };
+                let record = context.store().signature(instantiated).unwrap();
+                assert_eq!(record.target(), Some(original.signature));
+                assert_eq!(
+                    context.store().type_mapper_has_exact_endpoints(
+                        record.mapper().unwrap(),
+                        &[parameter],
+                        &[element]
+                    ),
+                    Some(true)
+                );
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(record.parameters()[0])
+                        .unwrap()
+                        .resolved_type,
+                    Some(element)
+                );
+                assert_eq!(record.resolved_return_type(), Some(boolean));
+                let warm = call_publication_state(&context, call);
+                for _ in 0..2 {
+                    context.recheck_source_file(file).unwrap();
+                    assert_eq!(context.get_type_at_location(call).unwrap(), result);
+                    assert_eq!(call_publication_state(&context, call), warm);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn array_fixed_generic_callback_replay_rejects_changed_checked_returns() {
+        let library = parsed(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let source = parsed(
+            "declare const values: (string | null)[]; const filtered = values.filter(Boolean);",
+        );
+        let file = FileId::new(96_583);
+        let mut context = context_with_default_library_and_options(
+            &library,
+            FileId::new(96_582),
+            &source,
+            file,
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        let [call] = calls(&source, file).try_into().unwrap();
+        let result = context.get_type_at_location(call).unwrap();
+        let element = context
+            .store()
+            .canonical_array_reference(context.global_types(), result)
+            .unwrap()
+            .unwrap()
+            .element_type;
+        let NodeData::CallExpression(data) = &source.arena.get(call.node).unwrap().data else {
+            unreachable!()
+        };
+        let callback = context
+            .get_type_at_location(NodeRef::new(call.arena, file, data.arguments.nodes[0]))
+            .unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(context.store(), callback)
+        else {
+            unreachable!()
+        };
+        let original = projection.call_signatures[0].signature;
+        let CachedSignatureLookup::Hit(instantiated) =
+            context
+                .store()
+                .cached_signature(original, type_list_key(&[element]), &[element])
+        else {
+            unreachable!()
+        };
+        let saved = context
+            .store()
+            .signature(instantiated)
+            .unwrap()
+            .resolved_return_type();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(instantiated, Some(number))
+        );
+        let damaged = call_publication_state(&context, call);
+        for _ in 0..2 {
+            assert_eq!(
+                context.recheck_source_file(file),
+                Err(SourceCheckError::Call(call))
+            );
+            assert_eq!(call_publication_state(&context, call), damaged);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(instantiated, saved)
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.get_type_at_location(call).unwrap(), result);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Build both real source projections without executing the invalid call.
+    fn array_fixed_generic_callback_comparison_rejects_incompatible_nongeneric_source() {
+        let library = parsed(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let source = parsed(concat!(
+            "declare const values: string[];\n",
+            "declare const incompatible: (value: number) => boolean;\n",
+            "values.filter(incompatible);\n",
+        ));
+        let library_file = FileId::new(96_584);
+        let file = FileId::new(96_585);
+        let mut context = context_with_default_library_and_options(
+            &library,
+            library_file,
+            &source,
+            file,
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let annotation = |name: &str| {
+            source
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) = &source.arena.get(variable.name)?.data
+                    else {
+                        return None;
+                    };
+                    (identifier.text == name).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        variable.type_?,
+                    ))
+                })
+                .unwrap()
+        };
+        let receiver = context
+            .get_type_from_type_node(annotation("values"))
+            .unwrap();
+        let callback = context
+            .get_type_from_type_node(annotation("incompatible"))
+            .unwrap();
+        let [call]: [NodeRef; 1] = calls(&source, file).try_into().unwrap();
+        let NodeData::CallExpression(data) = &source.arena.get(call.node).unwrap().data else {
+            unreachable!()
+        };
+        let site = NodeRef::new(call.arena, file, data.expression);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let method = materialize_global_array_callback_method(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            receiver,
+            "filter",
+            site,
+        )
+        .unwrap()
+        .unwrap();
+        let method = context
+            .store()
+            .type_payload(method)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let callee = super::super::instantiated_members::instantiate_published_generic_interface_method_with_session(
+            context.store_mut_for_test(), &globals, receiver, method, &mut session,
+        ).unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set_with_array_targets(context.store(), callee, targets)
+        else {
+            panic!("the real Array method must retain both overloads")
+        };
+        let ordinary = projection
+            .call_signatures
+            .iter()
+            .find(|call| {
+                context
+                    .store()
+                    .signature(call.signature)
+                    .unwrap()
+                    .type_parameters()
+                    .is_empty()
+            })
+            .unwrap();
+        let StoredSingleCallableValidation::Valid {
+            callable: contextual,
+            ..
+        } = validate_stored_single_callable_with_array_targets(
+            context.store(),
+            ordinary.parameters[0],
+            targets,
+        )
+        else {
+            panic!("the ordinary filter overload must retain its real callback type")
+        };
+        let StoredSingleCallableValidation::Valid {
+            callable: source_callback,
+            ..
+        } = validate_stored_single_callable_with_array_targets(context.store(), callback, targets)
+        else {
+            panic!("the incompatible source annotation must remain a real function type")
+        };
+        assert_eq!(
+            contextual.parameters[0],
+            context.store().intrinsic_bootstrap().unwrap().string_type
+        );
+        assert_eq!(
+            source_callback.parameters,
+            [context.store().intrinsic_bootstrap().unwrap().number_type]
+        );
+        assert!(
+            context
+                .store()
+                .signature(source_callback.signature)
+                .unwrap()
+                .type_parameters()
+                .is_empty()
+        );
+        let before = call_publication_state(&context, call);
+        assert!(before.type_links.is_none());
+        assert!(before.signature_links.is_none());
+        for _ in 0..2 {
+            assert_eq!(
+                check_array_callback_in_fixed_context(
+                    context.store_mut_for_test(),
+                    &globals,
+                    options,
+                    &mut session,
+                    call,
+                    &source_callback,
+                    &contextual,
+                ),
+                Ok(None)
+            );
+            assert_eq!(call_publication_state(&context, call), before);
+        }
+        assert!(diagnostics.is_empty());
+        assert!(
+            context
+                .store()
+                .source_file_links(context.source_file(file).unwrap())
+                .is_none_or(|links| !links.type_checked)
         );
     }
 
