@@ -271,6 +271,9 @@ pub(super) struct ClassBindingPropertyPlan {
 }
 
 impl ClassBindingPropertyPlan {
+    pub(super) const fn binding(&self) -> NodeRef {
+        self.binding
+    }
     pub(super) const fn target(&self) -> NodeRef {
         self.target
     }
@@ -280,6 +283,45 @@ impl ClassBindingPropertyPlan {
     pub(super) const fn receiver(&self) -> NodeRef {
         self.context.receiver
     }
+}
+
+/// Reads the source property of an already checked class binding, not its local target.
+pub(super) fn class_binding_property_artifact_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    binding: NodeRef,
+    receiver: NodeRef,
+) -> Result<SemanticSymbolId, SourcePropertyError> {
+    let plan = plan_class_binding_property(store, host, binding, receiver)?;
+    let invalid = || SourcePropertyError::InvalidCache(plan.property);
+    let identities = completed_class_receiver_identities(store, &plan.context)?;
+    let receiver_type = identities.receiver_type(&plan.context)?;
+    if store.type_node_links(receiver)
+        != Some(&TypeNodeLinks {
+            resolved_type: Some(receiver_type),
+            ..TypeNodeLinks::default()
+        })
+    {
+        return Err(invalid());
+    }
+    let lookup = identities.lookup_type(&plan.context)?;
+    let symbol = store
+        .type_payload(lookup)
+        .and_then(|record| record.data().structured())
+        .and_then(|structured| structured.members)
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source(&plan.name))
+        .ok_or_else(|| unsupported_access(plan.property))?;
+    class_context_member_for_symbol(
+        store,
+        host,
+        plan.property,
+        lookup,
+        &plan.context,
+        identities,
+        symbol,
+    )?;
+    Ok(symbol)
 }
 
 /// Retains the real binding or assignment property. No property-access node is synthesized.
@@ -1244,34 +1286,7 @@ fn class_receiver_identities(
             instance_super: None,
         }
     } else {
-        let instance = store
-            .declared_type_links(context.class_symbol)
-            .and_then(|links| links.declared_type)
-            .ok_or_else(|| unsupported_access(context.receiver))?;
-        if classes::validate_class_heritage_members(store, instance)
-            != ClassHeritageMembersValidation::Valid
-        {
-            return Err(unsupported_access(context.receiver));
-        }
-        let TypeData::Interface(class) = store.type_payload(instance).ok_or_else(invalid)?.data()
-        else {
-            return Err(invalid());
-        };
-        let this_type = class.this_type.ok_or_else(invalid)?;
-        let value = store
-            .value_symbol_links(context.class_symbol)
-            .and_then(|links| links.resolved_type)
-            .ok_or_else(invalid)?;
-        let base = store
-            .direct_class_heritage_provenance(instance)
-            .map(|base| (base.base_instance_type, base.base_value_type));
-        ClassReceiverIdentities {
-            instance,
-            this_type,
-            value,
-            base,
-            instance_super: None,
-        }
+        completed_class_receiver_identities(store, context)?
     };
     if context.kind == ClassReceiverKind::SuperProperty
         && context.side == ClassPropertySide::Instance
@@ -1312,6 +1327,41 @@ fn class_receiver_identities(
         result.instance_super = Some(view);
     }
     Ok(result)
+}
+
+fn completed_class_receiver_identities(
+    store: &CanonicalTypeMapperStore,
+    context: &ClassAccessContext,
+) -> Result<ClassReceiverIdentities, SourcePropertyError> {
+    let invalid = || SourcePropertyError::InvalidCache(context.receiver);
+    let instance = store
+        .declared_type_links(context.class_symbol)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(|| unsupported_access(context.receiver))?;
+    if classes::validate_class_heritage_members(store, instance)
+        != ClassHeritageMembersValidation::Valid
+    {
+        return Err(unsupported_access(context.receiver));
+    }
+    let TypeData::Interface(class) = store.type_payload(instance).ok_or_else(invalid)?.data()
+    else {
+        return Err(invalid());
+    };
+    let this_type = class.this_type.ok_or_else(invalid)?;
+    let value = store
+        .value_symbol_links(context.class_symbol)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    let base = store
+        .direct_class_heritage_provenance(instance)
+        .map(|base| (base.base_instance_type, base.base_value_type));
+    Ok(ClassReceiverIdentities {
+        instance,
+        this_type,
+        value,
+        base,
+        instance_super: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

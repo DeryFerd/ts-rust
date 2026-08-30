@@ -2387,6 +2387,7 @@ pub(super) enum PropertyObjectKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TypeLiteralMemberPolicy {
+    ClassAssignment,
     General,
     ConcreteIndexedAccess,
     GenericInterface,
@@ -2896,6 +2897,7 @@ pub(super) struct PropertyObjectPlan {
     pub methods: Vec<PlannedInterfaceMethod>,
     pub accessors: Vec<PlannedInterfaceAccessor>,
     pub object_literal_getters: Vec<PlannedObjectLiteralGetter>,
+    class_assignment_properties: Option<Vec<super::source_properties::ClassBindingPropertyPlan>>,
     pub spreads: Vec<PlannedObjectSpread>,
     pub indexes: Vec<PlannedIndexSignature>,
     pub call_signatures: Vec<PlannedCallSignature>,
@@ -2904,6 +2906,15 @@ pub(super) struct PropertyObjectPlan {
 }
 
 impl PropertyObjectPlan {
+    pub(super) fn is_class_assignment(&self) -> bool {
+        self.class_assignment_properties.is_some()
+    }
+
+    pub(super) fn class_assignment_properties(
+        &self,
+    ) -> Option<&[super::source_properties::ClassBindingPropertyPlan]> {
+        self.class_assignment_properties.as_deref()
+    }
     pub(super) fn object_literal_getter(
         &self,
         symbol: SemanticSymbolId,
@@ -4839,6 +4850,7 @@ pub(super) fn plan_object_literal(
             });
         }
     }
+    let assignment = plan_class_assignment_properties(store, host, node)?;
     let mut plan = plan_members(
         store,
         host,
@@ -4849,8 +4861,13 @@ pub(super) fn plan_object_literal(
         &object.properties,
         &[],
         None,
-        TypeLiteralMemberPolicy::General,
+        if assignment.is_some() {
+            TypeLiteralMemberPolicy::ClassAssignment
+        } else {
+            TypeLiteralMemberPolicy::General
+        },
     )?;
+    plan.class_assignment_properties = assignment;
     plan.const_context = object_literal_has_const_assertion(store, host, node)?;
     if plan.const_context {
         for property in &mut plan.properties {
@@ -4858,6 +4875,53 @@ pub(super) fn plan_object_literal(
         }
     }
     Ok(plan)
+}
+
+fn plan_class_assignment_properties(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    object: NodeRef,
+) -> Result<Option<Vec<super::source_properties::ClassBindingPropertyPlan>>, PropertyObjectError> {
+    let invalid = || PropertyObjectError::InvalidObjectLiteral(object);
+    let record = preflight_node(store, host, object).map_err(|_| invalid())?;
+    let Some(parent) = record.parent else {
+        return Ok(None);
+    };
+    let assignment = NodeRef::new(object.arena, object.file, parent);
+    let parent = preflight_node(store, host, assignment).map_err(|_| invalid())?;
+    let NodeData::BinaryExpression(binary) = &parent.data else {
+        return Ok(None);
+    };
+    if binary.left != object.node
+        || store.source_node_kind(NodeRef::new(
+            object.arena,
+            object.file,
+            binary.operator_token,
+        )) != Some(SyntaxKind::EqualsToken)
+        || store.source_node_kind(NodeRef::new(object.arena, object.file, binary.right))
+            != Some(SyntaxKind::ThisKeyword)
+    {
+        return Ok(None);
+    }
+    let NodeData::ObjectLiteralExpression(literal) = &record.data else {
+        return Err(invalid());
+    };
+    let receiver = NodeRef::new(object.arena, object.file, binary.right);
+    let properties = literal
+        .properties
+        .nodes
+        .iter()
+        .map(|property| {
+            super::source_properties::plan_class_binding_property(
+                store,
+                host,
+                NodeRef::new(object.arena, object.file, *property),
+                receiver,
+            )
+            .map_err(|_| invalid())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(properties))
 }
 
 fn plan_javascript_expando_object_literal(
@@ -4942,6 +5006,7 @@ fn plan_javascript_expando_object_literal(
         methods: Vec::new(),
         accessors: Vec::new(),
         object_literal_getters: Vec::new(),
+        class_assignment_properties: None,
         spreads: Vec::new(),
         indexes: Vec::new(),
         call_signatures: Vec::new(),
@@ -10240,6 +10305,7 @@ fn plan_members(
         methods: Vec::new(),
         accessors: Vec::new(),
         object_literal_getters: Vec::new(),
+        class_assignment_properties: None,
         spreads: Vec::new(),
         indexes: Vec::new(),
         call_signatures: Vec::new(),
@@ -10929,7 +10995,9 @@ fn plan_members(
         };
         let expected_check_flags = source_property_check_flags(readonly);
         let symbol_declarations = property_record.declarations().unwrap_or_default();
-        let declarations_valid = if kind == PropertyObjectKind::Interface {
+        let declarations_valid = if kind == PropertyObjectKind::Interface
+            || policy == TypeLiteralMemberPolicy::ClassAssignment
+        {
             !symbol_declarations.is_empty() && symbol_declarations.contains(&member)
         } else {
             symbol_declarations == [member].as_slice()
@@ -10962,6 +11030,21 @@ fn plan_members(
             else {
                 return Err(invalid_plan(&provisional));
             };
+            if policy == TypeLiteralMemberPolicy::ClassAssignment {
+                if kind != PropertyObjectKind::ObjectLiteral
+                    || existing.name != property_name
+                    || existing.optional != optional
+                    || existing.readonly != readonly
+                {
+                    return Err(invalid_plan(&provisional));
+                }
+                // Go's object member table keeps the last assignment property,
+                // while its symbol retains all original declarations.
+                existing.declaration = member;
+                existing.name_node = name;
+                existing.type_node = type_node;
+                continue;
+            }
             if property_record.flags().intersects(SymbolFlags::ACCESSOR) {
                 let getter = accessors.iter().find(|accessor| {
                     accessor.symbol == property_symbol && accessor.parameter.is_none()
@@ -12919,6 +13002,7 @@ pub(super) fn plan_selected_interface_method(
         methods,
         accessors: Vec::new(),
         object_literal_getters: Vec::new(),
+        class_assignment_properties: None,
         spreads: Vec::new(),
         indexes: Vec::new(),
         call_signatures: Vec::new(),
@@ -13361,6 +13445,7 @@ fn selected_method_plan(
             .collect(),
         accessors: Vec::new(),
         object_literal_getters: Vec::new(),
+        class_assignment_properties: None,
         spreads: Vec::new(),
         indexes: Vec::new(),
         call_signatures: Vec::new(),
@@ -15883,6 +15968,7 @@ fn property_object_alias_source_plan(
         methods: Vec::new(),
         accessors: Vec::new(),
         object_literal_getters: Vec::new(),
+        class_assignment_properties: None,
         spreads: Vec::new(),
         indexes: Vec::new(),
         call_signatures: Vec::new(),
@@ -18617,7 +18703,7 @@ fn object_literal_property_types(
         }
         property_types.push(valid_object_literal_property(
             store,
-            plan.symbol,
+            plan,
             property,
             *cloned_symbol,
         )?);
@@ -18627,7 +18713,7 @@ fn object_literal_property_types(
 
 fn valid_object_literal_property(
     store: &CanonicalTypeMapperStore,
-    owner: SemanticSymbolId,
+    plan: &PropertyObjectPlan,
     property: &PlannedProperty,
     cloned_symbol: SemanticSymbolId,
 ) -> Option<TypeId> {
@@ -18648,8 +18734,7 @@ fn valid_object_literal_property(
         }
         || bound.check_flags() != CheckFlags::NONE
         || bound.name() != property.name.as_ref()
-        || bound.declarations() != Some(&[property.declaration])
-        || bound.value_declaration() != Some(property.declaration)
+        || !valid_object_literal_property_declarations(store, plan, property)
         || bound.members().is_some()
         || bound.exports().is_some()
         || bound.export_symbol().is_some()
@@ -18662,7 +18747,7 @@ fn valid_object_literal_property(
         || cloned.members().is_some()
         || cloned.exports().is_some()
         || cloned.parent() != bound.parent()
-        || cloned.parent() != Some(owner)
+        || cloned.parent() != Some(plan.symbol)
         || cloned.export_symbol().is_some()
     {
         return None;
@@ -22111,8 +22196,7 @@ fn valid_bound_object_literal_property(
             }
         && bound.check_flags() == CheckFlags::NONE
         && bound.name() == property.name.as_ref()
-        && bound.declarations() == Some(&[property.declaration])
-        && bound.value_declaration() == Some(property.declaration)
+        && valid_object_literal_property_declarations(store, plan, property)
         && bound.members().is_none()
         && bound.exports().is_none()
         && bound.parent() == Some(plan.symbol)
@@ -22132,6 +22216,61 @@ fn valid_bound_object_literal_property(
             .and_then(|members| store.symbol_table(members))
             .and_then(|members| members.get(property.name.as_ref()))
             == Some(property.symbol)
+}
+
+fn valid_object_literal_property_declarations(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    property: &PlannedProperty,
+) -> bool {
+    let Some(bound) = store.symbol(property.symbol) else {
+        return false;
+    };
+    let Some(assignment) = &plan.class_assignment_properties else {
+        return bound.declarations() == Some(&[property.declaration])
+            && bound.value_declaration() == Some(property.declaration);
+    };
+    let mut actual_members = match store.source_direct_children(plan.node) {
+        Some(children) => children,
+        None => return false,
+    };
+    actual_members.sort_by_key(|member| store.source_node_start(*member));
+    if plan.kind != PropertyObjectKind::ObjectLiteral
+        || !actual_members
+            .iter()
+            .copied()
+            .eq(assignment.iter().map(|member| member.binding()))
+        || assignment.iter().any(|member| {
+            store.source_node_parent(member.binding()) != Some(SourceNodeParent::Parent(plan.node))
+                || store.source_node_parent(member.property())
+                    != Some(SourceNodeParent::Parent(member.binding()))
+                || store.source_node_parent(member.target())
+                    != Some(SourceNodeParent::Parent(member.binding()))
+                || !matches!(
+                    store.source_node_kind(member.binding()),
+                    Some(SyntaxKind::PropertyAssignment | SyntaxKind::ShorthandPropertyAssignment)
+                )
+        })
+    {
+        return false;
+    }
+    let declarations = assignment
+        .iter()
+        .filter(|member| store.source_declaration_symbol(member.binding()) == Some(property.symbol))
+        .collect::<Vec<_>>();
+    let Some(last) = declarations.last() else {
+        return false;
+    };
+    last.binding() == property.declaration
+        && last.property() == property.name_node
+        && last.target() == property.type_node
+        && bound.value_declaration() == declarations.first().map(|member| member.binding())
+        && bound.declarations().is_some_and(|actual| {
+            actual
+                .iter()
+                .copied()
+                .eq(declarations.iter().map(|member| member.binding()))
+        })
 }
 
 fn inherited_const_object_literal(store: &CanonicalTypeMapperStore, node: NodeRef) -> bool {
