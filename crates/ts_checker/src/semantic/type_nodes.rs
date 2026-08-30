@@ -19355,18 +19355,33 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     Ok(())
                 };
             };
-            let Some(owner_links) = self.store.type_alias_links(owner) else {
-                return if key_alias && reference_result.is_some() {
-                    Err(invalid())
-                } else {
-                    Ok(())
+            let owner_arguments = if let Some(owner_links) = self.store.type_alias_links(owner) {
+                owner_links.type_parameters.as_deref().unwrap_or_default()
+            } else if key_alias && let Some(result) = reference_result {
+                // An RHS query can retain its source request before the outer alias is declared.
+                let Some(TypeData::IndexedAccess(lookup)) =
+                    self.store.type_payload(result).map(TypeRecord::data)
+                else {
+                    return Err(invalid());
                 };
+                let request =
+                    validated_source_mapped_lookup_request(self.store, lookup.object_type)
+                        .map_err(|_| invalid())?;
+                let Some((request_owner, owner_arguments)) = request.alias_identity.as_ref() else {
+                    return Err(invalid());
+                };
+                if *request_owner != owner
+                    || request.alias != symbol
+                    || request.lookup != result
+                    || !source_mapped_lookup_reference_matches(self.store, reference, result)
+                {
+                    return Err(invalid());
+                }
+                owner_arguments.as_slice()
+            } else {
+                return Ok(());
             };
-            Some((
-                owner,
-                global,
-                owner_links.type_parameters.as_deref().unwrap_or_default(),
-            ))
+            Some((owner, global, owner_arguments))
         } else {
             None
         };
@@ -57545,6 +57560,271 @@ mod tests {
             assert_eq!(store_state(&store), before);
             assert!(diagnostics.is_empty());
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The same RHS request must survive exact restoration before and after outer publication.
+    fn source_mapped_lookup_warm_rhs_requires_its_retained_owner_request() {
+        let PropTypesInferPropsFixture {
+            library,
+            declarations,
+            library_file,
+            declaration_file,
+            files,
+            mut store,
+        } = prop_types_key_alias_fixture(
+            "prop-types",
+            concat!(
+                "{ [K in keyof V]: V[K] extends Validator<infer T> ",
+                "? IsOptional<T> extends true ? never : K : never }[keyof V]",
+            ),
+            "Exclude<keyof V, RequiredKeys<V>>",
+        );
+        let bound = files.get(&declaration_file).unwrap();
+        let (owner, reference) =
+            source_mapped_request_parts(&declarations, declaration_file, bound, "RequiredForward");
+        let (other_owner, _) =
+            source_mapped_request_parts(&declarations, declaration_file, bound, "OptionalForward");
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&declarations.arena, bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let lookup = query.get_type_from_type_node(reference).unwrap();
+        assert!(query.store.type_alias_links(owner).is_none());
+        let TypeData::IndexedAccess(indexed) = query.store.type_payload(lookup).unwrap().data()
+        else {
+            panic!("the generic RHS must retain its whole lookup")
+        };
+        let mapped = indexed.object_type;
+        let retained = validated_source_mapped_lookup_request(query.store, mapped)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            retained.alias_identity,
+            Some((owner, vec![retained.argument]))
+        );
+        let links = query
+            .store
+            .type_alias_links(retained.alias)
+            .unwrap()
+            .clone();
+        let node_links = query.store.type_node_links(reference).unwrap().clone();
+        let mapped_record = query.store.type_payload(mapped).unwrap();
+        let mapped_flags = mapped_record.object_flags();
+        assert!(!mapped_flags.contains(ObjectFlags::MEMBERS_RESOLVED));
+        let TypeData::Mapped(mapped_data) = mapped_record.data() else {
+            unreachable!()
+        };
+        let template = mapped_data.template_type.unwrap();
+        let mapped_data = TypeData::Mapped(mapped_data.clone());
+        let template_record = query.store.type_payload(template).unwrap();
+        let TypeData::Conditional(conditional) = template_record.data() else {
+            panic!("the generic mapped value must remain conditional")
+        };
+        assert!(conditional.resolved_true_type.is_none());
+        assert!(conditional.resolved_false_type.is_none());
+        assert!(conditional.resolved_inferred_true_type.is_none());
+        let template_data = TypeData::Conditional(conditional.clone());
+        let request_count = query.store.source_mapped_lookup_request_count();
+        let warm = source_callable_infer_replay_state(
+            query.store,
+            query.instantiation_session.as_deref().unwrap(),
+        );
+        for _ in 0..2 {
+            assert_eq!(query.get_type_from_type_node(reference), Ok(lookup));
+            assert!(query.store.type_alias_links(owner).is_none());
+            assert_eq!(
+                source_callable_infer_replay_state(
+                    query.store,
+                    query.instantiation_session.as_deref().unwrap(),
+                ),
+                warm,
+            );
+        }
+
+        let number = query.store.intrinsic_bootstrap().unwrap().number_type;
+        for changed in [
+            None,
+            Some(SourceMappedLookupRequest {
+                alias_identity: None,
+                ..retained.clone()
+            }),
+            Some(SourceMappedLookupRequest {
+                alias_identity: Some((other_owner, vec![retained.argument])),
+                ..retained.clone()
+            }),
+            Some(SourceMappedLookupRequest {
+                alias_identity: Some((owner, vec![number])),
+                ..retained.clone()
+            }),
+            Some(SourceMappedLookupRequest {
+                key: type_alias_instantiation_cache_key(&[retained.argument], None),
+                ..retained.clone()
+            }),
+            Some(SourceMappedLookupRequest {
+                lookup: retained.declared_lookup,
+                ..retained.clone()
+            }),
+        ] {
+            assert_eq!(
+                query
+                    .store
+                    .replace_source_mapped_lookup_request_for_test(mapped, changed.clone()),
+                Some(retained.clone()),
+            );
+            for _ in 0..2 {
+                assert!(query.get_type_from_type_node(reference).is_err());
+                assert_eq!(
+                    query.store.source_mapped_lookup_request(mapped),
+                    changed.as_ref()
+                );
+                assert!(query.store.type_alias_links(owner).is_none());
+                assert_eq!(query.store.type_alias_links(retained.alias), Some(&links));
+                assert_eq!(query.store.type_node_links(reference), Some(&node_links));
+                assert_eq!(
+                    query.store.type_payload(mapped).unwrap().data(),
+                    &mapped_data
+                );
+                assert_eq!(
+                    query.store.type_payload(template).unwrap().data(),
+                    &template_data
+                );
+                assert_eq!(
+                    query.store.source_mapped_lookup_request_count(),
+                    request_count - usize::from(changed.is_none()),
+                );
+                assert_eq!(
+                    source_callable_infer_replay_state(
+                        query.store,
+                        query.instantiation_session.as_deref().unwrap(),
+                    ),
+                    warm,
+                );
+            }
+            assert_eq!(
+                query
+                    .store
+                    .replace_source_mapped_lookup_request_for_test(mapped, Some(retained.clone())),
+                changed,
+            );
+            assert_eq!(query.get_type_from_type_node(reference), Ok(lookup));
+        }
+
+        let mut wrong_cache = links.clone();
+        let entries = wrong_cache.instantiations.as_mut().unwrap();
+        assert_eq!(entries.remove(&retained.key), Some(lookup));
+        entries.insert(
+            type_alias_instantiation_cache_key(&[retained.argument], None),
+            lookup,
+        );
+        assert!(
+            query
+                .store
+                .set_type_alias_links(retained.alias, wrong_cache.clone())
+        );
+        for _ in 0..2 {
+            assert!(query.get_type_from_type_node(reference).is_err());
+            assert_eq!(
+                query.store.type_alias_links(retained.alias),
+                Some(&wrong_cache)
+            );
+            assert!(query.store.type_alias_links(owner).is_none());
+            assert_eq!(
+                source_callable_infer_replay_state(
+                    query.store,
+                    query.instantiation_session.as_deref().unwrap(),
+                ),
+                warm,
+            );
+        }
+        assert!(
+            query
+                .store
+                .set_type_alias_links(retained.alias, links.clone())
+        );
+        assert_eq!(query.get_type_from_type_node(reference), Ok(lookup));
+        assert_eq!(
+            source_callable_infer_replay_state(
+                query.store,
+                query.instantiation_session.as_deref().unwrap(),
+            ),
+            warm,
+        );
+
+        assert_eq!(query.get_declared_type_of_symbol(owner), Ok(lookup));
+        let owner_links = query.store.type_alias_links(owner).unwrap().clone();
+        let mut wrong_owner = owner_links.clone();
+        wrong_owner.type_parameters = Some(vec![number]);
+        assert!(query.store.set_type_alias_links(owner, wrong_owner.clone()));
+        let published = source_callable_infer_replay_state(
+            query.store,
+            query.instantiation_session.as_deref().unwrap(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                query.get_type_from_type_node(reference),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(owner)
+                )),
+            );
+            assert_eq!(query.store.type_alias_links(owner), Some(&wrong_owner));
+            assert_eq!(
+                source_callable_infer_replay_state(
+                    query.store,
+                    query.instantiation_session.as_deref().unwrap(),
+                ),
+                published,
+            );
+        }
+        assert!(query.store.set_type_alias_links(owner, owner_links.clone()));
+        assert_eq!(query.get_type_from_type_node(reference), Ok(lookup));
+        assert_eq!(query.store.type_alias_links(owner), Some(&owner_links));
+        assert_eq!(query.store.type_alias_links(retained.alias), Some(&links));
+        assert_eq!(query.store.type_node_links(reference), Some(&node_links));
+        assert_eq!(
+            query.store.source_mapped_lookup_request(mapped),
+            Some(&retained)
+        );
+        assert_eq!(
+            query.store.type_payload(mapped).unwrap().data(),
+            &mapped_data
+        );
+        assert_eq!(
+            query.store.type_payload(mapped).unwrap().object_flags(),
+            mapped_flags
+        );
+        assert_eq!(
+            query.store.type_payload(template).unwrap().data(),
+            &template_data
+        );
+        assert_eq!(
+            query.store.source_mapped_lookup_request_count(),
+            request_count
+        );
+        assert_eq!(
+            source_callable_infer_replay_state(
+                query.store,
+                query.instantiation_session.as_deref().unwrap(),
+            ),
+            published,
+        );
+        assert!(query.store.type_resolution_is_empty());
+        drop(query);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
