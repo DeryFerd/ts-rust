@@ -2877,11 +2877,10 @@ fn append_validated_generic_interface_type_edges(
     edges.extend_from_slice(&shape.target_arguments);
     edges.extend_from_slice(&shape.base_types);
     edges.extend(shape.properties.iter().map(|property| property.type_));
-    for &symbol in shape
-        .inherited_properties
-        .iter()
-        .chain(warm.iter().flat_map(|members| members.properties()))
-    {
+    for &symbol in shape.inherited_properties.iter().chain(
+        warm.iter()
+            .flat_map(InstantiatedInterfaceMembers::properties),
+    ) {
         let links = store
             .value_symbol_links(symbol)
             .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(symbol))?;

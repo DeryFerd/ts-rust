@@ -420,7 +420,7 @@ fn preflight_contextual_type_graph(
                     contextual_type,
                     global_types.map(CanonicalArrayTargets::from_global_types),
                 )
-                .map_err(|error| contextual_generic_reference_error(contextual_type, error))?;
+                .map_err(|error| contextual_generic_reference_error(contextual_type, &error))?;
                 for edge in edges {
                     preflight_contextual_type_graph(
                         store,
@@ -469,18 +469,18 @@ fn preflight_contextual_type_graph(
 
 fn contextual_generic_reference_error(
     reference: TypeId,
-    error: GenericInterfaceMemberError,
+    error: &GenericInterfaceMemberError,
 ) -> SourceCheckError {
     let error = match error {
         GenericInterfaceMemberError::UnsupportedTarget(type_)
         | GenericInterfaceMemberError::UnsupportedPropertyType(type_) => {
-            RelationUnavailable::UnsupportedStructuredType(type_)
+            RelationUnavailable::UnsupportedStructuredType(*type_)
         }
         GenericInterfaceMemberError::UnsupportedMember(symbol) => {
-            RelationUnavailable::UnsupportedProperty(symbol)
+            RelationUnavailable::UnsupportedProperty(*symbol)
         }
         GenericInterfaceMemberError::Capacity(type_) => {
-            RelationUnavailable::UnionValidationCapacity(type_)
+            RelationUnavailable::UnionValidationCapacity(*type_)
         }
         GenericInterfaceMemberError::Reference(_)
         | GenericInterfaceMemberError::InvalidTarget(_)
