@@ -2329,6 +2329,10 @@ fn plan_body(
         if record.kind == SyntaxKind::VariableStatement {
             return true;
         }
+        if record.kind == SyntaxKind::EmptyStatement {
+            return matches!(&record.data, NodeData::EmptyStatement(empty) if empty.flow_node.is_none())
+                && record.flags.0 == 0;
+        }
         let NodeData::ExpressionStatement(statement) = &record.data else {
             return false;
         };

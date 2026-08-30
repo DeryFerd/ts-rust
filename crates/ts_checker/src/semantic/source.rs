@@ -38,6 +38,7 @@
 //! lexical self-names, and bounded block bodies,
 //! ordinary object-literal methods with checked parameters and linear bodies,
 //! parenthesized standalone closures, lexical captures, immediate invocation,
+//! stored void block arrows checked after their enclosing linear local scope,
 //! and contextually typed class prototype method implementations,
 //! authenticated shorthand object-assignment defaults inside bounded function bodies
 //! and variable initializer expressions,
@@ -1112,6 +1113,89 @@ struct PlannedVariable {
     initializer: PlannedVariableInitializer,
 }
 
+fn deferred_local_arrow(local: &PlannedVariable) -> Option<&PlannedArrowExpression> {
+    let PlannedVariableInitializer::Expression(initializer) = &local.initializer else {
+        return None;
+    };
+    let PlannedExpressionKind::Arrow(arrow) = &initializer.kind else {
+        return None;
+    };
+    (local.binding == VariableBindingKind::Const
+        && local.type_node.is_none()
+        && local.jsdoc_type.is_none()
+        && !local.evolving_array
+        && !initializer.awaited
+        && arrow.callable.declaration == initializer.node
+        && arrow.callable.family == SourceCallableFamily::ArrowFunction
+        && arrow.callable.body_mode == SourceCallableBodyMode::Present
+        && arrow.callable.return_type.is_inferred()
+        && !arrow.callable.is_async
+        && arrow.callable.parameter_count() == 0
+        && arrow.callable.type_parameters.is_empty()
+        && arrow.parameter_initializers.is_empty()
+        && arrow.expression_statement.is_none()
+        && arrow.loop_body.is_none()
+        && arrow.prototype_this.is_none()
+        && matches!(arrow.body, PlannedArrowBody::Empty)
+        && arrow.linear_body.as_ref().is_some_and(|body| {
+            body.return_statement.is_none() && body.return_expression.is_none()
+        }))
+    .then_some(arrow)
+}
+
+fn validate_deferred_local_arrow(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    callable: &SourceCallablePlan,
+    local: &PlannedVariable,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), SourceCheckError> {
+    let invalid = || SourceCheckError::Arrow(local.declaration);
+    let arrow = deferred_local_arrow(local).ok_or_else(invalid)?;
+    let (arena, bound) = host.source(local.declaration).ok_or_else(invalid)?;
+    let record = host.node(local.declaration).ok_or_else(invalid)?;
+    let NodeData::VariableDeclaration(variable) = &record.data else {
+        return Err(invalid());
+    };
+    if record.kind != SyntaxKind::VariableDeclaration
+        || variable.name != local.name.node
+        || variable.initializer != Some(arrow.callable.declaration.node)
+        || variable.type_.is_some()
+        || bound.container(local.declaration) != Some(callable.declaration)
+        || bound.block_scope_container(local.declaration) != Some(callable.declaration)
+        || bound
+            .symbol(local.declaration)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(local.symbol)
+        || !store.source_declaration_belongs_to_symbol(local.declaration, local.symbol)
+    {
+        return Err(invalid());
+    }
+    let list = record
+        .parent
+        .and_then(|node| arena.get(node))
+        .ok_or_else(invalid)?;
+    if list.kind != SyntaxKind::VariableDeclarationList
+        || list.flags.0 != NODE_FLAG_CONST
+        || !matches!(&list.data, NodeData::VariableDeclarationList(list)
+            if list.declarations.nodes.contains(&local.declaration.node))
+    {
+        return Err(invalid());
+    }
+    let (actual, body) =
+        plan_source_arrow_value(store, host, arrow.callable.declaration, array_targets)
+            .map_err(SourcePlanner::arrow_plan_error)?;
+    if actual != arrow.callable || !matches!(body, SourceArrowBodyPlan::LinearBlock { .. }) {
+        return Err(invalid());
+    }
+    let body = plan_source_linear_function_statements_syntax(arena, bound, store, &actual)
+        .map_err(|error| SourcePlanner::function_statements_plan_error(&actual, error))?;
+    if body.return_statement.is_some() || body.return_expression.is_some() {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct PlannedArrayVariable {
     pattern: NodeRef,
@@ -1546,6 +1630,7 @@ struct PlannedObjectShorthandAssignment {
 struct PlannedLinearFunctionStatements {
     locals: Vec<PlannedVariable>,
     statements: Vec<PlannedLinearFunctionStatement>,
+    deferred_local_arrows: HashSet<usize>,
     return_statement: Option<NodeRef>,
     return_expression: Option<PlannedExpression>,
     unreachable_ranges: Vec<CanonicalCheckerDiagnosticRange>,
@@ -14075,8 +14160,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
         let mut locals = Vec::with_capacity(local_syntax.len());
         let mut statements = Vec::with_capacity(statement_syntax.len());
+        let mut deferred_local_arrows = HashSet::new();
         let mut logical_statements = Vec::new();
-        let mut expected_locals = local_syntax.into_iter();
+        let mut expected_locals = local_syntax.iter().copied();
         for statement in statement_syntax {
             match statement {
                 SourceLinearFunctionStatementSyntax::Local(local) => {
@@ -14086,7 +14172,19 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         ));
                     }
                     let index = locals.len();
-                    locals.push(self.finish_local_declaration(local)?);
+                    let planned = if return_expression.is_none()
+                        && self.can_defer_local_arrow_body(callable, local)?
+                    {
+                        let planned = self.finish_deferred_local_arrow(local, &local_syntax)?;
+                        if deferred_local_arrow(&planned).is_none() {
+                            return Err(Self::unsupported_function_body(callable));
+                        }
+                        deferred_local_arrows.insert(index);
+                        planned
+                    } else {
+                        self.finish_local_declaration(local)?
+                    };
+                    locals.push(planned);
                     statements.push(PlannedLinearFunctionStatement::Local(index));
                 }
                 SourceLinearFunctionStatementSyntax::Function(declaration) => {
@@ -14245,7 +14343,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 symbol: local.symbol,
             })
             .collect::<Vec<_>>();
-        // Parenthesized async IIFEs do not create binder CALL flow nodes.
+        // Parenthesized IIFEs do not create binder CALL flow nodes.
         let calls = statements.iter().filter_map(|statement| match statement {
             PlannedLinearFunctionStatement::Expression {
                 statement,
@@ -14412,6 +14510,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(PlannedLinearFunctionStatements {
             locals,
             statements,
+            deferred_local_arrows,
             return_statement,
             return_expression,
             unreachable_ranges,
@@ -14419,6 +14518,89 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             capture_assignments,
             captured_array_mutations,
         })
+    }
+
+    fn can_defer_local_arrow_body(
+        &self,
+        callable: &SourceCallablePlan,
+        local: SourceLocalDeclarationSyntax,
+    ) -> Result<bool, SourceCheckError> {
+        if local.binding != VariableBindingKind::Const
+            || local.type_node.is_some()
+            || callable.is_async
+            || !matches!(
+                callable.family,
+                SourceCallableFamily::FunctionDeclaration | SourceCallableFamily::ArrowFunction
+            )
+        {
+            return Ok(false);
+        }
+        let Some(initializer) = local.initializer else {
+            return Ok(false);
+        };
+        let record = self.node(initializer)?;
+        let NodeData::ArrowFunction(arrow) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::ArrowFunction
+            || record.parent != Some(local.declaration.node)
+            || !arrow.parameters.nodes.is_empty()
+            || arrow.type_parameters.is_some()
+            || arrow.type_.is_some()
+            || arrow.modifiers.is_some()
+            || self.bound.container(local.declaration) != Some(callable.declaration)
+            || self.bound.block_scope_container(local.declaration) != Some(callable.declaration)
+        {
+            return Ok(false);
+        }
+        let Some((store, host)) = self.semantic else {
+            return Ok(false);
+        };
+        let (arrow, body) = plan_source_arrow_value(store, host, initializer, self.array_targets)
+            .map_err(Self::arrow_plan_error)?;
+        if !matches!(body, SourceArrowBodyPlan::LinearBlock { .. }) {
+            return Ok(false);
+        }
+        let body =
+            plan_source_linear_function_statements_syntax(self.arena, self.bound, store, &arrow)
+                .map_err(|error| Self::function_statements_plan_error(&arrow, error))?;
+        Ok(body.return_statement.is_none() && body.return_expression.is_none())
+    }
+
+    /// Only the stored body sees later names. Its eager enclosing scope is restored.
+    fn finish_deferred_local_arrow(
+        &mut self,
+        local: SourceLocalDeclarationSyntax,
+        locals: &[SourceLocalDeclarationSyntax],
+    ) -> Result<PlannedVariable, SourceCheckError> {
+        let prior = self.prior_variables.clone();
+        let readable = self.readable_variables.clone();
+        let result = (|| {
+            for later in locals {
+                if later.initializer.is_some()
+                    && self.node(later.declaration)?.range.start
+                        > self.node(local.declaration)?.range.start
+                    && self.bound.block_scope_container(later.declaration)
+                        == self.bound.block_scope_container(local.declaration)
+                    && !self.prior_variables.contains(&later.symbol)
+                {
+                    self.prior_variables.insert(later.symbol);
+                    self.readable_variables.insert(later.symbol);
+                }
+            }
+            self.finish_local_declaration(local)
+        })();
+        self.prior_variables = prior;
+        self.readable_variables = readable;
+        let planned = result?;
+        if !self.prior_variables.insert(planned.symbol)
+            || !self.readable_variables.insert(planned.symbol)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(planned.symbol),
+            ));
+        }
+        Ok(planned)
     }
 
     fn finish_loop_function_statements(
@@ -28813,6 +28995,32 @@ fn preflight_inferred_function_return_dependencies(
                     PlannedExpressionKind::Property(property) => {
                         expression_is_closed(&property.receiver, parameters, locals, functions)
                     }
+                    PlannedExpressionKind::Arrow(arrow)
+                        if arrow.callable.family == SourceCallableFamily::ArrowFunction
+                            && arrow.callable.body_mode == SourceCallableBodyMode::Present
+                            && !arrow.callable.is_async
+                            && arrow.callable.parameter_count() == 0
+                            && arrow.callable.type_parameters.is_empty()
+                            && arrow.parameter_initializers.is_empty()
+                            && arrow.expression_statement.is_none()
+                            && arrow.linear_body.is_none()
+                            && arrow.loop_body.is_none()
+                            && arrow.prototype_this.is_none()
+                            && functions.host.node(callee.node).is_some_and(|record| {
+                                record.kind == SyntaxKind::ArrowFunction
+                            })
+                            && functions.host.source(expression.node).is_some_and(|(arena, _)| {
+                                is_immediately_invoked_source_callable(arena, expression.node)
+                            }) =>
+                    {
+                        match &arrow.body {
+                            PlannedArrowBody::Empty => true,
+                            PlannedArrowBody::Return { expression, .. } => {
+                                expression_is_closed(expression, parameters, locals, functions)
+                            }
+                            PlannedArrowBody::ForOf(_) | PlannedArrowBody::ReturnJsx { .. } => false,
+                        }
+                    }
                     _ => false,
                 };
                 callee_is_closed
@@ -28857,6 +29065,47 @@ fn preflight_inferred_function_return_dependencies(
             }
             locals.insert(local.symbol);
             true
+        })
+    }
+
+    fn linear_local_initializers_are_closed(
+        statements: &PlannedLinearFunctionStatements,
+        parameters: &[SourceCallableParameterPlan],
+        locals: &mut HashSet<SemanticSymbolId>,
+        functions: FunctionDependencies<'_, '_>,
+    ) -> bool {
+        for (index, local) in statements.locals.iter().enumerate() {
+            if statements.deferred_local_arrows.contains(&index) {
+                if statements.return_expression.is_some() || deferred_local_arrow(local).is_none() {
+                    return false;
+                }
+                // A no-return block supplies void without reading its deferred body.
+                locals.insert(local.symbol);
+            } else if !local_initializers_are_closed(
+                std::slice::from_ref(local),
+                parameters,
+                locals,
+                functions,
+            ) {
+                return false;
+            }
+        }
+        statements.deferred_local_arrows.iter().all(|index| {
+            let Some(arrow) = statements.locals.get(*index).and_then(deferred_local_arrow) else {
+                return false;
+            };
+            let Some(body) = &arrow.linear_body else {
+                return false;
+            };
+            let mut body_locals = locals.clone();
+            linear_local_initializers_are_closed(body, parameters, &mut body_locals, functions)
+                && body.statements.iter().all(|statement| match statement {
+                    PlannedLinearFunctionStatement::Local(_) => true,
+                    PlannedLinearFunctionStatement::Expression { expression, .. } => {
+                        expression_is_closed(expression, parameters, &body_locals, functions)
+                    }
+                    _ => false,
+                })
         })
     }
 
@@ -29092,8 +29341,8 @@ fn preflight_inferred_function_return_dependencies(
                         None
                     }
                 }));
-                local_initializers_are_closed(
-                    &statements.locals,
+                linear_local_initializers_are_closed(
+                    statements,
                     &function.callable.parameters,
                     &mut locals,
                     functions,
@@ -46015,6 +46264,24 @@ fn check_planned_linear_function_statements_with_capture_entries(
     outer_capture: Option<SourceArrowCaptureContext<'_>>,
 ) -> Result<HashMap<SemanticSymbolId, TypeId>, SourceCheckError> {
     let mut base_flow_types = base_flow_types;
+    for index in &statements.deferred_local_arrows {
+        let local = statements
+            .locals
+            .get(*index)
+            .ok_or(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(callable.declaration),
+            ))?;
+        if statements.return_expression.is_some() {
+            return Err(SourcePlanner::unsupported_function_body(callable));
+        }
+        validate_deferred_local_arrow(
+            store,
+            host,
+            callable,
+            local,
+            Some(CanonicalArrayTargets::from_global_types(global_types)),
+        )?;
+    }
     let mut nested_callables = HashMap::new();
     for statement in &statements.statements {
         match statement {
@@ -46076,6 +46343,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
         .frame_with_captured_locals(store, host, bound, base_flow_types.clone())
         .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
     let mut nested_flow_types = base_flow_types.clone();
+    let mut deferred_bodies = Vec::with_capacity(statements.deferred_local_arrows.len());
     let mut unreachable_ranges = statements.unreachable_ranges.iter().peekable();
     for statement in &statements.statements {
         if let Some(point) = statement.flow_point(&statements.locals)
@@ -46117,24 +46385,89 @@ fn check_planned_linear_function_statements_with_capture_entries(
                     .ok_or(SourceCheckError::Function(
                         SourceFunctionInvariant::Callable(callable.declaration),
                     ))?;
-                check_planned_function_locals(
-                    store,
-                    host,
-                    global_types,
-                    source,
-                    options,
-                    session,
-                    diagnostics,
-                    &mut frame,
-                    type_import_execution,
-                    type_import_capabilities,
-                    deferred,
-                    callable,
-                    std::slice::from_ref(local),
-                    arrow_capture,
-                    staged_value_types,
-                    value_order,
-                )?;
+                if statements.deferred_local_arrows.contains(index) {
+                    let arrow = deferred_local_arrow(local)
+                        .ok_or(SourceCheckError::Arrow(local.declaration))?;
+                    session.reset_query();
+                    let snapshot = frame
+                        .snapshot_at(store, global_types, local.name)
+                        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                    issue_arrow_line_terminator_diagnostic(
+                        host,
+                        diagnostics,
+                        arrow.callable.declaration,
+                    )?;
+                    let materialized = materialize_checked_source_callable(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        &arrow.callable,
+                        type_import_capabilities,
+                    )?;
+                    preflight_source_expression_cache(
+                        store,
+                        arrow.callable.declaration,
+                        materialized.type_,
+                    )?;
+                    // The authenticated block has no return. Its body is checked below.
+                    publish_checked_source_callable_return_with_capture_context(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        snapshot.types(),
+                        type_import_execution,
+                        deferred,
+                        &arrow.callable,
+                        materialized.signature,
+                        None,
+                        None,
+                        arrow_capture,
+                    )?;
+                    publish_expression_type(store, arrow.callable.declaration, materialized.type_)?;
+                    let declared = inferred_variable_type(
+                        store,
+                        global_types,
+                        local.binding,
+                        materialized.type_,
+                    )?;
+                    stage_value_type(
+                        store,
+                        staged_value_types,
+                        value_order,
+                        local.symbol,
+                        declared,
+                    )?;
+                    frame
+                        .complete_assignment(local.declaration, local.symbol, declared)
+                        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                    deferred_bodies.push((local, snapshot.types().clone()));
+                } else {
+                    check_planned_function_locals(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &mut frame,
+                        type_import_execution,
+                        type_import_capabilities,
+                        deferred,
+                        callable,
+                        std::slice::from_ref(local),
+                        arrow_capture,
+                        staged_value_types,
+                        value_order,
+                    )?;
+                }
                 let shared_parameter = callable
                     .parameters
                     .iter()
@@ -46506,6 +46839,60 @@ fn check_planned_linear_function_statements_with_capture_entries(
         return Err(SourceCheckError::Function(
             SourceFunctionInvariant::Callable(callable.body),
         ));
+    }
+
+    for (local, mut flow_types) in deferred_bodies {
+        // Earlier reads keep their creation snapshot. Only later locals need entries.
+        for later in &statements.locals {
+            if !flow_types.contains_key(&later.symbol)
+                && host.node(later.declaration).is_some_and(|later_node| {
+                    host.node(local.declaration)
+                        .is_some_and(|local_node| later_node.range.start > local_node.range.start)
+                })
+                && bound.block_scope_container(later.declaration)
+                    == bound.block_scope_container(local.declaration)
+            {
+                let type_ = staged_value_types.get(&later.symbol).copied().ok_or(
+                    SourceCheckError::Variable(VariableInvariant::MissingStagedValueType(
+                        later.symbol,
+                    )),
+                )?;
+                flow_types.insert(later.symbol, type_);
+            }
+        }
+        let PlannedVariableInitializer::Expression(initializer) = &local.initializer else {
+            return Err(SourceCheckError::Arrow(local.declaration));
+        };
+        let arrow_capture = Some(SourceArrowCaptureContext {
+            declared_types: captured_entry_types,
+            mutable_symbols: None,
+            outer: outer_capture.as_ref(),
+            flow: Some(&statements.flow),
+            assignments: &statements.capture_assignments,
+            value_exports: &[],
+        });
+        session.reset_query();
+        let checked = check_expression_type_with_capture_context(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            &flow_types,
+            type_import_execution,
+            initializer,
+            None,
+            deferred,
+            None,
+            arrow_capture,
+        )?;
+        if staged_value_types.get(&local.symbol) != Some(&checked.result) {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(local.symbol),
+            ));
+        }
     }
 
     let Some(return_statement) = statements.return_statement else {
@@ -116725,6 +117112,289 @@ class Foo2 {
             Some(shape_type)
         );
         assert!(!is_type_checked(&context, types_file));
+    }
+
+    #[test]
+    fn deferred_local_arrow_planning_restores_scope_and_keeps_the_depth_limit() {
+        for (index, trailing) in ["", "const eager = blocked; const blocked = 1;"]
+            .into_iter()
+            .enumerate()
+        {
+            let source = parsed(&format!(
+                "function factory() {{ const deferred = () => {{ ; (() => later)(); {trailing} }}; const later = 1; }}"
+            ));
+            let file = FileId::new(202_811 + u32::try_from(index).unwrap());
+            let context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let declaration = function_declaration(&source, file, "factory");
+            let deferred = variable_initializer(&source, file, "deferred");
+            let (_, bound) = context.file(file).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let callable = plan_source_callable(
+                context.store(),
+                &host,
+                declaration,
+                bound.symbol(declaration).unwrap(),
+                None,
+            )
+            .unwrap();
+            let mut planner = SourcePlanner::new_semantic_with_global_types(
+                &source.arena,
+                bound,
+                context.source_file(file).unwrap(),
+                context.store(),
+                &host,
+                context.global_types(),
+                context.options(),
+            );
+            let before = observable_state(&context, file);
+            for _ in 0..2 {
+                let planned = planner.plan_function_body(&callable);
+                if trailing.is_empty() {
+                    let (_, _, PlannedFunctionBody::Linear(body)) = planned.unwrap() else {
+                        panic!("the owner must retain its real linear body")
+                    };
+                    assert_eq!(body.deferred_local_arrows, HashSet::from([0]));
+                    assert_eq!(body.locals.len(), 2);
+                    assert_eq!(
+                        deferred_local_arrow(&body.locals[0])
+                            .unwrap()
+                            .callable
+                            .declaration,
+                        deferred,
+                    );
+                } else {
+                    assert!(matches!(planned, Err(SourceCheckError::Unsupported(_))));
+                }
+                assert!(planner.prior_variables.is_empty());
+                assert!(planner.readable_variables.is_empty());
+                assert!(planner.hoisted_functions.is_empty());
+                assert!(planner.prior_enums.is_empty());
+                assert_eq!(planner.nested_arrow_depth, 0);
+                assert_eq!(observable_state(&context, file), before);
+            }
+            planner.nested_arrow_depth = MAX_NESTED_SOURCE_ARROW_ARGUMENT_DEPTH;
+            assert!(matches!(
+                planner.plan_function_body(&callable),
+                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(node)))
+                    if node == deferred
+            ));
+            assert!(planner.prior_variables.is_empty());
+            assert!(planner.readable_variables.is_empty());
+            assert_eq!(
+                planner.nested_arrow_depth,
+                MAX_NESTED_SOURCE_ARROW_ARGUMENT_DEPTH
+            );
+            assert_eq!(observable_state(&context, file), before);
+        }
+    }
+
+    #[test]
+    fn deferred_local_arrow_revalidates_its_real_owner_before_warm_answers() {
+        let source = parsed(
+            "function factory() { const deferred = () => { ; (() => later)(); }; const later = 1; }",
+        );
+        let file = FileId::new(202_813);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let plan = SourcePlanner::new_semantic_with_global_types(
+            &source.arena,
+            &bound,
+            context.source_file(file).unwrap(),
+            context.store(),
+            &host,
+            context.global_types(),
+            context.options(),
+        )
+        .finish()
+        .unwrap();
+        let [function] = plan.functions.as_slice() else {
+            panic!("the fixture must retain its one source function")
+        };
+        let PlannedFunctionBody::Linear(body) = &function.body else {
+            panic!("the owner must retain its real local order")
+        };
+        let local = &body.locals[0];
+        let arrow = deferred_local_arrow(local).unwrap();
+        let array_targets = Some(CanonicalArrayTargets::from_global_types(
+            context.global_types(),
+        ));
+        let validate = |context: &CanonicalCheckerContext<'_>, local: &PlannedVariable, targets| {
+            validate_deferred_local_arrow(
+                context.store(),
+                &host,
+                &function.callable,
+                local,
+                targets,
+            )
+        };
+        let before = observable_state(&context, file);
+        assert_eq!(validate(&context, local, array_targets), Ok(()));
+        assert!(validate(&context, local, None).is_err());
+        let mut wrong_local = local.clone();
+        wrong_local.symbol = body.locals[1].symbol;
+        assert!(matches!(
+            validate(&context, &wrong_local, array_targets),
+            Err(SourceCheckError::Arrow(node)) if node == local.declaration
+        ));
+        assert_eq!(observable_state(&context, file), before);
+
+        context.check_source_file(file).unwrap();
+        let callable_type = context
+            .store()
+            .source_callable_type_for_owner(arrow.callable.owner_symbol)
+            .unwrap();
+        assert_eq!(
+            resolved_node_type(&context, arrow.callable.declaration),
+            callable_type
+        );
+        let warm = observable_state(&context, file);
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            arrow.callable.owner_symbol,
+            Some(vec![arrow.callable.declaration]),
+            Some(function.callable.declaration),
+        ));
+        let poisoned = format!("{:#?}", context.store());
+        assert!(validate(&context, local, array_targets).is_err());
+        assert_eq!(format!("{:#?}", context.store()), poisoned);
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            arrow.callable.owner_symbol,
+            Some(vec![arrow.callable.declaration]),
+            Some(arrow.callable.declaration),
+        ));
+        assert_eq!(validate(&context, local, array_targets), Ok(()));
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn deferred_local_arrow_keeps_creation_flow_and_later_write_capture_rules() {
+        for (index, write) in ["", "value = 'later';"].into_iter().enumerate() {
+            let source = parsed(&format!(
+                "function factory(value: string | number) {{ value = 1; const deferred = () => {{ const copy: number = value; }}; {write} const eager = value; }}"
+            ));
+            let file = FileId::new(202_815 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let declaration = function_declaration(&source, file, "factory");
+            let NodeData::FunctionDeclaration(function) =
+                &source.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let [parameter] = function.parameters.nodes.as_slice() else {
+                panic!("the source must retain its one parameter")
+            };
+            let parameter = NodeRef::new(source.arena.id(), file, *parameter);
+            let symbol = context.file(file).unwrap().1.symbol(parameter).unwrap();
+            let captured_read = variable_initializer(&source, file, "copy");
+            let eager_read = variable_initializer(&source, file, "eager");
+            context.check_source_file(file).unwrap();
+            let declared = context
+                .store()
+                .value_symbol_links(symbol)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert!(matches!(
+                context.store().type_payload(declared).unwrap().data(),
+                TypeData::Union(_)
+            ));
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (captured, eager) = if write.is_empty() {
+                assert!(context.diagnostics().is_empty());
+                (bootstrap.number_type, bootstrap.number_type)
+            } else {
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("the deferred assignment must keep its one union mismatch")
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 2322);
+                assert_eq!(diagnostic.node, Some(variable_name(&source, file, "copy")));
+                assert!(diagnostic.range_override.is_none());
+                (declared, bootstrap.string_type)
+            };
+            assert_eq!(resolved_node_type(&context, captured_read), captured);
+            assert_eq!(resolved_node_type(&context, eager_read), eager);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(captured_read)
+                    .unwrap()
+                    .resolved_symbol,
+                Some(symbol),
+            );
+            let diagnostics = context.diagnostics().clone();
+            let warm = observable_state(&context, file);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(context.get_type_at_location(captured_read), Ok(captured));
+                assert_eq!(context.get_type_at_location(eager_read), Ok(eager));
+                assert_eq!(context.diagnostics(), &diagnostics);
+                assert_eq!(observable_state(&context, file), warm);
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_local_arrow_void_header_keeps_pending_return_dependencies_closed() {
+        let source = parsed(concat!(
+            "function factory() { const deferred = () => { pending(); }; const later = 1; } ",
+            "function pending() { return 1; }",
+        ));
+        let file = FileId::new(202_814);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let plan = SourcePlanner::new_semantic_with_global_types(
+            &source.arena,
+            &bound,
+            context.source_file(file).unwrap(),
+            context.store(),
+            &host,
+            context.global_types(),
+            context.options(),
+        )
+        .finish()
+        .unwrap();
+        let [factory, pending] = plan.functions.as_slice() else {
+            panic!("the fixture must retain both source declarations")
+        };
+        let PlannedFunctionBody::Linear(body) = &factory.body else {
+            panic!("the stored body must use the deferred linear path")
+        };
+        assert_eq!(body.deferred_local_arrows, HashSet::from([0]));
+        assert!(pending.callable.return_type.is_inferred());
+        let before = observable_state(&context, file);
+        assert!(matches!(
+            preflight_inferred_function_return_dependencies(
+                context.store(), &host, &plan.functions, &[], &[], &[],
+            ),
+            Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
+                SourceFunctionUnsupported::FunctionBody(node),
+            ))) if node == factory.callable.body
+        ));
+        assert_eq!(observable_state(&context, file), before);
+        for _ in 0..2 {
+            assert!(matches!(
+                context.recheck_source_file(file),
+                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
+                    SourceFunctionUnsupported::FunctionBody(node),
+                ))) if node == factory.callable.body
+            ));
+            assert_eq!(observable_state(&context, file), before);
+        }
     }
 
     #[test]

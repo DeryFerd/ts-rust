@@ -8614,6 +8614,9 @@ impl SyntaxPlanner<'_> {
                     callee_record.kind,
                     SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression
                 ) && !immediate_async_arrow
+                    && !super::source_calls::is_immediately_invoked_source_callable(
+                        self.arena, expression,
+                    )
                     || callee_record.flags.0 != 0
                 {
                     return Err(self.unsupported(
