@@ -26879,7 +26879,7 @@ fn collect_eager_logical_truthiness_conditions(
                 pending.push(&call.callee);
             }
             PlannedExpressionKind::SuperCall(call) => pending.extend(call.arguments()),
-            PlannedExpressionKind::ImportCall(call) => pending.push(&call.specifier),
+            PlannedExpressionKind::ImportCall(call) => pending.extend(call.specifier.as_ref()),
             PlannedExpressionKind::Binary(binary) => {
                 pending.extend(binary.prefix.iter().map(|step| &step.right));
                 pending.extend(binary.shorthand_assignment_initializer());
