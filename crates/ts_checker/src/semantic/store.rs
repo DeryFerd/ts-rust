@@ -4210,18 +4210,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return true;
         }
 
-        let mut declarations = Vec::with_capacity(signature.type_parameters().len());
-        for index in 0..declaration.node.index() {
-            let Ok(index) = u32::try_from(index) else {
-                return false;
-            };
-            let parameter = NodeRef::new(declaration.arena, declaration.file, NodeId::new(index));
-            if self.source_node_kind(parameter) == Some(SyntaxKind::TypeParameter)
-                && self.source_node_parent(parameter) == Some(SourceNodeParent::Parent(declaration))
-            {
-                declarations.push(parameter);
-            }
-        }
+        let Some(mut declarations) = self.source_direct_children(declaration) else {
+            return false;
+        };
+        declarations.retain(|parameter| {
+            parameter.node < declaration.node
+                && self.source_node_kind(*parameter) == Some(SyntaxKind::TypeParameter)
+        });
         if declarations.len() != signature.type_parameters().len() {
             return false;
         }
@@ -4325,22 +4320,23 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 return None;
             }
 
-            let facts = self.source_node_facts.get(&method_declaration.arena)?;
-            let actual_parameter_count = facts
-                .iter()
-                .flatten()
-                .filter(|facts| {
-                    facts.kind == SyntaxKind::Parameter
-                        && facts.parent == Some(method_declaration.node)
-                })
-                .count();
-            if actual_parameter_count != signature.parameters().len() {
+            let mut parameter_declarations = self.source_direct_children(*method_declaration)?;
+            parameter_declarations.retain(|parameter| {
+                self.source_node_kind(*parameter) == Some(SyntaxKind::Parameter)
+            });
+            if parameter_declarations.len() != signature.parameters().len() {
                 return None;
             }
 
             let mut minimum = 0usize;
             let mut has_rest = false;
-            for (index, parameter) in signature.parameters().iter().copied().enumerate() {
+            for (index, (parameter, expected_parameter)) in signature
+                .parameters()
+                .iter()
+                .copied()
+                .zip(parameter_declarations)
+                .enumerate()
+            {
                 let parameter_symbol = self.symbol(parameter)?;
                 let [parameter_declaration] = parameter_symbol.declarations()? else {
                     return None;
@@ -4350,10 +4346,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 let parameter_type = parameter_links.resolved_type?;
                 let parameter_annotation =
                     self.source_direct_type_annotation(parameter_declaration)?;
-                let optional = facts.iter().flatten().any(|facts| {
-                    facts.kind == SyntaxKind::QuestionToken
-                        && facts.parent == Some(parameter_declaration.node)
-                });
+                let parameter_children = self.source_direct_children(parameter_declaration)?;
+                let optional = parameter_children
+                    .iter()
+                    .any(|child| self.source_node_kind(*child) == Some(SyntaxKind::QuestionToken));
                 let bootstrap = self.intrinsic_bootstrap.as_ref()?;
                 let annotation_matches = if optional && bootstrap.options.strict_null_checks {
                     let base = self
@@ -4393,16 +4389,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         parameter_type,
                     )
                 };
-                let expected_parameter = facts
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, facts)| {
-                        let facts = facts.as_ref()?;
-                        (facts.kind == SyntaxKind::Parameter
-                            && facts.parent == Some(method_declaration.node))
-                        .then_some(index)
-                    })
-                    .nth(index)?;
                 if parameter_symbol.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
                     || parameter_symbol.check_flags() != CheckFlags::NONE
                     || parameter_symbol.value_declaration() != Some(parameter_declaration)
@@ -4411,7 +4397,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     || parameter_symbol.parent().is_some()
                     || parameter_symbol.export_symbol().is_some()
                     || self.get_merged_symbol(parameter) != Some(parameter)
-                    || parameter_declaration.node.index() != expected_parameter
+                    || parameter_declaration != expected_parameter
                     || self.source_node_kind(parameter_declaration) != Some(SyntaxKind::Parameter)
                     || self.source_node_parent(parameter_declaration)
                         != Some(SourceNodeParent::Parent(*method_declaration))
@@ -4426,10 +4412,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     return None;
                 }
 
-                let rest = facts.iter().flatten().any(|facts| {
-                    facts.kind == SyntaxKind::DotDotDotToken
-                        && facts.parent == Some(parameter_declaration.node)
-                });
+                let rest = parameter_children
+                    .iter()
+                    .any(|child| self.source_node_kind(*child) == Some(SyntaxKind::DotDotDotToken));
                 if rest && (has_rest || index + 1 != signature.parameters().len()) {
                     return None;
                 }
@@ -15509,6 +15494,111 @@ mod tests {
                 None
             );
         }
+        assert_eq!(format!("{store:?}"), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Compare each method read with its old retained-fact scan.
+    fn declared_method_source_children_match_retained_parameter_scans() {
+        let parsed = parse_source_file(concat!(
+            "interface Contract { ",
+            "run<T, U>(first: T, callback: <V>(value?: V) => U, ",
+            "last?: U, ...rest: T[]): U; ",
+            "run(): number; ",
+            "} ",
+            "type Other = { run<V>(value?: V, ...rest: V[]): void }; ",
+            "declare function unrelated<X>(value?: X, ...rest: X[]): X;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(59);
+        let mut store = TestStore::new();
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+
+        let before = format!("{store:?}");
+        let facts = store.source_node_facts.get(&parsed.arena.id()).unwrap();
+        let mut parameter_shapes = Vec::new();
+        let mut type_parameter_counts = Vec::new();
+        for (method, record) in parsed.arena.iter() {
+            if record.kind != SyntaxKind::MethodSignature {
+                continue;
+            }
+            let method = NodeRef::new(parsed.arena.id(), file, method);
+            let retained_parameters = facts
+                .iter()
+                .enumerate()
+                .filter_map(|(index, child)| {
+                    let child = child.as_ref()?;
+                    (child.kind == SyntaxKind::Parameter && child.parent == Some(method.node))
+                        .then_some(NodeRef::new(
+                            method.arena,
+                            file,
+                            NodeId::new(u32::try_from(index).unwrap()),
+                        ))
+                })
+                .collect::<Vec<_>>();
+            let mut indexed_parameters = store.source_direct_children(method).unwrap();
+            indexed_parameters.retain(|parameter| {
+                store.source_node_kind(*parameter) == Some(SyntaxKind::Parameter)
+            });
+            assert_eq!(indexed_parameters, retained_parameters);
+            assert!(
+                indexed_parameters
+                    .windows(2)
+                    .all(|pair| pair[0].node < pair[1].node)
+            );
+
+            let retained_type_parameters = facts[..method.node.index()]
+                .iter()
+                .enumerate()
+                .filter_map(|(index, child)| {
+                    let child = child.as_ref()?;
+                    (child.kind == SyntaxKind::TypeParameter && child.parent == Some(method.node))
+                        .then_some(NodeRef::new(
+                            method.arena,
+                            file,
+                            NodeId::new(u32::try_from(index).unwrap()),
+                        ))
+                })
+                .collect::<Vec<_>>();
+            let mut indexed_type_parameters = store.source_direct_children(method).unwrap();
+            indexed_type_parameters.retain(|parameter| {
+                parameter.node < method.node
+                    && store.source_node_kind(*parameter) == Some(SyntaxKind::TypeParameter)
+            });
+            assert_eq!(indexed_type_parameters, retained_type_parameters);
+            type_parameter_counts.push(indexed_type_parameters.len());
+
+            let mut shape = Vec::new();
+            for parameter in indexed_parameters {
+                let children = store.source_direct_children(parameter).unwrap();
+                let flags = [SyntaxKind::QuestionToken, SyntaxKind::DotDotDotToken].map(|kind| {
+                    let retained = facts
+                        .iter()
+                        .flatten()
+                        .any(|child| child.kind == kind && child.parent == Some(parameter.node));
+                    let indexed = children
+                        .iter()
+                        .any(|child| store.source_node_kind(*child) == Some(kind));
+                    assert_eq!(indexed, retained);
+                    indexed
+                });
+                shape.push(flags);
+            }
+            parameter_shapes.push(shape);
+        }
+        assert_eq!(type_parameter_counts, vec![2, 0, 1]);
+        assert_eq!(
+            parameter_shapes,
+            vec![
+                vec![[false, false], [false, false], [true, false], [false, true]],
+                vec![],
+                vec![[true, false], [false, true]],
+            ],
+        );
         assert_eq!(format!("{store:?}"), before);
     }
 
