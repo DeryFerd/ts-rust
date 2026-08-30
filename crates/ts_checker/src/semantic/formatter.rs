@@ -13870,7 +13870,7 @@ mod tests {
     }
 
     fn assert_source_object_method_display(
-        context: &CanonicalCheckerContext<'_>,
+        context: &mut CanonicalCheckerContext<'_>,
         declaration: NodeRef,
         callable: TypeId,
         expected: Result<&str, TypeDisplayUnavailable>,
@@ -14048,7 +14048,12 @@ mod tests {
             assert_eq!(related.diagnostic.arguments, ["run", "Shape"]);
             let counts = alias_display_cache_counts(&context);
             for _ in 0..2 {
-                assert_source_object_method_display(&context, declaration, callable, Ok("() => 2"));
+                assert_source_object_method_display(
+                    &mut context,
+                    declaration,
+                    callable,
+                    Ok("() => 2"),
+                );
                 assert_eq!(
                     type_to_string(context.store(), callable),
                     Err(TypeDisplayUnavailable::FunctionType {
@@ -14101,7 +14106,7 @@ mod tests {
                 .is_none()
         );
         assert_source_object_method_display(
-            &context,
+            &mut context,
             declaration,
             callable,
             Ok("(value: number) => number"),
@@ -14162,7 +14167,7 @@ mod tests {
             .unwrap()
             .clone();
         let string = context.store().intrinsic_bootstrap().unwrap().string_type;
-        let reject = |context: &CanonicalCheckerContext<'_>| {
+        let reject = |context: &mut CanonicalCheckerContext<'_>| {
             assert_source_object_method_display(
                 context,
                 declaration,
@@ -14175,14 +14180,14 @@ mod tests {
                 .store_mut_for_test()
                 .set_value_symbol_links(owner, ValueSymbolLinks::default())
         );
-        reject(&context);
+        reject(&mut context);
         assert!(
             context
                 .store_mut_for_test()
                 .set_value_symbol_links(owner, owner_links)
         );
         assert_source_object_method_display(
-            &context,
+            &mut context,
             declaration,
             callable,
             Ok("(value: number) => number"),
@@ -14192,14 +14197,14 @@ mod tests {
                 .store_mut_for_test()
                 .set_signature_links(declaration, SignatureLinks::default())
         );
-        reject(&context);
+        reject(&mut context);
         assert!(
             context
                 .store_mut_for_test()
                 .set_signature_links(declaration, signature_links)
         );
         assert_source_object_method_display(
-            &context,
+            &mut context,
             declaration,
             callable,
             Ok("(value: number) => number"),
@@ -14209,14 +14214,14 @@ mod tests {
                 .store_mut_for_test()
                 .set_signature_resolved_return_type(provenance.signature, Some(string))
         );
-        reject(&context);
+        reject(&mut context);
         assert!(
             context
                 .store_mut_for_test()
                 .set_signature_resolved_return_type(provenance.signature, Some(returned))
         );
         assert_source_object_method_display(
-            &context,
+            &mut context,
             declaration,
             callable,
             Ok("(value: number) => number"),
@@ -14228,14 +14233,14 @@ mod tests {
                 ..parameter_links.clone()
             }
         ));
-        reject(&context);
+        reject(&mut context);
         assert!(
             context
                 .store_mut_for_test()
                 .set_value_symbol_links(parameter, parameter_links)
         );
         assert_source_object_method_display(
-            &context,
+            &mut context,
             declaration,
             callable,
             Ok("(value: number) => number"),
@@ -14245,14 +14250,14 @@ mod tests {
                 .store_mut_for_test()
                 .set_type_symbol(callable, Some(class_method))
         );
-        reject(&context);
+        reject(&mut context);
         assert!(
             context
                 .store_mut_for_test()
                 .set_type_symbol(callable, Some(owner))
         );
         assert_source_object_method_display(
-            &context,
+            &mut context,
             declaration,
             callable,
             Ok("(value: number) => number"),
@@ -14278,7 +14283,7 @@ mod tests {
         );
         assert_malformed_display_without_writes(&context, unbranded);
         assert_source_object_method_display(
-            &context,
+            &mut context,
             declaration,
             callable,
             Ok("(value: number) => number"),
