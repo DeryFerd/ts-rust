@@ -11573,10 +11573,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let readable_variables = self.readable_variables.clone();
         let planned = (|| {
             for parameter in &arrow.parameters {
-                if !self.prior_variables.insert(parameter.symbol)
-                    || !self.readable_variables.insert(parameter.symbol)
-                {
-                    return Err(SourceCheckError::Arrow(parameter.declaration));
+                for symbol in std::iter::once(parameter.symbol).chain(
+                    parameter
+                        .object_bindings
+                        .iter()
+                        .flatten()
+                        .map(|binding| binding.symbol),
+                ) {
+                    if !self.prior_variables.insert(symbol)
+                        || !self.readable_variables.insert(symbol)
+                    {
+                        return Err(SourceCheckError::Arrow(parameter.declaration));
+                    }
                 }
             }
 
@@ -50667,9 +50675,19 @@ fn preflight_contextual_source_publication(
                 .signature_links(arrow.declaration)
                 .is_some_and(|links| links != &super::links::SignatureLinks::default())
             || arrow.parameters.iter().any(|parameter| {
-                store
-                    .value_symbol_links(parameter.symbol)
-                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+                std::iter::once(parameter.symbol)
+                    .chain(
+                        parameter
+                            .object_bindings
+                            .iter()
+                            .flatten()
+                            .map(|binding| binding.symbol),
+                    )
+                    .any(|symbol| {
+                        store
+                            .value_symbol_links(symbol)
+                            .is_some_and(|links| links != &ValueSymbolLinks::default())
+                    })
             })
             || store
                 .type_node_links(arrow.declaration)
@@ -50729,7 +50747,78 @@ fn preflight_contextual_source_publication(
     if !warm_source_is_exact {
         return Err(SourceCheckError::Arrow(arrow.declaration));
     }
+    for binding in arrow
+        .parameters
+        .iter()
+        .filter_map(|parameter| parameter.object_bindings.as_ref())
+        .flatten()
+    {
+        let Some(links) = store.value_symbol_links(binding.symbol) else {
+            return Err(SourceCheckError::Arrow(binding.element));
+        };
+        if links
+            .resolved_type
+            .is_none_or(|type_| store.type_payload(type_).is_none())
+            || links
+                != &(ValueSymbolLinks {
+                    resolved_type: links.resolved_type,
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return Err(SourceCheckError::Arrow(binding.element));
+        }
+    }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // Share the caller's source property query and cache checks.
+fn contextual_object_parameter_binding_types(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    parameter: &super::source_arrows::SourceContextualParameterPlan,
+    parent_type: TypeId,
+) -> Result<Vec<(SemanticSymbolId, ValueSymbolLinks)>, SourceCheckError> {
+    let Some(bindings) = &parameter.object_bindings else {
+        return Ok(Vec::new());
+    };
+    if store
+        .type_payload(parent_type)
+        .is_none_or(|record| record.flags() != TypeFlags::OBJECT)
+    {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Arrow(parameter.name),
+        ));
+    }
+    let mut binding_types = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let type_ = object_parameter_property_type(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            parent_type,
+            binding.property,
+            &binding.property_name,
+        )?;
+        let expected = ValueSymbolLinks {
+            resolved_type: Some(type_),
+            ..ValueSymbolLinks::default()
+        };
+        if store
+            .value_symbol_links(binding.symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default() && links != &expected)
+        {
+            return Err(SourceCheckError::Arrow(binding.element));
+        }
+        binding_types.push((binding.symbol, expected));
+    }
+    Ok(binding_types)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -50787,7 +50876,9 @@ fn materialize_contextual_source_arrow(
     let void = bootstrap.void_type;
     let strict_null_checks = bootstrap.options.strict_null_checks;
     let mut prepared_parameters = Vec::with_capacity(parameters.len());
-    for parameter in &parameters {
+    let mut binding_types = Vec::new();
+    let mut flow_types = current_flow_types.clone();
+    for (parameter, syntax) in parameters.iter().zip(&plan.parameters) {
         let base = match parameter.origin {
             SourceContextualParameterOrigin::ExplicitAnnotation { type_node } => {
                 session.reset_query();
@@ -50835,6 +50926,31 @@ fn materialize_contextual_source_arrow(
             symbol: parameter.symbol,
             type_,
         });
+        if flow_types.insert(parameter.symbol, type_).is_some() {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
+            ));
+        }
+        for (symbol, links) in contextual_object_parameter_binding_types(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            syntax,
+            type_,
+        )? {
+            let type_ = links
+                .resolved_type
+                .ok_or(SourceCheckError::Arrow(parameter.declaration))?;
+            if flow_types.insert(symbol, type_).is_some() {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::DuplicateCurrentFlowType(symbol),
+                ));
+            }
+            binding_types.push((symbol, links));
+        }
     }
 
     let return_type = match (&plan.return_origin, &arrow.body) {
@@ -50849,17 +50965,6 @@ fn materialize_contextual_source_arrow(
             let target_return = target_callable
                 .return_type
                 .ok_or(SourceCheckError::Arrow(plan.contextual_type.type_node))?;
-            let mut flow_types = current_flow_types.clone();
-            for parameter in &prepared_parameters {
-                if flow_types
-                    .insert(parameter.symbol, parameter.type_)
-                    .is_some()
-                {
-                    return Err(SourceCheckError::Variable(
-                        VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
-                    ));
-                }
-            }
             let checked = check_expression_type(
                 store,
                 host,
@@ -50905,6 +51010,13 @@ fn materialize_contextual_source_arrow(
         }
         _ => return Err(SourceCheckError::Arrow(plan.declaration)),
     };
+    let missing_binding_links = binding_types
+        .iter()
+        .filter(|(symbol, _)| store.value_symbol_links(*symbol).is_none())
+        .count();
+    if !store.try_reserve_value_symbol_links(missing_binding_links) {
+        return Err(SourceCheckError::Arrow(plan.declaration));
+    }
     let callable = publish_contextual_source_callable(
         store,
         &PreparedContextualSourceCallable {
@@ -50919,6 +51031,11 @@ fn materialize_contextual_source_arrow(
         },
     )
     .map_err(SourcePlanner::callable_plan_error)?;
+    for (symbol, links) in binding_types {
+        if !store.set_value_symbol_links(symbol, links) {
+            return Err(SourceCheckError::Arrow(plan.declaration));
+        }
+    }
     publish_expression_type(store, plan.declaration, callable)?;
 
     for node in implicit_any_nodes {
@@ -60454,6 +60571,32 @@ pub(super) fn check_source_file(
             &mut type_import_preflight_diagnostics,
         )?
         .preflight_type_from_type_node(arrow.source.contextual_type.type_node)?;
+        if let Some(callable) = store.source_callable_type_for_owner(arrow.source.owner_symbol) {
+            let parameter_types = store
+                .source_callable_provenance(callable)
+                .and_then(|provenance| {
+                    store.callable_signature_parameter_types(provenance.signature)
+                })
+                .ok_or(SourceCheckError::Arrow(arrow.source.declaration))?
+                .to_vec();
+            if parameter_types.len() != arrow.source.parameters.len() {
+                return Err(SourceCheckError::Arrow(arrow.source.declaration));
+            }
+            // Warm preflight checks caches. The execution pass reports binding errors.
+            let mut binding_diagnostics = CanonicalCheckerDiagnostics::default();
+            for (parameter, type_) in arrow.source.parameters.iter().zip(parameter_types) {
+                contextual_object_parameter_binding_types(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut binding_diagnostics,
+                    parameter,
+                    type_,
+                )?;
+            }
+        }
         for annotation in arrow
             .source
             .parameters
@@ -109962,6 +110105,62 @@ class Foo2 {
             );
             assert!(context.store().value_symbol_links(ready_owner).is_none());
             assert!(!is_type_checked(&context, file));
+        }
+    }
+
+    #[test]
+    fn contextual_object_arrow_bindings_reject_poisoned_warm_types() {
+        let source = parsed(concat!(
+            "const ready: () => number = () => 1; ",
+            "const read: (input: { value: number }) => number = ({ value }) => value;",
+        ));
+        let file = FileId::new(19_766);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let binding = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::BindingElement).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(binding).unwrap();
+        let original = context.store().value_symbol_links(symbol).unwrap().clone();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let ready = variable_initializer(&source, file, "ready");
+        let ready_type = resolved_node_type(&context, ready);
+        for poisoned in [
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+            ValueSymbolLinks::default(),
+        ] {
+            mark_source_unchecked(&mut context, file);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(symbol, poisoned.clone(),)
+            );
+            let before = observable_state(&context, file);
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Arrow(binding)),
+            );
+            assert_eq!(observable_state(&context, file), before);
+            assert_eq!(context.store().value_symbol_links(symbol), Some(&poisoned));
+            assert_eq!(resolved_node_type(&context, ready), ready_type);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(symbol, original.clone(),)
+            );
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
         }
     }
 

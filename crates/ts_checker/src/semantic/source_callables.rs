@@ -12368,11 +12368,32 @@ pub(super) fn source_callable_display_projection(
             let name_node = host
                 .node(name)
                 .ok_or(SourceCallableDisplayError::Malformed)?;
-            let NodeData::Identifier(identifier) = &name_node.data else {
-                return Err(SourceCallableDisplayError::Malformed);
+            let name = match &name_node.data {
+                NodeData::Identifier(identifier) => identifier.text.clone(),
+                NodeData::BindingPattern(pattern)
+                    if name_node.kind == SyntaxKind::ObjectBindingPattern =>
+                {
+                    let (arena, bound) = host
+                        .source(provenance.declaration)
+                        .ok_or(SourceCallableDisplayError::Malformed)?;
+                    let bindings = plan_function_object_parameter_bindings(
+                        arena,
+                        bound,
+                        store,
+                        provenance.declaration,
+                        declaration,
+                    )
+                    .map_err(|_| SourceCallableDisplayError::Malformed)?;
+                    source_object_binding_pattern_display(
+                        host,
+                        &bindings,
+                        pattern.elements.has_trailing_comma,
+                    )?
+                }
+                _ => return Err(SourceCallableDisplayError::Malformed),
             };
             parameters.push(ValidatedSingleCallParameterDisplay {
-                name: identifier.text.clone(),
+                name,
                 value_type: *value_type,
                 annotation_type: None,
                 optional: parameter_data.question_token.is_some(),
@@ -12460,37 +12481,11 @@ pub(super) fn source_callable_display_projection(
                     parameter.declaration,
                 )
                 .ok_or(SourceCallableDisplayError::Malformed)?;
-                let mut display = String::from("{");
-                if !bindings.is_empty() {
-                    display.push(' ');
-                }
-                for (index, binding) in bindings.iter().enumerate() {
-                    if index != 0 {
-                        display.push_str(", ");
-                    }
-                    if binding.property != binding.name {
-                        if let Some(key) = binding.computed_key {
-                            display.push('[');
-                            display.push_str(&source_object_binding_property_display(host, key)?);
-                            display.push(']');
-                        } else {
-                            display.push_str(&source_object_binding_property_display(
-                                host,
-                                binding.property,
-                            )?);
-                        }
-                        display.push_str(": ");
-                    }
-                    display.push_str(&source_object_binding_property_display(host, binding.name)?);
-                }
-                if pattern.elements.has_trailing_comma {
-                    display.push(',');
-                }
-                if !bindings.is_empty() {
-                    display.push(' ');
-                }
-                display.push('}');
-                display
+                source_object_binding_pattern_display(
+                    host,
+                    &bindings,
+                    pattern.elements.has_trailing_comma,
+                )?
             }
             NodeData::BindingPattern(pattern)
                 if authenticated_function_array_parameter_bindings(
@@ -12555,6 +12550,44 @@ pub(super) fn source_callable_display_projection(
         parameters,
         return_type,
     })
+}
+
+fn source_object_binding_pattern_display(
+    host: &DeclaredTypeHost<'_>,
+    bindings: &[PlannedObjectBindingElement],
+    trailing_comma: bool,
+) -> Result<String, SourceCallableDisplayError> {
+    let mut display = String::from("{");
+    if !bindings.is_empty() {
+        display.push(' ');
+    }
+    for (index, binding) in bindings.iter().enumerate() {
+        if index != 0 {
+            display.push_str(", ");
+        }
+        if binding.property != binding.name {
+            if let Some(key) = binding.computed_key {
+                display.push('[');
+                display.push_str(&source_object_binding_property_display(host, key)?);
+                display.push(']');
+            } else {
+                display.push_str(&source_object_binding_property_display(
+                    host,
+                    binding.property,
+                )?);
+            }
+            display.push_str(": ");
+        }
+        display.push_str(&source_object_binding_property_display(host, binding.name)?);
+    }
+    if trailing_comma {
+        display.push(',');
+    }
+    if !bindings.is_empty() {
+        display.push(' ');
+    }
+    display.push('}');
+    Ok(display)
 }
 
 fn source_object_binding_property_display(

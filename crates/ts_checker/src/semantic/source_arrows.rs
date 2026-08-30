@@ -31,8 +31,8 @@ use super::{
         source_arrow_owner_expando_exports_are_valid,
     },
     variables::{
-        VariableBindingKind, VariableInvariant, VariablePlanError, VariableUnsupported,
-        plan_top_level_variable,
+        PlannedObjectBindingElement, VariableBindingKind, VariableInvariant, VariablePlanError,
+        VariableUnsupported, plan_function_object_parameter_bindings, plan_top_level_variable,
     },
 };
 
@@ -64,12 +64,13 @@ pub(super) enum SourceContextualParameterRequest {
     RestTail { start: usize },
 }
 
-/// One identifier parameter and its binder-owned value symbol.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// One parameter and its separate binder-owned parameter and object leaf symbols.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceContextualParameterPlan {
     pub(super) declaration: NodeRef,
     pub(super) name: NodeRef,
     pub(super) symbol: SemanticSymbolId,
+    pub(super) object_bindings: Option<Vec<PlannedObjectBindingElement>>,
     pub(super) annotation: Option<NodeRef>,
     pub(super) optional: bool,
     pub(super) rest: bool,
@@ -478,15 +479,21 @@ fn plan_contextual_target_syntax_shape(
     host: &DeclaredTypeHost<'_>,
     type_node: NodeRef,
     array_targets: Option<CanonicalArrayTargets>,
-) -> Result<(SourceContextualSignatureShape, NodeRef), SourceContextualArrowError> {
+) -> Result<(SourceContextualSignatureShape, NodeRef, Vec<NodeRef>), SourceContextualArrowError> {
     let (function, alias) =
         contextual_function_type_syntax(store, host, type_node, None, &mut HashSet::new())?;
     let function_record = preflight_node(store, host, function)?;
-    let (parameter_count, return_type) = match function_record.kind {
+    let (parameter_types, return_type) = match function_record.kind {
         SyntaxKind::FunctionType => {
             let plan = plan_function_type(store, host, function, alias, false, array_targets)
                 .map_err(|error| contextual_target_plan_error(error, type_node))?;
-            (plan.parameters.len(), plan.return_type)
+            (
+                plan.parameters
+                    .iter()
+                    .map(|parameter| parameter.type_node)
+                    .collect::<Vec<_>>(),
+                plan.return_type,
+            )
         }
         SyntaxKind::TypeLiteral | SyntaxKind::InterfaceDeclaration => {
             contextual_declared_call_signature_shape(store, host, function, type_node)?
@@ -525,10 +532,11 @@ fn plan_contextual_target_syntax_shape(
         SourceContextualSignatureShape {
             call_signature_count: 1,
             type_parameter_count: 0,
-            parameter_count,
+            parameter_count: parameter_types.len(),
             has_effective_rest: false,
         },
         return_type,
+        parameter_types,
     ))
 }
 
@@ -538,7 +546,7 @@ fn contextual_declared_call_signature_shape(
     host: &DeclaredTypeHost<'_>,
     owner: NodeRef,
     target: NodeRef,
-) -> Result<(usize, NodeRef), SourceContextualArrowError> {
+) -> Result<(Vec<NodeRef>, NodeRef), SourceContextualArrowError> {
     let record = preflight_node(store, host, owner)?;
     let (members, expected_owner_flags) = match &record.data {
         NodeData::TypeLiteralNode(literal) if record.kind == SyntaxKind::TypeLiteral => {
@@ -624,6 +632,7 @@ fn contextual_declared_call_signature_shape(
             SourceContextualArrowInvariant::InvalidVariableType(return_type),
         ));
     }
+    let mut parameter_types = Vec::with_capacity(call.parameters.nodes.len());
     for parameter in &call.parameters.nodes {
         let parameter = NodeRef::new(signature.arena, signature.file, *parameter);
         let parameter_record = preflight_node(store, host, parameter)?;
@@ -649,8 +658,21 @@ fn contextual_declared_call_signature_shape(
                 SourceContextualArrowUnsupported::ContextualTargetSyntax(parameter),
             ));
         }
+        let annotation = NodeRef::new(
+            parameter.arena,
+            parameter.file,
+            data.type_.expect("the parameter annotation was checked"),
+        );
+        preflight_contextual_child(
+            store,
+            host,
+            parameter,
+            annotation,
+            SourceContextualArrowInvariant::InvalidVariableType(annotation),
+        )?;
+        parameter_types.push(annotation);
     }
-    Ok((call.parameters.nodes.len(), return_type))
+    Ok((parameter_types, return_type))
 }
 
 fn contextual_declared_expando_exports_are_exact(
@@ -1107,7 +1129,7 @@ pub(super) fn plan_contextual_source_arrow(
             SourceContextualArrowInvariant::InvalidVariableType(type_node),
         ));
     }
-    let (contextual_signature_shape, contextual_return_type) =
+    let (contextual_signature_shape, contextual_return_type, contextual_parameter_types) =
         plan_contextual_target_syntax_shape(store, host, type_node, array_targets)?;
 
     let Some(initializer_id) = declaration.initializer else {
@@ -1301,22 +1323,63 @@ pub(super) fn plan_contextual_source_arrow(
 
         let name = NodeRef::new(parameter.arena, parameter.file, data.name);
         let name_record = preflight_node(store, host, name)?;
-        let NodeData::Identifier(parameter_identifier) = &name_record.data else {
-            return Err(contextual_unsupported(
-                SourceContextualArrowUnsupported::DestructuredParameter(parameter),
-            ));
+        let (parameter_name, object_bindings) = match &name_record.data {
+            NodeData::Identifier(identifier) => {
+                if name_record.kind != SyntaxKind::Identifier || identifier.flow_node.is_some() {
+                    return Err(contextual_invariant(
+                        SourceContextualArrowInvariant::InvalidParameter(parameter),
+                    ));
+                }
+                (identifier.text.clone(), None)
+            }
+            NodeData::BindingPattern(_) if name_record.kind == SyntaxKind::ObjectBindingPattern => {
+                let Some(context) = contextual_parameter_types.get(index) else {
+                    return Err(contextual_unsupported(
+                        SourceContextualArrowUnsupported::DestructuredParameter(parameter),
+                    ));
+                };
+                // Object bindings need a real positional object context. Primitive,
+                // union, and exhausted-context bindings remain outside this slice.
+                if !matches!(
+                    preflight_node(store, host, *context)?.kind,
+                    SyntaxKind::TypeLiteral
+                        | SyntaxKind::TypeReference
+                        | SyntaxKind::ParenthesizedType
+                ) {
+                    return Err(contextual_unsupported(
+                        SourceContextualArrowUnsupported::DestructuredParameter(parameter),
+                    ));
+                }
+                let (arena, bound) = host.source(initializer).ok_or_else(|| {
+                    contextual_invariant(SourceContextualArrowInvariant::InvalidParameter(
+                        parameter,
+                    ))
+                })?;
+                let bindings = plan_function_object_parameter_bindings(
+                    arena,
+                    bound,
+                    store,
+                    initializer,
+                    parameter,
+                )
+                .map_err(map_contextual_variable_error)?;
+                (format!("__{index}"), Some(bindings))
+            }
+            _ => {
+                return Err(contextual_unsupported(
+                    SourceContextualArrowUnsupported::DestructuredParameter(parameter),
+                ));
+            }
         };
-        if name_record.kind != SyntaxKind::Identifier
-            || name_record.parent != Some(parameter.node)
+        if name_record.parent != Some(parameter.node)
             || name_record.flags.0 != 0
-            || parameter_identifier.flow_node.is_some()
             || !range_contains(parameter_record.range, name_record.range)
         {
             return Err(contextual_invariant(
                 SourceContextualArrowInvariant::InvalidParameter(parameter),
             ));
         }
-        if parameter_identifier.text == "this" {
+        if parameter_name == "this" {
             return Err(contextual_unsupported(
                 SourceContextualArrowUnsupported::DestructuredParameter(parameter),
             ));
@@ -1435,7 +1498,7 @@ pub(super) fn plan_contextual_source_arrow(
         if symbol != raw_symbol
             || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
             || symbol_record.check_flags() != CheckFlags::NONE
-            || symbol_record.name().as_bytes() != parameter_identifier.text.as_bytes()
+            || symbol_record.name().as_bytes() != parameter_name.as_bytes()
             || symbol_record.declarations() != Some(&[parameter])
             || symbol_record.value_declaration() != Some(parameter)
             || symbol_record.members().is_some()
@@ -1451,6 +1514,7 @@ pub(super) fn plan_contextual_source_arrow(
             declaration: parameter,
             name,
             symbol,
+            object_bindings,
             annotation,
             optional,
             rest,
