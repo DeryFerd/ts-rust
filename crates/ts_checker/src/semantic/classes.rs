@@ -4851,6 +4851,82 @@ fn completed_source_class_method_type(
         .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(symbol)))
 }
 
+/// Reads a completed method's retained return after source and signature validation.
+pub(super) fn completed_source_class_method_signature_return_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+    options: CanonicalTypeQueryOptions,
+) -> Result<TypeId, ClassError> {
+    let invalid = || invariant(ClassInvariant::InvalidPropertyTypeCache(declaration));
+    let record = preflight_node(store, host, declaration)?;
+    if record.kind != SyntaxKind::MethodDeclaration
+        || !matches!(record.data, NodeData::MethodDeclaration(_))
+    {
+        return Err(invalid());
+    }
+    let class = record
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(invalid)?;
+    let class_record = preflight_node(store, host, class)?;
+    if class_record.kind != SyntaxKind::ClassDeclaration
+        || !matches!(class_record.data, NodeData::ClassDeclaration(_))
+    {
+        return Err(invalid());
+    }
+    let method_symbol = bound_symbol(store, host, declaration).ok_or_else(invalid)?;
+    let class_symbol = bound_symbol(store, host, class).ok_or_else(invalid)?;
+    let provenance = store
+        .source_class_provenance_for_symbol(class_symbol)
+        .ok_or_else(invalid)?;
+    validate_source_class_header(store, host, provenance)?;
+    let prepared = &provenance.prepared;
+    let plan = &prepared.plan;
+    if plan.symbol() != class_symbol
+        || plan.declaration() != class
+        || !provenance.complete
+        || plan
+            .type_query_context
+            .as_ref()
+            .is_some_and(|context| context.options != options)
+    {
+        return Err(invalid());
+    }
+    let index = plan
+        .methods
+        .iter()
+        .position(|method| {
+            method.method.declaration == declaration && method.method.symbol == method_symbol
+        })
+        .ok_or_else(invalid)?;
+    if prepared.methods[index].1 != signature {
+        return Err(invalid());
+    }
+    let return_type = provenance.method_returns[index].ok_or_else(invalid)?;
+    let signature_record = store.signature(signature).ok_or_else(invalid)?;
+    let edges = std::iter::once(Some(return_type)).chain(signature_record.parameters().iter().map(
+        |parameter| {
+            store
+                .value_symbol_links(*parameter)
+                .and_then(|links| links.resolved_type)
+        },
+    ));
+    for edge in edges {
+        // The retained plan proves identity, but only this caller grants array access.
+        store
+            .validate_cached_array_capability_with_pending_functions(
+                array_targets,
+                edge.ok_or_else(invalid)?,
+                &[],
+            )
+            .map_err(|_| invalid())?;
+    }
+    Ok(return_type)
+}
+
 /// Checks each overload against its checked implementation, in binder order.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_source_class_method_overloads(
@@ -31639,6 +31715,527 @@ mod query_tests {
             .unwrap();
         let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
         (declaration, symbol)
+    }
+
+    #[test]
+    fn completed_source_method_return_queries_keep_identity_and_replay() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { take(pair: [number, string]): void; } ",
+            "class Receiver implements Shape { take(pair: [number, string]): void {} } ",
+            "class NumberResult { value(): number { return 1; } } ",
+            "class StringResult { static value(): string { return 'ready'; } }",
+        ));
+        let file = FileId::new(14_440);
+        let mut context = context_with_options(
+            &parsed,
+            file,
+            CanonicalModuleState::Script,
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let expected = [
+            ("Receiver", bootstrap.void_type),
+            ("NumberResult", bootstrap.number_type),
+            ("StringResult", bootstrap.string_type),
+        ];
+        let methods = expected.map(|(name, returned)| {
+            let (_, owner) = class(&context, &parsed, file, name);
+            let provenance = context
+                .store()
+                .source_class_provenance_for_symbol(owner)
+                .unwrap();
+            assert!(provenance.complete);
+            let [method] = provenance.prepared.plan.methods.as_slice() else {
+                panic!("each source class has one actual method")
+            };
+            let [(callable, signature)] = provenance.prepared.methods.as_slice() else {
+                panic!("each source method retains one callable and signature")
+            };
+            assert_eq!(provenance.method_returns, [Some(returned)]);
+            assert_eq!(
+                context.store().signature(*signature).unwrap().declaration(),
+                Some(method.method.declaration)
+            );
+            assert_eq!(
+                context.store().type_payload(*callable).unwrap().symbol(),
+                Some(method.method.symbol)
+            );
+            (owner, method.method.declaration, *signature, returned)
+        });
+        assert_ne!(methods[0].2, methods[1].2);
+        assert_ne!(methods[1].2, methods[2].2);
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                standard_field_query_counts(context),
+                context.diagnostics().clone(),
+                methods.map(|(owner, declaration, _, _)| {
+                    (
+                        context
+                            .store()
+                            .source_class_provenance_for_symbol(owner)
+                            .cloned(),
+                        context.store().signature_links(declaration).cloned(),
+                    )
+                }),
+            )
+        };
+        let warm = snapshot(&context);
+        for _ in 0..2 {
+            for (_, declaration, signature, returned) in methods {
+                assert_eq!(
+                    context.get_return_type_of_signature(signature),
+                    Ok(returned)
+                );
+                let host = context.declared_type_host().unwrap();
+                assert_eq!(
+                    completed_source_class_method_signature_return_type(
+                        context.store(),
+                        &host,
+                        declaration,
+                        signature,
+                        None,
+                        context.options().into(),
+                    ),
+                    Ok(returned),
+                    "scalar returns and the fixed keyword tuple do not require Array authority",
+                );
+            }
+            assert_eq!(snapshot(&context), warm);
+            context.check_source_file(file).unwrap();
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(snapshot(&context), warm);
+        }
+    }
+
+    #[test]
+    fn completed_source_method_return_queries_reject_changed_state() {
+        let parsed = parse_source_file(concat!(
+            "class Subject { value: number; ",
+            "take(pair: [number, string]): number { return pair[0]; } } ",
+            "class Other {}",
+        ));
+        let file = FileId::new(14_441);
+        let mut context = context(&parsed, file, CanonicalModuleState::Script);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (_, owner) = class(&context, &parsed, file, "Subject");
+        let (_, other) = class(&context, &parsed, file, "Other");
+        let provenance = context
+            .store()
+            .source_class_provenance_for_symbol(owner)
+            .unwrap()
+            .clone();
+        let prepared = &provenance.prepared;
+        let method = &prepared.plan.methods[0].method;
+        let (callable, signature) = prepared.methods[0];
+        let parameter = method.parameters[0].symbol;
+        let field = context
+            .store()
+            .symbol_table(context.store().symbol(owner).unwrap().members().unwrap())
+            .unwrap()
+            .get_source("value")
+            .unwrap();
+        let returned = provenance.method_returns[0].unwrap();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(
+            returned,
+            context.store().intrinsic_bootstrap().unwrap().number_type
+        );
+        let method_record = context.store().symbol(method.symbol).unwrap();
+        let relationships = (
+            method_record.members(),
+            method_record.exports(),
+            method_record.parent(),
+            method_record.export_symbol(),
+        );
+        let declaration_links = context.store().declared_type_links(owner).unwrap().clone();
+        let parameter_links = context
+            .store()
+            .value_symbol_links(parameter)
+            .unwrap()
+            .clone();
+        let field_links = context.store().value_symbol_links(field).unwrap().clone();
+        let signature_links = context
+            .store()
+            .signature_links(method.declaration)
+            .unwrap()
+            .clone();
+        let other_type = context
+            .store()
+            .declared_type_links(other)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let replacement = context
+            .store_mut_for_test()
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(method.declaration),
+                Vec::new(),
+                None,
+                vec![parameter],
+                Some(returned),
+                None,
+                1,
+            )
+            .unwrap();
+        assert_ne!(replacement, signature);
+        let invalid = |signature| {
+            DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                signature,
+            ))
+        };
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            let TypeData::Object(object) = context.store().type_payload(callable).unwrap().data()
+            else {
+                panic!("the real method keeps its callable object")
+            };
+            (
+                standard_field_query_counts(context),
+                context.store().relation_state_snapshot(),
+                context.diagnostics().clone(),
+                context
+                    .store()
+                    .source_class_provenance(prepared.instance_type)
+                    .cloned(),
+                context.store().declared_type_links(owner).cloned(),
+                context.store().symbol(method.symbol).unwrap().parent(),
+                context.store().value_symbol_links(parameter).cloned(),
+                context.store().value_symbol_links(field).cloned(),
+                context.store().signature_links(method.declaration).cloned(),
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                object.structured.signatures.clone(),
+            )
+        };
+        let before = snapshot(&context);
+        assert_eq!(
+            context.get_return_type_of_signature(replacement),
+            Err(invalid(replacement))
+        );
+        assert_eq!(snapshot(&context), before);
+        assert_eq!(
+            context.get_return_type_of_signature(signature),
+            Ok(returned)
+        );
+        for poison in 0..6 {
+            let store = context.store_mut_for_test();
+            match poison {
+                0 => assert!(store.set_signature_resolved_return_type(signature, Some(wrong))),
+                1 => assert!(store.set_value_symbol_links(
+                    parameter,
+                    ValueSymbolLinks {
+                        resolved_type: Some(wrong),
+                        ..ValueSymbolLinks::default()
+                    }
+                )),
+                2 => assert!(store.set_symbol_relationships(
+                    method.symbol,
+                    relationships.0,
+                    relationships.1,
+                    Some(other),
+                    relationships.3,
+                )),
+                3 => {
+                    let mut changed = declaration_links.clone();
+                    changed.declared_type = Some(other_type);
+                    assert!(store.set_declared_type_links(owner, changed));
+                }
+                4 => assert!(store.set_value_symbol_links(
+                    field,
+                    ValueSymbolLinks {
+                        resolved_type: Some(wrong),
+                        ..ValueSymbolLinks::default()
+                    }
+                )),
+                5 => {
+                    assert!(store.set_signature_links(
+                        method.declaration,
+                        SignatureLinks {
+                            resolved_signature: ResolvedSignatureState::Resolved(replacement),
+                            ..SignatureLinks::default()
+                        }
+                    ));
+                    assert!(store.set_structured_type_members(
+                        callable,
+                        None,
+                        None,
+                        Some(vec![replacement]),
+                        None,
+                        None
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            let changed = snapshot(&context);
+            for _ in 0..2 {
+                assert_eq!(
+                    context.get_return_type_of_signature(signature),
+                    Err(invalid(signature)),
+                    "poison {poison}"
+                );
+                assert_eq!(snapshot(&context), changed);
+            }
+            if poison == 5 {
+                assert_eq!(
+                    context.get_return_type_of_signature(replacement),
+                    Err(invalid(replacement))
+                );
+                assert_eq!(snapshot(&context), changed);
+            }
+            let store = context.store_mut_for_test();
+            assert!(store.set_signature_resolved_return_type(signature, Some(returned)));
+            assert!(store.set_value_symbol_links(parameter, parameter_links.clone()));
+            assert!(store.set_symbol_relationships(
+                method.symbol,
+                relationships.0,
+                relationships.1,
+                relationships.2,
+                relationships.3
+            ));
+            assert!(store.set_declared_type_links(owner, declaration_links.clone()));
+            assert!(store.set_value_symbol_links(field, field_links.clone()));
+            assert!(store.set_signature_links(method.declaration, signature_links.clone()));
+            assert!(store.set_structured_type_members(
+                callable,
+                None,
+                None,
+                Some(vec![signature]),
+                None,
+                None
+            ));
+            let restored = snapshot(&context);
+            assert_eq!(
+                context.get_return_type_of_signature(signature),
+                Ok(returned)
+            );
+            assert_eq!(snapshot(&context), restored);
+        }
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            context.get_return_type_of_signature(signature),
+            Ok(returned)
+        );
+    }
+
+    #[test]
+    fn completed_source_method_return_queries_require_completion_and_caller_arrays() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let parsed = parse_source_file("class Subject { take(items: number[]): void {} }");
+        let library_file = FileId::new(14_442);
+        let file = FileId::new(14_443);
+        let mut binder = CanonicalBinder::new();
+        for (source, id, library, path) in [
+            (&library, library_file, true, "\"/lib.d.ts\""),
+            (&parsed, file, false, "\"/method-return.ts\""),
+        ] {
+            assert!(source.diagnostics.is_empty());
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    id,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        library,
+                        library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&source.arena, id)
+                .unwrap();
+        }
+        let options = CanonicalCheckerOptions::default();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(library_file, &library.arena), (file, &parsed.arena)],
+            options,
+        )
+        .unwrap();
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, &library_bound), (&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        for target in [globals.array_type, globals.readonly_array_type] {
+            let symbol = context
+                .store()
+                .type_payload(target)
+                .unwrap()
+                .symbol()
+                .unwrap();
+            let declaration = context
+                .store()
+                .symbol(symbol)
+                .unwrap()
+                .declarations()
+                .unwrap()[0];
+            assert_eq!(declaration.file, library_file);
+            assert_eq!(library_bound.symbol(declaration), Some(symbol));
+        }
+        let (_, owner) = class(&context, &parsed, file, "Subject");
+        let annotation = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrayType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let array = context.get_type_from_type_node(annotation).unwrap();
+        let reference = context
+            .store()
+            .canonical_array_reference_with_targets(targets, array)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reference.element_type,
+            context.store().intrinsic_bootstrap().unwrap().number_type
+        );
+        assert!(!reference.readonly);
+        assert!(
+            context
+                .store()
+                .source_class_provenance_for_symbol(owner)
+                .is_none()
+        );
+        let query_context = ClassTypeQueryContext::new(&globals, options);
+        let plan = plan_source_class_members_with_type_context(
+            context.store(),
+            &host,
+            owner,
+            Some(&query_context),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let prepared = prepare_source_class_members_with_type_queries(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            &plan,
+        )
+        .unwrap();
+        let method = &prepared.plan.methods[0].method;
+        let signature = prepared.methods[0].1;
+        let invalid = DeclaredTypeError::TypeNodeUnavailable(
+            TypeNodeUnavailable::InvalidFunctionSignature(signature),
+        );
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                standard_field_query_counts(context),
+                context.store().relation_state_snapshot(),
+                context
+                    .store()
+                    .source_class_provenance(prepared.instance_type)
+                    .cloned(),
+                context
+                    .store()
+                    .source_file_links(context.source_file(file).unwrap())
+                    .cloned(),
+                context.store().signature_links(method.declaration).cloned(),
+                context.diagnostics().clone(),
+            )
+        };
+        let incomplete = snapshot(&context);
+        for _ in 0..2 {
+            assert_eq!(
+                context.get_return_type_of_signature(signature),
+                Err(invalid)
+            );
+            assert_eq!(snapshot(&context), incomplete);
+            assert!(
+                !context
+                    .store()
+                    .source_class_provenance(prepared.instance_type)
+                    .unwrap()
+                    .complete
+            );
+        }
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert!(
+            context
+                .store()
+                .source_class_provenance(prepared.instance_type)
+                .unwrap()
+                .complete
+        );
+        let returned = context.store().intrinsic_bootstrap().unwrap().void_type;
+        assert_eq!(
+            context.get_return_type_of_signature(signature),
+            Ok(returned)
+        );
+        let warm = snapshot(&context);
+        let wrong_targets = CanonicalArrayTargets::for_test(
+            globals.readonly_array_type,
+            globals.readonly_array_type,
+        );
+        let invalid_read =
+            ClassError::Invariant(ClassInvariant::InvalidPropertyTypeCache(method.declaration));
+        for supplied in [None, Some(wrong_targets)] {
+            assert_eq!(
+                completed_source_class_method_signature_return_type(
+                    context.store(),
+                    &host,
+                    method.declaration,
+                    signature,
+                    supplied,
+                    options.into(),
+                ),
+                Err(invalid_read)
+            );
+            assert_eq!(snapshot(&context), warm);
+        }
+        let mut wrong_options: CanonicalTypeQueryOptions = options.into();
+        wrong_options.no_implicit_any = !wrong_options.no_implicit_any;
+        assert_eq!(
+            completed_source_class_method_signature_return_type(
+                context.store(),
+                &host,
+                method.declaration,
+                signature,
+                Some(targets),
+                wrong_options,
+            ),
+            Err(invalid_read)
+        );
+        assert_eq!(snapshot(&context), warm);
+        assert_eq!(
+            completed_source_class_method_signature_return_type(
+                context.store(),
+                &host,
+                method.declaration,
+                signature,
+                Some(targets),
+                options.into(),
+            ),
+            Ok(returned)
+        );
+        assert_eq!(snapshot(&context), warm);
     }
 
     fn standard_field_query_nodes(
