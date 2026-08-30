@@ -15480,13 +15480,14 @@ mod tests {
                     .enumerate()
                     .filter_map(|(index, child)| {
                         let child = child.as_ref()?;
-                        (child.parent == Some(parent.node) && child.kind == kind).then(|| {
-                            NodeRef::new(
-                                parent.arena,
-                                parent.file,
-                                NodeId::new(u32::try_from(index).unwrap()),
-                            )
-                        })
+                        if child.parent != Some(parent.node) || child.kind != kind {
+                            return None;
+                        }
+                        Some(NodeRef::new(
+                            parent.arena,
+                            parent.file,
+                            NodeId::new(u32::try_from(index).unwrap()),
+                        ))
                     })
                     .collect::<Vec<_>>();
                 let expected = match matching.as_slice() {
