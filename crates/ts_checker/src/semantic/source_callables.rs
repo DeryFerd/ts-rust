@@ -4482,7 +4482,7 @@ pub(super) fn source_object_literal_method_symbol(
     })
 }
 
-/// Authenticates one unparenthesized callback in a direct, array, or global sort call.
+/// Authenticates one unparenthesized callback in a direct or source-owned method call.
 #[allow(clippy::too_many_lines)] // Validate the callback, array owner, and source container.
 pub(super) fn source_direct_call_argument_arrow_is_exact(
     store: &CanonicalTypeMapperStore,
@@ -4547,11 +4547,6 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
         NodeData::PropertyAccessExpression(property)
             if callee_record.kind == SyntaxKind::PropertyAccessExpression =>
         {
-            let Some(name) =
-                super::source_calls::source_global_array_callback_method_name(host, callee)
-            else {
-                return Ok(false);
-            };
             let receiver = NodeRef::new(callee.arena, callee.file, property.expression);
             if preflight_node(store, host, receiver)?.parent != Some(callee.node)
                 || property.question_dot_token.is_some()
@@ -4560,23 +4555,28 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
             {
                 return Ok(false);
             }
-            let Some(globals) = store
+            let globals = store
                 .intrinsic_bootstrap()
-                .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
-            else {
-                return Ok(false);
-            };
-            ["Array", "ReadonlyArray"].iter().any(|owner| {
-                globals
-                    .get_source(owner)
-                    .and_then(|owner| store.get_merged_symbol(owner))
-                    .and_then(|owner| store.symbol(owner))
-                    .and_then(ts_binder::semantic::Symbol::members)
-                    .and_then(|members| store.symbol_table(members))
-                    .and_then(|members| members.get_source(&name))
-                    .and_then(|method| store.symbol(method))
-                    .is_some_and(|method| method.flags() == SymbolFlags::METHOD)
-            })
+                .and_then(|bootstrap| store.symbol_table(bootstrap.globals));
+            let array_method =
+                super::source_calls::source_global_array_callback_method_name(host, callee)
+                    .is_some_and(|name| {
+                        globals.is_some_and(|globals| {
+                            ["Array", "ReadonlyArray"].iter().any(|owner| {
+                                globals
+                                    .get_source(owner)
+                                    .and_then(|owner| store.get_merged_symbol(owner))
+                                    .and_then(|owner| store.symbol(owner))
+                                    .and_then(ts_binder::semantic::Symbol::members)
+                                    .and_then(|members| store.symbol_table(members))
+                                    .and_then(|members| members.get_source(&name))
+                                    .and_then(|method| store.symbol(method))
+                                    .is_some_and(|method| method.flags() == SymbolFlags::METHOD)
+                            })
+                        })
+                    });
+            array_method
+                || source_fixed_method_callback_is_exact(store, host, call, callee, declaration)?
         }
         _ => false,
     };
@@ -4646,6 +4646,395 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
                 && symbol.export_symbol().is_none()
         })
         && callee_valid)
+}
+
+/// Proves a cold receiver annotation without asking for a member or a value type.
+#[allow(clippy::too_many_lines)] // The variable, annotation, and resolver must share one source owner.
+fn source_fixed_method_callback_receiver(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    receiver: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceCallableError> {
+    let invalid = || invariant(SourceCallableInvariant::InvalidOwnerSymbol(receiver));
+    let record = preflight_node(store, host, receiver)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Ok(None);
+    };
+    if record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Ok(None);
+    }
+    let (arena, bound) = host.source(receiver).ok_or_else(invalid)?;
+    let mut resolver_host = host.name_resolver_host(store)?;
+    let mut resolver =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut resolver_host)
+            .map_err(DeclaredTypeError::from)?;
+    let Some(symbol) = resolver
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(receiver)),
+            &identifier.text,
+            SymbolFlags::VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?
+    else {
+        return Ok(None);
+    };
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    let Some(declaration) = owner.value_declaration() else {
+        return Ok(None);
+    };
+    if !declaration.is_for(receiver.arena, receiver.file) {
+        return Ok(None);
+    }
+    let declaration_record = preflight_node(store, host, declaration)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Ok(None);
+    };
+    let Some(annotation) = variable.type_ else {
+        return Ok(None);
+    };
+    if variable.initializer.is_some() || variable.exclamation_token.is_some() {
+        return Ok(None);
+    }
+    let name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(name_data) = &name_record.data else {
+        return Ok(None);
+    };
+    let Some(SourceNodeParent::Parent(list)) = store.source_node_parent(declaration) else {
+        return Err(invalid());
+    };
+    let list_record = preflight_node(store, host, list)?;
+    let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
+        return Err(invalid());
+    };
+    let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(list) else {
+        return Err(invalid());
+    };
+    let statement_record = preflight_node(store, host, statement)?;
+    let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+        return Err(invalid());
+    };
+    if store.source_node_parent(statement) != Some(SourceNodeParent::Parent(bound.source_file()))
+        || declaration_record.range.end > record.range.start
+    {
+        return Ok(None);
+    }
+    if declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || variable.symbol.is_some()
+        || variable.local_symbol.is_some()
+        || variable.facts != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || name_data.flow_node.is_some()
+        || name_data.text != identifier.text
+        || list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_data.facts != 0
+        || list_data
+            .declarations
+            .nodes
+            .iter()
+            .filter(|node| **node == declaration.node)
+            .count()
+            != 1
+        || statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.flags.0 != 0
+        || statement_data.declaration_list != list.node
+        || statement_data.flow_node.is_some()
+        || statement_data.facts != 0
+    {
+        return Err(invalid());
+    }
+    if let Some(modifiers) = &statement_data.modifiers {
+        let [modifier] = modifiers.list.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let modifier = NodeRef::new(statement.arena, statement.file, *modifier);
+        let modifier_record = preflight_node(store, host, modifier)?;
+        if modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifier_record.kind != SyntaxKind::DeclareKeyword
+            || modifier_record.flags.0 != 0
+            || modifier_record.parent != Some(statement.node)
+        {
+            return Ok(None);
+        }
+    }
+    let binding = match list_record.flags.0 {
+        0 => super::variables::VariableBindingKind::Var,
+        1 => super::variables::VariableBindingKind::Let,
+        2 => super::variables::VariableBindingKind::Const,
+        _ => return Ok(None),
+    };
+    let planned = match super::variables::plan_top_level_variable(
+        bound,
+        store,
+        declaration,
+        name,
+        &name_data.text,
+        binding,
+        false,
+    ) {
+        Ok(symbol) => symbol,
+        Err(super::variables::VariablePlanError::Unsupported(_)) => return Ok(None),
+        Err(super::variables::VariablePlanError::Invariant(_)) => return Err(invalid()),
+        Err(super::variables::VariablePlanError::DeclaredType(error)) => return Err(error.into()),
+    };
+    if planned != symbol {
+        return Err(invalid());
+    }
+    let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
+    let annotation_record = preflight_node(store, host, annotation)?;
+    let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+        return Ok(None);
+    };
+    if reference.type_arguments.is_some() {
+        return Ok(None);
+    }
+    let reference_name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+    let reference_name_record = preflight_node(store, host, reference_name)?;
+    let NodeData::Identifier(type_name) = &reference_name_record.data else {
+        return Ok(None);
+    };
+    if annotation_record.kind != SyntaxKind::TypeReference
+        || annotation_record.flags.0 != 0
+        || annotation_record.parent != Some(declaration.node)
+        || reference_name_record.kind != SyntaxKind::Identifier
+        || reference_name_record.parent != Some(annotation.node)
+        || reference_name_record.flags.0 != 0
+        || type_name.flow_node.is_some()
+        || type_name.text.is_empty()
+    {
+        return Err(invalid());
+    }
+    let Some(interface) = resolver
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(reference_name)),
+            &type_name.text,
+            SymbolFlags::TYPE,
+            None,
+            true,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(None);
+    };
+    let interface_record = store.symbol(interface).ok_or_else(invalid)?;
+    if !interface_record.flags().contains(SymbolFlags::INTERFACE)
+        || interface_record.flags().contains(SymbolFlags::CLASS)
+    {
+        return Ok(None);
+    }
+    let expected_type = store
+        .declared_type_links(interface)
+        .and_then(|links| links.declared_type);
+    for node in [annotation, receiver] {
+        if store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+            .is_some_and(|type_| Some(type_) != expected_type)
+        {
+            return Err(invariant(SourceCallableInvariant::InvalidTypeCache(node)));
+        }
+    }
+    if store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type)
+        .is_some_and(|type_| Some(type_) != expected_type)
+        || store
+            .symbol_node_links(receiver)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|cached| cached != symbol)
+        || store
+            .symbol_node_links(reference_name)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|cached| store.get_merged_symbol(cached) != Some(interface))
+    {
+        return Err(invalid());
+    }
+    Ok(Some(interface))
+}
+
+/// The callback position belongs to every real fixed overload, in declaration order.
+#[allow(clippy::too_many_lines)] // Keep the selected method and its nested function annotations together.
+fn source_fixed_method_callback_is_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    call: NodeRef,
+    callee: NodeRef,
+    callback: NodeRef,
+) -> Result<bool, SourceCallableError> {
+    let invalid = || invariant(SourceCallableInvariant::InvalidOwnerSymbol(callee));
+    let call_record = preflight_node(store, host, call)?;
+    let NodeData::CallExpression(call_data) = &call_record.data else {
+        return Err(invalid());
+    };
+    let Some(index) = call_data
+        .arguments
+        .nodes
+        .iter()
+        .position(|node| *node == callback.node)
+    else {
+        return Err(invalid());
+    };
+    let property_record = preflight_node(store, host, callee)?;
+    let NodeData::PropertyAccessExpression(property) = &property_record.data else {
+        return Err(invalid());
+    };
+    let receiver = NodeRef::new(callee.arena, callee.file, property.expression);
+    let Some(owner) = source_fixed_method_callback_receiver(store, host, receiver)? else {
+        return Ok(false);
+    };
+    let name = NodeRef::new(callee.arena, callee.file, property.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Ok(false);
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(callee.node)
+        || name_record.flags.0 != 0
+        || identifier.flow_node.is_some()
+    {
+        return Err(invalid());
+    }
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    for declaration in owner_record.declarations().ok_or_else(invalid)? {
+        let record = preflight_node(store, host, *declaration)?;
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            return Ok(false);
+        };
+        if interface.type_parameters.is_some() || interface.heritage_clauses.is_some() {
+            return Ok(false);
+        }
+    }
+    let Some(method) = owner_record
+        .members()
+        .and_then(|table| store.symbol_table(table))
+        .and_then(|table| table.get_source(&identifier.text))
+        .and_then(|method| store.get_merged_symbol(method))
+    else {
+        return Ok(false);
+    };
+    let method_record = store.symbol(method).ok_or_else(invalid)?;
+    if method_record.name().as_utf8() != Some(identifier.text.as_str())
+        || store.get_parent_of_symbol(method) != Some(owner)
+        || !store.source_merged_symbol_declarations_match(method)
+    {
+        return Err(invalid());
+    }
+    if method_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::METHOD {
+        return Ok(false);
+    }
+    let plan = match super::object_members::plan_selected_interface_method(store, host, method) {
+        Ok(plan) => plan,
+        Err(super::object_members::PropertyObjectError::UnsupportedMember { .. }) => {
+            return Ok(false);
+        }
+        Err(_) => return Err(invalid()),
+    };
+    if plan.symbol != owner || plan.methods.is_empty() {
+        return Err(invalid());
+    }
+    for method in &plan.methods {
+        if !method.type_parameters.is_empty()
+            || method.computed_key.is_some()
+            || method.flags.contains(SignatureFlags::HAS_REST_PARAMETER)
+            || method.parameters.iter().any(|parameter| parameter.optional)
+        {
+            return Ok(false);
+        }
+        let Some(parameter) = method.parameters.get(index) else {
+            return Ok(false);
+        };
+        let callback_record = preflight_node(store, host, parameter.type_node)?;
+        if callback_record.kind != SyntaxKind::FunctionType {
+            return Ok(false);
+        }
+        let callback_plan =
+            match plan_function_type(store, host, parameter.type_node, None, false, None) {
+                Ok(plan) => plan,
+                Err(super::functions::FunctionTypeError::Unsupported(_)) => return Ok(false),
+                Err(_) => {
+                    return Err(invariant(SourceCallableInvariant::InvalidParameter(
+                        method.declaration,
+                    )));
+                }
+            };
+        if !callback_plan.type_parameters.is_empty()
+            || callback_plan.flags != SignatureFlags::NONE
+            || callback_plan.type_predicate.is_some()
+            || callback_plan
+                .parameters
+                .iter()
+                .any(|parameter| parameter.optional)
+        {
+            return Ok(false);
+        }
+    }
+    for node in [callee, name] {
+        if store
+            .symbol_node_links(node)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|cached| cached != method)
+        {
+            return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(node)));
+        }
+    }
+    let method_type = store
+        .value_symbol_links(method)
+        .and_then(|links| links.resolved_type);
+    let expected_links =
+        super::object_members::declared_method_value_links(store, method, method_type)
+            .ok_or_else(invalid)?;
+    if store
+        .value_symbol_links(method)
+        .is_some_and(|links| links != &expected_links)
+    {
+        return Err(invalid());
+    }
+    if let Some(type_) = method_type {
+        let super::callable_sets::StoredCallableSetValidation::Valid { projection, .. } =
+            super::callable_sets::validate_stored_callable_set(store, type_)
+        else {
+            return Err(invariant(SourceCallableInvariant::InvalidTypeCache(callee)));
+        };
+        if projection.owner != type_
+            || !projection.construct_signatures.is_empty()
+            || projection.call_signatures.len() != plan.methods.len()
+            || projection
+                .call_signatures
+                .iter()
+                .zip(&plan.methods)
+                .any(|(call, method)| {
+                    store
+                        .signature(call.signature)
+                        .and_then(Signature::declaration)
+                        != Some(method.declaration)
+                })
+        {
+            return Err(invalid());
+        }
+    }
+    for node in [callee, name] {
+        if store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+            .is_some_and(|cached| Some(cached) != method_type)
+        {
+            return Err(invariant(SourceCallableInvariant::InvalidTypeCache(node)));
+        }
+    }
+    Ok(true)
 }
 
 /// Keeps an Array callback inside the existing captured-local assignment proof.
@@ -15848,6 +16237,340 @@ mod tests {
             CanonicalCheckerOptions::default(),
         )
         .unwrap()
+    }
+
+    const FIXED_METHOD_FIRST: &str =
+        "interface Visitor { visit(kind: 'text', callback: (value: string) => string): string; }";
+    const FIXED_METHOD_SECOND: &str =
+        "interface Visitor { visit(kind: 'count', callback: (value: number) => number): number; }";
+    const FIXED_METHOD_SOURCE: &str = concat!(
+        "declare const visitor: Visitor;\n",
+        "const text = visitor.visit('text', value => value);\n",
+        "const count = visitor.visit('count', value => value + 1);\n",
+    );
+
+    fn fixed_method_callback_context<'a>(
+        sources: &[(FileId, &'a ParseResult)],
+    ) -> CanonicalCheckerContext<'a> {
+        let mut binder = CanonicalBinder::new();
+        for (index, (file, parsed)) in sources.iter().enumerate() {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    *file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/fixed-method-{index}.ts\"")),
+                        CanonicalSourceLanguage::TypeScript,
+                        index + 1 != sources.len(),
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+        }
+        for (file, parsed) in sources {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, *file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            sources
+                .iter()
+                .map(|(file, parsed)| (*file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                strict_function_types: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn fixed_method_callback_arrows(parsed: &ParseResult, file: FileId) -> Vec<NodeRef> {
+        let mut nodes = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some((
+                    record.range.start,
+                    NodeRef::new(parsed.arena.id(), file, node),
+                ))
+            })
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|(start, _)| *start);
+        nodes.into_iter().map(|(_, node)| node).collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check cold proof, both query orders, and real overload order together.
+    fn fixed_method_callback_admission_keeps_real_merged_order_and_context() {
+        let first = parse_source_file(FIXED_METHOD_FIRST);
+        let second = parse_source_file(FIXED_METHOD_SECOND);
+        let source = parse_source_file(FIXED_METHOD_SOURCE);
+        let first_file = FileId::new(96_570);
+        let second_file = FileId::new(96_571);
+        let file = FileId::new(96_572);
+        let arrows = fixed_method_callback_arrows(&source, file);
+        assert_eq!(arrows.len(), 2);
+        for reverse in [false, true] {
+            for query_first in [false, true] {
+                let declarations = if reverse {
+                    [(second_file, &second), (first_file, &first)]
+                } else {
+                    [(first_file, &first), (second_file, &second)]
+                };
+                let mut context = fixed_method_callback_context(&[
+                    declarations[0],
+                    declarations[1],
+                    (file, &source),
+                ]);
+                let cold = generic_transaction_state(context.store());
+                for &arrow in &arrows {
+                    assert_eq!(
+                        source_direct_call_argument_arrow_is_exact(
+                            context.store(),
+                            &context.declared_type_host().unwrap(),
+                            arrow
+                        ),
+                        Ok(true)
+                    );
+                }
+                assert_eq!(generic_transaction_state(context.store()), cold);
+                if query_first {
+                    context.get_type_at_location(arrows[0]).unwrap();
+                }
+                context.check_source_file(file).unwrap();
+                assert!(
+                    context.diagnostics().is_empty(),
+                    "{:?}",
+                    context.diagnostics()
+                );
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                let expected = [bootstrap.string_type, bootstrap.number_type];
+                for (&arrow, expected) in arrows.iter().zip(expected) {
+                    let NodeData::ArrowFunction(data) = &source.arena.get(arrow.node).unwrap().data
+                    else {
+                        unreachable!()
+                    };
+                    let parameter = NodeRef::new(arrow.arena, file, data.parameters.nodes[0]);
+                    let symbol = context.file(file).unwrap().1.symbol(parameter).unwrap();
+                    assert_eq!(
+                        context
+                            .store()
+                            .value_symbol_links(symbol)
+                            .unwrap()
+                            .resolved_type,
+                        Some(expected)
+                    );
+                    let type_ = context.get_type_at_location(arrow).unwrap();
+                    let provenance = context.store().source_callable_provenance(type_).unwrap();
+                    assert!(provenance.contextual_target.is_some());
+                    assert_eq!(
+                        context
+                            .store()
+                            .signature(provenance.signature)
+                            .unwrap()
+                            .resolved_return_type(),
+                        Some(expected)
+                    );
+                    let SourceNodeParent::Parent(call) =
+                        context.store().source_node_parent(arrow).unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    assert_eq!(context.get_type_at_location(call).unwrap(), expected);
+                }
+                let owner = context
+                    .store()
+                    .symbol_table(context.globals())
+                    .unwrap()
+                    .get_source("Visitor")
+                    .unwrap();
+                let owner = context.store().get_merged_symbol(owner).unwrap();
+                let member = context.store().symbol(owner).unwrap().members().unwrap();
+                let member = context
+                    .store()
+                    .symbol_table(member)
+                    .unwrap()
+                    .get_source("visit")
+                    .unwrap();
+                let member = context.store().get_merged_symbol(member).unwrap();
+                let plan = super::super::object_members::plan_selected_interface_method(
+                    context.store(),
+                    &context.declared_type_host().unwrap(),
+                    member,
+                )
+                .unwrap();
+                assert_eq!(
+                    plan.methods
+                        .iter()
+                        .map(|method| method.declaration.file)
+                        .collect::<Vec<_>>(),
+                    declarations.map(|(file, _)| file)
+                );
+                let warm = generic_transaction_state(context.store());
+                for _ in 0..2 {
+                    context.recheck_source_file(file).unwrap();
+                    for &arrow in &arrows {
+                        assert_eq!(
+                            source_direct_call_argument_arrow_is_exact(
+                                context.store(),
+                                &context.declared_type_host().unwrap(),
+                                arrow
+                            ),
+                            Ok(true)
+                        );
+                    }
+                    assert_eq!(generic_transaction_state(context.store()), warm);
+                    assert!(context.diagnostics().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each damaged receiver/member cache is restored on the same source.
+    fn fixed_method_callback_admission_rejects_receiver_and_member_cache_damage() {
+        let first = parse_source_file(FIXED_METHOD_FIRST);
+        let second = parse_source_file(FIXED_METHOD_SECOND);
+        let source = parse_source_file(FIXED_METHOD_SOURCE);
+        let file = FileId::new(96_575);
+        let arrow = fixed_method_callback_arrows(&source, file)[0];
+        for warm in [false, true] {
+            for damage_symbol in [false, true] {
+                let mut context = fixed_method_callback_context(&[
+                    (FileId::new(96_573), &first),
+                    (FileId::new(96_574), &second),
+                    (file, &source),
+                ]);
+                if warm {
+                    context.check_source_file(file).unwrap();
+                }
+                let SourceNodeParent::Parent(call) =
+                    context.store().source_node_parent(arrow).unwrap()
+                else {
+                    unreachable!()
+                };
+                let NodeData::CallExpression(call_data) =
+                    &source.arena.get(call.node).unwrap().data
+                else {
+                    unreachable!()
+                };
+                let callee = NodeRef::new(arrow.arena, file, call_data.expression);
+                let NodeData::PropertyAccessExpression(property) =
+                    &source.arena.get(callee.node).unwrap().data
+                else {
+                    unreachable!()
+                };
+                let receiver = NodeRef::new(arrow.arena, file, property.expression);
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                let wrong_symbol = context.file(file).unwrap().1.symbol(arrow).unwrap();
+                for node in [receiver, callee] {
+                    let saved_type = context
+                        .store()
+                        .type_node_links(node)
+                        .cloned()
+                        .unwrap_or_default();
+                    let saved_symbol = context
+                        .store()
+                        .symbol_node_links(node)
+                        .cloned()
+                        .unwrap_or_default();
+                    if damage_symbol {
+                        assert!(context.store_mut_for_test().set_symbol_node_links(
+                            node,
+                            SymbolNodeLinks {
+                                resolved_symbol: Some(wrong_symbol)
+                            }
+                        ));
+                    } else {
+                        assert!(context.store_mut_for_test().set_type_node_links(
+                            node,
+                            TypeNodeLinks {
+                                resolved_type: Some(number),
+                                ..TypeNodeLinks::default()
+                            }
+                        ));
+                    }
+                    let damaged = generic_transaction_state(context.store());
+                    for _ in 0..2 {
+                        let expected = if damage_symbol {
+                            SourceCallableInvariant::InvalidOwnerSymbol(node)
+                        } else {
+                            SourceCallableInvariant::InvalidTypeCache(node)
+                        };
+                        assert_eq!(
+                            source_direct_call_argument_arrow_is_exact(
+                                context.store(),
+                                &context.declared_type_host().unwrap(),
+                                arrow
+                            ),
+                            Err(SourceCallableError::Invariant(expected))
+                        );
+                        assert_eq!(generic_transaction_state(context.store()), damaged);
+                    }
+                    if damage_symbol {
+                        assert!(
+                            context
+                                .store_mut_for_test()
+                                .set_symbol_node_links(node, saved_symbol)
+                        );
+                    } else {
+                        assert!(
+                            context
+                                .store_mut_for_test()
+                                .set_type_node_links(node, saved_type)
+                        );
+                    }
+                    assert_eq!(
+                        source_direct_call_argument_arrow_is_exact(
+                            context.store(),
+                            &context.declared_type_host().unwrap(),
+                            arrow
+                        ),
+                        Ok(true)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_method_callback_admission_keeps_other_property_callbacks_unsupported() {
+        for declaration in [
+            "interface Visitor { visit: (callback: (value: string) => string) => string; }",
+            "interface Visitor { visit?(callback: (value: string) => string): string; }",
+            "interface Visitor { visit<T>(callback: (value: T) => T): T; }",
+            "interface Base { visit(callback: (value: string) => string): string; } interface Visitor extends Base {}",
+            "interface Visitor { visit(callback: number): string; }",
+        ] {
+            let parsed = parse_source_file(&format!(
+                "{declaration} declare const visitor: Visitor; const result = visitor.visit(value => value);"
+            ));
+            let file = FileId::new(96_576);
+            let context = fixed_method_callback_context(&[(file, &parsed)]);
+            let [arrow] = fixed_method_callback_arrows(&parsed, file)
+                .try_into()
+                .unwrap();
+            let before = generic_transaction_state(context.store());
+            assert_eq!(
+                source_direct_call_argument_arrow_is_exact(
+                    context.store(),
+                    &context.declared_type_host().unwrap(),
+                    arrow
+                ),
+                Ok(false),
+                "{declaration}"
+            );
+            assert_eq!(generic_transaction_state(context.store()), before);
+        }
     }
 
     const WRAPPER_METHOD_LIBRARY: &str = concat!(
