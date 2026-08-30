@@ -2138,6 +2138,10 @@ impl SourceFlowPlan {
             .is_some_and(|record| {
                 record.kind == SyntaxKind::ArrowFunction
                     && matches!(record.data, NodeData::ArrowFunction(_))
+                    || record.kind == SyntaxKind::MethodDeclaration
+                        && bound.symbol(container).is_some_and(|owner| {
+                            store.source_object_literal_method_owner_is_exact(container, owner)
+                        })
             })
             .then_some(container);
         Self::preflight_with_effects(
@@ -4998,10 +5002,24 @@ fn validate_direct_call(
     let body_id = statement.parent.ok_or_else(invalid)?;
     let body = arena.get(body_id).ok_or_else(invalid)?;
     let function = arena.get(container.node).ok_or_else(invalid)?;
-    let NodeData::FunctionDeclaration(function_data) = &function.data else {
-        return Err(invalid().into());
-    };
-    let function_body = function_data.body.ok_or_else(invalid)?;
+    let function_body = match &function.data {
+        NodeData::FunctionDeclaration(function_data)
+            if function.kind == SyntaxKind::FunctionDeclaration =>
+        {
+            function_data.body
+        }
+        NodeData::MethodDeclaration(method)
+            if function.kind == SyntaxKind::MethodDeclaration
+                && function
+                    .parent
+                    .and_then(|parent| arena.get(parent))
+                    .is_some_and(|parent| parent.kind == SyntaxKind::ObjectLiteralExpression) =>
+        {
+            method.body
+        }
+        _ => return Err(invalid().into()),
+    }
+    .ok_or_else(invalid)?;
     let scope = if body_id == function_body {
         container
     } else {
@@ -5013,7 +5031,6 @@ fn validate_direct_call(
         || statement_data.expression != expression.node
         || statement_data.flow_node.is_some()
         || body.kind != SyntaxKind::Block
-        || function.kind != SyntaxKind::FunctionDeclaration
         || arena.get(function_body).is_none_or(|body| {
             body.kind != SyntaxKind::Block || body.parent != Some(container.node)
         })

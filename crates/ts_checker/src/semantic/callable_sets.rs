@@ -750,6 +750,7 @@ fn valid_untyped_javascript_source_signature(
             Some(SourceNodeParent::Parent(variable))
                 if store.source_node_kind(variable) == Some(SyntaxKind::VariableDeclaration)
         ),
+        SourceCallableFamily::ObjectLiteralMethod => false,
     };
     if record.flags() != SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
         || record.flags() != provenance.flags

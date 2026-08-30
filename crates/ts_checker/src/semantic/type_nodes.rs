@@ -27941,6 +27941,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression => {
                 SourceCallableFamily::ArrowFunction
             }
+            SyntaxKind::MethodDeclaration => SourceCallableFamily::ObjectLiteralMethod,
             kind => {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::UnsupportedSyntax {
@@ -28002,8 +28003,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(())
     }
 
-    /// Resolves one exact source function declaration or expression into
-    /// the callable value owned by its binder FUNCTION symbol.
+    /// Resolves an exact source function, expression, arrow, or object-literal method into
+    /// the callable value owned by its binder symbol.
     pub(super) fn get_type_of_source_callable(
         &mut self,
         declaration: NodeRef,
@@ -28023,6 +28024,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression => {
                 SourceCallableFamily::ArrowFunction
             }
+            SyntaxKind::MethodDeclaration => SourceCallableFamily::ObjectLiteralMethod,
             kind => {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::UnsupportedSyntax {

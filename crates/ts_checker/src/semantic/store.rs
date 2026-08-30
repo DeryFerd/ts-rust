@@ -299,6 +299,7 @@ impl PropertiesTypeCacheKey {
 pub(super) enum SourceCallableFamily {
     FunctionDeclaration,
     ArrowFunction,
+    ObjectLiteralMethod,
 }
 
 /// Whether a source callable's return is owned by exact annotation syntax or
@@ -333,6 +334,7 @@ impl SourceCallableFamily {
         match self {
             Self::FunctionDeclaration => SyntaxKind::FunctionDeclaration,
             Self::ArrowFunction => SyntaxKind::ArrowFunction,
+            Self::ObjectLiteralMethod => SyntaxKind::MethodDeclaration,
         }
     }
 
@@ -345,6 +347,7 @@ impl SourceCallableFamily {
                     Self::ArrowFunction,
                     SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression
                 )
+                | (Self::ObjectLiteralMethod, SyntaxKind::MethodDeclaration)
         )
     }
 }
@@ -1915,8 +1918,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let contextual_pair = match (provenance.contextual_target, provenance.contextual_variable) {
             (None, None) => provenance.captured_assignment.is_none(),
             (Some(target), Some(variable)) => {
-                provenance.family == SourceCallableFamily::ArrowFunction
-                    && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+                matches!(
+                    provenance.family,
+                    SourceCallableFamily::ArrowFunction | SourceCallableFamily::ObjectLiteralMethod
+                ) && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
                     && provenance.captured_assignment.is_none()
                     && target != type_
                     && self.types.get(target).is_some()
@@ -2822,13 +2827,64 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
-    /// Proves the exact variable or object-property owner of a contextual arrow.
+    /// Proves a method symbol and its containing object literal without reading types.
+    pub(super) fn source_object_literal_method_owner_is_exact(
+        &self,
+        declaration: NodeRef,
+        owner_symbol: SemanticSymbolId,
+    ) -> bool {
+        let Some(owner) = self.symbol(owner_symbol) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(object_declaration)) =
+            self.source_node_parent(declaration)
+        else {
+            return false;
+        };
+        let Some(object_symbol) = owner.parent() else {
+            return false;
+        };
+        let Some(object) = self.symbol(object_symbol) else {
+            return false;
+        };
+        self.source_node_kind(declaration) == Some(SyntaxKind::MethodDeclaration)
+            && self.get_merged_symbol(owner_symbol) == Some(owner_symbol)
+            && owner.flags() == SymbolFlags::METHOD
+            && owner.check_flags() == CheckFlags::NONE
+            && owner.declarations() == Some(&[declaration])
+            && owner.value_declaration() == Some(declaration)
+            && owner.members().is_none()
+            && owner.exports().is_none()
+            && owner.export_symbol().is_none()
+            && self.source_node_kind(object_declaration)
+                == Some(SyntaxKind::ObjectLiteralExpression)
+            && self.get_merged_symbol(object_symbol) == Some(object_symbol)
+            && object.flags() == SymbolFlags::OBJECT_LITERAL
+            && object.check_flags() == CheckFlags::NONE
+            && object.name() == InternalSymbolName::Object.as_ref()
+            && object.declarations() == Some(&[object_declaration])
+            && object.value_declaration() == Some(object_declaration)
+            && object.parent().is_none()
+            && object.exports().is_none()
+            && object.export_symbol().is_none()
+            && object
+                .members()
+                .and_then(|members| self.symbol_table(members))
+                .and_then(|members| members.get(owner.name()))
+                == Some(owner_symbol)
+    }
+
+    /// Proves the exact variable, property, or method owner of a contextual callable.
     pub(super) fn source_contextual_callable_anchor_is_exact(
         &self,
         declaration: NodeRef,
         owner_symbol: SemanticSymbolId,
         anchor: SemanticSymbolId,
     ) -> bool {
+        if self.source_node_kind(declaration) == Some(SyntaxKind::MethodDeclaration) {
+            return anchor == owner_symbol
+                && self.source_object_literal_method_owner_is_exact(declaration, owner_symbol);
+        }
         let Some(owner) = self.symbol(owner_symbol) else {
             return false;
         };

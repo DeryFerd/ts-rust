@@ -6611,6 +6611,16 @@ impl SyntaxPlanner<'_> {
                     && function.body == self.callable.body.node
                     && function.type_ == expected_return
             }
+            NodeData::MethodDeclaration(method) => {
+                self.callable.family == SourceCallableFamily::ObjectLiteralMethod
+                    && record.kind == SyntaxKind::MethodDeclaration
+                    && method.body == Some(self.callable.body.node)
+                    && method.type_ == expected_return
+                    && self.store.source_object_literal_method_owner_is_exact(
+                        declaration,
+                        self.callable.owner_symbol,
+                    )
+            }
             _ => false,
         };
         if !valid_callable {

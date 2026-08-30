@@ -28,6 +28,7 @@ pub(super) enum CallableFamily {
     FunctionType,
     FunctionDeclaration,
     ArrowFunction,
+    ObjectLiteralMethod,
     SourceFunctionOverloads,
     DeclaredCallSignatures,
 }
@@ -37,6 +38,7 @@ impl From<SourceCallableFamily> for CallableFamily {
         match family {
             SourceCallableFamily::FunctionDeclaration => Self::FunctionDeclaration,
             SourceCallableFamily::ArrowFunction => Self::ArrowFunction,
+            SourceCallableFamily::ObjectLiteralMethod => Self::ObjectLiteralMethod,
         }
     }
 }
@@ -281,16 +283,16 @@ pub(super) fn single_callable_display_projection(
         )
         .map(Some)
         .map_err(SingleCallableDisplayError::FunctionType),
-        CallableFamily::FunctionDeclaration | CallableFamily::ArrowFunction => {
-            source_callable_display_projection(
-                store,
-                host,
-                type_,
-                global_types.map(CanonicalArrayTargets::from_global_types),
-            )
-            .map(Some)
-            .map_err(SingleCallableDisplayError::SourceCallable)
-        }
+        CallableFamily::FunctionDeclaration
+        | CallableFamily::ArrowFunction
+        | CallableFamily::ObjectLiteralMethod => source_callable_display_projection(
+            store,
+            host,
+            type_,
+            global_types.map(CanonicalArrayTargets::from_global_types),
+        )
+        .map(Some)
+        .map_err(SingleCallableDisplayError::SourceCallable),
         CallableFamily::SourceFunctionOverloads | CallableFamily::DeclaredCallSignatures => {
             Ok(None)
         }
@@ -329,7 +331,10 @@ fn validated_single_callable(
         rest_parameter,
         min_argument_count,
         return_type: signature_record.resolved_return_type(),
-        // These exact source/type-node providers are neither methods nor constructors.
-        strict_variance_exempt: false,
+        strict_variance_exempt: store
+            .source_callable_provenance(type_)
+            .is_some_and(|provenance| {
+                provenance.family == SourceCallableFamily::ObjectLiteralMethod
+            }),
     })
 }
