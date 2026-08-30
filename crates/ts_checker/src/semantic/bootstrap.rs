@@ -7392,9 +7392,9 @@ mod tests {
                 seen.borrow_mut().push(type_);
                 Ok(None)
             };
-            let seed = store.intrinsic_bootstrap().unwrap().unknown_type;
+            let prior_type = store.intrinsic_bootstrap().unwrap().unknown_type;
             let mut walk = CachedArrayWalk {
-                visited: HashSet::from([seed]),
+                visited: HashSet::from([prior_type]),
                 source_interfaces: Some(&callback),
             };
             let pending = HashSet::new();
@@ -7413,7 +7413,7 @@ mod tests {
             let array_position = seen.iter().position(|type_| *type_ == array).unwrap();
             assert!(number_position < array_position);
             assert_eq!(seen.iter().filter(|type_| **type_ == array).count(), 1);
-            assert!(walk.visited.contains(&seed));
+            assert!(walk.visited.contains(&prior_type));
             assert_eq!(
                 (
                     store.type_len(),

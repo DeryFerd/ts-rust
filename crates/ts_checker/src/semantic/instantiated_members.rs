@@ -4632,7 +4632,7 @@ fn closed_declared_function_type_edges(
     for (&parameter, &value) in signature_record.parameters().iter().zip(parameter_types) {
         let declaration = store
             .symbol(parameter)
-            .and_then(|symbol| symbol.value_declaration())
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
             .ok_or_else(invalid)?;
         let annotation = store
             .source_direct_type_annotation(declaration)
@@ -10186,15 +10186,20 @@ mod tests {
                     ),
                     "{mutation}"
                 );
-                assert!(
-                    !instantiated_member_type_matches(
+                let expected = if mutation == "function_owner" {
+                    Err(InstantiationError::InvalidType(fixture.source))
+                } else {
+                    Ok(false)
+                };
+                assert_eq!(
+                    instantiated_member_type_matches(
                         store,
                         fixture.source,
                         value,
                         fixture.mapper,
                         None
-                    )
-                    .unwrap(),
+                    ),
+                    expected,
                     "{mutation}"
                 );
             }

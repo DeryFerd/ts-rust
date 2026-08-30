@@ -1552,11 +1552,12 @@ impl TypeQueryPlan {
                 .type_parameters
                 .iter()
                 .map(|parameter| {
-                    let type_ = store
+                    let parameter_type = store
                         .declared_type_links(parameter.symbol)
                         .and_then(|links| links.declared_type)
                         .ok_or_else(&invalid)?;
-                    if cached_ordinary_type_parameter_owner(store, type_) != Some(parameter.symbol)
+                    if cached_ordinary_type_parameter_owner(store, parameter_type)
+                        != Some(parameter.symbol)
                         || !store.source_declaration_belongs_to_symbol(
                             parameter.declaration,
                             parameter.symbol,
@@ -1564,7 +1565,7 @@ impl TypeQueryPlan {
                     {
                         return Err(invalid());
                     }
-                    Ok(type_)
+                    Ok(parameter_type)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             if store.type_alias_links(alias).is_some_and(|links| {
@@ -13307,13 +13308,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 return false;
             }
             previous_end = child_record.range.end;
-            let Ok(Some(type_)) = self.cached_array_element_identity(child) else {
+            let Ok(Some(constituent)) = self.cached_array_element_identity(child) else {
                 return false;
             };
             if self
                 .store
                 .append_deferred_intersection_constituent_with_array_targets(
-                    type_,
+                    constituent,
                     &mut types,
                     self.array_targets,
                 )

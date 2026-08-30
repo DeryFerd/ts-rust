@@ -1346,8 +1346,8 @@ pub(super) fn instantiate_ordinary_intersection_with_vector_and_alias_and_sessio
         session,
         Some(&mut builder),
     )?;
-    if let Some(receipt) = &builder.receipt {
-        if receipt.result != result
+    if let Some(receipt) = &builder.receipt
+        && (receipt.result != result
             || !receipt.matches_mapping_request(
                 store,
                 source,
@@ -1355,10 +1355,9 @@ pub(super) fn instantiate_ordinary_intersection_with_vector_and_alias_and_sessio
                 arguments,
                 alias_override,
                 array_targets,
-            )?
-        {
-            return Err(InstantiationError::InvalidType(result));
-        }
+            )?)
+    {
+        return Err(InstantiationError::InvalidType(result));
     }
     Ok((result, builder.receipt))
 }
@@ -6213,9 +6212,13 @@ mod tests {
             assert_eq!(mapped.parameters, source.parameters);
             assert_eq!(mapped.arguments, arguments);
             assert!(store.type_payload(instance).unwrap().alias().is_none());
-            let mapper = mapped.mapper.unwrap();
+            let physical_mapper = mapped.mapper.unwrap();
             assert_eq!(
-                store.type_mapper_has_exact_endpoints(mapper, &source.parameters, &arguments),
+                store.type_mapper_has_exact_endpoints(
+                    physical_mapper,
+                    &source.parameters,
+                    &arguments,
+                ),
                 Some(true),
             );
             assert_eq!(
@@ -6227,7 +6230,7 @@ mod tests {
             );
             assert_eq!(store.type_alias_len(), alias_count);
             assert_eq!(
-                instantiated_member_type_matches(&store, target, instance, mapper, None),
+                instantiated_member_type_matches(&store, target, instance, physical_mapper, None),
                 Ok(true),
             );
             assert!(store.inline_property_object_recovery(instance).is_none());
