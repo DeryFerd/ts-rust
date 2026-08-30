@@ -11394,43 +11394,91 @@ mod tests {
     }
 
     #[test]
-    fn source_arrow_expando_display_keeps_annotated_function_expression_unsupported() {
-        use crate::semantic::{SourceCheckError, SourceSyntaxRole, UnsupportedSourceSyntax};
-
+    fn source_arrow_expando_display_keeps_annotated_function_expression_identity() {
         let parsed =
             parse_source_file("const foo = function (): void {}; foo.bar = 42; export {};");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(274);
         let mut context = external_parsed_context(&parsed, file);
-        let expression = parsed
-            .arena
-            .iter()
-            .find_map(|(node, record)| {
-                (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
-                    parsed.arena.id(),
-                    file,
-                    node,
-                ))
-            })
-            .unwrap();
-        assert_eq!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Syntax {
-                    node: expression,
-                    kind: SyntaxKind::FunctionExpression,
-                    role: SourceSyntaxRole::VariableInitializer,
-                }
-            ))
-        );
+        context.check_source_file(file).unwrap();
+        let (expression, callable) = source_arrow_display_type(&mut context, &parsed, file);
         let (_, bound) = context.file(file).unwrap();
         let owner = bound.symbol(expression).unwrap();
-        assert!(
-            context
-                .store()
-                .source_callable_type_for_owner(owner)
-                .is_none()
-        );
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let exports = context.store().symbol(owner).unwrap().exports().unwrap();
+        let property = context
+            .store()
+            .symbol_table(exports)
+            .unwrap()
+            .get_source("bar")
+            .unwrap();
+        let assignment = context
+            .store()
+            .symbol(property)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let NodeData::BinaryExpression(data) = &parsed.arena.get(assignment.node).unwrap().data
+        else {
+            panic!("the expando must retain its source assignment");
+        };
+        let left = NodeRef::new(assignment.arena, assignment.file, data.left);
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (number, void) = (bootstrap.number_type, bootstrap.void_type);
+        for _ in 0..2 {
+            assert_eq!(context.get_type_at_location(expression), Ok(callable));
+            assert_eq!(context.get_type_at_location(left), Ok(number));
+            assert_eq!(context.get_symbol_at_location(left), Ok(Some(property)));
+            assert_eq!(context.get_return_type_of_signature(signature), Ok(void));
+            let store = context.store();
+            assert_eq!(store.source_callable_type_for_owner(owner), Some(callable));
+            assert_eq!(
+                store.source_callable_type_for_signature(signature),
+                Some(callable)
+            );
+            assert_eq!(
+                store.signature(signature).unwrap().declaration(),
+                Some(expression)
+            );
+            assert_eq!(
+                store.symbol_table(exports).unwrap().get_source("bar"),
+                Some(property)
+            );
+            assert_eq!(store.get_parent_of_symbol(property), Some(owner));
+            assert_eq!(
+                store.value_symbol_links(property).unwrap().resolved_type,
+                Some(number)
+            );
+            let before = format!("{store:?}");
+            let counts = (store.type_len(), store.symbol_len(), store.signature_len());
+            assert_eq!(
+                context.type_to_string(callable).unwrap(),
+                "{ (): void; bar: number; }"
+            );
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(
+                        callable,
+                        expression,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION,
+                    )
+                    .unwrap(),
+                "{ (): void; bar: number; }",
+            );
+            assert_eq!(format!("{:?}", context.store()), before);
+            assert!(context.diagnostics().is_empty());
+            context.recheck_source_file(file).unwrap();
+            let store = context.store();
+            assert_eq!(
+                (store.type_len(), store.symbol_len(), store.signature_len()),
+                counts
+            );
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]

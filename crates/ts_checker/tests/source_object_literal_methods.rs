@@ -476,6 +476,68 @@ fn contextual_object_method_returns_keep_matching_literal_types() {
 }
 
 #[test]
+fn contextual_object_method_keeps_a_mismatched_literal_return() {
+    let library = parse_source_file(ES5);
+    let source = concat!(
+        "interface Shape { run(): 1; }\n",
+        "const object: Shape = { run() { return 2; } };\n",
+        "const result = object.run();",
+    );
+    let parsed = parse_source_file(source);
+    let declaration = method(&parsed, "run");
+    let NodeData::MethodDeclaration(data) = &parsed.arena.get(declaration.node).unwrap().data
+    else {
+        panic!("the source must retain its object method");
+    };
+    let name = NodeRef::new(parsed.arena.id(), FILE, data.name);
+    let target_name = parsed
+        .arena
+        .iter()
+        .find_map(|(_, record)| {
+            let NodeData::MethodSignatureDeclaration(data) = &record.data else {
+                return None;
+            };
+            Some(NodeRef::new(parsed.arena.id(), FILE, data.name))
+        })
+        .unwrap();
+    let call = initializer(&parsed, "result");
+    for source_first in [false, true] {
+        let mut checker = context(&library, &parsed);
+        if source_first {
+            checker.check_source_file(FILE).unwrap();
+        } else {
+            checker.get_type_at_location(declaration).unwrap();
+        }
+        let state = method_state(&mut checker, &parsed, declaration);
+        assert_eq!(checker.type_to_string(state.returned).unwrap(), "2");
+        let TypeData::Literal(literal) =
+            checker.store().type_payload(state.returned).unwrap().data()
+        else {
+            panic!("the mismatched return must keep its numeric literal");
+        };
+        assert_eq!(literal.regular_type, state.returned);
+        let called = checker.get_type_at_location(call).unwrap();
+        assert_eq!(checker.type_to_string(called).unwrap(), "1");
+        assert_ne!(signature(&checker, call), state.signature);
+        let [diagnostic] = checker.diagnostics().as_slice() else {
+            panic!("the method must report one contextual return mismatch");
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(diagnostic.node, Some(name));
+        assert_eq!(node_text(source, &parsed, name), "run");
+        assert_eq!(diagnostic.range_override, None);
+        assert_eq!(diagnostic.diagnostic.arguments, ["() => 2", "() => 1"]);
+        let [related] = diagnostic.related_information.as_slice() else {
+            panic!("the mismatch must retain the target method declaration");
+        };
+        assert_eq!(related.diagnostic.code(), 6500);
+        assert_eq!(related.node, Some(target_name));
+        assert_eq!(related.diagnostic.arguments, ["run", "Shape"]);
+        assert_replay(&mut checker, &parsed, &[declaration], &[call]);
+    }
+}
+
+#[test]
 fn contextual_object_methods_infer_undefined_for_empty_and_bare_returns() {
     let library = parse_source_file(ES5);
     for (parameters, target_parameters, argument, body) in

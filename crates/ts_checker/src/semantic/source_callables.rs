@@ -2911,7 +2911,7 @@ fn plan_source_callable_with_owner_shape(
             }
         }
         NodeData::MethodDeclaration(method) if record.kind == SyntaxKind::MethodDeclaration => {
-            if source_object_literal_method_symbol(store, host, declaration)? != Some(owner_symbol)
+            if source_object_literal_method_symbol(store, host, declaration) != Some(owner_symbol)
                 || method.postfix_token.is_some()
             {
                 return Err(SourceCallableError::Unsupported(
@@ -4151,27 +4151,25 @@ pub(super) fn source_object_literal_method_symbol(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
-) -> Result<Option<SemanticSymbolId>, SourceCallableError> {
+) -> Option<SemanticSymbolId> {
     if store.source_node_kind(declaration) != Some(SyntaxKind::MethodDeclaration) {
-        return Ok(None);
+        return None;
     }
     let Some(SourceNodeParent::Parent(object)) = store.source_node_parent(declaration) else {
-        return Ok(None);
+        return None;
     };
     if store.source_node_kind(object) != Some(SyntaxKind::ObjectLiteralExpression) {
-        return Ok(None);
+        return None;
     }
-    let Ok(plan) = super::object_members::plan_object_literal(store, host, object) else {
-        return Ok(None);
-    };
+    let plan = super::object_members::plan_object_literal(store, host, object).ok()?;
     let symbol = plan.properties.iter().find_map(|property| {
         (property.declaration == declaration && property.type_node == declaration)
             .then_some(property.symbol)
     });
-    Ok(symbol.filter(|symbol| {
+    symbol.filter(|symbol| {
         store.source_object_literal_method_owner_is_exact(declaration, *symbol)
             && host.symbol_matches(store, declaration, *symbol)
-    }))
+    })
 }
 
 /// Authenticates one unparenthesized callback in a direct, array, or global sort call.
@@ -9279,7 +9277,7 @@ fn validate_owner_name_and_export_route(
 ) -> Result<(), SourceCallableError> {
     match view.family {
         SourceCallableFamily::ObjectLiteralMethod => {
-            let symbol = source_object_literal_method_symbol(store, host, declaration)?;
+            let symbol = source_object_literal_method_symbol(store, host, declaration);
             if local_symbol.is_some()
                 || body_mode != SourceCallableBodyMode::Present
                 || symbol.is_none()
@@ -10705,7 +10703,7 @@ fn publish_prepared_contextual_source_callable(
     };
     let owner_parent = store
         .symbol(prepared.owner_symbol)
-        .and_then(|owner| owner.parent());
+        .and_then(ts_binder::semantic::Symbol::parent);
     if let Some(existing) = store.source_callable_type_for_owner(prepared.owner_symbol) {
         let provenance = store.source_callable_provenance(existing);
         let signature = provenance.and_then(|provenance| store.signature(provenance.signature));

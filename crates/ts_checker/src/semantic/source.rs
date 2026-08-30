@@ -21580,7 +21580,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         let owner =
             super::source_callables::source_object_literal_method_symbol(store, host, declaration)
-                .map_err(Self::callable_plan_error)?
                 .ok_or_else(unsupported)?;
         let callable = plan_source_callable(store, host, declaration, owner, self.array_targets)
             .map_err(Self::callable_plan_error)?;
@@ -50029,20 +50028,16 @@ fn inferred_source_return_for_context(
     returned: TypeId,
     contextual_return: Option<TypeId>,
 ) -> Result<TypeId, SourceCheckError> {
-    let contextual_literal = store.type_payload(returned)
-        .and_then(|record| match record.data() {
-            TypeData::Literal(literal) => Some(literal.regular_type),
-            _ => None,
-        })
-        .filter(|literal| contextual_return.is_some_and(|target_return| {
-            store.type_payload(target_return).is_some_and(|target| {
-                target_return == *literal
-                    || matches!(target.data(), TypeData::Union(union) if union.union.types.contains(literal))
-            })
-        }));
-    let widened = match contextual_literal {
-        Some(literal) => literal,
-        None => widened_fresh_literal_type(store, returned)?,
+    let widened = if contextual_return.is_some()
+        && store
+            .type_payload(returned)
+            .is_some_and(|record| record.flags().intersects(TypeFlags::UNIT))
+    {
+        let treatment =
+            mutable_literal_treatment(store, Some(global_types), returned, contextual_return)?;
+        prepared_fresh_literal_union_type(store, global_types, returned, treatment)?
+    } else {
+        widened_fresh_literal_type(store, returned)?
     };
     Ok(store.get_widened_type_with_global_types(widened, global_types)?)
 }
@@ -103871,7 +103866,7 @@ class Foo2 {
     }
 
     #[test]
-    fn parenthesized_object_property_functions_reject_unsupported_function_shapes() {
+    fn parenthesized_object_property_functions_keep_names_parameters_and_annotations() {
         for (index, initializer) in [
             "(function named() { return 1; })",
             "(function (value: number) { return value; })",
@@ -103884,34 +103879,89 @@ class Foo2 {
             let source = parsed(&text);
             let file = FileId::new(9_981 + u32::try_from(index).unwrap());
             let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
-            let function = source
+            let (function, data) = source
                 .arena
                 .iter()
                 .find_map(|(node, record)| {
-                    (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
-                        source.arena.id(),
-                        file,
-                        node,
-                    ))
+                    let NodeData::FunctionExpression(data) = &record.data else {
+                        return None;
+                    };
+                    Some((NodeRef::new(source.arena.id(), file, node), data))
                 })
                 .unwrap();
 
-            assert!(matches!(
-                context.check_source_file(file),
-                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
-                    node,
-                    kind: SyntaxKind::FunctionExpression,
-                    role: SourceSyntaxRole::VariableInitializer,
-                })) if node == function
-            ));
+            context.check_source_file(file).unwrap();
             let (_, bound) = context.file(file).unwrap();
             let owner = bound.symbol(function).unwrap();
-            assert!(
-                context
-                    .store()
-                    .source_callable_type_for_owner(owner)
-                    .is_none()
+            let parameters = data
+                .parameters
+                .nodes
+                .iter()
+                .map(|&node| {
+                    let parameter = NodeRef::new(function.arena, function.file, node);
+                    let NodeData::ParameterDeclaration(data) =
+                        &source.arena.get(node).unwrap().data
+                    else {
+                        panic!("the function must retain its ordinary parameter");
+                    };
+                    (
+                        parameter,
+                        NodeRef::new(function.arena, function.file, data.name),
+                        bound.symbol(parameter).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let callable = context.get_type_at_location(function).unwrap();
+            let provenance = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap();
+            assert_eq!(provenance.owner_symbol, owner);
+            assert_eq!(provenance.declaration, function);
+            let signature = provenance.signature;
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let object = variable_initializer(&source, file, "value");
+            assert_eq!(object_property_type(&context, object, "method"), callable);
+            assert_eq!(
+                context.store().signature(signature).unwrap().declaration(),
+                Some(function)
             );
+            assert_eq!(
+                context.store().signature(signature).unwrap().parameters(),
+                parameters
+                    .iter()
+                    .map(|parameter| parameter.2)
+                    .collect::<Vec<_>>(),
+            );
+            for _ in 0..2 {
+                assert_eq!(context.get_type_at_location(function), Ok(callable));
+                assert_eq!(context.get_return_type_of_signature(signature), Ok(number));
+                assert_eq!(
+                    context.store().source_callable_type_for_owner(owner),
+                    Some(callable)
+                );
+                if let Some(name) = data.name {
+                    let name = NodeRef::new(function.arena, function.file, name);
+                    assert_eq!(context.get_symbol_at_location(name), Ok(Some(owner)));
+                }
+                for &(parameter, name, symbol) in &parameters {
+                    assert_eq!(context.get_symbol_at_location(name), Ok(Some(symbol)));
+                    assert_eq!(context.get_type_at_location(name), Ok(number));
+                    assert_eq!(context.get_type_at_location(parameter), Ok(number));
+                    assert_eq!(
+                        context
+                            .store()
+                            .value_symbol_links(symbol)
+                            .unwrap()
+                            .resolved_type,
+                        Some(number)
+                    );
+                }
+                assert!(context.diagnostics().is_empty());
+                let warm = observable_state(&context, file);
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(observable_state(&context, file), warm);
+            }
         }
     }
 

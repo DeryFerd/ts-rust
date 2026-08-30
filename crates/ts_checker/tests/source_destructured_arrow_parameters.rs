@@ -4,8 +4,8 @@ use ts_binder::{
     EscapedName, SemanticSymbolId,
 };
 use ts_checker::semantic::{
-    CanonicalArtifactQueryError, CanonicalCheckerContext, CanonicalCheckerOptions,
-    IntrinsicBootstrapOptions, SourceCheckError, TypeId,
+    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SourceCheckError,
+    TypeId, artifact_queries::CanonicalArtifactQueryError,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
