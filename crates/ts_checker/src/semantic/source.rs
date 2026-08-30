@@ -9056,6 +9056,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let binding = match list_record.flags.0 {
                     NODE_FLAG_CONST => VariableBindingKind::Const,
                     NODE_FLAG_LET => VariableBindingKind::Let,
+                    0 if parent == body.body
+                        && matches!(
+                            body.kind,
+                            ClassBodyKind::Constructor | ClassBodyKind::Method { .. }
+                        ) =>
+                    {
+                        VariableBindingKind::Var
+                    }
                     _ => {
                         return Err(SourceCheckError::Unsupported(
                             UnsupportedSourceSyntax::Class(list),
@@ -9091,7 +9099,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     let name = self.reference(data.name);
                     let name_record = self.node(name)?;
                     if name_record.kind == SyntaxKind::ObjectBindingPattern {
-                        if declaration_count != 1
+                        if binding == VariableBindingKind::Var
+                            || declaration_count != 1
                             || data.type_.is_some()
                             || data.initializer.is_none()
                         {
@@ -9122,10 +9131,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     let symbol_record = store
                         .symbol(symbol)
                         .ok_or(SourceCheckError::Class(declaration))?;
-                    let scope = self
+                    if binding == VariableBindingKind::Var
+                        && symbol_record
+                            .declarations()
+                            .is_some_and(|declarations| declarations.len() > 1)
+                        && store.source_symbol_declarations_match(symbol)
+                    {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Class(declaration),
+                        ));
+                    }
+                    let block_scope = self
                         .bound
                         .block_scope_container(declaration)
                         .ok_or(SourceCheckError::Class(declaration))?;
+                    let (scope, flags) = if binding == VariableBindingKind::Var {
+                        (body.declaration, SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                    } else {
+                        (block_scope, SymbolFlags::BLOCK_SCOPED_VARIABLE)
+                    };
                     if name_record.kind != SyntaxKind::Identifier
                         || name_record.flags.0 != 0
                         || name_record.parent != Some(declaration.node)
@@ -9139,7 +9163,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             .and_then(|locals| locals.get_source(&identifier.text))
                             != Some(symbol)
                         || store.get_merged_symbol(symbol) != Some(symbol)
-                        || symbol_record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+                        || symbol_record.flags() != flags
                         || symbol_record.check_flags() != CheckFlags::NONE
                         || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
                         || symbol_record.declarations() != Some(&[declaration])
