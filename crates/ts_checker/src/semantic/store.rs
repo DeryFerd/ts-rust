@@ -15976,7 +15976,10 @@ mod tests {
             binder.finish(),
             vec![(file, &parsed.arena)],
             CanonicalCheckerOptions {
-                strict_null_checks: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
                 strict_function_types: true,
                 ..CanonicalCheckerOptions::default()
             },
