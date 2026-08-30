@@ -3974,7 +3974,7 @@ impl SourceFlowFrame<'_, '_> {
                             .ok_or(SourceFlowInvariant::MissingCurrentType(symbol))?;
                         let predicate = store
                             .signature(signature)
-                            .and_then(|signature| signature.resolved_type_predicate())
+                            .and_then(super::signatures::Signature::resolved_type_predicate)
                             .and_then(|predicate| store.type_predicate(predicate))
                             .ok_or(SourceFlowInvariant::InvalidCallEffect(call))?;
                         let narrowed = match predicate.type_id() {
@@ -4304,7 +4304,7 @@ fn narrow_source_assertion_type(
     if matches!(record.data(), TypeData::Union(_)) {
         let mut constituents = Vec::new();
         collect_source_equality_leaves(store, current, &mut constituents, &mut HashSet::new())
-            .map_err(|error| SourceFlowInvariant::EqualityNarrowing(error))?;
+            .map_err(SourceFlowInvariant::EqualityNarrowing)?;
         let narrowed = constituents
             .into_iter()
             .map(|type_| narrow_source_assertion_type(store, globals, flow, call, type_, asserted))
@@ -5413,7 +5413,7 @@ fn validate_source_update(
             .and_then(ts_binder::semantic::Symbol::value_declaration)
             != Some(update.declaration)
         || list.kind != SyntaxKind::VariableDeclarationList
-        || !matches!(list.flags.0, 0 | 1 | 2)
+        || !matches!(list.flags.0, 0..=2)
         || !declarations
             .declarations
             .nodes
@@ -5594,7 +5594,7 @@ fn validate_source_call_effect(
                         }
                         match &host.node(node).ok_or_else(invalid)?.data {
                             NodeData::ParenthesizedExpression(inner) => {
-                                node.node = inner.expression
+                                node.node = inner.expression;
                             }
                             _ => return Ok(node),
                         }
@@ -5615,14 +5615,14 @@ fn validate_source_call_effect(
                     if record.kind != SyntaxKind::FalseKeyword || predicate.type_id().is_some() {
                         return Err(invalid().into());
                     }
-                } else if !matches!(
+                } else if !(matches!(
                     record.kind,
                     SyntaxKind::StringLiteral
                         | SyntaxKind::NumericLiteral
                         | SyntaxKind::BigIntLiteral
                         | SyntaxKind::TrueKeyword
                         | SyntaxKind::NullKeyword
-                ) && !(record.kind == SyntaxKind::FalseKeyword
+                ) || record.kind == SyntaxKind::FalseKeyword
                     && predicate.type_id().is_some())
                 {
                     return Err(SourceFlowUnsupported::Call(call).into());

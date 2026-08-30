@@ -1709,7 +1709,7 @@ pub(super) fn authenticated_jsdoc_overload_group(
                 JsDocTagKind::Overload => overloads.push(tag),
                 JsDocTagKind::Parameter if index + 1 == comments.len() => host_parameters.push(tag),
                 JsDocTagKind::Return if index + 1 == comments.len() && host_return.is_none() => {
-                    host_return = Some(tag)
+                    host_return = Some(tag);
                 }
                 _ => return None,
             }

@@ -19005,7 +19005,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         if self
             .bound
             .source_facts()
-            .is_some_and(|facts| facts.is_javascript_file())
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
             && let NodeData::SourceFile(source) = &self.node(self.source.node_ref())?.data
         {
             for declaration in &source.statements.nodes {
@@ -19043,16 +19043,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     UnsupportedSourceSyntax::JsDoc(reference),
                 ));
             }
-            if !valid_range(
+            if !(valid_range(
                 node.range,
                 parent_range,
                 source_range,
                 self.arena.source_text(),
-            ) && !self.is_reparsed_jsdoc_signature_range(
+            ) || self.is_reparsed_jsdoc_signature_range(
                 reference,
                 expected_parent,
                 source_range,
-            ) && !(expected_parent.is_some_and(|parent| {
+            ) || expected_parent.is_some_and(|parent| {
                 jsdoc_range_edges.contains(&(self.reference(parent), reference))
             }) && valid_range(node.range, None, source_range, self.arena.source_text()))
             {
