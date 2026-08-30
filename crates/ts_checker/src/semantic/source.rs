@@ -12010,6 +12010,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         self.prior_enums = body_prior_enums;
         self.leave_callable_parameter_scope(callable)?;
         let (object_parameter_bindings, body) = result?;
+        if callable.return_type.is_inferred()
+            && object_parameter_keys_need_source_flow(&object_parameter_bindings)
+            && !matches!(
+                body,
+                PlannedFunctionBody::Empty | PlannedFunctionBody::Return { .. }
+            )
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
         Ok((parameter_initializers, object_parameter_bindings, body))
     }
 
@@ -12089,6 +12098,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         if callable.family != SourceCallableFamily::FunctionDeclaration {
             return Ok(Vec::new());
         }
+        let mut parameter_symbols = HashSet::new();
+        for parameter in &callable.parameters {
+            parameter_symbols.insert(parameter.symbol);
+            parameter_symbols.extend(self.callable_parameter_binding_symbols(callable, parameter)?);
+        }
         let mut parameters = Vec::new();
         for parameter in &callable.parameters {
             let record = self.node(parameter.declaration)?;
@@ -12120,6 +12134,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     .computed_key
                     .map(|key| self.plan_computed_binding_key(key, binding.property))
                     .transpose()?;
+                if let Some(key) = &computed_key {
+                    let read = match &key.kind {
+                        PlannedExpressionKind::Call(call) => &call.callee,
+                        _ => key,
+                    };
+                    if parameter_symbols
+                        .iter()
+                        .any(|symbol| planned_expression_reads_symbol(read, *symbol))
+                    {
+                        return Err(self.unsupported(
+                            key.node,
+                            self.node(key.node)?.kind,
+                            SourceSyntaxRole::VariableName,
+                        ));
+                    }
+                }
                 elements.push(PlannedObjectVariableElement {
                     binding,
                     computed_key,
@@ -27584,6 +27614,20 @@ fn deferred_inferred_javascript_functions(
     deferred_functions
 }
 
+fn object_parameter_keys_need_source_flow(bindings: &[PlannedObjectParameterBindings]) -> bool {
+    bindings
+        .iter()
+        .flat_map(|parameter| &parameter.elements)
+        .any(|element| {
+            element.computed_key.as_ref().is_some_and(|key| {
+                matches!(
+                    key.kind,
+                    PlannedExpressionKind::Identifier(_) | PlannedExpressionKind::Call(_)
+                )
+            })
+        })
+}
+
 fn preflight_uncached_conditional_operand_links(
     store: &CanonicalTypeMapperStore,
     expression: &PlannedExpression,
@@ -40556,7 +40600,7 @@ fn check_callable_object_parameter_bindings(
     let mut binding_types = Vec::with_capacity(bindings.len());
     for element in &planned.elements {
         let binding = &element.binding;
-        let (property_node, property_name) = if let Some(key) = &element.computed_key {
+        let type_ = if let Some(key) = &element.computed_key {
             let checked = check_expression_type(
                 store,
                 host,
@@ -40578,24 +40622,47 @@ fn check_callable_object_parameter_bindings(
                 binding.property,
                 checked.result,
             )?;
-            (
-                key.node,
-                literal_computed_property_name(store, checked.result).ok_or_else(invalid)?,
-            )
+            if let Some(property_name) = literal_computed_property_name(store, checked.result) {
+                object_parameter_property_type(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    parent_type,
+                    key.node,
+                    &property_name,
+                )?
+            } else {
+                let checked = check_computed_binding_element(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    binding.element,
+                    parent_type,
+                    checked.result,
+                )
+                .map_err(|error| SourcePlanner::element_plan_error(binding.element, error))?;
+                if let Some(diagnostic) = checked.diagnostic {
+                    merge_retry_diagnostic(diagnostics, diagnostic);
+                }
+                checked.type_
+            }
         } else {
-            (binding.property, binding.property_name.clone())
+            object_parameter_property_type(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                parent_type,
+                binding.property,
+                &binding.property_name,
+            )?
         };
-        let type_ = object_parameter_property_type(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            diagnostics,
-            parent_type,
-            property_node,
-            &property_name,
-        )?;
         let expected = ValueSymbolLinks {
             resolved_type: Some(type_),
             ..ValueSymbolLinks::default()
@@ -61306,6 +61373,15 @@ pub(super) fn check_source_file(
     }
     let deferred_inferred_functions =
         deferred_inferred_javascript_functions(&statements, &functions, javascript_jsdoc.is_some());
+    let deferred_computed_parameter_functions = functions
+        .iter()
+        .enumerate()
+        .filter(|(_, function)| {
+            function.callable.return_type.is_inferred()
+                && object_parameter_keys_need_source_flow(&function.object_parameter_bindings)
+        })
+        .map(|(index, _)| index)
+        .collect::<HashSet<_>>();
     let enums = statements
         .iter()
         .filter_map(|statement| {
@@ -62857,6 +62933,12 @@ pub(super) fn check_source_file(
         functions.iter().zip(&materialized_functions).enumerate()
     {
         if !function.callable.return_type.is_inferred() {
+            continue;
+        }
+        if deferred_computed_parameter_functions.contains(&index) {
+            // The declaration's outer keys must be checked after their source values.
+            // Leave the return unresolved until the existing body checker can run.
+            inferred_function_diagnostics[index] = Some(CanonicalCheckerDiagnostics::default());
             continue;
         }
         if deferred_inferred_functions.contains(&index) {
@@ -64549,7 +64631,57 @@ pub(super) fn check_source_file(
                         .ok_or(SourceCheckError::Function(
                             SourceFunctionInvariant::Callable(function.callable.declaration),
                         ))?;
-                    if deferred_inferred_functions.contains(&index) {
+                    if deferred_computed_parameter_functions.contains(&index) {
+                        let expression = match &function.body {
+                            PlannedFunctionBody::Empty => None,
+                            PlannedFunctionBody::Return { expression, .. } => Some(expression),
+                            _ => {
+                                return Err(SourcePlanner::unsupported_function_body(
+                                    &function.callable,
+                                ));
+                            }
+                        };
+                        let materialized =
+                            materialized_functions
+                                .get(index)
+                                .ok_or(SourceCheckError::Function(
+                                    SourceFunctionInvariant::InvalidStatementIndex(index),
+                                ))?;
+                        let captured_flow_types = function_declaration_flow_types(
+                            &current_flow_types,
+                            &top_level_declared_types,
+                        );
+                        let body_flow_types = check_callable_parameter_initializers(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            &mut function_diagnostics,
+                            &captured_flow_types,
+                            &type_import_execution,
+                            &mut deferred,
+                            &function.callable,
+                            &function.parameter_initializers,
+                            &function.object_parameter_bindings,
+                        )?;
+                        publish_checked_source_callable_return(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            &mut function_diagnostics,
+                            &body_flow_types,
+                            &type_import_execution,
+                            &mut deferred,
+                            &function.callable,
+                            materialized.signature,
+                            expression,
+                        )?;
+                    } else if deferred_inferred_functions.contains(&index) {
                         let PlannedFunctionBody::Linear(statements) = &function.body else {
                             return Err(SourceCheckError::Function(
                                 SourceFunctionInvariant::Callable(function.callable.declaration),
@@ -108773,6 +108905,117 @@ class Foo2 {
         );
         assert_eq!(observable_state(&context, file), cold);
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn computed_function_parameter_keys_reject_late_cache_changes_before_leaf_publication() {
+        let source = parsed(concat!(
+            "const firstKey = 'first'; const secondKey = 'second'; ",
+            "function read({ [firstKey]: first, [secondKey]: second }: ",
+            "{ first: number; second: string }) { return first; }",
+        ));
+        let file = FileId::new(19_796);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let declaration = function_declaration(&source, file, "read");
+        let locals = context.file(file).unwrap().1.locals(declaration).unwrap();
+        let first = context
+            .store()
+            .symbol_table(locals)
+            .unwrap()
+            .get_source("first")
+            .unwrap();
+        let first_links = context.store().value_symbol_links(first).cloned().unwrap();
+        let keys = source
+            .arena
+            .iter()
+            .filter_map(|(_, record)| {
+                let NodeData::ComputedPropertyName(computed) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(source.arena.id(), file, computed.expression))
+            })
+            .collect::<Vec<_>>();
+        let [_, second_key] = keys.as_slice() else {
+            panic!("expected two computed parameter keys")
+        };
+        let original_key = context
+            .store()
+            .type_node_links(*second_key)
+            .cloned()
+            .unwrap();
+        let owner = function_symbol(&context, &source, file, "read");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let return_type = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .resolved_return_type();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let poisoned_key = TypeNodeLinks {
+            resolved_type: Some(string),
+            ..TypeNodeLinks::default()
+        };
+        assert_ne!(original_key, poisoned_key);
+        mark_source_unchecked(&mut context, file);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(first, ValueSymbolLinks::default())
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(*second_key, poisoned_key.clone())
+        );
+        let before = observable_state(&context, file);
+
+        let error = context.check_source_file(file).unwrap_err();
+        assert_eq!(context.check_source_file(file).unwrap_err(), error);
+        assert_eq!(observable_state(&context, file), before);
+        assert_eq!(
+            context.store().value_symbol_links(first),
+            Some(&ValueSymbolLinks::default())
+        );
+        assert_eq!(
+            context.store().type_node_links(*second_key),
+            Some(&poisoned_key)
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            return_type
+        );
+        assert!(context.diagnostics().is_empty());
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(*second_key, original_key)
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context.store().value_symbol_links(first),
+            Some(&first_links)
+        );
+        assert_eq!(
+            context.store().source_callable_type_for_owner(owner),
+            Some(callable)
+        );
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]

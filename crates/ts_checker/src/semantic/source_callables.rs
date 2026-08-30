@@ -12928,6 +12928,32 @@ fn source_object_binding_property_display(
     if let NodeData::Identifier(identifier) = &record.data {
         return Ok(identifier.text.clone());
     }
+    if let NodeData::CallExpression(call) = &record.data {
+        let callee = NodeRef::new(node.arena, node.file, call.expression);
+        let callee_record = host
+            .node(callee)
+            .ok_or(SourceCallableDisplayError::Malformed)?;
+        let NodeData::Identifier(identifier) = &callee_record.data else {
+            return Err(SourceCallableDisplayError::Malformed);
+        };
+        if record.kind != SyntaxKind::CallExpression
+            || record.flags.0 != 0
+            || call.question_dot_token.is_some()
+            || call.type_arguments.is_some()
+            || call.symbol.is_some()
+            || call.facts != 0
+            || !call.arguments.nodes.is_empty()
+            || call.arguments.has_trailing_comma
+            || callee_record.kind != SyntaxKind::Identifier
+            || callee_record.parent != Some(node.node)
+            || callee_record.flags.0 != 0
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(SourceCallableDisplayError::Malformed);
+        }
+        return Ok(format!("{}()", identifier.text));
+    }
     if !matches!(
         record.kind,
         SyntaxKind::StringLiteral

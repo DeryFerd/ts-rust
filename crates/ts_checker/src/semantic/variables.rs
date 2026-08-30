@@ -982,6 +982,8 @@ pub(super) fn plan_function_object_parameter_bindings(
                     SyntaxKind::StringLiteral
                         | SyntaxKind::NumericLiteral
                         | SyntaxKind::NoSubstitutionTemplateLiteral
+                        | SyntaxKind::Identifier
+                        | SyntaxKind::CallExpression
                 ) {
                     return Err(VariablePlanError::Unsupported(
                         VariableUnsupported::BindingPattern(key),
@@ -3366,18 +3368,18 @@ mod tests {
 
     #[test]
     fn typed_function_object_parameters_reject_unsupported_binding_shapes() {
-        for (index, source) in [
-            "function read({ value }: { value: number } = { value: 1 }) {}",
-            "function read({ value = 1 }: { value?: number }) {}",
-            "function read({ ...rest }: { value: number }) {}",
-            "function read({ [key]: value }: { value: number }) {}",
-            "function read({ nested: { value } }: { nested: { value: number } }) {}",
-            "function read({ value }) {}",
-            "function read<T>({ value }: { value: number }) {}",
-            "declare function read({ value }: { value: number }): void;",
-            "declare namespace Scope { function read({ value }: { value: number }) {} }",
-            "type Shape<T> = { value: T }; function read({ value }: Shape<number>) {}",
-            "namespace Scope { export interface Shape { value: number } } function read({ value }: Scope.Shape) {}",
+        for (index, (source, retains_computed_key)) in [
+            ("function read({ value }: { value: number } = { value: 1 }) {}", false),
+            ("function read({ value = 1 }: { value?: number }) {}", false),
+            ("function read({ ...rest }: { value: number }) {}", false),
+            ("function read({ [key]: value }: { value: number }) {}", true),
+            ("function read({ nested: { value } }: { nested: { value: number } }) {}", false),
+            ("function read({ value }) {}", false),
+            ("function read<T>({ value }: { value: number }) {}", false),
+            ("declare function read({ value }: { value: number }): void;", false),
+            ("declare namespace Scope { function read({ value }: { value: number }) {} }", false),
+            ("type Shape<T> = { value: T }; function read({ value }: Shape<number>) {}", false),
+            ("namespace Scope { export interface Shape { value: number } } function read({ value }: Scope.Shape) {}", false),
         ]
         .into_iter()
         .enumerate()
@@ -3389,21 +3391,42 @@ mod tests {
                 fixture.store.symbol_len(),
                 fixture.store.checker_link_allocated_lengths(),
             );
-            assert!(
-                matches!(
-                    plan_function_object_parameter_bindings(
-                        &fixture.parsed.arena,
-                        &fixture.bound,
-                        &fixture.store,
-                        function,
-                        parameter,
-                    ),
-                    Err(VariablePlanError::Unsupported(
-                        VariableUnsupported::BindingPattern(_)
-                    )),
-                ),
-                "{source}"
+            let result = plan_function_object_parameter_bindings(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                function,
+                parameter,
             );
+            if retains_computed_key {
+                let planned = result.unwrap();
+                let [binding] = planned.as_slice() else {
+                    panic!("expected one computed parameter binding")
+                };
+                let NodeData::ComputedPropertyName(computed) =
+                    &fixture.parsed.arena.get(binding.property.node).unwrap().data
+                else {
+                    panic!("expected the original computed property name")
+                };
+                let key = NodeRef::new(function.arena, function.file, computed.expression);
+                assert_eq!(binding.computed_key, Some(key));
+                assert_eq!(
+                    fixture.store.source_node_parent(key),
+                    Some(SourceNodeParent::Parent(binding.property)),
+                );
+                assert!(fixture.store.type_node_links(key).is_none());
+                assert!(fixture.store.value_symbol_links(binding.symbol).is_none());
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(VariablePlanError::Unsupported(
+                            VariableUnsupported::BindingPattern(_)
+                        )),
+                    ),
+                    "{source}"
+                );
+            }
             assert_eq!(
                 (
                     fixture.store.type_len(),
