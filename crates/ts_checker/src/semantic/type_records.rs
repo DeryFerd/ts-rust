@@ -7,7 +7,7 @@
 //! allocated-empty slices, while explicit `HashMap` states preserve nil versus
 //! allocated-empty maps without turning checker hot paths into linear scans.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{EscapedName, InternalSymbolName, SemanticSymbolId, SymbolTableId};
@@ -109,9 +109,16 @@ pub struct TypeAlias {
     id: TypeAliasId,
     symbol: Option<SemanticSymbolId>,
     type_arguments: Option<Vec<TypeId>>,
+    imported_body: Option<Arc<super::source_imports::SourceAliasBodyTypeImportPlan>>,
 }
 
 impl TypeAlias {
+    pub(super) fn imported_body(
+        &self,
+    ) -> Option<&super::source_imports::SourceAliasBodyTypeImportPlan> {
+        self.imported_body.as_deref()
+    }
+
     #[must_use]
     pub const fn id(&self) -> TypeAliasId {
         self.id
@@ -655,6 +662,43 @@ impl TypeRecord {
 /// Canonical store specialization used by subsequent type-checker modules.
 pub type CanonicalSemanticStore<MapperPayload> = SemanticStore<TypeRecord, MapperPayload>;
 
+impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    /// Retains the host-proved origin only on the original imported wrapper result.
+    pub(super) fn retain_type_alias_imported_body(
+        &mut self,
+        result: TypeId,
+        proof: Arc<super::source_imports::SourceAliasBodyTypeImportPlan>,
+    ) -> bool {
+        let Some(record) = self.type_payload(result) else {
+            return false;
+        };
+        let Some(alias) = record.alias() else {
+            return false;
+        };
+        if !matches!(record.data(), TypeData::Object(object)
+            if object.target.is_some() && object.mapper.is_some())
+            || !record
+                .object_flags()
+                .contains(ObjectFlags::ANONYMOUS | ObjectFlags::INSTANTIATED)
+            || proof.validate_wrapper_identity(self, alias).is_err()
+        {
+            return false;
+        }
+        let Some(identity) = self.type_alias_payload(alias) else {
+            return false;
+        };
+        if let Some(existing) = identity.imported_body.as_ref() {
+            return existing.as_ref() == proof.as_ref();
+        }
+        self.type_alias_payload_mut(alias)
+            .expect("the alias identity was checked")
+            .imported_body = Some(proof);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+}
+
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
     pub(super) fn type_is_exact_callable_object(&self, type_: TypeId) -> bool {
         self.source_callable_provenance(type_).is_some()
@@ -709,6 +753,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             id,
             symbol,
             type_arguments: None,
+            imported_body: None,
         }))
     }
 
@@ -1341,6 +1386,14 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
 
     pub fn set_type_alias(&mut self, id: TypeId, alias: Option<TypeAliasId>) -> bool {
         if !self.valid_record_alias(alias) {
+            return false;
+        }
+        if alias.and_then(|alias| self.type_alias(alias)).is_some_and(|alias| alias.imported_body().is_some())
+            && self.type_payload(id).is_none_or(|record| {
+                !record.object_flags().contains(ObjectFlags::ANONYMOUS | ObjectFlags::INSTANTIATED)
+                    || !matches!(record.data(), TypeData::Object(object) if object.target.is_some() && object.mapper.is_some())
+            })
+        {
             return false;
         }
         let Some(current) = self.type_payload(id).map(TypeRecord::alias) else {

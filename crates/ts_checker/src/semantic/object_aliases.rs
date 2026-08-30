@@ -2152,6 +2152,7 @@ fn validate_source_header<M>(
         || object.target.is_some()
         || object.mapper.is_some()
         || alias.symbol() != Some(source.alias_symbol)
+        || alias.imported_body().is_some()
         || alias.type_arguments() != Some(source.parameters.as_slice())
         || store
             .type_node_links(source.syntax.declaration)
@@ -2205,6 +2206,7 @@ fn validate_raw_instance_fields(
         || object.target != Some(target)
         || object.instantiations != TypeCacheState::Unallocated
         || alias.type_arguments().is_some() == identity_arguments.is_empty()
+        || identity_symbol == source.alias_symbol && alias.imported_body().is_some()
         || arguments == source.parameters
             && identity_symbol == source.alias_symbol
             && identity_arguments == arguments
@@ -2252,6 +2254,18 @@ fn validate_instance_header_without_request(
 ) -> Result<PropertyObjectAliasInstanceHeader, RelationUnavailable> {
     let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
     let header = validate_raw_instance_header(store, source, target, type_)?;
+    let identity = store
+        .type_payload(type_)
+        .and_then(TypeRecord::alias)
+        .ok_or_else(invalid)?;
+    if let Some(proof) = store
+        .type_alias(identity)
+        .and_then(|alias| alias.imported_body())
+    {
+        proof
+            .validate_wrapper_identity(store, identity)
+            .map_err(|_| invalid())?;
+    }
     if header.identity_symbol == source.alias_symbol {
         if header.identity_arguments.len() != source.parameters.len() {
             return Err(invalid());
@@ -2609,15 +2623,29 @@ fn identity_source_mapping(
             .and_then(|links| links.resolved_symbol)
             .ok_or_else(invalid)?;
         let referenced_header = property_object_alias_identity_source_header(store, referenced)?;
+        let identity = store
+            .type_payload(declared_type)
+            .and_then(TypeRecord::alias)
+            .ok_or_else(invalid)?;
+        let imported = super::source_imports::validate_stored_alias_body_wrapper_import(
+            store,
+            identity,
+            symbol,
+            header.alias_declaration,
+            reference.node,
+            referenced,
+        )
+        .map_err(|_| invalid())?;
         if store.type_node_links(reference.node)
             != Some(&TypeNodeLinks {
                 resolved_type: Some(declared_type),
                 outer_type_parameters: None,
             })
-            || store.source_identifier_text(reference.name)
-                != store
-                    .symbol(referenced)
-                    .and_then(|record| record.name().as_utf8())
+            || !imported
+                && store.source_identifier_text(reference.name)
+                    != store
+                        .symbol(referenced)
+                        .and_then(|record| record.name().as_utf8())
             || header.parameters.iter().any(|(_, parameter)| {
                 store
                     .symbol(*parameter)
@@ -2633,7 +2661,7 @@ fn identity_source_mapping(
                 .is_some_and(|links| {
                     links
                         .resolved_symbol
-                        .is_some_and(|cached| cached != referenced)
+                        .is_some_and(|cached| cached != referenced && !imported)
                 })
         {
             return Err(invalid());

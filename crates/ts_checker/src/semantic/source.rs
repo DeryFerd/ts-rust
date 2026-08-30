@@ -7072,7 +7072,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             {
                 Some(alias)
             }
-            _ => None,
+            Ok(_) | Err(ts_binder::CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => {
+                None
+            }
+            Err(error) => return Err(DeclaredTypeError::from(error).into()),
         })
     }
 
@@ -7292,6 +7295,28 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     UnsupportedSourceSyntax::Import(reference),
                 ));
             };
+            // Textual matches do not grant import authority across a lexical shadow.
+            if let NodeData::TypeReferenceNode(type_reference) = &record.data
+                && matches!(
+                    &self.node(self.reference(type_reference.type_name))?.data,
+                    NodeData::Identifier(_)
+                )
+                && self.resolved_type_import_alias_for_reference(reference)? != Some(alias_symbol)
+            {
+                continue;
+            }
+            if let Some(body) =
+                super::source_imports::plan_source_alias_body_type_import(store, host, reference)
+                    .map_err(|error| Self::import_plan_error(reference, &error))?
+            {
+                if body.reference() != reference || body.alias_symbol() != alias_symbol {
+                    return Err(SourceCheckError::Import(reference));
+                }
+                // The normal type query retains the RHS owner proof. Do not turn
+                // it into an external annotation capability for the whole alias.
+                planned.insert(reference);
+                continue;
+            }
             let Some(property) = plan_source_property_type_import(store, host, reference)
                 .map_err(|error| Self::import_plan_error(reference, &error))?
             else {
@@ -75494,6 +75519,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep the original alias and call inputs with their distinct results.
     fn local_alias_and_call_type_imports_fail_before_source_publication() {
         let target = parsed("export type User = number;");
         for (index, body) in [
@@ -75519,6 +75545,130 @@ mod tests {
             );
             let earlier = variable_symbol(&context, &importer, importer_file, "earlier");
             let cold = observable_state(&context, importer_file);
+
+            if index == 0 {
+                let (declaration, reference) = importer
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                            return None;
+                        };
+                        Some((
+                            NodeRef::new(importer.arena.id(), importer_file, node),
+                            NodeRef::new(importer.arena.id(), importer_file, alias.type_),
+                        ))
+                    })
+                    .unwrap();
+                let provider_declaration =
+                    target
+                        .arena
+                        .iter()
+                        .find_map(|(node, record)| {
+                            (record.kind == SyntaxKind::TypeAliasDeclaration)
+                                .then_some(NodeRef::new(target.arena.id(), target_file, node))
+                        })
+                        .unwrap();
+                let local = context
+                    .file(importer_file)
+                    .unwrap()
+                    .1
+                    .symbol(declaration)
+                    .unwrap();
+                let provider = context
+                    .file(target_file)
+                    .unwrap()
+                    .1
+                    .symbol(provider_declaration)
+                    .unwrap();
+                let imported =
+                    source_import_alias_symbol(&context, &importer, importer_file, "Local");
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                assert!(context.store().type_alias_links(local).is_none());
+                assert!(context.store().alias_symbol_links(imported).is_none());
+                context.check_source_file(importer_file).unwrap();
+                assert_eq!(resolved_import_target(&context, imported), provider);
+                assert_eq!(
+                    context
+                        .store()
+                        .type_alias_links(provider)
+                        .unwrap()
+                        .declared_type,
+                    Some(number)
+                );
+                assert_eq!(
+                    context
+                        .store()
+                        .type_alias_links(local)
+                        .unwrap()
+                        .declared_type,
+                    Some(number)
+                );
+                assert_eq!(resolved_node_type(&context, reference), number);
+                assert_eq!(
+                    context
+                        .store()
+                        .symbol_node_links(reference)
+                        .unwrap()
+                        .resolved_symbol,
+                    Some(provider)
+                );
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(earlier)
+                        .unwrap()
+                        .resolved_type,
+                    Some(number)
+                );
+                assert!(context.store().value_symbol_links(imported).is_none());
+                assert!(is_type_checked(&context, importer_file));
+                assert!(!is_type_checked(&context, target_file));
+                assert!(context.diagnostics().is_empty());
+                let links = (
+                    context.store().type_alias_links(local).unwrap().clone(),
+                    context.store().type_alias_links(provider).unwrap().clone(),
+                    context
+                        .store()
+                        .alias_symbol_links(imported)
+                        .unwrap()
+                        .clone(),
+                    context.store().type_node_links(reference).unwrap().clone(),
+                    context
+                        .store()
+                        .symbol_node_links(reference)
+                        .unwrap()
+                        .clone(),
+                    context.store().value_symbol_links(earlier).unwrap().clone(),
+                );
+                let warm = observable_state(&context, importer_file);
+                for _ in 0..2 {
+                    assert_eq!(context.get_type_from_type_node(reference), Ok(number));
+                    context.recheck_source_file(importer_file).unwrap();
+                    assert_eq!(observable_state(&context, importer_file), warm);
+                    assert_eq!(
+                        (
+                            context.store().type_alias_links(local).unwrap().clone(),
+                            context.store().type_alias_links(provider).unwrap().clone(),
+                            context
+                                .store()
+                                .alias_symbol_links(imported)
+                                .unwrap()
+                                .clone(),
+                            context.store().type_node_links(reference).unwrap().clone(),
+                            context
+                                .store()
+                                .symbol_node_links(reference)
+                                .unwrap()
+                                .clone(),
+                            context.store().value_symbol_links(earlier).unwrap().clone(),
+                        ),
+                        links
+                    );
+                    assert!(context.store().value_symbol_links(imported).is_none());
+                }
+                continue;
+            }
 
             for _ in 0..2 {
                 assert!(matches!(

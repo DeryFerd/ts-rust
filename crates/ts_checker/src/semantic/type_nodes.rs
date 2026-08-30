@@ -101,7 +101,9 @@ use super::{
         SourceCallableAliasAnnotation, SourceCallableAliasSnapshot, SourceCallableError,
         SourceCallableFamily, SourceCallablePlan, SourceCallableTypeParameterPlan,
     },
-    source_imports::{self, SourceImportError, SourcePropertyTypeImportPlan},
+    source_imports::{
+        self, SourceAliasBodyTypeImportPlan, SourceImportError, SourcePropertyTypeImportPlan,
+    },
     source_namespaces::authenticated_merged_namespace_interface,
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
     store::{
@@ -925,7 +927,19 @@ impl TypeQueryPlan {
             .and_then(|links| links.resolved_type);
         let mut needs_node_cache = true;
         let expected = if let Some(reference) = self.references.get(&node) {
-            let cold_property_import = if let Some(property) = &reference.property_import {
+            let cold_property_import = if let Some(body) = &reference.alias_body_import {
+                if body.reference() != node
+                    || Some(body.alias_symbol()) != reference.import_alias
+                    || body.target_symbol() != reference.symbol
+                    || body.arguments() != reference.type_arguments
+                    || reference.property_import.is_some()
+                {
+                    return Err(invalid());
+                }
+                !body
+                    .validate_current(store)
+                    .map_err(|error| property_type_import_error(node, error))?
+            } else if let Some(property) = &reference.property_import {
                 if property.annotation() != node
                     || Some(property.alias_symbol()) != reference.import_alias
                     || property.target_symbol() != reference.symbol
@@ -3315,6 +3329,7 @@ struct PlannedTypeReference {
     symbol: SemanticSymbolId,
     import_alias: Option<SemanticSymbolId>,
     property_import: Option<SourcePropertyTypeImportPlan>,
+    alias_body_import: Option<SourceAliasBodyTypeImportPlan>,
     type_arguments: Vec<NodeRef>,
     alias_owner: Option<SemanticSymbolId>,
     arity: PlannedTypeReferenceArity,
@@ -3544,6 +3559,10 @@ impl SourceCallableTypeQueryEvidence {
                     .property_import
                     .as_ref()
                     .is_some_and(|property| property.validate_retained(store).is_err())
+                    || reference
+                        .alias_body_import
+                        .as_ref()
+                        .is_some_and(|body| body.validate_retained(store).is_err())
             })
         {
             return false;
@@ -16495,6 +16514,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             source_imports::plan_source_property_type_import(self.store, self.host, node)
                 .map_err(|error| property_type_import_error(node, error))?
         };
+        let alias_body_import = if qualified || record_heritage || property_import.is_some() {
+            None
+        } else {
+            source_imports::plan_source_alias_body_type_import(self.store, self.host, node)
+                .map_err(|error| property_type_import_error(node, error))?
+        };
         let cached_symbol = self
             .store
             .symbol_node_links(node)
@@ -16519,6 +16544,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let cached_source_symbol = if !qualified
             && exact_import.is_none()
             && property_import.is_none()
+            && alias_body_import.is_none()
             && (cached_type.is_some() || cached_symbol.is_some())
         {
             self.reject_cached_import_alias_without_capability(node, name, name_text)?
@@ -16577,6 +16603,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && self.intersection_planning_depth == 0
             && exact_import.is_none()
             && property_import.is_none()
+            && alias_body_import.is_none()
             && let Some(cached) = cached_type
             && !cached_array_capability_missing
             && !cached_pending_function
@@ -16619,7 +16646,21 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let possible_global_array_name = !qualified
             && self.array_targets.is_some()
             && matches!(name_text, "Array" | "ReadonlyArray");
-        let symbol = if let Some(property) = &property_import {
+        let symbol = if let Some(body) = &alias_body_import {
+            if body.reference() != node
+                || body.arguments() != type_arguments
+                || exact_import.is_some_and(|capability| !body.matches_capability(&capability))
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidImportAliasTarget {
+                        node,
+                        alias: body.alias_symbol(),
+                        target: body.target_symbol(),
+                    },
+                ));
+            }
+            body.target_symbol()
+        } else if let Some(property) = &property_import {
             if property.annotation() != node
                 || exact_import.is_some_and(|capability| !property.matches_capability(&capability))
             {
@@ -17295,8 +17336,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             import_alias: property_import
                 .as_ref()
                 .map(SourcePropertyTypeImportPlan::alias_symbol)
+                .or_else(|| {
+                    alias_body_import
+                        .as_ref()
+                        .map(SourceAliasBodyTypeImportPlan::alias_symbol)
+                })
                 .or_else(|| exact_import.map(|capability| capability.alias)),
             property_import,
+            alias_body_import,
             type_arguments,
             alias_owner: effective_alias_owner,
             arity,
@@ -25496,6 +25543,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || self.direct_keyof_rhs(type_node)?
             || self.direct_tuple_type_rhs(type_node)?
             || self.direct_conditional_type_rhs(type_node)?
+            || self.type_node_contains_import_alias_reference(type_node, &mut HashSet::new())?
             || !planned_parameters.is_empty()
                 && preflight_node(self.store, self.host, type_node)?.kind == SyntaxKind::UnionType
             || preflight_node(self.store, self.host, type_node)?.kind == SyntaxKind::MappedType
@@ -30212,8 +30260,24 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .iter()
             .filter(|parameter| self.store.declared_type_links(**parameter).is_none())
             .count();
-        // Check every property route before publishing any cold import links.
+        // Validate every declaration-owned route before publishing cold import links.
         for (&node, reference) in &plan.references {
+            if let Some(body) = &reference.alias_body_import {
+                let current =
+                    source_imports::plan_source_alias_body_type_import(self.store, self.host, node)
+                        .map_err(|error| property_type_import_error(node, error))?;
+                if body.reference() != node
+                    || Some(body.alias_symbol()) != reference.import_alias
+                    || body.target_symbol() != reference.symbol
+                    || body.arguments() != reference.type_arguments
+                    || reference.property_import.is_some()
+                    || current.as_ref() != Some(body)
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(node),
+                    ));
+                }
+            }
             let Some(property) = &reference.property_import else {
                 continue;
             };
@@ -30232,6 +30296,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
         }
         for (&node, reference) in &plan.references {
+            if let Some(body) = &reference.alias_body_import {
+                source_imports::prepare_source_alias_body_type_import(self.store, self.host, body)
+                    .map_err(|error| property_type_import_error(node, error))?;
+            }
             let Some(property) = &reference.property_import else {
                 continue;
             };
@@ -30803,6 +30871,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 symbol: base.symbol,
                 import_alias: None,
                 property_import: None,
+                alias_body_import: None,
                 type_arguments: supplied.to_vec(),
                 alias_owner: None,
                 arity: PlannedTypeReferenceArity::Valid,
@@ -35849,10 +35918,27 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         .map_err(|_| invalid())?;
         let owner = plan.aliases.get(&identity.0).ok_or_else(invalid)?;
         let referenced = plan.aliases.get(&reference.symbol).ok_or_else(invalid)?;
+        let imported = reference.alias_body_import.as_ref();
+        if let Some(imported) = imported {
+            if imported.owner() != identity.0
+                || imported.reference() != node
+                || imported.target_symbol() != reference.symbol
+                || imported.arguments() != reference.type_arguments
+                || source_imports::plan_source_alias_body_type_import(self.store, self.host, node)
+                    .map_err(|error| property_type_import_error(node, error))?
+                    .as_ref()
+                    != Some(imported)
+            {
+                return Err(invalid());
+            }
+            imported
+                .validate_retained(self.store)
+                .map_err(|error| property_type_import_error(node, error))?;
+        }
         if plan.references.get(&node) != Some(reference)
             || reference.alias_owner != Some(identity.0)
             || reference.arity != PlannedTypeReferenceArity::Valid
-            || reference.import_alias.is_some()
+            || reference.import_alias.is_some() && imported.is_none()
             || reference.global_array_target.is_some()
             || reference.direct_generic
             || self
@@ -35950,11 +36036,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             });
         if source_arguments != reference.type_arguments
             || self.store.source_node_kind(name) != Some(SyntaxKind::Identifier)
-            || self.store.source_identifier_text(name)
-                != self
-                    .store
-                    .symbol(reference.symbol)
-                    .and_then(|symbol| symbol.name().as_utf8())
+            || imported.is_none()
+                && self.store.source_identifier_text(name)
+                    != self
+                        .store
+                        .symbol(reference.symbol)
+                        .and_then(|symbol| symbol.name().as_utf8())
             || self.store.source_node_parent(name) != Some(SourceNodeParent::Parent(node))
             || self
                 .store
@@ -35963,7 +36050,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             || self.store.symbol_node_links(name).is_some_and(|links| {
                 links
                     .resolved_symbol
-                    .is_some_and(|symbol| symbol != reference.symbol)
+                    .is_some_and(|symbol| symbol != reference.symbol && imported.is_none())
             })
             || self.store.symbol_node_links(node).is_some_and(|links| {
                 links
@@ -36609,6 +36696,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         } else {
             None
         };
+        // Allocate the immutable source proof before the mapper can publish a result.
+        let wrapper_import = if property_object_alias && alias_identity.is_some() {
+            reference
+                .alias_body_import
+                .as_ref()
+                .map(|proof| Arc::new(proof.clone()))
+        } else {
+            None
+        };
         let mut intersection_receipt = None;
         let instantiation = if property_object_alias && let Some(identity) = &alias_identity {
             self.instantiate_property_alias_with_identity(
@@ -36810,6 +36906,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             )?
         };
 
+        if let Some(proof) = wrapper_import
+            && self
+                .store
+                .type_payload(instantiation)
+                .and_then(TypeRecord::alias)
+                .and_then(|alias| self.store.type_alias(alias))
+                .is_some_and(|identity| identity.symbol() == Some(proof.owner()))
+            && !self
+                .store
+                .retain_type_alias_imported_body(instantiation, proof)
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
+            ));
+        }
         self.report_property_alias_instantiation_limit(node, property_limit_mark);
         if (literal_method_alias
             || property_object_alias
@@ -41862,6 +41973,148 @@ mod tests {
             _ => panic!("expected a property declaration"),
         };
         NodeRef::new(property.arena, property.file, annotation)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Verify the whole import plan before publication and exact session replay.
+    fn alias_body_type_import_query_checks_argument_caches_before_publication() {
+        let source = parse_source_file(concat!(
+            "import type { Left, Right } from '../types'; ",
+            "export type Choice<T> = Left<T> extends unknown ? Right<T> : never;",
+        ));
+        let barrel = parse_source_file("export * from './utils';");
+        let provider = parse_source_file("export type Left<T> = T; export type Right<T> = T;");
+        let sources = [&source, &barrel, &provider];
+        let (mut context, bounds, manifest) = property_type_import_test_context(sources);
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources
+                .into_iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (&parsed.arena, bound)),
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap()
+        .with_module_resolutions(&manifest);
+        let declaration = property_type_import_named_node(
+            &source,
+            PROPERTY_IMPORT_FILES[0],
+            SyntaxKind::TypeAliasDeclaration,
+            "Choice",
+        );
+        let NodeData::TypeAliasDeclaration(alias) =
+            &source.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let body = NodeRef::new(declaration.arena, declaration.file, alias.type_);
+        let (right, argument) = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeReferenceNode(reference) = &record.data else {
+                    return None;
+                };
+                (identifier_text(&source.arena, reference.type_name) == Some("Right")).then(|| {
+                    (
+                        NodeRef::new(source.arena.id(), PROPERTY_IMPORT_FILES[0], node),
+                        NodeRef::new(
+                            source.arena.id(),
+                            PROPERTY_IMPORT_FILES[0],
+                            reference.type_arguments.as_ref().unwrap().nodes[0],
+                        ),
+                    )
+                })
+            })
+            .unwrap();
+        let store = context.store_mut_for_test();
+        let right_plan = source_imports::plan_source_alias_body_type_import(store, &host, right)
+            .unwrap()
+            .unwrap();
+        let left_binding = property_type_import_named_node(
+            &source,
+            PROPERTY_IMPORT_FILES[0],
+            SyntaxKind::ImportSpecifier,
+            "Left",
+        );
+        let left_alias = bounds[0].symbol(left_binding).unwrap();
+        assert!(store.alias_symbol_links(left_alias).is_none());
+        assert!(
+            store
+                .alias_symbol_links(right_plan.alias_symbol())
+                .is_none()
+        );
+        assert!(store.type_node_links(argument).is_none());
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(store.set_type_node_links(
+            argument,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                outer_type_parameters: None,
+            }
+        ));
+        let before = function_store_state(store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let session_before = (
+            session.query_count(),
+            session.total_count(),
+            session.limit_event_mark(),
+        );
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(query.get_type_from_type_node(body).is_err());
+        assert_eq!(function_store_state(query.store), before);
+        assert!(query.store.alias_symbol_links(left_alias).is_none());
+        assert!(
+            query
+                .store
+                .alias_symbol_links(right_plan.alias_symbol())
+                .is_none()
+        );
+        assert!(query.store.type_node_links(body).is_none());
+        let failed_session = query.instantiation_session.as_deref().unwrap();
+        assert_eq!(
+            (
+                failed_session.query_count(),
+                failed_session.total_count(),
+                failed_session.limit_event_mark(),
+            ),
+            session_before
+        );
+        assert!(
+            query
+                .store
+                .set_type_node_links(argument, TypeNodeLinks::default())
+        );
+        let result = query.get_type_from_type_node(body).unwrap();
+        let warm = function_store_state(query.store);
+        let warm_session = query.instantiation_session.as_deref().unwrap();
+        let warm_counts = (
+            warm_session.query_count(),
+            warm_session.total_count(),
+            warm_session.limit_event_mark(),
+        );
+        assert_eq!(query.get_type_from_type_node(body), Ok(result));
+        assert_eq!(function_store_state(query.store), warm);
+        assert!(query.diagnostics.is_empty());
+        drop(query);
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_mark()
+            ),
+            warm_counts
+        );
     }
 
     #[test]
