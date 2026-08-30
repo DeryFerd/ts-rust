@@ -1756,6 +1756,76 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(())
     }
 
+    /// A published method clone must keep its source proof if its flags change.
+    pub(super) fn object_literal_property_requires_method_proof(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> bool {
+        self.symbol(symbol)
+            .is_some_and(|record| record.flags().intersects(SymbolFlags::METHOD))
+            || self
+                .object_literal_property_clone_origin(symbol)
+                .is_some_and(|origin| {
+                    self.source_callable_type_for_owner(origin.source())
+                        .is_some()
+                })
+    }
+
+    /// Reads the publisher's exact method clone without resolving a new callable.
+    pub(super) fn object_literal_method_clone_type(
+        &self,
+        symbol: SemanticSymbolId,
+        owner: SemanticSymbolId,
+    ) -> Option<TypeId> {
+        let origin = self.object_literal_property_clone_origin(symbol)?;
+        let cloned = self.symbol(symbol)?;
+        let source = self.symbol(origin.source())?;
+        let [declaration] = source.declarations()? else {
+            return None;
+        };
+        let callable = self.source_callable_type_for_owner(origin.source())?;
+        let provenance = self.source_callable_provenance(callable)?;
+        if origin.symbol() != symbol
+            || origin.source() == symbol
+            || self.symbol(owner)?.value_declaration() != Some(origin.owner())
+            || self.source_node_parent(*declaration)
+                != Some(SourceNodeParent::Parent(origin.owner()))
+            || !self.source_symbol_declarations_match(origin.source())
+            || !self.source_object_literal_method_owner_is_exact(*declaration, origin.source())
+            || source.parent() != Some(owner)
+            || cloned.flags()
+                != SymbolFlags::METHOD | SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+            || cloned.check_flags() != CheckFlags::NONE
+            || cloned.name() != source.name()
+            || cloned.name().is_internal()
+            || cloned.name().is_private_identifier()
+            || cloned.name().is_late_bound()
+            || cloned.declarations() != source.declarations()
+            || cloned.value_declaration() != Some(*declaration)
+            || cloned.parent() != Some(owner)
+            || cloned.members().is_some()
+            || cloned.exports().is_some()
+            || cloned.export_symbol().is_some()
+            || self.get_merged_symbol(symbol) != Some(symbol)
+            || self.value_symbol_links(symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(callable),
+                    target: Some(origin.source()),
+                    ..ValueSymbolLinks::default()
+                })
+            || provenance.family != super::store::SourceCallableFamily::ObjectLiteralMethod
+            || provenance.declaration != *declaration
+            || provenance.owner_symbol != origin.source()
+            || !matches!(
+                super::source_callables::validate_stored_source_callable(self, callable),
+                super::source_callables::StoredSourceCallableValidation::Valid(_)
+            )
+        {
+            return None;
+        }
+        Some(callable)
+    }
+
     fn fresh_object_shape(&self, type_: TypeId) -> Option<ObjectShape> {
         let record = self.type_payload(type_)?;
         let TypeData::Object(object) = record.data() else {
@@ -1848,6 +1918,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 {
                     return None;
                 }
+                result.push(PropertyShape {
+                    symbol: *property,
+                    name: property_record.name().to_owned(),
+                    type_: property_type,
+                });
+                continue;
+            }
+            if self.object_literal_property_requires_method_proof(*property) {
+                let property_type = self.object_literal_method_clone_type(*property, owner)?;
+                let raw = self
+                    .object_literal_property_clone_origin(*property)?
+                    .source();
+                if expected_property_checks != CheckFlags::NONE
+                    || !seen_raw.insert(raw)
+                    || table.get(property_record.name()) != Some(*property)
+                    || raw_table.and_then(|raw| raw.get(property_record.name())) != Some(raw)
+                {
+                    return None;
+                }
+                expected_flags |= self.type_payload(property_type)?.object_flags()
+                    & ObjectFlags::PROPAGATING_FLAGS;
                 result.push(PropertyShape {
                     symbol: *property,
                     name: property_record.name().to_owned(),
@@ -2698,6 +2789,272 @@ mod tests {
             format!("{store:?}") == before,
             "the widening query changed the store"
         );
+    }
+
+    #[test]
+    fn object_method_clones_keep_their_callables_during_regularization_and_widening() {
+        let source = parsed(concat!(
+            "const object: any = { text: 'ready', missing: undefined, ",
+            "identity(value: number): number { return value; }, ",
+            "inferred(value: string) { return value; } };",
+        ));
+        let file = FileId::new(202);
+        let mut context = checker_context(&[(file, &source)]);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let node = variable_initializer(&source, file, "object");
+        let fresh = resolved_expression_type(&context, node);
+        let store = context.store_mut_for_test();
+        assert!(
+            !store
+                .derived_types
+                .regular_object_literals
+                .contains_key(&fresh)
+        );
+        let shape = store.fresh_object_shape(fresh).unwrap();
+        let methods = ["identity", "inferred"].map(|name| property(&shape, name).clone());
+        for method in &methods {
+            let origin = store
+                .object_literal_property_clone_origin(method.symbol)
+                .unwrap();
+            assert_eq!(origin.owner(), node);
+            assert_eq!(origin.symbol(), method.symbol);
+            assert_ne!(origin.source(), method.symbol);
+            assert_eq!(
+                store.source_callable_type_for_owner(origin.source()),
+                Some(method.type_)
+            );
+            assert_eq!(
+                store.object_literal_method_clone_type(method.symbol, shape.symbol),
+                Some(method.type_)
+            );
+            assert_eq!(
+                store.symbol(method.symbol).unwrap().flags(),
+                SymbolFlags::METHOD | SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+            );
+        }
+        let symbols = store.symbol_len();
+        let signatures = store.signature_len();
+        let regular = store.get_regular_type_of_object_literal(fresh).unwrap();
+        assert_ne!(regular, fresh);
+        assert_eq!(store.symbol_len(), symbols);
+        let widened = store.get_widened_type(regular).unwrap();
+        assert_ne!(widened, regular);
+        assert_eq!(store.symbol_len(), symbols + 1);
+        assert_eq!(store.signature_len(), signatures);
+        let widened_shape = store.resolved_object_shape(widened).unwrap();
+        assert_eq!(
+            property(&widened_shape, "text").type_,
+            store.intrinsic_bootstrap().unwrap().string_type
+        );
+        assert_eq!(
+            property(&widened_shape, "missing").type_,
+            store.intrinsic_bootstrap().unwrap().any_type
+        );
+        assert_ne!(
+            property(&widened_shape, "missing").symbol,
+            property(&shape, "missing").symbol
+        );
+        for result in [regular, widened] {
+            let result_shape = store.resolved_object_shape(result).unwrap();
+            for method in &methods {
+                let retained = property(&result_shape, method.name.as_utf8().unwrap());
+                assert_eq!(retained.symbol, method.symbol);
+                assert_eq!(retained.type_, method.type_);
+            }
+        }
+        let warm = format!("{store:?}");
+        for _ in 0..2 {
+            assert_eq!(store.get_regular_type_of_object_literal(fresh), Ok(regular));
+            assert_eq!(store.get_widened_type(regular), Ok(widened));
+            assert_eq!(format!("{store:?}"), warm);
+        }
+    }
+
+    #[test]
+    fn object_method_clones_reject_source_and_callable_damage_before_cache_reuse() {
+        let source = parsed(concat!(
+            "const object: any = { method(value: number): number { return value; } }; ",
+            "const donor: any = { method(value: number): number { return value; } };",
+        ));
+        let file = FileId::new(203);
+        let mut context = checker_context(&[(file, &source)]);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let fresh =
+            resolved_expression_type(&context, variable_initializer(&source, file, "object"));
+        let donor =
+            resolved_expression_type(&context, variable_initializer(&source, file, "donor"));
+        let store = context.store_mut_for_test();
+        let shape = store.fresh_object_shape(fresh).unwrap();
+        let method = property(&shape, "method").clone();
+        let donor_shape = store.fresh_object_shape(donor).unwrap();
+        let donor_method = property(&donor_shape, "method");
+        let donor_raw = store
+            .value_symbol_links(donor_method.symbol)
+            .unwrap()
+            .target
+            .unwrap();
+        let original = store.value_symbol_links(method.symbol).unwrap().clone();
+        let raw = original.target.unwrap();
+        let raw_links = store.value_symbol_links(raw).unwrap().clone();
+        let declaration = store.symbol(raw).unwrap().value_declaration().unwrap();
+        let callable = store.source_callable_provenance(method.type_).unwrap();
+        let returned = store
+            .signature(callable.signature)
+            .unwrap()
+            .resolved_return_type()
+            .unwrap();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let mapper = store.new_simple_type_mapper(returned, string).unwrap();
+        let reject = |store: &mut CanonicalTypeMapperStore| {
+            let expected = store
+                .derived_types
+                .regular_object_literals
+                .get(&fresh)
+                .map_or(DerivedTypeError::MalformedObjectLiteral(fresh), |cached| {
+                    DerivedTypeError::InvalidRegularObjectLiteralCache {
+                        source: fresh,
+                        cached: *cached,
+                    }
+                });
+            let before = format!("{store:?}");
+            for _ in 0..2 {
+                assert!(store.fresh_object_shape(fresh).is_none());
+                assert_eq!(
+                    store.object_literal_method_clone_type(method.symbol, shape.symbol),
+                    None
+                );
+                assert_eq!(
+                    store.get_regular_type_of_object_literal(fresh),
+                    Err(expected)
+                );
+                assert_eq!(format!("{store:?}"), before);
+            }
+        };
+        assert!(
+            !store
+                .derived_types
+                .regular_object_literals
+                .contains_key(&fresh)
+        );
+        assert!(store.set_value_symbol_links(
+            method.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(donor_method.type_),
+                ..original.clone()
+            }
+        ));
+        reject(store);
+        assert!(store.set_value_symbol_links(method.symbol, original.clone()));
+        let regular = store.get_regular_type_of_object_literal(fresh).unwrap();
+
+        for symbol in [method.symbol, raw] {
+            assert!(store.set_symbol_relationships(
+                symbol,
+                None,
+                None,
+                Some(donor_shape.symbol),
+                None
+            ));
+            reject(store);
+            assert!(store.set_symbol_relationships(symbol, None, None, Some(shape.symbol), None));
+            assert_eq!(store.get_regular_type_of_object_literal(fresh), Ok(regular));
+            assert!(store.set_symbol_declarations(symbol, Some(vec![declaration]), None));
+            reject(store);
+            assert!(store.set_symbol_declarations(
+                symbol,
+                Some(vec![declaration]),
+                Some(declaration)
+            ));
+            assert_eq!(store.get_regular_type_of_object_literal(fresh), Ok(regular));
+        }
+        for links in [
+            ValueSymbolLinks {
+                target: Some(donor_raw),
+                ..original.clone()
+            },
+            ValueSymbolLinks {
+                mapper: Some(mapper),
+                ..original.clone()
+            },
+        ] {
+            assert!(store.set_value_symbol_links(method.symbol, links));
+            reject(store);
+            assert!(store.set_value_symbol_links(method.symbol, original.clone()));
+            assert_eq!(store.get_regular_type_of_object_literal(fresh), Ok(regular));
+        }
+        assert!(store.set_value_symbol_links(raw, ValueSymbolLinks::default()));
+        reject(store);
+        assert!(store.set_symbol_flags(
+            method.symbol,
+            SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE
+        ));
+        assert!(store.set_symbol_flags(raw, SymbolFlags::PROPERTY, CheckFlags::NONE));
+        reject(store);
+        assert!(store.set_symbol_flags(raw, SymbolFlags::METHOD, CheckFlags::NONE));
+        assert!(store.set_symbol_flags(
+            method.symbol,
+            SymbolFlags::METHOD | SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE
+        ));
+        assert!(store.set_value_symbol_links(raw, raw_links));
+        assert_eq!(store.get_regular_type_of_object_literal(fresh), Ok(regular));
+        assert!(store.set_signature_resolved_return_type(callable.signature, Some(string)));
+        reject(store);
+        assert!(store.set_signature_resolved_return_type(callable.signature, Some(returned)));
+        assert_eq!(store.get_regular_type_of_object_literal(fresh), Ok(regular));
+
+        let mut forged = SymbolData::new(
+            SymbolFlags::METHOD | SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            method.name.clone(),
+        );
+        forged.declarations = Some(vec![declaration]);
+        forged.value_declaration = Some(declaration);
+        forged.parent = Some(shape.symbol);
+        let forged = store.alloc_symbol(forged).unwrap();
+        assert!(store.set_value_symbol_links(forged, original));
+        assert!(store.object_literal_property_clone_origin(forged).is_none());
+        assert_eq!(
+            store.insert_symbol(shape.members, method.name.clone(), forged),
+            Some(Some(method.symbol))
+        );
+        assert!(store.set_structured_type_members(
+            fresh,
+            Some(shape.members),
+            Some(vec![forged]),
+            None,
+            None,
+            None
+        ));
+        let before = format!("{store:?}");
+        assert!(store.fresh_object_shape(fresh).is_none());
+        assert_eq!(
+            store.object_literal_method_clone_type(forged, shape.symbol),
+            None
+        );
+        assert_eq!(
+            store.get_regular_type_of_object_literal(fresh),
+            Err(DerivedTypeError::InvalidRegularObjectLiteralCache {
+                source: fresh,
+                cached: regular
+            })
+        );
+        assert_eq!(format!("{store:?}"), before);
+        assert_eq!(
+            store.insert_symbol(shape.members, method.name.clone(), method.symbol),
+            Some(Some(forged))
+        );
+        assert!(store.set_structured_type_members(
+            fresh,
+            Some(shape.members),
+            Some(vec![method.symbol]),
+            None,
+            None,
+            None
+        ));
+        assert_eq!(store.get_regular_type_of_object_literal(fresh), Ok(regular));
     }
 
     #[test]

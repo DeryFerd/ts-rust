@@ -6494,6 +6494,16 @@ impl Program {
                         range_override,
                     });
                 }
+                None if anchor.kind == SyntaxKind::ReturnStatement => {
+                    // Go GetErrorRangeForNode selects the first token, after trivia.
+                    let start = anchor.range.start.get() as usize;
+                    if !source.source_text.is_char_boundary(start) {
+                        return Err(CanonicalProgramCheckError::InvalidDiagnosticNode(node));
+                    }
+                    let mut scanner = Scanner::new(&source.source_text);
+                    scanner.reset_token_state(start);
+                    scanner.scan().range
+                }
                 None => anchor.range,
             };
             (Some(source.file_name.clone()), Some(range))
@@ -15140,6 +15150,66 @@ mod tests {
         ordered.sort_by(super::compare_program_diagnostics);
         assert_eq!(ordered[0].range, Some(exact_range));
         assert_eq!(ordered[1].range, Some(later_range));
+    }
+
+    #[test]
+    fn canonical_program_return_diagnostic_selects_keyword_and_preserves_override() {
+        for text in [
+            "function value(): number {\n  /* π */ return 'no';\n}",
+            "function value(): void {\n  // before the statement\n  return;\n}",
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/input.ts", text).unwrap();
+            let program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["input.ts".to_owned()],
+                CompilerOptions {
+                    no_check: true,
+                    no_lib: true,
+                    ..CompilerOptions::default()
+                },
+            );
+            let source = program.source_file("/project/input.ts").unwrap();
+            assert!(source.parse.diagnostics.is_empty());
+            let (id, record) = source
+                .parse
+                .arena
+                .iter()
+                .find(|(_, record)| matches!(record.data, NodeData::ReturnStatement(_)))
+                .unwrap();
+            let anchor = source.node_ref(id).unwrap();
+            let start = u32::try_from(text.find("return").unwrap()).unwrap();
+            let keyword = TextRange::new(TextPos::new(start), TextPos::new(start + 6));
+            let diagnostic =
+                Diagnostic::with_arguments(message_by_code(2322).unwrap(), ["string", "number"]);
+            let converted = program
+                .canonical_program_diagnostic(
+                    Some(anchor),
+                    None,
+                    &diagnostic,
+                    [(Some(anchor), &diagnostic)],
+                )
+                .unwrap();
+            assert_eq!(converted.file_name.as_deref(), Some("/project/input.ts"));
+            assert_eq!(converted.range, Some(keyword));
+            assert_eq!(converted.related_information.len(), 1);
+            assert_eq!(converted.related_information[0].range, Some(keyword));
+            assert_eq!(&text[start as usize..(start + 6) as usize], "return");
+            assert!(record.range.end > keyword.end);
+
+            let overridden = program
+                .canonical_program_diagnostic(
+                    Some(anchor),
+                    Some(CanonicalCheckerDiagnosticRange::new(anchor, record.range)),
+                    &diagnostic,
+                    std::iter::empty(),
+                )
+                .unwrap();
+            assert_eq!(overridden.range, Some(record.range));
+            assert_eq!(overridden.code, converted.code);
+            assert_eq!(overridden.message, converted.message);
+        }
     }
 
     #[test]

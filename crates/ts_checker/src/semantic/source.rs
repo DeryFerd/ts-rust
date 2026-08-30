@@ -21220,6 +21220,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     } else {
                         false
                     };
+                    let enclosing_method = if arrow.parameters.nodes.is_empty()
+                        && self.node(container)?.kind == SyntaxKind::MethodDeclaration
+                        && let Some(owner) =
+                            super::source_callables::source_object_literal_method_symbol(
+                                store, host, container,
+                            ) {
+                        let enclosing =
+                            plan_source_callable(store, host, container, owner, self.array_targets)
+                                .map_err(Self::callable_plan_error)?;
+                        enclosing.declaration == container
+                            && enclosing.owner_symbol == owner
+                            && enclosing.family == SourceCallableFamily::ObjectLiteralMethod
+                            && enclosing.body_mode == SourceCallableBodyMode::Present
+                            && enclosing.type_parameters.is_empty()
+                            && !enclosing.is_async
+                            && self.source_node_is_within(parent, enclosing.body)?
+                    } else {
+                        false
+                    };
                     if container == self.bound.source_file() {
                         let name = self.reference(variable.name);
                         let NodeData::Identifier(identifier) = &self.node(name)?.data else {
@@ -21238,6 +21257,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     } else if !class_local
                         && !enclosing_arrow
                         && !enclosing_function
+                        && !enclosing_method
                         && (self.node(container)?.kind != SyntaxKind::FunctionDeclaration
                             || arrow.parameters.nodes.is_empty())
                         || !arrow.parameters.nodes.iter().all(|parameter| {
@@ -21254,7 +21274,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             UnsupportedSourceSyntax::Arrow(declaration),
                         ));
                     }
-                    local_arrow_in_sync_callable = enclosing_arrow || enclosing_function;
+                    local_arrow_in_sync_callable =
+                        enclosing_arrow || enclosing_function || enclosing_method;
                     break;
                 }
                 NodeData::PropertyDeclaration(property)

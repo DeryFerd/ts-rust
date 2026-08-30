@@ -6814,6 +6814,81 @@ mod tests {
     }
 
     #[test]
+    fn canonical_object_method_return_serializes_the_keyword_range() {
+        // Keep the input from object_method_defaults_bodies_and_calls_keep_exact_diagnostics.
+        let source = concat!(
+            "const object = { typed(value: number = 'wrong'): number { return 'bad'; } };\n",
+            "const omitted = object.typed();\n",
+            "const invalid = object.typed('argument');",
+        );
+        let case = Case::parse("methods.ts", source).unwrap();
+        assert_eq!(case.units.len(), 1);
+        assert_eq!(case.units[0].source_text.as_scannable_str(), source);
+        assert_eq!(source.len(), 150);
+        let mut variant = OptionVariant {
+            values: [
+                ("lib", "es5"),
+                ("strictNullChecks", "true"),
+                ("noImplicitAny", "true"),
+                ("strictFunctionTypes", "true"),
+                ("exactOptionalPropertyTypes", "false"),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect(),
+            ..OptionVariant::default()
+        };
+        let compilation =
+            super::compile_case_variant(&case, &mut variant, FixtureChecker::Canonical, false)
+                .unwrap();
+        assert!(variant.unsupported_details.is_empty());
+        assert_eq!(compilation.diagnostics.len(), 3);
+        for (diagnostic, (code, start, length, text, message)) in compilation
+            .diagnostics
+            .iter()
+            .zip([
+                (
+                    2322,
+                    23,
+                    23,
+                    "value: number = 'wrong'",
+                    "Type 'string' is not assignable to type 'number'.",
+                ),
+                (
+                    2322,
+                    58,
+                    6,
+                    "return",
+                    "Type 'string' is not assignable to type 'number'.",
+                ),
+                (
+                    2345,
+                    138,
+                    10,
+                    "'argument'",
+                    "Argument of type '\"argument\"' is not assignable to parameter of type 'number | undefined'.",
+                ),
+            ])
+        {
+            assert_eq!(diagnostic.source_text.as_ref().unwrap().as_scannable_str(), source);
+            assert_eq!(&source[start..start + length], text);
+            let serialized = serde_json::to_value(DiagnosticScorecardDiagnostic::from(diagnostic))
+                .unwrap();
+            assert_eq!(
+                serialized,
+                serde_json::json!({
+                    "fileName": "/.src/methods.ts",
+                    "range": { "start": start, "length": length },
+                    "code": code,
+                    "category": "error",
+                    "message": message,
+                    "relatedInformation": [],
+                }),
+            );
+        }
+    }
+
+    #[test]
     fn canonical_checker_matches_pinned_simple_multi_file_diagnostics_exactly() {
         // This is the pinned source verbatim: there is deliberately no `noLib`
         // or `lib` directive, so the fixture's default library closure (and its
