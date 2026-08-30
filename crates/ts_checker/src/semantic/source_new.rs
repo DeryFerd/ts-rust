@@ -5238,12 +5238,15 @@ pub(super) fn check_source_constructor_overload_new(
     global_types: &CanonicalGlobalTypes,
     strict_function_types: bool,
     plan: &SourceDefaultNewPlan,
+    session: &mut InstantiationSession,
 ) -> Result<Option<CheckedSourceConstructorOverloadNew>, SourceNewError> {
     let SourceNewTarget::ConstructorOverloads(class) = &plan.target else {
         return Ok(None);
     };
     preflight_direct_default_new(store, host, plan)?;
     preflight_prepared_default_new_cache(store, host, plan)?;
+    let existing_signature = exact_signature_cache(store, plan.node)
+        .map_err(|()| invariant(SourceNewInvariant::InvalidExpressionCache(plan.node)))?;
     let group = super::classes::source_class_constructor_overloads(store, host, class.symbol())?
         .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(class.declaration())))?;
     let arguments = materialize_new_argument_types(store, plan)?;
@@ -5274,6 +5277,8 @@ pub(super) fn check_source_constructor_overload_new(
         strict_function_types,
         request,
         &group.signatures,
+        existing_signature,
+        session,
     )
     .map_err(|error| SourceNewError::Call {
         node: plan.node,
@@ -5293,6 +5298,7 @@ pub(super) fn check_source_constructor_overload_new(
         strict_function_types,
         request,
         &group.implementation,
+        session,
     )
     .map_err(|error| SourceNewError::Call {
         node: plan.node,

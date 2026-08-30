@@ -32486,6 +32486,7 @@ fn check_expression_type_with_capture_context(
                 global_types,
                 options.strict_function_types,
                 construction,
+                session,
             )
             .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
             let checked = if let Some(overloaded) = overloaded {

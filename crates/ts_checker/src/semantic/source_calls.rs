@@ -32,8 +32,8 @@ use super::{
     },
     calls::{
         ClassBodyInvocationResolution, DirectCallApplicability, DirectCallError, DirectCallForm,
-        DirectCallRequest, DirectCallResolution, DirectCallUnsupported,
-        resolve_class_body_invocation, resolve_direct_call,
+        DirectCallOverloadFailure, DirectCallRequest, DirectCallResolution, DirectCallUnsupported,
+        resolve_class_body_invocation_with_session, resolve_direct_call_with_session,
     },
     classes::{
         ClassBodyAccessToken, ClassBodyCallable, ClassBodyIdentities, ClassError,
@@ -5176,6 +5176,7 @@ struct ResolvedLegacySourceCall {
     maximum_argument_count: usize,
     has_effective_rest: bool,
     applicability: DirectCallApplicability,
+    overload_failure: Option<DirectCallOverloadFailure>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5240,6 +5241,27 @@ fn resolve_source_call_once(
         false
     };
     if explicit_type_arguments.is_none() || nongeneric_type_arguments {
+        if let Some(existing) = existing_call_signature
+            && let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(store, callee_type)
+            && projection.call_signatures.iter().all(|callable| {
+                store
+                    .signature(callable.signature)
+                    .is_some_and(|signature| signature.type_parameters().is_empty())
+            })
+            && !projection
+                .call_signatures
+                .iter()
+                .any(|callable| callable.signature == existing)
+            && !super::calls::overload_failure_signature_matches(
+                store,
+                callee_type,
+                existing,
+                &projection.call_signatures,
+            )
+        {
+            return Err(SourceCallResolutionError::Invariant);
+        }
         let request = DirectCallRequest {
             form,
             optional_chain: false,
@@ -5248,7 +5270,14 @@ fn resolve_source_call_once(
             callee: callee_type,
             arguments: argument_types,
         };
-        match resolve_direct_call(store, global_types, options.strict_function_types, request) {
+        match resolve_direct_call_with_session(
+            store,
+            global_types,
+            options.strict_function_types,
+            request,
+            existing_call_signature,
+            session,
+        ) {
             Ok(resolution) => {
                 let resolved = ResolvedLegacySourceCall {
                     signature: resolution.projection.signature,
@@ -5257,6 +5286,7 @@ fn resolve_source_call_once(
                     maximum_argument_count: resolution.projection.maximum_argument_count,
                     has_effective_rest: resolution.projection.has_effective_rest,
                     applicability: resolution.applicability,
+                    overload_failure: resolution.overload_failure,
                 };
                 return Ok(if nongeneric_type_arguments {
                     ResolvedSourceCall::NongenericTypeArguments(resolved)
@@ -6178,6 +6208,72 @@ fn prepare_legacy_source_call_diagnostic(
     argument_types: &[TypeId],
     resolution: ResolvedLegacySourceCall,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    let mut diagnostic_resolution = resolution;
+    let mut overload_note = None;
+    match resolution.overload_failure {
+        Some(DirectCallOverloadFailure::Argument {
+            signature,
+            failed_candidates,
+        }) => {
+            if failed_candidates == 0
+                || !matches!(
+                    resolution.applicability,
+                    DirectCallApplicability::ArgumentNotAssignable { .. }
+                )
+            {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            diagnostic_resolution.signature = signature;
+            diagnostic_resolution.overload_failure = None;
+            overload_note = (failed_candidates > 1).then_some(signature);
+        }
+        Some(DirectCallOverloadFailure::Arity {
+            closest_signature,
+            minimum_argument_count,
+            maximum_argument_count,
+            gap,
+        }) => {
+            if let Some((below, above)) = gap {
+                if !(below < argument_types.len() && argument_types.len() < above)
+                    || argument_types.len() != plan.arguments.len()
+                {
+                    return Err(SourceCheckError::Call(plan.node));
+                }
+                return Ok(vec![CanonicalCheckerDiagnostic {
+                    node: Some(plan.callee_diagnostic_node),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(2575).ok_or(SourceCheckError::MissingDiagnostic(2575))?,
+                        [
+                            argument_types.len().to_string(),
+                            below.to_string(),
+                            above.to_string(),
+                        ],
+                    ),
+                    related_information: Vec::new(),
+                }]);
+            }
+            diagnostic_resolution.signature = closest_signature;
+            diagnostic_resolution.minimum_argument_count = minimum_argument_count;
+            diagnostic_resolution.maximum_argument_count = maximum_argument_count;
+            diagnostic_resolution.has_effective_rest = false;
+            diagnostic_resolution.overload_failure = None;
+            diagnostic_resolution.applicability = if argument_types.len() < minimum_argument_count {
+                DirectCallApplicability::TooFewArguments {
+                    expected_at_least: minimum_argument_count,
+                    actual: argument_types.len(),
+                }
+            } else if argument_types.len() > maximum_argument_count {
+                DirectCallApplicability::TooManyArguments {
+                    expected_at_most: maximum_argument_count,
+                    actual: argument_types.len(),
+                }
+            } else {
+                return Err(SourceCheckError::Call(plan.node));
+            };
+        }
+        None => {}
+    }
     let mut result = prepare_fixed_source_call_diagnostic(
         store,
         host,
@@ -6187,13 +6283,45 @@ fn prepare_legacy_source_call_diagnostic(
         diagnostics,
         plan.into(),
         argument_types,
-        resolution,
+        diagnostic_resolution,
     )?;
+    if let Some(signature) = overload_note {
+        let declaration = store
+            .signature(signature)
+            .and_then(|signature| signature.declaration())
+            .ok_or(SourceCheckError::Call(plan.node))?;
+        for diagnostic in &mut result {
+            let message = diagnostic
+                .diagnostic
+                .render()
+                .map_err(|_| SourceCheckError::Call(plan.node))?;
+            let detail = Diagnostic::new(
+                message_by_code(2770).ok_or(SourceCheckError::MissingDiagnostic(2770))?,
+            )
+            .render()
+            .map_err(|_| SourceCheckError::Call(plan.node))?;
+            diagnostic.diagnostic = Diagnostic::new(
+                message_by_code(2769).ok_or(SourceCheckError::MissingDiagnostic(2769))?,
+            )
+            .with_details(
+                std::iter::once(format!("  {detail}"))
+                    .chain(message.lines().map(|line| format!("    {line}"))),
+            );
+            diagnostic
+                .related_information
+                .push(CanonicalCheckerRelatedInformation {
+                    node: Some(declaration),
+                    diagnostic: Diagnostic::new(
+                        message_by_code(2771).ok_or(SourceCheckError::MissingDiagnostic(2771))?,
+                    ),
+                });
+        }
+    }
     if matches!(
-        resolution.applicability,
+        diagnostic_resolution.applicability,
         DirectCallApplicability::ArgumentNotAssignable { .. }
     ) && let Some(declaration) = store
-        .signature(resolution.signature)
+        .signature(diagnostic_resolution.signature)
         .and_then(|signature| signature.declaration())
         && let Some(symbol) = host
             .bound_file(declaration)
@@ -6206,7 +6334,7 @@ fn prepare_legacy_source_call_diagnostic(
         && overloads
             .signatures
             .iter()
-            .any(|callable| callable.signature == resolution.signature)
+            .any(|callable| callable.signature == diagnostic_resolution.signature)
         && super::calls::class_overload_implementation_accepts_arguments(
             store,
             global_types,
@@ -6220,6 +6348,7 @@ fn prepare_legacy_source_call_diagnostic(
                 arguments: argument_types,
             },
             &overloads.implementation,
+            session,
         )
         .map_err(|error| direct_class_call_error(plan.node, error))?
     {
@@ -7374,6 +7503,12 @@ fn source_class_method_target(
                         .signatures
                         .iter()
                         .any(|callable| callable.signature == signature)
+                        && !super::calls::overload_failure_signature_matches(
+                            store,
+                            callee_type,
+                            signature,
+                            &overloads.signatures,
+                        )
                 }))
                 || target.pending_return_body().is_some()
         })
@@ -7486,12 +7621,17 @@ fn resolve_source_class_call(
     let mut retried_properties = HashSet::new();
     let mut relation_candidates = request.arguments.to_vec();
     loop {
-        match resolve_class_body_invocation(
+        let existing_signature = store
+            .signature_links(node)
+            .and_then(|links| links.resolved_signature.signature());
+        match resolve_class_body_invocation_with_session(
             store,
             globals,
             options.strict_function_types,
             request,
             target,
+            existing_signature,
+            session,
         ) {
             Ok(ClassBodyInvocationResolution::Resolved(resolution)) => return Ok(Some(resolution)),
             Ok(ClassBodyInvocationResolution::PendingReturn(arguments)) => {
@@ -7571,6 +7711,7 @@ fn legacy_class_call_resolution(resolution: &DirectCallResolution) -> ResolvedLe
         maximum_argument_count: resolution.projection.maximum_argument_count,
         has_effective_rest: resolution.projection.has_effective_rest,
         applicability: resolution.applicability,
+        overload_failure: resolution.overload_failure,
     }
 }
 
@@ -8040,6 +8181,7 @@ pub(super) fn check_direct_source_call(
                 maximum_argument_count: 1,
                 has_effective_rest: false,
                 applicability: resolution.applicability,
+                overload_failure: None,
             };
             let diagnostic = prepare_legacy_source_call_diagnostic(
                 store,
@@ -13374,10 +13516,7 @@ mod tests {
     }
 
     #[test]
-    fn declared_call_set_failure_recovery_remains_an_atomic_boundary() {
-        // Pinned tsgo synthesizes a recovery signature whose return type is
-        // `never`. That constructor is outside this overload slice, so the
-        // call must remain unpublished rather than reuse either declaration.
+    fn declared_call_set_failure_recovery_preserves_real_overloads_and_canonical_never() {
         let parsed = parsed(concat!(
             "interface Recovery { ",
             "(value: number, other: number): string; ",
@@ -13398,17 +13537,237 @@ mod tests {
             .collect::<Vec<_>>();
         let mut context = context(&parsed, file);
 
-        assert!(context.check_source_file(file).is_err());
+        context.check_source_file(file).unwrap();
 
-        assert!(context.diagnostics().is_empty());
-        assert!(context.store().type_node_links(call).is_none());
-        assert!(context.store().signature_links(call).is_none());
+        let visible = declarations
+            .iter()
+            .map(|declaration| {
+                context
+                    .store()
+                    .signature_links(*declaration)
+                    .unwrap()
+                    .resolved_signature
+                    .signature()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let recovered = context
+            .store()
+            .signature_links(call)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        assert!(!visible.contains(&recovered));
+        let signature = context.store().signature(recovered).unwrap();
+        assert_eq!(
+            signature.flags(),
+            SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE
+        );
+        assert_eq!(signature.declaration(), Some(declarations[0]));
+        assert_eq!(signature.min_argument_count(), 1);
+        assert_eq!(signature.parameters().len(), 2);
+        let source_parameters = context.store().signature(visible[0]).unwrap().parameters();
+        for (parameter, source) in signature.parameters().iter().zip(source_parameters) {
+            assert_ne!(parameter, source);
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(*parameter)
+                    .unwrap()
+                    .target,
+                Some(*source)
+            );
+            assert_eq!(
+                context.store().symbol(*parameter).unwrap().declarations(),
+                context.store().symbol(*source).unwrap().declarations()
+            );
+        }
+        let parameter_types = signature
+            .parameters()
+            .iter()
+            .map(|parameter| {
+                context
+                    .type_to_string(
+                        context
+                            .store()
+                            .value_symbol_links(*parameter)
+                            .unwrap()
+                            .resolved_type
+                            .unwrap(),
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(parameter_types, ["string | number", "number"]);
+        let never = context.store().intrinsic_bootstrap().unwrap().never_type;
+        assert_eq!(signature.resolved_return_type(), Some(never));
+        assert_eq!(
+            context.store().type_node_links(call).unwrap().resolved_type,
+            Some(never)
+        );
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("the one matching arity must report its argument error")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Argument of type 'boolean' is not assignable to parameter of type 'string'."
+        );
+        let argument = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TrueKeyword).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(diagnostic.node, Some(argument));
+        assert!(diagnostic.range_override.is_none());
+        assert!(diagnostic.related_information.is_empty());
         assert!(declarations.iter().all(|declaration| {
             context
                 .store()
                 .signature_links(*declaration)
                 .is_some_and(|links| links.resolved_signature.signature().is_some())
         }));
+        let NodeData::CallExpression(syntax) = &parsed.arena.get(call.node).unwrap().data else {
+            panic!("expected a source call")
+        };
+        let callee = NodeRef::new(call.arena, call.file, syntax.expression);
+        let callable = context.get_type_at_location(callee).unwrap();
+        let members = context
+            .store()
+            .type_payload(callable)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap();
+        assert_eq!(members.signatures.as_deref(), Some(visible.as_slice()));
+        assert_eq!(members.call_signature_count, visible.len());
+        let cold = call_publication_state(&context, call);
+        let diagnostics = context.diagnostics().clone();
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(call_publication_state(&context, call), cold);
+        assert_eq!(context.diagnostics(), &diagnostics);
+    }
+
+    #[test]
+    fn overload_failure_cache_damage_rejects_before_new_publication() {
+        for poison in 0..8 {
+            let parsed = parsed(concat!(
+                "interface Recovery { (value: string): number; (value: number): number; } ",
+                "function use(callable: Recovery): number { return callable(true); }",
+            ));
+            let file = FileId::new(62_280 + poison);
+            let call = calls(&parsed, file)[0];
+            let mut context = context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            let original_call = context.store().signature_links(call).unwrap().clone();
+            let recovered = original_call.resolved_signature.signature().unwrap();
+            let record = context.store().signature(recovered).unwrap();
+            let parameter = record.parameters()[0];
+            let original_flags = record.flags();
+            let original_return = record.resolved_return_type();
+            let original_parameter = context
+                .store()
+                .value_symbol_links(parameter)
+                .unwrap()
+                .clone();
+            let source = original_parameter.target.unwrap();
+            let receipts = context.store().overload_failure_signatures.clone();
+            let receipt_keys = context.store().overload_failure_signature_keys.clone();
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::CallSignature).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let visible = context
+                .store()
+                .signature_links(declaration)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            mark_source_unchecked(&mut context, file);
+            let store = context.store_mut_for_test();
+            match poison {
+                0 => assert!(store.set_signature_flags(recovered, SignatureFlags::NONE)),
+                1 => assert!(store.set_signature_resolved_return_type(recovered, Some(string))),
+                2 => assert!(store.set_signature_isolated_type(recovered, Some(string))),
+                3 => {
+                    let mut changed = original_parameter.clone();
+                    changed.target = None;
+                    assert!(store.set_value_symbol_links(parameter, changed));
+                }
+                4 => assert_eq!(store.record_merged_symbol(source, parameter), Ok(None)),
+                5 => store.overload_failure_signatures.clear(),
+                6 => {
+                    store.overload_failure_signatures.clear();
+                    assert!(store.set_signature_links(
+                        call,
+                        SignatureLinks {
+                            resolved_signature: ResolvedSignatureState::Resolved(visible),
+                            ..SignatureLinks::default()
+                        }
+                    ));
+                }
+                7 => store.overload_failure_signature_keys.clear(),
+                _ => unreachable!(),
+            }
+            let poisoned = call_publication_state(&context, call);
+            let symbol_count = context.store().symbol_len();
+            let receipt_count = context.store().overload_failure_signatures.len();
+
+            assert!(context.check_source_file(file).is_err());
+
+            assert_eq!(call_publication_state(&context, call), poisoned);
+            assert!(context.get_return_type_of_signature(recovered).is_err());
+            assert_eq!(call_publication_state(&context, call), poisoned);
+            assert_eq!(context.store().symbol_len(), symbol_count);
+            assert_eq!(
+                context.store().overload_failure_signatures.len(),
+                receipt_count
+            );
+            // Symbol redirects are permanent. The other damaged caches can be
+            // restored and must reuse the original recovery on the next check.
+            if poison != 4 {
+                let store = context.store_mut_for_test();
+                assert!(store.set_signature_flags(recovered, original_flags));
+                assert!(store.set_signature_resolved_return_type(recovered, original_return));
+                assert!(store.set_signature_isolated_type(recovered, None));
+                assert!(store.set_value_symbol_links(parameter, original_parameter));
+                assert!(store.set_signature_links(call, original_call));
+                store.overload_failure_signatures = receipts;
+                store.overload_failure_signature_keys = receipt_keys;
+                context.check_source_file(file).unwrap();
+                assert_eq!(
+                    context.get_return_type_of_signature(recovered).unwrap(),
+                    original_return.unwrap()
+                );
+                assert_eq!(
+                    context
+                        .store()
+                        .signature_links(call)
+                        .unwrap()
+                        .resolved_signature
+                        .signature(),
+                    Some(recovered)
+                );
+                assert_eq!(context.store().symbol_len(), symbol_count);
+                assert_eq!(context.store().signature_len(), poisoned.signature_count);
+            }
+        }
     }
 
     #[test]

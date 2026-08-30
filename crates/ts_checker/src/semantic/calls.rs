@@ -11,19 +11,24 @@
 
 use std::collections::HashSet;
 
-use ts_binder::SymbolFlags;
+use ts_ast::NodeRef;
+use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, MinArgumentCountFlags, RelationUnavailable,
     SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
-    bootstrap::LiteralTypeCacheError,
+    bootstrap::{LiteralTypeCacheError, UnionReduction},
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::ValidatedSingleCallable,
     classes::{
         ClassBodyCallable, ClassHeritageMembersValidation, optional_constructor_parameter_type,
         validate_class_heritage_members,
     },
+    instantiate::{InstantiationLimits, InstantiationSession},
+    intersection_types::{IntersectionTypeError, intersect_property_types},
+    links::ValueSymbolLinks,
+    relation::RelationKind,
     signatures::{ElementFlags, Signature, SignatureFlags, SignatureKind, TupleElementInfo},
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_records::{ObjectTypeData, TypeData, TypeRecord},
@@ -123,6 +128,7 @@ pub(super) enum DirectCallInvariant {
     },
     ParameterProjectionCapacity(SignatureId),
     InvalidParameterProjection(SignatureId),
+    InvalidOverloadFailureSignature(SignatureId),
 }
 
 /// A capability, provenance, or relation failure. Ordinary call diagnostics
@@ -168,10 +174,9 @@ pub(super) struct DirectCallArgumentTarget {
     pub(super) parameter_type: TypeId,
 }
 
-/// Exact signature and return projection retained even when the call has an
-/// ordinary arity or assignability error. Pinned overload-failure recovery
-/// still selects this sole candidate, so the erroneous call keeps its return
-/// type rather than becoming `any`.
+/// Signature and return projection retained for both valid and erroneous calls.
+/// A failed overload group has a separate marked recovery signature. Its
+/// diagnostic still names the real overload that failed applicability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DirectCallProjection {
     pub(super) callee: TypeId,
@@ -266,6 +271,43 @@ impl RestParameterShape {
 pub(super) struct DirectCallResolution {
     pub(super) projection: DirectCallProjection,
     pub(super) applicability: DirectCallApplicability,
+    pub(super) overload_failure: Option<DirectCallOverloadFailure>,
+}
+
+/// Error selection is separate from the signature used to type a failed call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DirectCallOverloadFailure {
+    Argument {
+        signature: SignatureId,
+        failed_candidates: usize,
+    },
+    Arity {
+        closest_signature: SignatureId,
+        minimum_argument_count: usize,
+        maximum_argument_count: usize,
+        gap: Option<(usize, usize)>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OverloadFailureParameter {
+    symbol: SemanticSymbolId,
+    source: SemanticSymbolId,
+    type_: TypeId,
+}
+
+/// Immutable inputs and outputs of one fixed overload-failure signature.
+/// This receipt does not add the recovery signature to the callable's overloads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct OverloadFailureSignature {
+    signature: SignatureId,
+    callables: Vec<ValidatedSingleCallable>,
+    parameters: Vec<OverloadFailureParameter>,
+    return_type: TypeId,
+    flags: SignatureFlags,
+    declaration: Option<NodeRef>,
+    minimum_argument_count: i32,
+    array_targets: CanonicalArrayTargets,
 }
 
 /// A checked argument list that does not claim a signature return type.
@@ -304,6 +346,7 @@ impl DirectCallArgumentResolution {
                 return_kind,
             },
             applicability: self.applicability,
+            overload_failure: None,
         }
     }
 }
@@ -323,6 +366,26 @@ pub(super) fn resolve_direct_call(
     global_types: &CanonicalGlobalTypes,
     strict_function_types: bool,
     request: DirectCallRequest<'_>,
+) -> Result<DirectCallResolution, DirectCallError> {
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    resolve_direct_call_with_session(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        None,
+        &mut session,
+    )
+}
+
+/// Uses the caller's session for overload relations and recovery type construction.
+pub(super) fn resolve_direct_call_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: DirectCallRequest<'_>,
+    existing_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
 ) -> Result<DirectCallResolution, DirectCallError> {
     validate_direct_call_form(request)?;
     if store.type_payload(request.callee).is_none() {
@@ -355,6 +418,8 @@ pub(super) fn resolve_direct_call(
         strict_function_types,
         request,
         &projection.call_signatures,
+        existing_signature,
+        session,
     )
 }
 
@@ -364,13 +429,16 @@ pub(super) fn resolve_direct_call_candidates(
     strict_function_types: bool,
     request: DirectCallRequest<'_>,
     callables: &[ValidatedSingleCallable],
+    existing_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
 ) -> Result<DirectCallResolution, DirectCallError> {
     validate_direct_invocation_options(request)?;
     validate_argument_types(store, request.arguments)?;
+    let original_callables = callables;
     let callables = reorder_direct_call_candidates(store, request.callee, callables)?;
     let candidate_count = callables.len();
     let mut candidates = Vec::with_capacity(candidate_count);
-    for callable in callables {
+    for callable in &callables {
         match project_validated_direct_call(store, Some(global_types), request, callable) {
             Ok(candidate) => candidates.push(candidate),
             Err(DirectCallError::Unsupported(DirectCallUnsupported::Form(
@@ -392,43 +460,71 @@ pub(super) fn resolve_direct_call_candidates(
         }
         resolution.applicability =
             check_argument_applicability(&resolution.projection, |source, target| {
-                store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                store.is_type_assignable_to_with_session(
                     source,
                     target,
-                    global_types,
-                    strict_function_types,
+                    Some(global_types),
+                    Some(strict_function_types),
+                    session,
                 )
             })?;
         return Ok(resolution);
     }
 
-    if let Some(candidate) = choose_applicable_overload(&candidates, |source, target| {
-        store.is_type_subtype_of_with_global_types_and_strict_function_types(
-            source,
-            target,
-            global_types,
-            strict_function_types,
-        )
-    })? {
+    let mut argument_failures = Vec::with_capacity(candidates.len());
+    if let Some(candidate) =
+        choose_applicable_overload(&candidates, &mut argument_failures, |source, target| {
+            store.is_type_related_to_with_session(
+                source,
+                target,
+                RelationKind::Subtype,
+                Some(global_types),
+                Some(strict_function_types),
+                session,
+            )
+        })?
+    {
         return Ok(candidate);
     }
-    if let Some(candidate) = choose_applicable_overload(&candidates, |source, target| {
-        store.is_type_assignable_to_with_global_types_and_strict_function_types(
-            source,
-            target,
-            global_types,
-            strict_function_types,
-        )
-    })? {
+    if let Some(candidate) =
+        choose_applicable_overload(&candidates, &mut argument_failures, |source, target| {
+            store.is_type_assignable_to_with_session(
+                source,
+                target,
+                Some(global_types),
+                Some(strict_function_types),
+                session,
+            )
+        })?
+    {
         return Ok(candidate);
     }
 
+    if request.form == DirectCallForm::Call
+        && callables
+            .iter()
+            .all(|callable| callable.rest_parameter.is_none())
+    {
+        return recover_fixed_call_overload(
+            store,
+            global_types,
+            strict_function_types,
+            request,
+            &callables,
+            original_callables,
+            &candidates,
+            &argument_failures,
+            existing_signature,
+            session,
+        );
+    }
     if let Some(candidate) = recover_direct_call_overload(
         store,
         global_types,
         strict_function_types,
         request,
         &candidates,
+        session,
     )? {
         return Ok(candidate);
     }
@@ -436,12 +532,34 @@ pub(super) fn resolve_direct_call_candidates(
 }
 
 /// Applies the ordinary fixed-signature engine to an authenticated class-body target.
+#[cfg(test)]
 pub(super) fn resolve_class_body_invocation(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
     strict_function_types: bool,
     request: DirectCallRequest<'_>,
     target: &ClassBodyCallable,
+) -> Result<ClassBodyInvocationResolution, DirectCallError> {
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    resolve_class_body_invocation_with_session(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        target,
+        None,
+        &mut session,
+    )
+}
+
+pub(super) fn resolve_class_body_invocation_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: DirectCallRequest<'_>,
+    target: &ClassBodyCallable,
+    existing_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
 ) -> Result<ClassBodyInvocationResolution, DirectCallError> {
     if !matches!(
         (request.form, target.kind()),
@@ -470,6 +588,8 @@ pub(super) fn resolve_class_body_invocation(
             strict_function_types,
             request,
             &overloads.signatures,
+            existing_signature,
+            session,
         )
         .map(ClassBodyInvocationResolution::Resolved);
     }
@@ -515,6 +635,7 @@ pub(super) fn resolve_class_body_invocation(
             strict_function_types,
             request,
             callable,
+            session,
         )?;
         return Ok(ClassBodyInvocationResolution::PendingReturn(arguments));
     }
@@ -523,11 +644,12 @@ pub(super) fn resolve_class_body_invocation(
     if resolution.applicability == DirectCallApplicability::Applicable {
         resolution.applicability =
             check_argument_applicability(&resolution.projection, |source, target| {
-                store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                store.is_type_assignable_to_with_session(
                     source,
                     target,
-                    global_types,
-                    strict_function_types,
+                    Some(global_types),
+                    Some(strict_function_types),
+                    session,
                 )
             })?;
     }
@@ -634,8 +756,10 @@ fn reorder_direct_call_candidates<'a>(
 
 fn choose_applicable_overload(
     candidates: &[DirectCallResolution],
+    argument_failures: &mut Vec<(SignatureId, DirectCallApplicability)>,
     mut is_related: impl FnMut(TypeId, TypeId) -> Result<bool, RelationUnavailable>,
 ) -> Result<Option<DirectCallResolution>, DirectCallError> {
+    argument_failures.clear();
     for candidate in candidates {
         if candidate.applicability != DirectCallApplicability::Applicable {
             continue;
@@ -646,8 +770,530 @@ fn choose_applicable_overload(
             selected.applicability = applicability;
             return Ok(Some(selected));
         }
+        argument_failures.push((candidate.projection.signature, applicability));
     }
     Ok(None)
+}
+
+/// Mirrors the fixed, non-generic part of `getCandidateForOverloadFailure`.
+#[allow(clippy::too_many_arguments)]
+fn recover_fixed_call_overload(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: DirectCallRequest<'_>,
+    callables: &[&ValidatedSingleCallable],
+    original_callables: &[ValidatedSingleCallable],
+    candidates: &[DirectCallResolution],
+    argument_failures: &[(SignatureId, DirectCallApplicability)],
+    existing_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
+) -> Result<DirectCallResolution, DirectCallError> {
+    if let Err(established) = store.claim_strict_function_types(strict_function_types) {
+        return Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
+            established,
+            requested: strict_function_types,
+        }
+        .into());
+    }
+    let class_method = store
+        .type_payload(request.callee)
+        .and_then(TypeRecord::symbol)
+        .and_then(|symbol| store.symbol(symbol))
+        .is_some_and(|method| {
+            method.flags().contains(SymbolFlags::METHOD)
+                && method
+                    .parent()
+                    .and_then(|owner| store.symbol(owner))
+                    .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
+        });
+    if class_method
+        && super::classes::source_class_method_overloads(store, request.callee)
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        return Err(DirectCallUnsupported::OverloadFailureRecovery(request.callee).into());
+    }
+    let first = candidates
+        .first()
+        .ok_or(DirectCallInvariant::MalformedCallable(request.callee))?;
+    let (failure, applicability) =
+        if let Some(&(signature, applicability)) = argument_failures.last() {
+            (
+                DirectCallOverloadFailure::Argument {
+                    signature,
+                    failed_candidates: argument_failures.len(),
+                },
+                applicability,
+            )
+        } else {
+            // Arity diagnostics use the original visible order, before literal
+            // overloads move to the front of the applicability search.
+            let arity_candidates = original_callables
+                .iter()
+                .map(|callable| {
+                    candidates
+                        .iter()
+                        .find(|candidate| candidate.projection.signature == callable.signature)
+                        .ok_or(DirectCallInvariant::InvalidSignature(callable.signature))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let closest_candidate = arity_candidates
+                .first()
+                .ok_or(DirectCallInvariant::MalformedCallable(request.callee))?;
+            let mut minimum = closest_candidate.projection.minimum_argument_count;
+            let mut maximum = closest_candidate.projection.maximum_argument_count;
+            let mut closest = closest_candidate.projection.signature;
+            let mut below = None;
+            let mut above = None;
+            for candidate in arity_candidates {
+                let min = candidate.projection.minimum_argument_count;
+                let max = candidate.projection.maximum_argument_count;
+                if min < minimum {
+                    minimum = min;
+                    closest = candidate.projection.signature;
+                }
+                maximum = maximum.max(max);
+                if min < request.arguments.len() {
+                    below = Some(below.map_or(min, |previous: usize| previous.max(min)));
+                }
+                if request.arguments.len() < max {
+                    above = Some(above.map_or(max, |previous: usize| previous.min(max)));
+                }
+            }
+            let gap = if minimum < request.arguments.len() && request.arguments.len() < maximum {
+                Some(
+                    below
+                        .zip(above)
+                        .ok_or(DirectCallInvariant::MalformedCallable(request.callee))?,
+                )
+            } else {
+                None
+            };
+            (
+                DirectCallOverloadFailure::Arity {
+                    closest_signature: closest,
+                    minimum_argument_count: minimum,
+                    maximum_argument_count: maximum,
+                    gap,
+                },
+                first.applicability,
+            )
+        };
+    let callable = get_fixed_overload_failure_signature(
+        store,
+        global_types,
+        request.callee,
+        callables,
+        existing_signature,
+        session,
+    )?;
+    let mut resolution =
+        project_validated_direct_call(store, Some(global_types), request, &callable)?;
+    // A union of parameter types can accept the arguments. That does not turn
+    // this failed call into a successful overload selection.
+    resolution.applicability = applicability;
+    resolution.overload_failure = Some(failure);
+    Ok(resolution)
+}
+
+fn overload_failure_type_error(
+    callee: TypeId,
+    signature: SignatureId,
+    error: LiteralTypeCacheError,
+) -> DirectCallError {
+    match error {
+        LiteralTypeCacheError::UnsupportedUnionConstituent(_) => {
+            DirectCallUnsupported::OverloadFailureRecovery(callee).into()
+        }
+        LiteralTypeCacheError::Capacity => {
+            DirectCallInvariant::ParameterProjectionCapacity(signature).into()
+        }
+        _ => DirectCallInvariant::InvalidOverloadFailureSignature(signature).into(),
+    }
+}
+
+fn overload_failure_return_type(
+    store: &mut CanonicalTypeMapperStore,
+    callee: TypeId,
+    signature: SignatureId,
+    returns: &[TypeId],
+    array_targets: CanonicalArrayTargets,
+) -> Result<TypeId, DirectCallError> {
+    match intersect_property_types(store, returns) {
+        Ok(type_) => Ok(type_),
+        Err(IntersectionTypeError::UnsupportedPropertyType(_)) => store
+            .canonical_intersection_type_with_array_targets(returns, None, Some(array_targets))
+            .map_err(|error| match error {
+                IntersectionTypeError::UnsupportedConstituent(_)
+                | IntersectionTypeError::UnsupportedPropertyType(_) => {
+                    DirectCallUnsupported::OverloadFailureRecovery(callee).into()
+                }
+                IntersectionTypeError::Capacity => {
+                    DirectCallInvariant::ParameterProjectionCapacity(signature).into()
+                }
+                _ => DirectCallInvariant::InvalidOverloadFailureSignature(signature).into(),
+            }),
+        Err(_) => Err(DirectCallInvariant::InvalidOverloadFailureSignature(signature).into()),
+    }
+}
+
+fn get_fixed_overload_failure_signature(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    callee: TypeId,
+    callables: &[&ValidatedSingleCallable],
+    existing_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
+) -> Result<ValidatedSingleCallable, DirectCallError> {
+    let first = callables
+        .first()
+        .ok_or(DirectCallInvariant::MalformedCallable(callee))?;
+    let key = (
+        callee,
+        callables
+            .iter()
+            .map(|callable| callable.signature)
+            .collect::<Vec<_>>(),
+    );
+    let array_targets = CanonicalArrayTargets::from_global_types(global_types);
+    if let Some(cached) = store.overload_failure_signatures.get(&key) {
+        if existing_signature.is_some_and(|existing| existing != cached.signature)
+            || store.overload_failure_signature_keys.get(&cached.signature) != Some(&key)
+            || cached.array_targets != array_targets
+            || !cached.callables.iter().eq(callables.iter().copied())
+            || !overload_failure_signature_is_exact(store, cached)
+        {
+            return Err(
+                DirectCallInvariant::InvalidOverloadFailureSignature(cached.signature).into(),
+            );
+        }
+        return Ok(cached.callable(callee));
+    }
+    if let Some(existing) = existing_signature {
+        return Err(DirectCallInvariant::InvalidOverloadFailureSignature(existing).into());
+    }
+    let mut flags = SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE;
+    let mut minimum = usize::MAX;
+    let mut maximum = 0;
+    let mut returns = Vec::with_capacity(callables.len());
+    for callable in callables {
+        let signature = validate_signature_parameters(store, callable)?;
+        if callable.owner != callee
+            || callable.rest_parameter.is_some()
+            || !signature.type_parameters().is_empty()
+            || signature.this_parameter().is_some()
+            || signature.flags().intersects(
+                SignatureFlags::CONSTRUCT
+                    | SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE,
+            )
+        {
+            return Err(DirectCallUnsupported::OverloadFailureRecovery(callee).into());
+        }
+        flags |= signature.flags() & SignatureFlags::HAS_LITERAL_TYPES;
+        minimum = minimum.min(signature.parameters().len());
+        maximum = maximum.max(signature.parameters().len());
+        let return_type =
+            callable
+                .return_type
+                .ok_or(DirectCallUnsupported::UnresolvedReturnType(
+                    callable.signature,
+                ))?;
+        store
+            .validate_union_constituent_with_array_targets(array_targets, return_type)
+            .map_err(|error| overload_failure_type_error(callee, callable.signature, error))?;
+        returns.push(return_type);
+    }
+    let return_type =
+        overload_failure_return_type(store, callee, first.signature, &returns, array_targets)?;
+    let declaration = store
+        .signature(first.signature)
+        .ok_or(DirectCallInvariant::InvalidSignature(first.signature))?
+        .declaration();
+    let minimum_argument_count = i32::try_from(minimum)
+        .map_err(|_| DirectCallInvariant::ParameterProjectionCapacity(first.signature))?;
+    let mut parameter_types = Vec::with_capacity(maximum);
+    for index in 0..maximum {
+        let mut types = Vec::new();
+        let mut source = None;
+        for callable in callables {
+            if let Some(&type_) = callable.parameters.get(index) {
+                types.push(type_);
+                let symbol = store
+                    .signature(callable.signature)
+                    .and_then(|signature| signature.parameters().get(index))
+                    .copied()
+                    .ok_or(DirectCallInvariant::InvalidSignature(callable.signature))?;
+                source.get_or_insert(symbol);
+            }
+        }
+        let source = source.ok_or(DirectCallInvariant::InvalidSignature(first.signature))?;
+        let type_ = store
+            .expression_union_type_with_global_types_and_session(
+                global_types,
+                &types,
+                UnionReduction::Subtype,
+                session,
+            )
+            .map_err(|error| overload_failure_type_error(callee, first.signature, error))?;
+        parameter_types.push((source, type_));
+    }
+    if !store.try_reserve_signatures(1)
+        || !store.try_reserve_checker_symbol_allocations(maximum, 0)
+        || !store.try_reserve_value_symbol_links(maximum)
+        || store.overload_failure_signatures.try_reserve(1).is_err()
+        || store
+            .overload_failure_signature_keys
+            .try_reserve(1)
+            .is_err()
+    {
+        return Err(DirectCallInvariant::ParameterProjectionCapacity(first.signature).into());
+    }
+    let mut parameters = Vec::with_capacity(maximum);
+    for (source, type_) in parameter_types {
+        let original = store
+            .symbol(source)
+            .expect("the overload provider validated its parameter");
+        let flags = original.flags();
+        let name = original.name().to_owned();
+        let check_flags = original.check_flags() & CheckFlags::READONLY;
+        let declarations = original.declarations().map(<[_]>::to_vec);
+        let value_declaration = original.value_declaration();
+        let parent = original.parent();
+        let name_type = store
+            .value_symbol_links(source)
+            .and_then(|links| links.name_type);
+        let symbol = store.alloc_transient_symbol(flags, name, check_flags);
+        assert!(store.set_symbol_declarations(symbol, declarations, value_declaration));
+        assert!(store.set_symbol_relationships(symbol, None, None, parent, None));
+        assert!(store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                target: Some(source),
+                name_type,
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        parameters.push(OverloadFailureParameter {
+            symbol,
+            source,
+            type_,
+        });
+    }
+    let signature = store
+        .alloc_signature(
+            flags,
+            declaration,
+            Vec::new(),
+            None,
+            parameters
+                .iter()
+                .map(|parameter| parameter.symbol)
+                .collect(),
+            Some(return_type),
+            None,
+            minimum_argument_count,
+        )
+        .expect("overload failure signature inputs were validated and reserved");
+    let receipt = OverloadFailureSignature {
+        signature,
+        callables: callables
+            .iter()
+            .map(|callable| (**callable).clone())
+            .collect(),
+        parameters,
+        return_type,
+        flags,
+        declaration,
+        minimum_argument_count,
+        array_targets,
+    };
+    let result = receipt.callable(callee);
+    assert!(
+        store
+            .overload_failure_signature_keys
+            .insert(signature, key.clone())
+            .is_none()
+    );
+    assert!(
+        store
+            .overload_failure_signatures
+            .insert(key, receipt)
+            .is_none()
+    );
+    Ok(result)
+}
+
+impl OverloadFailureSignature {
+    fn callable(&self, owner: TypeId) -> ValidatedSingleCallable {
+        ValidatedSingleCallable {
+            owner,
+            signature: self.signature,
+            parameters: self
+                .parameters
+                .iter()
+                .map(|parameter| parameter.type_)
+                .collect(),
+            rest_parameter: None,
+            min_argument_count: usize::try_from(self.minimum_argument_count)
+                .expect("the recovery minimum was checked before publication"),
+            return_type: Some(self.return_type),
+            strict_variance_exempt: self.callables[0].strict_variance_exempt,
+        }
+    }
+}
+
+fn overload_failure_signature_is_exact(
+    store: &CanonicalTypeMapperStore,
+    receipt: &OverloadFailureSignature,
+) -> bool {
+    let Some(signature) = store.signature(receipt.signature) else {
+        return false;
+    };
+    if signature.flags() != receipt.flags
+        || signature.declaration() != receipt.declaration
+        || signature.min_argument_count() != receipt.minimum_argument_count
+        || signature.resolved_return_type() != Some(receipt.return_type)
+        || signature.parameters().len() != receipt.parameters.len()
+        || !signature.type_parameters().is_empty()
+        || signature.this_parameter().is_some()
+        || signature.target().is_some()
+        || signature.mapper().is_some()
+        || signature.composite().is_some()
+        || signature.isolated_signature_type().is_some()
+        || signature.resolved_type_predicate().is_some()
+        || receipt
+            .callables
+            .iter()
+            .any(|callable| callable.signature == receipt.signature)
+    {
+        return false;
+    }
+    for (symbol, parameter) in signature.parameters().iter().zip(&receipt.parameters) {
+        let Some(original) = store.symbol(parameter.source) else {
+            return false;
+        };
+        let Some(combined) = store.symbol(*symbol) else {
+            return false;
+        };
+        if *symbol != parameter.symbol
+            || store.get_merged_symbol(*symbol) != Some(*symbol)
+            || combined.flags() != original.flags() | SymbolFlags::TRANSIENT
+            || combined.check_flags() != original.check_flags() & CheckFlags::READONLY
+            || combined.name() != original.name()
+            || combined.declarations() != original.declarations()
+            || combined.value_declaration() != original.value_declaration()
+            || combined.parent() != original.parent()
+            || combined.members().is_some()
+            || combined.exports().is_some()
+            || combined.export_symbol().is_some()
+            || store.value_symbol_links(*symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(parameter.type_),
+                    target: Some(parameter.source),
+                    name_type: store
+                        .value_symbol_links(parameter.source)
+                        .and_then(|links| links.name_type),
+                    ..ValueSymbolLinks::default()
+                })
+            || store
+                .validate_union_constituent_with_array_targets(
+                    receipt.array_targets,
+                    parameter.type_,
+                )
+                .is_err()
+        {
+            return false;
+        }
+    }
+    store
+        .validate_union_constituent_with_array_targets(receipt.array_targets, receipt.return_type)
+        .is_ok()
+        && receipt.callables.first().is_some_and(|first| {
+            get_min_argument_count_with_array_targets(
+                store,
+                Some(receipt.array_targets),
+                &receipt.callable(first.owner),
+                MinArgumentCountFlags::NONE,
+            )
+            .is_ok()
+        })
+}
+
+/// A call cache can retain only a failure signature from this exact group.
+pub(super) fn overload_failure_signature_matches(
+    store: &CanonicalTypeMapperStore,
+    callee: TypeId,
+    signature: SignatureId,
+    callables: &[ValidatedSingleCallable],
+) -> bool {
+    let Ok(ordered) = reorder_direct_call_candidates(store, callee, callables) else {
+        return false;
+    };
+    let key = (
+        callee,
+        ordered
+            .iter()
+            .map(|callable| callable.signature)
+            .collect::<Vec<_>>(),
+    );
+    store
+        .overload_failure_signatures
+        .get(&key)
+        .is_some_and(|receipt| {
+            receipt.signature == signature
+                && store.overload_failure_signature_keys.get(&signature) == Some(&key)
+                && receipt.callables.iter().eq(ordered.iter().copied())
+                && overload_failure_signature_is_exact(store, receipt)
+        })
+}
+
+/// Raw return queries use the recovery's reverse-owned receipt and real overload provider.
+pub(super) fn overload_failure_signature_return_type(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, DirectCallError> {
+    let invalid = || DirectCallInvariant::InvalidOverloadFailureSignature(signature);
+    let Some(key) = store.overload_failure_signature_keys.get(&signature) else {
+        return if store.signature(signature).is_some_and(|record| {
+            record
+                .flags()
+                .contains(SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE)
+        }) {
+            Err(invalid().into())
+        } else {
+            Ok(None)
+        };
+    };
+    let receipt = store
+        .overload_failure_signatures
+        .get(key)
+        .ok_or_else(invalid)?;
+    if array_targets != Some(receipt.array_targets) {
+        return Err(invalid().into());
+    }
+    let callables = if let Some(group) =
+        super::classes::source_class_method_overloads(store, key.0).map_err(|_| invalid())?
+    {
+        group.signatures
+    } else {
+        match validate_stored_callable_set(store, key.0) {
+            StoredCallableSetValidation::Valid { projection, .. }
+                if projection.construct_signatures.is_empty()
+                    && !projection.call_signatures.is_empty() =>
+            {
+                projection.call_signatures
+            }
+            _ => return Err(invalid().into()),
+        }
+    };
+    if !overload_failure_signature_matches(store, key.0, signature, &callables) {
+        return Err(invalid().into());
+    }
+    Ok(Some(receipt.return_type))
 }
 
 /// Source classes retain the implementation needed for exact recovery notes.
@@ -657,6 +1303,7 @@ fn recover_direct_call_overload(
     strict_function_types: bool,
     request: DirectCallRequest<'_>,
     candidates: &[DirectCallResolution],
+    session: &mut InstantiationSession,
 ) -> Result<Option<DirectCallResolution>, DirectCallError> {
     let class_method = store
         .type_payload(request.callee)
@@ -682,11 +1329,12 @@ fn recover_direct_call_overload(
         return Ok(Some(candidate));
     }
     recover_single_overload_argument_error(candidates, |source, target| {
-        store.is_type_assignable_to_with_global_types_and_strict_function_types(
+        store.is_type_assignable_to_with_session(
             source,
             target,
-            global_types,
-            strict_function_types,
+            Some(global_types),
+            Some(strict_function_types),
+            session,
         )
     })
 }
@@ -1517,6 +2165,7 @@ fn check_validated_class_call_arguments(
     strict_function_types: bool,
     request: DirectCallRequest<'_>,
     callable: &ValidatedSingleCallable,
+    session: &mut InstantiationSession,
 ) -> Result<DirectCallArgumentResolution, DirectCallError> {
     validate_argument_types(store, request.arguments)?;
     let parameters = prepare_direct_call_parameters(store, Some(globals), request, callable)?;
@@ -1527,11 +2176,12 @@ fn check_validated_class_call_arguments(
             &arguments.argument_targets,
             arguments.rest_argument_target,
             |source, target| {
-                store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                store.is_type_assignable_to_with_session(
                     source,
                     target,
-                    globals,
-                    strict_function_types,
+                    Some(globals),
+                    Some(strict_function_types),
+                    session,
                 )
             },
         )?;
@@ -1546,6 +2196,7 @@ pub(super) fn class_overload_implementation_accepts_arguments(
     strict_function_types: bool,
     request: DirectCallRequest<'_>,
     implementation: &ValidatedSingleCallable,
+    session: &mut InstantiationSession,
 ) -> Result<bool, DirectCallError> {
     Ok(check_validated_class_call_arguments(
         store,
@@ -1553,6 +2204,7 @@ pub(super) fn class_overload_implementation_accepts_arguments(
         strict_function_types,
         request,
         implementation,
+        session,
     )?
     .applicability
         == DirectCallApplicability::Applicable)
