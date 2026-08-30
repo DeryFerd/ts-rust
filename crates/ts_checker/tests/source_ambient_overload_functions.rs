@@ -411,7 +411,9 @@ fn later_bad_callable_provider_keeps_the_ready_overload_cold_across_retries() {
 }
 
 #[test]
-fn failed_multi_overload_recovery_does_not_publish_a_fake_candidate() {
+#[allow(clippy::too_many_lines)]
+fn failed_multi_overloads_keep_marked_recovery_out_of_public_candidates() {
+    use ts_checker::semantic::signatures::SignatureFlags;
     let parsed = parse_source_file(concat!(
         "declare function parse(value: number, radix: number): string;\n",
         "declare function parse(value: string): number;\n",
@@ -427,7 +429,7 @@ fn failed_multi_overload_recovery_does_not_publish_a_fake_candidate() {
         panic!("fixture must retain one successful and one failed call")
     };
 
-    assert!(context.check_source_file(file).is_err());
+    context.check_source_file(file).unwrap();
 
     assert!(declarations.iter().all(|declaration| {
         context
@@ -437,10 +439,112 @@ fn failed_multi_overload_recovery_does_not_publish_a_fake_candidate() {
     }));
     assert!(context.store().signature_links(*good).is_some());
     assert!(context.store().type_node_links(*good).is_some());
-    assert!(context.store().signature_links(*bad).is_none());
-    assert!(context.store().type_node_links(*bad).is_none());
-    assert!(context.diagnostics().is_empty());
-    assert!(!is_type_checked(&context, file));
+    let visible = declarations
+        .iter()
+        .map(|declaration| signature_for_declaration(&context, *declaration))
+        .collect::<Vec<_>>();
+    let recovered = signature_for_declaration(&context, *bad);
+    assert!(!visible.contains(&recovered));
+    let record = context.store().signature(recovered).unwrap();
+    assert_eq!(
+        record.flags(),
+        SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE
+    );
+    assert_eq!(record.declaration(), Some(declarations[0]));
+    assert_eq!(record.min_argument_count(), 1);
+    assert_eq!(record.parameters().len(), 2);
+    let source_parameters = context.store().signature(visible[0]).unwrap().parameters();
+    for (parameter, source) in record.parameters().iter().zip(source_parameters) {
+        assert_ne!(parameter, source);
+        let links = context.store().value_symbol_links(*parameter).unwrap();
+        assert_eq!(links.target, Some(*source));
+        assert_eq!(
+            context.store().symbol(*parameter).unwrap().declarations(),
+            context.store().symbol(*source).unwrap().declarations()
+        );
+    }
+    let parameter_types = record
+        .parameters()
+        .iter()
+        .map(|parameter| {
+            let type_ = context
+                .store()
+                .value_symbol_links(*parameter)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            context.type_to_string(type_).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(parameter_types, ["string | number", "number"]);
+    let never = context.store().intrinsic_bootstrap().unwrap().never_type;
+    assert_eq!(record.resolved_return_type(), Some(never));
+    assert_eq!(
+        context.store().type_node_links(*bad).unwrap().resolved_type,
+        Some(never)
+    );
+    let callable = context
+        .get_type_at_location(call_callee(&parsed, file, *bad))
+        .unwrap();
+    let members = match context.store().type_payload(callable).unwrap().data() {
+        TypeData::Object(data) => &data.structured,
+        _ => panic!("expected the source callable's structured type"),
+    };
+    assert_eq!(members.signatures.as_deref(), Some(visible.as_slice()));
+    assert_eq!(members.call_signature_count, visible.len());
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("only the one matching arity reports an argument error")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2345);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Argument of type 'boolean' is not assignable to parameter of type 'string'."
+    );
+    let argument = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            (record.kind == SyntaxKind::TrueKeyword).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .unwrap();
+    assert_eq!(diagnostic.node, Some(argument));
+    assert!(diagnostic.range_override.is_none());
+    assert!(diagnostic.related_information.is_empty());
+    assert!(is_type_checked(&context, file));
+    let cold = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().mapper_len(),
+        context.store().symbol_len(),
+        context.store().signature_links(*good).cloned(),
+        context.store().type_node_links(*good).cloned(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+            context.store().signature_links(*good).cloned(),
+            context.store().type_node_links(*good).cloned(),
+            context.diagnostics().clone()
+        ),
+        cold
+    );
+    assert_eq!(signature_for_declaration(&context, *bad), recovered);
+    assert_eq!(
+        declarations
+            .iter()
+            .map(|declaration| signature_for_declaration(&context, *declaration))
+            .collect::<Vec<_>>(),
+        visible
+    );
 }
 
 #[test]

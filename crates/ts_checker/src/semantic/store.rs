@@ -727,6 +727,9 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_overload_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_overload_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
     source_overload_types_by_signature: HashMap<SignatureId, TypeId>,
+    pub(super) overload_failure_signatures:
+        HashMap<(TypeId, Vec<SignatureId>), super::calls::OverloadFailureSignature>,
+    pub(super) overload_failure_signature_keys: HashMap<SignatureId, (TypeId, Vec<SignatureId>)>,
     /// Pinned checker `cachedSignatures`, keyed by generic target and the
     /// ordered type-argument hash.
     cached_signatures: HashMap<(SignatureId, CacheHashKey), CachedSignatureEntry>,
@@ -897,6 +900,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_overload_types_by_declaration: HashMap::new(),
             source_overload_types_by_owner: HashMap::new(),
             source_overload_types_by_signature: HashMap::new(),
+            overload_failure_signatures: HashMap::new(),
+            overload_failure_signature_keys: HashMap::new(),
             cached_signatures: HashMap::new(),
             source_overload_erased_signatures: HashMap::new(),
             unresolved_symbols: HashMap::new(),

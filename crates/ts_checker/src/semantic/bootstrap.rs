@@ -10390,6 +10390,198 @@ mod tests {
     }
 
     #[test]
+    fn overload_failure_parameter_union_uses_the_caller_instantiation_budget() {
+        use crate::semantic::{
+            calls::{
+                DirectCallApplicability, DirectCallError, DirectCallForm, DirectCallRequest,
+                DirectCallUnsupported, resolve_direct_call_with_session,
+            },
+            instantiate::{InstantiationLimits, InstantiationSession},
+        };
+
+        let declarations = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Base<T> { value: T; [index: number]: Array<number>; }",
+        ));
+        let parsed = parse_source_file(concat!(
+            "interface Derived extends Base<number> {} ",
+            "interface Plain { value: number; } ",
+            "interface Recovery { (value: Derived): number; (value: Plain): number; } ",
+            "function keep(callable: Recovery): number { return 1; }",
+        ));
+        assert!(declarations.diagnostics.is_empty());
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(62_290);
+        let library_file = FileId::new(62_291);
+        let mut binder = CanonicalBinder::new();
+        for (file, source, is_declaration) in
+            [(library_file, &declarations, true), (file, &parsed, false)]
+        {
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_declaration,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(library_file, &declarations.arena), (file, &parsed.arena)]
+                .into_iter()
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(interface.name).unwrap().data
+                else {
+                    return None;
+                };
+                (name.text == "Recovery").then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let callee = context.get_declared_type_of_symbol(owner).unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(context.store(), callee)
+        else {
+            panic!("the source overload group must be published")
+        };
+        assert_eq!(projection.call_signatures.len(), 2);
+        let (derived, _, proxy) = inherited_graph_property(context.store());
+        assert_eq!(projection.call_signatures[0].parameters, [derived]);
+        let broad = projection.call_signatures[1].parameters[0];
+        assert!(
+            context
+                .store()
+                .value_symbol_links(proxy)
+                .unwrap()
+                .resolved_type
+                .is_none()
+        );
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        let request = DirectCallRequest {
+            form: DirectCallForm::Call,
+            optional_chain: false,
+            type_argument_count: 0,
+            has_spread_argument: false,
+            callee,
+            arguments: &[],
+        };
+        let before = (
+            store.signature_len(),
+            store.symbol_len(),
+            store.overload_failure_signatures.len(),
+        );
+        let mut limited = InstantiationSession::new(InstantiationLimits {
+            max_count: 0,
+            ..InstantiationLimits::default()
+        });
+        let mark = limited.limit_event_mark();
+        assert!(matches!(
+            resolve_direct_call_with_session(store, &globals, false, request, None, &mut limited),
+            Err(DirectCallError::Unsupported(DirectCallUnsupported::OverloadFailureRecovery(type_))) if type_ == callee
+        ));
+        assert!(limited.limit_event_occurred_since(mark));
+        assert_eq!(limited.limit_event_count(), 1);
+        assert!(
+            store
+                .value_symbol_links(proxy)
+                .unwrap()
+                .resolved_type
+                .is_none()
+        );
+        assert_eq!(
+            (
+                store.signature_len(),
+                store.symbol_len(),
+                store.overload_failure_signatures.len()
+            ),
+            before
+        );
+
+        let mut adequate = InstantiationSession::new(InstantiationLimits::default());
+        let recovered =
+            resolve_direct_call_with_session(store, &globals, false, request, None, &mut adequate)
+                .unwrap();
+        assert!(adequate.total_count() > 0);
+        assert_eq!(adequate.limit_event_count(), 0);
+        assert!(matches!(
+            recovered.applicability,
+            DirectCallApplicability::TooFewArguments {
+                expected_at_least: 1,
+                actual: 0
+            }
+        ));
+        let record = store.signature(recovered.projection.signature).unwrap();
+        assert_eq!(
+            record.flags(),
+            SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE
+        );
+        assert_eq!(
+            store
+                .value_symbol_links(record.parameters()[0])
+                .unwrap()
+                .resolved_type,
+            Some(broad)
+        );
+        assert_eq!(
+            store.value_symbol_links(proxy).unwrap().resolved_type,
+            Some(store.intrinsic_bootstrap().unwrap().number_type)
+        );
+        let warm = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.overload_failure_signatures.len(),
+        );
+        let count = adequate.total_count();
+        assert_eq!(
+            resolve_direct_call_with_session(
+                store,
+                &globals,
+                false,
+                request,
+                Some(recovered.projection.signature),
+                &mut adequate
+            )
+            .unwrap(),
+            recovered
+        );
+        assert_eq!(adequate.total_count(), count);
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.overload_failure_signatures.len()
+            ),
+            warm
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Both bodies must preserve cold array targets through source replay.
     fn inherited_index_callables_preserve_cold_array_targets() {
         let declarations = parse_source_file(concat!(

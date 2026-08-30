@@ -1582,6 +1582,10 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             GlobalMergeCompletion::new(options.name_resolution),
         )
         .map_err(DeclaredTypeError::from)?;
+        if let Some(members) = super::classes::completed_source_class_members(store, &host, symbol)?
+        {
+            return Ok(members);
+        }
         let type_context = ClassTypeQueryContext::new(global_types, *options);
         let plan = plan_nongeneric_class_member_query_with_type_context(
             store,
