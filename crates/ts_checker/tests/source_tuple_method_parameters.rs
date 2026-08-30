@@ -5,8 +5,9 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerDiagnosticRange, CanonicalCheckerOptions,
-    ElementFlags, IntrinsicBootstrapOptions, SignatureFlags, SignatureId, SourceCheckError,
-    TypeData, TypeId, UnsupportedSourceSyntax,
+    IntrinsicBootstrapOptions, SignatureId, SourceCheckError, TypeData, TypeId,
+    UnsupportedSourceSyntax,
+    signatures::{ElementFlags, SignatureFlags},
 };
 use ts_parser::{ParseResult, parse_source_file};
 
