@@ -38,7 +38,7 @@ use super::{
     },
     keyof_types::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
-        plan_nongeneric_keyof_type_with_array_targets, resolve_nongeneric_keyof_type,
+        plan_nongeneric_keyof_type_with_array_targets, resolve_nongeneric_keyof_type_with_session,
         validate_generic_keyof_index_type, validate_source_object_literal_for_keyof,
     },
     mapped_types::{
@@ -4385,7 +4385,7 @@ fn instantiate_type_worker(
             }
             let plan = plan_nongeneric_keyof_type_with_array_targets(store, target, array_targets)
                 .map_err(|error| instantiated_keyof_error(type_, error))?;
-            resolve_nongeneric_keyof_type(store, &plan)
+            resolve_nongeneric_keyof_type_with_session(store, &plan, session)
                 .map_err(|error| instantiated_keyof_error(type_, error))
         }
         InstantiationWork::IndexedAccess {
@@ -5888,6 +5888,7 @@ mod tests {
             conditional_signature_projection,
         },
         declared::{get_declared_class_interface_or_type_parameter, type_list_key},
+        keyof_types::resolve_nongeneric_keyof_type,
         links::TypeAliasLinks,
         mapper::TypeMapper,
         production::GlobalMergeCompletion,

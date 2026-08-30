@@ -755,6 +755,31 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    /// Keeps cached union validation in the caller's instantiation session.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_type_query_types_with_session(
+        &mut self,
+        strings: &[String],
+        numbers: &[Number],
+        bigints: &[PseudoBigInt],
+        union_operations: usize,
+        named_union_operations: usize,
+        session: &mut InstantiationSession,
+    ) -> Result<PreparedTypeQueryTypes, LiteralTypeCacheError> {
+        self.prepare_type_query_types_worker(
+            strings,
+            numbers,
+            bigints,
+            union_operations,
+            named_union_operations,
+            UnionArrayValidation::None,
+            &[],
+            0,
+            0,
+            Some(session),
+        )
+    }
+
     pub(super) fn prepare_type_query_types_with_global_types(
         &mut self,
         strings: &[String],

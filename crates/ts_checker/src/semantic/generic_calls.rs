@@ -391,6 +391,7 @@ struct GenericCallSignatureShape {
     rest_element_template: Option<TypeId>,
     minimum_argument_count: usize,
     return_type: TypeId,
+    return_requires_exact_cache: bool,
     array_targets: Option<CanonicalArrayTargets>,
 }
 
@@ -1851,8 +1852,8 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
             .into());
         }
     }
-    if let Some(return_type) = return_type {
-        validate_generic_mapper_type(
+    let return_requires_exact_cache = if let Some(return_type) = return_type {
+        let contains_keyof = validate_generic_mapper_type_worker(
             store,
             return_type,
             &type_parameter_ids,
@@ -1860,7 +1861,16 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
             callable.signature,
             &mut Vec::new(),
         )?;
-    }
+        contains_keyof
+            || matches!(
+                store
+                    .type_payload(return_type)
+                    .map(super::type_records::TypeRecord::data),
+                Some(TypeData::Mapped(_))
+            )
+    } else {
+        false
+    };
     Ok(GenericCallSignatureShape {
         signature: callable.signature,
         instantiated_method,
@@ -1873,6 +1883,7 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
             array_targets,
         )?,
         return_type: return_type.unwrap_or(no_constraint),
+        return_requires_exact_cache,
         array_targets,
     })
 }
@@ -2679,6 +2690,26 @@ fn validate_generic_mapper_type(
     signature: SignatureId,
     active_types: &mut Vec<TypeId>,
 ) -> Result<(), GenericCallVectorError> {
+    validate_generic_mapper_type_worker(
+        store,
+        type_,
+        type_parameters,
+        array_targets,
+        signature,
+        active_types,
+    )
+    .map(|_| ())
+}
+
+/// Reports symbolic keyof only along the mapper arguments this validator accepts.
+fn validate_generic_mapper_type_worker(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    type_parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    signature: SignatureId,
+    active_types: &mut Vec<TypeId>,
+) -> Result<bool, GenericCallVectorError> {
     let record = store
         .type_payload(type_)
         .ok_or(GenericCallVectorUnsupported::InstantiationType { signature, type_ })?;
@@ -2698,8 +2729,8 @@ fn validate_generic_mapper_type(
             .iter()
             .chain(identity_arguments)
             .copied()
-            .try_for_each(|argument| {
-                validate_generic_mapper_type(
+            .try_fold(false, |contains_keyof, argument| {
+                validate_generic_mapper_type_worker(
                     store,
                     argument,
                     type_parameters,
@@ -2707,17 +2738,18 @@ fn validate_generic_mapper_type(
                     signature,
                     active_types,
                 )
+                .map(|nested| contains_keyof || nested)
             });
         active_types.truncate(active_depth);
         return result;
     }
     match record.data() {
-        TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(()),
-        TypeData::TypeParameter(_) if type_parameters.contains(&type_) => Ok(()),
+        TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(false),
+        TypeData::TypeParameter(_) if type_parameters.contains(&type_) => Ok(false),
         TypeData::Index(_) => {
             let target = validate_generic_keyof_index_type(store, type_)
                 .map_err(|error| generic_mapper_index_error(signature, type_, error))?;
-            validate_generic_mapper_type(
+            validate_generic_mapper_type_worker(
                 store,
                 target,
                 type_parameters,
@@ -2725,6 +2757,7 @@ fn validate_generic_mapper_type(
                 signature,
                 active_types,
             )
+            .map(|_| true)
         }
         TypeData::Mapped(_) => {
             let Some(projection) =
@@ -2754,8 +2787,8 @@ fn validate_generic_mapper_type(
                 .iter()
                 .chain(identity_arguments)
                 .copied()
-                .try_for_each(|argument| {
-                    validate_generic_mapper_type(
+                .try_fold(false, |contains_keyof, argument| {
+                    validate_generic_mapper_type_worker(
                         store,
                         argument,
                         type_parameters,
@@ -2763,13 +2796,15 @@ fn validate_generic_mapper_type(
                         signature,
                         active_types,
                     )
+                    .map(|nested| contains_keyof || nested)
                 });
             active_types.pop();
             result
         }
         TypeData::Union(union) if record.alias().is_none() && union.origin.is_none() => {
+            let mut contains_keyof = false;
             for constituent in &union.union.types {
-                validate_generic_mapper_type(
+                contains_keyof |= validate_generic_mapper_type_worker(
                     store,
                     *constituent,
                     type_parameters,
@@ -2778,7 +2813,7 @@ fn validate_generic_mapper_type(
                     active_types,
                 )?;
             }
-            Ok(())
+            Ok(contains_keyof)
         }
         TypeData::TypeReference(_) | TypeData::Interface(_) => {
             if let Some(array_targets) = array_targets {
@@ -2799,7 +2834,7 @@ fn validate_generic_mapper_type(
                         .into());
                     }
                     active_types.push(type_);
-                    validate_generic_mapper_type(
+                    let contains_keyof = validate_generic_mapper_type_worker(
                         store,
                         reference.element_type,
                         type_parameters,
@@ -2808,7 +2843,7 @@ fn validate_generic_mapper_type(
                         active_types,
                     )?;
                     active_types.pop();
-                    return Ok(());
+                    return Ok(contains_keyof);
                 }
             }
 
@@ -2826,8 +2861,9 @@ fn validate_generic_mapper_type(
                 .into());
             }
             active_types.push(type_);
+            let mut contains_keyof = false;
             for argument in reference.type_arguments {
-                validate_generic_mapper_type(
+                contains_keyof |= validate_generic_mapper_type_worker(
                     store,
                     argument,
                     type_parameters,
@@ -2837,7 +2873,7 @@ fn validate_generic_mapper_type(
                 )?;
             }
             active_types.pop();
-            Ok(())
+            Ok(contains_keyof)
         }
         _ => Err(GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into()),
     }
@@ -4946,15 +4982,28 @@ fn valid_generic_call_vector_signature_shell(
         || signature.this_parameter().is_some()
         || signature.parameters().len() != original.parameters().len()
         || signature.resolved_return_type().is_some_and(|resolved| {
-            !generic_call_type_instantiation_matches(
-                store,
-                shape.array_targets,
-                shape.return_type,
-                resolved,
-                sources,
-                type_arguments,
-                &mut Vec::new(),
-            )
+            if shape.return_requires_exact_cache {
+                // Keyof results need their real key cache even below retained wrappers.
+                !cached_instantiation_with_vector(
+                    store,
+                    shape.return_type,
+                    sources,
+                    type_arguments,
+                    shape.array_targets,
+                    None,
+                )
+                .is_ok_and(|cached| cached == Some(resolved))
+            } else {
+                !generic_call_type_instantiation_matches(
+                    store,
+                    shape.array_targets,
+                    shape.return_type,
+                    resolved,
+                    sources,
+                    type_arguments,
+                    &mut Vec::new(),
+                )
+            }
         })
         || signature.resolved_type_predicate().is_some()
         || signature.min_argument_count() != original.min_argument_count()
@@ -5180,12 +5229,6 @@ fn demand_generic_call_vector_return(
     {
         return Ok(resolved);
     }
-    let requires_exact_return_cache = matches!(
-        store
-            .type_payload(shape.return_type)
-            .map(super::type_records::TypeRecord::data),
-        Some(TypeData::Index(_) | TypeData::Mapped(_))
-    );
     let limit_mark = session.limit_event_mark();
     let resolved = instantiate_type_with_session(
         store,
@@ -5194,7 +5237,7 @@ fn demand_generic_call_vector_return(
         shape.array_targets,
         session,
     )?;
-    if requires_exact_return_cache && session.limit_event_occurred_since(limit_mark) {
+    if shape.return_requires_exact_cache && session.limit_event_occurred_since(limit_mark) {
         return Ok(resolved);
     }
     assert!(
@@ -5941,6 +5984,7 @@ fn identity_generic_call_vector_shape(
         rest_element_template: None,
         minimum_argument_count: 1,
         return_type: shape.type_parameter,
+        return_requires_exact_cache: false,
         array_targets: None,
     })
 }
