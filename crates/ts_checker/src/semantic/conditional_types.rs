@@ -657,6 +657,241 @@ pub(super) fn conditional_remap_projection_with_source(
     conditional_remap_projection_worker(store, conditional, Some(source), array_targets)
 }
 
+/// Classifies a direct method-return source without granting instantiation.
+pub(super) fn is_signature_conditional_source(
+    store: &CanonicalTypeMapperStore,
+    conditional: TypeId,
+) -> bool {
+    let Some(TypeData::Conditional(data)) = store.type_payload(conditional).map(TypeRecord::data)
+    else {
+        return false;
+    };
+    store
+        .conditional_root(data.root)
+        .and_then(|root| store.source_node_parent(root.node()))
+        .is_some_and(|parent| {
+            matches!(parent, SourceNodeParent::Parent(parent)
+            if store.source_node_kind(parent) == Some(SyntaxKind::MethodSignature))
+        })
+}
+
+/// Checks every identity after the source-only family classification.
+#[cfg(test)]
+pub(super) fn conditional_signature_projection(
+    store: &CanonicalTypeMapperStore,
+    conditional: TypeId,
+) -> Result<(ConditionalRemapProjection, NodeRef), ConditionalTypeError> {
+    conditional_signature_projection_with_array_targets(store, conditional, None)
+}
+
+pub(super) fn conditional_signature_projection_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    conditional: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(ConditionalRemapProjection, NodeRef), ConditionalTypeError> {
+    let projection = conditional_remap_identity_projection(store, conditional, array_targets)?;
+    let declaration = validate_signature_capture_source(store, &projection)?;
+    Ok((projection, declaration))
+}
+
+/// A copied signature can read an existing root result, but cannot demand a branch.
+pub(super) fn cached_signature_conditional_result(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, ConditionalTypeError> {
+    validate_signature_capture_source(store, projection)?;
+    validate_conditional_remap_inputs(store, projection, arguments, None, array_targets)?;
+    remap_cached_result(store, projection, arguments, None, array_targets)
+}
+
+#[allow(clippy::too_many_lines)] // Prove the complete source scope before a store-only warm read.
+fn validate_signature_capture_source(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+) -> Result<NodeRef, ConditionalTypeError> {
+    let unsupported = || {
+        ConditionalTypeError::Instantiation(InstantiationError::UnsupportedType(
+            projection.type_id(),
+        ))
+    };
+    let definition = &projection.production.definition;
+    let invalid = || ConditionalTypeError::InvalidTypeNodeCache(definition.node);
+    let Some(SourceNodeParent::Parent(declaration)) = store.source_node_parent(definition.node)
+    else {
+        return Err(unsupported());
+    };
+    if store.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature)
+        || definition.alias.is_some()
+        || projection.alias().is_some()
+        || projection.production.alias_reference.is_some()
+    {
+        return Err(unsupported());
+    }
+    if store.source_direct_type_annotation(declaration) != Some(definition.node) {
+        return Err(invalid());
+    }
+    let method = store
+        .source_declaration_symbol(declaration)
+        .ok_or_else(invalid)?;
+    let (owner, target) = store
+        .authenticated_interface_method_owner(method)
+        .ok_or_else(invalid)?;
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    let Some([interface]) = owner_record.declarations() else {
+        return Err(unsupported());
+    };
+    if store.source_node_parent(declaration) != Some(SourceNodeParent::Parent(*interface))
+        || store.source_node_kind(*interface) != Some(SyntaxKind::InterfaceDeclaration)
+        || !store.source_declaration_belongs_to_symbol(*interface, owner)
+        || !store.source_symbol_declarations_match(owner)
+    {
+        return Err(invalid());
+    }
+    let signature = store
+        .signature_links(declaration)
+        .and_then(|links| links.resolved_signature.signature())
+        .ok_or_else(invalid)?;
+    let signature_record = store.signature(signature).ok_or_else(invalid)?;
+    let source_value = store
+        .value_symbol_links(method)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    let original = store
+        .conditional_query_production(ConditionalQueryKey::Node(definition.node))
+        .ok_or_else(invalid)?;
+    if signature_record.declaration() != Some(declaration)
+        || store.interface_method_linked_type(signature) != Some(source_value)
+        || signature_record.target().is_some()
+        || signature_record.mapper().is_some()
+        || signature_record.resolved_return_type() != Some(original.result)
+        || !super::callable_sets::valid_declared_method_type_parameters(
+            store,
+            signature_record,
+            declaration,
+        )
+    {
+        return Err(ConditionalTypeError::InvalidSignature(signature));
+    }
+
+    let mut parameters = Vec::new();
+    for scope in [*interface, declaration] {
+        let children = store.source_direct_children(scope).ok_or_else(invalid)?;
+        for child in children {
+            if store.source_node_kind(child) != Some(SyntaxKind::TypeParameter) {
+                continue;
+            }
+            let symbol = store.source_declaration_symbol(child).ok_or_else(invalid)?;
+            let type_ = store
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .ok_or_else(invalid)?;
+            if cached_ordinary_type_parameter_owner(store, type_) != Some(symbol)
+                || store.source_node_parent(child) != Some(SourceNodeParent::Parent(scope))
+                || parameters.contains(&type_)
+            {
+                return Err(invalid());
+            }
+            parameters.push(type_);
+        }
+    }
+    let Some(TypeData::Interface(interface_record)) =
+        store.type_payload(target).map(TypeRecord::data)
+    else {
+        return Err(invalid());
+    };
+    let own_count = parameters
+        .len()
+        .checked_sub(signature_record.type_parameters().len())
+        .ok_or_else(invalid)?;
+    if &parameters[own_count..] != signature_record.type_parameters()
+        || interface_record
+            .reference
+            .resolved_type_arguments
+            .as_deref()
+            .unwrap_or_default()
+            != &parameters[..own_count]
+    {
+        return Err(invalid());
+    }
+    if own_count != 0 {
+        let reference = super::reference_types::validate_direct_generic_reference(store, target)
+            .map_err(|_| invalid())?;
+        if reference.target != target || reference.type_arguments != parameters[..own_count] {
+            return Err(invalid());
+        }
+    }
+    // This slice keeps every parameter in the two real scopes. A filtered or
+    // nested scope needs its own source proof before a store-only replay.
+    if parameters.is_empty()
+        || definition.outer_parameters() != parameters
+        || !definition.infer_type_parameters.is_empty()
+    {
+        return Err(unsupported());
+    }
+    let mut ancestor = *interface;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(ancestor) {
+            return Err(invalid());
+        }
+        match store.source_node_parent(ancestor).ok_or_else(invalid)? {
+            SourceNodeParent::Root => {
+                if store.source_node_kind(ancestor) != Some(SyntaxKind::SourceFile) {
+                    return Err(invalid());
+                }
+                break;
+            }
+            SourceNodeParent::Parent(parent) => {
+                if !matches!(
+                    store.source_node_kind(parent),
+                    Some(
+                        SyntaxKind::SourceFile
+                            | SyntaxKind::ModuleBlock
+                            | SyntaxKind::ModuleDeclaration
+                    )
+                ) {
+                    return Err(unsupported());
+                }
+                if store
+                    .source_direct_children(parent)
+                    .ok_or_else(invalid)?
+                    .iter()
+                    .filter(|&&child| child == ancestor)
+                    .count()
+                    != 1
+                {
+                    return Err(invalid());
+                }
+                ancestor = parent;
+            }
+        }
+    }
+    let mut pending = vec![definition.node];
+    let mut visited = HashSet::new();
+    while let Some(node) = pending.pop() {
+        if !visited.insert(node) {
+            return Err(invalid());
+        }
+        if matches!(
+            store.source_node_kind(node),
+            Some(SyntaxKind::ThisType | SyntaxKind::TypeQuery | SyntaxKind::TypeParameter)
+        ) || node != definition.node
+            && store.source_node_kind(node) == Some(SyntaxKind::ConditionalType)
+        {
+            return Err(unsupported());
+        }
+        for child in store.source_direct_children(node).ok_or_else(invalid)? {
+            if store.source_node_parent(child) != Some(SourceNodeParent::Parent(node)) {
+                return Err(invalid());
+            }
+            pending.push(child);
+        }
+    }
+    Ok(declaration)
+}
+
 fn conditional_remap_projection_worker(
     store: &CanonicalTypeMapperStore,
     conditional: TypeId,
@@ -802,7 +1037,9 @@ fn validate_remap_capture_source(
     };
     let invalid = || ConditionalTypeError::InvalidConditional(projection.type_id());
     let definition = &projection.production.definition;
-    let alias = definition.alias.as_ref().ok_or_else(unsupported)?;
+    let Some(alias) = definition.alias.as_ref() else {
+        return validate_signature_capture_source(store, projection).map(|_| ());
+    };
     let invalid_owner = || ConditionalTypeError::InvalidAliasSymbol(alias.symbol);
     let [declaration] = store
         .symbol(alias.symbol)

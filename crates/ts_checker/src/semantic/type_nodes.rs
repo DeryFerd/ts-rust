@@ -29,7 +29,8 @@ use super::{
         ConditionalTypeBranches, ConditionalTypeInstantiation, ConditionalTypeRequest,
         conditional_alias_projection_with_array_targets, conditional_check_is_assignable,
         conditional_operands_have_disjoint_primitive_domains,
-        conditional_query_alias_with_array_targets, get_conditional_type_instantiation,
+        conditional_query_alias_with_array_targets,
+        conditional_signature_projection_with_array_targets, get_conditional_type_instantiation,
         get_type_from_conditional_type, record_conditional_alias_declaration,
         validate_conditional_alias_declaration_with_array_targets,
         validate_conditional_reference_result_with_array_targets,
@@ -72,7 +73,8 @@ use super::{
         instantiate_type_with_vector_and_session,
     },
     instantiated_members::{
-        instantiated_function_member_signature_return, published_interface_method_signature_return,
+        instantiated_function_member_signature_return,
+        instantiated_interface_method_signature_return,
     },
     interface_heritage::{
         DirectInterfaceBaseKind, DirectInterfaceBasePlan, DirectInterfaceHeritagePlan,
@@ -26398,6 +26400,119 @@ impl ConditionalBranchSource for MappedConditionalBranchSource<'_, '_, '_> {
     }
 }
 
+/// A selected method supplies its real branch syntax, never the branch decision.
+struct MethodConditionalBranchSource<'host, 'arena, 'diagnostics> {
+    host: &'host DeclaredTypeHost<'arena>,
+    global_types: CanonicalGlobalTypes,
+    options: CanonicalTypeQueryOptions,
+    diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
+    method: SemanticSymbolId,
+}
+
+impl ConditionalBranchSource for MethodConditionalBranchSource<'_, '_, '_> {
+    fn preflight(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        conditional: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery);
+        let Some(TypeData::Conditional(data)) =
+            store.type_payload(conditional).map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        let node = store
+            .conditional_root(data.root)
+            .ok_or_else(invalid)?
+            .node();
+        let array_targets = Some(CanonicalArrayTargets::from_global_types(&self.global_types));
+        let (_, declaration) =
+            conditional_signature_projection_with_array_targets(store, conditional, array_targets)
+                .map_err(|error| {
+                    if matches!(
+                        error,
+                        super::conditional_types::ConditionalTypeError::Instantiation(
+                            super::instantiate::InstantiationError::UnsupportedType(_)
+                        )
+                    ) {
+                        type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                            node,
+                            kind: SyntaxKind::ConditionalType,
+                        })
+                    } else {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+                    }
+                })?;
+        if !self.host.symbol_matches(store, declaration, self.method) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionType(declaration),
+            ));
+        }
+        preflight_node(store, self.host, declaration)?;
+        let aliases = HashMap::new();
+        let planner = TypeQueryPlanner::new(
+            store,
+            self.host,
+            Some(self.global_types.array_type),
+            array_targets,
+            self.options.strict_builtin_iterator_return,
+            &aliases,
+        );
+        let captures = planner.plan_conditional_captures(node, None)?;
+        validate_conditional_source_captures_with_array_targets(
+            store,
+            node,
+            captures.outer.as_deref(),
+            &captures.infer,
+            array_targets,
+        )
+        .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)))
+    }
+
+    fn resolve_branch(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        conditional: TypeId,
+        branch: ConditionalBranchKind,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        self.preflight(store, conditional)?;
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery);
+        let Some(TypeData::Conditional(data)) =
+            store.type_payload(conditional).map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        let node = store
+            .conditional_root(data.root)
+            .ok_or_else(invalid)?
+            .node();
+        let record = preflight_node(store, self.host, node)?;
+        let NodeData::ConditionalTypeNode(conditional) = &record.data else {
+            return Err(invalid());
+        };
+        let selected = match branch {
+            ConditionalBranchKind::True => conditional.true_type,
+            ConditionalBranchKind::False => conditional.false_type,
+        };
+        let selected = NodeRef::new(node.arena, node.file, selected);
+        if preflight_node(store, self.host, selected)?.parent != Some(node.node) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(selected),
+            ));
+        }
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            self.host,
+            &self.global_types,
+            self.options,
+            session,
+            &mut *self.diagnostics,
+        )?
+        .get_type_from_type_node_worker(selected, false, true)
+    }
+}
+
 #[cfg(test)]
 pub(super) fn source_callable_type_query_evidence_for_test(
     store: &mut CanonicalTypeMapperStore,
@@ -27600,6 +27715,69 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             Ok(value)
         })();
         self.complete_type_query(result, &plan, &mut prepared)
+    }
+
+    /// Specializes a published method with this source query's capabilities and limits.
+    pub(super) fn get_type_of_instantiated_interface_method(
+        &mut self,
+        receiver: TypeId,
+        method: SemanticSymbolId,
+    ) -> Result<TypeId, super::SourceCheckError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery);
+        let globals = self.global_types.clone().ok_or_else(invalid)?;
+        let session = self
+            .instantiation_session
+            .as_deref_mut()
+            .ok_or_else(invalid)?;
+        let mut source = MethodConditionalBranchSource {
+            host: self.host,
+            global_types: globals.clone(),
+            options: self.options,
+            diagnostics: &mut *self.diagnostics,
+            method,
+        };
+        super::instantiated_members::instantiate_published_generic_interface_method_with_source(
+            self.store,
+            &globals,
+            receiver,
+            method,
+            session,
+            &mut source,
+        )
+    }
+
+    /// Demands a member proxy without replacing its retained mapper or value cache.
+    pub(super) fn get_type_of_instantiated_interface_property(
+        &mut self,
+        receiver: TypeId,
+        property: SemanticSymbolId,
+    ) -> Result<TypeId, super::SourceCheckError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery);
+        let globals = self.global_types.clone().ok_or_else(invalid)?;
+        let session = self
+            .instantiation_session
+            .as_deref_mut()
+            .ok_or_else(invalid)?;
+        let method = self
+            .store
+            .value_symbol_links(property)
+            .and_then(|links| links.target)
+            .unwrap_or(property);
+        let mut source = MethodConditionalBranchSource {
+            host: self.host,
+            global_types: globals.clone(),
+            options: self.options,
+            diagnostics: &mut *self.diagnostics,
+            method,
+        };
+        super::instantiated_members::demand_instantiated_property_type_with_source(
+            self.store,
+            &globals,
+            receiver,
+            property,
+            session,
+            &mut source,
+        )
     }
 
     fn execute_interface_method_type_parameters(
@@ -28888,7 +29066,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .ok_or_else(invalid_method);
         }
         if let Some(method) =
-            published_interface_method_signature_return(self.store, signature, array_targets)
+            instantiated_interface_method_signature_return(self.store, signature, array_targets)
                 .map_err(|_| invalid_method())?
         {
             self.reject_type_reference_alias_capabilities()?;
@@ -28896,8 +29074,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .get_return_type_of_declared_method_signature(method.source, method.declaration)
                 .map_err(|_| invalid_method())?;
             if source_return != method.source_return
-                || published_interface_method_signature_return(self.store, signature, array_targets)
-                    .map_err(|_| invalid_method())?
+                || instantiated_interface_method_signature_return(
+                    self.store,
+                    signature,
+                    array_targets,
+                )
+                .map_err(|_| invalid_method())?
                     != Some(method)
             {
                 return Err(invalid_method());

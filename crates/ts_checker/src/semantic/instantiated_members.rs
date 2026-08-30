@@ -34,6 +34,10 @@ use super::{
         CallableFamily, ValidatedSingleCallParameterDisplay, ValidatedSingleCallSignatureDisplay,
         ValidatedSingleCallable,
     },
+    conditional_types::{
+        ConditionalBranchSource, ConditionalRemapProjection,
+        conditional_signature_projection_with_array_targets, is_signature_conditional_source,
+    },
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
     declared_values::{SelectedDeclaredProperty, selected_source_property_object_property},
     functions::{
@@ -43,8 +47,8 @@ use super::{
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession,
         cached_instantiation_with_vector, instantiable_member_type_contains_variables,
-        instantiate_type_with_session, instantiate_type_with_vector_and_session,
-        instantiated_member_type_matches,
+        instantiate_type_with_session, instantiate_type_with_source,
+        instantiate_type_with_vector_and_session, instantiated_member_type_matches,
     },
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
     object_aliases::{
@@ -876,6 +880,7 @@ enum RecoveredPropertyTypeShape {
         index: TypeId,
         access: AccessFlags,
     },
+    Conditional(ConditionalRemapProjection),
     Object {
         data: ObjectTypeData,
         signatures: Vec<RecoveredPropertySignatureIdentity>,
@@ -1225,6 +1230,20 @@ pub(super) fn property_recovery_type_identity(
                         index: indexed.index_type,
                         access: indexed.access_flags,
                     }
+                }
+                TypeData::Conditional(conditional)
+                    if is_signature_conditional_source(store, type_) =>
+                {
+                    let (projection, _) = conditional_signature_projection_with_array_targets(
+                        store,
+                        type_,
+                        array_targets,
+                    )
+                    .ok()?;
+                    pending.extend(projection.parameters());
+                    pending.extend(projection.arguments());
+                    pending.extend([conditional.check_type, conditional.extends_type]);
+                    RecoveredPropertyTypeShape::Conditional(projection)
                 }
                 TypeData::Object(object) => {
                     let mut signatures = Vec::new();
@@ -3143,10 +3162,47 @@ pub(super) fn demand_instantiated_property_type(
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, GenericInterfaceMemberError> {
+    demand_instantiated_property_type_worker(store, reference, symbol, array_targets, session, None)
+        .map_err(|error| error.into_member(reference))
+}
+
+/// Keeps a resolved member table's lazy method value in the same source query.
+pub(super) fn demand_instantiated_property_type_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    reference: TypeId,
+    symbol: SemanticSymbolId,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<TypeId, SourceCheckError> {
+    let mut source = SignatureInstantiationSource {
+        global_types,
+        branches: source,
+    };
+    demand_instantiated_property_type_worker(
+        store,
+        reference,
+        symbol,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+        session,
+        Some(&mut source),
+    )
+    .map_err(|error| error.into_source(reference))
+}
+
+#[allow(clippy::too_many_lines)] // Keep the existing proxy publication and recovery order.
+fn demand_instantiated_property_type_worker(
+    store: &mut CanonicalTypeMapperStore,
+    reference: TypeId,
+    symbol: SemanticSymbolId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+    source: Option<&mut SignatureInstantiationSource<'_>>,
+) -> Result<TypeId, MethodSignatureError> {
     let members = validate_generic_interface_members(store, reference, array_targets)?
         .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(reference))?;
     if !members.properties.contains(&symbol) {
-        return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol));
+        return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol).into());
     }
     let record = store
         .symbol(symbol)
@@ -3158,7 +3214,9 @@ pub(super) fn demand_instantiated_property_type(
     let proxy = record.flags().contains(SymbolFlags::TRANSIENT)
         && record.check_flags().contains(CheckFlags::INSTANTIATED);
     if !proxy {
-        return cached.ok_or(GenericInterfaceMemberError::InvalidCachedProperty(symbol));
+        return cached
+            .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(symbol))
+            .map_err(Into::into);
     }
     let (target, mapper) = {
         let links = store
@@ -3186,7 +3244,26 @@ pub(super) fn demand_instantiated_property_type(
             Some(StoredCallableSetValidation::Valid { .. })
         )
     {
-        return Err(GenericInterfaceMemberError::InvalidMember(target));
+        return Err(GenericInterfaceMemberError::InvalidMember(target).into());
+    }
+    if method && let Some(source) = source.as_deref() {
+        let signatures = store
+            .type_payload(template)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .ok_or(GenericInterfaceMemberError::InvalidMember(target))?;
+        for &signature in signatures {
+            let parameters = store
+                .callable_signature_parameter_types(signature)
+                .ok_or(GenericInterfaceMemberError::InvalidMember(target))?;
+            let returned = store
+                .signature(signature)
+                .and_then(super::signatures::Signature::resolved_return_type)
+                .ok_or(GenericInterfaceMemberError::InvalidMember(target))?;
+            for type_ in parameters.iter().copied().chain([returned]) {
+                preflight_signature_conditional_source(store, type_, source)?;
+            }
+        }
     }
     if let Some(cached) = cached {
         if !cached_instantiated_property_value_matches(
@@ -3197,7 +3274,7 @@ pub(super) fn demand_instantiated_property_type(
             Some(cached),
             array_targets,
         ) {
-            return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol));
+            return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol).into());
         }
         return Ok(cached);
     }
@@ -3207,11 +3284,18 @@ pub(super) fn demand_instantiated_property_type(
             .is_none_or(|bootstrap| bootstrap.error_type != error_type)
             || store.validate_union_constituent(error_type).is_err()
     }) {
-        return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol));
+        return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol).into());
     }
     let limit_mark = session.limit_event_mark();
     let instantiated = if method {
-        instantiate_generic_interface_method_type(store, template, mapper, array_targets, session)?
+        instantiate_generic_interface_method_type(
+            store,
+            template,
+            mapper,
+            array_targets,
+            session,
+            source,
+        )?
     } else {
         instantiate_generic_member_type(store, template, mapper, array_targets, session)?
     };
@@ -3230,7 +3314,7 @@ pub(super) fn demand_instantiated_property_type(
             ..ValueSymbolLinks::default()
         })
     {
-        return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol));
+        return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol).into());
     }
     let recovery = if session.recovery_error_type().is_some()
         && session.limit_event_occurred_since(limit_mark)
@@ -3239,7 +3323,7 @@ pub(super) fn demand_instantiated_property_type(
             property_recovery_type_identity(store, &[template, instantiated], array_targets)
                 .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(symbol))?;
         if !store.try_reserve_instantiated_property_recoveries() {
-            return Err(GenericInterfaceMemberError::Capacity(template));
+            return Err(GenericInterfaceMemberError::Capacity(template).into());
         }
         Some(InstantiatedPropertyRecovery {
             valid: true,
@@ -3357,10 +3441,136 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
     method: SemanticSymbolId,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, GenericInterfaceMemberError> {
+    instantiate_published_interface_method_worker(
+        store,
+        global_types,
+        receiver,
+        method,
+        session,
+        None,
+    )
+    .map_err(|error| error.into_member(receiver))
+}
+
+/// Resolves conditional return branches through the caller's source owner.
+pub(super) fn instantiate_published_generic_interface_method_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    receiver: TypeId,
+    method: SemanticSymbolId,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<TypeId, SourceCheckError> {
+    let mut source = SignatureInstantiationSource {
+        global_types,
+        branches: source,
+    };
+    instantiate_published_interface_method_worker(
+        store,
+        global_types,
+        receiver,
+        method,
+        session,
+        Some(&mut source),
+    )
+    .map_err(|error| error.into_source(receiver))
+}
+
+struct SignatureInstantiationSource<'a> {
+    global_types: &'a CanonicalGlobalTypes,
+    branches: &'a mut dyn ConditionalBranchSource,
+}
+
+fn preflight_signature_conditional_source(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    source: &SignatureInstantiationSource<'_>,
+) -> Result<(), MethodSignatureError> {
+    if matches!(
+        store.type_payload(template).map(super::TypeRecord::data),
+        Some(TypeData::Conditional(_))
+    ) {
+        source
+            .branches
+            .preflight(store, template)
+            .map_err(|error| MethodSignatureError::Source {
+                template,
+                error: InstantiationError::Declared(error),
+            })?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum MethodSignatureError {
+    Member(GenericInterfaceMemberError),
+    Source {
+        template: TypeId,
+        error: InstantiationError,
+    },
+}
+
+impl From<GenericInterfaceMemberError> for MethodSignatureError {
+    fn from(error: GenericInterfaceMemberError) -> Self {
+        Self::Member(error)
+    }
+}
+
+impl MethodSignatureError {
+    fn into_member(self, receiver: TypeId) -> GenericInterfaceMemberError {
+        match self {
+            Self::Member(error) => error,
+            Self::Source { template, error } => match error {
+                InstantiationError::InvalidType(_)
+                | InstantiationError::InvalidMapper(_)
+                | InstantiationError::InvalidAlias(_)
+                | InstantiationError::Declared(_) => {
+                    GenericInterfaceMemberError::InvalidCachedMembers(receiver)
+                }
+                _ => property_instantiation_error(template, &error),
+            },
+        }
+    }
+
+    fn into_source(self, receiver: TypeId) -> SourceCheckError {
+        match self {
+            Self::Source {
+                error: InstantiationError::Declared(error),
+                ..
+            } => error.into(),
+            other => super::object_members::source_generic_member_error(
+                receiver,
+                &other.into_member(receiver),
+            ),
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Keep method publication and recovery in one transaction.
+fn instantiate_published_interface_method_worker(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    receiver: TypeId,
+    method: SemanticSymbolId,
+    session: &mut InstantiationSession,
+    mut source: Option<&mut SignatureInstantiationSource<'_>>,
+) -> Result<TypeId, MethodSignatureError> {
     let targets = CanonicalArrayTargets::from_global_types(global_types);
     let plan = plan_published_interface_method(store, Some(targets), receiver, method)?;
+    if let Some(source) = source.as_deref() {
+        for template in plan.signatures.iter().flat_map(|signature| {
+            signature
+                .parameter_types
+                .iter()
+                .copied()
+                .chain([signature.return_type])
+        }) {
+            preflight_signature_conditional_source(store, template, source)?;
+        }
+    }
     if let Some(cached) = cached_published_interface_method(store, &plan, targets)? {
-        return mapped_interface_method_value(store, global_types, &plan, cached);
+        return mapped_interface_method_value(store, global_types, &plan, cached)
+            .map_err(Into::into);
     }
     if session.recovery_error_type().is_some_and(|error_type| {
         store
@@ -3368,32 +3578,31 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
             .is_none_or(|bootstrap| bootstrap.error_type != error_type)
             || store.validate_union_constituent(error_type).is_err()
     }) {
-        return Err(GenericInterfaceMemberError::InvalidCachedMembers(
-            plan.receiver,
-        ));
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(plan.receiver).into());
     }
     if !store.try_reserve_mappers(1)
         || !store.try_reserve_types(1)
         || !store.try_reserve_signatures(plan.signatures.len())
     {
-        return Err(GenericInterfaceMemberError::Capacity(plan.receiver));
+        return Err(GenericInterfaceMemberError::Capacity(plan.receiver).into());
     }
     let mapper = store
         .new_type_mapper(plan.mapper_sources.clone(), plan.mapper_targets.clone())
         .ok_or(GenericInterfaceMemberError::Capacity(plan.receiver))?;
     let limit_mark = session.limit_event_mark();
     let mut signatures = Vec::with_capacity(plan.signatures.len());
-    for source in &plan.signatures {
-        let signature = instantiate_generic_method_signature(
+    for signature_source in &plan.signatures {
+        let signature = instantiate_generic_method_signature_worker(
             store,
-            source.source,
-            &source.parameter_types,
-            source.return_type,
+            signature_source.source,
+            &signature_source.parameter_types,
+            signature_source.return_type,
             mapper,
             Some(targets),
             session,
             plan.method,
             plan.receiver,
+            source.as_deref_mut(),
         )?;
         signatures.push(signature);
     }
@@ -3413,14 +3622,14 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
             plan.receiver,
         ))?;
         if !store.try_reserve_published_interface_method_recoveries() {
-            return Err(GenericInterfaceMemberError::Capacity(plan.receiver));
+            return Err(GenericInterfaceMemberError::Capacity(plan.receiver).into());
         }
         Some((error_type, snapshot))
     } else {
         None
     };
     if !store.try_reserve_published_interface_method_origins(signatures.len()) {
-        return Err(GenericInterfaceMemberError::Capacity(plan.receiver));
+        return Err(GenericInterfaceMemberError::Capacity(plan.receiver).into());
     }
     let origin_plan = plan.clone();
     let origin_signatures = signatures.clone().into_boxed_slice();
@@ -3430,9 +3639,7 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
     if !store.set_object_target_and_mapper(callable, Some(plan.source), Some(mapper))
         || !store.set_structured_type_members(callable, None, None, Some(signatures), None, None)
     {
-        return Err(GenericInterfaceMemberError::InvalidCachedMembers(
-            plan.receiver,
-        ));
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(plan.receiver).into());
     }
     if let Some((error_type, snapshot)) = recovery {
         assert!(store.publish_published_interface_method_recovery(
@@ -3456,7 +3663,7 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
             signatures: origin_signatures,
         })
     );
-    mapped_interface_method_value(store, global_types, &plan, callable)
+    mapped_interface_method_value(store, global_types, &plan, callable).map_err(Into::into)
 }
 
 fn mapped_interface_method_value(
@@ -4366,6 +4573,112 @@ pub(super) fn published_interface_method_signature_return(
         declaration,
         source_return: source.return_type,
         return_type,
+    }))
+}
+
+/// Reads a selected-method copy or an exact value already owned by a member proxy.
+pub(super) fn instantiated_interface_method_signature_return(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    if let Some(result) =
+        published_interface_method_signature_return(store, signature, array_targets)?
+    {
+        return Ok(Some(result));
+    }
+    proxy_interface_method_signature_return(store, signature, array_targets)
+}
+
+#[allow(clippy::too_many_lines)] // Follow the existing receiver and proxy cache without searching for a copy.
+fn proxy_interface_method_signature_return(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    let Some(copied) = store.signature(signature) else {
+        return Ok(None);
+    };
+    let Some(source) = copied.target() else {
+        return Ok(None);
+    };
+    let Some(source_value) = store.interface_method_linked_type(source) else {
+        return Ok(None);
+    };
+    let invalid = || GenericInterfaceMemberError::InvalidCachedMembers(source_value);
+    let original = store.signature(source).ok_or_else(invalid)?;
+    let declaration = original.declaration().ok_or_else(invalid)?;
+    let method = store
+        .source_declaration_symbol(declaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let (owner, target) = store
+        .authenticated_interface_method_owner(method)
+        .ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = store.type_payload(target).ok_or_else(invalid)?.data()
+    else {
+        return Err(invalid());
+    };
+    let signature_mapper = copied.mapper().ok_or_else(invalid)?;
+    let receiver = store
+        .map_type(signature_mapper, interface.this_type.ok_or_else(invalid)?)
+        .ok_or_else(invalid)?;
+    let members =
+        validate_generic_interface_members(store, receiver, array_targets)?.ok_or_else(invalid)?;
+    let method_record = store.symbol(method).ok_or_else(invalid)?;
+    let property = members
+        .members()
+        .and_then(|table| store.symbol_table(table))
+        .and_then(|table| table.get(method_record.name()))
+        .filter(|property| members.properties().contains(property))
+        .ok_or_else(invalid)?;
+    let proxy = store.symbol(property).ok_or_else(invalid)?;
+    let links = store.value_symbol_links(property).ok_or_else(invalid)?;
+    let callable = links.resolved_type.ok_or_else(invalid)?;
+    if !proxy
+        .flags()
+        .contains(SymbolFlags::METHOD | SymbolFlags::TRANSIENT)
+        || !proxy.check_flags().contains(CheckFlags::INSTANTIATED)
+        || links.target != Some(method)
+        || members.target() != target
+    {
+        return Err(invalid());
+    }
+    let (source_callable, value, _) = published_interface_method_value(store, owner, method)?;
+    if value != source_value {
+        return Err(invalid());
+    }
+    let sources = store
+        .type_payload(source_callable)
+        .and_then(|record| record.data().structured())
+        .and_then(|members| members.signatures.as_deref())
+        .ok_or_else(invalid)?;
+    let index = sources
+        .iter()
+        .position(|candidate| *candidate == source)
+        .ok_or_else(invalid)?;
+    let signatures = store
+        .type_payload(callable)
+        .and_then(|record| record.data().structured())
+        .and_then(|members| members.signatures.as_deref())
+        .ok_or_else(invalid)?;
+    if signatures.len() != sources.len()
+        || signatures.get(index) != Some(&signature)
+        || copied.declaration() != Some(declaration)
+    {
+        return Err(invalid());
+    }
+    for type_ in [source_callable, receiver, callable] {
+        store
+            .validate_cached_array_capability_with_pending_functions(array_targets, type_, &[])
+            .map_err(|_| invalid())?;
+    }
+    Ok(Some(PublishedInterfaceMethodSignatureReturn {
+        owner: callable,
+        source,
+        declaration,
+        source_return: original.resolved_return_type().ok_or_else(invalid)?,
+        return_type: copied.resolved_return_type().ok_or_else(invalid)?,
     }))
 }
 
@@ -6375,13 +6688,14 @@ fn instantiate_generic_interface_method_type(
     mapper: TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut InstantiationSession,
-) -> Result<TypeId, GenericInterfaceMemberError> {
+    mut branch_source: Option<&mut SignatureInstantiationSource<'_>>,
+) -> Result<TypeId, MethodSignatureError> {
     let method = store
         .type_payload(source)
         .and_then(super::type_records::TypeRecord::symbol)
         .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(source))?;
     if valid_interface_method_value(store, method, source).is_none() {
-        return Err(GenericInterfaceMemberError::InvalidMember(method));
+        return Err(GenericInterfaceMemberError::InvalidMember(method).into());
     }
     let sources = store
         .type_payload(source)
@@ -6406,11 +6720,11 @@ fn instantiate_generic_interface_method_type(
         })
         .collect::<Result<Vec<_>, GenericInterfaceMemberError>>()?;
     if !store.try_reserve_types(1) || !store.try_reserve_signatures(sources.len()) {
-        return Err(GenericInterfaceMemberError::Capacity(source));
+        return Err(GenericInterfaceMemberError::Capacity(source).into());
     }
     let mut signatures = Vec::with_capacity(sources.len());
     for (original, parameter_templates, return_template) in sources {
-        let signature = instantiate_generic_method_signature(
+        let signature = instantiate_generic_method_signature_worker(
             store,
             original,
             &parameter_templates,
@@ -6420,6 +6734,7 @@ fn instantiate_generic_interface_method_type(
             session,
             method,
             source,
+            branch_source.as_deref_mut(),
         )?;
         signatures.push(signature);
     }
@@ -6429,7 +6744,7 @@ fn instantiate_generic_interface_method_type(
     if !store.set_object_target_and_mapper(callable, Some(source), Some(mapper))
         || !store.set_structured_type_members(callable, None, None, Some(signatures), None, None)
     {
-        return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(source).into());
     }
     Ok(callable)
 }
@@ -6446,6 +6761,34 @@ fn instantiate_generic_method_signature(
     method: SemanticSymbolId,
     owner_type: TypeId,
 ) -> Result<SignatureId, GenericInterfaceMemberError> {
+    instantiate_generic_method_signature_worker(
+        store,
+        original,
+        parameter_templates,
+        return_template,
+        owner_mapper,
+        array_targets,
+        session,
+        method,
+        owner_type,
+        None,
+    )
+    .map_err(|error| error.into_member(owner_type))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep fresh method parameters in the caller's mapper and session.
+fn instantiate_generic_method_signature_worker(
+    store: &mut CanonicalTypeMapperStore,
+    original: SignatureId,
+    parameter_templates: &[TypeId],
+    return_template: TypeId,
+    owner_mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+    method: SemanticSymbolId,
+    owner_type: TypeId,
+    mut source: Option<&mut SignatureInstantiationSource<'_>>,
+) -> Result<SignatureId, MethodSignatureError> {
     let source_parameters = store
         .signature(original)
         .ok_or(GenericInterfaceMemberError::InvalidMember(method))?
@@ -6456,21 +6799,23 @@ fn instantiate_generic_method_signature(
             .iter()
             .copied()
             .map(|parameter| {
-                instantiate_generic_member_type(
+                instantiate_signature_member_type(
                     store,
                     parameter,
                     owner_mapper,
                     array_targets,
                     session,
+                    source.as_deref_mut(),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let return_type = instantiate_generic_member_type(
+        let return_type = instantiate_signature_member_type(
             store,
             return_template,
             owner_mapper,
             array_targets,
             session,
+            source.as_deref_mut(),
         )?;
         Some((parameters, return_type))
     } else {
@@ -6497,40 +6842,50 @@ fn instantiate_generic_method_signature(
         ))?;
     let fresh_parameters = instantiated.type_parameters().to_vec();
     if fresh_parameters.len() != source_parameters.len() {
-        return Err(GenericInterfaceMemberError::InvalidCachedMembers(
-            owner_type,
-        ));
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(owner_type).into());
     }
-    for (fresh, source) in fresh_parameters.into_iter().zip(source_parameters) {
+    for (fresh, source_parameter) in fresh_parameters.into_iter().zip(source_parameters) {
         let (constraint, default_type) = match store
-            .type_payload(source)
+            .type_payload(source_parameter)
             .map(super::type_records::TypeRecord::data)
         {
             Some(TypeData::TypeParameter(parameter)) => {
                 (parameter.constraint, parameter.resolved_default_type)
             }
-            _ => return Err(GenericInterfaceMemberError::InvalidMember(method)),
+            _ => return Err(GenericInterfaceMemberError::InvalidMember(method).into()),
         };
         let constraint = constraint
             .map(|constraint| {
-                instantiate_generic_member_type(store, constraint, mapper, array_targets, session)
+                instantiate_signature_member_type(
+                    store,
+                    constraint,
+                    mapper,
+                    array_targets,
+                    session,
+                    source.as_deref_mut(),
+                )
             })
             .transpose()?;
         let default_type = default_type
             .map(|default_type| {
-                instantiate_generic_member_type(store, default_type, mapper, array_targets, session)
+                instantiate_signature_member_type(
+                    store,
+                    default_type,
+                    mapper,
+                    array_targets,
+                    session,
+                    source.as_deref_mut(),
+                )
             })
             .transpose()?;
         if !store.set_type_parameter_resolution(
             fresh,
             constraint,
-            Some(source),
+            Some(source_parameter),
             Some(mapper),
             default_type,
         ) {
-            return Err(GenericInterfaceMemberError::InvalidCachedMembers(
-                owner_type,
-            ));
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(owner_type).into());
         }
     }
 
@@ -6541,15 +6896,23 @@ fn instantiate_generic_method_signature(
             .iter()
             .copied()
             .map(|parameter| {
-                instantiate_generic_member_type(store, parameter, mapper, array_targets, session)
+                instantiate_signature_member_type(
+                    store,
+                    parameter,
+                    mapper,
+                    array_targets,
+                    session,
+                    source.as_deref_mut(),
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let return_type = instantiate_generic_member_type(
+        let return_type = instantiate_signature_member_type(
             store,
             return_template,
             mapper,
             array_targets,
             session,
+            source.as_deref_mut(),
         )?;
         (parameters, return_type)
     };
@@ -6574,17 +6937,40 @@ fn instantiate_generic_method_signature(
                     },
                 )
         {
-            return Err(GenericInterfaceMemberError::InvalidCachedProperty(
-                parameter,
-            ));
+            return Err(GenericInterfaceMemberError::InvalidCachedProperty(parameter).into());
         }
     }
     if !store.set_signature_resolved_return_type(signature, Some(return_type)) {
-        return Err(GenericInterfaceMemberError::InvalidCachedMembers(
-            owner_type,
-        ));
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(owner_type).into());
     }
     Ok(signature)
+}
+
+fn instantiate_signature_member_type(
+    store: &mut CanonicalTypeMapperStore,
+    template: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+    source: Option<&mut SignatureInstantiationSource<'_>>,
+) -> Result<TypeId, MethodSignatureError> {
+    if matches!(
+        store.type_payload(template).map(super::TypeRecord::data),
+        Some(TypeData::Conditional(_))
+    ) && let Some(source) = source
+    {
+        return instantiate_type_with_source(
+            store,
+            template,
+            mapper,
+            source.global_types,
+            session,
+            source.branches,
+        )
+        .map_err(|error| MethodSignatureError::Source { template, error });
+    }
+    instantiate_generic_member_type(store, template, mapper, array_targets, session)
+        .map_err(Into::into)
 }
 
 fn indexed_property_name(store: &CanonicalTypeMapperStore, index: TypeId) -> Option<String> {
@@ -7146,6 +7532,23 @@ fn member_type_requires_instantiation_inner(
     active: &mut HashSet<TypeId>,
     classify_only: bool,
 ) -> Result<bool, GenericInterfaceMemberError> {
+    if is_signature_conditional_source(store, type_) {
+        return instantiable_member_type_contains_variables(
+            store,
+            type_,
+            mapper_parameters,
+            array_targets,
+        )
+        .map_err(|error| match error {
+            InstantiationError::UnsupportedType(_) => {
+                GenericInterfaceMemberError::UnsupportedPropertyType(type_)
+            }
+            InstantiationError::Union(super::bootstrap::LiteralTypeCacheError::Capacity) => {
+                GenericInterfaceMemberError::Capacity(type_)
+            }
+            _ => GenericInterfaceMemberError::InvalidCachedMembers(type_),
+        });
+    }
     if let Some(tuple) = store
         .canonical_tuple_shape(type_)
         .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?

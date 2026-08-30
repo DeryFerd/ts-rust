@@ -51,9 +51,8 @@ use super::{
     instantiated_members::{
         GenericInterfaceMemberError, demand_instantiated_property_type,
         demand_property_object_alias_property,
-        instantiate_published_generic_array_property_callable,
-        instantiate_published_generic_interface_method_with_session, property_instantiation_error,
-        resolve_members_with_array_targets,
+        instantiate_published_generic_array_property_callable, property_instantiation_error,
+        resolve_members_with_array_targets, resolve_members_with_array_targets_and_session,
         resolve_property_object_alias_members_with_array_targets,
         resolve_property_with_array_targets_and_session, validate_generic_interface_members,
         validate_property_object_alias_members_with_array_targets,
@@ -510,6 +509,28 @@ pub(super) fn resolve_object_property_by_key_with_source(
         .object_flags()
         .contains(ObjectFlags::MEMBERS_RESOLVED)
     {
+        let target = match record.data() {
+            TypeData::TypeReference(reference) => reference.object.target,
+            TypeData::Interface(interface) if generic => interface.reference.object.target,
+            _ => None,
+        };
+        if target.is_some_and(|target| {
+            store.type_payload(target).is_some_and(|record| {
+                matches!(record.data(), TypeData::Interface(_))
+                    && !record.object_flags().contains(ObjectFlags::CLASS)
+            })
+        }) {
+            return resolve_instantiated_object_property_by_key_with_source(
+                store,
+                host,
+                global_types,
+                options,
+                receiver,
+                name,
+                session,
+                diagnostics,
+            );
+        }
         return resolve_object_property_by_key(store, Some(global_types), receiver, name, session)
             .map_err(Into::into);
     }
@@ -533,14 +554,16 @@ pub(super) fn resolve_object_property_by_key_with_source(
             .map_err(Into::into);
         }
         if interface.declared_members_resolved {
-            return resolve_object_property_by_key(
+            return resolve_instantiated_object_property_by_key_with_source(
                 store,
-                Some(global_types),
+                host,
+                global_types,
+                options,
                 receiver,
                 name,
                 session,
-            )
-            .map_err(Into::into);
+                diagnostics,
+            );
         }
         if record
             .data()
@@ -681,14 +704,15 @@ pub(super) fn resolve_object_property_by_key_with_source(
     let type_ = if mapper_sources.is_empty() {
         template
     } else if method {
-        instantiate_published_generic_interface_method_with_session(
+        CanonicalTypeQuery::new_with_global_types_and_session(
             store,
+            host,
             global_types,
-            receiver,
-            symbol,
+            options,
             session,
-        )
-        .map_err(|error| source_generic_member_error(receiver, &error))?
+            diagnostics,
+        )?
+        .get_type_of_instantiated_interface_method(receiver, symbol)?
     } else if array.is_some() && store.type_has_function_type_provenance(template) {
         instantiate_published_generic_array_property_callable(store, global_types, receiver, symbol)
             .map_err(|error| source_generic_member_error(receiver, &error))?
@@ -704,6 +728,73 @@ pub(super) fn resolve_object_property_by_key_with_source(
         .map_err(|error| {
             source_generic_member_error(receiver, &property_instantiation_error(template, &error))
         })?
+    };
+    Ok(Some(ResolvedOwnProperty {
+        symbol,
+        type_,
+        optional,
+        readonly,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)] // Keep the source host and limits with the selected proxy.
+fn resolve_instantiated_object_property_by_key_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    receiver: TypeId,
+    name: EscapedNameRef<'_>,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
+    if store
+        .direct_interface_heritage_provenance(receiver)
+        .is_some()
+    {
+        return resolve_object_property_by_key(store, Some(global_types), receiver, name, session)
+            .map_err(Into::into);
+    }
+    let members = resolve_members_with_array_targets_and_session(
+        store,
+        receiver,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+        session,
+    )
+    .map_err(|error| source_generic_member_error(receiver, &error))?;
+    let Some(table) = members.members() else {
+        return Ok(None);
+    };
+    let table = store
+        .symbol_table(table)
+        .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+    let Some(symbol) = table.get(name) else {
+        return Ok(None);
+    };
+    let record = store
+        .symbol(symbol)
+        .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+    let optional = record.flags().contains(SymbolFlags::OPTIONAL);
+    let readonly = record.check_flags().contains(CheckFlags::READONLY);
+    let type_ = if record.flags().contains(SymbolFlags::METHOD) {
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_type_of_instantiated_interface_property(receiver, symbol)?
+    } else {
+        demand_instantiated_property_type(
+            store,
+            receiver,
+            symbol,
+            Some(CanonicalArrayTargets::from_global_types(global_types)),
+            session,
+        )
+        .map_err(|error| source_generic_member_error(receiver, &error))?
     };
     Ok(Some(ResolvedOwnProperty {
         symbol,
@@ -1163,7 +1254,7 @@ fn source_member_name_matches(
     Ok(suffix == Some(identity.to_string().as_bytes()))
 }
 
-fn source_generic_member_error(
+pub(super) fn source_generic_member_error(
     receiver: TypeId,
     error: &GenericInterfaceMemberError,
 ) -> SourceCheckError {
