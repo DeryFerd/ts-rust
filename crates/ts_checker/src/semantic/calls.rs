@@ -4586,6 +4586,7 @@ mod tests {
         let string = bootstrap.string_type;
         let callable = callable(store, SignatureFlags::NONE, &[number], 1, None);
         let before = (store.type_len(), store.signature_len());
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
 
         for (arguments, expected) in [
             (
@@ -4618,6 +4619,7 @@ mod tests {
                 strict,
                 request(callable.owner, &arguments),
                 &callable,
+                &mut session,
             )
             .unwrap();
             assert_eq!(checked.signature(), callable.signature);
@@ -4645,6 +4647,7 @@ mod tests {
         let foreign = initialized_store();
         let foreign_type = foreign.intrinsic_bootstrap().unwrap().number_type;
         let before = (store.type_len(), store.signature_len());
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
         assert_eq!(
             check_validated_class_call_arguments(
                 store,
@@ -4652,6 +4655,7 @@ mod tests {
                 strict,
                 request(callable.owner, &[foreign_type]),
                 &callable,
+                &mut session,
             ),
             Err(DirectCallError::Invariant(
                 DirectCallInvariant::InvalidArgumentType {
