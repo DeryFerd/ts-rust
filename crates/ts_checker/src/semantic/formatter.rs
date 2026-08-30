@@ -3932,12 +3932,12 @@ fn append_function_type_parameters(
     Ok(())
 }
 
-fn source_expando_literal_display_types(
+fn source_expando_literal_display_type(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     owner: TypeId,
     expression: NodeRef,
-) -> Result<(TypeId, TypeId), TypeDisplayUnavailable> {
+) -> Result<Option<TypeId>, TypeDisplayUnavailable> {
     let invalid = || TypeDisplayUnavailable::MalformedType(owner);
     let node = host.node(expression).ok_or_else(invalid)?;
     let bootstrap = store
@@ -3974,19 +3974,89 @@ fn source_expando_literal_display_types(
                 bootstrap.regular_false_type
             })
         }
-        _ => {
-            return Err(TypeDisplayUnavailable::FunctionType {
-                type_id: owner,
-                reason: FunctionTypeDisplayUnavailable::CallableProperties,
-            });
-        }
+        _ => return Ok(None),
     }
     .ok_or_else(invalid)?;
     let fresh = store
         .fresh_type_of_literal_type(regular)
         .map_err(|_| invalid())?;
-    let widened = super::source::widened_fresh_literal_type(store, fresh).map_err(|_| invalid())?;
-    Ok((fresh, widened))
+    Ok(Some(fresh))
+}
+
+fn source_expando_display_types(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    owner: TypeId,
+    assignment: &super::assignment::ArrowExpandoAssignmentPlan,
+) -> Result<(TypeId, TypeId), TypeDisplayUnavailable> {
+    let invalid = || TypeDisplayUnavailable::MalformedType(owner);
+    let assigned = store
+        .type_node_links(assignment.right)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    let property = store
+        .value_symbol_links(assignment.property_symbol)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    if source_expando_literal_display_type(store, host, owner, assignment.right)?
+        .is_some_and(|literal| literal != assigned)
+    {
+        return Err(invalid());
+    }
+    let node = host.node(assignment.right).ok_or_else(invalid)?;
+    if matches!(node.data, NodeData::ObjectLiteralExpression(_)) {
+        let plan = object_members::plan_object_literal(store, host, assignment.right)
+            .map_err(|_| invalid())?;
+        if !matches!(
+            object_members::object_literal_state(store, &plan),
+            Ok(Some(object_members::PropertyObjectState::Resolved(resolved))) if resolved == assigned
+        ) {
+            return Err(invalid());
+        }
+    }
+    // Source checking gives an empty expando array the canonical any[] type.
+    if matches!(&node.data, NodeData::ArrayLiteralExpression(array) if array.elements.nodes.is_empty())
+    {
+        let global_types = global_types.ok_or(TypeDisplayUnavailable::FunctionType {
+            type_id: owner,
+            reason: FunctionTypeDisplayUnavailable::CallableProperties,
+        })?;
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(TypeDisplayUnavailable::MissingBootstrap)?;
+        let element = if bootstrap.options.strict_null_checks {
+            bootstrap.implicit_never_type
+        } else {
+            bootstrap.undefined_widening_type
+        };
+        if property != global_types.any_array_type
+            || store
+                .canonical_array_reference(global_types, assigned)
+                .map_err(|_| invalid())?
+                .is_none_or(|array| {
+                    !array.array_literal || array.readonly || array.element_type != element
+                })
+        {
+            return Err(invalid());
+        }
+        return Ok((assigned, property));
+    }
+    let widened =
+        super::source::widened_fresh_literal_type(store, assigned).map_err(|_| invalid())?;
+    let record = store.type_payload(widened).ok_or_else(invalid)?;
+    let valid = if record
+        .object_flags()
+        .intersects(ObjectFlags::REQUIRES_WIDENING)
+    {
+        store.validate_cached_widened_type(widened, property, global_types)
+    } else {
+        property == widened
+    };
+    if !valid {
+        return Err(invalid());
+    }
+    Ok((assigned, property))
 }
 
 fn source_arrow_expando_display_plans(
@@ -4063,6 +4133,7 @@ fn source_arrow_expando_display_plans(
 fn source_arrow_expando_display_properties(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
 ) -> Result<Vec<StructuralPropertyDisplay>, TypeDisplayUnavailable> {
     let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
@@ -4096,7 +4167,7 @@ fn source_arrow_expando_display_properties(
     let (_, bound) = host.source(provenance.declaration).ok_or_else(invalid)?;
     if bound
         .source_facts()
-        .is_none_or(|facts| facts.is_javascript_file())
+        .is_none_or(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
         || !store
             .source_file_links(super::SourceFileRef::new(store.id(), bound.source_file()))
             .is_some_and(|links| links.type_checked)
@@ -4120,7 +4191,7 @@ fn source_arrow_expando_display_properties(
             return Err(invalid());
         }
         let (assigned_type, property_type) =
-            source_expando_literal_display_types(store, host, type_id, plan.right)?;
+            source_expando_display_types(store, host, global_types, type_id, &plan)?;
         if store.value_symbol_links(symbol)
             != Some(&ValueSymbolLinks {
                 resolved_type: Some(property_type),
@@ -4171,7 +4242,8 @@ fn display_single_call_signature(
     state: &mut DisplayState,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
-    let properties = source_arrow_expando_display_properties(store, host, projection.owner)?;
+    let properties =
+        source_arrow_expando_display_properties(store, host, global_types, projection.owner)?;
     // Pinned `signatureToSignatureDeclarationHelper`: three units is the
     // minimum signature contribution, independent of the emitted punctuation.
     state.add(3);
@@ -10311,7 +10383,7 @@ mod tests {
                 "{ (value: string): number; zebra: boolean; alpha: string; count: number; }",
             ),
             (
-                "const foo = function (): void {}; foo.bar = 42; export {};",
+                "const foo = function () {}; foo.bar = 42; export {};",
                 "{ (): void; bar: number; }",
             ),
         ] {
@@ -10343,6 +10415,46 @@ mod tests {
             }
             assert!(context.diagnostics().is_empty());
         }
+    }
+
+    #[test]
+    fn source_arrow_expando_display_keeps_annotated_function_expression_unsupported() {
+        use crate::semantic::{SourceCheckError, SourceSyntaxRole, UnsupportedSourceSyntax};
+
+        let parsed =
+            parse_source_file("const foo = function (): void {}; foo.bar = 42; export {};");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(274);
+        let mut context = external_parsed_context(&parsed, file);
+        let expression = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    node: expression,
+                    kind: SyntaxKind::FunctionExpression,
+                    role: SourceSyntaxRole::VariableInitializer,
+                }
+            ))
+        );
+        let (_, bound) = context.file(file).unwrap();
+        let owner = bound.symbol(expression).unwrap();
+        assert!(
+            context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
     }
 
     #[test]
@@ -10476,21 +10588,101 @@ mod tests {
     }
 
     #[test]
-    fn source_arrow_expando_display_does_not_omit_unsupported_property_values() {
+    fn source_arrow_expando_display_keeps_object_property_values() {
         let parsed = parse_source_file("const foo = () => {}; foo.bar = { value: 1 }; export {};");
         let file = FileId::new(273);
         let mut context = external_parsed_context(&parsed, file);
         context.check_source_file(file).unwrap();
-        let (_, callable) = source_arrow_display_type(&mut context, &parsed, file);
-        let before = format!("{:?}", context.store());
-        assert_eq!(
-            context.type_to_string(callable),
-            Err(TypeDisplayUnavailable::FunctionType {
-                type_id: callable,
-                reason: FunctionTypeDisplayUnavailable::CallableProperties,
-            })
-        );
-        assert_eq!(format!("{:?}", context.store()), before);
+        let (arrow, callable) = source_arrow_display_type(&mut context, &parsed, file);
+        for _ in 0..2 {
+            let before = format!("{:?}", context.store());
+            assert_eq!(
+                context.type_to_string(callable).unwrap(),
+                "{ (): void; bar: { value: number; }; }"
+            );
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(
+                        callable,
+                        arrow,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION,
+                    )
+                    .unwrap(),
+                "{ (): void; bar: { value: number; }; }"
+            );
+            assert_eq!(format!("{:?}", context.store()), before);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(format!("{:?}", context.store()), before);
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn source_arrow_expando_display_reuses_array_union_and_identifier_value_types() {
+        for (source, expected) in [
+            (
+                "interface Array<T> {} const foo = () => {}; foo.bar = [1, 2];",
+                "{ (): void; bar: number[]; }",
+            ),
+            (
+                "interface Array<T> {} const foo = () => {}; foo.bar = [{ value: 1 }];",
+                "{ (): void; bar: { value: number; }[]; }",
+            ),
+            (
+                "interface Array<T> {} const foo = () => {}; foo.bar = [];",
+                "{ (): void; bar: any[]; }",
+            ),
+            (
+                "const condition = true; const foo = () => {}; foo.bar = condition ? { value: 1 } : { value: 'x' };",
+                "{ (): void; bar: { value: number; } | { value: string; }; }",
+            ),
+            (
+                "const payload = { value: 1 }; const foo = () => {}; foo.bar = payload;",
+                "{ (): void; bar: { value: number; }; }",
+            ),
+        ] {
+            for strict_null_checks in [false, true] {
+                let parsed = parse_source_file(source);
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                let file = FileId::new(275);
+                let mut context = parsed_context(
+                    &parsed,
+                    file,
+                    CanonicalCheckerOptions {
+                        intrinsic: IntrinsicBootstrapOptions {
+                            strict_null_checks,
+                            ..IntrinsicBootstrapOptions::default()
+                        },
+                        ..CanonicalCheckerOptions::default()
+                    },
+                );
+                context.check_source_file(file).unwrap();
+                let (arrow, callable) = source_arrow_display_type(&mut context, &parsed, file);
+                for _ in 0..2 {
+                    let before = format!("{:?}", context.store());
+                    assert_eq!(
+                        context.type_to_string(callable).unwrap(),
+                        expected,
+                        "{source}, strict null checks: {strict_null_checks}"
+                    );
+                    assert_eq!(
+                        context
+                            .type_to_string_at_location_with_flags(
+                                callable,
+                                arrow,
+                                CanonicalTypeFormatFlags::NO_TRUNCATION,
+                            )
+                            .unwrap(),
+                        expected,
+                        "{source}, strict null checks: {strict_null_checks}"
+                    );
+                    assert_eq!(format!("{:?}", context.store()), before);
+                    context.recheck_source_file(file).unwrap();
+                    assert_eq!(format!("{:?}", context.store()), before);
+                }
+                assert!(context.diagnostics().is_empty());
+            }
+        }
     }
 
     #[test]

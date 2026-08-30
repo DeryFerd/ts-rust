@@ -489,6 +489,23 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .expect("the root widened type plan was published"))
     }
 
+    /// Checks one retained widening cache pair without publishing a type.
+    pub(super) fn validate_cached_widened_type(
+        &self,
+        source: TypeId,
+        target: TypeId,
+        global_types: Option<&CanonicalGlobalTypes>,
+    ) -> bool {
+        self.derived_types.widened_types.get(&source) == Some(&target)
+            && self.widened_cache_entry_is_valid(
+                source,
+                target,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+                global_types.map(CanonicalArrayTargets::from_global_types),
+            )
+    }
+
     /// Validates a relation operand that may be a cached regular or widened
     /// object-literal type.
     ///
@@ -2681,6 +2698,93 @@ mod tests {
             format!("{store:?}") == before,
             "the widening query changed the store"
         );
+    }
+
+    #[test]
+    fn cached_widened_type_display_proof_keeps_exact_pairs_and_rejects_damage() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "const object: any = { value: 1 }; ",
+            "const array: any = [{ value: 1 }]; ",
+            "const union: any = [{ value: 1 }, { value: 'x' }]; ",
+            "const donor: any = { value: 2 };",
+        ));
+        let library_file = FileId::new(200);
+        let file = FileId::new(201);
+        let mut context = checker_context(&[(library_file, &library), (file, &source)]);
+        context.check_source_file(file).unwrap();
+        let global_types = context.global_types().clone();
+        let types = ["object", "array", "union", "donor"].map(|name| {
+            resolved_expression_type(&context, variable_initializer(&source, file, name))
+        });
+        let union = context
+            .store()
+            .canonical_array_element_type(&global_types, types[2])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            context.store().type_payload(union).unwrap().data(),
+            TypeData::Union(_)
+        ));
+        let donor = context
+            .store_mut_for_test()
+            .get_widened_type_with_global_types(types[3], &global_types)
+            .unwrap();
+        for source_type in [types[0], types[1], union] {
+            let target = context
+                .store_mut_for_test()
+                .get_widened_type_with_global_types(source_type, &global_types)
+                .unwrap();
+            assert_ne!(target, source_type);
+            assert_ne!(target, donor);
+            let before = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert!(context.store().validate_cached_widened_type(
+                    source_type,
+                    target,
+                    Some(&global_types),
+                ));
+                assert!(!context.store().validate_cached_widened_type(
+                    source_type,
+                    donor,
+                    Some(&global_types),
+                ));
+                assert_eq!(format!("{:?}", context.store()), before);
+            }
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .derived_types
+                    .widened_types
+                    .insert(source_type, donor),
+                Some(target),
+            );
+            let damaged = format!("{:?}", context.store());
+            for candidate in [target, donor] {
+                assert!(!context.store().validate_cached_widened_type(
+                    source_type,
+                    candidate,
+                    Some(&global_types),
+                ));
+                assert_eq!(format!("{:?}", context.store()), damaged);
+            }
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .derived_types
+                    .widened_types
+                    .insert(source_type, target),
+                Some(donor),
+            );
+            assert_eq!(format!("{:?}", context.store()), before);
+            assert!(context.store().validate_cached_widened_type(
+                source_type,
+                target,
+                Some(&global_types),
+            ));
+            assert_eq!(format!("{:?}", context.store()), before);
+        }
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
