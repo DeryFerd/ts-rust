@@ -23862,22 +23862,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceLiteralCacheError::BootstrapUninitialized,
             ))?;
         let cached_literal = |expression: &PlannedExpression| {
-            let regular = match &expression.unparenthesized().kind {
-                PlannedExpressionKind::String(value) => bootstrap.cached_string_literal_type(value),
-                PlannedExpressionKind::Number { value, .. } => {
-                    bootstrap.cached_number_literal_type(*value)
-                }
-                PlannedExpressionKind::BigInt { value, .. } => {
-                    bootstrap.cached_bigint_literal_type(value)
-                }
-                PlannedExpressionKind::Boolean(value) => Some(if *value {
-                    bootstrap.regular_true_type
-                } else {
-                    bootstrap.regular_false_type
-                }),
-                _ => None,
-            };
-            let Some(regular) = regular else {
+            let Some(regular) = cached_source_scalar_regular_literal_type(store, expression)?
+            else {
                 return Ok(None);
             };
             if store.type_payload(regular).is_some_and(|record| {
@@ -25729,6 +25715,161 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         debug_assert!(node.is_for(self.arena.id(), self.bound.file_id()));
         SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax { node, kind, role })
     }
+}
+
+/// Reads only literal entries already made by the source scalar checker.
+fn cached_source_scalar_regular_literal_type(
+    store: &CanonicalTypeMapperStore,
+    expression: &PlannedExpression,
+) -> Result<Option<TypeId>, LiteralTypeCacheError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+    Ok(match &expression.unparenthesized().kind {
+        PlannedExpressionKind::String(value) => bootstrap.cached_string_literal_type(value),
+        PlannedExpressionKind::Number { value, .. } => bootstrap.cached_number_literal_type(*value),
+        PlannedExpressionKind::BigInt { value, .. } => bootstrap.cached_bigint_literal_type(value),
+        PlannedExpressionKind::Boolean(value) => Some(if *value {
+            bootstrap.regular_true_type
+        } else {
+            bootstrap.regular_false_type
+        }),
+        _ => None,
+    })
+}
+
+/// Reuses the scalar plan for a checked unary chain without publishing child links.
+#[allow(clippy::too_many_lines)] // The whole chain must retain its source owner and literal caches.
+pub(super) fn checked_prefix_unary_artifact_type(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    source: SourceFileRef,
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    if !store.contains_source_file(source) {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::StoreSourceMismatch(source),
+        ));
+    }
+    let host = DeclaredTypeHost::new([(arena, bound)]).map_err(DeclaredTypeError::from)?;
+    let mut planner = SourcePlanner::new_semantic(arena, bound, source, store, &host);
+    if !planner.store_source_shape_matches() {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::BoundSourceMismatch {
+                expected: bound.source_file(),
+                actual: source,
+            },
+        ));
+    }
+    if !store
+        .source_file_links(source)
+        .is_some_and(|links| links.type_checked)
+        || bound
+            .source_facts()
+            .is_none_or(|facts| facts.is_declaration_file() || facts.is_default_library())
+    {
+        return Ok(None);
+    }
+
+    let mut root = node;
+    let mut ancestors = HashSet::from([node]);
+    while let Some(parent) = planner
+        .node(root)?
+        .parent
+        .map(|node| planner.reference(node))
+    {
+        let record = planner.node(parent)?;
+        let child = match &record.data {
+            NodeData::PrefixUnaryExpression(prefix)
+                if matches!(
+                    prefix.operator,
+                    SyntaxKind::ExclamationToken | SyntaxKind::MinusToken
+                ) =>
+            {
+                prefix.operand
+            }
+            NodeData::ParenthesizedExpression(parenthesized) => parenthesized.expression,
+            _ => break,
+        };
+        if child != root.node || !ancestors.insert(parent) {
+            return Err(SourceCheckError::PrimitiveOperator(root));
+        }
+        root = parent;
+    }
+
+    let mut nodes = Vec::new();
+    let mut current = root;
+    let mut has_prefix = false;
+    loop {
+        if nodes.contains(&current) {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::RepeatedNode(current),
+            ));
+        }
+        nodes.push(current);
+        let record = planner.node(current)?;
+        if record.flags.0 != 0 {
+            return Ok(None);
+        }
+        let child = match &record.data {
+            NodeData::PrefixUnaryExpression(prefix)
+                if matches!(
+                    prefix.operator,
+                    SyntaxKind::ExclamationToken | SyntaxKind::MinusToken
+                ) =>
+            {
+                has_prefix = true;
+                prefix.operand
+            }
+            NodeData::ParenthesizedExpression(parenthesized) => parenthesized.expression,
+            NodeData::KeywordExpression(_)
+                if matches!(
+                    record.kind,
+                    SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword
+                ) =>
+            {
+                break;
+            }
+            NodeData::NumericLiteral(_) | NodeData::BigIntLiteral(_) => break,
+            _ => return Ok(None),
+        };
+        let child = planner.reference(child);
+        if planner.node(child)?.parent != Some(current.node) {
+            return Err(SourceCheckError::PrimitiveOperator(child));
+        }
+        current = child;
+    }
+    if !has_prefix || !nodes.contains(&node) {
+        return Ok(None);
+    }
+    if !planner.source_node_is_within(current, source.node_ref())? {
+        return Err(SourceCheckError::PrimitiveOperator(current));
+    }
+
+    let mut result = None;
+    for expression_node in nodes {
+        let expression = match planner.plan_expression(expression_node) {
+            Ok(expression) => expression,
+            Err(SourceCheckError::Unsupported(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Some(regular) = cached_source_scalar_regular_literal_type(store, &expression)? else {
+            return Ok(None);
+        };
+        let type_ = store.fresh_type_of_literal_type(regular)?;
+        preflight_source_expression_cache(store, expression_node, type_)?;
+        if store
+            .symbol_node_links(expression_node)
+            .is_some_and(|links| links.resolved_symbol.is_some())
+        {
+            return Err(SourceCheckError::PrimitiveOperator(expression_node));
+        }
+        if expression_node == node {
+            result = Some(type_);
+        }
+    }
+    Ok(result)
 }
 
 /// Reuses the source proof without publishing the catch binding's value type.
@@ -97641,6 +97782,47 @@ class Foo2 {
 
         assert_eq!(observable_state(&context, file), after_first);
         assert_eq!(context.diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn prefix_unary_readback_rejects_a_stale_source_owner() {
+        let mut parsed = parsed("const value = !!true;");
+        let file = FileId::new(9_230);
+        let bindings = completed_bindings(&[(file, &parsed)]);
+        let (symbols, mut files) = bindings.try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        let source = store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PrefixUnaryExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        parsed.arena.get_mut(node.node).unwrap().parent = None;
+        let state = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+                store.source_file_links(source).cloned(),
+            )
+        };
+        let before = state(&store);
+        assert!(matches!(
+            checked_prefix_unary_artifact_type(&parsed.arena, &bound, source, &store, node),
+            Err(SourceCheckError::DeclaredType(DeclaredTypeError::Host(
+                DeclaredTypeHostError::ArenaRevisionMismatch { .. }
+            )))
+        ));
+        assert_eq!(state(&store), before);
     }
 
     #[test]

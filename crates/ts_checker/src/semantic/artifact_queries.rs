@@ -255,6 +255,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some(type_) = self.checked_prefix_unary_artifact_type(node)? {
+            return Ok(type_);
+        }
+
         if let Some(type_) = self.checked_conditional_literal_artifact_type(node)? {
             return Ok(type_);
         }
@@ -1710,6 +1714,28 @@ impl CanonicalCheckerContext<'_> {
             return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
         }
         Ok(())
+    }
+
+    fn checked_prefix_unary_artifact_type(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (arena, bound, record) = self.validated_artifact_node(node)?;
+        if !matches!(
+            record.data,
+            NodeData::PrefixUnaryExpression(_)
+                | NodeData::ParenthesizedExpression(_)
+                | NodeData::NumericLiteral(_)
+                | NodeData::BigIntLiteral(_)
+                | NodeData::KeywordExpression(_)
+        ) {
+            return Ok(None);
+        }
+        let source = self
+            .source_file(node.file)
+            .ok_or(CanonicalArtifactQueryError::MissingFile(node.file))?;
+        super::source::checked_prefix_unary_artifact_type(arena, bound, source, self.store(), node)
+            .map_err(CanonicalArtifactQueryError::from)
     }
 
     fn checked_conditional_literal_artifact_type(
@@ -4417,8 +4443,8 @@ mod tests {
         AliasSymbolLinks, AliasTargetState, CanonicalCheckerOptions,
         CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
         CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, DeclaredTypeLinks,
-        IntrinsicBootstrapOptions, ModuleSymbolLinks, SymbolNodeLinks, TypeData, TypeNodeLinks,
-        ValueSymbolLinks,
+        IntrinsicBootstrapOptions, ModuleSymbolLinks, SourceAssertionError, SourceCheckError,
+        SourceLiteralCacheError, SymbolNodeLinks, TypeData, TypeNodeLinks, ValueSymbolLinks,
         types::{ObjectFlags, TypeFlags},
     };
 
@@ -6903,6 +6929,266 @@ mod tests {
                 assert_eq!(context.get_type_at_location(declaration), Ok(instance));
             }
         }
+    }
+
+    #[test]
+    fn prefix_unary_readback_requires_a_checked_source_and_owned_nodes() {
+        let parsed = parse_source_file("const value = !!true;");
+        let foreign = parse_source_file("const value = !!true;");
+        let file = FileId::new(6_230);
+        let prefix = |parsed: &ParseResult| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::PrefixUnaryExpression).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap()
+        };
+        let node = prefix(&parsed);
+        let foreign_node = prefix(&foreign);
+        let mut context = context(&parsed, file);
+        let source = context.source_file(file).unwrap();
+        let state = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            (
+                [store.type_len(), store.symbol_len(), store.signature_len()],
+                store.checker_link_allocated_lengths(),
+                store.source_file_links(source).cloned(),
+                context.diagnostics().len(),
+            )
+        };
+        let cold = state(&context);
+        for _ in 0..2 {
+            assert_eq!(context.checked_prefix_unary_artifact_type(node), Ok(None));
+            assert_eq!(
+                context.get_type_at_location(foreign_node),
+                Err(CanonicalArtifactQueryError::ForeignNode(foreign_node)),
+            );
+            assert_eq!(state(&context), cold);
+        }
+        context.check_source_file(file).unwrap();
+        let warm = state(&context);
+        assert!(
+            context
+                .checked_prefix_unary_artifact_type(node)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(state(&context), warm);
+    }
+
+    #[test]
+    fn prefix_unary_readback_rejects_changed_chain_and_literal_caches() {
+        for poison in 0..5 {
+            let parsed = parse_source_file("const value = !!true;");
+            let file = FileId::new(6_231);
+            let mut context = context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            let outer = parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    variable
+                        .initializer
+                        .map(|node| NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let operand = |node: NodeRef| {
+                let NodeData::PrefixUnaryExpression(prefix) =
+                    &parsed.arena.get(node.node).unwrap().data
+                else {
+                    panic!("the source has a prefix expression")
+                };
+                NodeRef::new(parsed.arena.id(), file, prefix.operand)
+            };
+            let inner = operand(outer);
+            let literal = operand(inner);
+            let (truth, falsity, regular_false, boolean, symbol) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.true_type,
+                    bootstrap.false_type,
+                    bootstrap.regular_false_type,
+                    bootstrap.boolean_type,
+                    bootstrap.unknown_symbol,
+                )
+            };
+            let error = match poison {
+                0..=2 => {
+                    let (node, cached, expected) = match poison {
+                        0 => (outer, Some(boolean), truth),
+                        1 => (inner, Some(truth), falsity),
+                        _ => (literal, None, truth),
+                    };
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        node,
+                        TypeNodeLinks {
+                            resolved_type: cached,
+                            outer_type_parameters: (poison == 2).then(Vec::new),
+                        },
+                    ));
+                    SourceCheckError::Assertion(SourceAssertionError::InvalidExpressionCache {
+                        node,
+                        cached,
+                        expected,
+                    })
+                }
+                3 => {
+                    assert!(context.store_mut_for_test().set_symbol_node_links(
+                        inner,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(symbol)
+                        },
+                    ));
+                    SourceCheckError::PrimitiveOperator(inner)
+                }
+                4 => {
+                    assert!(context.store_mut_for_test().set_literal_links(
+                        regular_false,
+                        Some(truth),
+                        regular_false,
+                    ));
+                    SourceCheckError::LiteralCache(SourceLiteralCacheError::InvalidCachedLiteral(
+                        regular_false,
+                    ))
+                }
+                _ => unreachable!(),
+            };
+            let source = context.source_file(file).unwrap();
+            let state = |context: &CanonicalCheckerContext<'_>| {
+                let store = context.store();
+                (
+                    [
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.mapper_len(),
+                    ],
+                    store.checker_link_allocated_lengths(),
+                    store.source_file_links(source).cloned(),
+                    store.relation_state_snapshot(),
+                    [outer, inner, literal].map(|node| {
+                        (
+                            store.type_node_links(node).cloned(),
+                            store.symbol_node_links(node).cloned(),
+                        )
+                    }),
+                    context.diagnostics().as_slice().to_vec(),
+                )
+            };
+            let before = state(&context);
+            for node in [outer, inner, literal] {
+                assert_eq!(
+                    context.get_type_at_location(node),
+                    Err(CanonicalArtifactQueryError::SourceCheck(error)),
+                    "poison {poison}"
+                );
+                assert_eq!(state(&context), before, "poison {poison}");
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_unary_queries_keep_unsupported_operators_and_missing_scalar_state() {
+        for (text, operator) in [
+            ("const value = +2;", SyntaxKind::PlusToken),
+            ("const value = ~2;", SyntaxKind::TildeToken),
+            (
+                "const flag = true; const value = !flag;",
+                SyntaxKind::ExclamationToken,
+            ),
+        ] {
+            let parsed = parse_source_file(text);
+            let file = FileId::new(6_232);
+            let node = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::PrefixUnaryExpression).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let mut context = context(&parsed, file);
+            let source = context.source_file(file).unwrap();
+            let state = |context: &CanonicalCheckerContext<'_>| {
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().source_file_links(source).cloned(),
+                    context.diagnostics().as_slice().to_vec(),
+                )
+            };
+            let before = state(&context);
+            assert_eq!(
+                context.get_type_at_location(node),
+                Err(CanonicalArtifactQueryError::SourceCheck(
+                    SourceCheckError::Unsupported(
+                        crate::semantic::UnsupportedSourceSyntax::InvalidPrefixUnaryOperator {
+                            node,
+                            operator
+                        },
+                    )
+                )),
+                "{text}",
+            );
+            assert_eq!(state(&context), before);
+        }
+
+        let parsed = parse_source_file("enum E { A = -17 }");
+        let file = FileId::new(6_233);
+        let node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PrefixUnaryExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(
+            context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .cached_number_literal_type(ts_jsnum::Number::new(-17.0))
+                .is_none()
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().as_slice().to_vec(),
+        );
+        assert_eq!(
+            context.get_type_at_location(node),
+            Err(CanonicalArtifactQueryError::MissingType {
+                node,
+                kind: SyntaxKind::PrefixUnaryExpression,
+            })
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            before
+        );
     }
 
     #[test]
