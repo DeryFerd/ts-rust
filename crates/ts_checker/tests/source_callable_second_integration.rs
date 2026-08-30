@@ -7,6 +7,7 @@ use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
     DeclaredTypeLinks, IntrinsicBootstrapOptions, SignatureId, SignatureLinks, SourceFileLinks,
     SymbolNodeLinks, TypeData, TypeId, TypeNodeLinks, ValueSymbolLinks,
+    type_records::StructuredTypeData,
 };
 use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
 
@@ -110,6 +111,22 @@ fn signature(checker: &CanonicalCheckerContext<'_>, declaration: NodeRef) -> Sig
         .signature_links(declaration)
         .and_then(|links| links.resolved_signature.signature())
         .unwrap()
+}
+
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
 }
 
 fn callable_signature(checker: &CanonicalCheckerContext<'_>, type_: TypeId) -> SignatureId {
@@ -662,13 +679,7 @@ fn assert_jsdoc_overload_key(
 
 fn assert_rest_property(checker: &mut CanonicalCheckerContext<'_>, rest: TypeId) {
     assert_eq!(checker.type_to_string(rest).unwrap(), "{ keep: boolean; }");
-    let structured = checker
-        .store()
-        .type_payload(rest)
-        .unwrap()
-        .data()
-        .structured()
-        .unwrap();
+    let structured = structured_data(checker.store().type_payload(rest).unwrap().data()).unwrap();
     let [property] = structured.properties.as_deref().unwrap() else {
         panic!("rest must exclude only the value property")
     };
