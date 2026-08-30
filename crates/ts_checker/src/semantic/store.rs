@@ -3885,15 +3885,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || declarations.iter().any(|declaration| {
                 self.source_node_kind(*declaration) != Some(SyntaxKind::MethodSignature)
                     || self
-                        .source_node_facts
-                        .get(&declaration.arena)
-                        .is_none_or(|facts| {
-                            facts
-                                .iter()
-                                .flatten()
-                                .filter(|facts| {
-                                    facts.parent == Some(declaration.node)
-                                        && facts.kind == SyntaxKind::QuestionToken
+                        .source_direct_children(*declaration)
+                        .is_none_or(|children| {
+                            children
+                                .into_iter()
+                                .filter(|&child| {
+                                    self.source_node_kind(child) == Some(SyntaxKind::QuestionToken)
                                 })
                                 .count()
                                 != usize::from(optional)
@@ -16336,6 +16333,108 @@ mod tests {
             );
         }
         assert_eq!(format!("{store:?}"), before);
+    }
+
+    #[test]
+    fn declared_method_optional_counts_match_retained_fact_scan() {
+        let parsed = parse_source_file(concat!(
+            "interface Contract { ",
+            "required(callback: (value?: string) => void, value?: number): void; ",
+            "required(): void; optional?(value?: string): void; optional?(): void; } ",
+            "type Other = { unrelated?: string };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(60);
+        let mut binder = CanonicalBinder::new();
+        let facts = CanonicalSourceFileFacts::new(
+            EscapedName::source("\"/method-optional-count.ts\""),
+            CanonicalSourceLanguage::TypeScript,
+            false,
+            CanonicalModuleState::Script,
+        );
+        binder
+            .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts)
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let methods = parsed
+            .arena
+            .iter()
+            .filter(|(_, record)| record.kind == SyntaxKind::MethodSignature)
+            .map(|(node, _)| NodeRef::new(parsed.arena.id(), file, node))
+            .collect::<Vec<_>>();
+        assert_eq!(methods.len(), 4);
+        let owners = [methods[0], methods[2]]
+            .map(|declaration| binder.file(file).unwrap().symbol(declaration).unwrap());
+        assert_ne!(owners[0], owners[1]);
+        let (symbols, _) = binder.finish().try_into_parts().unwrap();
+        let mut store = TestStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        let original = store.source_node_facts[&parsed.arena.id()].clone();
+        let before = format!("{store:?}");
+        for (symbol, optional) in owners.into_iter().zip([false, true]) {
+            let method = store.symbol(symbol).unwrap();
+            let declarations = method.declarations().unwrap().to_vec();
+            let expected_tokens = usize::from(optional);
+            assert_eq!(declarations.len(), 2);
+            for duplicate in [false, true] {
+                if duplicate {
+                    let extra = store
+                        .source_direct_children(declarations[1])
+                        .unwrap()
+                        .into_iter()
+                        .filter(|&child| {
+                            store.source_node_kind(child) != Some(SyntaxKind::QuestionToken)
+                        })
+                        .take(2 - expected_tokens)
+                        .collect::<Vec<_>>();
+                    assert_eq!(extra.len(), 2 - expected_tokens);
+                    for child in extra {
+                        store.source_node_facts.get_mut(&child.arena).unwrap()
+                            [child.node.index()]
+                        .as_mut()
+                        .unwrap()
+                        .kind = SyntaxKind::QuestionToken;
+                    }
+                }
+                let facts = store.source_node_facts.get(&parsed.arena.id()).unwrap();
+                let counts = declarations
+                    .iter()
+                    .map(|declaration| {
+                        facts
+                            .iter()
+                            .flatten()
+                            .filter(|child| {
+                                child.parent == Some(declaration.node)
+                                    && child.kind == SyntaxKind::QuestionToken
+                            })
+                            .count()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    counts,
+                    [expected_tokens, if duplicate { 2 } else { expected_tokens }]
+                );
+                let expected = counts
+                    .into_iter()
+                    .all(|count| count == expected_tokens)
+                    .then_some(optional);
+                let frozen = format!("{store:?}");
+                for _ in 0..2 {
+                    assert_eq!(store.declared_method_optional_flag(symbol), expected);
+                    assert_eq!(format!("{store:?}"), frozen);
+                }
+                store
+                    .source_node_facts
+                    .insert(parsed.arena.id(), original.clone());
+                assert_eq!(format!("{store:?}"), before);
+            }
+        }
     }
 
     #[test]
