@@ -7651,7 +7651,7 @@ pub(super) fn validated_synthetic_namespace_symbol(
                     || property_type != callable
                     || store
                         .signature(signature)
-                        .and_then(|signature| signature.resolved_return_type())
+                        .and_then(super::signatures::Signature::resolved_return_type)
                         != store
                             .intrinsic_bootstrap()
                             .map(|bootstrap| bootstrap.void_type)

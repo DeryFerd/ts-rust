@@ -7023,7 +7023,8 @@ mod tests {
     }
 
     #[test]
-    fn other_merged_ambient_namespace_imports_keep_their_original_target() {
+    #[allow(clippy::too_many_lines)] // Keep the four source shapes and their exact owner checks together.
+    fn other_merged_ambient_namespace_imports_preserve_target_ownership() {
         for (index, importer_text, declaration_text, imported_name) in [
             (
                 0,
@@ -7089,14 +7090,208 @@ mod tests {
                 ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
                     .unwrap();
 
+            if index != 3 {
+                assert_eq!(
+                    CanonicalAliasResolver::new(&mut store, &mut host)
+                        .resolve_alias(import_alias)
+                        .unwrap()
+                        .target,
+                    AliasTargetState::Resolved(original)
+                );
+                assert!(store.export_type_links(original).is_none());
+                continue;
+            }
+
+            let importer_bound = bound_files.get(&importer_file).unwrap();
+            let import_scope = importer_bound.container(binding).unwrap();
             assert_eq!(
-                CanonicalAliasResolver::new(&mut store, &mut host)
-                    .resolve_alias(import_alias)
+                store
+                    .symbol_table(importer_bound.locals(import_scope).unwrap())
                     .unwrap()
-                    .target,
-                AliasTargetState::Resolved(original)
+                    .get_source(imported_name),
+                Some(import_alias)
             );
-            assert!(store.export_type_links(original).is_none());
+            assert_eq!(store.source_declaration_symbol(binding), Some(import_alias));
+            assert_eq!(
+                store.symbol(import_alias).unwrap().declarations(),
+                Some([binding].as_slice())
+            );
+            assert_eq!(
+                store.symbol(import_alias).unwrap().flags(),
+                SymbolFlags::ALIAS
+            );
+            assert_eq!(
+                store.symbol(import_alias).unwrap().name().as_utf8(),
+                Some(imported_name)
+            );
+            assert_eq!(store.get_merged_symbol(import_alias), Some(import_alias));
+            assert_ne!(import_alias, original);
+            let clause = importer.arena.get(binding.node).unwrap().parent.unwrap();
+            let import = importer.arena.get(clause).unwrap().parent.unwrap();
+            let originating_import = node_ref(&importer, importer_file, import);
+            assert_eq!(
+                importer.arena.get(import).unwrap().kind,
+                SyntaxKind::ImportDeclaration
+            );
+            let original_declarations = store
+                .symbol(original)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .to_vec();
+            let [function, namespace] = original_declarations.as_slice() else {
+                panic!("foo retains its real function and namespace declarations")
+            };
+            assert_eq!(target_bound.symbol(*function), Some(original));
+            assert_eq!(target_bound.symbol(*namespace), Some(original));
+            assert_eq!(
+                declaration.arena.get(function.node).unwrap().kind,
+                SyntaxKind::FunctionDeclaration
+            );
+            assert_eq!(
+                declaration.arena.get(namespace.node).unwrap().kind,
+                SyntaxKind::ModuleDeclaration
+            );
+            assert_eq!(
+                store.symbol(original).unwrap().value_declaration(),
+                Some(*function)
+            );
+            let module = source_module(&bound_files, declaration_file);
+            let module_exports = store.symbol(module).unwrap().exports().unwrap();
+            let assignment = store
+                .symbol_table(module_exports)
+                .unwrap()
+                .get(InternalSymbolName::ExportEquals.as_ref())
+                .unwrap();
+            let type_allocations = (store.type_len(), store.signature_len(), store.mapper_len());
+            assert!(store.symbol(original).unwrap().exports().is_none());
+
+            let wrapper = CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(import_alias)
+                .unwrap()
+                .target
+                .symbol()
+                .unwrap();
+            assert_ne!(wrapper, original);
+            assert_ne!(wrapper, import_alias);
+            assert_ne!(wrapper, module);
+            let exports = store.symbol(wrapper).unwrap().exports().unwrap();
+            let default = store
+                .symbol_table(exports)
+                .unwrap()
+                .get(InternalSymbolName::Default.as_ref())
+                .unwrap();
+            assert_ne!(default, wrapper);
+            assert_ne!(default, original);
+            assert_ne!(default, import_alias);
+            let assert_owners = |store: &TestStore| {
+                let wrapper_record = store.symbol(wrapper).unwrap();
+                let original_record = store.symbol(original).unwrap();
+                assert_eq!(
+                    original_record.flags(),
+                    SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE
+                );
+                assert_eq!(wrapper_record.flags(), original_record.flags());
+                assert_eq!(wrapper_record.name(), original_record.name());
+                assert_eq!(
+                    wrapper_record.declarations(),
+                    Some(original_declarations.as_slice())
+                );
+                assert_eq!(wrapper_record.value_declaration(), Some(*function));
+                assert_eq!(wrapper_record.parent(), original_record.parent());
+                assert!(wrapper_record.members().is_none());
+                assert_eq!(store.get_merged_symbol(wrapper), Some(wrapper));
+                assert_eq!(
+                    store.export_type_links(wrapper),
+                    Some(&ExportTypeLinks {
+                        target: Some(original),
+                        originating_import: Some(originating_import),
+                    })
+                );
+                let exports = store
+                    .symbol_table(wrapper_record.exports().unwrap())
+                    .unwrap();
+                assert_eq!(exports.len(), 1);
+                assert_eq!(
+                    exports.get(InternalSymbolName::Default.as_ref()),
+                    Some(default)
+                );
+                let default_record = store.symbol(default).unwrap();
+                assert_eq!(default_record.flags(), SymbolFlags::ALIAS);
+                assert_eq!(default_record.name(), InternalSymbolName::Default.as_ref());
+                assert_eq!(default_record.parent(), Some(module));
+                assert!(default_record.declarations().is_none());
+                assert!(default_record.value_declaration().is_none());
+                assert_eq!(
+                    store.alias_symbol_links(default),
+                    Some(&AliasSymbolLinks {
+                        immediate_target: Some(original),
+                        alias_target: AliasTargetState::Resolved(original),
+                        ..AliasSymbolLinks::default()
+                    })
+                );
+                assert_eq!(
+                    store.alias_symbol_links(import_alias),
+                    Some(&AliasSymbolLinks {
+                        immediate_target: Some(wrapper),
+                        alias_target: AliasTargetState::Resolved(wrapper),
+                        ..AliasSymbolLinks::default()
+                    })
+                );
+                assert_eq!(
+                    original_record.declarations(),
+                    Some(original_declarations.as_slice())
+                );
+                assert_eq!(original_record.value_declaration(), Some(*function));
+                assert!(original_record.exports().is_none());
+                assert!(store.export_type_links(original).is_none());
+                assert_eq!(
+                    store.symbol(module).unwrap().exports(),
+                    Some(module_exports)
+                );
+                let module_exports = store.symbol_table(module_exports).unwrap();
+                assert_eq!(module_exports.len(), 1);
+                assert_eq!(
+                    module_exports.get(InternalSymbolName::ExportEquals.as_ref()),
+                    Some(assignment)
+                );
+                for symbol in [import_alias, original, wrapper, default, assignment] {
+                    assert!(store.value_symbol_links(symbol).is_none());
+                }
+                assert!(store.signature_links(*function).is_none());
+                assert_eq!(
+                    (store.type_len(), store.signature_len(), store.mapper_len()),
+                    type_allocations
+                );
+            };
+            assert_owners(&store);
+            let warm = (
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    host.get_target_of_alias_declaration(&mut store, import_alias),
+                    Ok(CanonicalImmediateAliasTarget::Resolved(wrapper))
+                );
+                assert_eq!(
+                    CanonicalAliasResolver::new(&mut store, &mut host)
+                        .resolve_alias(import_alias)
+                        .unwrap()
+                        .target,
+                    AliasTargetState::Resolved(wrapper)
+                );
+                assert_owners(&store);
+                assert_eq!(
+                    (
+                        store.symbol_len(),
+                        store.symbol_store().symbol_table_len(),
+                        store.checker_link_allocated_lengths()
+                    ),
+                    warm
+                );
+            }
         }
     }
 
