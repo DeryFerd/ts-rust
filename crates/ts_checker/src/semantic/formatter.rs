@@ -1772,12 +1772,27 @@ fn validated_declared_method_display(
     let Some(owner) = method
         .parent()
         .and_then(|owner| store.get_merged_symbol(owner))
-        .and_then(|owner| store.symbol(owner))
     else {
         return Ok(None);
     };
-    if owner.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
-        && owner.flags() != SymbolFlags::TYPE_LITERAL
+    let Some(owner_record) = store.symbol(owner) else {
+        return Ok(None);
+    };
+    // Cold selected methods and private names retain their separate display proof.
+    let completed_class_method = owner_record.flags().contains(SymbolFlags::CLASS)
+        && !method.name().is_private_identifier()
+        && !method.name().is_reserved_member_name()
+        && !method.name().is_late_bound()
+        && store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .is_some_and(|instance| {
+                validate_class_heritage_members(store, instance)
+                    == ClassHeritageMembersValidation::Valid
+            });
+    if !completed_class_method
+        && owner_record.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+        && owner_record.flags() != SymbolFlags::TYPE_LITERAL
     {
         return Ok(None);
     }
@@ -1831,14 +1846,21 @@ fn display_declared_method_signatures(
             if !host.symbol_matches(store, declaration, owner) {
                 return Err(TypeDisplayUnavailable::MalformedType(type_id));
             }
-            let Some(NodeData::MethodSignatureDeclaration(method)) =
-                host.node(declaration).map(|node| &node.data)
-            else {
-                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            let parameters = match host.node(declaration).map(|node| &node.data) {
+                Some(NodeData::MethodSignatureDeclaration(method)) => &method.parameters.nodes,
+                Some(NodeData::MethodDeclaration(method))
+                    if method.type_parameters.is_none()
+                        && signature.type_parameters().is_empty()
+                        && signature.target().is_none()
+                        && signature.mapper().is_none() =>
+                {
+                    &method.parameters.nodes
+                }
+                _ => return Err(TypeDisplayUnavailable::MalformedType(type_id)),
             };
             if signature.this_parameter().is_some()
                 || signature.resolved_type_predicate().is_some()
-                || method.parameters.nodes.len() != signature.parameters().len()
+                || parameters.len() != signature.parameters().len()
             {
                 return Err(TypeDisplayUnavailable::MalformedType(type_id));
             }
@@ -1924,15 +1946,14 @@ fn append_declared_method_type_parameters(
     let declaration = signature_record
         .declaration()
         .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
-    let Some(NodeData::MethodSignatureDeclaration(method)) =
-        host.node(declaration).map(|node| &node.data)
-    else {
-        return Err(TypeDisplayUnavailable::MalformedType(owner));
+    let declarations = match host.node(declaration).map(|node| &node.data) {
+        Some(NodeData::MethodSignatureDeclaration(method)) => method
+            .type_parameters
+            .as_ref()
+            .map_or(&[][..], |parameters| parameters.nodes.as_slice()),
+        Some(NodeData::MethodDeclaration(method)) if method.type_parameters.is_none() => &[],
+        _ => return Err(TypeDisplayUnavailable::MalformedType(owner)),
     };
-    let declarations = method
-        .type_parameters
-        .as_ref()
-        .map_or(&[][..], |parameters| parameters.nodes.as_slice());
     let original = signature_record
         .target()
         .and_then(|target| store.signature(target))
@@ -13958,6 +13979,217 @@ mod tests {
         assert_eq!(
             context.type_to_string(callable),
             Err(TypeDisplayUnavailable::MalformedType(callable))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check each damaged cache on the same real method shape.
+    fn class_method_display_rejects_changed_parameter_and_signature_caches() {
+        let parsed =
+            parse_source_file("class Model { run(value: number): string { return 'done'; } }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(148_301);
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::MethodDeclaration(method) = &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the method keeps its original declaration")
+        };
+        let parameter_declaration =
+            NodeRef::new(parsed.arena.id(), file, method.parameters.nodes[0]);
+        let NodeData::ParameterDeclaration(parameter) =
+            &parsed.arena.get(parameter_declaration.node).unwrap().data
+        else {
+            panic!("the method keeps its original parameter")
+        };
+        let annotation = NodeRef::new(parsed.arena.id(), file, parameter.type_.unwrap());
+
+        for changed in [
+            "parameter_value",
+            "parameter_annotation",
+            "paired_parameter_type",
+            "parameter_declaration",
+            "signature_link",
+            "pending_return",
+            "return_type",
+            "signature_target",
+        ] {
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let callable = context
+                .store()
+                .value_symbol_links(symbol)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let signature = context
+                .store()
+                .signature_links(declaration)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            let record = context.store().signature(signature).unwrap();
+            let [parameter] = *record.parameters() else {
+                panic!("the required parameter must remain in the signature")
+            };
+            assert_eq!(record.min_argument_count(), 1);
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            assert_eq!(record.resolved_return_type(), Some(string));
+            assert_source_class_display_without_writes(
+                &mut context,
+                callable,
+                declaration,
+                Ok("(value: number) => string"),
+            );
+
+            match changed {
+                "parameter_value" | "paired_parameter_type" => {
+                    assert!(context.store_mut_for_test().set_value_symbol_links(
+                        parameter,
+                        ValueSymbolLinks {
+                            resolved_type: Some(string),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                "parameter_annotation" => {}
+                "parameter_declaration" => {
+                    assert!(context.store_mut_for_test().set_symbol_declarations(
+                        parameter,
+                        Some(vec![declaration]),
+                        Some(declaration),
+                    ));
+                }
+                "signature_link" => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_links(declaration, SignatureLinks::default())
+                    );
+                }
+                "pending_return" => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_resolved_return_type(signature, None)
+                    );
+                }
+                "return_type" => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_resolved_return_type(signature, Some(number))
+                    );
+                }
+                "signature_target" => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_target_and_mapper(signature, Some(signature), None,)
+                    );
+                }
+                _ => unreachable!("each cache change is listed above"),
+            }
+            if matches!(changed, "parameter_annotation" | "paired_parameter_type") {
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(string),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+            }
+            assert_source_class_display_without_writes(
+                &mut context,
+                callable,
+                declaration,
+                Err(TypeDisplayUnavailable::MalformedType(callable)),
+            );
+        }
+    }
+
+    #[test]
+    fn selected_class_method_display_preserves_cold_member_queries() {
+        let parsed =
+            parse_source_file("declare class Model { selected(): number; pending: string; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(148_302);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let symbol = bound.symbol(declaration).unwrap();
+        let owner = context.store().symbol(symbol).unwrap().parent().unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let mut session = crate::semantic::instantiate::InstantiationSession::new(
+            crate::semantic::instantiate::InstantiationLimits::default(),
+        );
+        let mut diagnostics = crate::semantic::CanonicalCheckerDiagnostics::default();
+        let callable = crate::semantic::classes::ClassValueQuery {
+            store: context.store_mut_for_test(),
+            host: &host,
+            global_types: &globals,
+            options,
+            session: &mut session,
+            diagnostics: &mut diagnostics,
+        }
+        .member_type(symbol)
+        .unwrap();
+        assert!(diagnostics.is_empty());
+        assert!(
+            context
+                .store()
+                .declared_type_links(owner)
+                .is_none_or(|links| links.declared_type.is_none())
+        );
+        assert_source_class_display_without_writes(
+            &mut context,
+            callable,
+            declaration,
+            Ok("() => number"),
+        );
+
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(symbol)
+                .unwrap()
+                .resolved_type,
+            Some(callable),
+        );
+        assert_source_class_display_without_writes(
+            &mut context,
+            callable,
+            declaration,
+            Ok("() => number"),
         );
     }
 
