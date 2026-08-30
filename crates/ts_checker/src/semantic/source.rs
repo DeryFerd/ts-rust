@@ -52,6 +52,8 @@
 //! binder-authenticated `CommonJS` exports, function or arrow expandos, and
 //! authenticated class or JavaScript function-alias prototype members,
 //! including writes through previously declared JavaScript function expandos.
+//! Own source-class fields accept direct top-level writes. Later direct reads
+//! use the source file's checked assignments without changing declared field types.
 //! Option-gated unused-local, unused-parameter, and unused-import diagnostics
 //! run after complete source value and reference publication.
 //! The complete source tree and complete supported-statement plan are validated
@@ -279,15 +281,16 @@ use super::{
         prepare_source_overload_publication, publish_source_overload_batch,
     },
     source_properties::{
-        CheckedClassPropertyWriteTarget, ClassAccessContext, SourceClassPropertyWritePlan,
-        SourcePropertyDiagnostic, SourcePropertyError, SourcePropertyPlan,
-        SourcePropertyQueryError, SourcePropertyUnsupported, attach_class_access_context,
-        check_class_property_write_target, check_class_receiver,
+        CheckedClassPropertyWriteTarget, ClassAccessContext, OwnClassPropertyWritePlan,
+        SourceClassPropertyWritePlan, SourcePropertyDiagnostic, SourcePropertyError,
+        SourcePropertyPlan, SourcePropertyQueryError, SourcePropertyUnsupported,
+        attach_class_access_context, check_class_property_write_target, check_class_receiver,
         check_direct_source_property_with_class_context_and_session,
         check_direct_source_property_with_session, check_direct_source_property_with_source,
+        check_own_class_property_flow_read, check_own_class_property_write_target,
         finish_direct_source_property_plan, plan_class_access_context, plan_class_property_write,
         plan_direct_source_property_call_syntax, plan_direct_source_property_syntax,
-        prepare_source_property_diagnostic,
+        plan_own_class_property_write, prepare_source_property_diagnostic,
     },
     source_statements::{
         SourceCapturedBlockLoopSyntax, SourceCapturedIterationBodySyntax,
@@ -968,6 +971,7 @@ struct PreparedSourceTypeImportValueUse {
 struct SourceTypeImportExecution<'a> {
     value_uses: HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
     annotation_capabilities: &'a HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+    property_flow: super::source_flow::OwnClassPropertyFlow,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1914,6 +1918,13 @@ struct PlannedAssignment {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedOwnClassPropertyAssignment {
+    target: OwnClassPropertyWritePlan,
+    receiver: PlannedExpression,
+    right: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
 struct PlannedEvolvingArrayAssignment {
     expression: NodeRef,
     element: SourceElementPlan,
@@ -2240,6 +2251,7 @@ enum PlannedStatement {
     ArrayVariable(Box<PlannedArrayVariable>),
     ObjectVariable(Box<PlannedObjectVariable>),
     Assignment(PlannedAssignment),
+    OwnClassPropertyAssignment(Box<PlannedOwnClassPropertyAssignment>),
     EvolvingArrayAssignment(Box<PlannedEvolvingArrayAssignment>),
     CommonJsAssignment(PlannedCommonJsAssignment),
     JavaScriptRequireAlias(PlannedJavaScriptRequireAlias),
@@ -4615,6 +4627,31 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 right,
                             },
                         ));
+                        continue;
+                    }
+                    if let Some(assignment) = super::assignment::plan_own_class_property_assignment(
+                        self.arena, self.bound, store, host, statement,
+                    )
+                    .map_err(Self::assignment_plan_error)?
+                    {
+                        let target = plan_own_class_property_write(store, host, &assignment)
+                            .map_err(|error| Self::property_plan_error(assignment.left, error))?;
+                        let receiver = self.plan_expression(assignment.receiver)?;
+                        if !matches!(&receiver.kind, PlannedExpressionKind::Identifier(read)
+                            if read.value_symbol == assignment.receiver_symbol)
+                        {
+                            return Err(SourceCheckError::Property(assignment.left));
+                        }
+                        self.primitive_binary_position_roots
+                            .insert(assignment.right);
+                        let right = self.plan_expression(assignment.right)?;
+                        statements.push(PlannedStatement::OwnClassPropertyAssignment(Box::new(
+                            PlannedOwnClassPropertyAssignment {
+                                target,
+                                receiver,
+                                right,
+                            },
+                        )));
                         continue;
                     }
                     let assignment = if self.assignable_ambient_variables.is_empty()
@@ -31784,22 +31821,35 @@ fn check_expression_type_with_capture_context(
                 class_flow.as_deref_mut(),
                 arrow_capture,
             )?;
-            let checked = check_direct_source_property_with_source(
+            let checked = if let Some(checked) = check_own_class_property_flow_read(
                 store,
                 host,
-                global_types,
                 options,
                 property,
                 receiver.result,
-                session,
-                diagnostics,
+                &type_import_execution.property_flow,
             )
-            .map_err(|error| match error {
-                SourcePropertyQueryError::Property(error) => {
-                    SourcePlanner::property_plan_error(expression.node, error)
-                }
-                SourcePropertyQueryError::Source(error) => error,
-            })?;
+            .map_err(|error| SourcePlanner::property_plan_error(expression.node, error))?
+            {
+                checked
+            } else {
+                check_direct_source_property_with_source(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    property,
+                    receiver.result,
+                    session,
+                    diagnostics,
+                )
+                .map_err(|error| match error {
+                    SourcePropertyQueryError::Property(error) => {
+                        SourcePlanner::property_plan_error(expression.node, error)
+                    }
+                    SourcePropertyQueryError::Source(error) => error,
+                })?
+            };
             for diagnostic in checked.diagnostics {
                 publish_or_defer_class_property_diagnostic(
                     store,
@@ -31848,6 +31898,15 @@ fn check_expression_type_with_capture_context(
                 class_flow.as_deref_mut(),
                 arrow_capture,
             )?;
+            if type_import_execution
+                .property_flow
+                .has_unproved_element_read(store, host, options, element)
+                .map_err(|error| class_body_flow_error(element.node, error))?
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Element(element.node),
+                ));
+            }
             let mut demanded = HashSet::new();
             let checked = loop {
                 match check_direct_source_element_with_source::<SourceElementReadError>(
@@ -45202,6 +45261,116 @@ fn check_planned_return_branch(
         None,
     )?;
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Validate the original binding plan before its flow boundary.
+fn own_class_property_binding_is_unproved(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    options: CanonicalCheckerOptions,
+    flow: &super::source_flow::OwnClassPropertyFlow,
+    variable: &PlannedObjectVariable,
+) -> Result<bool, SourceCheckError> {
+    let Some(receiver) = flow
+        .matching_receiver_symbol(store, host, variable.initializer.node)
+        .map_err(|error| class_body_flow_error(variable.pattern, error))?
+    else {
+        return Ok(false);
+    };
+    let invalid =
+        || SourceCheckError::Variable(VariableInvariant::InvalidBindingPattern(variable.pattern));
+    let mut affected = Vec::new();
+    for element in &variable.elements {
+        let binding = &element.binding;
+        let name = if let Some(parent) = binding.parent_properties.first() {
+            Some(parent.property_name.as_str())
+        } else if binding.rest {
+            continue;
+        } else if let Some(key) = binding.computed_key {
+            match &host.node(key).ok_or_else(invalid)?.data {
+                NodeData::StringLiteral(literal) => Some(literal.text.as_str()),
+                NodeData::NoSubstitutionTemplateLiteral(literal) => Some(literal.text.as_str()),
+                _ => None,
+            }
+        } else {
+            Some(binding.property_name.as_str())
+        };
+        if flow
+            .has_checked_reference(store, host, options, receiver, name)
+            .map_err(|error| class_body_flow_error(variable.pattern, error))?
+        {
+            affected.push(binding);
+        }
+    }
+    if affected.is_empty() {
+        return Ok(false);
+    }
+    let (arena, bound) = host.source(variable.pattern).ok_or_else(invalid)?;
+    let declaration = host
+        .node(variable.pattern)
+        .and_then(|node| node.parent)
+        .map(|node| NodeRef::new(variable.pattern.arena, variable.pattern.file, node))
+        .ok_or_else(invalid)?;
+    let record = host.node(declaration).ok_or_else(invalid)?;
+    let NodeData::VariableDeclaration(source) = &record.data else {
+        return Err(invalid());
+    };
+    if source.name != variable.pattern.node
+        || source
+            .initializer
+            .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            != Some(variable.initializer.node)
+        || source
+            .type_
+            .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            != variable.type_node
+    {
+        return Err(invalid());
+    }
+    let list = record.parent.ok_or_else(invalid)?;
+    let statement = arena
+        .get(list)
+        .and_then(|record| record.parent)
+        .ok_or_else(invalid)?;
+    let exported =
+        ts_binder::canonical_has_syntactic_modifier(arena, statement, SyntaxKind::ExportKeyword);
+    let replay = plan_top_level_object_binding_elements(
+        arena,
+        bound,
+        store,
+        declaration,
+        variable.binding,
+        exported,
+    )
+    .map_err(|_| invalid())?;
+    if replay.len() != variable.elements.len()
+        || replay
+            .iter()
+            .zip(&variable.elements)
+            .any(|(actual, planned)| actual != &planned.binding)
+    {
+        return Err(invalid());
+    }
+    if store
+        .type_node_links(variable.pattern)
+        .is_some_and(|links| links != &TypeNodeLinks::default())
+    {
+        return Err(invalid());
+    }
+    for binding in affected {
+        if store
+            .value_symbol_links(binding.symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+            || [binding.element, binding.name].iter().any(|&node| {
+                store
+                    .type_node_links(node)
+                    .is_some_and(|links| links != &TypeNodeLinks::default())
+            })
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(true)
 }
 
 fn current_flow_type_after_assignment(
@@ -60540,6 +60709,7 @@ pub(super) fn check_source_file(
     let mut type_import_execution = SourceTypeImportExecution {
         value_uses: HashMap::new(),
         annotation_capabilities: &type_import_capabilities,
+        property_flow: super::source_flow::OwnClassPropertyFlow::default(),
     };
     for read in &type_import_value_uses {
         if type_import_execution.value_uses.contains_key(&read.node) {
@@ -64753,6 +64923,33 @@ pub(super) fn check_source_file(
                     .transpose()?;
                 let initializer_flow_types =
                     circular_flow_types.as_ref().unwrap_or(&current_flow_types);
+                if own_class_property_binding_is_unproved(
+                    store,
+                    host,
+                    options,
+                    &type_import_execution.property_flow,
+                    &variable,
+                )? {
+                    check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        initializer_flow_types,
+                        &type_import_execution,
+                        &variable.initializer,
+                        None,
+                        &mut deferred,
+                    )?;
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Variable(VariableUnsupported::BindingPattern(
+                            variable.pattern,
+                        )),
+                    ));
+                }
                 let initializer = if let Some(type_node) = variable.type_node {
                     check_planned_assignment(
                         store,
@@ -65306,6 +65503,75 @@ pub(super) fn check_source_file(
                         VariableInvariant::DuplicateCurrentFlowType(variable.element.symbol),
                     ));
                 }
+            }
+            PlannedStatement::OwnClassPropertyAssignment(write) => {
+                let assignment = write.target.assignment();
+                let receiver = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &type_import_execution,
+                    &write.receiver,
+                    None,
+                    &mut deferred,
+                )?;
+                let target = check_own_class_property_write_target(
+                    store,
+                    host,
+                    options,
+                    &write.target,
+                    receiver.result,
+                )
+                .map_err(|error| SourcePlanner::property_plan_error(assignment.left, error))?;
+                if let Some(diagnostic) = target.diagnostic {
+                    merge_retry_diagnostic(diagnostics, diagnostic);
+                }
+                let checked = check_assignment_to_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &type_import_execution,
+                    &mut deferred,
+                    target.type_,
+                    None,
+                    &write.right,
+                    assignment.left,
+                    Some(assignment.expression),
+                )?;
+                let flow_type = current_flow_type_after_assignment(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    CheckedAssignment {
+                        declared_type: target.declared_type,
+                        assigned_type: checked.assigned_type,
+                    },
+                )?;
+                type_import_execution
+                    .property_flow
+                    .complete_assignment(
+                        store,
+                        host,
+                        options,
+                        &write.target,
+                        receiver.result,
+                        checked.assigned_type,
+                        flow_type,
+                    )
+                    .map_err(|error| class_body_flow_error(assignment.left, error))?;
             }
             PlannedStatement::Assignment(assignment) => {
                 let staged_declared_type = *top_level_declared_types
@@ -69601,6 +69867,7 @@ mod tests {
         let imports = SourceTypeImportExecution {
             value_uses: HashMap::new(),
             annotation_capabilities: &capabilities,
+            property_flow: super::source_flow::OwnClassPropertyFlow::default(),
         };
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
         let mut check = |context: &mut CanonicalCheckerContext<'_>,
@@ -116733,6 +117000,7 @@ class Foo2 {
             &SourceTypeImportExecution {
                 value_uses: HashMap::new(),
                 annotation_capabilities: &capabilities,
+                property_flow: super::source_flow::OwnClassPropertyFlow::default(),
             },
             &mut Vec::new(),
             &mut execution,
