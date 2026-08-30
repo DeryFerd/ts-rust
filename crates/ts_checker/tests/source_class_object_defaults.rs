@@ -103,7 +103,7 @@ fn reference_arguments(
             .unwrap()
             .declared_type
     );
-    reference.resolved_type_arguments.as_ref().unwrap().to_vec()
+    reference.resolved_type_arguments.as_ref().unwrap().clone()
 }
 
 #[test]

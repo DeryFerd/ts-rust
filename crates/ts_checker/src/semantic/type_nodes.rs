@@ -22949,7 +22949,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
         let (earlier_parameter, expected) = match &default_record.data {
             NodeData::KeywordTypeNode(_)
-                if default_record.kind == SyntaxKind::AnyKeyword || ordinary_interface =>
+                if default_record.kind == SyntaxKind::AnyKeyword
+                    || ordinary_interface
+                    || default_record.kind == SyntaxKind::ObjectKeyword
+                        && self
+                            .store
+                            .symbol(symbol)
+                            .is_some_and(|owner| owner.flags() == SymbolFlags::CLASS) =>
             {
                 let bootstrap =
                     self.store

@@ -512,7 +512,11 @@ fn unsupported_parameter_fields_leave_static_initialized_and_inherited_queries_c
             let NodeData::HeritageClause(data) = &parsed.arena.get(clause).unwrap().data else {
                 panic!("expected the extends clause")
             };
-            ClassUnsupported::Heritage(NodeRef::new(class.arena, class.file, data.types.nodes[0]))
+            let base = parsed.arena.get(data.types.nodes[0]).unwrap();
+            let NodeData::ExpressionWithTypeArguments(base) = &base.data else {
+                panic!("expected the base type reference")
+            };
+            ClassUnsupported::Heritage(NodeRef::new(class.arena, class.file, base.expression))
         },
     );
 }
