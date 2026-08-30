@@ -110,6 +110,7 @@ struct SourceNodeFacts {
     default_function_name: Option<NodeId>,
     prefix_unary_operator: Option<SyntaxKind>,
     type_operator: Option<SyntaxKind>,
+    type_parameter_annotations: Option<Box<TypeParameterAnnotationFacts>>,
     mapped_type: Option<Box<MappedTypeSyntaxFacts>>,
     plain_interface_heritage: Option<Box<PlainInterfaceHeritageFacts>>,
     exported: bool,
@@ -140,6 +141,19 @@ struct MappedTypeSyntaxFacts {
     name_type: Option<NodeId>,
     template: Option<NodeId>,
     modifiers: Option<MappedTypeModifiers>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TypeParameterAnnotationFacts {
+    constraint: Option<NodeId>,
+    default_type: Option<NodeId>,
+}
+
+/// Written operands stay separate from missing or changed type caches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceTypeParameterAnnotations {
+    pub constraint: Option<NodeRef>,
+    pub default_type: Option<NodeRef>,
 }
 
 /// Exact operand roles retained from one registered mapped declaration.
@@ -8387,6 +8401,44 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_node_fact(node)?.type_operator
     }
 
+    /// Reads the actual constraint and default roles from registered source syntax.
+    pub(super) fn source_type_parameter_annotations(
+        &self,
+        parameter: NodeRef,
+    ) -> Option<SourceTypeParameterAnnotations> {
+        let facts = self.source_node_fact(parameter)?;
+        if facts.kind != SyntaxKind::TypeParameter {
+            return None;
+        }
+        let syntax = facts.type_parameter_annotations.as_deref()?;
+        let reference = |node| NodeRef::new(parameter.arena, parameter.file, node);
+        let annotations = SourceTypeParameterAnnotations {
+            constraint: syntax.constraint.map(reference),
+            default_type: syntax.default_type.map(reference),
+        };
+        let children = self.source_direct_children(parameter)?;
+        if annotations.constraint.is_some() && annotations.constraint == annotations.default_type {
+            return None;
+        }
+        annotations
+            .constraint
+            .into_iter()
+            .chain(annotations.default_type)
+            .all(|annotation| {
+                annotation != parameter
+                    && children.contains(&annotation)
+                    && self.source_node_parent(annotation)
+                        == Some(SourceNodeParent::Parent(parameter))
+                    && self.source_node_kind(annotation).is_some_and(|kind| {
+                        kind.is_keyword_type()
+                            || (SyntaxKind::FIRST_TYPE_NODE as u16
+                                ..=SyntaxKind::LAST_TYPE_NODE as u16)
+                                .contains(&(kind as u16))
+                    })
+            })
+            .then_some(annotations)
+    }
+
     /// Returns exact source roles, not mutable heritage or type-query caches.
     pub(super) fn source_plain_interface_heritage(
         &self,
@@ -8777,6 +8829,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 },
                 type_operator: match &node.data {
                     NodeData::TypeOperatorNode(operator) => Some(operator.operator),
+                    _ => None,
+                },
+                type_parameter_annotations: match &node.data {
+                    NodeData::TypeParameterDeclaration(parameter) => {
+                        Some(Box::new(TypeParameterAnnotationFacts {
+                            constraint: parameter.constraint,
+                            default_type: parameter.default_type,
+                        }))
+                    }
                     _ => None,
                 },
                 mapped_type: match &node.data {
@@ -16964,6 +17025,140 @@ mod tests {
             ],
         );
         assert_eq!(format!("{store:?}"), before);
+    }
+
+    #[test]
+    fn source_type_parameter_annotations_keep_written_roles_and_missing_facts_distinct() {
+        let parsed = parse_source_file(concat!(
+            "interface Methods { absent<T>(): T; ",
+            "constrained<T extends string>(): T; ",
+            "defaulted<T = string>(): T; ",
+            "both<T extends string = string>(): T; }",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(63);
+        let parameters = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::TypeParameterDeclaration(parameter) = &record.data else {
+                    return None;
+                };
+                let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+                Some((
+                    reference(node),
+                    SourceTypeParameterAnnotations {
+                        constraint: parameter.constraint.map(reference),
+                        default_type: parameter.default_type.map(reference),
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(parameters.len(), 4);
+        let mut store = TestStore::new();
+        assert!(store.register_ast_scope(AstScope::new(file, &parsed.arena)));
+        for (parameter, _) in &parameters {
+            assert_eq!(store.source_type_parameter_annotations(*parameter), None);
+        }
+        store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let before = format!("{store:?}");
+        for _ in 0..2 {
+            for (parameter, expected) in &parameters {
+                assert_eq!(
+                    store.source_type_parameter_annotations(*parameter),
+                    Some(*expected)
+                );
+                assert_eq!(
+                    store.source_type_parameter_annotations(NodeRef::new(
+                        parameter.arena,
+                        FileId::new(64),
+                        parameter.node,
+                    )),
+                    None
+                );
+            }
+            assert_eq!(format!("{store:?}"), before);
+        }
+        assert_eq!(parameters[0].1.constraint, None);
+        assert_eq!(parameters[0].1.default_type, None);
+        assert!(parameters[1].1.constraint.is_some());
+        assert_eq!(parameters[1].1.default_type, None);
+        assert_eq!(parameters[2].1.constraint, None);
+        assert!(parameters[2].1.default_type.is_some());
+        assert_ne!(parameters[3].1.constraint, parameters[3].1.default_type);
+    }
+
+    #[test]
+    fn source_type_parameter_annotations_reject_changed_roles_and_broken_child_edges() {
+        let mut parsed = parse_source_file("interface Methods { run<T extends string>(): T; }");
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(65);
+        let parameter = node_ref_of_kind(&parsed.arena, file, SyntaxKind::TypeParameter);
+        let original = parsed.arena.get(parameter.node).unwrap().clone();
+        let mut store = TestStore::new();
+        let source = store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let annotations = store.source_type_parameter_annotations(parameter).unwrap();
+        let constraint = annotations.constraint.unwrap();
+        let before = format!("{store:?}");
+        let NodeData::TypeParameterDeclaration(data) =
+            &mut parsed.arena.get_mut(parameter.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        data.default_type = data.constraint.take();
+        assert_eq!(
+            store.register_source_file(&parsed.arena, parsed.source_file, file),
+            None
+        );
+        assert_eq!(
+            store.source_type_parameter_annotations(parameter),
+            Some(annotations)
+        );
+        assert_eq!(format!("{store:?}"), before);
+        *parsed.arena.get_mut(parameter.node).unwrap() = original;
+        assert_eq!(
+            store.register_source_file(&parsed.arena, parsed.source_file, file),
+            Some(source)
+        );
+
+        let parent = store.source_node_facts[&parameter.arena][constraint.node.index()]
+            .as_ref()
+            .unwrap()
+            .parent;
+        store.source_node_facts.get_mut(&parameter.arena).unwrap()[constraint.node.index()]
+            .as_mut()
+            .unwrap()
+            .parent = Some(source.node_ref().node);
+        let damaged = format!("{store:?}");
+        for _ in 0..2 {
+            assert_eq!(store.source_type_parameter_annotations(parameter), None);
+            assert_eq!(format!("{store:?}"), damaged);
+        }
+        store.source_node_facts.get_mut(&parameter.arena).unwrap()[constraint.node.index()]
+            .as_mut()
+            .unwrap()
+            .parent = parent;
+        let children = store.source_node_children[&parameter.arena][parameter.node.index()].clone();
+        store
+            .source_node_children
+            .get_mut(&parameter.arena)
+            .unwrap()[parameter.node.index()] = Box::new([]);
+        assert_eq!(store.source_type_parameter_annotations(parameter), None);
+        store
+            .source_node_children
+            .get_mut(&parameter.arena)
+            .unwrap()[parameter.node.index()] = children;
+        for _ in 0..2 {
+            assert_eq!(
+                store.source_type_parameter_annotations(parameter),
+                Some(annotations)
+            );
+            assert_eq!(format!("{store:?}"), before);
+        }
     }
 
     #[test]

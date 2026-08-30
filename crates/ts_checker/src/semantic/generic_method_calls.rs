@@ -20,7 +20,7 @@ use super::{
         GenericCallArgumentRelation, GenericCallVectorApplicability, GenericCallVectorCandidate,
         GenericCallVectorError, GenericCallVectorRequest, GenericCallVectorResolution,
         check_generic_call_candidate_with_session, finish_generic_call_candidate_with_session,
-        validate_generic_call_vector_request,
+        generic_method_type_argument_bounds, validate_generic_call_vector_request,
     },
     instantiate::InstantiationSession,
     relation::RelationKind,
@@ -129,11 +129,16 @@ impl CheckedMethodCandidate {
     }
 }
 
-/// The callable provider has already authenticated each default cache.
+/// Methods use source absence. Source overloads keep their validated sentinel caches.
 fn type_argument_bounds(
     store: &CanonicalTypeMapperStore,
     callable: &ValidatedSingleCallable,
+    family: CallableFamily,
 ) -> Result<(usize, usize), GenericMethodCallError> {
+    if family != CallableFamily::SourceFunctionOverloads {
+        return generic_method_type_argument_bounds(store, callable)
+            .map_err(GenericMethodCallError::from);
+    }
     let signature = store
         .signature(callable.signature)
         .ok_or(GenericMethodCallError::Invalid(callable.owner))?;
@@ -339,7 +344,7 @@ pub(super) fn resolve_generic_method_call(
         return Ok(None);
     }
     validate_generic_call_vector_request(store, request)?;
-    let projection = match validate_stored_callable_set_with_array_targets(
+    let (family, projection) = match validate_stored_callable_set_with_array_targets(
         store,
         request.callee,
         Some(CanonicalArrayTargets::from_global_types(globals)),
@@ -350,7 +355,7 @@ pub(super) fn resolve_generic_method_call(
             && !projection.call_signatures.is_empty()
             && (declared_methods || family == CallableFamily::SourceFunctionOverloads) =>
         {
-            projection
+            (family, projection)
         }
         StoredCallableSetValidation::Malformed { .. } => {
             return Err(GenericMethodCallError::Invalid(request.callee));
@@ -361,7 +366,7 @@ pub(super) fn resolve_generic_method_call(
         reorder_direct_call_candidates(store, request.callee, &projection.call_signatures)?;
     let bounds = ordered
         .iter()
-        .map(|candidate| type_argument_bounds(store, candidate))
+        .map(|candidate| type_argument_bounds(store, candidate, family))
         .collect::<Result<Vec<_>, _>>()?;
     let passes = [
         GenericCallArgumentRelation::Subtype {
@@ -439,7 +444,7 @@ pub(super) fn resolve_generic_method_call(
         let mut eligible = Vec::new();
         for candidate in &projection.call_signatures {
             if has_type_argument_arity(
-                type_argument_bounds(store, candidate)?,
+                type_argument_bounds(store, candidate, family)?,
                 request.explicit_type_arguments,
             ) {
                 eligible.push(candidate);
