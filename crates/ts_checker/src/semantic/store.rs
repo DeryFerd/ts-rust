@@ -3948,10 +3948,44 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .any(|group| group.sources.contains(&source))
     }
 
+    /// Separates canonical declaration merges from computed or instantiated methods.
+    pub(super) fn source_merged_method_has_exact_declarations(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> bool {
+        let Some(method) = self.symbol(symbol) else {
+            return false;
+        };
+        let Some(declarations) = method.declarations() else {
+            return false;
+        };
+        method.flags().contains(SymbolFlags::TRANSIENT)
+            && method
+                .flags()
+                .without(SymbolFlags::TRANSIENT | SymbolFlags::OPTIONAL)
+                == SymbolFlags::METHOD
+            && method.check_flags() == CheckFlags::NONE
+            && !method.name().is_reserved_member_name()
+            && !method.name().is_private_identifier()
+            && !method.name().is_late_bound()
+            && self.get_merged_symbol(symbol) == Some(symbol)
+            && !self.source_symbol_declarations.contains_key(&symbol)
+            && self.source_merged_symbol_declarations_match(symbol)
+            && method.value_declaration() == declarations.first().copied()
+            && self
+                .get_parent_of_symbol(symbol)
+                .and_then(|owner| self.symbol(owner))
+                .is_some_and(|owner| owner.flags() & SymbolFlags::TYPE == SymbolFlags::INTERFACE)
+            && declarations.iter().all(|declaration| {
+                self.source_node_kind(*declaration) == Some(SyntaxKind::MethodSignature)
+            })
+    }
+
     /// Checks the method's optional flag against each source declaration.
     pub(super) fn declared_method_optional_flag(&self, symbol: SemanticSymbolId) -> Option<bool> {
         let method = self.symbol(symbol)?;
-        let sources = if method.flags().contains(SymbolFlags::TRANSIENT)
+        let merged = self.source_merged_method_has_exact_declarations(symbol);
+        let sources = if method.flags().contains(SymbolFlags::TRANSIENT) && !merged
             || method.check_flags().contains(CheckFlags::LATE)
             || method.name().is_late_bound()
         {
@@ -3968,7 +4002,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         for source in sources {
             let source_method = self.symbol(source)?;
             let original = source_method.declarations()?;
-            if source_method.flags() != flags
+            if source_method.flags()
+                != flags
+                    | if merged {
+                        SymbolFlags::TRANSIENT
+                    } else {
+                        SymbolFlags::NONE
+                    }
                 || source_method.value_declaration() != original.first().copied()
                 || source_method.check_flags() != CheckFlags::NONE
             {
@@ -4065,8 +4105,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let interface = self.symbol(owner)?;
         let owner_declarations = interface.declarations()?;
         let interface_type = self.declared_type_links(owner)?.declared_type?;
+        let merged = self.source_merged_method_has_exact_declarations(symbol);
         let late = method.check_flags().contains(CheckFlags::LATE)
-            || method.flags().contains(SymbolFlags::TRANSIENT)
+            || method.flags().contains(SymbolFlags::TRANSIENT) && !merged
             || method.name().is_late_bound();
         let valid_late = !late || self.late_bound_method_has_exact_sources(symbol, owner);
         let members = if late {
@@ -4110,7 +4151,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || method.flags().without(
                 SymbolFlags::METHOD
                     | SymbolFlags::OPTIONAL
-                    | if late {
+                    | if late || merged {
                         SymbolFlags::TRANSIENT
                     } else {
                         SymbolFlags::NONE
@@ -16460,6 +16501,97 @@ mod tests {
             );
         }
         assert_eq!(format!("{store:?}"), before);
+    }
+
+    #[test]
+    fn merged_method_sources_reject_missing_declarations_and_forged_transient_flags() {
+        let first = parse_source_file(
+            "interface Reader { read(value: string): number; stable(): boolean; }",
+        );
+        let second = parse_source_file("interface Reader { read(value: number): string; }");
+        let files = [(FileId::new(64), &first), (FileId::new(65), &second)];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in files {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/reader-{}.d.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let declarations = files.map(|(file, parsed)| {
+            node_ref_of_kind(&parsed.arena, file, SyntaxKind::MethodSignature)
+        });
+        let raw = declarations.map(|node| binder.file(node.file).unwrap().symbol(node).unwrap());
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .into_iter()
+                .map(|(file, parsed)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let merged = store.get_merged_symbol(raw[0]).unwrap();
+        assert_ne!(raw[0], merged);
+        assert_ne!(raw[1], merged);
+        assert_eq!(store.get_merged_symbol(raw[1]), Some(merged));
+        assert_eq!(
+            store.symbol(merged).unwrap().declarations(),
+            Some(&declarations[..])
+        );
+        let owner = store.get_parent_of_symbol(merged).unwrap();
+        let stable = store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get_source("stable"))
+            .unwrap();
+        let before = format!("{store:?}");
+        for _ in 0..2 {
+            assert!(store.source_merged_method_has_exact_declarations(merged));
+            assert_eq!(store.declared_method_optional_flag(merged), Some(false));
+            assert!(!store.source_merged_method_has_exact_declarations(stable));
+            assert_eq!(store.declared_method_optional_flag(stable), Some(false));
+            assert_eq!(format!("{store:?}"), before);
+        }
+
+        assert!(store.set_symbol_declarations(
+            merged,
+            Some(vec![declarations[0]]),
+            Some(declarations[0]),
+        ));
+        assert!(!store.source_merged_method_has_exact_declarations(merged));
+        assert_eq!(store.declared_method_optional_flag(merged), None);
+        assert!(store.set_symbol_declarations(
+            merged,
+            Some(declarations.to_vec()),
+            Some(declarations[0]),
+        ));
+        assert!(store.source_merged_method_has_exact_declarations(merged));
+        assert_eq!(store.declared_method_optional_flag(merged), Some(false));
+
+        assert!(store.set_symbol_flags(
+            stable,
+            SymbolFlags::METHOD | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE,
+        ));
+        assert!(!store.source_merged_method_has_exact_declarations(stable));
+        assert_eq!(store.declared_method_optional_flag(stable), None);
+        assert!(store.set_symbol_flags(stable, SymbolFlags::METHOD, CheckFlags::NONE));
+        assert_eq!(store.declared_method_optional_flag(stable), Some(false));
     }
 
     #[test]

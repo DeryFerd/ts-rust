@@ -15,8 +15,9 @@
 //! Other admitted construct signatures support optional `any` parameters.
 //! Interface call signatures may also retain one authenticated
 //! generic identifier predicate with its optional source type parameter.
-//! Named interface and type-literal methods retain their own binder symbols,
-//! authenticated method type parameters, annotated required or optional
+//! Named interface and type-literal methods retain their source declarations.
+//! Interface overloads from separate files share their canonical merged symbol.
+//! Signatures keep authenticated method type parameters, annotated required or optional
 //! parameters, and authenticated array, tuple, tuple-union, or inferred rest
 //! parameters. Strict optional methods keep a canonical union value separate
 //! from their callable object. Flat array rest bindings retain their anonymous
@@ -2707,7 +2708,7 @@ pub(super) struct PlannedInterfaceMethodTypeParameter {
 
 /// One named method on an interface or type literal.
 ///
-/// Ordinary overloads share a binder symbol. Computed overloads keep separate
+/// Ordinary overloads share a canonical symbol. Computed overloads keep separate
 /// source symbols until their common member name is resolved.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PlannedInterfaceMethod {
@@ -3705,7 +3706,12 @@ fn validate_declared_call_set_member_edges(
                 .position(|&owner| owner == property_owner)?,
             declaration.node.index(),
         );
-        let method = record.flags().without(SymbolFlags::OPTIONAL) == SymbolFlags::METHOD;
+        let method = record
+            .flags()
+            .without(SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT)
+            == SymbolFlags::METHOD
+            && (!record.flags().contains(SymbolFlags::TRANSIENT)
+                || store.source_merged_method_has_exact_declarations(*property));
         let accessor = record.flags().intersects(SymbolFlags::ACCESSOR);
         let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::ACCESSOR;
         if !seen_properties.insert(*property)
@@ -12194,12 +12200,18 @@ pub(super) fn plan_interface_method(
         .ok_or_else(unsupported)?;
     let method_symbol = store.symbol(symbol).ok_or_else(unsupported)?;
     let declarations = method_symbol.declarations().ok_or_else(unsupported)?;
-    if symbol != raw_symbol
+    let merged = store.source_merged_method_has_exact_declarations(symbol);
+    if symbol != raw_symbol && !merged
         || !host.symbol_matches(store, declaration, symbol)
         || method_symbol.flags()
             != SymbolFlags::METHOD
                 | if optional {
                     SymbolFlags::OPTIONAL
+                } else {
+                    SymbolFlags::NONE
+                }
+                | if merged {
+                    SymbolFlags::TRANSIENT
                 } else {
                     SymbolFlags::NONE
                 }
@@ -12732,6 +12744,7 @@ pub(super) fn plan_selected_interface_method(
     let selected = store.get_merged_symbol(selected).ok_or_else(invalid)?;
     let requested = store.symbol(selected).ok_or_else(invalid)?;
     let source = if requested.flags().contains(SymbolFlags::TRANSIENT)
+        && !store.source_merged_method_has_exact_declarations(selected)
         || requested.check_flags().contains(CheckFlags::LATE)
         || requested.name().is_late_bound()
     {
@@ -19675,8 +19688,9 @@ pub(super) fn declared_method_value_links(
     resolved_type: Option<TypeId>,
 ) -> Option<ValueSymbolLinks> {
     let method = store.symbol(symbol)?;
+    let merged = store.source_merged_method_has_exact_declarations(symbol);
     let late = method.check_flags().contains(CheckFlags::LATE)
-        || method.flags().contains(SymbolFlags::TRANSIENT)
+        || method.flags().contains(SymbolFlags::TRANSIENT) && !merged
         || method.name().is_late_bound();
     let name_type = if late {
         let owner = store.get_parent_of_symbol(symbol)?;
@@ -19696,7 +19710,14 @@ pub(super) fn declared_method_value_links(
         }
         links.name_type
     } else {
-        if method.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::METHOD
+        if method.flags()
+            != SymbolFlags::METHOD
+                | (method.flags() & SymbolFlags::OPTIONAL)
+                | if merged {
+                    SymbolFlags::TRANSIENT
+                } else {
+                    SymbolFlags::NONE
+                }
             || method.check_flags() != CheckFlags::NONE
         {
             return None;
@@ -21702,7 +21723,8 @@ fn valid_generic_publication_target(
         };
         let expected_flags = if method {
             SymbolFlags::METHOD
-                | if computed {
+                | if computed || store.source_merged_method_has_exact_declarations(property.symbol)
+                {
                     SymbolFlags::TRANSIENT
                 } else {
                     SymbolFlags::NONE

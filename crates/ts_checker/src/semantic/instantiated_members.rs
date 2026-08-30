@@ -7446,8 +7446,9 @@ fn declared_target_header(
             type_,
             property.flags().contains(SymbolFlags::OPTIONAL),
         );
+        let merged_method = method && store.source_merged_method_has_exact_declarations(symbol);
         let late = property.check_flags().contains(CheckFlags::LATE)
-            || property.flags().contains(SymbolFlags::TRANSIENT)
+            || property.flags().contains(SymbolFlags::TRANSIENT) && !merged_method
             || property.name().is_late_bound()
             || links.name_type.is_some();
         let valid_identity = if late {
@@ -7461,10 +7462,15 @@ fn declared_target_header(
             ) && (!method || valid_interface_method_value(store, symbol, type_).is_some())
         } else if method {
             property.flags().contains(SymbolFlags::METHOD)
-                && property
-                    .flags()
-                    .without(SymbolFlags::METHOD | SymbolFlags::OPTIONAL)
-                    == SymbolFlags::NONE
+                && property.flags().without(
+                    SymbolFlags::METHOD
+                        | SymbolFlags::OPTIONAL
+                        | if merged_method {
+                            SymbolFlags::TRANSIENT
+                        } else {
+                            SymbolFlags::NONE
+                        },
+                ) == SymbolFlags::NONE
                 && property.check_flags() == CheckFlags::NONE
                 && raw_table
                     .get(property.name())
@@ -7637,7 +7643,9 @@ fn cold_generic_interface_has_authenticated_non_property_members(
                 return false;
             }
             (SyntaxKind::PropertySignature, true)
-        } else if record.flags() == SymbolFlags::METHOD {
+        } else if record.flags() == SymbolFlags::METHOD
+            || store.source_merged_method_has_exact_declarations(symbol)
+        {
             if record.check_flags() != CheckFlags::NONE || record.name().as_utf8().is_none() {
                 return false;
             }
