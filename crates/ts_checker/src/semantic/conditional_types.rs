@@ -3677,6 +3677,7 @@ fn mapped_root_alias(
     Ok(Some((identity.symbol, type_arguments)))
 }
 
+#[allow(clippy::too_many_arguments)] // Keeps the deferred root, mapper inputs, alias, and array targets explicit.
 fn deferred_conditional(
     store: &mut CanonicalTypeMapperStore,
     root: ConditionalRootId,

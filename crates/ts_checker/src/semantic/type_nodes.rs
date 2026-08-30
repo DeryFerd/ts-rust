@@ -19322,7 +19322,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(Some((symbol, proof)))
     }
 
-    /// Limits branch demand to the source lookup and its referenced IsOptional chain.
+    /// Limits branch demand to the source lookup and its referenced `IsOptional` chain.
     fn source_mapped_conditional_owns_root(
         &mut self,
         proof: PropTypesKeyAliasPlan,

@@ -27,8 +27,7 @@ use super::{
     array_types::{CanonicalArrayReference, CanonicalArrayTargets},
     callable_sets::{
         CallableSetProjection, StoredCallableSetValidation, instantiated_method_type_matches,
-        validate_stored_callable_set, validated_instantiated_method_mapper,
-        validated_instantiated_method_parameter_types,
+        validated_instantiated_method_mapper, validated_instantiated_method_parameter_types,
     },
     callables::{
         CallableFamily, ValidatedSingleCallParameterDisplay, ValidatedSingleCallSignatureDisplay,
@@ -6930,7 +6929,7 @@ fn instantiate_generic_method_signature_worker(
             mapper,
             array_targets,
             session,
-            source.as_deref_mut(),
+            source,
         )?;
         (parameters, return_type)
     };
@@ -9401,10 +9400,10 @@ fn publish_cold_members(
         || !store.try_reserve_mappers(usize::from(needs_mapper))
         || !store.try_reserve_declared_call_set_provenance(
             usize::from(shape.reference != shape.target && !call_signatures.is_empty()),
-            if shape.reference != shape.target {
-                call_signatures.len()
-            } else {
+            if shape.reference == shape.target {
                 0
+            } else {
+                call_signatures.len()
             },
         )
     {
@@ -9569,6 +9568,7 @@ mod tests {
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
         LateBoundLinks, MembersAndExportsLinks, ResolvedSignatureState, SignatureLinks,
         SymbolNodeLinks, TypeNodeLinks, bootstrap::UnionReduction,
+        callable_sets::validate_stored_callable_set,
         object_aliases::property_object_alias_projection, signatures::ElementFlags,
         tuple_types::CanonicalTupleTypeRequest,
     };

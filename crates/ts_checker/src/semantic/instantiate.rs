@@ -2864,15 +2864,15 @@ fn cached_signature_conditional_type(
     let mapping = InstantiationMapping::Stored(mapper);
     let mut arguments = Vec::with_capacity(projection.arguments().len());
     for (parameter, argument) in projection.parameters().iter().zip(projection.arguments()) {
-        let mapped = if parameter == argument {
+        let resolved = if parameter == argument {
             cached_apply_mapping(store, *parameter, mapping, array_targets)?
         } else {
             cached_instantiated_type_worker(store, *argument, mapping, array_targets, None, active)?
         };
-        let Some(mapped) = mapped else {
+        let Some(resolved) = resolved else {
             return Ok(None);
         };
-        arguments.push(mapped);
+        arguments.push(resolved);
     }
     cached_signature_conditional_result(store, &projection, &arguments, array_targets)
         .map_err(|error| conditional_remap_error(template, error))

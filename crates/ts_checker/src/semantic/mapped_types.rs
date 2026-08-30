@@ -4893,12 +4893,12 @@ fn source_conditional_mapped_demand_with_array_targets(
     let invalid = || MappedTypeError::InvalidMappedType(type_);
     let origin = source_mapped_lookup_origin(store, type_)?
         .ok_or(MappedTypeError::UnsupportedTemplate(type_))?;
-    let Some(TypeData::Mapped(mapped)) = store.type_payload(type_).map(TypeRecord::data) else {
+    let Some(TypeData::Mapped(payload)) = store.type_payload(type_).map(TypeRecord::data) else {
         return Err(invalid());
     };
-    let argument = mapped.modifiers_type.ok_or_else(invalid)?;
-    let parameter = mapped.type_parameter.ok_or_else(invalid)?;
-    let mapper = mapped
+    let argument = payload.modifiers_type.ok_or_else(invalid)?;
+    let parameter = payload.type_parameter.ok_or_else(invalid)?;
+    let mapper = payload
         .object
         .mapper
         .ok_or(MappedTypeError::UnsupportedTemplate(origin.template))?;
@@ -9896,7 +9896,7 @@ mod tests {
             )
             .unwrap()
             .get_type_of_mapped_property(mapped, EscapedName::source("value").as_ref())
-            .map(|property| property.map(|property| property.type_())),
+            .map(|property| property.map(super::ResolvedMappedProperty::type_id)),
             Ok(Some(result)),
         );
 
@@ -9922,7 +9922,7 @@ mod tests {
                 )
                 .unwrap()
                 .get_type_of_mapped_property(mapped, EscapedName::source("value").as_ref())
-                .map(|property| property.map(|property| property.type_())),
+                .map(|property| property.map(super::ResolvedMappedProperty::type_id)),
                 Err(DeclaredTypeError::TypeNodeUnavailable(
                     TypeNodeUnavailable::UnsupportedSyntax {
                         node: demand.origin.declaration,

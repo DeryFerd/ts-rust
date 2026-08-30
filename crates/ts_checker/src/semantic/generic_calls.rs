@@ -2411,30 +2411,23 @@ fn validate_generic_call_type_parameter(
         symbol_record.flags() == SymbolFlags::TYPE_PARAMETER
             && symbol_record.check_flags() == CheckFlags::NONE
     });
-    let source_parameter = match instantiated_method {
-        Some(method) => {
-            let source = store
-                .signature(method.source)
-                .and_then(|signature| signature.type_parameters().get(earlier.len()))
-                .copied()
-                .ok_or(GenericCallVectorInvariant::InvalidTypeParameter(
-                    type_parameter,
-                ))?;
-            if data.target != Some(source) || data.mapper != Some(method.mapper) {
-                return Err(
-                    GenericCallVectorInvariant::InvalidTypeParameter(type_parameter).into(),
-                );
-            }
-            source
+    let source_parameter = if let Some(method) = instantiated_method {
+        let source = store
+            .signature(method.source)
+            .and_then(|signature| signature.type_parameters().get(earlier.len()))
+            .copied()
+            .ok_or(GenericCallVectorInvariant::InvalidTypeParameter(
+                type_parameter,
+            ))?;
+        if data.target != Some(source) || data.mapper != Some(method.mapper) {
+            return Err(GenericCallVectorInvariant::InvalidTypeParameter(type_parameter).into());
         }
-        None => {
-            if data.target.is_some() || data.mapper.is_some() {
-                return Err(
-                    GenericCallVectorInvariant::InvalidTypeParameter(type_parameter).into(),
-                );
-            }
-            type_parameter
+        source
+    } else {
+        if data.target.is_some() || data.mapper.is_some() {
+            return Err(GenericCallVectorInvariant::InvalidTypeParameter(type_parameter).into());
         }
+        type_parameter
     };
     if record.flags() != TypeFlags::TYPE_PARAMETER
         || (record.object_flags() != ObjectFlags::NONE && record.object_flags() != computed)

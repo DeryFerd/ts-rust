@@ -24,7 +24,7 @@ use super::{
     },
     instantiate::InstantiationSession,
     relation::RelationKind,
-    type_records::TypeData,
+    type_records::{TypeData, TypeRecord},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,7 +144,7 @@ fn type_argument_bounds(
     let mut minimum = 0;
     for (index, parameter) in signature.type_parameters().iter().enumerate() {
         let Some(TypeData::TypeParameter(parameter)) =
-            store.type_payload(*parameter).map(|record| record.data())
+            store.type_payload(*parameter).map(TypeRecord::data)
         else {
             return Err(GenericMethodCallError::Invalid(callable.owner));
         };
@@ -464,9 +464,8 @@ pub(super) fn resolve_generic_method_call(
                 .iter()
                 .filter_map(|&(minimum, _)| (minimum > actual).then_some(minimum))
                 .min();
-            let expected = match (below, above) {
-                (Some(expected), None) | (None, Some(expected)) => expected,
-                _ => return Err(GenericMethodCallError::Unsupported(request.callee)),
+            let ((Some(expected), None) | (None, Some(expected))) = (below, above) else {
+                return Err(GenericMethodCallError::Unsupported(request.callee));
             };
             GenericMethodCallDiagnostic::TypeArgumentArity { expected, actual }
         } else {

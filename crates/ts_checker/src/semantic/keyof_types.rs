@@ -881,7 +881,7 @@ fn resolve_composite_keyof_type(
                     .never_type),
                 [only] => Ok(*only),
                 _ => {
-                    let mut prepared = prepare_keyof_types(store, &[], 1, session.as_deref_mut())?;
+                    let mut prepared = prepare_keyof_types(store, &[], 1, session)?;
                     store
                         .literal_union_type_prepared(&keys, None, &mut prepared)
                         .map_err(Into::into)
