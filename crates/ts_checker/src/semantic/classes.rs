@@ -14,7 +14,7 @@
 //! additionally admits one direct local base whose own completed graph is in
 //! the same supported family; plain generic classes can forward their exact
 //! declaration-owned parameters through direct generic heritage. Parameters
-//! admit authenticated `{}` constraints and `any` or earlier-parameter defaults.
+//! admit authenticated `{}` constraints and `any`, `object`, or earlier-parameter defaults.
 //! Empty methods retain their canonical callable identities, including one
 //! authenticated `...args: any[]` rest parameter. Ambient classes also admit
 //! bodyless methods with direct primitive parameter and return annotations,
@@ -14104,12 +14104,14 @@ fn validate_plain_class_type_parameter_default(
     }
 
     let expected = match &record.data {
-        NodeData::KeywordTypeNode(_) if record.kind == SyntaxKind::AnyKeyword => Some(
-            store
-                .intrinsic_bootstrap()
-                .map(|bootstrap| bootstrap.any_type)
-                .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(default)))?,
-        ),
+        NodeData::KeywordTypeNode(_)
+            if matches!(
+                record.kind,
+                SyntaxKind::AnyKeyword | SyntaxKind::ObjectKeyword
+            ) =>
+        {
+            Some(primitive_keyword_type(store, default, record.kind)?)
+        }
         NodeData::TypeReferenceNode(reference)
             if record.kind == SyntaxKind::TypeReference && reference.type_arguments.is_none() =>
         {
