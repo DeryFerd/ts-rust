@@ -13,6 +13,7 @@
 //! query allocates its augmented property-cache table before synthesizing a
 //! property, including same-symbol and all-missing queries. Warm hits are
 //! proved from the selected name only and allocate nothing.
+//! Symbol display shares the read-only plan assembly and exact cache proof.
 
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{
@@ -21,7 +22,7 @@ use ts_binder::{
 };
 
 use super::{
-    CanonicalTypeMapperStore, RelationUnavailable, TypeId,
+    CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     links::ValueSymbolLinks,
     object_members::{
@@ -424,15 +425,66 @@ fn plan_union_property(
         .try_reserve_exact(constituents.len())
         .map_err(|_| UnionPropertyError::Capacity(union))?;
     for constituent in constituents {
+        // Preserve the provider's full proof, including absent-name queries
+        // on raw objects whose members are authenticated transient symbols.
         let resolved = store.resolved_own_property(constituent, source_name)?;
-        let resolved = resolved
-            .map(|property| {
-                validate_source_property(store, constituent, mode, property, name.as_ref())
-            })
-            .transpose()?;
-        properties.push(resolved);
+        properties.push(
+            resolved
+                .map(|property| {
+                    validate_source_property(store, constituent, mode, property, name.as_ref())
+                })
+                .transpose()?,
+        );
     }
+    finish_union_property_plan(
+        store,
+        union,
+        name,
+        cache,
+        cache_without_function_property_augment,
+        properties,
+    )
+}
 
+/// Rebuilds a display proof without calling the mutable member resolver.
+fn plan_cached_union_property(
+    store: &CanonicalTypeMapperStore,
+    union: TypeId,
+    name: &str,
+) -> Result<UnionPropertyPlan, UnionPropertyError> {
+    let (constituents, cache, cache_without_function_property_augment, mode) =
+        validate_union_shell(store, union)?;
+    let name = EscapedName::source(name);
+    let mut properties = Vec::new();
+    properties
+        .try_reserve_exact(constituents.len())
+        .map_err(|_| UnionPropertyError::Capacity(union))?;
+    for constituent in constituents {
+        properties.push(read_union_source_property(
+            store,
+            constituent,
+            mode,
+            name.as_ref(),
+        )?);
+    }
+    finish_union_property_plan(
+        store,
+        union,
+        name,
+        cache,
+        cache_without_function_property_augment,
+        properties,
+    )
+}
+
+fn finish_union_property_plan(
+    store: &CanonicalTypeMapperStore,
+    union: TypeId,
+    name: EscapedName,
+    cache: Option<SymbolTableId>,
+    cache_without_function_property_augment: Option<SymbolTableId>,
+    properties: Vec<Option<SourceProperty>>,
+) -> Result<UnionPropertyPlan, UnionPropertyError> {
     let mut found = Vec::new();
     found
         .try_reserve_exact(2)
@@ -468,6 +520,185 @@ fn plan_union_property(
         cache_without_function_property_augment,
         outcome,
     })
+}
+
+/// Reads only the resolved property objects admitted by `validate_union_shell`.
+fn read_union_source_property(
+    store: &CanonicalTypeMapperStore,
+    constituent: TypeId,
+    mode: UnionMemberMode,
+    name: ts_binder::EscapedNameRef<'_>,
+) -> Result<Option<SourceProperty>, UnionPropertyError> {
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(constituent);
+    let structured = store
+        .type_payload(constituent)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(invalid)?;
+    let properties = structured.properties.as_deref().unwrap_or_default();
+    let Some(members) = structured.members else {
+        return if properties.is_empty() {
+            Ok(None)
+        } else {
+            Err(invalid().into())
+        };
+    };
+    let members = store.symbol_table(members).ok_or_else(invalid)?;
+    if members.len() != properties.len() {
+        return Err(invalid().into());
+    }
+    let synthetic_structural = mode == UnionMemberMode::Raw
+        && properties.iter().any(|property| {
+            store
+                .symbol(*property)
+                .is_some_and(|record| record.flags().contains(SymbolFlags::TRANSIENT))
+        });
+    for (index, property) in properties.iter().enumerate() {
+        let record = if synthetic_structural {
+            super::relater::validated_synthetic_structural_property(store, constituent, *property)?
+        } else {
+            store
+                .symbol(*property)
+                .ok_or(RelationUnavailable::Symbol(*property))?
+        };
+        if !synthetic_structural
+            && (!record.flags().contains(SymbolFlags::PROPERTY)
+                || record
+                    .flags()
+                    .without(SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+                    != SymbolFlags::NONE
+                || record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
+                || record.name().is_reserved_member_name()
+                || record.name().is_private_identifier()
+                || record.name().is_late_bound()
+                || mode == UnionMemberMode::Raw
+                    && record
+                        .declarations()
+                        .is_some_and(|declarations| !declarations.is_empty()))
+        {
+            return Err(RelationUnavailable::UnsupportedProperty(*property).into());
+        }
+        if properties[..index].contains(property)
+            || members.get(record.name()) != Some(*property)
+            || mode == UnionMemberMode::Raw && record.parent().is_some()
+        {
+            return Err(invalid().into());
+        }
+    }
+    let Some(symbol) = members.get(name) else {
+        return Ok(None);
+    };
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
+    let type_ = store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type)
+        .ok_or(RelationUnavailable::UnresolvedPropertyType(symbol))?;
+    validate_source_property(
+        store,
+        constituent,
+        mode,
+        ResolvedOwnProperty {
+            symbol,
+            type_,
+            optional: record.flags().contains(SymbolFlags::OPTIONAL),
+            readonly: record.check_flags().contains(CheckFlags::READONLY),
+        },
+        name,
+    )
+    .map(Some)
+}
+
+/// Proves a published union property without resolving members or writing caches.
+/// The result is used only to match a source parent's member table.
+pub(super) fn published_union_property_source(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Option<SemanticSymbolId>, UnionPropertyError> {
+    let record = store
+        .symbol(symbol)
+        .ok_or(UnionPropertyError::InvalidProperty(symbol))?;
+    let containing = store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.containing_type);
+    let containing_data = containing.and_then(|type_| store.type_payload(type_));
+    // Intersections use the same check flag. Leave their own cached properties
+    // to the existing display path, but reject a redirected containing type.
+    if record
+        .check_flags()
+        .contains(CheckFlags::SYNTHETIC_PROPERTY)
+        && let Some(TypeData::Intersection(data)) = containing_data.map(|record| record.data())
+    {
+        return if data
+            .intersection
+            .property_cache
+            .and_then(|cache| store.symbol_table(cache))
+            .and_then(|cache| cache.get(record.name()))
+            == Some(symbol)
+            && data
+                .intersection
+                .resolved_properties
+                .as_ref()
+                .is_some_and(|properties| properties.contains(&symbol))
+        {
+            Ok(None)
+        } else {
+            Err(UnionPropertyError::InvalidProperty(symbol))
+        };
+    }
+    if !containing_data.is_some_and(|record| matches!(record.data(), TypeData::Union(_)))
+        && !record
+            .check_flags()
+            .contains(CheckFlags::SYNTHETIC_PROPERTY)
+    {
+        return Ok(None);
+    }
+    let invalid = || UnionPropertyError::InvalidProperty(symbol);
+    let union = containing.ok_or_else(invalid)?;
+    let name = record.name().as_utf8().ok_or_else(invalid)?;
+    let plan = plan_cached_union_property(store, union, name)?;
+    let PropertyOutcome::Synthetic(synthetic) = &plan.outcome else {
+        return Err(invalid());
+    };
+    if store.object_literal_property_clone_origin(symbol).is_some()
+        || plan
+            .cache
+            .and_then(|cache| store.symbol_table(cache))
+            .and_then(|cache| cache.get(record.name()))
+            != Some(symbol)
+    {
+        return Err(invalid());
+    }
+    validate_cached_property(store, &plan, symbol)?;
+    for source in &synthetic.sources {
+        let Some(declaration) = source.declaration else {
+            continue;
+        };
+        let node = host.node(declaration).ok_or_else(invalid)?;
+        let owner = source.parent.ok_or_else(invalid)?;
+        let Some([owner_declaration]) =
+            store.symbol(owner).and_then(|record| record.declarations())
+        else {
+            return Err(invalid());
+        };
+        if !host.symbol_matches(store, declaration, source.symbol)
+            || !host.symbol_matches(store, *owner_declaration, owner)
+            || store.source_node_kind(declaration) != Some(node.kind)
+            || host.node(*owner_declaration).is_none_or(|owner_node| {
+                store.source_node_kind(*owner_declaration) != Some(owner_node.kind)
+            })
+            || node
+                .parent
+                .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+                != Some(*owner_declaration)
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(Some(if synthetic.parent.is_some() {
+        synthetic.sources[0].symbol
+    } else {
+        symbol
+    }))
 }
 
 fn validate_union_shell(
@@ -1655,6 +1886,51 @@ mod tests {
 
         assert_eq!(store.resolved_union_property(union, "value"), Ok(None));
         assert_eq!(state(&store), cold);
+    }
+
+    #[test]
+    fn raw_transient_members_preserve_absent_name_cache_publication_and_replay() {
+        let mut store = initialized(IntrinsicBootstrapOptions::default());
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let objects = ["left", "right"].map(|name| {
+            let property = store.alloc_transient_symbol(
+                SymbolFlags::PROPERTY,
+                EscapedName::source(name),
+                CheckFlags::NONE,
+            );
+            assert!(store.set_value_symbol_links(
+                property,
+                ValueSymbolLinks {
+                    resolved_type: Some(number),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            alloc_object(&mut store, &[property])
+        });
+        let union = alloc_union(&mut store, objects[0], objects[1]);
+        assert!(union_data(&store, union).union.property_cache.is_none());
+        let before = state(&store);
+
+        assert_eq!(store.resolved_union_property(union, "absent"), Ok(None));
+        let cache = union_data(&store, union)
+            .union
+            .property_cache
+            .expect("an absent-name query publishes its empty cache");
+        assert!(store.symbol_table(cache).unwrap().is_empty());
+        assert_eq!(cached_property(&store, union, "absent"), None);
+        let cold = state(&store);
+        assert_eq!(cold.types, before.types);
+        assert_eq!(cold.checker_symbols, before.checker_symbols);
+        assert_eq!(cold.tables, before.tables + 1);
+        assert_eq!(cold.links, before.links);
+        let published = union_data(&store, union).clone();
+
+        for _ in 0..2 {
+            assert_eq!(store.resolved_union_property(union, "absent"), Ok(None));
+            assert_eq!(union_data(&store, union), &published);
+            assert!(store.symbol_table(cache).unwrap().is_empty());
+            assert_eq!(state(&store), cold);
+        }
     }
 
     #[test]

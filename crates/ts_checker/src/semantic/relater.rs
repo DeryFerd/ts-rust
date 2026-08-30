@@ -736,6 +736,76 @@ pub(super) struct ResolvedOwnProperty {
     pub(super) readonly: bool,
 }
 
+/// Shares the raw synthetic member proof with read-only union display.
+pub(super) fn validated_synthetic_structural_property(
+    store: &super::CanonicalTypeMapperStore,
+    receiver: TypeId,
+    symbol: SemanticSymbolId,
+) -> Result<&ts_binder::semantic::Symbol, RelationUnavailable> {
+    let record = store
+        .symbol(symbol)
+        .ok_or(RelationUnavailable::Symbol(symbol))?;
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
+    let owner = store.type_payload(receiver).ok_or_else(invalid)?;
+    let TypeData::Object(object) = owner.data() else {
+        return Err(invalid());
+    };
+    let members = object.structured.members.ok_or_else(invalid)?;
+    let table = store.symbol_table(members).ok_or_else(invalid)?;
+    let properties = object
+        .structured
+        .properties
+        .as_deref()
+        .ok_or_else(invalid)?;
+    let links = store.value_symbol_links(symbol).ok_or_else(invalid)?;
+    let property_type = links.resolved_type.ok_or_else(invalid)?;
+    let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT;
+    if owner.flags() == TypeFlags::OBJECT
+        && owner.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        && owner.symbol().is_none()
+        && owner.alias().is_none()
+        && object.target.is_none()
+        && object.mapper.is_none()
+        && object.instantiations == TypeCacheState::Unallocated
+        && object.structured.constrained == ConstrainedTypeData::default()
+        && object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_none()
+        && object.structured.signatures.is_none()
+        && object.structured.call_signature_count == 0
+        && object.structured.index_infos.is_none()
+        && !properties.is_empty()
+        && properties.contains(&symbol)
+        && table.get(record.name()) == Some(symbol)
+        && record
+            .flags()
+            .contains(SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
+        && record.flags().without(allowed_flags) == SymbolFlags::NONE
+        && record.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
+        && !record.name().is_reserved_member_name()
+        && !record.name().is_private_identifier()
+        && !record.name().is_late_bound()
+        && record.declarations().is_none()
+        && record.value_declaration().is_none()
+        && record.parent().is_none()
+        && record.members().is_none()
+        && record.exports().is_none()
+        && record.export_symbol().is_none()
+        && store.get_merged_symbol(symbol) == Some(symbol)
+        && store.type_payload(property_type).is_some()
+        && links
+            == &(ValueSymbolLinks {
+                resolved_type: Some(property_type),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        Ok(record)
+    } else {
+        Err(invalid())
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ObjectPropertyOrigin {
     Declared,
@@ -6233,67 +6303,7 @@ impl<'store> RelaterSession<'store> {
                 };
             }
             ObjectPropertyOrigin::SyntheticStructural(receiver) => {
-                let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
-                let owner = self.store.type_payload(receiver).ok_or_else(invalid)?;
-                let TypeData::Object(object) = owner.data() else {
-                    return Err(invalid());
-                };
-                let members = object.structured.members.ok_or_else(invalid)?;
-                let table = self.store.symbol_table(members).ok_or_else(invalid)?;
-                let properties = object
-                    .structured
-                    .properties
-                    .as_deref()
-                    .ok_or_else(invalid)?;
-                let links = self.store.value_symbol_links(symbol).ok_or_else(invalid)?;
-                let property_type = links.resolved_type.ok_or_else(invalid)?;
-                let allowed_flags =
-                    SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT;
-                return if owner.flags() == TypeFlags::OBJECT
-                    && owner.object_flags()
-                        == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
-                    && owner.symbol().is_none()
-                    && owner.alias().is_none()
-                    && object.target.is_none()
-                    && object.mapper.is_none()
-                    && object.instantiations == TypeCacheState::Unallocated
-                    && object.structured.constrained == ConstrainedTypeData::default()
-                    && object
-                        .structured
-                        .object_type_without_abstract_construct_signatures
-                        .is_none()
-                    && object.structured.signatures.is_none()
-                    && object.structured.call_signature_count == 0
-                    && object.structured.index_infos.is_none()
-                    && !properties.is_empty()
-                    && properties.contains(&symbol)
-                    && table.get(record.name()) == Some(symbol)
-                    && record
-                        .flags()
-                        .contains(SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
-                    && record.flags().without(allowed_flags) == SymbolFlags::NONE
-                    && record.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
-                    && !record.name().is_reserved_member_name()
-                    && !record.name().is_private_identifier()
-                    && !record.name().is_late_bound()
-                    && record.declarations().is_none()
-                    && record.value_declaration().is_none()
-                    && record.parent().is_none()
-                    && record.members().is_none()
-                    && record.exports().is_none()
-                    && record.export_symbol().is_none()
-                    && self.store.get_merged_symbol(symbol) == Some(symbol)
-                    && self.store.type_payload(property_type).is_some()
-                    && links
-                        == &(ValueSymbolLinks {
-                            resolved_type: Some(property_type),
-                            ..ValueSymbolLinks::default()
-                        })
-                {
-                    Ok(record)
-                } else {
-                    Err(invalid())
-                };
+                return validated_synthetic_structural_property(self.store, receiver, symbol);
             }
             ObjectPropertyOrigin::GenericReference(reference)
                 if record.flags().contains(SymbolFlags::TRANSIENT) =>
