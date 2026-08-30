@@ -21599,10 +21599,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         let (linear_body, body) = match body {
             PlannedFunctionBody::Empty => (None, PlannedArrowBody::Empty),
-            PlannedFunctionBody::Return { expression, .. } => (
+            PlannedFunctionBody::Return {
+                statement,
+                expression,
+            } => (
                 None,
                 PlannedArrowBody::Return {
-                    diagnostic_node: expression.node,
+                    diagnostic_node: statement,
                     expression,
                 },
             ),
@@ -32799,6 +32802,16 @@ fn check_expression_type_with_capture_context(
                 record.kind == SyntaxKind::FunctionExpression
                     && matches!(record.data, NodeData::FunctionExpression(_))
             });
+            let object_literal_method = arrow.callable.family
+                == SourceCallableFamily::ObjectLiteralMethod
+                && host.node(expression.node).is_some_and(|record| {
+                    record.kind == SyntaxKind::MethodDeclaration
+                        && matches!(record.data, NodeData::MethodDeclaration(_))
+                })
+                && store.source_object_literal_method_owner_is_exact(
+                    expression.node,
+                    arrow.callable.owner_symbol,
+                );
             let immediately_invoked =
                 actual_arrow && source_closure_is_immediately_invoked(host, expression.node);
             let captured_flow_types = if actual_arrow && !immediately_invoked {
@@ -32825,7 +32838,7 @@ fn check_expression_type_with_capture_context(
                 arrow,
                 contextual_type,
                 class_flow.as_deref_mut(),
-                if actual_arrow || ordinary_function_expression {
+                if actual_arrow || ordinary_function_expression || object_literal_method {
                     arrow_capture
                 } else {
                     None
@@ -35233,6 +35246,13 @@ fn check_planned_arrow_argument(
     {
         return Err(SourceCheckError::Arrow(expression));
     }
+    let object_literal_method = arrow.callable.family == SourceCallableFamily::ObjectLiteralMethod
+        && host.node(expression).is_some_and(|record| {
+            record.kind == SyntaxKind::MethodDeclaration
+                && matches!(record.data, NodeData::MethodDeclaration(_))
+        })
+        && store
+            .source_object_literal_method_owner_is_exact(expression, arrow.callable.owner_symbol);
     if matches!(arrow.body, PlannedArrowBody::ForOf(_))
         && (arrow.callable.is_async
             || arrow.expression_statement.is_some()
@@ -35264,11 +35284,7 @@ fn check_planned_arrow_argument(
                         NodeData::FunctionExpression(_),
                         SyntaxKind::FunctionExpression
                     )
-            ) || arrow.callable.family == SourceCallableFamily::ObjectLiteralMethod
-                && store.source_object_literal_method_owner_is_exact(
-                    expression,
-                    arrow.callable.owner_symbol,
-                ))
+            ) || object_literal_method)
         })
     {
         return Err(SourceCheckError::Arrow(expression));
@@ -35295,14 +35311,15 @@ fn check_planned_arrow_argument(
     let named_function_expression = host.node(expression).is_some_and(|record| {
         matches!(&record.data, NodeData::FunctionExpression(function) if function.name.is_some())
     });
-    let closure_flow_types =
-        if function_expression && !source_closure_is_immediately_invoked(host, expression) {
-            outer_capture
-                .map(|capture| capture.flow_types(store, host, expression, current_flow_types))
-                .transpose()?
-        } else {
-            None
-        };
+    let closure_flow_types = if (function_expression || object_literal_method)
+        && !source_closure_is_immediately_invoked(host, expression)
+    {
+        outer_capture
+            .map(|capture| capture.flow_types(store, host, expression, current_flow_types))
+            .transpose()?
+    } else {
+        None
+    };
     let current_flow_types = closure_flow_types.as_ref().unwrap_or(current_flow_types);
     if function_expression
         && !named_function_expression
@@ -35553,9 +35570,8 @@ fn check_planned_arrow_argument(
     });
     let current_flow_types = named_entry_types.as_ref().unwrap_or(current_flow_types);
     let mut captured_entry_types = source_arrow_parameter_entry_types(store, &arrow.callable)?;
-    let arrow_capture = host
-        .node(expression)
-        .is_some_and(|record| {
+    let arrow_capture = (object_literal_method
+        || host.node(expression).is_some_and(|record| {
             matches!(
                 (&record.data, record.kind),
                 (NodeData::ArrowFunction(_), SyntaxKind::ArrowFunction)
@@ -35564,24 +35580,24 @@ fn check_planned_arrow_argument(
                         SyntaxKind::FunctionExpression
                     )
             )
-        })
-        .then_some(SourceArrowCaptureContext {
-            declared_types: &captured_entry_types,
-            mutable_symbols: None,
-            outer: outer_capture.as_ref(),
-            flow: arrow
+        }))
+    .then_some(SourceArrowCaptureContext {
+        declared_types: &captured_entry_types,
+        mutable_symbols: None,
+        outer: outer_capture.as_ref(),
+        flow: arrow
+            .linear_body
+            .as_ref()
+            .map(|statements| &statements.flow),
+        assignments: match &arrow.body {
+            PlannedArrowBody::ForOf(iteration) => &iteration.capture_assignments,
+            _ => arrow
                 .linear_body
                 .as_ref()
-                .map(|statements| &statements.flow),
-            assignments: match &arrow.body {
-                PlannedArrowBody::ForOf(iteration) => &iteration.capture_assignments,
-                _ => arrow
-                    .linear_body
-                    .as_ref()
-                    .map_or(&[], |statements| statements.capture_assignments.as_slice()),
-            },
-            value_exports: &[],
-        });
+                .map_or(&[], |statements| statements.capture_assignments.as_slice()),
+        },
+        value_exports: &[],
+    });
     let flow_types = check_callable_parameter_initializers_with_capture_context(
         store,
         host,
@@ -35639,9 +35655,8 @@ fn check_planned_arrow_argument(
     } else {
         flow_types
     };
-    let arrow_capture = host
-        .node(expression)
-        .is_some_and(|record| {
+    let arrow_capture = (object_literal_method
+        || host.node(expression).is_some_and(|record| {
             matches!(
                 (&record.data, record.kind),
                 (NodeData::ArrowFunction(_), SyntaxKind::ArrowFunction)
@@ -35650,24 +35665,24 @@ fn check_planned_arrow_argument(
                         SyntaxKind::FunctionExpression
                     )
             )
-        })
-        .then_some(SourceArrowCaptureContext {
-            declared_types: &captured_entry_types,
-            mutable_symbols: None,
-            outer: outer_capture.as_ref(),
-            flow: arrow
+        }))
+    .then_some(SourceArrowCaptureContext {
+        declared_types: &captured_entry_types,
+        mutable_symbols: None,
+        outer: outer_capture.as_ref(),
+        flow: arrow
+            .linear_body
+            .as_ref()
+            .map(|statements| &statements.flow),
+        assignments: match &arrow.body {
+            PlannedArrowBody::ForOf(iteration) => &iteration.capture_assignments,
+            _ => arrow
                 .linear_body
                 .as_ref()
-                .map(|statements| &statements.flow),
-            assignments: match &arrow.body {
-                PlannedArrowBody::ForOf(iteration) => &iteration.capture_assignments,
-                _ => arrow
-                    .linear_body
-                    .as_ref()
-                    .map_or(&[], |statements| statements.capture_assignments.as_slice()),
-            },
-            value_exports: &[],
-        });
+                .map_or(&[], |statements| statements.capture_assignments.as_slice()),
+        },
+        value_exports: &[],
+    });
     if let PlannedArrowBody::ForOf(iteration) = &arrow.body {
         check_planned_lexical_iteration_with_capture_context(
             store,

@@ -28526,6 +28526,23 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             | SyntaxKind::FunctionExpression => {
                 return self.get_return_type_of_source_callable_signature(signature, declaration);
             }
+            SyntaxKind::MethodDeclaration
+                if self
+                    .store
+                    .source_callable_type_for_signature(signature)
+                    .and_then(|type_| self.store.source_callable_provenance(type_))
+                    .is_some_and(|provenance| {
+                        provenance.family == SourceCallableFamily::ObjectLiteralMethod
+                            && provenance.signature == signature
+                            && provenance.declaration == declaration
+                            && self.store.source_object_literal_method_owner_is_exact(
+                                declaration,
+                                provenance.owner_symbol,
+                            )
+                    }) =>
+            {
+                return self.get_return_type_of_source_callable_signature(signature, declaration);
+            }
             SyntaxKind::GetAccessor => {
                 return self
                     .get_return_type_of_object_literal_getter_signature(signature, declaration);
@@ -29175,10 +29192,22 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let record = self.store.signature(signature).ok_or_else(&invalid)?;
             // The host plan already proved the direct-call or property anchor.
             // Recheck its full capture value before using the published return.
+            let contextual_kind_is_exact = match (
+                callable.family,
+                self.host.node(declaration).map(|node| node.kind),
+            ) {
+                (SourceCallableFamily::ArrowFunction, Some(SyntaxKind::ArrowFunction)) => true,
+                (
+                    SourceCallableFamily::ObjectLiteralMethod,
+                    Some(SyntaxKind::MethodDeclaration),
+                ) => self.store.source_object_literal_method_owner_is_exact(
+                    declaration,
+                    callable.owner_symbol,
+                ),
+                _ => false,
+            };
             if retained.is_some()
-                || callable.family != SourceCallableFamily::ArrowFunction
-                || self.host.node(declaration).map(|node| node.kind)
-                    != Some(SyntaxKind::ArrowFunction)
+                || !contextual_kind_is_exact
                 || callable.family != provenance.family
                 || callable.declaration != provenance.declaration
                 || callable.owner_symbol != provenance.owner_symbol

@@ -381,7 +381,7 @@ fn object_method_defaults_bodies_and_calls_keep_exact_diagnostics() {
             ),
             (
                 2322,
-                "'bad'",
+                "return 'bad';",
                 "Type 'string' is not assignable to type 'number'.",
             ),
             (
