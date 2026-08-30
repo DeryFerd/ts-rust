@@ -4795,7 +4795,7 @@ fn display_interface_name(
         validate_merged_interface_display_owner(store, host, type_id, symbol_id)?;
     }
     if resolved {
-        if !interface_display_property_annotations_match(store, symbol_id) {
+        if !interface_display_property_annotations_match(store, host, type_id, symbol_id) {
             return Err(TypeDisplayUnavailable::MalformedType(type_id));
         }
         if validate_resolved_named_interface(store, host, type_id, symbol_id, interface).is_err()
@@ -5305,9 +5305,11 @@ fn validate_resolved_named_interface(
 
 fn interface_display_property_annotations_match(
     store: &CanonicalTypeMapperStore,
-    owner: SemanticSymbolId,
+    host: Option<&DeclaredTypeHost<'_>>,
+    interface: TypeId,
+    owner_id: SemanticSymbolId,
 ) -> bool {
-    let Some(owner) = store.symbol(owner) else {
+    let Some(owner) = store.symbol(owner_id) else {
         return false;
     };
     let Some(members) = owner.members() else {
@@ -5344,12 +5346,70 @@ fn interface_display_property_annotations_match(
         else {
             return false;
         };
-        store
-            .source_direct_type_annotation(declaration)
-            .is_some_and(|annotation| {
-                interface_property_annotation_matches(store, annotation, type_)
+        if let Some(annotation) = store.source_direct_type_annotation(declaration) {
+            interface_property_annotation_matches(store, annotation, type_)
+        } else {
+            host.is_some_and(|host| {
+                implicit_interface_property_display_matches(
+                    store,
+                    host,
+                    interface,
+                    owner_id,
+                    property,
+                    declaration,
+                    type_,
+                )
             })
+        }
     })
+}
+
+/// Unannotated interface properties retain their source name as the type marker.
+fn implicit_interface_property_display_matches(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    interface: TypeId,
+    owner: SemanticSymbolId,
+    property: SemanticSymbolId,
+    declaration: NodeRef,
+    property_type: TypeId,
+) -> bool {
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    if property_type != bootstrap.any_type
+        || !matches!(
+            store.type_payload(property_type).map(TypeRecord::data),
+            Some(TypeData::Intrinsic(_))
+        )
+        || store.validate_union_constituent(property_type).is_err()
+    {
+        return false;
+    }
+    let Ok(plan) = object_members::plan_interface(store, host, owner) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(plan.node) else {
+        return false;
+    };
+    plan.symbol == owner
+        && plan.declarations == [plan.node]
+        && plan.heritage.is_none()
+        && store.source_node_kind(source) == Some(SyntaxKind::SourceFile)
+        && store.symbol(owner).is_some_and(|record| {
+            record.flags() == SymbolFlags::INTERFACE && record.declarations() == Some(&[plan.node])
+        })
+        && plan.properties.iter().any(|planned| {
+            planned.symbol == property
+                && planned.declaration == declaration
+                && planned.type_node == planned.name_node
+                && !planned.optional
+                && !planned.readonly
+        })
+        && matches!(
+            object_members::interface_state(store, &plan, interface),
+            Ok(object_members::PropertyObjectState::Resolved(resolved)) if resolved == interface
+        )
 }
 
 fn interface_property_annotation_matches(
@@ -8889,6 +8949,444 @@ mod tests {
         };
         assert!(data.base_types_resolved);
         assert!(!data.declared_members_resolved);
+    }
+
+    fn implicit_interface_display_fixture(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (
+        CanonicalCheckerContext<'_>,
+        TypeId,
+        SemanticSymbolId,
+        [SemanticSymbolId; 2],
+    ) {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = parsed_context(parsed, file, CanonicalCheckerOptions::default());
+        let owner = merged_interface_display_global(&context, "Loose");
+        let interface = context.get_declared_type_of_symbol(owner).unwrap();
+        let members = context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|table| context.store().symbol_table(table))
+            .unwrap();
+        let properties = [
+            members.get_source("value").unwrap(),
+            members.get_source("typed").unwrap(),
+        ];
+        (context, interface, owner, properties)
+    }
+
+    fn implicit_interface_display_allocations(
+        store: &CanonicalTypeMapperStore,
+    ) -> ([usize; 7], [usize; 26]) {
+        (
+            [
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.type_alias_len(),
+                store.index_info_len(),
+                store.symbol_store().symbol_table_len(),
+            ],
+            store.checker_link_allocated_lengths(),
+        )
+    }
+
+    fn assert_implicit_interface_display(
+        context: &CanonicalCheckerContext<'_>,
+        interface: TypeId,
+        expected: Result<&str, TypeDisplayUnavailable>,
+    ) {
+        let store = context.store();
+        let allocations = implicit_interface_display_allocations(store);
+        let resolution = store.type_resolution_internal_state();
+        let diagnostics = context.diagnostics().as_slice().to_vec();
+        let record = store.type_payload(interface).unwrap();
+        let header = (
+            record.flags(),
+            record.object_flags(),
+            record.symbol(),
+            record.alias(),
+        );
+        let TypeData::Interface(data) = record.data() else {
+            panic!("the source interface must retain its interface record");
+        };
+        let data = data.clone();
+        let owner = record.symbol().unwrap();
+        let declared_links = store.declared_type_links(owner).cloned();
+        let members = store.symbol(owner).unwrap().members().unwrap();
+        let property_links = store
+            .symbol_table(members)
+            .unwrap()
+            .iter()
+            .map(|(_, property)| (property, store.value_symbol_links(property).cloned()))
+            .collect::<Vec<_>>();
+        for _ in 0..3 {
+            assert_eq!(
+                context.type_to_string(interface).as_deref(),
+                expected.as_ref().copied(),
+            );
+            assert_eq!(implicit_interface_display_allocations(store), allocations);
+            assert_eq!(store.type_resolution_internal_state(), resolution);
+            assert_eq!(context.diagnostics().as_slice(), diagnostics.as_slice());
+            let record = store.type_payload(interface).unwrap();
+            assert_eq!(
+                (
+                    record.flags(),
+                    record.object_flags(),
+                    record.symbol(),
+                    record.alias(),
+                ),
+                header,
+            );
+            let TypeData::Interface(current) = record.data() else {
+                panic!("display must not replace the interface record");
+            };
+            assert_eq!(current, &data);
+            assert_eq!(store.declared_type_links(owner), declared_links.as_ref());
+            for (property, links) in &property_links {
+                assert_eq!(store.value_symbol_links(*property), links.as_ref());
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_implicit_interface_display_keeps_cold_and_warm_records() {
+        let parsed = parse_source_file("interface Loose { value; typed: (string); }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(148_280);
+        for no_implicit_any in [false, true] {
+            let mut context = parsed_context(
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    no_implicit_any,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let owner = merged_interface_display_global(&context, "Loose");
+            let interface =
+                merged_interface_display_identity(&mut context, &[(file, &parsed, false)], owner);
+            assert_eq!(
+                context
+                    .store()
+                    .type_payload(interface)
+                    .unwrap()
+                    .object_flags(),
+                ObjectFlags::INTERFACE,
+            );
+            assert_implicit_interface_display(&context, interface, Ok("Loose"));
+            assert_eq!(context.get_declared_type_of_symbol(owner), Ok(interface));
+            context.check_source_file(file).unwrap();
+            assert_eq!(context.diagnostics().len(), usize::from(no_implicit_any));
+            let members = context.store().symbol(owner).unwrap().members().unwrap();
+            let table = context.store().symbol_table(members).unwrap();
+            let implicit = table.get_source("value").unwrap();
+            let typed = table.get_source("typed").unwrap();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(implicit)
+                    .unwrap()
+                    .resolved_type,
+                Some(bootstrap.any_type),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(typed)
+                    .unwrap()
+                    .resolved_type,
+                Some(bootstrap.string_type),
+            );
+            let declaration = context
+                .store()
+                .symbol(implicit)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            let NodeData::PropertyDeclaration(property) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("the implicit property must keep its source declaration");
+            };
+            let name = NodeRef::new(parsed.arena.id(), file, property.name);
+            assert!(
+                context
+                    .store()
+                    .source_direct_type_annotation(declaration)
+                    .is_none()
+            );
+            assert!(context.store().type_node_links(name).is_none());
+            let warm = implicit_interface_display_allocations(context.store());
+            let diagnostics = context.diagnostics().as_slice().to_vec();
+            for _ in 0..3 {
+                assert_implicit_interface_display(&context, interface, Ok("Loose"));
+                assert_hostless_malformed_display_without_writes(&context, interface);
+                assert_eq!(context.get_declared_type_of_symbol(owner), Ok(interface));
+                assert_eq!(
+                    implicit_interface_display_allocations(context.store()),
+                    warm
+                );
+                assert_eq!(context.diagnostics().as_slice(), diagnostics.as_slice());
+                assert!(context.store().type_node_links(name).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_implicit_interface_display_rejects_changed_property_links() {
+        let parsed = parse_source_file("interface Loose { value; typed: (string); }");
+        let (mut context, interface, _, [implicit, _]) =
+            implicit_interface_display_fixture(&parsed, FileId::new(148_281));
+        assert_implicit_interface_display(&context, interface, Ok("Loose"));
+        let original = context
+            .store()
+            .value_symbol_links(implicit)
+            .cloned()
+            .unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let error = bootstrap.error_type;
+        let wildcard = bootstrap.wildcard_type;
+        let warm = implicit_interface_display_allocations(context.store());
+        for damaged in [
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..original.clone()
+            },
+            ValueSymbolLinks {
+                resolved_type: Some(error),
+                ..original.clone()
+            },
+            ValueSymbolLinks {
+                resolved_type: Some(wildcard),
+                ..original.clone()
+            },
+            ValueSymbolLinks {
+                write_type: Some(number),
+                ..original.clone()
+            },
+            ValueSymbolLinks {
+                target: Some(implicit),
+                ..original.clone()
+            },
+        ] {
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(implicit, damaged.clone())
+            );
+            assert_implicit_interface_display(
+                &context,
+                interface,
+                Err(TypeDisplayUnavailable::MalformedType(interface)),
+            );
+            assert_eq!(context.store().value_symbol_links(implicit), Some(&damaged));
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(implicit, original.clone())
+            );
+            assert_implicit_interface_display(&context, interface, Ok("Loose"));
+            assert_eq!(
+                implicit_interface_display_allocations(context.store()),
+                warm
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_implicit_interface_display_rejects_changed_ownership() {
+        let parsed = parse_source_file("interface Loose { value; typed: (string); }");
+        let (mut context, interface, owner, [implicit, typed]) =
+            implicit_interface_display_fixture(&parsed, FileId::new(148_282));
+        assert_implicit_interface_display(&context, interface, Ok("Loose"));
+        let table = context.store().symbol(owner).unwrap().members().unwrap();
+        let warm = implicit_interface_display_allocations(context.store());
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            implicit,
+            None,
+            None,
+            Some(typed),
+            None,
+        ));
+        assert_implicit_interface_display(
+            &context,
+            interface,
+            Err(TypeDisplayUnavailable::MalformedType(interface)),
+        );
+        assert_eq!(
+            context.store().symbol(implicit).unwrap().parent(),
+            Some(typed)
+        );
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            implicit,
+            None,
+            None,
+            Some(owner),
+            None,
+        ));
+        assert_implicit_interface_display(&context, interface, Ok("Loose"));
+        assert_eq!(
+            implicit_interface_display_allocations(context.store()),
+            warm
+        );
+
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .insert_symbol(table, EscapedName::source("value"), typed,),
+            Some(Some(implicit))
+        );
+        assert_implicit_interface_display(
+            &context,
+            interface,
+            Err(TypeDisplayUnavailable::MalformedType(interface)),
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_table(table)
+                .unwrap()
+                .get_source("value"),
+            Some(typed)
+        );
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                table,
+                EscapedName::source("value"),
+                implicit,
+            ),
+            Some(Some(typed))
+        );
+        assert_implicit_interface_display(&context, interface, Ok("Loose"));
+        assert_eq!(
+            implicit_interface_display_allocations(context.store()),
+            warm
+        );
+    }
+
+    #[test]
+    fn ordinary_implicit_interface_display_rejects_changed_resolved_state() {
+        let parsed = parse_source_file("interface Loose { value; typed: (string); }");
+        let (mut context, interface, owner, [implicit, typed]) =
+            implicit_interface_display_fixture(&parsed, FileId::new(148_283));
+        assert_implicit_interface_display(&context, interface, Ok("Loose"));
+        let table = context.store().symbol(owner).unwrap().members().unwrap();
+        let warm = implicit_interface_display_allocations(context.store());
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_interface_declared_members(interface, true, None, None, None, None,)
+        );
+        assert_implicit_interface_display(
+            &context,
+            interface,
+            Err(TypeDisplayUnavailable::MalformedType(interface)),
+        );
+        assert!(context.store_mut_for_test().set_interface_declared_members(
+            interface,
+            true,
+            Some(table),
+            None,
+            None,
+            None,
+        ));
+        assert_implicit_interface_display(&context, interface, Ok("Loose"));
+        assert_eq!(
+            implicit_interface_display_allocations(context.store()),
+            warm
+        );
+
+        assert!(context.store_mut_for_test().set_structured_type_members(
+            interface,
+            Some(table),
+            Some(vec![typed, implicit]),
+            None,
+            None,
+            None,
+        ));
+        assert_implicit_interface_display(
+            &context,
+            interface,
+            Err(TypeDisplayUnavailable::MalformedType(interface)),
+        );
+        assert!(context.store_mut_for_test().set_structured_type_members(
+            interface,
+            Some(table),
+            Some(vec![implicit, typed]),
+            None,
+            None,
+            None,
+        ));
+        assert_implicit_interface_display(&context, interface, Ok("Loose"));
+        assert_eq!(
+            implicit_interface_display_allocations(context.store()),
+            warm
+        );
+    }
+
+    #[test]
+    fn ordinary_implicit_interface_display_rejects_changed_any_and_annotated_types() {
+        let parsed = parse_source_file("interface Loose { value; typed: (string); }");
+        let (mut context, interface, owner, [_, typed]) =
+            implicit_interface_display_fixture(&parsed, FileId::new(148_284));
+        assert_implicit_interface_display(&context, interface, Ok("Loose"));
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let any = bootstrap.any_type;
+        let number = bootstrap.number_type;
+        let warm = implicit_interface_display_allocations(context.store());
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_symbol(any, Some(owner))
+        );
+        assert_implicit_interface_display(
+            &context,
+            interface,
+            Err(TypeDisplayUnavailable::MalformedType(interface)),
+        );
+        assert_eq!(
+            context.store().type_payload(any).unwrap().symbol(),
+            Some(owner)
+        );
+        assert!(context.store_mut_for_test().set_type_symbol(any, None));
+        assert_implicit_interface_display(&context, interface, Ok("Loose"));
+        assert_eq!(
+            implicit_interface_display_allocations(context.store()),
+            warm
+        );
+
+        let original = context.store().value_symbol_links(typed).cloned().unwrap();
+        let damaged = ValueSymbolLinks {
+            resolved_type: Some(number),
+            ..original.clone()
+        };
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(typed, damaged.clone())
+        );
+        assert_implicit_interface_display(
+            &context,
+            interface,
+            Err(TypeDisplayUnavailable::MalformedType(interface)),
+        );
+        assert_eq!(context.store().value_symbol_links(typed), Some(&damaged));
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(typed, original)
+        );
+        assert_implicit_interface_display(&context, interface, Ok("Loose"));
+        assert_eq!(
+            implicit_interface_display_allocations(context.store()),
+            warm
+        );
     }
 
     #[test]
