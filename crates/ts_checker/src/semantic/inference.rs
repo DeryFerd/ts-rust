@@ -51,6 +51,16 @@ pub(super) enum InferenceLiteralTreatment {
     Widen,
 }
 
+type InferenceUnion<'a> = dyn FnMut(
+        &mut CanonicalTypeMapperStore,
+        &[TypeId],
+        UnionReduction,
+    ) -> Result<TypeId, LiteralTypeCacheError>
+    + 'a;
+
+type InferenceWidening<'a> =
+    dyn FnMut(&mut CanonicalTypeMapperStore, TypeId) -> Result<TypeId, DerivedTypeError> + 'a;
+
 /// Failure while finalizing one declaration-order inference bucket.
 #[derive(Debug, PartialEq)]
 pub(super) enum NakedTypeCandidateError {
@@ -311,6 +321,8 @@ pub(super) fn infer_naked_type_parameter_candidates(
         None,
         is_strict_subtype,
         is_subtype,
+        None,
+        None,
     )
 }
 
@@ -338,6 +350,8 @@ pub(super) fn infer_naked_type_parameter_candidates_with_array_targets(
         None,
         is_strict_subtype,
         is_subtype,
+        None,
+        None,
     )
 }
 
@@ -379,10 +393,13 @@ pub(super) fn infer_naked_type_parameter_variance_candidates(
         is_assignable,
         is_strict_subtype,
         is_subtype,
+        None,
+        None,
     )
 }
 
 /// Finalizes call candidates, widening only the selected covariant result.
+/// Union construction and widening use the caller's instantiation session.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn infer_call_type_parameter_candidates(
     store: &mut CanonicalTypeMapperStore,
@@ -405,6 +422,15 @@ pub(super) fn infer_call_type_parameter_candidates(
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
+    mut union_types: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        &[TypeId],
+        UnionReduction,
+    ) -> Result<TypeId, LiteralTypeCacheError>,
+    mut widen_type: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+    ) -> Result<TypeId, DerivedTypeError>,
 ) -> Result<Option<TypeId>, NakedTypeCandidateError> {
     infer_type_parameter_variance_candidates(
         store,
@@ -416,6 +442,8 @@ pub(super) fn infer_call_type_parameter_candidates(
         is_assignable,
         is_strict_subtype,
         is_subtype,
+        Some(&mut union_types),
+        Some(&mut widen_type),
     )
 }
 
@@ -442,6 +470,8 @@ fn infer_type_parameter_variance_candidates(
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
+    union_types: Option<&mut InferenceUnion<'_>>,
+    widen_type: Option<&mut InferenceWidening<'_>>,
 ) -> Result<Option<TypeId>, NakedTypeCandidateError> {
     for candidate in covariant.iter().chain(contravariant) {
         if is_non_inferrable_inference_source(store, *candidate, array_targets)? {
@@ -465,6 +495,8 @@ fn infer_type_parameter_variance_candidates(
         global_types,
         |store, source, target| is_strict_subtype(store, source, target),
         |store, source, target| is_subtype(store, source, target),
+        union_types,
+        widen_type,
     )?;
 
     let mut contravariant_result = None;
@@ -506,6 +538,7 @@ fn infer_type_parameter_variance_candidates(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // The caller owns relations and union reduction.
 fn infer_naked_type_parameter_candidates_with_optional_array_targets(
     store: &mut CanonicalTypeMapperStore,
     candidates: &[TypeId],
@@ -522,6 +555,8 @@ fn infer_naked_type_parameter_candidates_with_optional_array_targets(
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
+    mut union_types: Option<&mut InferenceUnion<'_>>,
+    widen_type: Option<&mut InferenceWidening<'_>>,
 ) -> Result<Option<TypeId>, NakedTypeCandidateError> {
     let mut validated = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -552,18 +587,25 @@ fn infer_naked_type_parameter_candidates_with_optional_array_targets(
                 })
             });
         if !literal.is_empty() {
-            nonliteral.push(store.expression_union_type_with_global_types(
-                global_types,
+            nonliteral.push(inference_union(
+                store,
                 &literal,
+                Some(global_types),
                 UnionReduction::Subtype,
+                &mut union_types,
             )?);
         }
         validated = nonliteral;
     }
     let mut prepared = Vec::with_capacity(validated.len());
     for candidate in validated {
-        let candidate =
-            inference_candidate_literal_treatment(store, candidate, treatment, global_types)?;
+        let candidate = inference_candidate_literal_treatment(
+            store,
+            candidate,
+            treatment,
+            global_types,
+            &mut union_types,
+        )?;
         if !prepared.contains(&candidate) {
             prepared.push(candidate);
         }
@@ -584,6 +626,7 @@ fn infer_naked_type_parameter_candidates_with_optional_array_targets(
                 store,
                 *candidate,
                 global_types,
+                &mut union_types,
             )?);
         }
         primary
@@ -593,21 +636,28 @@ fn infer_naked_type_parameter_candidates_with_optional_array_targets(
     let common = if primary.len() == 1 {
         primary[0]
     } else if literal_candidates_have_same_base(store, &primary) {
-        inference_union(store, &primary, global_types)?
+        inference_union(
+            store,
+            &primary,
+            global_types,
+            UnionReduction::Literal,
+            &mut union_types,
+        )?
     } else {
         single_common_supertype(store, &primary, &mut is_strict_subtype, &mut is_subtype)?
     };
     let common = if strict_null_checks && nullable != TypeFlags::NONE {
-        add_nullable_to_candidate(store, common, nullable, global_types)?
+        add_nullable_to_candidate(store, common, nullable, global_types, &mut union_types)?
     } else {
         common
     };
-    match global_types {
-        Some(global_types) => store
+    match (global_types, widen_type) {
+        (_, Some(widen_type)) => widen_type(store, common).map(Some).map_err(Into::into),
+        (Some(global_types), None) => store
             .get_widened_type_with_global_types(common, global_types)
             .map(Some)
             .map_err(Into::into),
-        None => Ok(Some(common)),
+        (None, None) => Ok(Some(common)),
     }
 }
 
@@ -615,13 +665,16 @@ fn inference_union(
     store: &mut CanonicalTypeMapperStore,
     types: &[TypeId],
     global_types: Option<&CanonicalGlobalTypes>,
+    reduction: UnionReduction,
+    union_types: &mut Option<&mut InferenceUnion<'_>>,
 ) -> Result<TypeId, LiteralTypeCacheError> {
+    if let Some(union_types) = union_types.as_deref_mut() {
+        return union_types(store, types, reduction);
+    }
     match global_types {
-        Some(global_types) => store.expression_union_type_with_global_types(
-            global_types,
-            types,
-            UnionReduction::Literal,
-        ),
+        Some(global_types) => {
+            store.expression_union_type_with_global_types(global_types, types, reduction)
+        }
         None => canonical_anonymous_union(store, types),
     }
 }
@@ -695,6 +748,7 @@ fn remove_nullable_from_candidate(
     store: &mut CanonicalTypeMapperStore,
     candidate: TypeId,
     global_types: Option<&CanonicalGlobalTypes>,
+    union_types: &mut Option<&mut InferenceUnion<'_>>,
 ) -> Result<TypeId, NakedTypeCandidateError> {
     let record =
         store
@@ -715,12 +769,20 @@ fn remove_nullable_from_candidate(
     let mut filtered = Vec::with_capacity(constituents.len());
     let mut changed = false;
     for constituent in constituents {
-        let primary = remove_nullable_from_candidate(store, constituent, global_types)?;
+        let primary =
+            remove_nullable_from_candidate(store, constituent, global_types, union_types)?;
         changed |= primary != constituent;
         filtered.push(primary);
     }
     if changed {
-        inference_union(store, &filtered, global_types).map_err(Into::into)
+        inference_union(
+            store,
+            &filtered,
+            global_types,
+            UnionReduction::Literal,
+            union_types,
+        )
+        .map_err(Into::into)
     } else {
         Ok(candidate)
     }
@@ -731,6 +793,7 @@ fn add_nullable_to_candidate(
     candidate: TypeId,
     nullable: TypeFlags,
     global_types: Option<&CanonicalGlobalTypes>,
+    union_types: &mut Option<&mut InferenceUnion<'_>>,
 ) -> Result<TypeId, NakedTypeCandidateError> {
     let bootstrap = store
         .intrinsic_bootstrap()
@@ -745,7 +808,14 @@ fn add_nullable_to_candidate(
     if nullable.intersects(TypeFlags::NULL) {
         types.push(null);
     }
-    inference_union(store, &types, global_types).map_err(Into::into)
+    inference_union(
+        store,
+        &types,
+        global_types,
+        UnionReduction::Literal,
+        union_types,
+    )
+    .map_err(Into::into)
 }
 
 fn inference_candidate_literal_treatment(
@@ -753,6 +823,7 @@ fn inference_candidate_literal_treatment(
     candidate: TypeId,
     treatment: InferenceLiteralTreatment,
     global_types: Option<&CanonicalGlobalTypes>,
+    union_types: &mut Option<&mut InferenceUnion<'_>>,
 ) -> Result<TypeId, LiteralTypeCacheError> {
     if treatment == InferenceLiteralTreatment::Preserve {
         return Ok(candidate);
@@ -800,12 +871,19 @@ fn inference_candidate_literal_treatment(
                     constituent,
                     treatment,
                     global_types,
+                    union_types,
                 )?;
                 changed |= mapped != constituent;
                 treated.push(mapped);
             }
             if changed {
-                inference_union(store, &treated, global_types)
+                inference_union(
+                    store,
+                    &treated,
+                    global_types,
+                    UnionReduction::Literal,
+                    union_types,
+                )
             } else {
                 Ok(candidate)
             }
@@ -1252,6 +1330,10 @@ mod tests {
             |store, source, target| {
                 store.is_type_subtype_of_with_global_types(source, target, global_types)
             },
+            |store, types, reduction| {
+                store.expression_union_type_with_global_types(global_types, types, reduction)
+            },
+            |store, type_| store.get_widened_type_with_global_types(type_, global_types),
         )
     }
 

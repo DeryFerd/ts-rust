@@ -17,6 +17,8 @@
 
 #![allow(dead_code)] // Installed ahead of the source-call dispatch consumer.
 
+use std::cell::RefCell;
+
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{CheckFlags, SymbolData, SymbolFlags};
 
@@ -54,6 +56,7 @@ use super::{
     mapped_types::{MappedTypeError, supported_mapped_alias_projection},
     object_aliases::property_object_alias_nonempty_projection,
     reference_types::{DirectGenericReference, validate_direct_generic_reference},
+    relation::RelationKind,
     signatures::{ElementFlags, IndexFlags, SignatureFlags},
     source_callables::{
         StoredSourceCallableValidation, constrained_string_rest_tuple_parameter,
@@ -490,19 +493,34 @@ pub(super) fn resolve_generic_call_vector_with_session(
         Some(global_types),
         existing_call_signature,
         session,
-        |store, source, target| {
-            store.is_type_assignable_to_with_global_types_and_strict_function_types(
+        |store, session, source, target| {
+            store.is_type_assignable_to_with_session(
                 source,
                 target,
-                global_types,
-                strict_function_types,
+                Some(global_types),
+                Some(strict_function_types),
+                session,
             )
         },
-        |store, source, target| {
-            store.is_type_strict_subtype_of_with_global_types(source, target, global_types)
+        |store, session, source, target| {
+            store.is_type_related_to_with_session(
+                source,
+                target,
+                RelationKind::StrictSubtype,
+                Some(global_types),
+                None,
+                session,
+            )
         },
-        |store, source, target| {
-            store.is_type_subtype_of_with_global_types(source, target, global_types)
+        |store, session, source, target| {
+            store.is_type_related_to_with_session(
+                source,
+                target,
+                RelationKind::Subtype,
+                Some(global_types),
+                None,
+                session,
+            )
         },
     )
 }
@@ -534,19 +552,34 @@ pub(super) fn check_generic_call_candidate_with_session(
         Some(global_types),
         relation,
         session,
-        |store, source, target| {
-            store.is_type_assignable_to_with_global_types_and_strict_function_types(
+        |store, session, source, target| {
+            store.is_type_assignable_to_with_session(
                 source,
                 target,
-                global_types,
-                strict_function_types,
+                Some(global_types),
+                Some(strict_function_types),
+                session,
             )
         },
-        |store, source, target| {
-            store.is_type_strict_subtype_of_with_global_types(source, target, global_types)
+        |store, session, source, target| {
+            store.is_type_related_to_with_session(
+                source,
+                target,
+                RelationKind::StrictSubtype,
+                Some(global_types),
+                None,
+                session,
+            )
         },
-        |store, source, target| {
-            store.is_type_subtype_of_with_global_types(source, target, global_types)
+        |store, session, source, target| {
+            store.is_type_related_to_with_session(
+                source,
+                target,
+                RelationKind::Subtype,
+                Some(global_types),
+                None,
+                session,
+            )
         },
     )
 }
@@ -569,19 +602,34 @@ pub(super) fn finish_generic_call_candidate_with_session(
         Some(global_types),
         existing_call_signature,
         session,
-        |store, source, target| {
-            store.is_type_assignable_to_with_global_types_and_strict_function_types(
+        |store, session, source, target| {
+            store.is_type_assignable_to_with_session(
                 source,
                 target,
-                global_types,
-                strict_function_types,
+                Some(global_types),
+                Some(strict_function_types),
+                session,
             )
         },
-        |store, source, target| {
-            store.is_type_strict_subtype_of_with_global_types(source, target, global_types)
+        |store, session, source, target| {
+            store.is_type_related_to_with_session(
+                source,
+                target,
+                RelationKind::StrictSubtype,
+                Some(global_types),
+                None,
+                session,
+            )
         },
-        |store, source, target| {
-            store.is_type_subtype_of_with_global_types(source, target, global_types)
+        |store, session, source, target| {
+            store.is_type_related_to_with_session(
+                source,
+                target,
+                RelationKind::Subtype,
+                Some(global_types),
+                None,
+                session,
+            )
         },
     )
 }
@@ -687,6 +735,7 @@ pub(super) fn instantiate_generic_signature_in_context_of(
     source: &ValidatedSingleCallable,
     contextual: &ValidatedSingleCallable,
     array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
 ) -> Result<ValidatedSingleCallable, GenericCallVectorError> {
     for candidate in [source, contextual] {
         match validate_stored_single_callable(store, candidate.owner) {
@@ -788,16 +837,15 @@ pub(super) fn instantiate_generic_signature_in_context_of(
         inference_shape.parameter_templates.push(shape.return_type);
         contextual_arguments.push(reference.element_type);
     }
-    let mut session = InstantiationSession::new(InstantiationLimits::default());
     let type_arguments = infer_generic_call_type_arguments(
         store,
         &inference_shape,
         &contextual_arguments,
         None,
-        &mut |_, left, right| Ok(left == right),
-        &mut |_, left, right| Ok(left == right),
-        &mut |_, left, right| Ok(left == right),
-        &mut session,
+        &mut |_, _, left, right| Ok(left == right),
+        &mut |_, _, left, right| Ok(left == right),
+        &mut |_, _, left, right| Ok(left == right),
+        session,
     )?;
     let (instantiation, _) =
         get_or_create_checked_generic_call_vector_shell(store, &shape, &sources, &type_arguments)?;
@@ -810,7 +858,7 @@ pub(super) fn instantiate_generic_signature_in_context_of(
             &type_arguments,
             instantiation.signature,
             index,
-            &mut session,
+            session,
         )?);
     }
     let return_type = demand_generic_call_vector_return(
@@ -819,7 +867,7 @@ pub(super) fn instantiate_generic_signature_in_context_of(
         &sources,
         &type_arguments,
         instantiation.signature,
-        &mut session,
+        session,
     )?;
     Ok(ValidatedSingleCallable {
         owner: source.owner,
@@ -1108,17 +1156,17 @@ fn project_validated_generic_call_vector(
     request: GenericCallVectorRequest<'_>,
     callable: &ValidatedSingleCallable,
     array_targets: Option<CanonicalArrayTargets>,
-    is_assignable: impl FnMut(
+    mut is_assignable: impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
-    is_strict_subtype: impl FnMut(
+    mut is_strict_subtype: impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
-    is_subtype: impl FnMut(
+    mut is_subtype: impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
         TypeId,
@@ -1133,9 +1181,9 @@ fn project_validated_generic_call_vector(
         None,
         None,
         &mut session,
-        is_assignable,
-        is_strict_subtype,
-        is_subtype,
+        |store, _, source, target| is_assignable(store, source, target),
+        |store, _, source, target| is_strict_subtype(store, source, target),
+        |store, _, source, target| is_subtype(store, source, target),
     )
 }
 
@@ -1150,16 +1198,19 @@ fn project_validated_generic_call_vector_with_session(
     session: &mut InstantiationSession,
     mut is_assignable: impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
     mut is_strict_subtype: impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
     mut is_subtype: impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
@@ -1200,16 +1251,19 @@ fn check_validated_generic_call_candidate(
     session: &mut InstantiationSession,
     mut is_assignable: impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
     mut is_strict_subtype: impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
     mut is_subtype: impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
@@ -1332,12 +1386,14 @@ fn check_validated_generic_call_candidate(
                 &sources,
                 &checked,
                 session,
-                &mut |store, source, target| {
-                    store.is_type_subtype_of_with_global_types_and_strict_function_types(
+                &mut |store, session, source, target| {
+                    store.is_type_related_to_with_session(
                         source,
                         target,
-                        globals,
-                        strict_function_types,
+                        RelationKind::Subtype,
+                        Some(globals),
+                        Some(strict_function_types),
+                        session,
                     )
                 },
             )?
@@ -1362,16 +1418,19 @@ fn finish_generic_call_candidate(
     session: &mut InstantiationSession,
     mut is_assignable: impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
     mut is_strict_subtype: impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
     mut is_subtype: impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
@@ -2813,16 +2872,19 @@ fn failure_type_arguments(
     global_types: Option<&CanonicalGlobalTypes>,
     is_assignable: &mut impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
     is_strict_subtype: &mut impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
     is_subtype: &mut impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
@@ -2851,16 +2913,19 @@ fn infer_generic_call_type_arguments(
     global_types: Option<&CanonicalGlobalTypes>,
     is_assignable: &mut impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
     is_strict_subtype: &mut impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
     is_subtype: &mut impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
@@ -2912,6 +2977,7 @@ fn infer_generic_call_type_arguments(
             shape.signature,
             &mut Vec::new(),
             false,
+            session,
         )?;
     }
 
@@ -2944,46 +3010,112 @@ fn infer_generic_call_type_arguments(
         } else {
             InferenceLiteralTreatment::Widen
         };
-        let candidate = if let Some(global_types) = global_types {
-            infer_call_type_parameter_candidates(
-                store,
-                &buckets[index],
-                &contravariant_buckets[index],
-                treatment,
-                global_types,
-                |store, source, target| is_assignable(store, source, target),
-                |store, source, target| is_strict_subtype(store, source, target),
-                |store, source, target| is_subtype(store, source, target),
-            )?
-        } else if contravariant_buckets[index].is_empty() {
-            match shape.array_targets {
-                Some(array_targets) => infer_naked_type_parameter_candidates_with_array_targets(
+        let candidate = {
+            // Inference calls these relations in turn. Each borrows the same caller.
+            let inference_session = RefCell::new(&mut *session);
+            if let Some(global_types) = global_types {
+                infer_call_type_parameter_candidates(
                     store,
                     &buckets[index],
+                    &contravariant_buckets[index],
                     treatment,
-                    array_targets,
-                    |store, source, target| is_strict_subtype(store, source, target),
-                    |store, source, target| is_subtype(store, source, target),
-                )?,
-                None => infer_naked_type_parameter_candidates(
+                    global_types,
+                    |store, source, target| {
+                        is_assignable(store, &mut inference_session.borrow_mut(), source, target)
+                    },
+                    |store, source, target| {
+                        is_strict_subtype(
+                            store,
+                            &mut inference_session.borrow_mut(),
+                            source,
+                            target,
+                        )
+                    },
+                    |store, source, target| {
+                        is_subtype(store, &mut inference_session.borrow_mut(), source, target)
+                    },
+                    |store, types, reduction| {
+                        store.expression_union_type_with_global_types_and_session(
+                            global_types,
+                            types,
+                            reduction,
+                            &mut inference_session.borrow_mut(),
+                        )
+                    },
+                    |store, type_| {
+                        store.get_widened_type_with_global_types_and_session(
+                            type_,
+                            global_types,
+                            &mut inference_session.borrow_mut(),
+                        )
+                    },
+                )?
+            } else if contravariant_buckets[index].is_empty() {
+                match shape.array_targets {
+                    Some(array_targets) => {
+                        infer_naked_type_parameter_candidates_with_array_targets(
+                            store,
+                            &buckets[index],
+                            treatment,
+                            array_targets,
+                            |store, source, target| {
+                                is_strict_subtype(
+                                    store,
+                                    &mut inference_session.borrow_mut(),
+                                    source,
+                                    target,
+                                )
+                            },
+                            |store, source, target| {
+                                is_subtype(
+                                    store,
+                                    &mut inference_session.borrow_mut(),
+                                    source,
+                                    target,
+                                )
+                            },
+                        )?
+                    }
+                    None => infer_naked_type_parameter_candidates(
+                        store,
+                        &buckets[index],
+                        treatment,
+                        |store, source, target| {
+                            is_strict_subtype(
+                                store,
+                                &mut inference_session.borrow_mut(),
+                                source,
+                                target,
+                            )
+                        },
+                        |store, source, target| {
+                            is_subtype(store, &mut inference_session.borrow_mut(), source, target)
+                        },
+                    )?,
+                }
+            } else {
+                infer_naked_type_parameter_variance_candidates(
                     store,
                     &buckets[index],
+                    &contravariant_buckets[index],
                     treatment,
-                    |store, source, target| is_strict_subtype(store, source, target),
-                    |store, source, target| is_subtype(store, source, target),
-                )?,
+                    shape.array_targets,
+                    |store, source, target| {
+                        is_assignable(store, &mut inference_session.borrow_mut(), source, target)
+                    },
+                    |store, source, target| {
+                        is_strict_subtype(
+                            store,
+                            &mut inference_session.borrow_mut(),
+                            source,
+                            target,
+                        )
+                    },
+                    |store, source, target| {
+                        is_subtype(store, &mut inference_session.borrow_mut(), source, target)
+                    },
+                )?
             }
-        } else {
-            infer_naked_type_parameter_variance_candidates(
-                store,
-                &buckets[index],
-                &contravariant_buckets[index],
-                treatment,
-                shape.array_targets,
-                |store, source, target| is_assignable(store, source, target),
-                |store, source, target| is_strict_subtype(store, source, target),
-                |store, source, target| is_subtype(store, source, target),
-            )?
         };
         let mut argument = match candidate {
             Some(candidate) => candidate,
@@ -3017,7 +3149,7 @@ fn infer_generic_call_type_arguments(
                 }),
         };
         if let Some(constraint) = instantiated_constraint
-            && !is_assignable(store, argument, constraint)?
+            && !is_assignable(store, session, argument, constraint)?
         {
             argument = constraint;
         }
@@ -3040,6 +3172,7 @@ fn collect_generic_call_inferences(
     signature: SignatureId,
     active_targets: &mut Vec<TypeId>,
     contravariant: bool,
+    session: &mut InstantiationSession,
 ) -> Result<(), GenericCallVectorError> {
     if is_non_inferrable_inference_source(store, source, array_targets)
         .map_err(|error| GenericCallVectorError::Inference(error.into()))?
@@ -3115,7 +3248,12 @@ fn collect_generic_call_inferences(
             [] => source,
             [candidate] => *candidate,
             candidates => store
-                .literal_union_type_with_alias_and_array_targets(candidates, None, array_targets)
+                .literal_union_type_with_alias_and_array_targets_and_session(
+                    candidates,
+                    None,
+                    array_targets,
+                    session,
+                )
                 .map_err(|error| GenericCallVectorError::Inference(error.into()))?,
         };
         return collect_generic_call_inferences(
@@ -3130,6 +3268,7 @@ fn collect_generic_call_inferences(
             signature,
             active_targets,
             contravariant,
+            session,
         );
     }
 
@@ -3195,6 +3334,7 @@ fn collect_generic_call_inferences(
                 signature,
                 active_targets,
                 contravariant,
+                session,
             );
             active_targets.pop();
             return result;
@@ -3275,6 +3415,7 @@ fn collect_generic_call_inferences(
                 signature,
                 active_targets,
                 contravariant != argument_contravariant,
+                session,
             )
         });
     active_targets.pop();
@@ -3338,6 +3479,7 @@ fn check_explicit_type_argument_constraints(
     checked: &[TypeId],
     is_assignable: &mut impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
@@ -3360,7 +3502,7 @@ fn check_explicit_type_argument_constraints(
             shape.array_targets,
             session,
         )?;
-        if !is_assignable(store, type_argument, constraint)? {
+        if !is_assignable(store, session, type_argument, constraint)? {
             return Ok(Some(
                 GenericCallVectorApplicability::ExplicitTypeArgumentConstraint {
                     index,
@@ -3382,6 +3524,7 @@ fn check_generic_call_arguments(
     session: &mut InstantiationSession,
     is_assignable: &mut impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
@@ -3431,10 +3574,11 @@ fn check_generic_call_arguments(
                 shape.signature,
                 argument_type,
                 parameter_type,
+                session,
                 is_assignable,
             )?
         } else {
-            is_assignable(store, argument_type, parameter_type)?
+            is_assignable(store, session, argument_type, parameter_type)?
         };
         if !assignable {
             return Ok(Some(
@@ -3454,8 +3598,10 @@ fn constrained_rest_tuple_argument_is_assignable(
     signature: SignatureId,
     source: TypeId,
     target: TypeId,
+    session: &mut InstantiationSession,
     is_assignable: &mut impl FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
@@ -3499,7 +3645,12 @@ fn constrained_rest_tuple_argument_is_assignable(
     let target_types = target_tuple.element_types().to_vec();
     let last = source_types.len().saturating_sub(1);
     for (index, source_type) in source_types.into_iter().enumerate() {
-        if !is_assignable(store, source_type, target_types[usize::from(index == last)])? {
+        if !is_assignable(
+            store,
+            session,
+            source_type,
+            target_types[usize::from(index == last)],
+        )? {
             return Ok(false);
         }
     }
@@ -9216,6 +9367,7 @@ mod tests {
         let mut covariant = vec![Vec::new()];
         let mut contravariant = vec![Vec::new()];
         let before = vector_cache_graph_counts(&store);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
 
         assert_eq!(
             collect_generic_call_inferences(
@@ -9230,6 +9382,7 @@ mod tests {
                 callable.signature,
                 &mut Vec::new(),
                 false,
+                &mut session,
             ),
             Ok(()),
         );
@@ -11218,12 +11371,14 @@ mod tests {
         let store = context.store_mut_for_test();
         let before = vector_cache_graph_counts(store);
         let observation = store.begin_relation_read_observation().unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
 
         let inferred = instantiate_generic_signature_in_context_of(
             store,
             &source,
             &contextual,
             Some(array_targets),
+            &mut session,
         )
         .unwrap();
 
@@ -11255,6 +11410,7 @@ mod tests {
             &source,
             &contextual,
             Some(array_targets),
+            &mut session,
         )
         .unwrap();
         assert_eq!(warm, inferred);
@@ -11268,6 +11424,7 @@ mod tests {
                 &source,
                 &forged,
                 Some(array_targets),
+                &mut session,
             ),
             Err(GenericCallVectorError::Invariant(
                 GenericCallVectorInvariant::CallableSignatureMismatch(contextual.signature),
@@ -12303,9 +12460,9 @@ mod tests {
             None,
             None,
             &mut session,
-            |_, _, _| Ok(true),
-            CanonicalTypeMapperStore::is_type_strict_subtype_of,
-            CanonicalTypeMapperStore::is_type_subtype_of,
+            |_, _, _, _| Ok(true),
+            |store, _, source, target| store.is_type_strict_subtype_of(source, target),
+            |store, _, source, target| store.is_type_subtype_of(source, target),
         )
         .unwrap();
         assert_eq!(
@@ -12356,9 +12513,9 @@ mod tests {
             None,
             None,
             &mut session,
-            |_, _, _| Ok(true),
-            CanonicalTypeMapperStore::is_type_strict_subtype_of,
-            CanonicalTypeMapperStore::is_type_subtype_of,
+            |_, _, _, _| Ok(true),
+            |store, _, source, target| store.is_type_strict_subtype_of(source, target),
+            |store, _, source, target| store.is_type_subtype_of(source, target),
         )
         .unwrap();
         assert_eq!(replay, resolution);

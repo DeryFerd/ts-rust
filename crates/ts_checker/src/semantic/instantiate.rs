@@ -5792,10 +5792,11 @@ fn instantiate_union(
             });
         }
         return store
-            .literal_union_type_with_alias_and_array_targets(
+            .literal_union_type_with_alias_and_array_targets_and_session(
                 &mapped_types,
                 Some((symbol, &mapped_arguments)),
                 array_targets,
+                session,
             )
             .map_err(Into::into);
     }
@@ -5810,7 +5811,12 @@ fn instantiate_union(
             .map_err(Into::into)
     } else {
         store
-            .literal_union_type_with_alias_and_array_targets(&mapped_types, None, array_targets)
+            .literal_union_type_with_alias_and_array_targets_and_session(
+                &mapped_types,
+                None,
+                array_targets,
+                session,
+            )
             .map_err(Into::into)
     }
 }

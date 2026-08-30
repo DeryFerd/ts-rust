@@ -5268,6 +5268,7 @@ impl<'store> RelaterSession<'store> {
             source,
             target,
             self.global_types.map(|globals| globals.array_targets),
+            self.instantiation_session.as_mut(),
         )
         .map(Some)
         .map_err(|error| match error {
