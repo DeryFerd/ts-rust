@@ -2142,13 +2142,15 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         let source = self.source_file(file).ok_or(SourceCheckError::Provenance(
             SourceCheckProvenanceError::MissingFile(file),
         ))?;
-        let mut links =
-            self.store
-                .source_file_links(source)
-                .cloned()
-                .ok_or(SourceCheckError::Provenance(
-                    SourceCheckProvenanceError::StoreSourceMismatch(source),
-                ))?;
+        if !self.store.contains_source_file(source) {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::StoreSourceMismatch(source),
+            ));
+        }
+        let Some(mut links) = self.store.source_file_links(source).cloned() else {
+            // A retained source without completion links is already unchecked.
+            return Ok(());
+        };
         links.type_checked = false;
         if !self.store.set_source_file_links(source, links) {
             return Err(SourceCheckError::Provenance(
@@ -4290,6 +4292,241 @@ mod tests {
                 context.store().checker_link_allocated_lengths(),
             ),
             lengths,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep failed calls, staged diagnostics, and both recheck APIs together.
+    fn never_completed_source_rechecks_preserve_failure_and_staged_diagnostics() {
+        let source = parsed(concat!(
+            "interface Matcher { ",
+            "m<T extends string>(value: T): T; ",
+            "m<T extends number>(value: T): T; ",
+            "m(left: boolean, right: boolean): boolean; }\n",
+            "declare const matcher: Matcher;\n",
+            "const wrong: string = 0;\n",
+            "const bad = matcher.m(true);\n",
+        ));
+        let file = FileId::new(8_406);
+        let calls = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallExpression).then_some(node_ref(&source, file, node))
+            })
+            .collect::<Vec<_>>();
+        let [call] = calls.as_slice() else {
+            panic!("the source has one rejected overload call");
+        };
+        let (wrong, annotation) = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(declaration) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &source.arena.get(declaration.name)?.data else {
+                    return None;
+                };
+                (name.text == "wrong").then_some((
+                    node_ref(&source, file, declaration.name),
+                    node_ref(&source, file, declaration.type_?),
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            source.arena.get(annotation.node).unwrap().kind,
+            SyntaxKind::StringKeyword,
+        );
+
+        for with_runtime in [false, true] {
+            let mut context = CanonicalCheckerContext::new(
+                completed_bindings(&[(file, &source)]),
+                vec![(file, &source.arena)],
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap();
+            let source_ref = context.source_file(file).unwrap();
+            let cold_links = context.store().checker_link_allocated_lengths();
+            assert!(context.store().source_file_links(source_ref).is_none());
+            assert_eq!(context.clear_source_file_completion(file), Ok(()));
+            assert_eq!(context.store().checker_link_allocated_lengths(), cold_links);
+            assert!(context.store().source_file_links(source_ref).is_none());
+            let check =
+                |context: &mut CanonicalCheckerContext<'_>, force| match (with_runtime, force) {
+                    (false, false) => context.check_source_file(file),
+                    (false, true) => context.recheck_source_file(file),
+                    (true, false) => context.check_source_file_with_jsx_runtime(
+                        file,
+                        CanonicalJsxRuntimeEvidence::Preserve,
+                    ),
+                    (true, true) => context.recheck_source_file_with_jsx_runtime(
+                        file,
+                        CanonicalJsxRuntimeEvidence::Preserve,
+                    ),
+                };
+            assert_eq!(
+                check(&mut context, false),
+                Err(SourceCheckError::Call(*call))
+            );
+            assert!(context.diagnostics().is_empty());
+            assert!(context.store().source_file_links(source_ref).is_none());
+            let staged = context.source_diagnostic_staging.get(&source_ref).unwrap();
+            let [diagnostic] = staged.as_slice() else {
+                panic!("the earlier assignment error stays private until completion");
+            };
+            assert_eq!(diagnostic.node, Some(wrong));
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(diagnostic.diagnostic.arguments, ["number", "string"]);
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            assert!(context.store().type_node_links(annotation).is_none());
+            assert!(context.store().type_node_links(wrong).is_none());
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                let store = context.store();
+                (
+                    [
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.mapper_len(),
+                        store.type_alias_len(),
+                        store.symbol_store().symbol_table_len(),
+                    ],
+                    store.checker_link_allocated_lengths(),
+                    source
+                        .arena
+                        .iter()
+                        .map(|(node, _)| {
+                            let node = node_ref(&source, file, node);
+                            (
+                                store.type_node_links(node).cloned(),
+                                store.symbol_node_links(node).cloned(),
+                                store.signature_links(node).cloned(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    store.source_file_links(source_ref).cloned(),
+                    context.diagnostics().clone(),
+                    context.source_diagnostic_staging.clone(),
+                )
+            };
+            let failed = snapshot(&context);
+            assert_eq!(context.get_type_from_type_node(annotation), Ok(string));
+            assert_eq!(snapshot(&context), failed);
+            for force in [false, true, true] {
+                assert_eq!(
+                    check(&mut context, force),
+                    Err(SourceCheckError::Call(*call))
+                );
+                assert_eq!(snapshot(&context), failed);
+                assert!(context.store().type_node_links(*call).is_none());
+                assert!(context.store().signature_links(*call).is_none());
+                assert!(context.store().type_resolution_is_empty());
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep foreign-store and replacement-source checks with their exact restores.
+    fn source_recheck_rejects_foreign_and_replaced_source_ownership() {
+        let source = parsed("declare const value: number;");
+        let replacement = parsed("declare const value: string;");
+        let file = FileId::new(8_407);
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let mut replacement_context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &replacement)]),
+            vec![(file, &replacement.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let original_source = context.source_file(file).unwrap();
+        let replacement_source = replacement_context.source_file(file).unwrap();
+        assert_ne!(
+            original_source.node_ref().arena,
+            replacement_source.node_ref().arena
+        );
+        assert!(context.store().source_file_links(original_source).is_none());
+        assert!(
+            replacement_context
+                .store()
+                .source_file_links(replacement_source)
+                .is_none()
+        );
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.options(),
+                context.diagnostics().clone(),
+                context.source_diagnostic_staging.clone(),
+            )
+        };
+        let original = snapshot(&context);
+        let replacement_state = snapshot(&replacement_context);
+        for with_runtime in [false, true] {
+            let recheck = |context: &mut CanonicalCheckerContext<'_>, file| {
+                if with_runtime {
+                    context.recheck_source_file_with_jsx_runtime(
+                        file,
+                        CanonicalJsxRuntimeEvidence::Preserve,
+                    )
+                } else {
+                    context.recheck_source_file(file)
+                }
+            };
+            let foreign_file = FileId::new(8_408);
+            assert_eq!(
+                recheck(&mut context, foreign_file),
+                Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MissingFile(foreign_file),
+                )),
+            );
+            std::mem::swap(&mut context.store, &mut replacement_context.store);
+            assert!(!context.store().contains_source_file(original_source));
+            assert_eq!(
+                recheck(&mut context, file),
+                Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::StoreSourceMismatch(original_source),
+                )),
+            );
+            std::mem::swap(&mut context.store, &mut replacement_context.store);
+            std::mem::swap(&mut context.files, &mut replacement_context.files);
+            assert_eq!(context.source_file(file), Some(replacement_source));
+            assert!(!context.store().contains_source_file(replacement_source));
+            assert_eq!(
+                recheck(&mut context, file),
+                Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::StoreSourceMismatch(replacement_source),
+                )),
+            );
+            std::mem::swap(&mut context.files, &mut replacement_context.files);
+            assert_eq!(snapshot(&context), original);
+            assert_eq!(snapshot(&replacement_context), replacement_state);
+            assert!(context.store().source_file_links(original_source).is_none());
+        }
+        context.recheck_source_file(file).unwrap();
+        assert!(
+            context
+                .store()
+                .source_file_links(original_source)
+                .unwrap()
+                .type_checked
+        );
+        let value = global_symbol(&context, "value").unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(value)
+                .unwrap()
+                .resolved_type,
+            Some(context.store().intrinsic_bootstrap().unwrap().number_type),
         );
         assert!(context.diagnostics().is_empty());
     }

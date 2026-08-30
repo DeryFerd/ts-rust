@@ -286,11 +286,10 @@ fn mapped_keyof_method_returns_keep_source_types_and_query_replay() {
         }
         assert!(context.diagnostics().is_empty());
         assert!(
-            !context
+            context
                 .store()
                 .source_file_links(context.source_file(SOURCE).unwrap())
-                .unwrap()
-                .type_checked
+                .is_none_or(|links| !links.type_checked)
         );
         for &call in &calls {
             assert!(context.store().signature_links(call).is_none());
