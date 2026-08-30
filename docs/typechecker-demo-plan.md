@@ -29,6 +29,12 @@ old failures and retained 25 failures, including one regression. One of those
 passed all 88 selected public tests, but seven checker tests still failed.
 These runs overlap and must not be added together as unique passing tests.
 
+A separate full core check passed 6,393 of 6,395 tests in 133 harnesses at
+`713a5211c21dd1dfd654cb612a23f5b585fca048`. Formatting, strict Clippy and both
+binary builds passed. The failures are an invalid literal-cache test setup
+and a missing union-type route for class method parameters. Both are being
+repaired. This result does not replace the accepted original test subset.
+
 ## Selected projects
 
 | Target | Complete upstream scope | Why use it | Fresh Rust construction result |
@@ -58,6 +64,11 @@ the class but not its inner rejecting guard. A separate source audit proves
 missing constructor-valued heritage and ordinary annotated constructor
 defaults. Those repairs are in progress. One first failure does not tell us
 how many remain.
+
+The Query source audit identifies missing contextual typing for the first
+two-parameter object-property arrow. Its declared `TimeoutProvider` property
+must supply both parameter types before the normal body check. The repair
+uses that general rule. It does not change the timer code or assume its return.
 
 Pinned project commits:
 
