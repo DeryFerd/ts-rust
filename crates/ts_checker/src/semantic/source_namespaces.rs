@@ -27,6 +27,7 @@ use super::{
         CanonicalAliasResolutionError, CanonicalAliasResolutionEvent, CanonicalAliasResolver,
         CanonicalAliasTargetHost, CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
     },
+    alias_provider::ProductionAliasSourceRegistry,
     array_types::CanonicalArrayTargets,
     bootstrap::UnionReduction,
     declared::{cached_ordinary_type_parameter_owner, preflight_class_or_interface_reference},
@@ -8077,9 +8078,27 @@ fn plan_ambient_module_reexport(
     } else {
         None
     };
-    let exports = store
-        .symbol(owner)
-        .and_then(ts_binder::semantic::Symbol::exports)
+    // A conflicting export keeps its own source alias even when another
+    // declaration wins the merged module's public export table.
+    let source_owner = bound
+        .symbol(namespace)
+        .ok_or(SourceCheckError::Import(declaration))?;
+    let source_record = store
+        .symbol(source_owner)
+        .ok_or(SourceCheckError::Import(declaration))?;
+    if store.get_merged_symbol(source_owner) != Some(owner)
+        || !store.source_merged_symbol_declarations_match(owner)
+        || source_record
+            .declarations()
+            .is_none_or(|declarations| !declarations.contains(&namespace))
+        || store
+            .symbol(owner)
+            .is_none_or(|record| record.name() != source_record.name())
+    {
+        return Err(SourceCheckError::Import(declaration));
+    }
+    let exports = source_record
+        .exports()
         .and_then(|exports| store.symbol_table(exports))
         .ok_or(SourceCheckError::Import(declaration))?;
     let mut aliases = HashSet::with_capacity(named.elements.nodes.len());
@@ -11585,6 +11604,70 @@ fn namespace_imports<'plan>(
     }
 }
 
+/// Reuses the source provider for a same-file ambient import reached during merging.
+pub(super) fn ambient_module_merge_alias_target(
+    store: &CanonicalTypeMapperStore,
+    files: &ProductionAliasSourceRegistry<'_>,
+    alias: SemanticSymbolId,
+) -> Result<Option<SemanticSymbolId>, CanonicalAliasTargetUnavailable> {
+    let Some([declaration]) = store
+        .symbol(alias)
+        .and_then(ts_binder::semantic::Symbol::declarations)
+    else {
+        return Ok(None);
+    };
+    let declaration = *declaration;
+    if store.source_node_kind(declaration) != Some(SyntaxKind::NamespaceImport) {
+        return Ok(None);
+    }
+    let invalid = || CanonicalAliasTargetUnavailable::MalformedDeclaration(declaration);
+    let (arena, bound) = files.snapshot(declaration.file).ok_or_else(invalid)?;
+    if bound
+        .source_facts()
+        .is_none_or(|facts| !facts.is_declaration_file())
+    {
+        return Ok(None);
+    }
+    let Some(namespace) = bound.container(declaration) else {
+        return Ok(None);
+    };
+    let Some(NodeData::ModuleDeclaration(module)) =
+        arena.get(namespace.node).map(|node| &node.data)
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        arena.get(module.name).map(|node| &node.data),
+        Some(NodeData::StringLiteral(_))
+    ) {
+        return Ok(None);
+    }
+    let clause = owned_node(arena, bound, store, declaration)
+        .map_err(|_| invalid())?
+        .parent
+        .ok_or_else(invalid)?;
+    let import = arena
+        .get(clause)
+        .and_then(|node| node.parent)
+        .map(|node| child(declaration, node))
+        .ok_or_else(invalid)?;
+    if bound.symbol(declaration) != Some(alias)
+        || arena.get(import.node).and_then(|node| node.parent) != module.body
+    {
+        return Err(invalid());
+    }
+    let imports = match plan_ambient_module_import(arena, bound, store, namespace, import) {
+        Ok(imports) => imports,
+        Err(SourceCheckError::Unsupported(_)) => return Ok(None),
+        Err(_) => return Err(invalid()),
+    };
+    imports
+        .iter()
+        .find(|import| import.symbol == alias && import.declaration == declaration)
+        .map(|import| import.ambient_target)
+        .ok_or_else(invalid)
+}
+
 /// Resolves manifest-backed imports nested in quoted ambient modules.
 pub(super) fn resolve_source_namespace_external_imports(
     store: &mut CanonicalTypeMapperStore,
@@ -11740,11 +11823,96 @@ fn issue_ambient_module_export_collision(
     Ok(())
 }
 
+/// Keeps the existing source anchors and related notes inside the native merge callback.
+pub(super) fn report_ambient_module_merge_diagnostic(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    diagnostic: super::merge::SymbolMergeDiagnostic,
+) -> Result<bool, SourceCheckError> {
+    if diagnostic.kind != super::merge::SymbolMergeDiagnosticKind::IncompatibleDeclarations {
+        return Ok(false);
+    }
+    let (Some(target), Some(source)) = (
+        store.symbol(diagnostic.target),
+        store.symbol(diagnostic.source),
+    ) else {
+        return Ok(false);
+    };
+    if !(target.flags() | source.flags()).intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+        || !target
+            .flags()
+            .intersects(SymbolFlags::ALIAS | SymbolFlags::VALUE)
+        || !source
+            .flags()
+            .intersects(SymbolFlags::ALIAS | SymbolFlags::VALUE)
+    {
+        return Ok(false);
+    }
+    let (Some([target_declaration]), Some([source_declaration])) =
+        (target.declarations(), source.declarations())
+    else {
+        return Ok(false);
+    };
+    if [*target_declaration, *source_declaration]
+        .into_iter()
+        .any(|declaration| {
+            !matches!(
+                store.source_node_kind(declaration),
+                Some(SyntaxKind::ExportSpecifier | SyntaxKind::VariableDeclaration)
+            )
+        })
+    {
+        return Ok(false);
+    }
+    let parent_name = |symbol| {
+        let parent = store.get_parent_of_symbol(symbol)?;
+        let record = store.symbol(parent)?;
+        let name = record.name().as_utf8()?;
+        let declarations = record.declarations()?;
+        if !record.flags().intersects(SymbolFlags::MODULE)
+            || !name.starts_with('"')
+            || !name.ends_with('"')
+            || declarations.is_empty()
+            || !declarations.iter().all(|declaration| {
+                let Some(NodeData::ModuleDeclaration(module)) =
+                    host.node(*declaration).map(|record| &record.data)
+                else {
+                    return false;
+                };
+                matches!(host.node(child(*declaration, module.name)).map(|record| &record.data),
+                    Some(NodeData::StringLiteral(literal))
+                        if name == format!("\"{}\"", literal.text))
+            })
+        {
+            return None;
+        }
+        Some(name)
+    };
+    if parent_name(diagnostic.target).is_none()
+        || parent_name(diagnostic.target) != parent_name(diagnostic.source)
+    {
+        return Ok(false);
+    }
+    issue_ambient_module_export_collision(
+        store,
+        host,
+        diagnostics,
+        *target_declaration,
+        diagnostic.target,
+        diagnostic.source,
+    )?;
+    Ok(true)
+}
+
 fn ambient_module_collision_export_is_exact(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
     symbol: SemanticSymbolId,
 ) -> bool {
+    let Some(owner) = store.get_merged_symbol(owner) else {
+        return false;
+    };
     let Some(record) = store.symbol(symbol) else {
         return false;
     };
@@ -11807,6 +11975,66 @@ fn ambient_module_collision_export_is_exact(
     current == target
 }
 
+fn validate_ambient_module_merge_dependencies(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceNamespacePlan,
+) -> Result<(), SourceCheckError> {
+    let invalid = || SourceCheckError::Import(plan.declaration);
+    let owner = store.symbol(plan.symbol).ok_or_else(invalid)?;
+    let declarations = owner.declarations().ok_or_else(invalid)?;
+    let binding = store
+        .source_global_bindings()
+        .and_then(|bindings| bindings.get(owner.name()))
+        .ok_or_else(invalid)?;
+    if binding.symbol != plan.symbol
+        || binding.flags != owner.flags()
+        || binding.declarations() != Some(declarations)
+        || !store.source_merged_symbol_declarations_match(plan.symbol)
+    {
+        return Err(invalid());
+    }
+
+    let mut source_owners = HashSet::new();
+    let mut exports = BTreeMap::<EscapedName, HashSet<SemanticSymbolId>>::new();
+    for &declaration in declarations {
+        let (_, bound) = host.source(declaration).ok_or_else(invalid)?;
+        let source = bound.symbol(declaration).ok_or_else(invalid)?;
+        if store.get_merged_symbol(source) != Some(plan.symbol) {
+            return Err(invalid());
+        }
+        if !source_owners.insert(source) {
+            continue;
+        }
+        let record = store.symbol(source).ok_or_else(invalid)?;
+        let Some(table) = record.exports() else {
+            continue;
+        };
+        for (name, symbol) in store.symbol_table(table).ok_or_else(invalid)?.iter() {
+            let symbol = store.get_merged_symbol(symbol).ok_or_else(invalid)?;
+            exports.entry(name.to_owned()).or_default().insert(symbol);
+        }
+    }
+    for symbols in exports.values().filter(|symbols| symbols.len() > 1) {
+        let mut block_scoped = false;
+        let mut values = true;
+        for &symbol in symbols {
+            let flags = store.symbol(symbol).ok_or_else(invalid)?.flags();
+            block_scoped |= flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE);
+            values &= flags.intersects(SymbolFlags::ALIAS | SymbolFlags::VALUE);
+        }
+        if block_scoped
+            && values
+            && symbols.iter().any(|&symbol| {
+                !ambient_module_collision_export_is_exact(store, plan.symbol, symbol)
+            })
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
 /// Registers reopened ambient modules and reports exact block-scoped export collisions.
 pub(super) fn merge_source_ambient_module_exports(
     store: &mut CanonicalTypeMapperStore,
@@ -11856,7 +12084,7 @@ pub(super) fn merge_source_ambient_module_exports(
             .ok_or(SourceCheckError::Import(plan.declaration));
     };
     if existing == plan.symbol {
-        return Ok(());
+        return validate_ambient_module_merge_dependencies(store, host, plan);
     }
     let existing_exports = store
         .symbol(existing)
@@ -21443,9 +21671,42 @@ mod tests {
             })
             .unwrap();
 
+        let module_declarations =
+            [(first_file, &first), (second_file, &second)].map(|(file, parsed)| {
+                parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        let NodeData::ModuleDeclaration(module) = &record.data else {
+                            return None;
+                        };
+                        matches!(parsed.arena.get(module.name).map(|node| &node.data),
+                            Some(NodeData::StringLiteral(name)) if name.text == "mymod")
+                        .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                    })
+                    .unwrap()
+            });
+        let raw = module_declarations.map(|declaration| {
+            context
+                .file(declaration.file)
+                .unwrap()
+                .1
+                .symbol(declaration)
+                .unwrap()
+        });
+        assert_ne!(raw[0], raw[1]);
+        let merged = raw.map(|symbol| context.store().get_merged_symbol(symbol).unwrap());
+        assert_eq!(merged[0], merged[1]);
+        let owner = context.store().symbol(merged[0]).unwrap();
+        assert_eq!(owner.name().as_utf8(), Some("\"mymod\""));
+        assert_eq!(owner.declarations(), Some(module_declarations.as_slice()));
+        let initialized_diagnostics = context.diagnostics().as_slice().to_vec();
+        assert_eq!(initialized_diagnostics.len(), 2);
+
         context.check_source_file(first_file).unwrap();
-        assert!(context.diagnostics().is_empty());
+        assert_eq!(context.diagnostics().as_slice(), initialized_diagnostics);
         context.check_source_file(second_file).unwrap();
+        assert_eq!(context.diagnostics().as_slice(), initialized_diagnostics);
 
         let diagnostics = context.diagnostics().as_slice();
         assert_eq!(diagnostics.len(), 2);
