@@ -5,7 +5,7 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerDiagnostic, CanonicalCheckerOptions, SignatureId,
-    TypeData, TypeId, signatures::SignatureFlags,
+    TypeData, TypeId, signatures::SignatureFlags, type_records::StructuredTypeData,
 };
 use ts_options::ScriptTarget;
 use ts_parser::{ParseResult, parse_source_file};
@@ -20,6 +20,22 @@ const NUMBER_OVERLOAD_ERROR: &str = concat!(
     "  The last overload gave the following error.\n",
     "    Argument of type 'boolean' is not assignable to parameter of type 'number'.",
 );
+
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
+}
 
 fn context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -298,13 +314,8 @@ fn assert_replay(
         .collect::<Vec<_>>();
     for call in calls {
         let callable = context.get_type_at_location(callee(parsed, *call)).unwrap();
-        let structured = context
-            .store()
-            .type_payload(callable)
-            .unwrap()
-            .data()
-            .structured()
-            .unwrap();
+        let structured =
+            structured_data(context.store().type_payload(callable).unwrap().data()).unwrap();
         assert_eq!(structured.signatures.as_deref(), Some(visible.as_slice()));
         assert_eq!(structured.call_signature_count, visible.len());
     }

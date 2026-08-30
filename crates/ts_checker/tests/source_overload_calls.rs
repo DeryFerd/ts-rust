@@ -5,9 +5,25 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, SignatureId, TypeData,
-    signatures::SignatureFlags,
+    signatures::SignatureFlags, type_records::StructuredTypeData,
 };
 use ts_parser::{ParseResult, parse_source_file};
+
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
+}
 
 fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
@@ -136,13 +152,7 @@ fn assert_failure_signature(
     };
     let callee = NodeRef::new(call.arena, call.file, syntax.expression);
     let callable = context.get_type_at_location(callee).unwrap();
-    let members = context
-        .store()
-        .type_payload(callable)
-        .unwrap()
-        .data()
-        .structured()
-        .unwrap();
+    let members = structured_data(context.store().type_payload(callable).unwrap().data()).unwrap();
     assert_eq!(members.signatures.as_deref(), Some(visible.as_slice()));
     assert_eq!(members.call_signature_count, visible.len());
     recovered

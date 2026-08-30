@@ -5,13 +5,29 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, SignatureId, TypeData, TypeId,
-    signatures::ElementFlags,
+    signatures::ElementFlags, type_records::StructuredTypeData,
 };
 use ts_options::ScriptTarget;
 use ts_parser::{ParseResult, parse_source_file};
 
 const FILE: FileId = FileId::new(62_202);
 const LIBRARY_FILE: FileId = FileId::new(62_201);
+
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
+}
 
 fn context<'a>(
     parsed: &'a ParseResult,
@@ -368,13 +384,7 @@ fn a_broad_method_implementation_does_not_accept_bad_overload_arguments() {
         .collect::<Vec<_>>();
     assert_eq!(parameter_types, ["string | number", "number"]);
     let callable = context.get_type_at_location(callee(&parsed, call)).unwrap();
-    let members = context
-        .store()
-        .type_payload(callable)
-        .unwrap()
-        .data()
-        .structured()
-        .unwrap();
+    let members = structured_data(context.store().type_payload(callable).unwrap().data()).unwrap();
     assert_eq!(members.signatures.as_deref(), Some(&original[..2]));
     assert_eq!(members.call_signature_count, 2);
     assert_eq!(

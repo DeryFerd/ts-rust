@@ -8,10 +8,27 @@ use ts_checker::semantic::{
     IntrinsicBootstrapOptions, SignatureId, SourceCheckError, TypeData, TypeId,
     UnsupportedSourceSyntax,
     signatures::{ElementFlags, SignatureFlags},
+    type_records::StructuredTypeData,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
 const FILE: FileId = FileId::new(0);
+
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
+}
 
 fn context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
@@ -449,7 +466,10 @@ fn tuple_method_implements_keeps_real_signatures_and_canonical_parameter() {
         let record = context.store().type_payload(type_).unwrap();
         assert_eq!(record.symbol(), Some(owner));
         assert_eq!(
-            record.data().structured().unwrap().properties.as_deref(),
+            structured_data(record.data())
+                .unwrap()
+                .properties
+                .as_deref(),
             Some(&[member][..]),
         );
         let symbol = context.store().symbol(member).unwrap();
