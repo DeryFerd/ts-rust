@@ -53,7 +53,9 @@ use super::{
         TypeResolutionCheckpoint, TypeResolutionStack, TypeResolutionTarget,
         TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
     },
-    mapped_types::{MappedIndexRecovery, MappedPropertyRecovery, MappedTypeModifiers},
+    mapped_types::{
+        MappedIndexRecovery, MappedPropertyRecovery, MappedTypeModifiers, SourceMappedLookupRequest,
+    },
     object_members::{
         ObjectLiteralGetterOrigin, ObjectLiteralGetterReturnProof, ObjectLiteralPropertyCloneOrigin,
     },
@@ -676,6 +678,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
         HashMap<(SemanticSymbolId, CacheHashKey), OrdinaryIntersectionAliasRequestRecovery>,
     mapped_property_recoveries: HashMap<SemanticSymbolId, MappedPropertyRecovery>,
     mapped_index_recoveries: HashMap<IndexInfoId, MappedIndexRecovery>,
+    source_mapped_lookup_requests: HashMap<TypeId, SourceMappedLookupRequest>,
     source_class_provenance: HashMap<TypeId, SourceClassProvenance>,
     source_classes_by_symbol: HashMap<SemanticSymbolId, TypeId>,
     class_instance_super_views: HashMap<TypeId, ClassInstanceSuperView>,
@@ -853,6 +856,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             ordinary_intersection_alias_request_recoveries: HashMap::new(),
             mapped_property_recoveries: HashMap::new(),
             mapped_index_recoveries: HashMap::new(),
+            source_mapped_lookup_requests: HashMap::new(),
             source_class_provenance: HashMap::new(),
             source_classes_by_symbol: HashMap::new(),
             class_instance_super_views: HashMap::new(),
@@ -5764,6 +5768,65 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.observe_relation_symbol_read(symbol);
         self.property_object_alias_request_recoveries
             .get(&(symbol, key))
+    }
+
+    pub(super) fn source_mapped_lookup_request(
+        &self,
+        mapped_type: TypeId,
+    ) -> Option<&SourceMappedLookupRequest> {
+        self.observe_relation_type_read(mapped_type);
+        self.source_mapped_lookup_requests.get(&mapped_type)
+    }
+
+    pub(super) fn try_reserve_source_mapped_lookup_requests(&mut self) -> bool {
+        self.source_mapped_lookup_requests.try_reserve(1).is_ok()
+    }
+
+    pub(super) fn publish_source_mapped_lookup_request(
+        &mut self,
+        request: SourceMappedLookupRequest,
+    ) -> bool {
+        if self.types.get(request.mapped_type).is_none()
+            || self.types.get(request.lookup).is_none()
+            || self.types.get(request.declared_lookup).is_none()
+            || self.types.get(request.parameter).is_none()
+            || self.types.get(request.argument).is_none()
+        {
+            return false;
+        }
+        match self
+            .source_mapped_lookup_requests
+            .entry(request.mapped_type)
+        {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get() == &request,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(request);
+                self.mark_relation_inputs_dirty();
+                self.mark_union_cache_validation_dirty();
+                true
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn source_mapped_lookup_request_count(&self) -> usize {
+        self.source_mapped_lookup_requests.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_source_mapped_lookup_request_for_test(
+        &mut self,
+        mapped_type: TypeId,
+        request: Option<SourceMappedLookupRequest>,
+    ) -> Option<SourceMappedLookupRequest> {
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        match request {
+            Some(request) => self
+                .source_mapped_lookup_requests
+                .insert(mapped_type, request),
+            None => self.source_mapped_lookup_requests.remove(&mapped_type),
+        }
     }
 
     pub(super) fn try_reserve_property_object_alias_request_recoveries(&mut self) -> bool {

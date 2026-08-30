@@ -49,7 +49,7 @@ use super::{
         resolve_nongeneric_keyof_type_with_session, validate_generic_keyof_index_type,
         validate_source_object_literal_for_keyof,
     },
-    links::{MappedSymbolLinks, TypeNodeLinks, ValueSymbolLinks},
+    links::{MappedSymbolLinks, SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks},
     mapper::TypeMapperApplication,
     object_aliases::{
         property_object_alias_identity_source_header, validate_property_object_alias_arguments,
@@ -60,7 +60,10 @@ use super::{
     signatures::{IndexFlags, IndexInfo},
     store::{SourceMappedTypeOperands, SourceNodeParent},
     template_types::{MAX_TEMPLATE_UNION_SIZE, StringMappingKind},
-    type_nodes::type_alias_instantiation_cache_key,
+    type_nodes::{
+        PropTypesKeyAliasKind, PropTypesKeyAliasPlan, SourceMappedLookupReferenceProof,
+        type_alias_instantiation_cache_key,
+    },
     type_records::{
         CacheHashKey, ConstrainedTypeData, LiteralValue, StructuredTypeData, TypeCacheState,
         TypeData, TypeRecord,
@@ -387,6 +390,558 @@ pub(super) struct SourceMappedLookupProjection {
     pub(super) type_parameters: Vec<TypeId>,
     pub(super) arguments: Vec<TypeId>,
     origin: SourceMappedLookupOrigin,
+}
+
+/// The first source producer owns one concrete alias request and its whole lookup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceMappedLookupRequest {
+    pub(super) alias: SemanticSymbolId,
+    pub(super) declared_lookup: TypeId,
+    pub(super) parameter: TypeId,
+    pub(super) argument: TypeId,
+    pub(super) alias_identity: Option<(SemanticSymbolId, Vec<TypeId>)>,
+    pub(super) key: CacheHashKey,
+    pub(super) lookup: TypeId,
+    pub(super) mapped_type: TypeId,
+    pub(super) producer: SourceMappedLookupProducer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum SourceMappedLookupProducer {
+    Direct {
+        reference: NodeRef,
+        argument: NodeRef,
+        binding: SourceMappedLookupReferenceProof,
+    },
+    OptionalKeys(Box<SourceMappedLookupOptionalProducer>),
+}
+
+/// OptionalKeys supplies the concrete argument for its real RequiredKeys<V> child.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceMappedLookupOptionalProducer {
+    pub(super) reference: NodeRef,
+    pub(super) argument: NodeRef,
+    pub(super) binding: SourceMappedLookupReferenceProof,
+    pub(super) alias: SemanticSymbolId,
+    pub(super) declared_type: TypeId,
+    pub(super) parameter: TypeId,
+    pub(super) alias_identity: Option<(SemanticSymbolId, Vec<TypeId>)>,
+    pub(super) key: CacheHashKey,
+    pub(super) plan: PropTypesKeyAliasPlan,
+}
+
+impl SourceMappedLookupRequest {
+    #[allow(clippy::too_many_arguments)] // These are the original alias factory inputs and its whole result.
+    pub(super) fn for_lookup(
+        store: &CanonicalTypeMapperStore,
+        alias: SemanticSymbolId,
+        declared_lookup: TypeId,
+        parameters: &[TypeId],
+        arguments: &[TypeId],
+        alias_identity: Option<(SemanticSymbolId, Vec<TypeId>)>,
+        key: CacheHashKey,
+        lookup: TypeId,
+        producer: SourceMappedLookupProducer,
+    ) -> Result<Option<Self>, MappedTypeError> {
+        let invalid = || MappedTypeError::InvalidMappedType(lookup);
+        let ([parameter], [argument]) = (parameters, arguments) else {
+            return Err(invalid());
+        };
+        if parameter == argument {
+            return if lookup == declared_lookup {
+                Ok(None)
+            } else {
+                Err(invalid())
+            };
+        }
+        let Some(TypeData::IndexedAccess(indexed)) =
+            store.type_payload(lookup).map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        let template = |lookup| {
+            let TypeData::IndexedAccess(lookup) = store.type_payload(lookup)?.data() else {
+                return None;
+            };
+            let TypeData::Mapped(mapped) = store.type_payload(lookup.object_type)?.data() else {
+                return None;
+            };
+            mapped.template_type
+        };
+        // The neutral generic producer keeps the original template and its own proof.
+        if template(declared_lookup).is_some_and(|original| template(lookup) == Some(original)) {
+            if alias_identity.is_some()
+                || key != type_alias_instantiation_cache_key(arguments, None)
+                || !source_mapped_lookup_identity_projection(store, lookup, None).is_ok_and(
+                    |projection| {
+                        projection.is_some_and(|projection| {
+                            projection.alias == alias
+                                && projection.declared_lookup == declared_lookup
+                                && projection.type_parameters == parameters
+                                && projection.arguments == arguments
+                                && projection.lookup == lookup
+                        })
+                    },
+                )
+            {
+                return Err(invalid());
+            }
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            alias,
+            declared_lookup,
+            parameter: *parameter,
+            argument: *argument,
+            alias_identity,
+            key,
+            lookup,
+            mapped_type: indexed.object_type,
+            producer,
+        }))
+    }
+
+    /// Another source node may reuse the same request without replacing its producer.
+    pub(super) fn same_request(&self, other: &Self) -> bool {
+        self.alias == other.alias
+            && self.declared_lookup == other.declared_lookup
+            && self.parameter == other.parameter
+            && self.argument == other.argument
+            && self.alias_identity == other.alias_identity
+            && self.key == other.key
+            && self.lookup == other.lookup
+            && self.mapped_type == other.mapped_type
+    }
+}
+
+/// Reads the first producer's exact request. A warm cache cannot recreate it.
+pub(super) fn validated_source_mapped_lookup_request(
+    store: &CanonicalTypeMapperStore,
+    mapped_type: TypeId,
+) -> Result<&SourceMappedLookupRequest, MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidMappedType(mapped_type);
+    let request = store
+        .source_mapped_lookup_request(mapped_type)
+        .ok_or_else(invalid)?;
+    let origin = source_mapped_lookup_origin(store, mapped_type)?.ok_or_else(invalid)?;
+    let identity = request
+        .alias_identity
+        .as_ref()
+        .map(|(owner, arguments)| {
+            store
+                .symbol_store()
+                .assigned_global_symbol_id(*owner)
+                .map(|global| (global, arguments.as_slice()))
+                .ok_or_else(invalid)
+        })
+        .transpose()?;
+    if request.mapped_type != mapped_type
+        || request.alias != origin.alias
+        || request.declared_lookup != origin.declared_lookup
+        || request.parameter != origin.source
+        || request.argument == request.parameter
+        || matches!(store.type_payload(mapped_type).map(TypeRecord::data),
+            Some(TypeData::Mapped(mapped)) if mapped.template_type == Some(origin.template))
+        || request.key != type_alias_instantiation_cache_key(&[request.argument], identity)
+        || store
+            .type_alias_links(request.alias)
+            .and_then(|links| links.instantiations.as_ref())
+            .and_then(|entries| entries.get(&request.key))
+            != Some(&request.lookup)
+        || !matches!(store.type_payload(request.lookup).map(TypeRecord::data),
+            Some(TypeData::IndexedAccess(lookup)) if lookup.object_type == mapped_type)
+    {
+        return Err(invalid());
+    }
+    store.validate_prop_types_required_keys_instantiation_worker(
+        request.alias,
+        request.declared_lookup,
+        &[request.parameter],
+        &[request.argument],
+        request.lookup,
+        false,
+    )?;
+    match &request.producer {
+        SourceMappedLookupProducer::Direct {
+            reference,
+            argument,
+            binding,
+        } => {
+            if !binding.matches_source(store, *reference, *argument, request.alias)
+                || source_mapped_reference_request_key(
+                    store,
+                    *reference,
+                    *argument,
+                    request.alias,
+                    request.argument,
+                    request.alias_identity.as_ref(),
+                    Some(request.lookup),
+                )
+                .map_err(|_| invalid())?
+                .0 != request.key
+            {
+                return Err(invalid());
+            }
+        }
+        SourceMappedLookupProducer::OptionalKeys(producer) => {
+            validate_optional_mapped_lookup_producer(store, request, producer)?;
+        }
+    }
+    Ok(request)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Source nodes, argument identity, and alias identity are one request.
+fn source_mapped_reference_request_key(
+    store: &CanonicalTypeMapperStore,
+    reference: NodeRef,
+    argument_node: NodeRef,
+    alias: SemanticSymbolId,
+    argument: TypeId,
+    identity: Option<&(SemanticSymbolId, Vec<TypeId>)>,
+    result: Option<TypeId>,
+) -> Result<(CacheHashKey, Option<TypeId>), MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidMappedType(result.unwrap_or(argument));
+    let children = store
+        .source_direct_children(reference)
+        .ok_or_else(invalid)?;
+    let [name, source_argument] = children.as_slice() else {
+        return Err(invalid());
+    };
+    if store.source_node_kind(reference) != Some(SyntaxKind::TypeReference)
+        || !matches!(
+            store.source_node_kind(*name),
+            Some(SyntaxKind::Identifier | SyntaxKind::QualifiedName)
+        )
+        || *source_argument != argument_node
+        || !source_mapped_argument_is_exact(store, argument_node, argument)
+        || store
+            .symbol_node_links(reference)
+            .is_some_and(|links| links.resolved_symbol.is_some_and(|symbol| symbol != alias))
+        || store.type_node_links(reference).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || result.is_some_and(|result| {
+                    links.resolved_type.is_some_and(|cached| cached != result)
+                })
+        })
+        || !store.source_symbol_declarations_match(alias)
+    {
+        return Err(invalid());
+    }
+    let mut child = reference;
+    let mut seen = HashSet::new();
+    let source_owner = loop {
+        if !seen.insert(child) {
+            return Err(invalid());
+        }
+        let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(child) else {
+            break None;
+        };
+        match store.source_node_kind(parent) {
+            Some(SyntaxKind::ParenthesizedType)
+                if store.source_direct_children(parent).as_deref() == Some(&[child]) =>
+            {
+                child = parent;
+            }
+            Some(SyntaxKind::TypeAliasDeclaration)
+                if store.source_direct_type_annotation(parent) == Some(child) =>
+            {
+                let owner = match store.symbol_store().source_binding_symbols(parent) {
+                    Some([Some(symbol), _]) => store.get_merged_symbol(symbol),
+                    Some([None, _]) => None,
+                    None => store.source_declaration_symbol(parent),
+                }
+                .ok_or_else(invalid)?;
+                break Some(owner);
+            }
+            _ => break None,
+        }
+    };
+    let effective_owner = source_owner.filter(|owner| {
+        !source_mapped_alias_is_local(store, *owner) || source_mapped_alias_is_local(store, alias)
+    });
+    if effective_owner != identity.map(|(owner, _)| *owner) {
+        return Err(invalid());
+    }
+    let identity = identity
+        .map(|(owner, arguments)| {
+            let header = property_object_alias_identity_source_header(store, *owner)
+                .map_err(|_| invalid())?;
+            if header.parameters.len() != arguments.len()
+                || header
+                    .parameters
+                    .iter()
+                    .zip(arguments)
+                    .any(|((_, owner), argument)| {
+                        cached_ordinary_type_parameter_owner(store, *argument) != Some(*owner)
+                    })
+            {
+                return Err(invalid());
+            }
+            store
+                .symbol_store()
+                .assigned_global_symbol_id(*owner)
+                .map(|global| (global, arguments.as_slice()))
+                .ok_or_else(invalid)
+        })
+        .transpose()?;
+    let key = type_alias_instantiation_cache_key(&[argument], identity);
+    let cached = store
+        .type_alias_links(alias)
+        .and_then(|links| links.instantiations.as_ref())
+        .and_then(|entries| entries.get(&key))
+        .copied();
+    let source_result = store
+        .type_node_links(reference)
+        .and_then(|links| links.resolved_type);
+    if result.is_some_and(|result| cached != Some(result))
+        || source_result.is_some_and(|source| cached != Some(source))
+    {
+        return Err(invalid());
+    }
+    Ok((key, cached))
+}
+
+fn source_mapped_argument_is_exact(
+    store: &CanonicalTypeMapperStore,
+    mut node: NodeRef,
+    argument: TypeId,
+) -> bool {
+    let mut seen = HashSet::new();
+    while seen.insert(node) {
+        if store.source_node_kind(node) != Some(SyntaxKind::ParenthesizedType) {
+            return store.source_direct_type_annotation_is_exact(node, argument);
+        }
+        if store.type_node_links(node).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links.resolved_type.is_some_and(|cached| cached != argument)
+        }) || store
+            .symbol_node_links(node)
+            .is_some_and(|links| links.resolved_symbol.is_some())
+        {
+            return false;
+        }
+        let Some(children) = store.source_direct_children(node) else {
+            return false;
+        };
+        let [child] = children.as_slice() else {
+            return false;
+        };
+        node = *child;
+    }
+    false
+}
+
+/// A cached source reference must still identify the first producer's request.
+pub(super) fn source_mapped_lookup_reference_matches(
+    store: &CanonicalTypeMapperStore,
+    reference: NodeRef,
+    lookup: TypeId,
+) -> bool {
+    let Some(TypeData::IndexedAccess(indexed)) = store.type_payload(lookup).map(TypeRecord::data)
+    else {
+        return false;
+    };
+    let Some(children) = store.source_direct_children(reference) else {
+        return false;
+    };
+    let [_, argument] = children.as_slice() else {
+        return false;
+    };
+    if store
+        .source_mapped_lookup_request(indexed.object_type)
+        .is_none()
+    {
+        let Ok(Some(projection)) = source_mapped_lookup_identity_projection(store, lookup, None)
+        else {
+            return false;
+        };
+        let [source] = projection.arguments.as_slice() else {
+            return false;
+        };
+        return projection.lookup == lookup
+            && source_mapped_reference_request_key(
+                store,
+                reference,
+                *argument,
+                projection.alias,
+                *source,
+                None,
+                Some(lookup),
+            )
+            .is_ok_and(|(key, _)| key == type_alias_instantiation_cache_key(&[*source], None));
+    }
+    let Ok(request) = validated_source_mapped_lookup_request(store, indexed.object_type) else {
+        return false;
+    };
+    request.lookup == lookup
+        && source_mapped_reference_request_key(
+            store,
+            reference,
+            *argument,
+            request.alias,
+            request.argument,
+            request.alias_identity.as_ref(),
+            Some(lookup),
+        )
+        .is_ok_and(|(key, _)| key == request.key)
+}
+
+fn source_mapped_alias_is_local(store: &CanonicalTypeMapperStore, alias: SemanticSymbolId) -> bool {
+    let Some([declaration]) = store.symbol(alias).and_then(|owner| owner.declarations()) else {
+        return false;
+    };
+    let mut node = *declaration;
+    let mut seen = HashSet::new();
+    while seen.insert(node) {
+        if matches!(
+            store.source_node_kind(node),
+            Some(
+                SyntaxKind::FunctionDeclaration
+                    | SyntaxKind::FunctionExpression
+                    | SyntaxKind::ArrowFunction
+                    | SyntaxKind::MethodDeclaration
+                    | SyntaxKind::GetAccessor
+                    | SyntaxKind::SetAccessor
+                    | SyntaxKind::Constructor
+            )
+        ) {
+            return true;
+        }
+        let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(node) else {
+            return false;
+        };
+        node = parent;
+    }
+    false
+}
+
+#[allow(clippy::too_many_lines)] // The inner request and the actual outer source form one prefix proof.
+fn validate_optional_mapped_lookup_producer(
+    store: &CanonicalTypeMapperStore,
+    request: &SourceMappedLookupRequest,
+    producer: &SourceMappedLookupOptionalProducer,
+) -> Result<(), MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidMappedType(request.mapped_type);
+    let header = property_object_alias_identity_source_header(store, producer.alias)
+        .map_err(|_| invalid())?;
+    let [(parameter_node, parameter_owner)] = header.parameters.as_slice() else {
+        return Err(invalid());
+    };
+    let source = producer.plan;
+    let links = store.type_alias_links(producer.alias).ok_or_else(invalid)?;
+    if request.alias_identity.is_some()
+        || !producer.binding.matches_source(
+            store,
+            producer.reference,
+            producer.argument,
+            producer.alias,
+        )
+        || source.kind != PropTypesKeyAliasKind::Optional
+        || source.required_alias != Some(request.alias)
+        || source.parameter != *parameter_owner
+        || cached_ordinary_type_parameter_owner(store, producer.parameter) != Some(*parameter_owner)
+        || store.source_node_parent(*parameter_node)
+            != Some(SourceNodeParent::Parent(header.alias_declaration))
+        || store.source_direct_type_annotation(header.alias_declaration) != Some(source.body)
+        || store.get_parent_of_symbol(producer.alias) != Some(source.module)
+        || store.get_parent_of_symbol(request.alias) != Some(source.module)
+        || links.declared_type != Some(producer.declared_type)
+        || links.type_parameters.as_deref() != Some(&[producer.parameter])
+        || !store.source_direct_type_annotation_is_exact(source.body, producer.declared_type)
+    {
+        return Err(invalid());
+    }
+    let children = store
+        .source_direct_children(source.body)
+        .ok_or_else(invalid)?;
+    let [_, keys, required] = children.as_slice() else {
+        return Err(invalid());
+    };
+    let required_children = store
+        .source_direct_children(*required)
+        .ok_or_else(invalid)?;
+    let [_, parameter] = required_children.as_slice() else {
+        return Err(invalid());
+    };
+    if store.source_node_kind(source.body) != Some(SyntaxKind::TypeReference)
+        || store
+            .symbol_node_links(source.body)
+            .and_then(|links| links.resolved_symbol)
+            != source.exclude_alias
+        || store.source_type_operator(*keys) != Some(SyntaxKind::KeyOfKeyword)
+        || store
+            .source_direct_type_annotation(*keys)
+            .is_none_or(|node| {
+                !store.source_direct_type_annotation_is_exact(node, producer.parameter)
+            })
+        || store.source_node_kind(*required) != Some(SyntaxKind::TypeReference)
+        || store.symbol_node_links(*required)
+            != Some(&SymbolNodeLinks {
+                resolved_symbol: Some(request.alias),
+            })
+        || !store.source_direct_type_annotation_is_exact(*parameter, producer.parameter)
+    {
+        return Err(invalid());
+    }
+    let required_lookup = store
+        .type_node_links(*required)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    if store
+        .type_alias_links(request.alias)
+        .and_then(|links| links.instantiations.as_ref())
+        .and_then(|entries| {
+            entries.get(&type_alias_instantiation_cache_key(
+                &[producer.parameter],
+                None,
+            ))
+        })
+        != Some(&required_lookup)
+    {
+        return Err(invalid());
+    }
+    store.validate_prop_types_required_keys_instantiation_worker(
+        request.alias,
+        request.declared_lookup,
+        &[request.parameter],
+        &[producer.parameter],
+        required_lookup,
+        false,
+    )?;
+    let (key, result) = source_mapped_reference_request_key(
+        store,
+        producer.reference,
+        producer.argument,
+        producer.alias,
+        request.argument,
+        producer.alias_identity.as_ref(),
+        None,
+    )
+    .map_err(|_| invalid())?;
+    if key != producer.key {
+        return Err(invalid());
+    }
+    // The inner request exists before the fallible outer Exclude result.
+    if let Some(result) = result {
+        let (Some(TypeData::Conditional(original)), Some(TypeData::Conditional(result))) = (
+            store
+                .type_payload(producer.declared_type)
+                .map(TypeRecord::data),
+            store.type_payload(result).map(TypeRecord::data),
+        ) else {
+            return Err(invalid());
+        };
+        let key_plan =
+            plan_nongeneric_keyof_type(store, request.argument).map_err(|_| invalid())?;
+        let keys = cached_nongeneric_keyof_type(store, &key_plan).map_err(|_| invalid())?;
+        if original.root != result.root
+            || keys != Some(result.check_type)
+            || result.extends_type != request.lookup
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4902,12 +5457,7 @@ fn source_conditional_mapped_demand_with_array_targets(
         .object
         .mapper
         .ok_or(MappedTypeError::UnsupportedTemplate(origin.template))?;
-    let lookup = store
-        .type_alias_links(origin.alias)
-        .and_then(|links| links.instantiations.as_ref())
-        .and_then(|entries| entries.get(&type_list_key(&[argument])))
-        .copied()
-        .ok_or_else(invalid)?;
+    let lookup = validated_source_mapped_lookup_request(store, type_)?.lookup;
     let Some(TypeData::IndexedAccess(indexed)) = store.type_payload(lookup).map(TypeRecord::data)
     else {
         return Err(invalid());
