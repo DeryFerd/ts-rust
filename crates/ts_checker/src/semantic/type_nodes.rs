@@ -77,6 +77,7 @@ use super::{
     instantiated_members::{
         instantiated_function_member_signature_return,
         instantiated_interface_method_signature_return,
+        interface_method_signature_return_for_query,
     },
     interface_heritage::{
         DirectInterfaceBaseKind, DirectInterfaceBasePlan, DirectInterfaceHeritagePlan,
@@ -31001,7 +31002,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .ok_or_else(invalid_method);
         }
         if let Some(method) =
-            instantiated_interface_method_signature_return(self.store, signature, array_targets)
+            interface_method_signature_return_for_query(self.store, signature, array_targets)
                 .map_err(|_| invalid_method())?
         {
             self.reject_type_reference_alias_capabilities()?;
