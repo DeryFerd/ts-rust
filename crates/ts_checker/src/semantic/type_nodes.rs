@@ -30,7 +30,7 @@ use super::{
         conditional_operands_have_disjoint_primitive_domains, conditional_query_alias,
         get_conditional_type_instantiation, get_type_from_conditional_type,
         record_conditional_alias_declaration, validate_conditional_alias_declaration,
-        validate_conditional_reference_result,
+        validate_conditional_reference_result, validate_conditional_source_captures,
     },
     constraints::{get_base_constraint_of_type, get_constraint_of_type},
     declared::{
@@ -3649,8 +3649,23 @@ struct PlannedConditionalType {
     true_type: NodeRef,
     false_type: NodeRef,
     infer_parameters: Vec<SemanticSymbolId>,
-    outer_parameters: Vec<SemanticSymbolId>,
+    outer_parameters: Option<Vec<SemanticSymbolId>>,
     alias_symbol: Option<SemanticSymbolId>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PlannedConditionalCaptures {
+    outer: Option<Vec<SemanticSymbolId>>,
+    infer: Vec<SemanticSymbolId>,
+}
+
+/// Each source node and each parameter/node pair has a finite plan-local slot.
+/// This walk does not resolve branch types or follow referenced alias bodies.
+struct ConditionalCaptureWalk {
+    source: NodeRef,
+    node_limit: usize,
+    nodes: HashSet<NodeRef>,
+    references: HashMap<(NodeRef, SemanticSymbolId), bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5564,6 +5579,637 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(())
     }
 
+    fn conditional_capture_node(
+        &self,
+        node: NodeRef,
+        walk: &mut ConditionalCaptureWalk,
+    ) -> Result<&ts_ast::Node, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        if node.arena != walk.source.arena || node.file != walk.source.file {
+            return Err(invalid());
+        }
+        let record = preflight_node(self.store, self.host, node)?;
+        let parent = record.parent.map_or(SourceNodeParent::Root, |parent| {
+            SourceNodeParent::Parent(NodeRef::new(node.arena, node.file, parent))
+        });
+        if self.store.source_node_kind(node) != Some(record.kind)
+            || self.store.source_node_parent(node) != Some(parent)
+            || walk.nodes.insert(node) && walk.nodes.len() > walk.node_limit
+        {
+            return Err(invalid());
+        }
+        Ok(record)
+    }
+
+    fn conditional_capture_children(
+        &self,
+        node: NodeRef,
+        walk: &mut ConditionalCaptureWalk,
+    ) -> Result<Vec<NodeRef>, DeclaredTypeError> {
+        let record = self.conditional_capture_node(node, walk)?;
+        let mut children = Vec::new();
+        record.for_each_child(|child| children.push(NodeRef::new(node.arena, node.file, child)));
+        let mut seen = HashSet::new();
+        for child in &children {
+            if !seen.insert(*child)
+                || self.conditional_capture_node(*child, walk)?.parent != Some(node.node)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+        }
+        let stored = self.store.source_direct_children(node).ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+        })?;
+        if stored.len() != children.len() || stored.iter().any(|child| !seen.contains(child)) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        Ok(children)
+    }
+
+    fn conditional_capture_ancestors(
+        &self,
+        node: NodeRef,
+        walk: &mut ConditionalCaptureWalk,
+    ) -> Result<Vec<NodeRef>, DeclaredTypeError> {
+        let mut path = Vec::new();
+        let mut seen = HashSet::new();
+        let mut current = node;
+        loop {
+            if !seen.insert(current) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(current),
+                ));
+            }
+            path.push(current);
+            let record = self.conditional_capture_node(current, walk)?;
+            let Some(parent) = record.parent else {
+                if record.kind != SyntaxKind::SourceFile
+                    || self
+                        .host
+                        .bound_file(current)
+                        .is_none_or(|bound| bound.source_file() != current)
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(current),
+                    ));
+                }
+                return Ok(path);
+            };
+            let parent = NodeRef::new(current.arena, current.file, parent);
+            if !self
+                .conditional_capture_children(parent, walk)?
+                .contains(&current)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(current),
+                ));
+            }
+            current = parent;
+        }
+    }
+
+    fn conditional_capture_parameter(
+        &self,
+        declaration: NodeRef,
+        walk: &mut ConditionalCaptureWalk,
+    ) -> Result<SemanticSymbolId, DeclaredTypeError> {
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(declaration));
+        let record = self.conditional_capture_node(declaration, walk)?;
+        if record.kind != SyntaxKind::TypeParameter
+            || !matches!(&record.data, NodeData::TypeParameterDeclaration(_))
+            || record.parent.is_none()
+        {
+            return Err(invalid());
+        }
+        let symbol = self
+            .host
+            .bound_file(declaration)
+            .and_then(|bound| bound.symbol(declaration))
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+            .ok_or_else(invalid)?;
+        preflight_type_parameter_symbol(self.store, self.host, symbol, &mut HashSet::new())?;
+        if !self.store.source_symbol_declarations_match(symbol)
+            || !self
+                .store
+                .source_declaration_belongs_to_symbol(declaration, symbol)
+        {
+            return Err(invalid());
+        }
+        let declarations = self
+            .store
+            .symbol(symbol)
+            .and_then(|symbol| symbol.declarations())
+            .filter(|declarations| !declarations.is_empty())
+            .ok_or_else(invalid)?;
+        for declaration in declarations {
+            let record = self.conditional_capture_node(*declaration, walk)?;
+            if record.kind != SyntaxKind::TypeParameter
+                || !self.host.symbol_matches(self.store, *declaration, symbol)
+                || self
+                    .store
+                    .type_node_links(*declaration)
+                    .is_some_and(|links| {
+                        links.outer_type_parameters.is_some()
+                            || links.resolved_type.is_some_and(|type_| {
+                                cached_ordinary_type_parameter_owner(self.store, type_)
+                                    != Some(symbol)
+                            })
+                    })
+                || self
+                    .store
+                    .symbol_node_links(*declaration)
+                    .is_some_and(|links| {
+                        links.resolved_symbol.is_some_and(|cached| cached != symbol)
+                    })
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(symbol)
+    }
+
+    fn conditional_capture_infer_parameters(
+        &self,
+        conditional: NodeRef,
+        walk: &mut ConditionalCaptureWalk,
+    ) -> Result<Vec<SemanticSymbolId>, DeclaredTypeError> {
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(conditional));
+        let bound = self.host.bound_file(conditional).ok_or_else(invalid)?;
+        let Some(locals) = bound.locals(conditional) else {
+            return Ok(Vec::new());
+        };
+        let locals = self.store.symbol_table(locals).ok_or_else(invalid)?;
+        let mut ordered = Vec::new();
+        let mut seen = HashSet::new();
+        for (_, raw_symbol) in locals.iter() {
+            let symbol = self
+                .store
+                .get_merged_symbol(raw_symbol)
+                .ok_or_else(invalid)?;
+            let record = self.store.symbol(symbol).ok_or_else(invalid)?;
+            if !record.flags().contains(SymbolFlags::TYPE_PARAMETER) {
+                continue;
+            }
+            let declarations = record
+                .declarations()
+                .filter(|declarations| !declarations.is_empty())
+                .ok_or_else(invalid)?;
+            let mut first = None;
+            for declaration in declarations {
+                if self.conditional_capture_parameter(*declaration, walk)? != symbol {
+                    return Err(invalid());
+                }
+                let path = self.conditional_capture_ancestors(*declaration, walk)?;
+                let Some(infer) = path.get(1).copied() else {
+                    return Err(invalid());
+                };
+                if !matches!(&self.conditional_capture_node(infer, walk)?.data,
+                    NodeData::InferTypeNode(data) if data.type_parameter == declaration.node)
+                {
+                    return Err(invalid());
+                }
+                let owner = path[1..].windows(2).find_map(|pair| {
+                    let NodeData::ConditionalTypeNode(data) = &self.host.node(pair[1])?.data else {
+                        return None;
+                    };
+                    (data.extends_type == pair[0].node).then_some(pair[1])
+                });
+                if owner != Some(conditional) {
+                    return Err(invalid());
+                }
+                let start = self
+                    .conditional_capture_node(*declaration, walk)?
+                    .range
+                    .start;
+                let position = (start, *declaration);
+                first = Some(first.map_or(position, |previous| std::cmp::min(previous, position)));
+            }
+            if !seen.insert(symbol) {
+                return Err(invalid());
+            }
+            ordered.push((first.ok_or_else(invalid)?, symbol));
+        }
+        ordered.sort_unstable_by_key(|(position, _)| *position);
+        Ok(ordered.into_iter().map(|(_, symbol)| symbol).collect())
+    }
+
+    fn conditional_capture_identifier_symbol(
+        &self,
+        name: NodeRef,
+        meaning: SymbolFlags,
+    ) -> Result<Option<SemanticSymbolId>, DeclaredTypeError> {
+        let NodeData::Identifier(identifier) = &preflight_node(self.store, self.host, name)?.data
+        else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(name),
+            ));
+        };
+        let (arena, bound) = self
+            .host
+            .source(name)
+            .ok_or(DeclaredTypeUnavailable::MissingOrForeignFacts(name))?;
+        let mut callback_host = self.host.name_resolver_host(self.store)?;
+        let resolved = CanonicalNameResolver::new(
+            arena,
+            bound,
+            self.store.symbol_store(),
+            &mut callback_host,
+        )?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(name)),
+            &identifier.text,
+            meaning,
+            None,
+            true,
+            false,
+        );
+        let symbol = match resolved {
+            Ok(symbol) => symbol,
+            Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias))
+                if self
+                    .store
+                    .symbol(alias)
+                    .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::ALIAS)) =>
+            {
+                Some(alias)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        symbol
+            .map(|symbol| {
+                self.store.get_merged_symbol(symbol).ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(name))
+                })
+            })
+            .transpose()
+    }
+
+    fn conditional_capture_query_may_reference(
+        &self,
+        query: NodeRef,
+        parameter: SemanticSymbolId,
+        walk: &mut ConditionalCaptureWalk,
+    ) -> Result<bool, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(query));
+        let NodeData::TypeQueryNode(data) = &self.conditional_capture_node(query, walk)?.data
+        else {
+            return Err(invalid());
+        };
+        let mut name = NodeRef::new(query.arena, query.file, data.expr_name);
+        let mut visited = HashSet::new();
+        let symbol = loop {
+            if !visited.insert(name) {
+                return Err(invalid());
+            }
+            self.conditional_capture_children(name, walk)?;
+            match &self.conditional_capture_node(name, walk)?.data {
+                NodeData::Identifier(identifier) if identifier.text == "this" => return Ok(true),
+                NodeData::Identifier(_) => {
+                    break self.conditional_capture_identifier_symbol(name, SymbolFlags::VALUE)?;
+                }
+                NodeData::QualifiedName(data) => {
+                    name = NodeRef::new(name.arena, name.file, data.left)
+                }
+                NodeData::PropertyAccessExpression(data) => {
+                    name = NodeRef::new(name.arena, name.file, data.expression)
+                }
+                _ if self
+                    .host
+                    .node(name)
+                    .is_some_and(|record| record.kind == SyntaxKind::ThisKeyword) =>
+                {
+                    return Ok(true);
+                }
+                _ => {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::UnsupportedSyntax {
+                            node: query,
+                            kind: SyntaxKind::TypeQuery,
+                        },
+                    ));
+                }
+            }
+        };
+        let Some(symbol) = symbol else {
+            return Ok(false);
+        };
+        let Some([declaration]) = self
+            .store
+            .symbol(parameter)
+            .and_then(|symbol| symbol.declarations())
+        else {
+            return Ok(true);
+        };
+        let scope = self
+            .conditional_capture_node(*declaration, walk)?
+            .parent
+            .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+            .ok_or_else(invalid)?;
+        let declarations = self
+            .store
+            .symbol(symbol)
+            .ok_or_else(invalid)?
+            .declarations()
+            .unwrap_or_default();
+        for declaration in declarations {
+            if declaration.arena != scope.arena || declaration.file != scope.file {
+                continue;
+            }
+            if self
+                .conditional_capture_ancestors(*declaration, walk)?
+                .contains(&scope)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Follows source syntax only. Completed node/parameter pairs are reused.
+    #[allow(clippy::too_many_lines)] // Type queries and method annotations have distinct source traversal rules.
+    fn conditional_capture_contains_reference(
+        &self,
+        root: NodeRef,
+        parameter: SemanticSymbolId,
+        walk: &mut ConditionalCaptureWalk,
+    ) -> Result<bool, DeclaredTypeError> {
+        let mut pending: Vec<(NodeRef, Option<Vec<NodeRef>>)> = vec![(root, None)];
+        let mut active = HashSet::new();
+        while let Some((node, completed_children)) = pending.pop() {
+            if walk.references.contains_key(&(node, parameter)) {
+                continue;
+            }
+            if let Some(children) = completed_children {
+                let result = children
+                    .into_iter()
+                    .any(|child| walk.references[&(child, parameter)]);
+                walk.references.insert((node, parameter), result);
+                active.remove(&node);
+                continue;
+            }
+            if !active.insert(node) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+            let mut children = self.conditional_capture_children(node, walk)?;
+            let record = self.conditional_capture_node(node, walk)?;
+            let mut direct = false;
+            match &record.data {
+                NodeData::TypeReferenceNode(reference)
+                    if reference
+                        .type_arguments
+                        .as_ref()
+                        .is_none_or(|arguments| arguments.nodes.is_empty()) =>
+                {
+                    let name = NodeRef::new(node.arena, node.file, reference.type_name);
+                    if matches!(
+                        &self.conditional_capture_node(name, walk)?.data,
+                        NodeData::Identifier(_)
+                    ) {
+                        direct = self
+                            .conditional_capture_identifier_symbol(name, SymbolFlags::TYPE)?
+                            == Some(parameter);
+                    }
+                }
+                NodeData::TypeQueryNode(query) => {
+                    direct = self.conditional_capture_query_may_reference(node, parameter, walk)?;
+                    children = query
+                        .type_arguments
+                        .iter()
+                        .flat_map(|arguments| &arguments.nodes)
+                        .map(|child| NodeRef::new(node.arena, node.file, *child))
+                        .collect();
+                }
+                NodeData::MethodDeclaration(method) => {
+                    direct = method.type_.is_none() && method.body.is_some();
+                    children = method
+                        .type_parameters
+                        .iter()
+                        .flat_map(|parameters| &parameters.nodes)
+                        .chain(&method.parameters.nodes)
+                        .copied()
+                        .chain(method.type_)
+                        .map(|child| NodeRef::new(node.arena, node.file, child))
+                        .collect();
+                }
+                NodeData::MethodSignatureDeclaration(method) => {
+                    children = method
+                        .type_parameters
+                        .iter()
+                        .flat_map(|parameters| &parameters.nodes)
+                        .chain(&method.parameters.nodes)
+                        .copied()
+                        .chain(method.type_)
+                        .map(|child| NodeRef::new(node.arena, node.file, child))
+                        .collect();
+                }
+                _ => {}
+            }
+            if direct {
+                walk.references.insert((node, parameter), true);
+                active.remove(&node);
+            } else {
+                pending.push((node, Some(children.clone())));
+                pending.extend(children.into_iter().rev().map(|child| (child, None)));
+            }
+        }
+        walk.references
+            .get(&(root, parameter))
+            .copied()
+            .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(root)))
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep lexical collection and Go's source-only filtering together.
+    fn plan_conditional_captures(
+        &self,
+        node: NodeRef,
+        alias: Option<SemanticSymbolId>,
+    ) -> Result<PlannedConditionalCaptures, DeclaredTypeError> {
+        let (arena, _) = self
+            .host
+            .source(node)
+            .ok_or(DeclaredTypeUnavailable::MissingOrForeignFacts(node))?;
+        let mut walk = ConditionalCaptureWalk {
+            source: node,
+            node_limit: arena.len(),
+            nodes: HashSet::new(),
+            references: HashMap::new(),
+        };
+        let ancestors = self.conditional_capture_ancestors(node, &mut walk)?;
+        let mut outer = None;
+        for scope in ancestors.iter().skip(1).rev().copied() {
+            let record = self.conditional_capture_node(scope, &mut walk)?;
+            let parameters = match &record.data {
+                NodeData::MappedTypeNode(mapped) => {
+                    let declaration = NodeRef::new(scope.arena, scope.file, mapped.type_parameter);
+                    vec![self.conditional_capture_parameter(declaration, &mut walk)?]
+                }
+                NodeData::ConditionalTypeNode(_) => {
+                    self.conditional_capture_infer_parameters(scope, &mut walk)?
+                }
+                NodeData::ClassDeclaration(_)
+                | NodeData::ClassExpression(_)
+                | NodeData::InterfaceDeclaration(_)
+                | NodeData::FunctionExpression(_)
+                | NodeData::ArrowFunction(_) => {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::UnsupportedSyntax {
+                            node: scope,
+                            kind: record.kind,
+                        },
+                    ));
+                }
+                _ => {
+                    let parameters = match &record.data {
+                        NodeData::TypeAliasDeclaration(data) => data.type_parameters.as_ref(),
+                        NodeData::FunctionDeclaration(data) => data.type_parameters.as_ref(),
+                        NodeData::FunctionTypeNode(data) => data.type_parameters.as_ref(),
+                        NodeData::ConstructorTypeNode(data) => data.type_parameters.as_ref(),
+                        NodeData::CallSignatureDeclaration(data) => data.type_parameters.as_ref(),
+                        NodeData::ConstructSignatureDeclaration(data) => {
+                            data.type_parameters.as_ref()
+                        }
+                        NodeData::MethodSignatureDeclaration(data) => data.type_parameters.as_ref(),
+                        NodeData::MethodDeclaration(data) => {
+                            if record.parent.is_some_and(|parent| {
+                                self.host
+                                    .node(NodeRef::new(scope.arena, scope.file, parent))
+                                    .is_some_and(|parent| {
+                                        parent.kind == SyntaxKind::ObjectLiteralExpression
+                                    })
+                            }) {
+                                return Err(type_node_unavailable(
+                                    TypeNodeUnavailable::UnsupportedSyntax {
+                                        node: scope,
+                                        kind: record.kind,
+                                    },
+                                ));
+                            }
+                            data.type_parameters.as_ref()
+                        }
+                        _ => None,
+                    };
+                    let symbols = explicit_type_parameter_symbols(
+                        self.store,
+                        self.host,
+                        scope,
+                        parameters,
+                        &mut HashSet::new(),
+                    )?;
+                    for declaration in parameters.iter().flat_map(|parameters| &parameters.nodes) {
+                        self.conditional_capture_parameter(
+                            NodeRef::new(scope.arena, scope.file, *declaration),
+                            &mut walk,
+                        )?;
+                    }
+                    symbols
+                }
+            };
+            if !parameters.is_empty() {
+                let captured = outer.get_or_insert_with(Vec::new);
+                for parameter in parameters {
+                    if !captured.contains(&parameter) {
+                        captured.push(parameter);
+                    }
+                }
+            }
+        }
+        let generic_alias = if let Some(alias) = alias {
+            if self.direct_type_alias_owner(node)? != Some(alias) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+            let Some([declaration]) = self
+                .store
+                .symbol(alias)
+                .and_then(|symbol| symbol.declarations())
+            else {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            };
+            let NodeData::TypeAliasDeclaration(data) =
+                &self.conditional_capture_node(*declaration, &mut walk)?.data
+            else {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            };
+            data.type_parameters
+                .as_ref()
+                .is_some_and(|parameters| !parameters.nodes.is_empty())
+        } else {
+            false
+        };
+        if !generic_alias && let Some(candidates) = outer.take() {
+            let mut retained = Vec::new();
+            for parameter in candidates {
+                let declarations = self
+                    .store
+                    .symbol(parameter)
+                    .and_then(|symbol| symbol.declarations())
+                    .unwrap_or_default();
+                let possibly_referenced = if let [declaration] = declarations {
+                    let container = self
+                        .conditional_capture_node(*declaration, &mut walk)?
+                        .parent
+                        .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent));
+                    if let Some(index) = ancestors
+                        .iter()
+                        .position(|ancestor| Some(*ancestor) == container)
+                    {
+                        let mut retained_by_ancestor = false;
+                        for ancestor in &ancestors[..index] {
+                            let record = self.conditional_capture_node(*ancestor, &mut walk)?;
+                            if record.kind == SyntaxKind::Block {
+                                retained_by_ancestor = true;
+                                break;
+                            }
+                            if let NodeData::ConditionalTypeNode(conditional) = &record.data
+                                && self.conditional_capture_contains_reference(
+                                    NodeRef::new(
+                                        ancestor.arena,
+                                        ancestor.file,
+                                        conditional.extends_type,
+                                    ),
+                                    parameter,
+                                    &mut walk,
+                                )?
+                            {
+                                retained_by_ancestor = true;
+                                break;
+                            }
+                        }
+                        retained_by_ancestor
+                            || self.conditional_capture_contains_reference(
+                                node, parameter, &mut walk,
+                            )?
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
+                if possibly_referenced {
+                    retained.push(parameter);
+                }
+            }
+            outer = Some(retained);
+        }
+        let infer = self.conditional_capture_infer_parameters(node, &mut walk)?;
+        validate_conditional_source_captures(self.store, node, outer.as_deref(), &infer)
+            .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)))?;
+        Ok(PlannedConditionalCaptures { outer, infer })
+    }
+
     fn plan_conditional_type(
         &mut self,
         node: NodeRef,
@@ -5602,6 +6248,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 ));
             }
         }
+        let captures = self.plan_conditional_captures(node, derived_alias)?;
         self.plan_type_node_in_context(check_type, None, false)?;
         self.plan_type_node_in_context(extends_type, None, false)?;
         if self.conditional_operand_contains_infer(extends_type, &mut HashSet::new())? {
@@ -5622,31 +6269,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.plan_type_node_in_context(false_type, None, false)?;
             }
         }
-        let infer_parameters = self
-            .plan
-            .infer_parameters
-            .iter()
-            .filter_map(|(infer, symbol)| {
-                let mut current = *infer;
-                while let Some(parent) = self.host.node(current).and_then(|node| node.parent) {
-                    current = NodeRef::new(current.arena, current.file, parent);
-                    if current == node {
-                        return Some(*symbol);
-                    }
-                }
-                None
-            })
-            .collect();
-        let outer_parameters = derived_alias
-            .and_then(|owner| self.plan.aliases.get(&owner))
-            .map(|alias| {
-                alias
-                    .type_parameters
-                    .iter()
-                    .map(|parameter| parameter.symbol)
-                    .collect()
-            })
-            .unwrap_or_default();
         self.plan.conditionals.insert(
             node,
             PlannedConditionalType {
@@ -5654,8 +6276,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 extends_type,
                 true_type,
                 false_type,
-                infer_parameters,
-                outer_parameters,
+                infer_parameters: captures.infer,
+                outer_parameters: captures.outer,
                 alias_symbol: derived_alias,
             },
         );
@@ -6242,22 +6864,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let check_type = NodeRef::new(node.arena, node.file, conditional.check_type);
         self.plan_mapped_template_type(check_type, mapped_parameter)?;
         self.plan_conditional_type(node, None)?;
-        let constrained_parameter = self
-            .plan
-            .aliases
-            .get(&alias)
-            .and_then(|alias| alias.type_parameters.get(1))
-            .map(|parameter| parameter.symbol)
-            .ok_or_else(|| {
-                type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(alias))
-            })?;
-        let conditional = self.plan.conditionals.get_mut(&node).ok_or_else(|| {
-            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
-                node,
-                kind: SyntaxKind::ConditionalType,
-            })
-        })?;
-        conditional.outer_parameters = vec![constrained_parameter, mapped_parameter];
         Ok(())
     }
 
@@ -29247,6 +29853,28 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         additional_union_operations: usize,
         additional_source_types: usize,
     ) -> Result<PreparedTypeQueryTypes, DeclaredTypeError> {
+        let mut conditional_parameters = HashSet::new();
+        for parameter in plan.conditionals.values().flat_map(|conditional| {
+            conditional
+                .outer_parameters
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .chain(&conditional.infer_parameters)
+        }) {
+            if self
+                .store
+                .declared_type_links(*parameter)
+                .and_then(|links| links.declared_type)
+                .is_none()
+            {
+                conditional_parameters.insert(*parameter);
+            }
+        }
+        let conditional_declared_links = conditional_parameters
+            .iter()
+            .filter(|parameter| self.store.declared_type_links(**parameter).is_none())
+            .count();
         // Check every property route before publishing any cold import links.
         for (&node, reference) in &plan.references {
             let Some(property) = &reference.property_import else {
@@ -29511,6 +30139,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|count| count.checked_add(tuple_preflight.additional_types()))
             .and_then(|count| count.checked_add(cold_function_types))
             .and_then(|count| count.checked_add(cold_constructors.len()))
+            .and_then(|count| count.checked_add(conditional_parameters.len()))
             .and_then(|count| {
                 count.checked_add(
                     plan.unique_symbols
@@ -29597,6 +30226,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         if !self.store.try_reserve_index_infos(index_infos)
             || !self.store.try_reserve_types(additional_types)
+            || !self
+                .store
+                .try_reserve_declared_type_links(conditional_declared_links)
             || !self.store.try_reserve_symbol_node_links(symbol_node_links)
             || !self.store.try_reserve_type_node_links(type_node_links)
         {
@@ -31363,11 +31995,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if !infer_type_parameters.is_empty() {
             self.resolve_conditional_callable_returns([check_type, extends_type], plan, prepared)?;
         }
-        let outer_type_parameters = conditional
-            .outer_parameters
-            .iter()
-            .map(|symbol| execute_type_parameter(self.store, *symbol))
-            .collect::<Vec<_>>();
+        let outer_type_parameters = conditional.outer_parameters.as_ref().map(|parameters| {
+            parameters
+                .iter()
+                .map(|symbol| execute_type_parameter(self.store, *symbol))
+                .collect::<Vec<_>>()
+        });
         let demand = self.conditional_branch_demand(
             node,
             check_type,
@@ -31414,7 +32047,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 extends_type,
                 branches,
                 infer_type_parameters: &infer_type_parameters,
-                outer_type_parameters: &outer_type_parameters,
+                outer_type_parameters: outer_type_parameters.as_deref(),
                 alias,
             },
             self.global_types.as_ref(),
@@ -31512,7 +32145,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             || signature.type_parameters() != [check_type].as_slice()
             || !signature.parameters().is_empty()
             || !conditional.infer_parameters.is_empty()
-            || !conditional.outer_parameters.is_empty()
+            || conditional.outer_parameters.as_deref() != Some([parameter].as_slice())
             || [conditional.true_type, conditional.false_type]
                 .into_iter()
                 .any(|branch| {
@@ -31753,7 +32386,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             reference.type_arguments.is_empty()
                                 && reference.import_alias.is_none()
                                 && reference.arity == PlannedTypeReferenceArity::Valid
-                                && conditional.outer_parameters.contains(&reference.symbol)
+                                && conditional
+                                    .outer_parameters
+                                    .as_deref()
+                                    .unwrap_or_default()
+                                    .contains(&reference.symbol)
                         })
                     }
                     _ => false,
@@ -54150,6 +54787,246 @@ mod tests {
             };
             let unselected = NodeRef::new(conditional.arena, conditional.file, unselected);
             assert!(fixture.store.type_node_links(unselected).is_none());
+        }
+    }
+
+    fn capture_conditional_nodes(fixture: &Fixture) -> Vec<NodeRef> {
+        let mut nodes = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(id, record)| {
+                (record.kind == SyntaxKind::ConditionalType).then_some((
+                    record.range.start,
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, id),
+                ))
+            })
+            .collect::<Vec<_>>();
+        nodes.sort_unstable();
+        nodes.into_iter().map(|(_, node)| node).collect()
+    }
+
+    fn capture_parameter_symbol(
+        fixture: &Fixture,
+        name: &str,
+        parent_kind: SyntaxKind,
+    ) -> SemanticSymbolId {
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                let NodeData::TypeParameterDeclaration(parameter) = &record.data else {
+                    return None;
+                };
+                (identifier_text(&fixture.parsed.arena, parameter.name) == Some(name)
+                    && fixture.parsed.arena.get(record.parent?)?.kind == parent_kind)
+                    .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, id))
+            })
+            .unwrap();
+        fixture
+            .store
+            .get_merged_symbol(fixture.files[&fixture.file].symbol(declaration).unwrap())
+            .unwrap()
+    }
+
+    fn source_capture_plan(
+        fixture: &Fixture,
+        node: NodeRef,
+    ) -> Result<PlannedConditionalCaptures, DeclaredTypeError> {
+        let host = post_global_host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let imports = HashMap::new();
+        let planner = TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &imports);
+        planner.plan_conditional_captures(node, planner.direct_type_alias_owner(node)?)
+    }
+
+    #[test]
+    fn conditional_source_captures_keep_the_original_required_keys_parameters() {
+        let fixture = fixture(
+            "type RequiredKeys<T> = { [K in keyof T]: T[K] extends Required<T>[K] ? K : never }[keyof T];",
+        );
+        let node = capture_conditional_nodes(&fixture)[0];
+        let source = capture_parameter_symbol(&fixture, "T", SyntaxKind::TypeAliasDeclaration);
+        let key = capture_parameter_symbol(&fixture, "K", SyntaxKind::MappedType);
+        let before = store_state(&fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                source_capture_plan(&fixture, node),
+                Ok(PlannedConditionalCaptures {
+                    outer: Some(vec![source, key]),
+                    infer: Vec::new(),
+                })
+            );
+            assert_eq!(store_state(&fixture.store), before);
+            for (id, _) in fixture.parsed.arena.iter() {
+                let node = NodeRef::new(fixture.parsed.arena.id(), fixture.file, id);
+                assert!(fixture.store.type_node_links(node).is_none());
+                assert!(fixture.store.symbol_node_links(node).is_none());
+            }
+            assert!(fixture.store.declared_type_links(source).is_none());
+            assert!(fixture.store.declared_type_links(key).is_none());
+        }
+    }
+
+    #[test]
+    fn conditional_source_captures_filter_unused_parameters_but_read_both_branches() {
+        let fixture = fixture(concat!(
+            "type M<T, Unused> = { [K in keyof T]: [",
+            "T[K] extends string ? K : never, ",
+            "K extends string ? T : never, ",
+            "string extends number ? 0 : 1] }; ",
+            "type Plain = string extends number ? 0 : 1;",
+        ));
+        let nodes = capture_conditional_nodes(&fixture);
+        assert_eq!(nodes.len(), 4);
+        let source = capture_parameter_symbol(&fixture, "T", SyntaxKind::TypeAliasDeclaration);
+        let key = capture_parameter_symbol(&fixture, "K", SyntaxKind::MappedType);
+        let before = store_state(&fixture.store);
+        for (node, outer) in nodes.into_iter().zip([
+            Some(vec![source, key]),
+            Some(vec![source, key]),
+            Some(Vec::new()),
+            None,
+        ]) {
+            assert_eq!(
+                source_capture_plan(&fixture, node),
+                Ok(PlannedConditionalCaptures {
+                    outer,
+                    infer: Vec::new(),
+                })
+            );
+        }
+        assert_eq!(store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn conditional_source_captures_keep_generic_function_and_type_query_dependencies() {
+        let fixture = fixture(concat!(
+            "declare const externalValue: string; ",
+            "function outer<Outer, Unused>() { ",
+            "type Select<Own> = Own extends string ? Outer : never; ",
+            "type Closed = { value: string extends number ? 0 : 1 }; } ",
+            "type ValueQuery = <Value>(argument: Value) => string extends typeof argument ? 0 : 1; ",
+            "type ExternalQuery = <Cold>() => string extends typeof externalValue ? 0 : 1;",
+        ));
+        let outer = capture_parameter_symbol(&fixture, "Outer", SyntaxKind::FunctionDeclaration);
+        let unused = capture_parameter_symbol(&fixture, "Unused", SyntaxKind::FunctionDeclaration);
+        let own = capture_parameter_symbol(&fixture, "Own", SyntaxKind::TypeAliasDeclaration);
+        let value = capture_parameter_symbol(&fixture, "Value", SyntaxKind::FunctionType);
+        let nodes = capture_conditional_nodes(&fixture);
+        assert_eq!(nodes.len(), 4);
+        let before = store_state(&fixture.store);
+        for (node, parameters) in nodes.into_iter().zip([
+            vec![outer, unused, own],
+            vec![outer, unused],
+            vec![value],
+            Vec::new(),
+        ]) {
+            assert_eq!(
+                source_capture_plan(&fixture, node),
+                Ok(PlannedConditionalCaptures {
+                    outer: Some(parameters),
+                    infer: Vec::new(),
+                })
+            );
+        }
+        assert_eq!(store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn conditional_source_captures_separate_infer_scopes_and_shadowed_names() {
+        let fixture = fixture(concat!(
+            "type Nested<T, U> = T extends infer U ",
+            "? (U extends infer V ? [U, V] : never) ",
+            ": (U extends infer W ? [U, W] : never); ",
+            "type Repeated<R> = R extends [infer Item, infer Item] ? Item : never;",
+        ));
+        let parameter = capture_parameter_symbol(&fixture, "T", SyntaxKind::TypeAliasDeclaration);
+        let alias_u = capture_parameter_symbol(&fixture, "U", SyntaxKind::TypeAliasDeclaration);
+        let infer_u = capture_parameter_symbol(&fixture, "U", SyntaxKind::InferType);
+        let infer_v = capture_parameter_symbol(&fixture, "V", SyntaxKind::InferType);
+        let infer_w = capture_parameter_symbol(&fixture, "W", SyntaxKind::InferType);
+        let repeated = capture_parameter_symbol(&fixture, "R", SyntaxKind::TypeAliasDeclaration);
+        let item = capture_parameter_symbol(&fixture, "Item", SyntaxKind::InferType);
+        assert_ne!(alias_u, infer_u);
+        assert_eq!(
+            fixture
+                .store
+                .symbol(item)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .len(),
+            2
+        );
+        let nodes = capture_conditional_nodes(&fixture);
+        assert_eq!(nodes.len(), 4);
+        let before = store_state(&fixture.store);
+        for (node, (outer, infer)) in nodes.into_iter().zip([
+            (vec![parameter, alias_u], vec![infer_u]),
+            (vec![infer_u], vec![infer_v]),
+            (vec![alias_u, infer_u], vec![infer_w]),
+            (vec![repeated], vec![item]),
+        ]) {
+            assert_eq!(
+                source_capture_plan(&fixture, node),
+                Ok(PlannedConditionalCaptures {
+                    outer: Some(outer),
+                    infer,
+                })
+            );
+        }
+        assert_eq!(store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn conditional_source_captures_do_not_omit_unproved_receiver_or_contextual_parameters() {
+        for (source, kind) in [
+            (
+                "interface Shape<T> { value: string extends number ? 0 : 1; }",
+                SyntaxKind::InterfaceDeclaration,
+            ),
+            (
+                "class Shape<T> { method() { type C = string extends number ? 0 : 1; } }",
+                SyntaxKind::ClassDeclaration,
+            ),
+            (
+                "const make = function <T>() { type C = string extends number ? 0 : 1; };",
+                SyntaxKind::FunctionExpression,
+            ),
+            (
+                "const make = <T>() => { type C = string extends number ? 0 : 1; };",
+                SyntaxKind::ArrowFunction,
+            ),
+            (
+                "const object = { make<T>() { type C = string extends number ? 0 : 1; } };",
+                SyntaxKind::MethodDeclaration,
+            ),
+        ] {
+            let fixture = fixture(source);
+            let node = capture_conditional_nodes(&fixture)[0];
+            let scope = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(id, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        id,
+                    ))
+                })
+                .unwrap();
+            let before = store_state(&fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    source_capture_plan(&fixture, node),
+                    Err(type_node_unavailable(
+                        TypeNodeUnavailable::UnsupportedSyntax { node: scope, kind },
+                    ))
+                );
+                assert_eq!(store_state(&fixture.store), before);
+            }
         }
     }
 
