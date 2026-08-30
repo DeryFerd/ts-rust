@@ -12753,7 +12753,7 @@ mod tests {
     }
 
     fn assert_source_class_display_without_writes(
-        context: &CanonicalCheckerContext<'_>,
+        context: &mut CanonicalCheckerContext<'_>,
         type_: TypeId,
         declaration: NodeRef,
         expected: Result<&str, TypeDisplayUnavailable>,
@@ -12803,7 +12803,7 @@ mod tests {
             assert_eq!(context.get_type_at_location(name).unwrap(), types[0]);
             for (type_, expected) in types.into_iter().zip(["Foo", "typeof Foo"]) {
                 assert_source_class_display_without_writes(
-                    &context,
+                    &mut context,
                     type_,
                     declaration,
                     Ok(expected),
@@ -12831,7 +12831,7 @@ mod tests {
             );
             for (type_, expected) in types.into_iter().zip(["Foo", "typeof Foo"]) {
                 assert_source_class_display_without_writes(
-                    &context,
+                    &mut context,
                     type_,
                     declaration,
                     Ok(expected),
@@ -12880,7 +12880,7 @@ mod tests {
                 );
                 for type_ in types {
                     assert_source_class_display_without_writes(
-                        &context,
+                        &mut context,
                         type_,
                         declaration,
                         Err(TypeDisplayUnavailable::MalformedType(type_)),
@@ -12897,7 +12897,7 @@ mod tests {
                 );
                 for (type_, expected) in types.into_iter().zip(["Foo", "typeof Foo"]) {
                     assert_source_class_display_without_writes(
-                        &context,
+                        &mut context,
                         type_,
                         declaration,
                         Ok(expected),
@@ -12932,7 +12932,7 @@ mod tests {
             );
             for type_ in types {
                 assert_source_class_display_without_writes(
-                    &context,
+                    &mut context,
                     type_,
                     declaration,
                     Err(TypeDisplayUnavailable::MalformedType(type_)),
@@ -12945,7 +12945,7 @@ mod tests {
             );
             for (type_, expected) in types.into_iter().zip(["Foo", "typeof Foo"]) {
                 assert_source_class_display_without_writes(
-                    &context,
+                    &mut context,
                     type_,
                     declaration,
                     Ok(expected),
@@ -12973,7 +12973,7 @@ mod tests {
             );
             assert!(context.store().value_symbol_links(owner).is_none());
             assert_source_class_display_without_writes(
-                &context,
+                &mut context,
                 instance,
                 declaration,
                 Err(TypeDisplayUnavailable::MalformedType(instance)),
@@ -12999,7 +12999,7 @@ mod tests {
             members.shells().value_type(),
         ] {
             assert_source_class_display_without_writes(
-                &context,
+                &mut context,
                 type_,
                 declaration,
                 Err(TypeDisplayUnavailable::MalformedType(type_)),
