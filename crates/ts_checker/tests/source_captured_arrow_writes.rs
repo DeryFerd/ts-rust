@@ -728,9 +728,9 @@ fn assert_subscribe(
         let mapped_type = cached_type(context, callee);
         let mapped = object(context, mapped_type);
         assert_eq!(mapped.target, Some(source_type));
-        let mapper = mapped.mapper.unwrap();
+        let substitution = mapped.mapper.unwrap();
         assert_eq!(
-            context.store().map_type(mapper, source_element),
+            context.store().map_type(substitution, source_element),
             Some(element)
         );
         let selected = signature(context, call);
@@ -741,14 +741,14 @@ fn assert_subscribe(
         let selected_record = context.store().signature(selected).unwrap();
         assert_eq!(selected_record.declaration(), Some(library_method));
         assert_eq!(selected_record.target(), Some(source_signature));
-        assert_eq!(selected_record.mapper(), Some(mapper));
+        assert_eq!(selected_record.mapper(), Some(substitution));
         assert!(selected_record.type_parameters().is_empty());
         assert_eq!(selected_record.parameters().len(), 1);
         assert!(selected_record.has_rest_parameter());
         assert_eq!(value_type(context, selected_record.parameters()[0]), array);
         assert_eq!(selected_record.resolved_return_type(), Some(number));
         assert_eq!(cached_type(context, call), number);
-        let identity = (mapped_type, selected, mapper);
+        let identity = (mapped_type, selected, substitution);
         if let Some(expected) = mapped_identity {
             assert_eq!(identity, expected);
         }
@@ -778,7 +778,15 @@ fn assert_subscribe(
         ]);
         proof.returns.push((selected, number));
         let (_, bound) = context.file(SOURCE_FILE).unwrap();
-        assert_eq!(bound.flow_container(call), Some(subscribe));
+        assert_eq!(bound.container(call), Some(subscribe));
+        let statement = node_ref(parsed, parsed.arena.get(call.node).unwrap().parent.unwrap());
+        let NodeData::ExpressionStatement(statement_data) =
+            &parsed.arena.get(statement.node).unwrap().data
+        else {
+            panic!("each push must remain in its actual expression statement")
+        };
+        assert_eq!(node_ref(parsed, statement_data.expression), call);
+        assert_eq!(bound.flow_container(statement), Some(subscribe));
         let graph = bound.flow_graph().nodes();
         let rows = graph
             .iter()

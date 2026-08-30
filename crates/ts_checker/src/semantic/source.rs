@@ -24301,7 +24301,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || self.bound.container(left.node) != Some(immediate.writer)
             || self.bound.flow_container(left.node) != Some(immediate.writer)
             || self.bound.container(parameter) != Some(child)
-            || self.bound.flow_container(initializer) != Some(child)
+            || self.bound.container(initializer) != Some(child)
             || stored_child
                 .parameters
                 .iter()
@@ -109222,7 +109222,12 @@ class Foo2 {
             panic!("expected the actual default parameter")
         };
         let call = NodeRef::new(source.arena.id(), file, parameter_data.initializer.unwrap());
-        let writer = context.file(file).unwrap().1.container(target).unwrap();
+        let bound = context.file(file).unwrap().1;
+        let writer = bound.container(target).unwrap();
+        assert_eq!(bound.container(parameter), Some(child));
+        assert_eq!(bound.container(call), Some(child));
+        assert_eq!(bound.flow_container(call), None);
+        assert_eq!(bound.flow_container(target), Some(writer));
         let actual = ImmediateClosureAssignment { writer, call };
         let inspect = |context: &CanonicalCheckerContext<'_>,
                        immediate: ImmediateClosureAssignment| {
