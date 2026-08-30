@@ -2,9 +2,10 @@
 //!
 //! The installed slice mirrors pinned `getConstraintOfType`,
 //! `getConstraintOfTypeParameter`, and `getBaseConstraintOfType` for resolved
-//! type parameters plus primitive/literal unions. Declaration and inferred
-//! constraint resolution remains checker-query work; an unresolved cache is a
-//! typed error, never an invented `unknown` or identity constraint.
+//! type parameters, primitive/literal unions, and source-owned mapped types.
+//! Declaration and inferred constraint resolution remains checker-query work.
+//! An unresolved cache is a typed error, never an invented `unknown` or identity
+//! constraint.
 
 use std::collections::HashSet;
 
@@ -177,6 +178,8 @@ enum ConstraintRecursionIdentity {
 #[derive(Debug)]
 enum ConstraintKind {
     Leaf,
+    // Mapped objects still use the counted resolution frame.
+    MappedIdentity,
     Parameter {
         is_this_type: bool,
     },
@@ -262,6 +265,9 @@ impl<'store> ConstraintSession<'store> {
         {
             Err(ConstraintError::UnsupportedBaseType(type_))
         } else {
+            if matches!(record.data(), TypeData::Mapped(_)) {
+                self.validate_mapped_constraint(type_)?;
+            }
             if matches!(
                 record.data(),
                 TypeData::Union(_) | TypeData::Intersection(_)
@@ -270,6 +276,30 @@ impl<'store> ConstraintSession<'store> {
             }
             Ok(BaseConstraint::Type(type_))
         }
+    }
+
+    fn validate_mapped_constraint(&self, type_: TypeId) -> Result<(), ConstraintError> {
+        self.store
+            .validate_deferred_mapped_type(type_)
+            .map_err(|_| ConstraintError::UnsupportedBaseType(type_))?;
+        let Some(TypeData::Mapped(mapped)) = self.store.type_payload(type_).map(TypeRecord::data)
+        else {
+            return Err(ConstraintError::InvalidType(type_));
+        };
+        if mapped
+            .object
+            .structured
+            .constrained
+            .resolved_base_constraint
+            .is_some_and(|cached| {
+                cached != type_
+                    && cached != self.no_constraint
+                    && cached != self.circular_constraint
+            })
+        {
+            return Err(ConstraintError::InvalidCachedConstraint(type_));
+        }
+        Ok(())
     }
 
     fn validate_cached_constraint_objects(&self, type_: TypeId) -> Result<(), ConstraintError> {
@@ -293,6 +323,7 @@ impl<'store> ConstraintSession<'store> {
                 TypeData::Intersection(data) => {
                     pending.extend(data.intersection.types.iter().rev().copied());
                 }
+                TypeData::Mapped(_) => self.validate_mapped_constraint(type_)?,
                 TypeData::Object(_)
                     if !matches!(
                         validate_resolved_declared_property_object(self.store, type_),
@@ -401,6 +432,10 @@ impl<'store> ConstraintSession<'store> {
                 TypeData::TypeParameter(data) => ConstraintKind::Parameter {
                     is_this_type: data.is_this_type,
                 },
+                TypeData::Mapped(_) => {
+                    self.validate_mapped_constraint(type_)?;
+                    ConstraintKind::MappedIdentity
+                }
                 TypeData::Union(data) => ConstraintKind::Union(data.union.types.clone()),
                 TypeData::Intersection(data) => {
                     ConstraintKind::Intersection(data.intersection.types.clone())
@@ -507,6 +542,7 @@ impl<'store> ConstraintSession<'store> {
     ) -> Result<BaseConstraint, ConstraintError> {
         match kind {
             ConstraintKind::Leaf => unreachable!("leaf types return before recursion limits"),
+            ConstraintKind::MappedIdentity => Ok(BaseConstraint::Type(type_)),
             ConstraintKind::Parameter { is_this_type } => {
                 let constraint = self.direct_constraint(type_)?;
                 if is_this_type {
@@ -815,11 +851,15 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SemanticStore,
+        CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
+        DeclaredTypeHost, IntrinsicBootstrapOptions, SemanticStore, SignatureId,
+        instantiate::{InstantiationLimits, InstantiationSession},
         mapper::TypeMapper,
         object_members::DeclaredPropertyObjectProof,
+        production::GlobalMergeCompletion,
         signatures::IndexFlags,
-        type_records::{TypeData, TypeRecord},
+        type_nodes::CanonicalTypeQuery,
+        type_records::{ConstrainedTypeData, StructuredTypeData, TypeData, TypeRecord},
         types::ObjectFlags,
     };
 
@@ -849,6 +889,549 @@ mod tests {
             constraint = parameter;
         }
         constraint
+    }
+
+    const MAPPED_CONSTRAINT_SOURCE: &str = concat!(
+        "interface Validator<T> { value: T; }\n",
+        "type ValidationMap<T> = { [K in keyof T]-?: Validator<T[K]> };\n",
+        "declare function shape<P extends ValidationMap<any>>(type: P): P;\n",
+    );
+
+    struct MappedConstraintContext<'arena> {
+        context: CanonicalCheckerContext<'arena>,
+        declaration: NodeRef,
+        owner: SemanticSymbolId,
+        annotation: NodeRef,
+        mapped: TypeId,
+    }
+
+    fn mapped_constraint_context(parsed: &ParseResult) -> MappedConstraintContext<'_> {
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(93);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/mapped-constraints.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let (declaration, parameter) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let ts_ast::NodeData::FunctionDeclaration(function) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    function.type_parameters.as_ref().unwrap().nodes[0],
+                ))
+            })
+            .unwrap();
+        let ts_ast::NodeData::TypeParameterDeclaration(parameter) =
+            &parsed.arena.get(parameter).unwrap().data
+        else {
+            panic!("the function must have its source type parameter");
+        };
+        let annotation = NodeRef::new(parsed.arena.id(), file, parameter.constraint.unwrap());
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let mapped = context.get_type_from_type_node(annotation).unwrap();
+        assert_mapped_constraint_members_cold(context.store(), mapped, None);
+        MappedConstraintContext {
+            context,
+            declaration,
+            owner,
+            annotation,
+            mapped,
+        }
+    }
+
+    fn mapped_constraint_lengths(store: &CanonicalTypeMapperStore) -> ([usize; 7], [usize; 26]) {
+        (
+            [
+                store.type_len(),
+                store.type_alias_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.index_info_len(),
+                store.symbol_store().symbol_table_len(),
+            ],
+            store.checker_link_allocated_lengths(),
+        )
+    }
+
+    fn assert_mapped_constraint_members_cold(
+        store: &CanonicalTypeMapperStore,
+        mapped: TypeId,
+        base: Option<TypeId>,
+    ) {
+        let record = store.type_payload(mapped).unwrap();
+        let TypeData::Mapped(data) = record.data() else {
+            panic!("the source annotation must retain its mapped type");
+        };
+        assert!(data.object.target.is_some());
+        assert!(data.object.mapper.is_some());
+        assert!(
+            !record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        assert_eq!(
+            data.object.structured,
+            StructuredTypeData {
+                constrained: ConstrainedTypeData {
+                    resolved_base_constraint: base,
+                },
+                ..StructuredTypeData::default()
+            },
+        );
+        store.validate_deferred_mapped_type(mapped).unwrap();
+        assert!(
+            store
+                .validate_mapped_type_relation_endpoint(mapped)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn query_mapped_constraint_callable(
+        fixture: &mut MappedConstraintContext<'_>,
+        parsed: &ParseResult,
+        session: &mut InstantiationSession,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> (TypeId, SignatureId, TypeId) {
+        let file = fixture.declaration.file;
+        let bound = fixture.context.file(file).unwrap().1.clone();
+        let options = fixture.context.options();
+        let globals = fixture.context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let type_ = {
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                fixture.context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                session,
+                diagnostics,
+            )
+            .unwrap();
+            query
+                .preflight_type_of_source_callable(fixture.declaration, fixture.owner)
+                .unwrap();
+            query
+                .get_type_of_source_callable(fixture.declaration, fixture.owner)
+                .unwrap()
+        };
+        let signature = fixture
+            .context
+            .store()
+            .source_callable_provenance(type_)
+            .unwrap()
+            .signature;
+        let returned = CanonicalTypeQuery::new_with_global_types_and_session(
+            fixture.context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            session,
+            diagnostics,
+        )
+        .unwrap()
+        .get_return_type_of_signature(signature)
+        .unwrap();
+        (type_, signature, returned)
+    }
+
+    #[test]
+    fn mapped_base_constraints_keep_source_callable_identity_and_cold_members() {
+        let parsed = parse_source_file(MAPPED_CONSTRAINT_SOURCE);
+        let mut fixture = mapped_constraint_context(&parsed);
+        let mapped = fixture.mapped;
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let first =
+            query_mapped_constraint_callable(&mut fixture, &parsed, &mut session, &mut diagnostics);
+        let (_, signature, returned) = first;
+        let store = fixture.context.store();
+        assert_eq!(
+            store.signature(signature).unwrap().type_parameters(),
+            &[returned]
+        );
+        let TypeData::TypeParameter(parameter) = store.type_payload(returned).unwrap().data()
+        else {
+            panic!("the return must keep the declared P identity");
+        };
+        assert_eq!(parameter.constraint, Some(mapped));
+        assert_eq!(parameter.constrained.resolved_base_constraint, Some(mapped));
+        let evidence = store.source_callable_type_query(signature).unwrap();
+        assert!(evidence.is_exact(store));
+        assert_eq!(evidence.annotation_type(fixture.annotation), Some(mapped));
+        assert_mapped_constraint_members_cold(store, mapped, Some(mapped));
+        let before = mapped_constraint_lengths(store);
+        let before_session = (
+            session.query_count(),
+            session.total_count(),
+            session.limit_event_count(),
+        );
+        assert_eq!(
+            query_mapped_constraint_callable(&mut fixture, &parsed, &mut session, &mut diagnostics),
+            first,
+        );
+        assert_eq!(mapped_constraint_lengths(fixture.context.store()), before);
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            before_session,
+        );
+        assert_mapped_constraint_members_cold(fixture.context.store(), mapped, Some(mapped));
+        assert!(fixture.context.store().type_resolution_is_empty());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn mapped_base_constraints_use_counted_frames_and_zero_budget_warm_replay() {
+        let parsed = parse_source_file(MAPPED_CONSTRAINT_SOURCE);
+        let mut fixture = mapped_constraint_context(&parsed);
+        let mapped = fixture.mapped;
+        let store = fixture.context.store_mut_for_test();
+        let parameter = constrained_chain(store, 1, mapped);
+        let before = mapped_constraint_lengths(store);
+        assert_eq!(
+            get_base_constraint_of_type_with_limits(
+                store,
+                mapped,
+                ConstraintLimits { max_count: 0 }
+            ),
+            Ok(None),
+        );
+        assert_eq!(
+            get_base_constraint_of_type_with_limits(
+                store,
+                parameter,
+                ConstraintLimits { max_count: 1 }
+            ),
+            Err(ConstraintError::CountLimit { count: 1, limit: 1 }),
+        );
+        assert_eq!(
+            store
+                .type_payload(parameter)
+                .unwrap()
+                .data()
+                .constrained()
+                .unwrap()
+                .resolved_base_constraint,
+            None
+        );
+        assert_mapped_constraint_members_cold(store, mapped, None);
+        assert!(store.type_resolution_is_empty());
+        {
+            let mut session =
+                ConstraintSession::new(store, ConstraintLimits { max_count: 2 }).unwrap();
+            assert_eq!(
+                session.resolve_base_constraint(parameter, &mut Vec::new()),
+                Ok(BaseConstraint::Type(mapped))
+            );
+            assert_eq!(session.count, 2);
+            assert!(session.resolution_stack.is_empty());
+            assert!(session.failed_resolutions.is_empty());
+        }
+        assert_mapped_constraint_members_cold(store, mapped, Some(mapped));
+        {
+            let mut session =
+                ConstraintSession::new(store, ConstraintLimits { max_count: 0 }).unwrap();
+            assert_eq!(
+                session.resolve_base_constraint(parameter, &mut Vec::new()),
+                Ok(BaseConstraint::Type(mapped))
+            );
+            assert_eq!(
+                session.resolve_base_constraint(mapped, &mut Vec::new()),
+                Ok(BaseConstraint::Type(mapped))
+            );
+            assert_eq!(session.count, 0);
+        }
+        assert_eq!(get_constraint_of_type(store, parameter), Ok(Some(mapped)));
+        assert_eq!(get_base_constraint_of_type(store, mapped), Ok(None));
+        assert_eq!(mapped_constraint_lengths(store), before);
+        assert!(store.type_resolution_is_empty());
+    }
+
+    #[test]
+    fn mapped_base_constraints_keep_the_real_depth_cutoff_and_sentinel_replay() {
+        for length in [49, 50] {
+            let parsed = parse_source_file(MAPPED_CONSTRAINT_SOURCE);
+            let mut fixture = mapped_constraint_context(&parsed);
+            let mapped = fixture.mapped;
+            let no_constraint = fixture
+                .context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .no_constraint_type;
+            let expected = if length == 49 {
+                BaseConstraint::Type(mapped)
+            } else {
+                BaseConstraint::None
+            };
+            let cached = if length == 49 { mapped } else { no_constraint };
+            {
+                let store = fixture.context.store_mut_for_test();
+                let root = constrained_chain(store, length, mapped);
+                let before = mapped_constraint_lengths(store);
+                let mut session =
+                    ConstraintSession::new(store, ConstraintLimits::default()).unwrap();
+                assert_eq!(
+                    session.resolve_base_constraint(root, &mut Vec::new()),
+                    Ok(expected)
+                );
+                assert_eq!(session.count, length + 1);
+                assert!(session.resolution_stack.is_empty());
+                assert!(session.failed_resolutions.is_empty());
+                assert_eq!(mapped_constraint_lengths(session.store), before);
+                assert_mapped_constraint_members_cold(session.store, mapped, Some(cached));
+                assert!(session.store.type_resolution_is_empty());
+            }
+            assert_eq!(
+                fixture
+                    .context
+                    .get_type_from_type_node(fixture.annotation)
+                    .unwrap(),
+                mapped
+            );
+            let store = fixture.context.store_mut_for_test();
+            let fresh = constrained_chain(store, 1, mapped);
+            let before = mapped_constraint_lengths(store);
+            {
+                let mut session =
+                    ConstraintSession::new(store, ConstraintLimits { max_count: 1 }).unwrap();
+                assert_eq!(
+                    session.resolve_base_constraint(fresh, &mut Vec::new()),
+                    Ok(expected)
+                );
+                assert_eq!(session.count, 1);
+            }
+            assert_eq!(get_constraint_of_type(store, fresh), Ok(Some(mapped)));
+            assert_eq!(get_base_constraint_of_type(store, mapped), Ok(None));
+            assert_mapped_constraint_members_cold(store, mapped, Some(cached));
+            assert_eq!(mapped_constraint_lengths(store), before);
+            assert!(store.type_resolution_is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keeps each damaged record's rejection and restore checks together.
+    fn mapped_base_constraints_reject_and_restore_cold_and_cached_damage() {
+        #[derive(Clone, Copy)]
+        enum Damage {
+            Owner,
+            DeclarationCache,
+            Mapper,
+            BaseCache,
+        }
+
+        for warm in [false, true] {
+            for damage in [
+                Damage::Owner,
+                Damage::DeclarationCache,
+                Damage::Mapper,
+                Damage::BaseCache,
+            ] {
+                let parsed = parse_source_file(MAPPED_CONSTRAINT_SOURCE);
+                let mut fixture = mapped_constraint_context(&parsed);
+                let mapped = fixture.mapped;
+                let store = fixture.context.store_mut_for_test();
+                let string = store.intrinsic_bootstrap().unwrap().string_type;
+                let number = store.intrinsic_bootstrap().unwrap().number_type;
+                let parameter = constrained_chain(store, 1, mapped);
+                let union = store
+                    .alloc_union_type(ObjectFlags::NONE, vec![mapped, string])
+                    .unwrap();
+                let intersection = store
+                    .alloc_intersection_type(ObjectFlags::NONE, vec![mapped, number])
+                    .unwrap();
+                let nested = store
+                    .alloc_union_type(ObjectFlags::NONE, vec![intersection, string])
+                    .unwrap();
+                let roots = [
+                    (parameter, mapped),
+                    (union, union),
+                    (intersection, intersection),
+                    (nested, nested),
+                ];
+                if warm {
+                    for (root, expected) in roots {
+                        assert_eq!(get_base_constraint_of_type(store, root), Ok(Some(expected)));
+                    }
+                }
+                let record = store.type_payload(mapped).unwrap();
+                let owner = record.symbol();
+                let TypeData::Mapped(original) = record.data() else {
+                    unreachable!();
+                };
+                let original = original.clone();
+                let declaration = original.declaration.unwrap();
+                let links = store.type_node_links(declaration).cloned().unwrap();
+                let root_caches = |store: &CanonicalTypeMapperStore| {
+                    roots.map(|(root, _)| {
+                        store
+                            .type_payload(root)
+                            .unwrap()
+                            .data()
+                            .constrained()
+                            .unwrap()
+                            .resolved_base_constraint
+                    })
+                };
+                let before_roots = root_caches(store);
+                let before = mapped_constraint_lengths(store);
+                let expected = match damage {
+                    Damage::BaseCache => ConstraintError::InvalidCachedConstraint(mapped),
+                    _ => ConstraintError::UnsupportedBaseType(mapped),
+                };
+                match damage {
+                    Damage::Owner => assert!(store.set_type_symbol(mapped, Some(fixture.owner))),
+                    Damage::DeclarationCache => {
+                        let mut poisoned = links.clone();
+                        poisoned.resolved_type = Some(mapped);
+                        assert!(store.set_type_node_links(declaration, poisoned));
+                    }
+                    Damage::Mapper => assert!(store.set_object_target_and_mapper(
+                        mapped,
+                        original.object.target,
+                        None
+                    )),
+                    Damage::BaseCache => {
+                        assert!(store.set_resolved_base_constraint(mapped, Some(string)))
+                    }
+                }
+                let poisoned_owner = store.type_payload(mapped).unwrap().symbol();
+                let poisoned_links = store.type_node_links(declaration).cloned().unwrap();
+                let TypeData::Mapped(poisoned) = store.type_payload(mapped).unwrap().data() else {
+                    unreachable!();
+                };
+                let poisoned = poisoned.clone();
+                for (root, _) in roots {
+                    let result = get_base_constraint_of_type(store, root);
+                    assert_eq!(result.as_ref().err(), Some(&expected));
+                    assert_eq!(root_caches(store), before_roots);
+                    assert_eq!(mapped_constraint_lengths(store), before);
+                    assert!(store.type_resolution_is_empty());
+                }
+                let result = get_constraint_of_type(store, parameter);
+                assert_eq!(result.as_ref().err(), Some(&expected));
+                {
+                    let mut session =
+                        ConstraintSession::new(store, ConstraintLimits { max_count: 0 }).unwrap();
+                    let result = session.resolve_base_constraint(mapped, &mut Vec::new());
+                    assert_eq!(result.as_ref().err(), Some(&expected));
+                    assert_eq!(session.count, 0);
+                }
+                assert_eq!(store.type_payload(mapped).unwrap().symbol(), poisoned_owner);
+                assert_eq!(store.type_node_links(declaration), Some(&poisoned_links));
+                assert!(
+                    matches!(store.type_payload(mapped).unwrap().data(), TypeData::Mapped(data) if data == &poisoned)
+                );
+                assert_eq!(root_caches(store), before_roots);
+                assert_eq!(mapped_constraint_lengths(store), before);
+                match damage {
+                    Damage::Owner => assert!(store.set_type_symbol(mapped, owner)),
+                    Damage::DeclarationCache => {
+                        assert!(store.set_type_node_links(declaration, links))
+                    }
+                    Damage::Mapper => assert!(store.set_object_target_and_mapper(
+                        mapped,
+                        original.object.target,
+                        original.object.mapper
+                    )),
+                    Damage::BaseCache => assert!(
+                        store.set_resolved_base_constraint(
+                            mapped,
+                            original
+                                .object
+                                .structured
+                                .constrained
+                                .resolved_base_constraint
+                        )
+                    ),
+                }
+                for (root, expected) in roots {
+                    assert_eq!(get_base_constraint_of_type(store, root), Ok(Some(expected)));
+                    assert_eq!(
+                        get_base_constraint_of_type_with_limits(
+                            store,
+                            root,
+                            ConstraintLimits { max_count: 0 }
+                        ),
+                        Ok(Some(expected))
+                    );
+                }
+                assert_mapped_constraint_members_cold(store, mapped, Some(mapped));
+                assert_eq!(mapped_constraint_lengths(store), before);
+                assert!(store.type_resolution_is_empty());
+                assert_eq!(
+                    fixture
+                        .context
+                        .get_type_from_type_node(fixture.annotation)
+                        .unwrap(),
+                    mapped
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mapped_base_constraints_reject_unowned_and_foreign_identity() {
+        let mut store = initialized_store();
+        let unowned = store
+            .alloc_mapped_type(ObjectFlags::MAPPED, None, None)
+            .unwrap();
+        let parameter = constrained_chain(&mut store, 1, unowned);
+        for cached in [None, Some(unowned)] {
+            assert!(store.set_resolved_base_constraint(unowned, cached));
+            let before = mapped_constraint_lengths(&store);
+            assert_eq!(
+                get_base_constraint_of_type(&mut store, parameter),
+                Err(ConstraintError::UnsupportedBaseType(unowned))
+            );
+            assert_eq!(get_base_constraint_of_type(&mut store, unowned), Ok(None));
+            assert_eq!(mapped_constraint_lengths(&store), before);
+            assert!(store.type_resolution_is_empty());
+        }
+        let mut foreign = initialized_store();
+        let foreign_mapped = foreign
+            .alloc_mapped_type(ObjectFlags::MAPPED, None, None)
+            .unwrap();
+        let before = mapped_constraint_lengths(&store);
+        assert_eq!(
+            get_base_constraint_of_type(&mut store, foreign_mapped),
+            Err(ConstraintError::InvalidType(foreign_mapped))
+        );
+        assert!(!store.set_resolved_base_constraint(unowned, Some(foreign_mapped)));
+        assert_eq!(mapped_constraint_lengths(&store), before);
+        assert!(store.type_resolution_is_empty());
     }
 
     fn declared_object_context(

@@ -2102,7 +2102,11 @@ impl CanonicalTypeMapperStore {
             ) {
                 return Err(MappedTypeError::InvalidMappedType(instantiated));
             }
-        } else if mapped.object.structured != StructuredTypeData::default() {
+        } else if !unresolved_mapped_structure_is_valid(
+            self,
+            instantiated,
+            &mapped.object.structured,
+        ) {
             return Err(MappedTypeError::InvalidMappedType(instantiated));
         }
         Ok(())
@@ -2312,7 +2316,11 @@ impl CanonicalTypeMapperStore {
             ) {
                 return Err(MappedTypeError::InvalidMappedType(instantiated));
             }
-        } else if mapped.object.structured != StructuredTypeData::default() {
+        } else if !unresolved_mapped_structure_is_valid(
+            self,
+            instantiated,
+            &mapped.object.structured,
+        ) {
             return Err(MappedTypeError::InvalidMappedType(instantiated));
         }
         Ok(())
@@ -2512,7 +2520,11 @@ impl CanonicalTypeMapperStore {
             ) {
                 return Err(MappedTypeError::InvalidMappedType(instantiated));
             }
-        } else if mapped.object.structured != StructuredTypeData::default() {
+        } else if !unresolved_mapped_structure_is_valid(
+            self,
+            instantiated,
+            &mapped.object.structured,
+        ) {
             return Err(MappedTypeError::InvalidMappedType(instantiated));
         }
         Ok(())
@@ -2745,7 +2757,11 @@ impl CanonicalTypeMapperStore {
             ) {
                 return Err(MappedTypeError::InvalidMappedType(instantiated));
             }
-        } else if mapped.object.structured != StructuredTypeData::default() {
+        } else if !unresolved_mapped_structure_is_valid(
+            self,
+            indexed_access.object_type,
+            &mapped.object.structured,
+        ) {
             return Err(MappedTypeError::InvalidMappedType(instantiated));
         }
         Ok(())
@@ -4011,6 +4027,30 @@ fn validate_record_mapped_alias_request(
     })
 }
 
+// Base-constraint traversal can fill its cache before mapped members are requested.
+fn unresolved_mapped_structure_is_valid(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    structured: &StructuredTypeData,
+) -> bool {
+    let base = structured.constrained.resolved_base_constraint;
+    if base.is_some_and(|base| {
+        base != type_
+            && store.intrinsic_bootstrap().is_none_or(|bootstrap| {
+                base != bootstrap.no_constraint_type && base != bootstrap.circular_constraint_type
+            })
+    }) {
+        return false;
+    }
+    structured
+        == &StructuredTypeData {
+            constrained: ConstrainedTypeData {
+                resolved_base_constraint: base,
+            },
+            ..StructuredTypeData::default()
+        }
+}
+
 fn validate_unresolved_mapped_members(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -4021,7 +4061,9 @@ fn validate_unresolved_mapped_members(
     if record
         .object_flags()
         .contains(ObjectFlags::MEMBERS_RESOLVED)
-        || record.data().structured() != Some(&StructuredTypeData::default())
+        || record.data().structured().is_none_or(|structured| {
+            !unresolved_mapped_structure_is_valid(store, type_, structured)
+        })
     {
         return Err(MappedTypeError::InvalidCachedMembers(type_));
     }
@@ -5531,7 +5573,7 @@ fn validate_warm_mapped_members(
         .object_flags()
         .contains(ObjectFlags::MEMBERS_RESOLVED)
     {
-        if structured != &StructuredTypeData::default() {
+        if !unresolved_mapped_structure_is_valid(store, shape.type_, structured) {
             return Err(MappedTypeError::InvalidCachedMembers(shape.type_));
         }
         return Ok(None);
@@ -6664,11 +6706,12 @@ mod tests {
         MappedTypeModifiers, SupportedMappedAliasProjection,
         cached_supported_mapped_alias_instance, instantiate_supported_mapped_alias_instance,
         plan_mapped_type_declaration, plan_mapped_type_keys, selection_alias_source_constraint,
-        supported_mapped_alias_projection,
+        supported_mapped_alias_projection, unresolved_mapped_structure_is_valid,
     };
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeMapperStore,
         DeclaredTypeHost, IntrinsicBootstrapOptions, TypeData, TypeId,
+        constraints::get_base_constraint_of_type,
         declared::{execute_type_parameter, type_list_key},
         instantiate::{
             InstantiationLimits, InstantiationSession, instantiate_type_with_vector_and_session,
@@ -6681,7 +6724,7 @@ mod tests {
         object_members,
         signatures::IndexFlags,
         type_nodes::type_alias_instantiation_cache_key,
-        type_records::{LiteralValue, TypeCacheState},
+        type_records::{LiteralValue, StructuredTypeData, TypeCacheState},
         types::{AccessFlags, ObjectFlags},
     };
 
@@ -7172,6 +7215,62 @@ mod tests {
         );
     }
 
+    fn mapped_constraint_context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
+        let file = FileId::new(0);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source("\"/project/mapped-constraint-unit.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn mapped_constraint_alias_parts(
+        parsed: &ParseResult,
+        context: &CanonicalCheckerContext<'_>,
+        name: &str,
+    ) -> (SemanticSymbolId, NodeRef) {
+        let file = FileId::new(0);
+        let (declaration, body) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(alias.name)?.data else {
+                    return None;
+                };
+                (identifier.text == name).then_some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, alias.type_),
+                ))
+            })
+            .unwrap();
+        (
+            context.file(file).unwrap().1.symbol(declaration).unwrap(),
+            body,
+        )
+    }
+
     fn record_mapped_fixture(
         parsed: &ParseResult,
         context: &mut CanonicalCheckerContext<'_>,
@@ -7482,6 +7581,284 @@ mod tests {
             record.resolved_apparent_type,
             record.contains_error,
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Test the one allowed cache field and each forbidden member field.
+    fn mapped_base_constraints_cold_structure_accepts_only_exact_cache_states() {
+        let parsed = parse_source_file(concat!(
+            "type Mapped = { [Key in 'value']: string }; ",
+            "type Probe<Value extends Mapped> = Value;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        let (mapped_alias, _) = mapped_constraint_alias_parts(&parsed, &context, "Mapped");
+        let mapped = context.get_declared_type_of_symbol(mapped_alias).unwrap();
+        let TypeData::Mapped(data) = context.store().type_payload(mapped).unwrap().data() else {
+            panic!("the source alias must retain its mapped type")
+        };
+        assert_eq!(data.object.structured, StructuredTypeData::default());
+        assert!(unresolved_mapped_structure_is_valid(
+            context.store(),
+            mapped,
+            &data.object.structured,
+        ));
+
+        let (probe_alias, _) = mapped_constraint_alias_parts(&parsed, &context, "Probe");
+        let parameter = context.get_declared_type_of_symbol(probe_alias).unwrap();
+        assert_eq!(
+            get_base_constraint_of_type(context.store_mut_for_test(), parameter),
+            Ok(Some(mapped)),
+        );
+        let TypeData::Mapped(data) = context.store().type_payload(mapped).unwrap().data() else {
+            unreachable!()
+        };
+        let cold = data.object.structured.clone();
+        assert_eq!(cold.constrained.resolved_base_constraint, Some(mapped));
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let foreign = checker_context(&parsed);
+        let foreign_bootstrap = foreign.store().intrinsic_bootstrap().unwrap();
+        let before = cache_state(context.store());
+
+        for base in [
+            None,
+            Some(mapped),
+            Some(bootstrap.no_constraint_type),
+            Some(bootstrap.circular_constraint_type),
+        ] {
+            let mut structured = cold.clone();
+            structured.constrained.resolved_base_constraint = base;
+            assert!(unresolved_mapped_structure_is_valid(
+                context.store(),
+                mapped,
+                &structured,
+            ));
+        }
+        for base in [
+            bootstrap.string_type,
+            bootstrap.empty_object_type,
+            foreign_bootstrap.no_constraint_type,
+            foreign_bootstrap.circular_constraint_type,
+        ] {
+            let mut structured = cold.clone();
+            structured.constrained.resolved_base_constraint = Some(base);
+            assert!(!unresolved_mapped_structure_is_valid(
+                context.store(),
+                mapped,
+                &structured,
+            ));
+        }
+        for structured in [
+            StructuredTypeData {
+                members: Some(bootstrap.globals),
+                ..cold.clone()
+            },
+            StructuredTypeData {
+                properties: Some(Vec::new()),
+                ..cold.clone()
+            },
+            StructuredTypeData {
+                signatures: Some(Vec::new()),
+                ..cold.clone()
+            },
+            StructuredTypeData {
+                call_signature_count: 1,
+                ..cold.clone()
+            },
+            StructuredTypeData {
+                index_infos: Some(Vec::new()),
+                ..cold.clone()
+            },
+            StructuredTypeData {
+                object_type_without_abstract_construct_signatures: Some(mapped),
+                ..cold
+            },
+        ] {
+            assert!(!unresolved_mapped_structure_is_valid(
+                context.store(),
+                mapped,
+                &structured,
+            ));
+        }
+        assert_eq!(cache_state(context.store()), before);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Replay each utility after a real constraint query and cache damage.
+    fn mapped_base_constraints_utility_alias_queries_keep_real_self_caches() {
+        for (utility, declaration, arguments, modifiers) in [
+            (
+                "Record",
+                "type Record<K extends keyof any, T> = { [P in K]: T };",
+                "'value', string",
+                MappedTypeModifiers::NONE,
+            ),
+            (
+                "Partial",
+                "type Partial<T> = { [P in keyof T]?: T[P] };",
+                "Source",
+                MappedTypeModifiers::INCLUDE_OPTIONAL,
+            ),
+            (
+                "Pick",
+                "type Pick<T, K extends keyof T> = { [P in K]: T[P] };",
+                "Source, 'value'",
+                MappedTypeModifiers::NONE,
+            ),
+        ] {
+            let parsed = parse_source_file(&format!(
+                concat!(
+                    "interface Source {{ value: string }} {declaration} ",
+                    "type Result = {utility}<{arguments}>; ",
+                    "type Probe<Value extends Result> = Value;",
+                ),
+                declaration = declaration,
+                utility = utility,
+                arguments = arguments,
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut context = mapped_constraint_context(&parsed);
+            let (result_alias, request) =
+                mapped_constraint_alias_parts(&parsed, &context, "Result");
+            let result = context.get_declared_type_of_symbol(result_alias).unwrap();
+            let (utility_alias, _) = mapped_constraint_alias_parts(&parsed, &context, utility);
+            let NodeData::TypeReferenceNode(reference) =
+                &parsed.arena.get(request.node).unwrap().data
+            else {
+                panic!("Result must retain its utility reference")
+            };
+            let arguments = reference
+                .type_arguments
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .map(|argument| {
+                    context
+                        .get_type_from_type_node(NodeRef::new(
+                            request.arena,
+                            request.file,
+                            *argument,
+                        ))
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let links = context.store().type_alias_links(utility_alias).unwrap();
+            let declared = links.declared_type.unwrap();
+            let parameters = links.type_parameters.clone().unwrap();
+            let validate = |store: &CanonicalTypeMapperStore| match utility {
+                "Record" => store.validate_record_mapped_alias_instantiation(
+                    utility_alias,
+                    declared,
+                    &parameters,
+                    &arguments,
+                    result,
+                ),
+                "Partial" => store.validate_homomorphic_mapped_alias_instantiation(
+                    utility_alias,
+                    declared,
+                    &parameters,
+                    &arguments,
+                    result,
+                    modifiers,
+                ),
+                "Pick" => store.validate_pick_mapped_alias_instantiation(
+                    utility_alias,
+                    declared,
+                    &parameters,
+                    &arguments,
+                    result,
+                ),
+                _ => unreachable!(),
+            };
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                let TypeData::Mapped(data) = store.type_payload(result).unwrap().data() else {
+                    panic!("the utility result must remain a mapped type")
+                };
+                (
+                    cache_state(store),
+                    store.type_resolution_len(),
+                    store.type_resolution_start(),
+                    [
+                        store.signature_len(),
+                        store.index_info_len(),
+                        store.properties_type_cache_len(),
+                    ],
+                    data.clone(),
+                    [utility_alias, result_alias]
+                        .map(|alias| store.type_alias_links(alias).cloned()),
+                )
+            };
+            let TypeData::Mapped(data) = context.store().type_payload(result).unwrap().data()
+            else {
+                unreachable!()
+            };
+            assert_eq!(data.object.structured, StructuredTypeData::default());
+            let cold = snapshot(context.store());
+            assert_eq!(validate(context.store()), Ok(()));
+            assert_eq!(
+                context.get_declared_type_of_symbol(result_alias),
+                Ok(result)
+            );
+            assert_eq!(snapshot(context.store()), cold);
+
+            let (probe_alias, _) = mapped_constraint_alias_parts(&parsed, &context, "Probe");
+            let parameter = context.get_declared_type_of_symbol(probe_alias).unwrap();
+            assert_eq!(
+                get_base_constraint_of_type(context.store_mut_for_test(), parameter),
+                Ok(Some(result)),
+            );
+            let TypeData::Mapped(data) = context.store().type_payload(result).unwrap().data()
+            else {
+                unreachable!()
+            };
+            let base = data.object.structured.constrained.resolved_base_constraint;
+            assert_eq!(base, Some(result));
+            assert!(unresolved_mapped_structure_is_valid(
+                context.store(),
+                result,
+                &data.object.structured
+            ));
+            let warm = snapshot(context.store());
+            for _ in 0..2 {
+                assert_eq!(validate(context.store()), Ok(()));
+                assert_eq!(
+                    context.get_declared_type_of_symbol(result_alias),
+                    Ok(result)
+                );
+                assert_eq!(
+                    context
+                        .store()
+                        .validate_mapped_type_relation_endpoint(result),
+                    Ok(None)
+                );
+                assert_eq!(snapshot(context.store()), warm);
+            }
+
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_resolved_base_constraint(result, Some(string))
+            );
+            let damaged = snapshot(context.store());
+            assert!(validate(context.store()).is_err());
+            assert!(context.get_declared_type_of_symbol(result_alias).is_err());
+            assert_eq!(snapshot(context.store()), damaged);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_resolved_base_constraint(result, base)
+            );
+            assert_eq!(validate(context.store()), Ok(()));
+            assert_eq!(
+                context.get_declared_type_of_symbol(result_alias),
+                Ok(result)
+            );
+            assert_eq!(snapshot(context.store()), warm);
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
