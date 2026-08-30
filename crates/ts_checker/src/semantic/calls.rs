@@ -570,6 +570,23 @@ pub(super) fn resolve_class_body_invocation_with_session(
     }
     validate_direct_invocation_options(request)?;
     validate_argument_types(store, request.arguments)?;
+    if let Some(signatures) = target.construct_signatures() {
+        if request.callee != target.callable().owner
+            || !target.declared_constructor_is_current(store)
+        {
+            return Err(DirectCallInvariant::MalformedCallable(request.callee).into());
+        }
+        return resolve_direct_call_candidates(
+            store,
+            global_types,
+            strict_function_types,
+            request,
+            signatures,
+            existing_signature,
+            session,
+        )
+        .map(ClassBodyInvocationResolution::Resolved);
+    }
     if let Some(overloads) = target.overloads() {
         if target.kind() != SignatureKind::Call
             || request.callee != target.callable().owner
@@ -700,17 +717,25 @@ fn reorder_direct_call_candidates<'a>(
     callee: TypeId,
     callables: &'a [ValidatedSingleCallable],
 ) -> Result<Vec<&'a ValidatedSingleCallable>, DirectCallError> {
-    let shared_declaration_owner = store
-        .type_payload(callee)
-        .and_then(TypeRecord::symbol)
-        .and_then(|owner| store.symbol(owner))
-        .and_then(|owner| owner.declarations())
-        .is_some_and(|declarations| {
+    let inherited_owner =
+        super::classes::source_inherited_constructor_group_owner(store, callee, callables)
+            .map_err(|_| DirectCallInvariant::MalformedCallable(callee))?;
+    let shared_declaration_owner = inherited_owner
+        .or_else(|| store.type_payload(callee).and_then(TypeRecord::symbol))
+        .and_then(|owner| store.symbol(owner).map(|record| (owner, record)))
+        .is_some_and(|(owner, record)| {
+            let Some(declarations) = record.declarations() else { return false; };
             callables.iter().all(|callable| {
                 store
                     .signature(callable.signature)
-                    .and_then(Signature::declaration)
-                    .is_some_and(|declaration| declarations.contains(&declaration))
+                    .is_some_and(|signature| signature.declaration().is_some_and(|declaration| {
+                        declarations.contains(&declaration)
+                            || signature.flags().contains(SignatureFlags::CONSTRUCT)
+                                && matches!(store.source_node_parent(declaration),
+                                    Some(super::store::SourceNodeParent::Parent(parent))
+                                        if declarations.contains(&parent)
+                                            && store.source_declaration_symbol(parent) == Some(owner))
+                    }))
             })
         });
     let mut ordered = Vec::with_capacity(callables.len());

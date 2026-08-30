@@ -7322,7 +7322,7 @@ fn source_super_call_target(
         .symbol_node_links(syntax.callee)
         .is_some_and(|links| links.resolved_symbol.is_some())
         || preflight_call_cache_state(store, node)?
-            .is_some_and(|(_, signature)| signature != target.callable().signature)
+            .is_some_and(|(_, signature)| !target.contains_signature(signature))
     {
         return Err(SourceCheckError::Call(node));
     }
@@ -7538,9 +7538,13 @@ fn class_call_argument_contextual_type(
     ) {
         return Ok(None);
     }
-    if let Some(overloads) = target.overloads() {
+    if let Some(signatures) = target
+        .overloads()
+        .map(|overloads| overloads.signatures.as_slice())
+        .or_else(|| target.construct_signatures())
+    {
         let mut contextual_type = None;
-        for callable in &overloads.signatures {
+        for callable in signatures {
             if arguments.len() < callable.min_argument_count
                 || arguments.len() > callable.parameters.len()
             {
@@ -7823,7 +7827,7 @@ pub(super) fn check_source_super_call(
     )?;
     let current = source_super_call_target(store, host, plan, access)?;
     if !same_class_call_target(&target, &current)
-        || resolution.projection.signature != target.callable().signature
+        || !target.contains_signature(resolution.projection.signature)
         || !store.try_reserve_type_node_links(2)
         || !store.try_reserve_signature_links(1)
     {
