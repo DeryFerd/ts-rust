@@ -1267,8 +1267,18 @@ fn validate_symbol(
         class_expression_name(store, host, symbol)?
             .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
     }
+    // Union properties share declarations without being object-literal clones.
+    // Prove their cache before the clone validator rejects shared declarations.
+    if let Some(source) =
+        super::member_resolution::published_union_property_source(store, host, symbol)
+            .map_err(|_| SymbolDisplayError::InvalidSymbol(symbol))?
+    {
+        return Ok(source);
+    }
     let source = object_literal_property_source(store, host, symbol)?;
     if canonical != symbol {
+        super::member_resolution::published_union_property_source(store, host, canonical)
+            .map_err(|_| SymbolDisplayError::InvalidSymbol(canonical))?;
         object_literal_property_source(store, host, canonical)?;
     }
     if let Some(source) = source {
@@ -1479,11 +1489,14 @@ mod tests {
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalModuleResolutionEntry,
         CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
-        CanonicalResolvedModuleInput, TypeDisplayUnavailable,
+        CanonicalResolvedModuleInput, CanonicalUnionPropertyError, IntrinsicBootstrapOptions,
+        RelationStateSnapshot, SymbolNodeLinks, TypeData, TypeDisplayUnavailable, TypeId,
+        TypeNodeLinks, ValueSymbolLinks, types::ObjectFlags,
     };
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-        EscapedName,
+        CheckFlags, EscapedName, SymbolData,
+        semantic::{Symbol, SymbolTable},
     };
     use ts_parser::{ParseResult, parse_source_file};
 
@@ -1571,6 +1584,919 @@ mod tests {
             CanonicalCheckerOptions::default(),
         )
         .unwrap()
+    }
+
+    struct UnionDisplayFixture<'arena> {
+        context: CanonicalCheckerContext<'arena>,
+        access: NodeRef,
+        name: NodeRef,
+        union: TypeId,
+        property: SemanticSymbolId,
+        sources: [SemanticSymbolId; 2],
+    }
+
+    fn union_display_fixture(parsed: &ParseResult, file: FileId) -> UnionDisplayFixture<'_> {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/union-display.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (access, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                let NodeData::PropertyAccessExpression(access) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, id),
+                    NodeRef::new(parsed.arena.id(), file, access.name),
+                ))
+            })
+            .unwrap();
+        let property = context.get_symbol_at_location(access).unwrap().unwrap();
+        let union = context
+            .store()
+            .value_symbol_links(property)
+            .unwrap()
+            .containing_type
+            .unwrap();
+        let TypeData::Union(data) = context.store().type_payload(union).unwrap().data() else {
+            panic!("the property must retain its containing union")
+        };
+        let sources = data
+            .union
+            .types
+            .iter()
+            .map(|type_| {
+                let members = context
+                    .store()
+                    .type_payload(*type_)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap()
+                    .members
+                    .unwrap();
+                context
+                    .store()
+                    .symbol_table(members)
+                    .unwrap()
+                    .get(context.store().symbol(property).unwrap().name())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        UnionDisplayFixture {
+            context,
+            access,
+            name,
+            union,
+            property,
+            sources: sources.try_into().unwrap(),
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct UnionDisplayState {
+        counts: [usize; 6],
+        link_lengths: [usize; 26],
+        types: Vec<(TypeId, String)>,
+        symbols: Vec<(
+            SemanticSymbolId,
+            Symbol,
+            Option<ValueSymbolLinks>,
+            Option<SemanticSymbolId>,
+        )>,
+        tables: Vec<(SymbolTableId, SymbolTable)>,
+        nodes: Vec<(NodeRef, Option<TypeNodeLinks>, Option<SymbolNodeLinks>)>,
+        relations: RelationStateSnapshot,
+    }
+
+    fn union_display_state(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> UnionDisplayState {
+        let store = context.store();
+        let mut tables = vec![store.intrinsic_bootstrap().unwrap().globals];
+        for (_, record) in store.types() {
+            tables.extend(record.data().structured().and_then(|data| data.members));
+            if let TypeData::Union(data) = record.data() {
+                tables.extend(data.union.property_cache);
+                tables.extend(data.union.property_cache_without_function_property_augment);
+            }
+        }
+        for (_, record) in store.symbol_store().symbols() {
+            tables.extend(record.members());
+            tables.extend(record.exports());
+        }
+        tables.sort_unstable();
+        tables.dedup();
+        UnionDisplayState {
+            counts: [
+                store.type_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.index_info_len(),
+            ],
+            link_lengths: store.checker_link_allocated_lengths(),
+            types: store
+                .types()
+                .map(|(id, record)| (id, format!("{record:?}")))
+                .collect(),
+            symbols: store
+                .symbol_store()
+                .symbols()
+                .map(|(id, record)| {
+                    (
+                        id,
+                        record.clone(),
+                        store.value_symbol_links(id).cloned(),
+                        store.get_merged_symbol(id),
+                    )
+                })
+                .collect(),
+            tables: tables
+                .into_iter()
+                .map(|id| (id, store.symbol_table(id).unwrap().clone()))
+                .collect(),
+            nodes: parsed
+                .arena
+                .iter()
+                .map(|(id, _)| {
+                    let node = NodeRef::new(parsed.arena.id(), file, id);
+                    (
+                        node,
+                        store.type_node_links(node).cloned(),
+                        store.symbol_node_links(node).cloned(),
+                    )
+                })
+                .collect(),
+            relations: store.relation_state_snapshot(),
+        }
+    }
+
+    #[test]
+    fn location_display_retains_published_union_property_identity_and_declarations() {
+        for (name, source) in [
+            (
+                "msg",
+                concat!(
+                    "type Left = { msg?: undefined }; type Right = { msg: string }; ",
+                    "function read(input: Left | Right): string | undefined { return input.msg; }",
+                ),
+            ),
+            (
+                "msg",
+                concat!(
+                    "interface Left { readonly msg: string } type Right = { msg: number }; ",
+                    "function read(input: Left | Right): string | number { return input.msg; }",
+                ),
+            ),
+            (
+                "__msg",
+                concat!(
+                    "type Left = { __msg: string }; type Right = { __msg: number }; ",
+                    "function read(input: Left | Right): string | number { return input.__msg; }",
+                ),
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(41_023);
+            let mut fixture = union_display_fixture(&parsed, file);
+            let declarations = fixture.sources.map(|source| {
+                assert_ne!(source, fixture.property);
+                fixture.context.get_symbol_declarations(source).unwrap()[0]
+            });
+            assert_ne!(declarations[0], declarations[1]);
+            assert_eq!(
+                fixture
+                    .context
+                    .get_symbol_declarations(fixture.property)
+                    .unwrap(),
+                declarations
+            );
+            let before = union_display_state(&fixture.context, &parsed, file);
+            for _ in 0..2 {
+                for location in [fixture.access, fixture.name] {
+                    assert_eq!(
+                        fixture.context.get_symbol_at_location(location).unwrap(),
+                        Some(fixture.property)
+                    );
+                    assert_eq!(
+                        fixture
+                            .context
+                            .symbol_to_string_at_location(fixture.property, location)
+                            .unwrap(),
+                        name
+                    );
+                    assert_eq!(
+                        fixture
+                            .context
+                            .get_symbol_declarations(fixture.property)
+                            .unwrap(),
+                        declarations
+                    );
+                }
+                assert_eq!(union_display_state(&fixture.context, &parsed, file), before);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep publication, absent-member validation, and replay together.
+    fn location_display_retains_raw_partial_union_property_with_transient_absence() {
+        let parsed = parse_source_file("");
+        let file = FileId::new(41_027);
+        let mut context = class_expression_context(&parsed, file);
+        let enclosing = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let store = context.store_mut_for_test();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let value = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::PROPERTY,
+                EscapedName::source("value"),
+            ))
+            .unwrap();
+        let other = store.alloc_transient_symbol(
+            SymbolFlags::PROPERTY,
+            EscapedName::source("other"),
+            CheckFlags::NONE,
+        );
+        let links = ValueSymbolLinks {
+            resolved_type: Some(number),
+            ..ValueSymbolLinks::default()
+        };
+        let mut objects = Vec::new();
+        for property in [value, other] {
+            assert!(store.set_value_symbol_links(property, links.clone()));
+            let object = store
+                .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+                .unwrap();
+            let table = store.alloc_symbol_table();
+            let name = store.symbol(property).unwrap().name().to_owned();
+            assert_eq!(store.insert_symbol(table, name, property), Some(None));
+            assert!(store.set_structured_type_members(
+                object,
+                Some(table),
+                Some(vec![property]),
+                None,
+                None,
+                None
+            ));
+            objects.push(object);
+        }
+        objects.sort_unstable();
+        let union = store.alloc_union_type(ObjectFlags::NONE, objects).unwrap();
+        assert_eq!(context.get_union_property(union, "value"), Ok(None));
+        let TypeData::Union(data) = context.store().type_payload(union).unwrap().data() else {
+            panic!("the receiver must retain the union")
+        };
+        let cache = data
+            .union
+            .property_cache
+            .expect("a partial lookup publishes its property cache");
+        let property = context
+            .store()
+            .symbol_table(cache)
+            .unwrap()
+            .get_source("value")
+            .unwrap();
+        assert_ne!(property, value);
+        assert_ne!(property, other);
+        let record = context.store().symbol(property).unwrap();
+        assert_eq!(
+            record.flags(),
+            SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+        );
+        assert_eq!(
+            record.check_flags(),
+            CheckFlags::SYNTHETIC_PROPERTY | CheckFlags::CONTAINS_PUBLIC | CheckFlags::READ_PARTIAL
+        );
+        assert!(record.declarations().is_none());
+        assert_eq!(
+            context.store().value_symbol_links(property),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(number),
+                containing_type: Some(union),
+                ..ValueSymbolLinks::default()
+            })
+        );
+        let published = union_display_state(&context, &parsed, file);
+
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .symbol_to_string_at_location(property, enclosing)
+                    .unwrap(),
+                "value"
+            );
+            assert!(
+                context
+                    .get_symbol_declarations(property)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(union_display_state(&context, &parsed, file), published);
+            assert_eq!(context.get_union_property(union, "value"), Ok(None));
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_table(cache)
+                    .unwrap()
+                    .get_source("value"),
+                Some(property)
+            );
+            assert_eq!(union_display_state(&context, &parsed, file), published);
+        }
+        assert_eq!(
+            context.get_union_property(union, "other"),
+            Err(CanonicalUnionPropertyError::InvalidProperty(other))
+        );
+        assert_eq!(union_display_state(&context, &parsed, file), published);
+
+        let mut changed = links.clone();
+        changed.target = Some(value);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(other, changed)
+        );
+        let damaged = union_display_state(&context, &parsed, file);
+        for _ in 0..2 {
+            assert!(matches!(
+                context.symbol_to_string_at_location(property, enclosing),
+                Err(crate::semantic::artifact_queries::CanonicalArtifactQueryError::SymbolDisplay(
+                    SymbolDisplayError::InvalidSymbol(symbol)
+                )) if symbol == property
+            ));
+            assert_eq!(union_display_state(&context, &parsed, file), damaged);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(other, links)
+        );
+        assert_eq!(
+            context
+                .symbol_to_string_at_location(property, enclosing)
+                .unwrap(),
+            "value"
+        );
+        assert_eq!(context.get_union_property(union, "value"), Ok(None));
+        assert_eq!(union_display_state(&context, &parsed, file), published);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep each changed field beside its exact restoration.
+    fn location_display_rejects_changed_union_properties_without_writes() {
+        #[derive(Clone, Copy, Debug)]
+        enum Damage {
+            Flags,
+            CheckFlags,
+            DeclarationOrder,
+            MissingDeclarations,
+            ValueDeclaration,
+            Parent,
+            MissingContainingType,
+            WrongContainingType,
+            ResolvedType,
+            MissingCache,
+            CacheEntry,
+            SourceDeclaration,
+            SourceParent,
+            SourceType,
+            SourceMembers,
+        }
+        let parsed = parse_source_file(concat!(
+            "type Left = { msg?: undefined }; type Right = { msg: string }; ",
+            "function read(input: Left | Right): string | undefined { return input.msg; }",
+        ));
+        let file = FileId::new(41_024);
+        let mut fixture = union_display_fixture(&parsed, file);
+        let property = fixture.property;
+        let source = fixture.sources[0];
+        let original = fixture.context.store().symbol(property).unwrap().clone();
+        let original_links = fixture
+            .context
+            .store()
+            .value_symbol_links(property)
+            .unwrap()
+            .clone();
+        let source_record = fixture.context.store().symbol(source).unwrap().clone();
+        let source_links = fixture
+            .context
+            .store()
+            .value_symbol_links(source)
+            .unwrap()
+            .clone();
+        let other = fixture
+            .context
+            .store()
+            .symbol(fixture.sources[1])
+            .unwrap()
+            .clone();
+        let TypeData::Union(union) = fixture
+            .context
+            .store()
+            .type_payload(fixture.union)
+            .unwrap()
+            .data()
+        else {
+            panic!("the receiver must remain a union")
+        };
+        let union = union.clone();
+        let cache = union.union.property_cache.unwrap();
+        let owner = source_record.parent().unwrap();
+        let source_members = fixture
+            .context
+            .store()
+            .symbol(owner)
+            .unwrap()
+            .members()
+            .unwrap();
+        let wrong_type = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+        let before = union_display_state(&fixture.context, &parsed, file);
+        for damage in [
+            Damage::Flags,
+            Damage::CheckFlags,
+            Damage::DeclarationOrder,
+            Damage::MissingDeclarations,
+            Damage::ValueDeclaration,
+            Damage::Parent,
+            Damage::MissingContainingType,
+            Damage::WrongContainingType,
+            Damage::ResolvedType,
+            Damage::MissingCache,
+            Damage::CacheEntry,
+            Damage::SourceDeclaration,
+            Damage::SourceParent,
+            Damage::SourceType,
+            Damage::SourceMembers,
+        ] {
+            let store = fixture.context.store_mut_for_test();
+            match damage {
+                Damage::Flags => assert!(store.set_symbol_flags(
+                    property,
+                    SymbolFlags::PROPERTY,
+                    original.check_flags()
+                )),
+                Damage::CheckFlags => {
+                    assert!(store.set_symbol_flags(property, original.flags(), CheckFlags::NONE));
+                }
+                Damage::DeclarationOrder => {
+                    let mut declarations = original.declarations().unwrap().to_vec();
+                    declarations.reverse();
+                    assert!(store.set_symbol_declarations(property, Some(declarations), None));
+                }
+                Damage::MissingDeclarations => {
+                    assert!(store.set_symbol_declarations(property, None, None));
+                }
+                Damage::ValueDeclaration => assert!(store.set_symbol_declarations(
+                    property,
+                    original.declarations().map(<[NodeRef]>::to_vec),
+                    source_record.value_declaration()
+                )),
+                Damage::Parent => {
+                    assert!(store.set_symbol_relationships(
+                        property,
+                        None,
+                        None,
+                        Some(owner),
+                        None
+                    ));
+                }
+                Damage::MissingContainingType
+                | Damage::WrongContainingType
+                | Damage::ResolvedType => {
+                    let mut links = original_links.clone();
+                    match damage {
+                        Damage::MissingContainingType => links.containing_type = None,
+                        Damage::WrongContainingType => {
+                            links.containing_type = Some(union.union.types[0]);
+                        }
+                        Damage::ResolvedType => links.resolved_type = Some(wrong_type),
+                        _ => unreachable!(),
+                    }
+                    assert!(store.set_value_symbol_links(property, links));
+                }
+                Damage::MissingCache => {
+                    assert!(store.set_union_or_intersection_caches(
+                        fixture.union,
+                        None,
+                        None,
+                        None
+                    ));
+                }
+                Damage::CacheEntry => assert_eq!(
+                    store.insert_symbol(cache, EscapedName::source("msg"), source),
+                    Some(Some(property))
+                ),
+                Damage::SourceDeclaration => assert!(store.set_symbol_declarations(
+                    source,
+                    other.declarations().map(<[NodeRef]>::to_vec),
+                    other.value_declaration()
+                )),
+                Damage::SourceParent => assert!(store.set_symbol_relationships(
+                    source,
+                    None,
+                    None,
+                    other.parent(),
+                    None
+                )),
+                Damage::SourceType => {
+                    let mut links = source_links.clone();
+                    links.resolved_type = Some(wrong_type);
+                    assert!(store.set_value_symbol_links(source, links));
+                }
+                Damage::SourceMembers => assert_eq!(
+                    store.insert_symbol(
+                        source_members,
+                        EscapedName::source("msg"),
+                        fixture.sources[1]
+                    ),
+                    Some(Some(source))
+                ),
+            }
+            let damaged = union_display_state(&fixture.context, &parsed, file);
+            for _ in 0..2 {
+                let result = fixture
+                    .context
+                    .symbol_to_string_at_location(property, fixture.access);
+                assert!(
+                    matches!(
+                        &result,
+                        Err(crate::semantic::artifact_queries::CanonicalArtifactQueryError::SymbolDisplay(
+                            SymbolDisplayError::InvalidSymbol(symbol)
+                        )) if *symbol == property
+                    ),
+                    "damage {damage:?}: {result:?}"
+                );
+                assert_eq!(
+                    union_display_state(&fixture.context, &parsed, file),
+                    damaged,
+                    "damage {damage:?}"
+                );
+            }
+            let store = fixture.context.store_mut_for_test();
+            assert!(store.set_symbol_flags(property, original.flags(), original.check_flags()));
+            assert!(store.set_symbol_declarations(
+                property,
+                original.declarations().map(<[NodeRef]>::to_vec),
+                original.value_declaration()
+            ));
+            assert!(store.set_symbol_relationships(
+                property,
+                original.members(),
+                original.exports(),
+                original.parent(),
+                original.export_symbol()
+            ));
+            assert!(store.set_value_symbol_links(property, original_links.clone()));
+            assert!(store.set_symbol_declarations(
+                source,
+                source_record.declarations().map(<[NodeRef]>::to_vec),
+                source_record.value_declaration()
+            ));
+            assert!(store.set_symbol_relationships(
+                source,
+                source_record.members(),
+                source_record.exports(),
+                source_record.parent(),
+                source_record.export_symbol()
+            ));
+            assert!(store.set_value_symbol_links(source, source_links.clone()));
+            assert!(store.set_union_or_intersection_caches(
+                fixture.union,
+                union.union.property_cache,
+                union.union.property_cache_without_function_property_augment,
+                union.union.resolved_properties.clone()
+            ));
+            assert!(
+                store
+                    .insert_symbol(cache, EscapedName::source("msg"), property)
+                    .is_some()
+            );
+            assert!(
+                store
+                    .insert_symbol(source_members, EscapedName::source("msg"), source)
+                    .is_some()
+            );
+            assert_eq!(
+                fixture
+                    .context
+                    .symbol_to_string_at_location(property, fixture.access)
+                    .unwrap(),
+                "msg"
+            );
+            assert_eq!(
+                fixture
+                    .context
+                    .get_symbol_at_location(fixture.access)
+                    .unwrap(),
+                Some(property)
+            );
+            assert_eq!(
+                fixture.context.get_symbol_declarations(property).unwrap(),
+                original.declarations().unwrap()
+            );
+            assert_eq!(
+                union_display_state(&fixture.context, &parsed, file),
+                before,
+                "restored {damage:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the forged source and its restored member table together.
+    fn location_display_rejects_union_sources_without_binder_ownership() {
+        let parsed = parse_source_file(concat!(
+            "type Left = { msg: string }; type Right = { msg: number }; ",
+            "function read(input: Left | Right): string | number { return input.msg; }",
+        ));
+        let file = FileId::new(41_025);
+        let mut fixture = union_display_fixture(&parsed, file);
+        let source = fixture.sources[0];
+        let original = fixture.context.store().symbol(source).unwrap().clone();
+        let links = fixture
+            .context
+            .store()
+            .value_symbol_links(source)
+            .unwrap()
+            .clone();
+        let TypeData::Union(union) = fixture
+            .context
+            .store()
+            .type_payload(fixture.union)
+            .unwrap()
+            .data()
+        else {
+            panic!("the receiver must remain a union")
+        };
+        let constituent = union.union.types[0];
+        let members = fixture
+            .context
+            .store()
+            .type_payload(constituent)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .clone();
+        let table = members.members.unwrap();
+        let store = fixture.context.store_mut_for_test();
+        let forged = store
+            .alloc_symbol(SymbolData::new(
+                original.flags(),
+                original.name().to_owned(),
+            ))
+            .unwrap();
+        assert!(store.set_symbol_declarations(
+            forged,
+            original.declarations().map(<[NodeRef]>::to_vec),
+            original.value_declaration()
+        ));
+        assert!(store.set_symbol_relationships(forged, None, None, original.parent(), None));
+        assert!(store.set_value_symbol_links(forged, links));
+        let before = union_display_state(&fixture.context, &parsed, file);
+        let store = fixture.context.store_mut_for_test();
+        assert_eq!(
+            store.insert_symbol(table, EscapedName::source("msg"), forged),
+            Some(Some(source))
+        );
+        assert!(store.set_structured_type_members(
+            constituent,
+            Some(table),
+            Some(vec![forged]),
+            None,
+            None,
+            None
+        ));
+        let damaged = union_display_state(&fixture.context, &parsed, file);
+        for _ in 0..2 {
+            for property in [fixture.property, forged] {
+                assert!(matches!(
+                    fixture.context.symbol_to_string_at_location(property, fixture.access),
+                    Err(crate::semantic::artifact_queries::CanonicalArtifactQueryError::SymbolDisplay(
+                        SymbolDisplayError::InvalidSymbol(symbol)
+                    )) if symbol == property
+                ));
+            }
+            assert_eq!(
+                union_display_state(&fixture.context, &parsed, file),
+                damaged
+            );
+        }
+        let store = fixture.context.store_mut_for_test();
+        assert_eq!(
+            store.insert_symbol(table, EscapedName::source("msg"), source),
+            Some(Some(forged))
+        );
+        assert!(store.set_structured_type_members(
+            constituent,
+            members.members,
+            members.properties,
+            None,
+            None,
+            members.index_infos
+        ));
+        assert_eq!(
+            fixture
+                .context
+                .symbol_to_string_at_location(fixture.property, fixture.access)
+                .unwrap(),
+            "msg"
+        );
+        assert_eq!(
+            fixture
+                .context
+                .get_symbol_at_location(fixture.access)
+                .unwrap(),
+            Some(fixture.property)
+        );
+        assert_eq!(union_display_state(&fixture.context, &parsed, file), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the competing producer claims and restoration together.
+    fn location_display_rejects_object_literal_clones_claiming_union_publication() {
+        let parsed = parse_source_file(concat!(
+            "type Left = { msg: string }; type Right = { msg: number }; ",
+            "function read(input: Left | Right): string | number { return input.msg; } ",
+            "const object = { msg: 'local' };",
+        ));
+        let file = FileId::new(41_026);
+        let mut fixture = union_display_fixture(&parsed, file);
+        let object = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                (node.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    id,
+                ))
+            })
+            .unwrap();
+        let object_type = fixture.context.get_type_at_location(object).unwrap();
+        let members = fixture
+            .context
+            .store()
+            .type_payload(object_type)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .members
+            .unwrap();
+        let clone = fixture
+            .context
+            .store()
+            .symbol_table(members)
+            .unwrap()
+            .get_source("msg")
+            .unwrap();
+        let original = fixture.context.store().symbol(clone).unwrap().clone();
+        let original_links = fixture
+            .context
+            .store()
+            .value_symbol_links(clone)
+            .unwrap()
+            .clone();
+        let origin = *fixture
+            .context
+            .store()
+            .object_literal_property_clone_origin(clone)
+            .unwrap();
+        let union_property = fixture
+            .context
+            .store()
+            .symbol(fixture.property)
+            .unwrap()
+            .clone();
+        let union_links = fixture
+            .context
+            .store()
+            .value_symbol_links(fixture.property)
+            .unwrap()
+            .clone();
+        let TypeData::Union(union) = fixture
+            .context
+            .store()
+            .type_payload(fixture.union)
+            .unwrap()
+            .data()
+        else {
+            panic!("the receiver must remain a union")
+        };
+        let cache = union.union.property_cache.unwrap();
+        let before = union_display_state(&fixture.context, &parsed, file);
+        let store = fixture.context.store_mut_for_test();
+        assert!(store.set_symbol_flags(
+            clone,
+            union_property.flags(),
+            union_property.check_flags()
+        ));
+        assert!(store.set_symbol_declarations(
+            clone,
+            union_property.declarations().map(<[NodeRef]>::to_vec),
+            union_property.value_declaration()
+        ));
+        assert!(store.set_symbol_relationships(clone, None, None, None, None));
+        assert!(store.set_value_symbol_links(clone, union_links));
+        assert_eq!(
+            store.insert_symbol(cache, EscapedName::source("msg"), clone),
+            Some(Some(fixture.property))
+        );
+        let damaged = union_display_state(&fixture.context, &parsed, file);
+        for _ in 0..2 {
+            assert!(matches!(
+                fixture.context.symbol_to_string_at_location(clone, fixture.access),
+                Err(crate::semantic::artifact_queries::CanonicalArtifactQueryError::SymbolDisplay(
+                    SymbolDisplayError::InvalidSymbol(symbol)
+                )) if symbol == clone
+            ));
+            assert_eq!(
+                union_display_state(&fixture.context, &parsed, file),
+                damaged
+            );
+        }
+        let store = fixture.context.store_mut_for_test();
+        assert!(store.set_symbol_flags(clone, original.flags(), original.check_flags()));
+        assert!(store.set_symbol_declarations(
+            clone,
+            original.declarations().map(<[NodeRef]>::to_vec),
+            original.value_declaration()
+        ));
+        assert!(store.set_symbol_relationships(
+            clone,
+            original.members(),
+            original.exports(),
+            original.parent(),
+            original.export_symbol()
+        ));
+        assert!(store.set_value_symbol_links(clone, original_links));
+        assert_eq!(
+            store.insert_symbol(cache, EscapedName::source("msg"), fixture.property),
+            Some(Some(clone))
+        );
+        assert_eq!(
+            fixture
+                .context
+                .symbol_to_string_at_location(clone, object)
+                .unwrap(),
+            "msg"
+        );
+        assert_eq!(
+            fixture
+                .context
+                .symbol_to_string_at_location(fixture.property, fixture.access)
+                .unwrap(),
+            "msg"
+        );
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .object_literal_property_clone_origin(clone),
+            Some(&origin)
+        );
+        assert_eq!(union_display_state(&fixture.context, &parsed, file), before);
     }
 
     #[test]

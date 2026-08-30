@@ -81240,6 +81240,338 @@ mod tests {
         assert_eq!(observable_state(&context, source_file), warm);
     }
 
+    struct TupleBindingDisplayFixture {
+        library: ParseResult,
+        source: ParseResult,
+    }
+
+    impl TupleBindingDisplayFixture {
+        const LIBRARY_FILE: FileId = FileId::new(59_640);
+        const SOURCE_FILE: FileId = FileId::new(59_641);
+        const DISPLAY: &str = "([k1, v1]: [string, any], [k2, v2]: [string, any]) => any";
+
+        fn new() -> Self {
+            Self {
+                library: parsed(concat!(
+                    "interface Array<T> { sort(compareFn?: (a: T, b: T) => number): this; } ",
+                    "interface ReadonlyArray<T> {} interface Object {} interface Function {} ",
+                    "interface IArguments {} interface String {} interface Number {} ",
+                    "interface Boolean {} interface RegExp {} interface ThisType<T> {} ",
+                    "interface ArrayLike<T> { readonly length: number; readonly [n: number]: T; } ",
+                    "interface ObjectConstructor { ",
+                    "entries<T>(value: { [s: string]: T; } | ArrayLike<T>): [string, T][]; ",
+                    "entries(value: {}): [string, any][]; ",
+                    "} declare var Object: ObjectConstructor;",
+                )),
+                source: parsed(concat!(
+                    "function foo(x?: object) { ",
+                    "return Object.entries(x || {}) ",
+                    ".sort(([k1, v1], [k2, v2]) => v1.name.localeCompare(v2.name)); ",
+                    "}",
+                )),
+            }
+        }
+
+        fn checked_context(&self) -> CanonicalCheckerContext<'_> {
+            let mut context = context_with_cross_file_global(
+                Self::LIBRARY_FILE,
+                &self.library,
+                Self::SOURCE_FILE,
+                &self.source,
+                CanonicalModuleState::Script,
+                CanonicalModuleState::Script,
+                true,
+            );
+            context.check_source_file(Self::SOURCE_FILE).unwrap();
+            assert!(context.diagnostics().is_empty());
+            context
+        }
+
+        fn arrow(&self) -> NodeRef {
+            let arrows = self
+                .source
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        self.source.arena.id(),
+                        Self::SOURCE_FILE,
+                        node,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let [arrow] = arrows.as_slice() else {
+                panic!("the original source has one sort callback")
+            };
+            *arrow
+        }
+
+        fn bindings(
+            &self,
+            context: &CanonicalCheckerContext<'_>,
+        ) -> Vec<(NodeRef, SemanticSymbolId, String)> {
+            let (_, bound) = context.file(Self::SOURCE_FILE).unwrap();
+            let mut bindings = self
+                .source
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    let NodeData::BindingElement(binding) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) =
+                        &self.source.arena.get(binding.name.unwrap()).unwrap().data
+                    else {
+                        panic!("the original callback retains its binding names")
+                    };
+                    let element = NodeRef::new(self.source.arena.id(), Self::SOURCE_FILE, node);
+                    Some((element, bound.symbol(element).unwrap(), name.text.clone()))
+                })
+                .collect::<Vec<_>>();
+            bindings
+                .sort_by_key(|(node, _, _)| self.source.arena.get(node.node).unwrap().range.start);
+            assert_eq!(
+                bindings
+                    .iter()
+                    .map(|(_, _, name)| name.as_str())
+                    .collect::<Vec<_>>(),
+                ["k1", "v1", "k2", "v2"],
+            );
+            bindings
+        }
+    }
+
+    fn tuple_binding_display_state(
+        context: &CanonicalCheckerContext<'_>,
+    ) -> (ObservableSourceState, [usize; 2]) {
+        (
+            observable_state(context, TupleBindingDisplayFixture::SOURCE_FILE),
+            [
+                context.store().index_info_len(),
+                context.store().type_predicate_len(),
+            ],
+        )
+    }
+
+    fn assert_tuple_binding_display(
+        context: &mut CanonicalCheckerContext<'_>,
+        arrow: NodeRef,
+        callable: TypeId,
+    ) {
+        let before = tuple_binding_display_state(context);
+        assert_eq!(
+            context.type_to_string(callable).unwrap(),
+            TupleBindingDisplayFixture::DISPLAY,
+        );
+        let call = context
+            .file(arrow.file)
+            .unwrap()
+            .0
+            .get(arrow.node)
+            .unwrap()
+            .parent
+            .unwrap();
+        assert_eq!(
+            context
+                .type_to_string_at_location_with_flags(
+                    callable,
+                    NodeRef::new(arrow.arena, arrow.file, call),
+                    super::super::formatter::CanonicalTypeFormatFlags::NO_TRUNCATION
+                        | super::super::formatter::CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE,
+                )
+                .unwrap(),
+            TupleBindingDisplayFixture::DISPLAY,
+        );
+        assert_eq!(tuple_binding_display_state(context), before);
+    }
+
+    fn assert_tuple_binding_display_rejected(
+        context: &CanonicalCheckerContext<'_>,
+        callable: TypeId,
+    ) {
+        let before = tuple_binding_display_state(context);
+        for _ in 0..2 {
+            assert_eq!(
+                context.type_to_string(callable),
+                Err(super::super::formatter::TypeDisplayUnavailable::MalformedType(callable)),
+            );
+            assert_eq!(tuple_binding_display_state(context), before);
+        }
+    }
+
+    #[test]
+    fn contextual_tuple_binding_display_keeps_original_callback_and_replay() {
+        let fixture = TupleBindingDisplayFixture::new();
+        let mut context = fixture.checked_context();
+        let arrow = fixture.arrow();
+        let callable = context.get_type_at_location(arrow).unwrap();
+        assert_eq!(resolved_node_type(&context, arrow), callable);
+        let provenance = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        assert_eq!(provenance.declaration, arrow);
+        assert!(provenance.contextual_target.is_some());
+        assert!(provenance.contextual_variable.is_none());
+        let signature = context.store().signature(provenance.signature).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(signature.resolved_return_type(), Some(bootstrap.any_type));
+        let parameter_types = context
+            .store()
+            .callable_signature_parameter_types(provenance.signature)
+            .unwrap();
+        assert_eq!(parameter_types.len(), 2);
+        for parameter_type in parameter_types {
+            let tuple = context
+                .store()
+                .canonical_tuple_shape(*parameter_type)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                tuple.element_types(),
+                [bootstrap.string_type, bootstrap.any_type]
+            );
+        }
+        for (index, (element, symbol, _)) in fixture.bindings(&context).iter().enumerate() {
+            let expected = [bootstrap.string_type, bootstrap.any_type][index % 2];
+            assert_eq!(
+                context.store().symbol(*symbol).unwrap().value_declaration(),
+                Some(*element),
+            );
+            assert_eq!(
+                context.store().value_symbol_links(*symbol),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(expected),
+                    ..ValueSymbolLinks::default()
+                }),
+            );
+        }
+
+        assert_tuple_binding_display(&mut context, arrow, callable);
+        let before = tuple_binding_display_state(&context);
+        for _ in 0..3 {
+            assert_eq!(context.get_type_at_location(arrow).unwrap(), callable);
+            assert_tuple_binding_display(&mut context, arrow, callable);
+            context.recheck_source_file(arrow.file).unwrap();
+            assert_eq!(context.get_type_at_location(arrow).unwrap(), callable);
+            assert_eq!(
+                context.store().source_callable_provenance(callable),
+                Some(provenance),
+            );
+            assert_eq!(tuple_binding_display_state(&context), before);
+        }
+    }
+
+    #[test]
+    fn contextual_tuple_binding_display_rejects_changed_binding_declarations() {
+        let fixture = TupleBindingDisplayFixture::new();
+        let mut context = fixture.checked_context();
+        let arrow = fixture.arrow();
+        let callable = context.get_type_at_location(arrow).unwrap();
+        assert_tuple_binding_display(&mut context, arrow, callable);
+        for (element, symbol, _) in fixture.bindings(&context) {
+            assert_eq!(
+                context.store().symbol(symbol).unwrap().declarations(),
+                Some([element].as_slice()),
+            );
+            assert_eq!(
+                context.store().symbol(symbol).unwrap().value_declaration(),
+                Some(element),
+            );
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                symbol,
+                Some(vec![arrow]),
+                Some(arrow),
+            ));
+            assert_tuple_binding_display_rejected(&context, callable);
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                symbol,
+                Some(vec![element]),
+                Some(element),
+            ));
+            assert_tuple_binding_display(&mut context, arrow, callable);
+            let before = tuple_binding_display_state(&context);
+            assert_eq!(context.get_type_at_location(arrow).unwrap(), callable);
+            assert_eq!(tuple_binding_display_state(&context), before);
+        }
+    }
+
+    #[test]
+    fn contextual_tuple_binding_display_rejects_changed_binding_locals() {
+        let fixture = TupleBindingDisplayFixture::new();
+        let mut context = fixture.checked_context();
+        let arrow = fixture.arrow();
+        let callable = context.get_type_at_location(arrow).unwrap();
+        assert_tuple_binding_display(&mut context, arrow, callable);
+        let locals = context.file(arrow.file).unwrap().1.locals(arrow).unwrap();
+        let bindings = fixture.bindings(&context);
+        for (index, (_, symbol, name)) in bindings.iter().enumerate() {
+            let other = bindings[(index + 1) % bindings.len()].1;
+            assert_ne!(*symbol, other);
+            assert_eq!(
+                context.store_mut_for_test().insert_symbol(
+                    locals,
+                    EscapedName::source(name),
+                    other,
+                ),
+                Some(Some(*symbol)),
+            );
+            assert_tuple_binding_display_rejected(&context, callable);
+            assert_eq!(
+                context.store_mut_for_test().insert_symbol(
+                    locals,
+                    EscapedName::source(name),
+                    *symbol,
+                ),
+                Some(Some(other)),
+            );
+            assert_tuple_binding_display(&mut context, arrow, callable);
+            let before = tuple_binding_display_state(&context);
+            assert_eq!(context.get_type_at_location(arrow).unwrap(), callable);
+            assert_eq!(tuple_binding_display_state(&context), before);
+        }
+    }
+
+    #[test]
+    fn contextual_tuple_binding_display_rejects_changed_binding_values() {
+        let fixture = TupleBindingDisplayFixture::new();
+        let mut context = fixture.checked_context();
+        let arrow = fixture.arrow();
+        let callable = context.get_type_at_location(arrow).unwrap();
+        assert_tuple_binding_display(&mut context, arrow, callable);
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for (_, symbol, _) in fixture.bindings(&context) {
+            let original = context.store().value_symbol_links(symbol).unwrap().clone();
+            assert_ne!(original.resolved_type, Some(number));
+            for changed in [
+                ValueSymbolLinks {
+                    resolved_type: Some(number),
+                    ..ValueSymbolLinks::default()
+                },
+                ValueSymbolLinks {
+                    write_type: Some(number),
+                    ..original.clone()
+                },
+            ] {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(symbol, changed)
+                );
+                assert_tuple_binding_display_rejected(&context, callable);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(symbol, original.clone())
+                );
+                assert_tuple_binding_display(&mut context, arrow, callable);
+                let before = tuple_binding_display_state(&context);
+                assert_eq!(context.get_type_at_location(arrow).unwrap(), callable);
+                assert_eq!(tuple_binding_display_state(&context), before);
+            }
+        }
+    }
+
     #[test]
     fn global_object_factory_generic_overloads_preserve_order_and_string_keys() {
         let library = parsed(concat!(
@@ -97605,31 +97937,109 @@ class Foo2 {
     }
 
     #[test]
-    fn unsupported_source_function_plans_are_atomic_and_missing_names_recover() {
+    #[allow(clippy::too_many_lines)] // Keep the original source cases and their replay checks together.
+    fn generic_source_function_returns_and_missing_names_replay() {
         let source = parsed(concat!(
             "function ready(): void {} ",
             "function generic<T>(value: T) { return value; }",
         ));
         let file = FileId::new(304);
-        let mut blocked = context(&[(file, &source)], CanonicalCheckerOptions::default());
-        let ready = function_symbol(&blocked, &source, file, "ready");
-        let before = observable_state(&blocked, file);
-
-        assert!(matches!(
-            blocked.check_source_file(file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::Callable(_))
-            ))
-        ));
-        assert_eq!(observable_state(&blocked, file), before);
-        assert!(blocked.store().value_symbol_links(ready).is_none());
-        assert!(
-            blocked
-                .store()
-                .source_callable_type_for_owner(ready)
-                .is_none()
+        let mut checked = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let ready = function_symbol(&checked, &source, file, "ready");
+        let declaration = function_declaration(&source, file, "generic");
+        let NodeData::FunctionDeclaration(function) =
+            &source.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        assert!(function.type_.is_none());
+        let type_parameter = NodeRef::new(
+            source.arena.id(),
+            file,
+            function.type_parameters.as_ref().unwrap().nodes[0],
         );
-        assert!(!is_type_checked(&blocked, file));
+        let parameter = NodeRef::new(source.arena.id(), file, function.parameters.nodes[0]);
+        let bound = checked.file(file).unwrap().1;
+        let type_parameter_symbol = bound.symbol(type_parameter).unwrap();
+        let parameter_symbol = bound.symbol(parameter).unwrap();
+
+        checked.check_source_file(file).unwrap();
+        let parameter_type = checked
+            .store()
+            .declared_type_links(type_parameter_symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let signature = checked
+            .store()
+            .signature_links(declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        let ready_type = checked
+            .store()
+            .source_callable_type_for_owner(ready)
+            .unwrap();
+        let ready_signature = checked
+            .store()
+            .source_callable_provenance(ready_type)
+            .unwrap()
+            .signature;
+        let warm = observable_state(&checked, file);
+        for replay in [false, true] {
+            if replay {
+                mark_source_unchecked(&mut checked, file);
+                checked.check_source_file(file).unwrap();
+            }
+            let store = checked.store();
+            let record = store.signature(signature).unwrap();
+            assert_eq!(
+                store
+                    .signature_links(declaration)
+                    .and_then(|links| links.resolved_signature.signature()),
+                Some(signature)
+            );
+            assert_eq!(record.declaration(), Some(declaration));
+            assert_eq!(record.type_parameters(), [parameter_type]);
+            assert_eq!(record.parameters(), [parameter_symbol]);
+            assert_eq!(record.resolved_return_type(), Some(parameter_type));
+            assert_eq!(
+                store.checked_source_callable_return_type(signature),
+                Some(parameter_type)
+            );
+            assert_eq!(
+                store.type_payload(parameter_type).unwrap().symbol(),
+                Some(type_parameter_symbol)
+            );
+            assert_eq!(
+                store
+                    .declared_type_links(type_parameter_symbol)
+                    .and_then(|links| links.declared_type),
+                Some(parameter_type)
+            );
+            assert_eq!(
+                store.symbol(type_parameter_symbol).unwrap().declarations(),
+                Some(&[type_parameter][..])
+            );
+            assert_eq!(
+                store
+                    .value_symbol_links(parameter_symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(parameter_type)
+            );
+            assert_eq!(
+                store
+                    .signature(ready_signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(store.intrinsic_bootstrap().unwrap().void_type)
+            );
+            assert_eq!(
+                store.source_callable_type_for_owner(ready),
+                Some(ready_type)
+            );
+            assert!(checked.diagnostics().is_empty());
+            assert!(is_type_checked(&checked, file));
+            assert_eq!(observable_state(&checked, file), warm);
+        }
 
         let unresolved = parsed("const value = missing;");
         let unresolved_file = FileId::new(305);

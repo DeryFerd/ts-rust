@@ -1058,6 +1058,13 @@ enum StructuralPropertyDisplay {
     },
 }
 
+struct SourceIndexOnlyDisplay {
+    parameter_name: String,
+    key_type: TypeId,
+    value_type: TypeId,
+    readonly: bool,
+}
+
 #[derive(Clone, Copy)]
 enum DeclaredMethodDisplayStyle {
     Function,
@@ -1375,6 +1382,24 @@ fn display_object_type(
     if kind == ObjectFlags::INTERFACE {
         return display_interface_name(store, host, type_id, record, state);
     }
+    if let Some(host) = host
+        && let Some(index) = validated_source_index_only_display(store, host, type_id, record)?
+    {
+        if !visiting.insert(type_id) {
+            return Err(TypeDisplayUnavailable::CyclicType(type_id));
+        }
+        let result = display_source_index_only_type(
+            store,
+            host,
+            global_types,
+            &index,
+            flags,
+            state,
+            visiting,
+        );
+        visiting.remove(&type_id);
+        return result;
+    }
     if let Some(reason) = unsupported_callable_shape(store, type_id, record)? {
         return Err(TypeDisplayUnavailable::FunctionType { type_id, reason });
     }
@@ -1402,6 +1427,138 @@ fn display_object_type(
     );
     visiting.remove(&type_id);
     result
+}
+
+fn validated_source_index_only_display(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_id: TypeId,
+    record: &TypeRecord,
+) -> Result<Option<SourceIndexOnlyDisplay>, TypeDisplayUnavailable> {
+    let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
+    let Some(owner) = record.symbol() else {
+        return Ok(None);
+    };
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    let [declaration] = owner_record.declarations().unwrap_or_default() else {
+        return Ok(None);
+    };
+    let Some(declaration_node) = host.node(*declaration) else {
+        return Ok(None);
+    };
+    let NodeData::TypeLiteralNode(literal) = &declaration_node.data else {
+        return Ok(None);
+    };
+    let [member] = literal.members.nodes.as_slice() else {
+        return Ok(None);
+    };
+    let member = NodeRef::new(declaration.arena, declaration.file, *member);
+    let NodeData::IndexSignatureDeclaration(index) = &host.node(member).ok_or_else(invalid)?.data
+    else {
+        return Ok(None);
+    };
+
+    // Source shape selects this path even if the cached index list was removed.
+    let plan = object_members::plan_type_literal(store, host, *declaration, None)
+        .map_err(|_| invalid())?;
+    let [planned] = plan.indexes.as_slice() else {
+        return Err(invalid());
+    };
+    if !plan.properties.is_empty()
+        || !plan.call_signatures.is_empty()
+        || !matches!(
+            object_members::type_literal_state(store, &plan),
+            Ok(Some(object_members::PropertyObjectState::Resolved(found))) if found == type_id
+        )
+    {
+        return Err(invalid());
+    }
+    let [index_id] = record
+        .data()
+        .structured()
+        .and_then(|structured| structured.index_infos.as_deref())
+        .ok_or_else(invalid)?
+    else {
+        return Err(invalid());
+    };
+    if !super::structured_members::valid_index_symbol(
+        store,
+        plan.symbol,
+        &plan.declarations,
+        planned.symbol,
+        &[*index_id],
+    ) {
+        return Err(invalid());
+    }
+    let info = store.index_info(*index_id).ok_or_else(invalid)?;
+    let [parameter] = index.parameters.nodes.as_slice() else {
+        return Err(invalid());
+    };
+    let parameter = NodeRef::new(member.arena, member.file, *parameter);
+    let NodeData::ParameterDeclaration(parameter) = &host.node(parameter).ok_or_else(invalid)?.data
+    else {
+        return Err(invalid());
+    };
+    let name = NodeRef::new(member.arena, member.file, parameter.name);
+    let NodeData::Identifier(name) = &host.node(name).ok_or_else(invalid)?.data else {
+        return Err(invalid());
+    };
+    Ok(Some(SourceIndexOnlyDisplay {
+        parameter_name: name.text.clone(),
+        key_type: info.key_type(),
+        value_type: info.value_type(),
+        readonly: info.is_readonly(),
+    }))
+}
+
+fn display_source_index_only_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    index: &SourceIndexOnlyDisplay,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    if state.check_truncation(flags) {
+        state.add(2);
+        return if flags.contains(CanonicalTypeFormatFlags::NO_TRUNCATION) {
+            Ok("{ /*elided*/ }".to_owned())
+        } else {
+            Ok("{ ...; }".to_owned())
+        };
+    }
+    let mut result = String::from("{ ");
+    if index.readonly {
+        result.push_str("readonly ");
+        state.add(9);
+    }
+    result.push('[');
+    result.push_str(&index.parameter_name);
+    result.push_str(": ");
+    state.add(index.parameter_name.len().saturating_add(4));
+    result.push_str(&display_type_worker(
+        store,
+        Some(host),
+        global_types,
+        index.key_type,
+        flags,
+        state,
+        visiting,
+    )?);
+    result.push_str("]: ");
+    result.push_str(&display_type_worker(
+        store,
+        Some(host),
+        global_types,
+        index.value_type,
+        flags,
+        state,
+        visiting,
+    )?);
+    result.push_str("; }");
+    state.add(2);
+    Ok(result)
 }
 
 fn display_validated_enum_value(
@@ -2878,7 +3035,7 @@ fn append_source_signature_parameters(
     )
 }
 
-#[allow(clippy::too_many_arguments)] // Callers supply parameter types from a validated signature.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Callers supply parameter types from a validated signature.
 fn append_validated_signature_parameters(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2951,18 +3108,145 @@ fn append_validated_signature_parameters(
         }
         result.push_str(": ");
         state.add(2);
-        result.push_str(&display_type_worker(
+        if let Some(types) = unchanged_parameter_object_union(
             store,
-            Some(host),
+            host,
             global_types,
+            owner,
+            signature,
+            index,
             *type_,
-            flags,
             state,
-            visiting,
-        )?);
+        )? {
+            ensure_acyclic_union_graph(store, *type_)?;
+            validate_display_union(store, global_types, *type_)?;
+            if !visiting.insert(*type_) {
+                return Err(TypeDisplayUnavailable::CyclicType(*type_));
+            }
+            let displayed = display_union_list(
+                store,
+                Some(host),
+                global_types,
+                *type_,
+                &types,
+                flags,
+                state,
+                visiting,
+            );
+            visiting.remove(type_);
+            result.push_str(&displayed?);
+        } else {
+            result.push_str(&display_type_worker(
+                store,
+                Some(host),
+                global_types,
+                *type_,
+                flags,
+                state,
+                visiting,
+            )?);
+        }
     }
     result.push(')');
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Match one source parameter to its effective signature slot.
+fn unchanged_parameter_object_union(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    owner: TypeId,
+    signature: SignatureId,
+    index: usize,
+    effective: TypeId,
+    state: &DisplayState,
+) -> Result<Option<Vec<TypeId>>, TypeDisplayUnavailable> {
+    let invalid = || TypeDisplayUnavailable::MalformedType(owner);
+    let signature = store.signature(signature).ok_or_else(invalid)?;
+    if state.location.is_none() || signature.target().is_some() || signature.mapper().is_some() {
+        return Ok(None);
+    }
+    let parameter = signature
+        .parameters()
+        .get(index)
+        .copied()
+        .ok_or_else(invalid)?;
+    let declaration = store
+        .symbol(parameter)
+        .and_then(ts_binder::semantic::Symbol::value_declaration)
+        .ok_or_else(invalid)?;
+    let node = host.node(declaration).ok_or_else(invalid)?;
+    let NodeData::ParameterDeclaration(data) = &node.data else {
+        return Err(invalid());
+    };
+    let Some(annotation) = data.type_ else {
+        return Ok(None);
+    };
+    if data.question_token.is_some()
+        || data.initializer.is_some()
+        || data.dot_dot_dot_token.is_some()
+    {
+        return Ok(None);
+    }
+    let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
+    if host.node(annotation).ok_or_else(invalid)?.kind != SyntaxKind::UnionType {
+        return Ok(None);
+    }
+    let signature_declaration = signature.declaration().ok_or_else(invalid)?;
+    let source_parameters = match &host.node(signature_declaration).ok_or_else(invalid)?.data {
+        NodeData::FunctionDeclaration(data) => &data.parameters.nodes,
+        NodeData::FunctionExpression(data) => &data.parameters.nodes,
+        NodeData::ArrowFunction(data) => &data.parameters.nodes,
+        NodeData::FunctionTypeNode(data) => &data.parameters.nodes,
+        NodeData::ConstructorTypeNode(data) => &data.parameters.nodes,
+        NodeData::MethodSignatureDeclaration(data) => &data.parameters.nodes,
+        NodeData::CallSignatureDeclaration(data) => &data.parameters.nodes,
+        NodeData::ConstructSignatureDeclaration(data) => &data.parameters.nodes,
+        _ => return Ok(None),
+    };
+    let parameters = store
+        .source_direct_children(signature_declaration)
+        .ok_or_else(invalid)?
+        .into_iter()
+        .filter(|node| store.source_node_kind(*node) == Some(SyntaxKind::Parameter))
+        .collect::<Vec<_>>();
+    if node.parent != Some(signature_declaration.node)
+        || declaration.arena != signature_declaration.arena
+        || declaration.file != signature_declaration.file
+        || parameters.len() != signature.parameters().len()
+        || !source_parameters
+            .iter()
+            .copied()
+            .eq(parameters.iter().map(|parameter| parameter.node))
+        || parameters.get(index) != Some(&declaration)
+        || !host.symbol_matches(store, declaration, parameter)
+        || host
+            .node(annotation)
+            .is_none_or(|node| node.parent != Some(declaration.node))
+        || store
+            .value_symbol_links(parameter)
+            .and_then(|links| links.resolved_type)
+            != Some(effective)
+    {
+        return Err(invalid());
+    }
+    if store
+        .type_payload(effective)
+        .ok_or_else(invalid)?
+        .object_flags()
+        .intersects(ObjectFlags::REQUIRES_WIDENING)
+    {
+        return Ok(None);
+    }
+    super::type_nodes::cached_source_object_union_display_types(
+        store,
+        host,
+        global_types,
+        annotation,
+        effective,
+    )
+    .map_err(|_| invalid())
 }
 
 #[allow(clippy::too_many_arguments)] // Keep recursive formatter state explicit.
@@ -13778,6 +14062,573 @@ mod tests {
         }
     }
 
+    const PARAMETER_OBJECT_UNION_SOURCE: &str = concat!(
+        "interface Alpha { alpha: number; } interface Beta { beta: string; } ",
+        "interface Service { left(value: Beta | Alpha): void; ",
+        "right(value: Alpha | Beta): void; } declare const service: Service; ",
+        "const left = service.left; const right = service.right;",
+    );
+
+    fn parameter_union_method_parts(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        method_name: &str,
+    ) -> (NodeRef, NodeRef, SignatureId, TypeId) {
+        let access = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::PropertyAccessExpression(access) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(access.name)?.data else {
+                    return None;
+                };
+                (name.text == method_name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let callable = context
+            .store()
+            .type_node_links(access)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let signature = context
+            .store()
+            .type_payload(callable)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        let declaration = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .declaration()
+            .unwrap();
+        let NodeData::MethodSignatureDeclaration(method) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the source method owns the signature");
+        };
+        let NodeData::ParameterDeclaration(parameter) =
+            &parsed.arena.get(method.parameters.nodes[0]).unwrap().data
+        else {
+            panic!("the method owns its first parameter");
+        };
+        let annotation = NodeRef::new(parsed.arena.id(), file, parameter.type_.unwrap());
+        (access, annotation, signature, callable)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both query orders retain the same canonical union.
+    fn parameter_object_union_display_reuses_each_declared_order() {
+        let parsed = parse_source_file(PARAMETER_OBJECT_UNION_SOURCE);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(148_300);
+        let first_annotation = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::UnionType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let flags = CanonicalTypeFormatFlags::NO_TRUNCATION;
+        for query_first in [false, true] {
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            let early =
+                query_first.then(|| context.get_type_from_type_node(first_annotation).unwrap());
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let mut shared_union = early;
+            for (name, expected) in [
+                ("left", "(value: Beta | Alpha) => void"),
+                ("right", "(value: Alpha | Beta) => void"),
+            ] {
+                let (access, annotation, signature, callable) =
+                    parameter_union_method_parts(&context, &parsed, file, name);
+                let parameter_type = context
+                    .store()
+                    .callable_signature_parameter_types(signature)
+                    .unwrap()[0];
+                if let Some(previous) = shared_union {
+                    assert_eq!(parameter_type, previous);
+                }
+                shared_union = Some(parameter_type);
+                assert_eq!(
+                    context.get_type_from_type_node(annotation),
+                    Ok(parameter_type)
+                );
+                let TypeData::Union(union) =
+                    context.store().type_payload(parameter_type).unwrap().data()
+                else {
+                    panic!("both source orders share one canonical union");
+                };
+                let union = union.clone();
+                let before = format!("{:?}", context.store());
+                for _ in 0..2 {
+                    assert_eq!(
+                        context
+                            .type_to_string_at_location_with_flags(callable, access, flags)
+                            .unwrap(),
+                        expected
+                    );
+                    assert_eq!(
+                        context.type_to_string(callable).unwrap(),
+                        "(value: Alpha | Beta) => void"
+                    );
+                    assert_eq!(
+                        context.type_to_string(parameter_type).unwrap(),
+                        "Alpha | Beta"
+                    );
+                    assert_eq!(
+                        context
+                            .type_to_string_at_location_with_flags(parameter_type, access, flags)
+                            .unwrap(),
+                        "Alpha | Beta"
+                    );
+                    assert_eq!(
+                        context.store().type_payload(parameter_type).unwrap().data(),
+                        &TypeData::Union(union.clone())
+                    );
+                    assert_eq!(format!("{:?}", context.store()), before);
+                }
+            }
+            let before = alias_display_cache_counts(&context);
+            context.check_source_file(file).unwrap();
+            assert_eq!(alias_display_cache_counts(&context), before);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep real generic and index ownership together with poison and restore.
+    fn parameter_object_union_display_keeps_generic_index_literal_owners() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Sequence<T> { readonly length: number; readonly [n: number]: T; } ",
+            "interface Catalog { ",
+            "pairs<T>(input: { [key: string]: T; } | Sequence<T>): [string, T][]; ",
+            "pairs(input: {}): [string, any][]; } ",
+            "declare const catalog: Catalog; const pairs = catalog.pairs;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(148_301);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (access, annotation, signature, callable) =
+            parameter_union_method_parts(&context, &parsed, file, "pairs");
+        let NodeData::UnionTypeNode(union) = &parsed.arena.get(annotation.node).unwrap().data
+        else {
+            panic!("the parameter has its written union");
+        };
+        let children = union
+            .types
+            .nodes
+            .iter()
+            .map(|node| NodeRef::new(parsed.arena.id(), file, *node))
+            .collect::<Vec<_>>();
+        let source_types = children
+            .iter()
+            .map(|node| {
+                context
+                    .store()
+                    .type_node_links(*node)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let parameter_type = context
+            .store()
+            .callable_signature_parameter_types(signature)
+            .unwrap()[0];
+        let TypeData::Union(canonical) =
+            context.store().type_payload(parameter_type).unwrap().data()
+        else {
+            panic!("the parameter retains its canonical union");
+        };
+        assert_eq!(canonical.union.types, [source_types[1], source_types[0]]);
+        assert!(canonical.origin.is_none());
+        let literal_owner = context.file(file).unwrap().1.symbol(children[0]).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .type_payload(source_types[0])
+                .unwrap()
+                .symbol(),
+            Some(literal_owner)
+        );
+        let reference =
+            validate_direct_generic_reference(context.store(), source_types[1]).unwrap();
+        let type_parameter = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .type_parameters()[0];
+        assert_eq!(reference.type_arguments, [type_parameter]);
+        let index = context
+            .store()
+            .type_payload(source_types[0])
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .index_infos
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(
+            context.store().index_info(index).unwrap().value_type(),
+            type_parameter
+        );
+        let before = format!("{:?}", context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(
+                        callable,
+                        access,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION
+                    )
+                    .unwrap(),
+                "{ <T>(input: { [key: string]: T; } | Sequence<T>): [string, T][]; (input: {}): [string, any][]; }"
+            );
+            assert_eq!(
+                context.type_to_string(callable).unwrap(),
+                "{ <T>(input: Sequence<T> | { [key: string]: T; }): [string, T][]; (input: {}): [string, any][]; }"
+            );
+            assert_eq!(format!("{:?}", context.store()), before);
+        }
+
+        let NodeData::TypeReferenceNode(reference_node) =
+            &parsed.arena.get(children[1].node).unwrap().data
+        else {
+            panic!("the named member retains its real type argument");
+        };
+        let argument = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            reference_node.type_arguments.as_ref().unwrap().nodes[0],
+        );
+        let TypeData::Interface(target) = context
+            .store()
+            .type_payload(reference.target)
+            .unwrap()
+            .data()
+        else {
+            panic!("the reference retains its interface target");
+        };
+        let other_parameter = target.reference.resolved_type_arguments.as_ref().unwrap()[0];
+        assert_ne!(type_parameter, other_parameter);
+        let other_owner =
+            cached_ordinary_type_parameter_owner(context.store(), other_parameter).unwrap();
+        let argument_type = context.store().type_node_links(argument).unwrap().clone();
+        let argument_symbol = context.store().symbol_node_links(argument).unwrap().clone();
+        for poison in 0..2 {
+            let literal_type = context
+                .store()
+                .type_node_links(children[0])
+                .unwrap()
+                .clone();
+            let named_type = context
+                .store()
+                .type_node_links(children[1])
+                .unwrap()
+                .clone();
+            if poison == 0 {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(children[0], named_type.clone())
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(children[1], literal_type.clone())
+                );
+            } else {
+                let mut changed = argument_type.clone();
+                changed.resolved_type = Some(other_parameter);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(argument, changed)
+                );
+                assert!(context.store_mut_for_test().set_symbol_node_links(
+                    argument,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(other_owner),
+                    }
+                ));
+            }
+            let poisoned = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    context.type_to_string_at_location_with_flags(
+                        callable,
+                        access,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION
+                    ),
+                    Err(TypeDisplayUnavailable::MalformedType(callable))
+                );
+                assert_eq!(format!("{:?}", context.store()), poisoned);
+            }
+            if poison == 0 {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(children[0], literal_type)
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(children[1], named_type)
+                );
+            } else {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(argument, argument_type.clone())
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(argument, argument_symbol.clone())
+                );
+            }
+            let restored = format!("{:?}", context.store());
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(
+                        callable,
+                        access,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION
+                    )
+                    .unwrap(),
+                "{ <T>(input: { [key: string]: T; } | Sequence<T>): [string, T][]; (input: {}): [string, any][]; }"
+            );
+            assert_eq!(format!("{:?}", context.store()), restored);
+        }
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let unrelated_members = [bootstrap.string_type, bootstrap.number_type];
+        let unrelated = context
+            .store_mut_for_test()
+            .literal_union_type(&unrelated_members, None)
+            .unwrap();
+        let original = context.store().type_node_links(annotation).unwrap().clone();
+        let mut changed = original.clone();
+        changed.resolved_type = Some(unrelated);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(annotation, changed)
+        );
+        {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, context.file(file).unwrap().1)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let poisoned = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    super::super::type_nodes::cached_source_object_union_display_types(
+                        context.store(),
+                        &host,
+                        Some(context.global_types()),
+                        annotation,
+                        unrelated,
+                    ),
+                    Err(super::super::DeclaredTypeError::TypeNodeUnavailable(
+                        super::super::type_nodes::TypeNodeUnavailable::InvalidUnionType(annotation),
+                    ))
+                );
+                assert_eq!(format!("{:?}", context.store()), poisoned);
+            }
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(annotation, original)
+        );
+        let restored = format!("{:?}", context.store());
+        assert_eq!(
+            context
+                .type_to_string_at_location_with_flags(
+                    callable,
+                    access,
+                    CanonicalTypeFormatFlags::NO_TRUNCATION
+                )
+                .unwrap(),
+            "{ <T>(input: { [key: string]: T; } | Sequence<T>): [string, T][]; (input: {}): [string, any][]; }"
+        );
+        assert_eq!(format!("{:?}", context.store()), restored);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each paired poison keeps its exact restored declaration.
+    fn parameter_object_union_display_rejects_paired_child_cache_swaps() {
+        let parsed = parse_source_file(PARAMETER_OBJECT_UNION_SOURCE);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(148_302);
+        for warm in [false, true] {
+            for swap_symbols in [false, true] {
+                let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+                context.check_source_file(file).unwrap();
+                let (access, annotation, _, callable) =
+                    parameter_union_method_parts(&context, &parsed, file, "left");
+                let NodeData::UnionTypeNode(union) =
+                    &parsed.arena.get(annotation.node).unwrap().data
+                else {
+                    panic!("the parameter retains both source references");
+                };
+                let children = union
+                    .types
+                    .nodes
+                    .iter()
+                    .map(|node| NodeRef::new(parsed.arena.id(), file, *node))
+                    .collect::<Vec<_>>();
+                let types = children
+                    .iter()
+                    .map(|node| context.store().type_node_links(*node).unwrap().clone())
+                    .collect::<Vec<_>>();
+                let symbols = children
+                    .iter()
+                    .map(|node| context.store().symbol_node_links(*node).unwrap().clone())
+                    .collect::<Vec<_>>();
+                let flags = CanonicalTypeFormatFlags::NO_TRUNCATION;
+                if warm {
+                    assert_eq!(
+                        context
+                            .type_to_string_at_location_with_flags(callable, access, flags)
+                            .unwrap(),
+                        "(value: Beta | Alpha) => void"
+                    );
+                }
+                for index in 0..2 {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_type_node_links(children[index], types[1 - index].clone())
+                    );
+                    if swap_symbols {
+                        assert!(
+                            context
+                                .store_mut_for_test()
+                                .set_symbol_node_links(children[index], symbols[1 - index].clone())
+                        );
+                    }
+                }
+                let poisoned = format!("{:?}", context.store());
+                for _ in 0..2 {
+                    assert_eq!(
+                        context.type_to_string_at_location_with_flags(callable, access, flags),
+                        Err(TypeDisplayUnavailable::MalformedType(callable))
+                    );
+                    assert_eq!(format!("{:?}", context.store()), poisoned);
+                }
+                for index in 0..2 {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_type_node_links(children[index], types[index].clone())
+                    );
+                    if swap_symbols {
+                        assert!(
+                            context
+                                .store_mut_for_test()
+                                .set_symbol_node_links(children[index], symbols[index].clone())
+                        );
+                    }
+                }
+                let restored = format!("{:?}", context.store());
+                for _ in 0..2 {
+                    assert_eq!(
+                        context
+                            .type_to_string_at_location_with_flags(callable, access, flags)
+                            .unwrap(),
+                        "(value: Beta | Alpha) => void"
+                    );
+                    assert_eq!(format!("{:?}", context.store()), restored);
+                }
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn parameter_object_union_display_keeps_instantiated_semantic_types() {
+        let parsed = parse_source_file(concat!(
+            "interface Alpha<T> { alpha: T; } interface Beta<T> { beta: T; } ",
+            "interface Service<T> { read(value: Beta<T> | Alpha<T>): T; } ",
+            "declare const service: Service<string>; const read = service.read;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(148_303);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (access, annotation, signature, callable) =
+            parameter_union_method_parts(&context, &parsed, file, "read");
+        let signature_record = context.store().signature(signature).unwrap();
+        assert!(signature_record.target().is_some());
+        assert!(signature_record.mapper().is_some());
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(context.store(), callable)
+        else {
+            panic!("the copied method retains its validated callable projection");
+        };
+        assert_eq!(projection.owner, callable);
+        assert!(projection.construct_signatures.is_empty());
+        let [projected] = projection.call_signatures.as_ref() else {
+            panic!("the copied method has one call signature");
+        };
+        assert_eq!(projected.owner, callable);
+        assert_eq!(projected.signature, signature);
+        assert!(projected.rest_parameter.is_none());
+        let [effective] = projected.parameters.as_slice() else {
+            panic!("the copied method has one effective parameter");
+        };
+        let effective = *effective;
+        let source = context
+            .store()
+            .type_node_links(annotation)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_ne!(source, effective);
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(signature_record.resolved_return_type(), Some(string));
+        let before = format!("{:?}", context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(
+                        callable,
+                        access,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION
+                    )
+                    .unwrap(),
+                "(value: Alpha<string> | Beta<string>) => string"
+            );
+            assert_eq!(
+                context.type_to_string(callable).unwrap(),
+                "(value: Alpha<string> | Beta<string>) => string"
+            );
+            assert_eq!(format!("{:?}", context.store()), before);
+        }
+    }
+
     #[test]
     fn instantiated_method_display_names_only_validated_fresh_parameters() {
         let parsed = parse_source_file(concat!(
@@ -18086,6 +18937,605 @@ mod tests {
             context.type_to_string(type_),
             Err(TypeDisplayUnavailable::MalformedType(type_))
         );
+    }
+
+    fn source_index_only_display_fixture(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (CanonicalCheckerContext<'_>, NodeRef, TypeId, IndexInfoId) {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = parsed_context(parsed, file, CanonicalCheckerOptions::default());
+        let annotation = variable_type_node(parsed, file, "obj");
+        let type_id = context.get_type_from_type_node(annotation).unwrap();
+        let [index] = context
+            .store()
+            .type_payload(type_id)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .index_infos
+            .as_deref()
+            .unwrap()
+        else {
+            panic!("the actual annotation must produce exactly one index");
+        };
+        let index = *index;
+        (context, annotation, type_id, index)
+    }
+
+    fn assert_source_index_only_display(
+        context: &CanonicalCheckerContext<'_>,
+        annotation: NodeRef,
+        type_id: TypeId,
+        expected: Result<&str, TypeDisplayUnavailable>,
+    ) {
+        let store = context.store();
+        let counts = alias_display_cache_counts(context);
+        let resolution = store.type_resolution_internal_state();
+        let diagnostics = context.diagnostics().as_slice().to_vec();
+        let annotation_links = store.type_node_links(annotation).cloned();
+        let record = store.type_payload(type_id).unwrap();
+        let header = (
+            record.flags(),
+            record.object_flags(),
+            record.symbol(),
+            record.alias(),
+        );
+        let TypeData::Object(object) = record.data() else {
+            panic!("the declared index must retain its anonymous object");
+        };
+        let object = object.clone();
+        let indexes = object
+            .structured
+            .index_infos
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|id| {
+                let info = store.index_info(*id).unwrap();
+                (
+                    *id,
+                    info.key_type(),
+                    info.value_type(),
+                    info.is_readonly(),
+                    info.declaration(),
+                    info.index_symbol(),
+                    info.components().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..3 {
+            assert_eq!(
+                context.type_to_string(type_id).as_deref(),
+                expected.as_ref().copied(),
+            );
+            assert_eq!(alias_display_cache_counts(context), counts);
+            assert_eq!(store.type_resolution_internal_state(), resolution);
+            assert_eq!(context.diagnostics().as_slice(), diagnostics.as_slice());
+            assert_eq!(store.type_node_links(annotation), annotation_links.as_ref());
+            let after = store.type_payload(type_id).unwrap();
+            assert_eq!(
+                (
+                    after.flags(),
+                    after.object_flags(),
+                    after.symbol(),
+                    after.alias(),
+                ),
+                header,
+            );
+            let TypeData::Object(after) = after.data() else {
+                panic!("display must not replace the anonymous object");
+            };
+            assert_eq!(after, &object);
+            for (id, key, value, readonly, declaration, symbol, components) in &indexes {
+                let info = store.index_info(*id).unwrap();
+                assert_eq!(info.key_type(), *key);
+                assert_eq!(info.value_type(), *value);
+                assert_eq!(info.is_readonly(), *readonly);
+                assert_eq!(info.declaration(), *declaration);
+                assert_eq!(info.index_symbol(), *symbol);
+                assert_eq!(info.components(), components.as_slice());
+            }
+        }
+    }
+
+    #[test]
+    fn source_index_only_display_keeps_original_annotation_identity() {
+        let parsed = parse_source_file(concat!(
+            "interface Contextual { dummy; p?: number; }\n",
+            "interface Ellement { dummy; p: any; }\n",
+            "declare var e: Ellement;\n",
+            "var obj: { [s: string]: Contextual } = { s: e }; // { s: Ellement; [s: string]: Ellement }\n",
+        ));
+        let file = FileId::new(148_290);
+        let (mut context, annotation, type_id, index) =
+            source_index_only_display_fixture(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let variable = parsed.arena.get(annotation.node).unwrap().parent.unwrap();
+        let NodeData::VariableDeclaration(variable) = &parsed.arena.get(variable).unwrap().data
+        else {
+            panic!("the original annotation must belong to obj");
+        };
+        let name = NodeRef::new(parsed.arena.id(), file, variable.name);
+        let initializer = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+        assert_eq!(context.get_type_at_location(name), Ok(type_id));
+        assert_eq!(context.get_type_from_type_node(annotation), Ok(type_id));
+        let raw = context.get_type_at_location(initializer).unwrap();
+        assert_ne!(raw, type_id);
+        assert_eq!(context.type_to_string(raw).unwrap(), "{ s: Ellement; }");
+        let contextual_owner = merged_interface_display_global(&context, "Contextual");
+        let contextual = context
+            .get_declared_type_of_symbol(contextual_owner)
+            .unwrap();
+        let bound = context.file(file).unwrap().1;
+        let owner = bound.symbol(annotation).unwrap();
+        let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+        let plan =
+            object_members::plan_type_literal(context.store(), &host, annotation, None).unwrap();
+        assert_eq!(plan.symbol, owner);
+        assert_eq!(plan.declarations, [annotation]);
+        assert_eq!(plan.indexes.len(), 1);
+        assert_eq!(
+            object_members::type_literal_state(context.store(), &plan),
+            Ok(Some(object_members::PropertyObjectState::Resolved(type_id))),
+        );
+        let record = context.store().type_payload(type_id).unwrap();
+        assert_eq!(record.symbol(), Some(owner));
+        assert_eq!(record.alias(), None);
+        assert_eq!(
+            record.object_flags(),
+            ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED,
+        );
+        let info = context.store().index_info(index).unwrap();
+        assert_eq!(info.declaration(), Some(plan.indexes[0].declaration));
+        assert_eq!(
+            info.key_type(),
+            context.store().intrinsic_bootstrap().unwrap().string_type
+        );
+        assert_eq!(info.value_type(), contextual);
+        assert!(!info.is_readonly());
+        assert_eq!(info.index_symbol(), None);
+        assert!(info.components().is_empty());
+        assert!(super::super::structured_members::valid_index_symbol(
+            context.store(),
+            owner,
+            &[annotation],
+            plan.indexes[0].symbol,
+            &[index],
+        ));
+        assert_source_index_only_display(
+            &context,
+            annotation,
+            type_id,
+            Ok("{ [s: string]: Contextual; }"),
+        );
+    }
+
+    #[test]
+    fn source_index_only_display_keeps_readonly_and_parameter_names() {
+        for (source, expected) in [
+            (
+                "declare var obj: { [entry: string]: number };",
+                "{ [entry: string]: number; }",
+            ),
+            (
+                "declare var obj: { readonly [position: number]: string };",
+                "{ readonly [position: number]: string; }",
+            ),
+            (
+                "declare var obj: { [token: symbol]: boolean };",
+                "{ [token: symbol]: boolean; }",
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let (context, annotation, type_id, _) =
+                source_index_only_display_fixture(&parsed, FileId::new(148_291));
+            assert_source_index_only_display(&context, annotation, type_id, Ok(expected));
+        }
+    }
+
+    #[test]
+    fn source_index_only_display_rejects_changed_type_caches() {
+        let parsed = parse_source_file("declare var obj: { [key: string]: number };");
+        let (mut context, annotation, type_id, index) =
+            source_index_only_display_fixture(&parsed, FileId::new(148_292));
+        let expected = "{ [key: string]: number; }";
+        assert_source_index_only_display(&context, annotation, type_id, Ok(expected));
+        let original = context
+            .store()
+            .type_node_links(annotation)
+            .cloned()
+            .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let counts = alias_display_cache_counts(&context);
+        for links in [
+            TypeNodeLinks::default(),
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                outer_type_parameters: None,
+            },
+            TypeNodeLinks {
+                resolved_type: Some(type_id),
+                outer_type_parameters: Some(vec![number]),
+            },
+        ] {
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(annotation, links)
+            );
+            assert_source_index_only_display(
+                &context,
+                annotation,
+                type_id,
+                Err(TypeDisplayUnavailable::MalformedType(type_id)),
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(annotation, original.clone())
+            );
+            assert_source_index_only_display(&context, annotation, type_id, Ok(expected));
+            assert_eq!(alias_display_cache_counts(&context), counts);
+        }
+        let members = context
+            .store()
+            .type_payload(type_id)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .members;
+        for indexes in [None, Some(Vec::new()), Some(vec![index, index])] {
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_structured_type_members(type_id, members, None, None, None, indexes,)
+            );
+            assert_source_index_only_display(
+                &context,
+                annotation,
+                type_id,
+                Err(TypeDisplayUnavailable::MalformedType(type_id)),
+            );
+            assert!(context.store_mut_for_test().set_structured_type_members(
+                type_id,
+                members,
+                None,
+                None,
+                None,
+                Some(vec![index]),
+            ));
+            assert_source_index_only_display(&context, annotation, type_id, Ok(expected));
+            assert_eq!(alias_display_cache_counts(&context), counts);
+        }
+    }
+
+    #[test]
+    fn source_index_only_display_rejects_changed_index_metadata() {
+        let parsed = parse_source_file("declare var obj: { [key: string]: string };");
+        let (mut context, annotation, type_id, index) =
+            source_index_only_display_fixture(&parsed, FileId::new(148_293));
+        let expected = "{ [key: string]: string; }";
+        assert_source_index_only_display(&context, annotation, type_id, Ok(expected));
+        let store = context.store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        let declaration = store.index_info(index).unwrap().declaration().unwrap();
+        let members = store
+            .type_payload(type_id)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .members;
+        let damaged = [
+            (number, string, false, Some(declaration), Vec::new()),
+            (string, number, false, Some(declaration), Vec::new()),
+            (string, string, true, Some(declaration), Vec::new()),
+            (string, string, false, None, Vec::new()),
+            (string, string, false, Some(annotation), Vec::new()),
+            (string, string, false, Some(declaration), vec![declaration]),
+        ]
+        .map(|(key, value, readonly, declaration, components)| {
+            context
+                .store_mut_for_test()
+                .alloc_index_info(key, value, readonly, declaration, components)
+                .unwrap()
+        });
+        let counts = alias_display_cache_counts(&context);
+        for replacement in damaged {
+            assert!(context.store_mut_for_test().set_structured_type_members(
+                type_id,
+                members,
+                None,
+                None,
+                None,
+                Some(vec![replacement]),
+            ));
+            assert_source_index_only_display(
+                &context,
+                annotation,
+                type_id,
+                Err(TypeDisplayUnavailable::MalformedType(type_id)),
+            );
+            assert!(context.store_mut_for_test().set_structured_type_members(
+                type_id,
+                members,
+                None,
+                None,
+                None,
+                Some(vec![index]),
+            ));
+            assert_source_index_only_display(&context, annotation, type_id, Ok(expected));
+            assert_eq!(alias_display_cache_counts(&context), counts);
+        }
+        let index_symbol = context
+            .file(annotation.file)
+            .unwrap()
+            .1
+            .symbol(declaration)
+            .unwrap();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_index_info_symbol(index, Some(index_symbol))
+        );
+        assert_source_index_only_display(
+            &context,
+            annotation,
+            type_id,
+            Err(TypeDisplayUnavailable::MalformedType(type_id)),
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_index_info_symbol(index, None)
+        );
+        assert_source_index_only_display(&context, annotation, type_id, Ok(expected));
+        assert_eq!(alias_display_cache_counts(&context), counts);
+    }
+
+    #[test]
+    fn source_index_only_display_rejects_changed_source_ownership() {
+        let parsed = parse_source_file("declare var obj: { [key: string]: number };");
+        let (mut context, annotation, type_id, index) =
+            source_index_only_display_fixture(&parsed, FileId::new(148_294));
+        let expected = "{ [key: string]: number; }";
+        assert_source_index_only_display(&context, annotation, type_id, Ok(expected));
+        let store = context.store();
+        let declaration = store.index_info(index).unwrap().declaration().unwrap();
+        let owner = store.type_payload(type_id).unwrap().symbol().unwrap();
+        let members = store.symbol(owner).unwrap().members().unwrap();
+        let index_symbol = context
+            .file(annotation.file)
+            .unwrap()
+            .1
+            .symbol(declaration)
+            .unwrap();
+        let counts = alias_display_cache_counts(&context);
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            index_symbol,
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert_source_index_only_display(
+            &context,
+            annotation,
+            type_id,
+            Err(TypeDisplayUnavailable::MalformedType(type_id)),
+        );
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            index_symbol,
+            None,
+            None,
+            Some(owner),
+            None,
+        ));
+        assert_source_index_only_display(&context, annotation, type_id, Ok(expected));
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                members,
+                EscapedName::internal(InternalSymbolName::Index),
+                owner,
+            ),
+            Some(Some(index_symbol))
+        );
+        assert_source_index_only_display(
+            &context,
+            annotation,
+            type_id,
+            Err(TypeDisplayUnavailable::MalformedType(type_id)),
+        );
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                members,
+                EscapedName::internal(InternalSymbolName::Index),
+                index_symbol,
+            ),
+            Some(Some(owner))
+        );
+        assert_source_index_only_display(&context, annotation, type_id, Ok(expected));
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            index_symbol,
+            Some(vec![annotation]),
+            None,
+        ));
+        assert_source_index_only_display(
+            &context,
+            annotation,
+            type_id,
+            Err(TypeDisplayUnavailable::MalformedType(type_id)),
+        );
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            index_symbol,
+            Some(vec![declaration]),
+            None,
+        ));
+        assert_source_index_only_display(&context, annotation, type_id, Ok(expected));
+        assert_eq!(alias_display_cache_counts(&context), counts);
+    }
+
+    #[test]
+    fn source_index_only_display_checks_written_primitive_after_paired_damage() {
+        let parsed = parse_source_file("declare var obj: { [key: string]: (string) };");
+        let (mut context, annotation, type_id, index) =
+            source_index_only_display_fixture(&parsed, FileId::new(148_295));
+        let expected = "{ [key: string]: string; }";
+        assert_source_index_only_display(&context, annotation, type_id, Ok(expected));
+        let store = context.store();
+        let declaration = store.index_info(index).unwrap().declaration().unwrap();
+        let NodeData::IndexSignatureDeclaration(index_node) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the index must retain its source declaration");
+        };
+        let value_node = NodeRef::new(declaration.arena, declaration.file, index_node.type_);
+        let index_value = store.index_info(index).unwrap().value_type();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        let resolved_value = context.get_type_from_type_node(value_node).unwrap();
+        assert_eq!(resolved_value, index_value);
+        assert_eq!(resolved_value, string);
+        assert!(context.store().type_node_links(value_node).is_none());
+        assert!(context.store_mut_for_test().set_type_node_links(
+            value_node,
+            TypeNodeLinks {
+                resolved_type: Some(resolved_value),
+                outer_type_parameters: None,
+            },
+        ));
+        let store = context.store();
+        let original = store.type_node_links(value_node).cloned().unwrap();
+        assert_eq!(original.resolved_type, Some(string));
+        let members = store
+            .type_payload(type_id)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .members;
+        let replacement = context
+            .store_mut_for_test()
+            .alloc_index_info(string, number, false, Some(declaration), Vec::new())
+            .unwrap();
+        let counts = alias_display_cache_counts(&context);
+        assert!(context.store_mut_for_test().set_type_node_links(
+            value_node,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                outer_type_parameters: None,
+            }
+        ));
+        assert!(context.store_mut_for_test().set_structured_type_members(
+            type_id,
+            members,
+            None,
+            None,
+            None,
+            Some(vec![replacement]),
+        ));
+        assert_source_index_only_display(
+            &context,
+            annotation,
+            type_id,
+            Err(TypeDisplayUnavailable::MalformedType(type_id)),
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(value_node, original)
+        );
+        assert!(context.store_mut_for_test().set_structured_type_members(
+            type_id,
+            members,
+            None,
+            None,
+            None,
+            Some(vec![index]),
+        ));
+        assert_source_index_only_display(&context, annotation, type_id, Ok(expected));
+        assert_eq!(alias_display_cache_counts(&context), counts);
+    }
+
+    #[test]
+    fn source_index_only_display_keeps_child_context_and_cycle_state() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "declare var obj: { [name: string]: \"item\"[] };",
+        ));
+        let file = FileId::new(148_296);
+        let (context, annotation, type_id, _) = source_index_only_display_fixture(&parsed, file);
+        let counts = alias_display_cache_counts(&context);
+        assert_source_index_only_display(
+            &context,
+            annotation,
+            type_id,
+            Ok("{ [name: string]: \"item\"[]; }"),
+        );
+        let flags = CanonicalTypeFormatFlags::NO_TRUNCATION
+            | CanonicalTypeFormatFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE;
+        assert_eq!(
+            context.type_to_string_with_flags(type_id, flags).unwrap(),
+            "{ [name: string]: 'item'[]; }"
+        );
+        let host = DeclaredTypeHost::new([(&parsed.arena, context.file(file).unwrap().1)]).unwrap();
+        let mut state = DisplayState {
+            approximate_length: 63,
+            ..DisplayState::default()
+        };
+        let mut visiting = HashSet::from([type_id]);
+        assert_eq!(
+            display_type_worker(
+                context.store(),
+                Some(&host),
+                Some(context.global_types()),
+                type_id,
+                flags,
+                &mut state,
+                &mut visiting,
+            ),
+            Err(TypeDisplayUnavailable::CyclicType(type_id))
+        );
+        assert_eq!(visiting, HashSet::from([type_id]));
+        assert_eq!(state.approximate_length, 63);
+        assert!(!state.truncating);
+        visiting.clear();
+        assert_eq!(
+            display_type_worker(
+                context.store(),
+                Some(&host),
+                Some(context.global_types()),
+                type_id,
+                flags,
+                &mut state,
+                &mut visiting,
+            )
+            .unwrap(),
+            "{ [name: string]: 'item'[]; }"
+        );
+        assert!(visiting.is_empty());
+        state.approximate_length = DEFAULT_MAXIMUM_TRUNCATION_LENGTH + 1;
+        assert_eq!(
+            display_type_worker(
+                context.store(),
+                Some(&host),
+                Some(context.global_types()),
+                type_id,
+                CanonicalTypeFormatFlags::NONE,
+                &mut state,
+                &mut visiting,
+            )
+            .unwrap(),
+            "{ ...; }"
+        );
+        assert!(state.truncating);
+        assert!(visiting.is_empty());
+        assert_eq!(alias_display_cache_counts(&context), counts);
     }
 
     #[test]

@@ -26104,12 +26104,18 @@ export default <T>(): Subject<T> => {
         )
         .unwrap();
         let resolved = resolve_all(&mut unannotated_function, &plan.bindings).unwrap();
-        assert!(matches!(
+        let before = store_state(&unannotated_function.store);
+        assert_eq!(
             prepare_one(&mut unannotated_function, &resolved[0], &read),
-            Err(SourceImportError::Callable(
-                SourceCallableError::Unsupported(_)
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::TargetSymbol {
+                    alias: plan.bindings[0].alias_symbol,
+                    target: resolved[0].target_symbol,
+                    flags: SymbolFlags::FUNCTION,
+                }
             ))
-        ));
+        );
+        assert_eq!(store_state(&unannotated_function.store), before);
         assert_eq!(
             unannotated_function
                 .store

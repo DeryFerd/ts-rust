@@ -2395,7 +2395,7 @@ fn initialize_globals(
         }
     }
 
-    if !store.record_source_global_bindings(globals) {
+    if !store.record_source_global_bindings_with_sources(globals, files) {
         return Err(CanonicalGlobalInitializationError::InvalidGlobals(globals));
     }
 

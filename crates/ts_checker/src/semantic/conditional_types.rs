@@ -53,7 +53,8 @@ pub(super) struct ConditionalTypeRequest<'a> {
     pub extends_type: TypeId,
     pub branches: ConditionalTypeBranches,
     pub infer_type_parameters: &'a [TypeId],
-    pub outer_type_parameters: &'a [TypeId],
+    /// A filtered empty list still has an allocated root identity cache.
+    pub outer_type_parameters: Option<&'a [TypeId]>,
     pub alias: Option<TypeAliasId>,
 }
 
@@ -98,8 +99,14 @@ struct ConditionalDefinition {
     extends_type: TypeId,
     is_distributive: bool,
     infer_type_parameters: Vec<TypeId>,
-    outer_type_parameters: Vec<TypeId>,
+    outer_type_parameters: Option<Vec<TypeId>>,
     alias: Option<RetainedConditionalAlias>,
+}
+
+impl ConditionalDefinition {
+    fn outer_parameters(&self) -> &[TypeId] {
+        self.outer_type_parameters.as_deref().unwrap_or_default()
+    }
 }
 
 /// Only conditional evaluation can create this immutable production record.
@@ -140,7 +147,7 @@ impl ConditionalRemapProjection {
     }
 
     pub(super) fn parameters(&self) -> &[TypeId] {
-        &self.production.definition.outer_type_parameters
+        self.production.definition.outer_parameters()
     }
 
     pub(super) fn arguments(&self) -> &[TypeId] {
@@ -385,8 +392,7 @@ pub(super) fn get_type_from_conditional_type(
             distributive,
             (!request.infer_type_parameters.is_empty())
                 .then(|| request.infer_type_parameters.to_vec()),
-            (!request.outer_type_parameters.is_empty())
-                .then(|| request.outer_type_parameters.to_vec()),
+            request.outer_type_parameters.map(<[_]>::to_vec),
             request.alias,
         )
         .ok_or(ConditionalTypeError::InvalidNode(request.node))?;
@@ -406,8 +412,8 @@ pub(super) fn get_type_from_conditional_type(
         0,
     )?;
 
-    if !request.outer_type_parameters.is_empty() {
-        let key = conditional_type_key(store, request.outer_type_parameters, None, false)?;
+    if let Some(parameters) = request.outer_type_parameters {
+        let key = conditional_type_key(store, parameters, None, false)?;
         if !store.set_conditional_root_instantiations(
             root,
             TypeCacheState::Allocated(HashMap::from([(key, result)])),
@@ -418,7 +424,7 @@ pub(super) fn get_type_from_conditional_type(
     let proof = ConditionalQueryProduction {
         key: query_key,
         definition,
-        type_arguments: request.outer_type_parameters.to_vec(),
+        type_arguments: request.outer_type_parameters.unwrap_or_default().to_vec(),
         alias: None,
         for_constraint: false,
         result,
@@ -574,12 +580,12 @@ pub(super) fn conditional_remap_projection(
         }
     }
     if !production.mapped_parameters.is_empty()
-        && production.mapped_parameters != definition.outer_type_parameters
+        && production.mapped_parameters != definition.outer_parameters()
     {
         return Err(ConditionalTypeError::InvalidConditional(conditional));
     }
     let arguments = if production.mapped_parameters.is_empty() {
-        definition.outer_type_parameters.clone()
+        definition.outer_parameters().to_vec()
     } else {
         production.type_arguments.clone()
     };
@@ -626,7 +632,7 @@ fn validate_remap_capture_source(
         return Err(unsupported());
     }
     // This source-only header proves every own parameter and excludes enclosing
-    // generic scopes. Inline roots do not yet retain a complete capture proof.
+    // generic scopes. This remapper does not yet revalidate inline capture scopes.
     let header =
         super::object_aliases::property_object_alias_identity_source_header(store, alias.symbol)
             .map_err(|_| invalid_owner())?;
@@ -653,12 +659,12 @@ fn validate_remap_capture_source(
         node = *child;
     }
     if header.alias_symbol != alias.symbol
-        || definition.outer_type_parameters != alias.type_arguments
-        || header.parameters.len() != definition.outer_type_parameters.len()
+        || definition.outer_parameters() != alias.type_arguments
+        || header.parameters.len() != definition.outer_parameters().len()
         || header
             .parameters
             .iter()
-            .zip(&definition.outer_type_parameters)
+            .zip(definition.outer_parameters())
             .any(|((_, symbol), parameter)| {
                 cached_ordinary_type_parameter_owner(store, *parameter) != Some(*symbol)
             })
@@ -1143,6 +1149,61 @@ pub(super) fn conditional_query_alias(
     Ok(proof.definition.alias.as_ref().map(|alias| alias.id))
 }
 
+/// Checks a source-derived capture list before a warm query can allocate.
+pub(super) fn validate_conditional_source_captures(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    outer: Option<&[SemanticSymbolId]>,
+    infer: &[SemanticSymbolId],
+) -> Result<(), ConditionalTypeError> {
+    validate_conditional_node_link_shape(store, node)?;
+    let invalid = || ConditionalTypeError::InvalidTypeNodeCache(node);
+    let cached = store
+        .type_node_links(node)
+        .and_then(|links| links.resolved_type);
+    let proof = store.conditional_query_production(ConditionalQueryKey::Node(node));
+    let Some(proof) = proof else {
+        return if cached.is_none() {
+            Ok(())
+        } else {
+            Err(invalid())
+        };
+    };
+    if cached != Some(proof.result) {
+        return Err(invalid());
+    }
+    validate_query_production(store, proof)?;
+    let matches = |types: &[TypeId], symbols: &[SemanticSymbolId]| {
+        types.len() == symbols.len()
+            && types.iter().zip(symbols).all(|(type_, symbol)| {
+                cached_ordinary_type_parameter_owner(store, *type_) == Some(*symbol)
+            })
+    };
+    if proof.definition.outer_type_parameters.is_some() != outer.is_some()
+        || !matches(
+            proof.definition.outer_parameters(),
+            outer.unwrap_or_default(),
+        )
+        || !matches(&proof.definition.infer_type_parameters, infer)
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn validate_conditional_node_link_shape(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+) -> Result<(), ConditionalTypeError> {
+    if store
+        .type_node_links(node)
+        .is_some_and(|links| links.outer_type_parameters.is_some())
+    {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(node));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_conditional_reference_result(
     store: &CanonicalTypeMapperStore,
     reference: NodeRef,
@@ -1274,7 +1335,7 @@ fn conditional_definition(
         extends_type: record.extends_type(),
         is_distributive: record.is_distributive(),
         infer_type_parameters: record.infer_type_parameters().unwrap_or_default().to_vec(),
-        outer_type_parameters: record.outer_type_parameters().unwrap_or_default().to_vec(),
+        outer_type_parameters: record.outer_type_parameters().map(<[_]>::to_vec),
         alias: retain_conditional_alias(store, record.alias())?,
     })
 }
@@ -1289,7 +1350,7 @@ fn validate_conditional_definition(
     validate_root_alias(
         store,
         definition.node,
-        &definition.outer_type_parameters,
+        definition.outer_parameters(),
         definition.alias.as_ref().map(|alias| alias.id),
     )
 }
@@ -1343,6 +1404,9 @@ fn validate_query_production(
     proof: &ConditionalQueryProduction,
 ) -> Result<(), ConditionalTypeError> {
     validate_conditional_definition(store, &proof.definition)?;
+    if let ConditionalQueryKey::Node(node) = proof.key {
+        validate_conditional_node_link_shape(store, node)?;
+    }
     if let ConditionalQueryKey::AliasReference(reference) = proof.key
         && let Some((symbol, _)) = proof.alias.as_ref()
     {
@@ -1393,7 +1457,7 @@ fn validate_query_production(
             return Ok(());
         }
         ConditionalQueryKey::Node(_) | ConditionalQueryKey::AliasReference(_)
-            if proof.definition.outer_type_parameters.is_empty() =>
+            if proof.definition.outer_type_parameters.is_none() =>
         {
             return if root.instantiations() == &TypeCacheState::Unallocated {
                 Ok(())
@@ -1404,7 +1468,7 @@ fn validate_query_production(
             };
         }
         ConditionalQueryKey::Node(_) => {
-            conditional_type_key_parts(&proof.definition.outer_type_parameters, None, false)
+            conditional_type_key_parts(proof.definition.outer_parameters(), None, false)
         }
         ConditionalQueryKey::Instantiation(_, key) => key,
         ConditionalQueryKey::AliasReference(_) => {
@@ -2875,6 +2939,7 @@ fn validate_request(
     {
         return Err(ConditionalTypeError::InvalidNode(request.node));
     }
+    validate_conditional_node_link_shape(store, request.node)?;
     let mut visiting = HashSet::new();
     validate_conditional_operand(store, request.check_type, &mut visiting)?;
     validate_conditional_operand(store, request.extends_type, &mut visiting)?;
@@ -2882,12 +2947,13 @@ fn validate_request(
     validate_root_alias(
         store,
         request.node,
-        request.outer_type_parameters,
+        request.outer_type_parameters.unwrap_or_default(),
         request.alias,
     )?;
     let mut seen = HashSet::new();
     for parameter in request
         .outer_type_parameters
+        .unwrap_or_default()
         .iter()
         .chain(request.infer_type_parameters)
     {
@@ -3039,7 +3105,7 @@ fn validate_cached_conditional(
         || proof.definition.check_type != request.check_type
         || proof.definition.extends_type != request.extends_type
         || proof.definition.infer_type_parameters != request.infer_type_parameters
-        || proof.definition.outer_type_parameters != request.outer_type_parameters
+        || proof.definition.outer_type_parameters.as_deref() != request.outer_type_parameters
         || proof.definition.alias != retain_conditional_alias(store, request.alias)?
     {
         return Err(ConditionalTypeError::InvalidTypeNodeCache(request.node));
@@ -4754,7 +4820,8 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerDiagnostics, CanonicalCheckerOptions, DeclaredTypeError, DeclaredTypeHost,
-        DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore, ValueSymbolLinks,
+        DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore, TypeNodeUnavailable,
+        ValueSymbolLinks,
         declared::execute_type_parameter,
         mapper::TypeMapper,
         production::GlobalMergeCompletion,
@@ -4999,7 +5066,7 @@ mod tests {
             extends_type: string,
             branches: branches(number, boolean),
             infer_type_parameters: &[],
-            outer_type_parameters: &[],
+            outer_type_parameters: None,
             alias: None,
         };
 
@@ -5055,7 +5122,7 @@ mod tests {
                 extends_type: excluded,
                 branches: branch_types,
                 infer_type_parameters: &[],
-                outer_type_parameters: &[parameter, excluded],
+                outer_type_parameters: Some(&[parameter, excluded]),
                 alias: None,
             },
             None,
@@ -5187,7 +5254,7 @@ mod tests {
                     extends_type: bound_parameter,
                     branches: branch_types,
                     infer_type_parameters: &[],
-                    outer_type_parameters: &[parameter, bound_parameter],
+                    outer_type_parameters: Some(&[parameter, bound_parameter]),
                     alias: None,
                 },
                 None,
@@ -5319,7 +5386,7 @@ mod tests {
                     extends_type: bound_parameter,
                     branches: branch_types,
                     infer_type_parameters: &[],
-                    outer_type_parameters: &[parameter, bound_parameter],
+                    outer_type_parameters: Some(&[parameter, bound_parameter]),
                     alias: None,
                 },
                 None,
@@ -5406,7 +5473,7 @@ mod tests {
                     extends_type: bound,
                     branches: branch_types,
                     infer_type_parameters: &[],
-                    outer_type_parameters: &[parameter, bound],
+                    outer_type_parameters: Some(&[parameter, bound]),
                     alias: None,
                 },
                 None,
@@ -5502,7 +5569,7 @@ mod tests {
                     extends_type: bound,
                     branches: branch_types,
                     infer_type_parameters: &[],
-                    outer_type_parameters: &[parameter, bound],
+                    outer_type_parameters: Some(&[parameter, bound]),
                     alias: None,
                 },
                 None,
@@ -5650,7 +5717,7 @@ mod tests {
                     extends_type: bound,
                     branches: branch_types,
                     infer_type_parameters: &[],
-                    outer_type_parameters: &[parameter, bound],
+                    outer_type_parameters: Some(&[parameter, bound]),
                     alias: None,
                 },
                 None,
@@ -5985,7 +6052,7 @@ mod tests {
                 extends_type: bound,
                 branches: branch_types,
                 infer_type_parameters: &[],
-                outer_type_parameters: &parameters,
+                outer_type_parameters: Some(&parameters),
                 alias: None,
             },
             None,
@@ -6086,7 +6153,7 @@ mod tests {
                 extends_type: bound,
                 branches: branch_types,
                 infer_type_parameters: &[],
-                outer_type_parameters: &[parameter, bound],
+                outer_type_parameters: Some(&[parameter, bound]),
                 alias: None,
             },
             None,
@@ -6532,7 +6599,7 @@ mod tests {
                 extends_type: bound,
                 branches: branch_types,
                 infer_type_parameters: &[],
-                outer_type_parameters: &[parameter, bound],
+                outer_type_parameters: Some(&[parameter, bound]),
                 alias: None,
             },
             None,
@@ -6623,7 +6690,7 @@ mod tests {
                 extends_type: string,
                 branches: branches(number, boolean),
                 infer_type_parameters: &[],
-                outer_type_parameters: &[],
+                outer_type_parameters: None,
                 alias: None,
             },
             None,
@@ -6655,7 +6722,7 @@ mod tests {
                 extends_type: number,
                 branches: branches(one, zero),
                 infer_type_parameters: &[],
-                outer_type_parameters: &[],
+                outer_type_parameters: None,
                 alias: None,
             },
             None,
@@ -6708,7 +6775,7 @@ mod tests {
                     extends_type: extends,
                     branches: branches(one, zero),
                     infer_type_parameters: &[],
-                    outer_type_parameters: &[],
+                    outer_type_parameters: None,
                     alias: None,
                 },
                 None,
@@ -6745,7 +6812,7 @@ mod tests {
                 extends_type: inferred,
                 branches: branch_types,
                 infer_type_parameters: &[inferred],
-                outer_type_parameters: &[parameter],
+                outer_type_parameters: Some(&[parameter]),
                 alias: None,
             },
             None,
@@ -6805,6 +6872,370 @@ mod tests {
             store.mapper_len(),
             store.conditional_production_lengths(),
         )
+    }
+
+    fn query_capture_node(
+        fixture: &mut Fixture,
+        node: NodeRef,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let result = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(node);
+        assert!(diagnostics.is_empty());
+        result
+    }
+
+    #[test]
+    fn conditional_source_captures_keep_absent_and_filtered_empty_root_caches_distinct() {
+        for reverse in [false, true] {
+            let mut fixture = Fixture::new(concat!(
+                "type Empty<T> = { [K in keyof T]: string extends number ? 0 : 1 }; ",
+                "type Plain = string extends number ? 0 : 1;",
+            ));
+            let mut nodes = fixture
+                .parsed
+                .arena
+                .iter()
+                .filter_map(|(id, record)| {
+                    (record.kind == SyntaxKind::ConditionalType).then_some((
+                        record.range.start,
+                        NodeRef::new(fixture.parsed.arena.id(), fixture.file, id),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            nodes.sort_unstable();
+            let [(_, empty), (_, plain)] = nodes.as_slice() else {
+                panic!("two source conditionals");
+            };
+            let (empty, plain) = (*empty, *plain);
+            let order = if reverse {
+                [plain, empty]
+            } else {
+                [empty, plain]
+            };
+            for node in order {
+                query_capture_node(&mut fixture, node).unwrap();
+            }
+            let empty_proof = fixture
+                .store
+                .conditional_query_production(ConditionalQueryKey::Node(empty))
+                .unwrap()
+                .clone();
+            let plain_proof = fixture
+                .store
+                .conditional_query_production(ConditionalQueryKey::Node(plain))
+                .unwrap()
+                .clone();
+            assert_eq!(
+                empty_proof.definition.outer_type_parameters,
+                Some(Vec::new())
+            );
+            assert_eq!(plain_proof.definition.outer_type_parameters, None);
+            let root = fixture.store.conditional_root(empty_proof.root()).unwrap();
+            assert_eq!(root.outer_type_parameters(), Some([].as_slice()));
+            let TypeCacheState::Allocated(cache) = root.instantiations() else {
+                panic!("filtered captures keep the identity cache");
+            };
+            assert_eq!(cache.len(), 1);
+            assert_eq!(
+                cache.get(&conditional_type_key_parts(&[], None, false)),
+                Some(&empty_proof.result)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .conditional_root(plain_proof.root())
+                    .unwrap()
+                    .instantiations(),
+                &TypeCacheState::Unallocated
+            );
+            let warm = conditional_allocation_counts(&fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    query_capture_node(&mut fixture, empty),
+                    Ok(empty_proof.result)
+                );
+                assert_eq!(
+                    query_capture_node(&mut fixture, plain),
+                    Ok(plain_proof.result)
+                );
+                assert_eq!(conditional_allocation_counts(&fixture.store), warm);
+                assert_eq!(
+                    validate_conditional_source_captures(&fixture.store, empty, Some(&[]), &[]),
+                    Ok(())
+                );
+                assert_eq!(
+                    validate_conditional_source_captures(&fixture.store, plain, None, &[]),
+                    Ok(())
+                );
+                assert_eq!(
+                    validate_conditional_source_captures(&fixture.store, empty, None, &[]),
+                    Err(ConditionalTypeError::InvalidTypeNodeCache(empty))
+                );
+                assert_eq!(
+                    validate_conditional_source_captures(&fixture.store, plain, Some(&[]), &[]),
+                    Err(ConditionalTypeError::InvalidTypeNodeCache(plain))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_source_captures_reject_outer_parameter_node_links_before_publication() {
+        for warm in [false, true] {
+            let mut fixture = Fixture::new(
+                "type Empty<T> = { [K in keyof T]: string extends number ? boolean : string };",
+            );
+            let node = fixture.conditional();
+            if warm {
+                query_capture_node(&mut fixture, node).unwrap();
+            }
+            assert!(fixture.store.ensure_type_node_links(node));
+            let original = fixture.store.type_node_links(node).unwrap().clone();
+            let proof = fixture
+                .store
+                .conditional_query_production(ConditionalQueryKey::Node(node))
+                .cloned();
+            let mut poison = original.clone();
+            poison.outer_type_parameters = Some(Vec::new());
+            assert!(fixture.store.set_type_node_links(node, poison.clone()));
+            let before = conditional_allocation_counts(&fixture.store);
+            let links = fixture.store.checker_link_allocated_lengths();
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let (string, number, boolean) = (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.boolean_type,
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_conditional_source_captures(&fixture.store, node, Some(&[]), &[]),
+                    Err(ConditionalTypeError::InvalidTypeNodeCache(node))
+                );
+                assert_eq!(
+                    get_type_from_conditional_type(
+                        &mut fixture.store,
+                        ConditionalTypeRequest {
+                            node,
+                            check_type: string,
+                            extends_type: number,
+                            branches: branches(boolean, string),
+                            infer_type_parameters: &[],
+                            outer_type_parameters: Some(&[]),
+                            alias: None,
+                        },
+                        None
+                    ),
+                    Err(ConditionalTypeError::InvalidTypeNodeCache(node))
+                );
+                assert_eq!(
+                    query_capture_node(&mut fixture, node),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(node),
+                    ))
+                );
+                assert_eq!(conditional_allocation_counts(&fixture.store), before);
+                assert_eq!(fixture.store.checker_link_allocated_lengths(), links);
+                assert_eq!(fixture.store.type_node_links(node), Some(&poison));
+                assert_eq!(
+                    fixture
+                        .store
+                        .conditional_query_production(ConditionalQueryKey::Node(node)),
+                    proof.as_ref()
+                );
+            }
+            assert!(fixture.store.set_type_node_links(node, original));
+            assert_eq!(query_capture_node(&mut fixture, node), Ok(string));
+            assert!(
+                fixture
+                    .store
+                    .type_node_links(node)
+                    .unwrap()
+                    .outer_type_parameters
+                    .is_none()
+            );
+            let restored = conditional_allocation_counts(&fixture.store);
+            assert_eq!(query_capture_node(&mut fixture, node), Ok(string));
+            assert_eq!(conditional_allocation_counts(&fixture.store), restored);
+        }
+    }
+
+    #[test]
+    fn conditional_source_captures_reject_and_restore_an_empty_root_cache() {
+        let mut fixture =
+            Fixture::new("type Empty<T> = { [K in keyof T]: string extends number ? 0 : 1 };");
+        let node = fixture.conditional();
+        let result = query_capture_node(&mut fixture, node).unwrap();
+        let proof = fixture
+            .store
+            .conditional_query_production(ConditionalQueryKey::Node(node))
+            .unwrap()
+            .clone();
+        let original = fixture
+            .store
+            .conditional_root(proof.root())
+            .unwrap()
+            .instantiations()
+            .clone();
+        assert!(matches!(original, TypeCacheState::Allocated(_)));
+        assert!(
+            fixture
+                .store
+                .set_conditional_root_instantiations(proof.root(), TypeCacheState::Unallocated)
+        );
+        let before = conditional_allocation_counts(&fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                validate_conditional_source_captures(&fixture.store, node, Some(&[]), &[]),
+                Err(ConditionalTypeError::InvalidInstantiationCache(
+                    proof.root()
+                ))
+            );
+            assert_eq!(
+                query_capture_node(&mut fixture, node),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ))
+            );
+            assert_eq!(conditional_allocation_counts(&fixture.store), before);
+            assert_eq!(
+                fixture
+                    .store
+                    .conditional_query_production(ConditionalQueryKey::Node(node)),
+                Some(&proof)
+            );
+            assert_eq!(
+                fixture.store.type_node_links(node).unwrap().resolved_type,
+                Some(result)
+            );
+        }
+        assert!(
+            fixture
+                .store
+                .set_conditional_root_instantiations(proof.root(), original)
+        );
+        assert_eq!(query_capture_node(&mut fixture, node), Ok(result));
+        assert_eq!(conditional_allocation_counts(&fixture.store), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Preserve both real parameter caches through failure and replay.
+    fn conditional_source_captures_revalidate_enclosing_parameter_caches_and_order() {
+        for corrupt_symbol in [false, true] {
+            let mut fixture = Fixture::new(concat!(
+                "function outer<Outer, Unused>() { ",
+                "type Select<Own> = Own extends string ? Outer : boolean; }",
+            ));
+            let source = fixture.declared_alias("Select");
+            let outer = fixture.type_parameter("Outer");
+            let unused = fixture.type_parameter("Unused");
+            let own = fixture.type_parameter("Own");
+            let parameters = [outer, unused, own];
+            let symbols = parameters.map(|parameter| {
+                cached_ordinary_type_parameter_owner(&fixture.store, parameter).unwrap()
+            });
+            let proof = validated_conditional_production(&fixture.store, source)
+                .unwrap()
+                .clone();
+            assert_eq!(
+                proof.definition.outer_type_parameters.as_deref(),
+                Some(parameters.as_slice())
+            );
+            assert_eq!(
+                proof.definition.alias.as_ref().unwrap().type_arguments,
+                [own]
+            );
+            let node = proof.definition.node;
+            let declaration = fixture
+                .store
+                .symbol(symbols[0])
+                .unwrap()
+                .declarations()
+                .unwrap()[0];
+            assert!(fixture.store.ensure_type_node_links(declaration));
+            assert!(fixture.store.ensure_symbol_node_links(declaration));
+            let original_type = fixture.store.type_node_links(declaration).unwrap().clone();
+            let original_symbol = fixture
+                .store
+                .symbol_node_links(declaration)
+                .unwrap()
+                .clone();
+            let before = conditional_allocation_counts(&fixture.store);
+            assert_eq!(
+                validate_conditional_source_captures(&fixture.store, node, Some(&symbols), &[]),
+                Ok(())
+            );
+            assert_eq!(
+                validate_conditional_source_captures(
+                    &fixture.store,
+                    node,
+                    Some(&[symbols[1], symbols[0], symbols[2]]),
+                    &[]
+                ),
+                Err(ConditionalTypeError::InvalidTypeNodeCache(node))
+            );
+            if corrupt_symbol {
+                let mut links = original_symbol.clone();
+                links.resolved_symbol = Some(symbols[1]);
+                assert!(fixture.store.set_symbol_node_links(declaration, links));
+            } else {
+                let mut links = original_type.clone();
+                links.resolved_type = Some(unused);
+                assert!(fixture.store.set_type_node_links(declaration, links));
+            }
+            let poisoned_type = fixture.store.type_node_links(declaration).unwrap().clone();
+            let poisoned_symbol = fixture
+                .store
+                .symbol_node_links(declaration)
+                .unwrap()
+                .clone();
+            for _ in 0..2 {
+                assert_eq!(
+                    fixture.try_declared_alias("Select"),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(declaration),
+                    ))
+                );
+                assert_eq!(conditional_allocation_counts(&fixture.store), before);
+                assert_eq!(
+                    fixture.store.type_node_links(declaration),
+                    Some(&poisoned_type)
+                );
+                assert_eq!(
+                    fixture.store.symbol_node_links(declaration),
+                    Some(&poisoned_symbol)
+                );
+                assert_eq!(
+                    validated_conditional_production(&fixture.store, source),
+                    Ok(&proof)
+                );
+            }
+            assert!(
+                fixture
+                    .store
+                    .set_type_node_links(declaration, original_type)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_symbol_node_links(declaration, original_symbol)
+            );
+            for _ in 0..2 {
+                assert_eq!(fixture.declared_alias("Select"), source);
+                assert_eq!(conditional_allocation_counts(&fixture.store), before);
+            }
+        }
     }
 
     fn assert_uncaptured_conditional_remap_is_unsupported(
@@ -6898,7 +7329,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_conditional_remap_rejects_uncaptured_inline_mapped_parameters() {
+    fn deferred_conditional_remap_rejects_inline_roots_with_complete_mapped_captures() {
         let mut fixture = Fixture::new(concat!(
             "interface Validator<Value> {} ",
             "type IsOptional<Value> = Value extends undefined ? true : false; ",
@@ -6930,7 +7361,6 @@ mod tests {
         let proof = validated_conditional_production(&fixture.store, source).unwrap();
         assert_eq!(proof.definition.node, node);
         assert!(proof.definition.alias.is_none());
-        assert!(proof.definition.outer_type_parameters.is_empty());
         let TypeData::IndexedAccess(indexed) = fixture
             .store
             .type_payload(proof.definition.check_type)
@@ -6940,6 +7370,10 @@ mod tests {
             unreachable!()
         };
         let parameters = [indexed.object_type, indexed.index_type];
+        assert_eq!(
+            proof.definition.outer_type_parameters.as_deref(),
+            Some(parameters.as_slice())
+        );
         let target = fixture.type_parameter("Value");
         let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
         assert_ne!(parameters[0], target);
@@ -6956,7 +7390,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_conditional_remap_rejects_uncaptured_enclosing_parameters() {
+    fn deferred_conditional_remap_rejects_local_aliases_with_complete_outer_captures() {
         let mut fixture = Fixture::new(concat!(
             "function outer<Outer>() { ",
             "type Select<Own> = Own extends string ? Outer : boolean; ",
@@ -6966,7 +7400,10 @@ mod tests {
         let own = fixture.type_parameter("Own");
         let outer = fixture.type_parameter("Outer");
         let proof = validated_conditional_production(&fixture.store, source).unwrap();
-        assert_eq!(proof.definition.outer_type_parameters, [own]);
+        assert_eq!(
+            proof.definition.outer_type_parameters.as_deref(),
+            Some([outer, own].as_slice())
+        );
         assert_eq!(
             proof.definition.alias.as_ref().unwrap().type_arguments,
             [own]
@@ -8153,7 +8590,7 @@ mod tests {
                     extends_type: string,
                     branches: branches(number, boolean),
                     infer_type_parameters: &[],
-                    outer_type_parameters: &[parameter],
+                    outer_type_parameters: Some(&[parameter]),
                     alias: Some(alias),
                 },
                 None
@@ -8206,7 +8643,7 @@ mod tests {
                 extends_type: string,
                 branches: branches(string, never),
                 infer_type_parameters: &[],
-                outer_type_parameters: &[parameter],
+                outer_type_parameters: Some(&[parameter]),
                 alias: None,
             },
             None,
@@ -8276,7 +8713,7 @@ mod tests {
                     extends_type: string,
                     branches: branches(parameter, never),
                     infer_type_parameters: &[],
-                    outer_type_parameters: &[parameter],
+                    outer_type_parameters: Some(&[parameter]),
                     alias: None,
                 },
                 None,
@@ -8292,7 +8729,7 @@ mod tests {
                     extends_type: string,
                     branches: branches(parameter, never),
                     infer_type_parameters: &[parameter],
-                    outer_type_parameters: &[parameter],
+                    outer_type_parameters: Some(&[parameter]),
                     alias: None,
                 },
                 None,
@@ -8373,7 +8810,7 @@ mod tests {
                 extends_type: string,
                 branches: branches(string, never),
                 infer_type_parameters: &[],
-                outer_type_parameters: &[object, key],
+                outer_type_parameters: Some(&[object, key]),
                 alias: None,
             },
             None,
@@ -8472,7 +8909,7 @@ mod tests {
                     extends_type: string,
                     branches: branch_types,
                     infer_type_parameters: &[],
-                    outer_type_parameters: &[parameter],
+                    outer_type_parameters: Some(&[parameter]),
                     alias: None,
                 },
                 None,
@@ -8541,7 +8978,7 @@ mod tests {
                 extends_type: string,
                 branches: branch_types,
                 infer_type_parameters: &[],
-                outer_type_parameters: &[parameter],
+                outer_type_parameters: Some(&[parameter]),
                 alias: None,
             },
             None,
@@ -8662,7 +9099,7 @@ mod tests {
                     extends_type: template,
                     branches: branch_types,
                     infer_type_parameters: &[head, rest],
-                    outer_type_parameters: &[parameter],
+                    outer_type_parameters: Some(&[parameter]),
                     alias: None,
                 },
                 None,
@@ -8789,7 +9226,7 @@ mod tests {
                     extends_type: template,
                     branches: branch_types,
                     infer_type_parameters: &[inferred],
-                    outer_type_parameters: &[parameter],
+                    outer_type_parameters: Some(&[parameter]),
                     alias: None,
                 },
                 None,
@@ -8846,7 +9283,7 @@ mod tests {
                 extends_type: template,
                 branches: branch_types,
                 infer_type_parameters: &[left, right],
-                outer_type_parameters: &[parameter],
+                outer_type_parameters: Some(&[parameter]),
                 alias: None,
             },
             None,
@@ -8933,7 +9370,7 @@ mod tests {
                     extends_type: template,
                     branches: branch_types,
                     infer_type_parameters: &[inferred],
-                    outer_type_parameters: &[parameter],
+                    outer_type_parameters: Some(&[parameter]),
                     alias: None,
                 },
                 None,
@@ -9002,7 +9439,7 @@ mod tests {
                 extends_type: template,
                 branches: branch_types,
                 infer_type_parameters: &[inferred],
-                outer_type_parameters: &[parameter],
+                outer_type_parameters: Some(&[parameter]),
                 alias: None,
             },
             None,
@@ -9049,7 +9486,7 @@ mod tests {
                     extends_type: target,
                     branches: branch_types,
                     infer_type_parameters: &[inferred],
-                    outer_type_parameters: &[parameter],
+                    outer_type_parameters: Some(&[parameter]),
                     alias: None,
                 },
                 None,
@@ -9138,7 +9575,7 @@ mod tests {
                 extends_type: target,
                 branches: branch_types,
                 infer_type_parameters: &[inferred],
-                outer_type_parameters: &[outer],
+                outer_type_parameters: Some(&[outer]),
                 alias: None,
             },
             None,
@@ -9503,7 +9940,7 @@ mod tests {
                 extends_type: target,
                 branches: branch_types,
                 infer_type_parameters: &[inferred],
-                outer_type_parameters: &[parameter],
+                outer_type_parameters: Some(&[parameter]),
                 alias: None,
             },
             None,
@@ -9579,7 +10016,7 @@ mod tests {
                 extends_type: target,
                 branches: branch_types,
                 infer_type_parameters: &[inferred],
-                outer_type_parameters: &[parameter],
+                outer_type_parameters: Some(&[parameter]),
                 alias: None,
             },
             None,
@@ -9681,7 +10118,7 @@ mod tests {
                     extends_type: target,
                     branches: branch_types,
                     infer_type_parameters: &inferred_parameters,
-                    outer_type_parameters: &[parameter],
+                    outer_type_parameters: Some(&[parameter]),
                     alias: None,
                 },
                 None,

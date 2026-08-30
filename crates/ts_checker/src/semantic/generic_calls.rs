@@ -1905,7 +1905,10 @@ fn validate_generic_call_type_query<'store>(
             (provenance.family == SourceCallableFamily::FunctionDeclaration
                 || provenance.family == SourceCallableFamily::ArrowFunction
                     && store.source_arrow_has_ordinary_type_parameters(provenance.declaration))
-                && provenance.return_provenance == SourceCallableReturnProvenance::Annotated
+                && (provenance.return_provenance == SourceCallableReturnProvenance::Annotated
+                    || provenance.family == SourceCallableFamily::FunctionDeclaration
+                        && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+                        && evidence.is_some())
         })
     else {
         return if evidence.is_some() {
@@ -1928,7 +1931,8 @@ fn validate_generic_call_type_query<'store>(
         || plan.export_local != provenance.export_local
         || plan.flags != provenance.flags
         || plan.array_targets != provenance.array_targets
-        || plan.return_type.annotation_identity().is_none()
+        || plan.return_type.provenance() != provenance.return_provenance
+        || !plan.return_type.is_inferred() && plan.return_type.annotation_identity().is_none()
         || plan.return_type.annotation_identity()
             != store.function_signature_return_annotation(signature)
         || store
@@ -1952,6 +1956,23 @@ fn validate_generic_call_type_query<'store>(
         || !evidence.is_exact(store)
     {
         return Err(invalid().into());
+    }
+    if plan.return_type.is_inferred() {
+        let Some(return_type) = super::source_callables::validate_inferred_source_callable_return(
+            store, plan, signature,
+        )
+        .map_err(|_| invalid())?
+        else {
+            return Err(invalid().into());
+        };
+        if store
+            .signature(signature)
+            .and_then(super::signatures::Signature::resolved_return_type)
+            != Some(return_type)
+            || store.checked_source_callable_return_type(signature) != Some(return_type)
+        {
+            return Err(invalid().into());
+        }
     }
     Ok(Some(evidence))
 }
