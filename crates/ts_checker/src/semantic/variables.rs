@@ -76,6 +76,7 @@ pub(super) struct PlannedCrossFileGlobalRead {
 }
 
 /// One computed object binding whose symbol belongs to the binding element.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PlannedComputedBindingElement {
     pub(super) declaration: NodeRef,
@@ -105,6 +106,7 @@ pub(super) struct PlannedObjectBindingElement {
     pub(super) initializer: Option<NodeRef>,
     pub(super) rest: bool,
     pub(super) excluded_properties: Vec<String>,
+    pub(super) excluded_computed_keys: Vec<NodeRef>,
     pub(super) name: NodeRef,
     pub(super) symbol: SemanticSymbolId,
 }
@@ -389,6 +391,7 @@ fn plan_variable_declaration(
 }
 
 /// Proves one top-level `{ [key]: name }` binding without publishing its type.
+#[cfg(test)]
 pub(super) fn plan_top_level_computed_binding_element(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -1172,7 +1175,7 @@ fn plan_object_binding_pattern(
     }
 
     let mut excluded_properties = Vec::with_capacity(pattern_data.elements.nodes.len());
-    let mut has_dynamic_computed_property = false;
+    let mut excluded_computed_keys = Vec::new();
     for (index, element) in pattern_data.elements.nodes.iter().enumerate() {
         let element = NodeRef::new(pattern.arena, pattern.file, *element);
         let element_record = binding_child_node(arena, store, element, pattern)?;
@@ -1254,6 +1257,12 @@ fn plan_object_binding_pattern(
                     {
                         key.text.clone()
                     }
+                    NodeData::BigIntLiteral(key)
+                        if key_record.kind == SyntaxKind::BigIntLiteral
+                            && key.token_flags.0 == 0 =>
+                    {
+                        key.text.clone()
+                    }
                     NodeData::NoSubstitutionTemplateLiteral(key)
                         if key_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral
                             && key.token_flags.0 == 0
@@ -1330,7 +1339,6 @@ fn plan_object_binding_pattern(
                 || pattern_data.elements.has_trailing_comma
                 || data.property_name.is_some()
                 || initializer.is_some()
-                || has_dynamic_computed_property
             {
                 return Err(VariablePlanError::Unsupported(
                     VariableUnsupported::BindingPattern(element),
@@ -1407,13 +1415,21 @@ fn plan_object_binding_pattern(
             return Err(VariableInvariant::InvalidBindingPattern(element).into());
         }
         if !rest {
-            has_dynamic_computed_property |= computed_key.is_some_and(|key| {
+            if let Some(key) = computed_key.filter(|key| {
                 matches!(
-                    store.source_node_kind(key),
-                    Some(SyntaxKind::Identifier | SyntaxKind::CallExpression)
+                    store.source_node_kind(*key),
+                    Some(
+                        SyntaxKind::Identifier
+                            | SyntaxKind::CallExpression
+                            | SyntaxKind::NumericLiteral
+                            | SyntaxKind::BigIntLiteral
+                    )
                 )
-            });
-            excluded_properties.push(property_name.clone());
+            }) {
+                excluded_computed_keys.push(key);
+            } else {
+                excluded_properties.push(property_name.clone());
+            }
         }
         planned.push(PlannedObjectBindingElement {
             element,
@@ -1425,6 +1441,11 @@ fn plan_object_binding_pattern(
             rest,
             excluded_properties: if rest {
                 excluded_properties.clone()
+            } else {
+                Vec::new()
+            },
+            excluded_computed_keys: if rest {
+                excluded_computed_keys.clone()
             } else {
                 Vec::new()
             },
@@ -3956,19 +3977,28 @@ mod tests {
             fixture.store.checker_link_allocated_lengths(),
         );
 
-        assert!(matches!(
-            plan_top_level_object_binding_elements(
-                &fixture.parsed.arena,
-                &fixture.bound,
-                &fixture.store,
-                declaration,
-                VariableBindingKind::Const,
-                false,
-            ),
-            Err(VariablePlanError::Unsupported(
-                VariableUnsupported::BindingPattern(_)
-            ))
-        ));
+        let planned = plan_top_level_object_binding_elements(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            declaration,
+            VariableBindingKind::Const,
+            false,
+        )
+        .unwrap();
+        let [selected, rest] = planned.as_slice() else {
+            panic!("expected one computed binding and its rest binding")
+        };
+        let key = selected.computed_key.unwrap();
+        assert_eq!(rest.excluded_computed_keys, vec![key]);
+        assert!(rest.excluded_properties.is_empty());
+        assert_eq!(
+            fixture.store.source_node_parent(key),
+            Some(SourceNodeParent::Parent(selected.property)),
+        );
+        for binding in &planned {
+            assert!(fixture.store.value_symbol_links(binding.symbol).is_none());
+        }
         assert_eq!(
             (
                 fixture.store.type_len(),

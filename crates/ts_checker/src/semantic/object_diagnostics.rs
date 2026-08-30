@@ -1790,6 +1790,23 @@ fn generic_assignability_diagnostic(
             options,
         )?
     };
+    if diagnostic.diagnostic.details.is_empty()
+        && store
+            .source_callable_provenance(source_type)
+            .is_some_and(|callable| {
+                store.source_node_kind(callable.declaration) == Some(SyntaxKind::FunctionExpression)
+            })
+    {
+        diagnostic.diagnostic.details = callable_assignability_details(
+            store,
+            host,
+            global_types,
+            source_type,
+            target_type,
+            flags,
+            options,
+        )?;
+    }
     if diagnostic.diagnostic.details.is_empty() {
         diagnostic.diagnostic.details = constructor_assignability_details(
             store,

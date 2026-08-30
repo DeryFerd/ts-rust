@@ -5,7 +5,7 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SignatureId,
-    SourceCheckError, TypeData, TypeId, UnsupportedSourceSyntax,
+    TypeData, TypeId,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -520,29 +520,99 @@ fn named_function_expression_self_name_has_its_own_scope() {
 }
 
 #[test]
-fn contextual_function_expression_return_stays_explicitly_unsupported() {
+#[allow(clippy::too_many_lines)] // Keep the original source and its separate callable identities together.
+fn contextual_function_expression_return_keeps_its_literal_and_source_identity() {
     let parsed = parse_source_file(
         "const echo: (value: number) => 1 = function(value: number) { return 1; };",
     );
-    let (_, _, expression) = variable(&parsed, "echo");
-    let mut checker = context(&parsed, false);
-    let owner = symbol(&checker, expression);
-    let mut warm = None;
-    for _ in 0..2 {
-        assert_eq!(
-            checker.check_source_file(FILE),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Arrow(expression)
-            )),
-        );
-        if let Some(before) = warm {
-            assert_eq!(counts(&checker), before);
-        } else {
-            warm = Some(counts(&checker));
+    let (binding, binding_name, expression) = variable(&parsed, "echo");
+    let NodeData::VariableDeclaration(variable) = &parsed.arena.get(binding.node).unwrap().data
+    else {
+        unreachable!();
+    };
+    let annotation = NodeRef::new(parsed.arena.id(), FILE, variable.type_.unwrap());
+    let NodeData::FunctionExpression(function) = &parsed.arena.get(expression.node).unwrap().data
+    else {
+        unreachable!();
+    };
+    let parameter = NodeRef::new(parsed.arena.id(), FILE, function.parameters.nodes[0]);
+    for query_first in [false, true] {
+        let mut checker = context(&parsed, false);
+        if query_first {
+            checker.get_type_at_location(expression).unwrap();
         }
+        checker.check_source_file(FILE).unwrap();
+        let owner = symbol(&checker, expression);
+        let binding = symbol(&checker, binding);
+        let parameter_symbol = symbol(&checker, parameter);
+        let callable = checker.get_type_at_location(expression).unwrap();
+        let target = checker.get_type_at_location(annotation).unwrap();
+        let own_signature = signature(&checker, expression);
+        let returned = checker.get_return_type_of_signature(own_signature).unwrap();
+        let number = checker.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_ne!(owner, binding);
+        assert_ne!(callable, target);
+        assert_ne!(returned, number);
+        assert_eq!(checker.type_to_string(returned).unwrap(), "1");
+        assert_eq!(
+            checker.store().symbol(owner).unwrap().flags(),
+            SymbolFlags::FUNCTION
+        );
+        assert_eq!(
+            checker.store().type_payload(callable).unwrap().symbol(),
+            Some(owner)
+        );
+        assert_eq!(
+            checker
+                .store()
+                .value_symbol_links(owner)
+                .unwrap()
+                .resolved_type,
+            Some(callable)
+        );
+        assert_eq!(
+            checker
+                .store()
+                .value_symbol_links(binding)
+                .unwrap()
+                .resolved_type,
+            Some(target)
+        );
+        assert_eq!(checker.get_type_at_location(binding_name), Ok(target));
+        assert_eq!(checker.get_type_at_location(parameter), Ok(number));
+        assert_eq!(
+            checker
+                .store()
+                .symbol(parameter_symbol)
+                .unwrap()
+                .declarations(),
+            Some(&[parameter][..])
+        );
+        assert_eq!(
+            checker
+                .store()
+                .value_symbol_links(parameter_symbol)
+                .unwrap()
+                .resolved_type,
+            Some(number)
+        );
+        let record = checker.store().signature(own_signature).unwrap();
+        assert_eq!(record.declaration(), Some(expression));
+        assert_eq!(record.parameters(), &[parameter_symbol]);
+        assert_eq!(record.resolved_return_type(), Some(returned));
         assert!(checker.diagnostics().is_empty());
-        assert!(checker.store().signature_links(expression).is_none());
-        assert!(checker.store().type_node_links(expression).is_none());
-        assert!(checker.store().value_symbol_links(owner).is_none());
+        let warm = counts(&checker);
+        checker.recheck_source_file(FILE).unwrap();
+        assert_eq!(checker.get_type_at_location(expression), Ok(callable));
+        assert_eq!(checker.get_type_at_location(annotation), Ok(target));
+        assert_eq!(checker.get_type_at_location(binding_name), Ok(target));
+        assert_eq!(checker.get_type_at_location(parameter), Ok(number));
+        assert_eq!(signature(&checker, expression), own_signature);
+        assert_eq!(
+            checker.get_return_type_of_signature(own_signature),
+            Ok(returned),
+        );
+        assert_eq!(counts(&checker), warm);
+        assert!(checker.diagnostics().is_empty());
     }
 }

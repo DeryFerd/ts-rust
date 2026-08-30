@@ -5270,6 +5270,88 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(false)
     }
 
+    /// A return union can use the type parameter declared by its function type.
+    fn function_type_owns_return_type_parameter_reference(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some([declaration]) = self
+            .store
+            .symbol(symbol)
+            .and_then(|parameter| parameter.declarations())
+        else {
+            return Ok(false);
+        };
+        let declaration_record = preflight_node(self.store, self.host, *declaration)?;
+        let Some(owner) = declaration_record.parent else {
+            return Ok(false);
+        };
+        let owner = NodeRef::new(declaration.arena, declaration.file, owner);
+        let owner_record = preflight_node(self.store, self.host, owner)?;
+        let NodeData::FunctionTypeNode(function) = &owner_record.data else {
+            return Ok(false);
+        };
+        if owner_record.kind != SyntaxKind::FunctionType {
+            return Ok(false);
+        }
+        let Some(return_type) = function
+            .type_
+            .map(|return_type| NodeRef::new(owner.arena, owner.file, return_type))
+        else {
+            return Ok(false);
+        };
+        let mut current = node;
+        let mut visited = HashSet::new();
+        while current != return_type {
+            if current == owner || !visited.insert(current) {
+                return Ok(false);
+            }
+            let Some(parent) = preflight_node(self.store, self.host, current)?.parent else {
+                return Ok(false);
+            };
+            current = NodeRef::new(current.arena, current.file, parent);
+        }
+
+        let alias_owner = self.direct_type_alias_owner(owner)?;
+        let alias_is_generic = if let Some(alias_owner) = alias_owner {
+            let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(owner));
+            let Some([alias_declaration]) = self
+                .store
+                .symbol(alias_owner)
+                .and_then(|alias| alias.declarations())
+            else {
+                return Err(invalid());
+            };
+            let alias = authenticated_type_alias_declaration(
+                self.store,
+                self.host,
+                *alias_declaration,
+                alias_owner,
+            )?
+            .ok_or_else(invalid)?;
+            alias
+                .type_parameters
+                .as_ref()
+                .is_some_and(|parameters| !parameters.nodes.is_empty())
+        } else {
+            false
+        };
+        let planned = functions::plan_function_type(
+            self.store,
+            self.host,
+            owner,
+            alias_owner,
+            alias_is_generic,
+            self.array_targets,
+        )
+        .map_err(function_type_error)?;
+        Ok(planned.return_type == return_type
+            && planned.type_parameters.iter().any(|parameter| {
+                parameter.declaration == *declaration && parameter.symbol == symbol
+            }))
+    }
+
     fn plan_source_callable_inputs(
         &mut self,
         callable: &source_callables::SourceCallablePlan,
@@ -16882,6 +16964,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && !flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
             && (!flags.contains(SymbolFlags::TYPE_PARAMETER)
                 || !self.source_callable_owns_type_parameter_reference(node, symbol)?
+                    && !self.function_type_owns_return_type_parameter_reference(node, symbol)?
                     && !self.is_authenticated_generic_alias_union_type_parameter(node, symbol)?
                     && !self.is_authenticated_property_object_alias_union_type_parameter(
                         node, symbol,
@@ -28012,6 +28095,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         declaration: NodeRef,
         owner_symbol: SemanticSymbolId,
     ) -> Result<TypeId, DeclaredTypeError> {
+        self.get_type_of_source_callable_with_context(declaration, owner_symbol, None)
+    }
+
+    pub(super) fn get_type_of_source_callable_with_context(
+        &mut self,
+        declaration: NodeRef,
+        owner_symbol: SemanticSymbolId,
+        contextual_function_expression: Option<TypeId>,
+    ) -> Result<TypeId, DeclaredTypeError> {
         if !self.pending_function_parameters.is_empty() {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidFunctionType(declaration),
@@ -28044,6 +28136,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             array_targets,
         )
         .map_err(|error| source_callable_error(error, family))?;
+        if let Some(target) = contextual_function_expression
+            && !source_callables::apply_function_expression_context(
+                self.store,
+                self.host,
+                &mut callable,
+                target,
+            )
+            .map_err(|error| source_callable_error(error, family))?
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionType(declaration),
+            ));
+        }
         self.require_source_callable_alias_capabilities(&callable)?;
         if callable.requires_type_query_evidence() {
             return self.get_type_of_queried_source_callable(&callable);
@@ -28243,6 +28348,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 continue;
             }
             let Some(type_node) = parameter.explicit_type_node() else {
+                if callable.contextual_function_expression_target().is_some() {
+                    base_types.push(parameter.base_type(self.store).ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(declaration))
+                    })?);
+                    continue;
+                }
                 let any_type = self
                     .store
                     .intrinsic_bootstrap()
@@ -29181,7 +29292,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::InvalidFunctionSignature(signature),
             ));
         }
-        if provenance.contextual_target.is_some() {
+        if provenance.contextual_target.is_some()
+            && callable.contextual_function_expression_target().is_none()
+        {
             self.reject_type_reference_alias_capabilities()?;
             let invalid =
                 || type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature));
@@ -82519,6 +82632,111 @@ mod tests {
             ),
             warm,
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source checks exact, foreign, damaged, and generic-alias owners.
+    fn function_type_return_unions_require_the_written_parameter_owner() {
+        let mut fixture = fixture(concat!(
+            "declare let first: <Value>() => Value extends string ? Value | null : never;\n",
+            "declare let second: <Value>() => Value extends string ? Value | null : never;\n",
+            "type Generic<Outer> = <Value>() => Value extends string ? Value | null : Outer;",
+        ));
+        let parts = |function: NodeRef| {
+            let NodeData::FunctionTypeNode(data) =
+                &fixture.parsed.arena.get(function.node).unwrap().data
+            else {
+                panic!("the annotation must keep its function type")
+            };
+            let parameter = NodeRef::new(
+                function.arena,
+                function.file,
+                data.type_parameters.as_ref().unwrap().nodes[0],
+            );
+            let NodeData::ConditionalTypeNode(conditional) =
+                &fixture.parsed.arena.get(data.type_.unwrap()).unwrap().data
+            else {
+                panic!("the function must have a conditional return")
+            };
+            let NodeData::UnionTypeNode(union) = &fixture
+                .parsed
+                .arena
+                .get(conditional.true_type)
+                .unwrap()
+                .data
+            else {
+                panic!("the true branch must contain its parameter union")
+            };
+            let reference = NodeRef::new(function.arena, function.file, union.types.nodes[0]);
+            assert_eq!(
+                fixture.store.source_node_kind(reference),
+                Some(SyntaxKind::TypeReference),
+            );
+            (function, reference, node_symbol(&fixture, parameter))
+        };
+        let (first, first_reference, first_parameter) =
+            parts(variable_type_node(&fixture, "first"));
+        let (second, second_reference, second_parameter) =
+            parts(variable_type_node(&fixture, "second"));
+        let (generic, generic_reference, generic_parameter) =
+            parts(function_type_node(&fixture, "Generic"));
+        assert_ne!(first_parameter, second_parameter);
+        assert_ne!(first_parameter, generic_parameter);
+
+        let owns = |fixture: &Fixture, reference, parameter| {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let aliases = HashMap::new();
+            TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases)
+                .function_type_owns_return_type_parameter_reference(reference, parameter)
+        };
+        let cold = function_store_state(&fixture.store);
+        assert_eq!(owns(&fixture, first_reference, first_parameter), Ok(true));
+        assert_eq!(owns(&fixture, second_reference, second_parameter), Ok(true));
+        assert_eq!(owns(&fixture, first_reference, second_parameter), Ok(false));
+        assert_eq!(owns(&fixture, second_reference, first_parameter), Ok(false));
+        assert_eq!(
+            owns(&fixture, generic_reference, generic_parameter),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node: generic,
+                    kind: SyntaxKind::FunctionType,
+                }
+            )),
+        );
+        assert_eq!(function_store_state(&fixture.store), cold);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let first_type = query_node(&mut fixture, first, &mut diagnostics).unwrap();
+        let second_type = query_node(&mut fixture, second, &mut diagnostics).unwrap();
+        assert_ne!(first_type, second_type);
+        let first_links = fixture.store.type_node_links(first).unwrap().clone();
+        let warm = function_store_state(&fixture.store);
+        assert!(fixture.store.set_type_node_links(
+            first,
+            TypeNodeLinks {
+                resolved_type: Some(second_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert_eq!(
+            owns(&fixture, first_reference, first_parameter),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionType(first)
+            )),
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
+        assert!(fixture.store.set_type_node_links(first, first_links));
+        assert_eq!(owns(&fixture, first_reference, first_parameter), Ok(true));
+        assert_eq!(owns(&fixture, first_reference, second_parameter), Ok(false));
+        assert_eq!(
+            query_node(&mut fixture, first, &mut diagnostics),
+            Ok(first_type)
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
     }
 

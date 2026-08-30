@@ -8902,6 +8902,88 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    /// Pinned `isImplementationCompatibleWithOverload` for a source-owned,
+    /// non-generic group. Both views retain their real declaration signatures.
+    pub(super) fn is_source_overload_implementation_compatible(
+        &mut self,
+        owner: TypeId,
+        overload: SignatureId,
+        global_types: &CanonicalGlobalTypes,
+        strict_function_types: bool,
+        instantiation_session: &mut InstantiationSession,
+    ) -> Result<bool, RelationUnavailable> {
+        let invalid = || RelationUnavailable::MalformedFunctionType(owner);
+        let provenance = self.source_overload_provenance(owner).ok_or_else(invalid)?;
+        let implementation = provenance.implementation.ok_or_else(invalid)?;
+        let body_row = provenance.signatures.last().ok_or_else(invalid)?;
+        if body_row.declaration != implementation.declaration
+            || body_row.signature == overload
+            || !provenance
+                .signatures
+                .iter()
+                .any(|row| row.signature == overload)
+        {
+            return Err(invalid());
+        }
+        let source = super::source_overloads::source_overload_signature_projection(
+            self,
+            owner,
+            body_row.signature,
+        )
+        .ok_or_else(invalid)?;
+        let target =
+            super::source_overloads::source_overload_signature_projection(self, owner, overload)
+                .ok_or_else(invalid)?;
+        if let Err(established) = self.claim_strict_function_types(strict_function_types) {
+            return Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                established,
+                requested: strict_function_types,
+            });
+        }
+        self.admit_callable_relation_type_with_array_targets(
+            owner,
+            Some(strict_function_types),
+            Some(CanonicalArrayTargets::from_global_types(global_types)),
+        )?;
+        let bootstrap = self.relation_bootstrap_facts()?;
+        let source_return = source.return_type.ok_or_else(invalid)?;
+        let target_return = target.return_type.ok_or_else(invalid)?;
+        if target_return != bootstrap.void_type
+            && !self.is_type_assignable_to_with_session(
+                target_return,
+                source_return,
+                Some(global_types),
+                Some(strict_function_types),
+                instantiation_session,
+            )?
+            && !self.is_type_assignable_to_with_session(
+                source_return,
+                target_return,
+                Some(global_types),
+                Some(strict_function_types),
+                instantiation_session,
+            )?
+        {
+            return Ok(false);
+        }
+        let mut session = RelaterSession::new_with_global_types_options_and_session(
+            self,
+            RelationKind::Assignable,
+            bootstrap,
+            Some(RelationGlobalTypes::from_global_types(global_types)),
+            Some(strict_function_types),
+            Some(instantiation_session),
+        );
+        session.observe_type_surface(owner);
+        let result = session.compare_signatures_related(
+            &source,
+            &target,
+            SignatureCheckMode::IGNORE_RETURN_TYPES,
+            IntersectionState::NONE,
+        )?;
+        Ok(session.finish_without_specialized_root_cache(result))
+    }
+
     /// Borrows the checker query's instantiation session for any relation.
     pub(super) fn is_type_related_to_with_session(
         &mut self,

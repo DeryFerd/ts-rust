@@ -821,6 +821,7 @@ impl PlannedJsDocTypedef {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedJavaScriptDeclaration {
     node: NodeRef,
+    overload_declarations: Vec<NodeRef>,
     type_: Option<PlannedJsDocType>,
     parameters: Vec<PlannedJsDocParameter>,
     return_type: Option<PlannedJsDocType>,
@@ -837,6 +838,12 @@ impl PlannedJavaScriptDeclaration {
     #[must_use]
     pub const fn node(&self) -> NodeRef {
         self.node
+    }
+
+    /// Real bodyless declarations in source order, excluding the implementation.
+    #[must_use]
+    pub fn overload_declarations(&self) -> &[NodeRef] {
+        &self.overload_declarations
     }
 
     #[must_use]
@@ -1527,6 +1534,14 @@ pub fn plan_javascript_source_jsdoc(
             .get(node)
             .ok_or(JsDocCommentError::InvalidSourceNode(source))?;
         let reference = NodeRef::new(arena.id(), source.file, node);
+        if record.kind == SyntaxKind::FunctionDeclaration && record.flags == NodeFlags::REPARSED {
+            let group = authenticated_jsdoc_overload_group(arena, reference)
+                .ok_or(JsDocCommentError::InvalidSourceNode(reference))?;
+            if group.implementation == reference {
+                return Err(JsDocCommentError::InvalidSourceNode(reference));
+            }
+            continue;
+        }
         if record.kind == SyntaxKind::JsTypeAliasDeclaration {
             let name = authenticate_reparsed_jsdoc_typedef(arena, source, reference)?;
             if source_typedefs.get(&(name.start.get(), name.end.get())) != Some(&reference) {
@@ -1544,8 +1559,17 @@ pub fn plan_javascript_source_jsdoc(
                 .collect::<Vec<_>>();
             if !comments.is_empty() {
                 let declaration = javascript_jsdoc_owner(arena, reference)?;
+                let overload_declarations = authenticated_jsdoc_overload_group(arena, declaration)
+                    .map_or_else(Vec::new, |group| {
+                        group
+                            .declarations
+                            .into_iter()
+                            .filter(|node| *node != declaration)
+                            .collect()
+                    });
                 let mut planned = PlannedJavaScriptDeclaration {
                     node: declaration,
+                    overload_declarations,
                     type_: None,
                     parameters: Vec::new(),
                     return_type: None,
@@ -1603,6 +1627,283 @@ pub fn plan_javascript_source_jsdoc(
         expressions,
         diagnostics,
     })
+}
+
+/// Source proof for a named `JSDoc` overload group. Each row is an actual parser
+/// declaration. Only the final row has the implementation body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ReparsedJsDocOverloadGroup {
+    pub(super) implementation: NodeRef,
+    pub(super) declarations: Vec<NodeRef>,
+    pub(super) range_edges: Vec<(NodeRef, NodeRef)>,
+}
+
+/// Authenticate the Go reparse shape before allowing comment ranges outside
+/// their source declaration. Unsupported `JSDoc` forms do not produce a proof.
+#[allow(clippy::too_many_lines)] // Check the complete source group before accepting clone ranges.
+pub(super) fn authenticated_jsdoc_overload_group(
+    arena: &NodeArena,
+    declaration: NodeRef,
+) -> Option<ReparsedJsDocOverloadGroup> {
+    if declaration.arena != arena.id() {
+        return None;
+    }
+    let record = arena.get(declaration.node)?;
+    let NodeData::FunctionDeclaration(function) = &record.data else {
+        return None;
+    };
+    let source = record.parent?;
+    let NodeData::SourceFile(source_data) = &arena.get(source)?.data else {
+        return None;
+    };
+    let statements = &source_data.statements.nodes;
+    let position = statements
+        .iter()
+        .position(|node| *node == declaration.node)?;
+    let implementation_index = if function.body.is_some() {
+        position
+    } else {
+        let offset = statements.get(position..)?.iter().position(|node| {
+            arena
+                .get(*node)
+                .is_none_or(|record| record.flags != NodeFlags::REPARSED)
+        })?;
+        position.checked_add(offset)?
+    };
+    let implementation = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        *statements.get(implementation_index)?,
+    );
+    let implementation_record = arena.get(implementation.node)?;
+    let NodeData::FunctionDeclaration(host) = &implementation_record.data else {
+        return None;
+    };
+    let host_name = arena.get(host.name?)?;
+    let NodeData::Identifier(host_identifier) = &host_name.data else {
+        return None;
+    };
+    if implementation_record.kind != SyntaxKind::FunctionDeclaration
+        || implementation_record.flags != NodeFlags::default()
+        || implementation_record.parent != Some(source)
+        || host.body.is_none()
+        || host.modifiers.is_some()
+        || host.asterisk_token.is_some()
+        || host.type_parameters.is_some()
+        || host_name.kind != SyntaxKind::Identifier
+        || host_name.parent != Some(implementation.node)
+        || host_identifier.flow_node.is_some()
+    {
+        return None;
+    }
+    let comments = leading_jsdoc_comments(arena, implementation).ok()?;
+    let mut overloads = Vec::new();
+    let mut host_parameters = Vec::new();
+    let mut host_return = None;
+    for (index, comment) in comments.iter().enumerate() {
+        if !comment.diagnostics().is_empty() {
+            return None;
+        }
+        for tag in comment.tags() {
+            match tag.kind() {
+                JsDocTagKind::Overload => overloads.push(tag),
+                JsDocTagKind::Parameter if index + 1 == comments.len() => host_parameters.push(tag),
+                JsDocTagKind::Return if index + 1 == comments.len() && host_return.is_none() => {
+                    host_return = Some(tag)
+                }
+                _ => return None,
+            }
+        }
+    }
+    if overloads.is_empty() {
+        return None;
+    }
+    let start = implementation_index.checked_sub(overloads.len())?;
+    let declarations = statements
+        .get(start..=implementation_index)?
+        .iter()
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, *node))
+        .collect::<Vec<_>>();
+    if !declarations.contains(&declaration) {
+        return None;
+    }
+    let mut range_edges = Vec::new();
+    authenticate_jsdoc_signature_nodes(
+        arena,
+        implementation,
+        &host_parameters,
+        host_return?,
+        false,
+        &mut range_edges,
+    )?;
+    for (declaration, tag) in declarations.iter().copied().zip(overloads) {
+        let node = arena.get(declaration.node)?;
+        let NodeData::FunctionDeclaration(function) = &node.data else {
+            return None;
+        };
+        let name_id = function.name?;
+        let name = arena.get(name_id)?;
+        let NodeData::Identifier(identifier) = &name.data else {
+            return None;
+        };
+        if node.kind != SyntaxKind::FunctionDeclaration
+            || node.flags != NodeFlags::REPARSED
+            || node.range != jsdoc_tag_name_range(tag).ok()?
+            || node.parent != Some(source)
+            || function.body.is_some()
+            || function.modifiers.is_some()
+            || function.asterisk_token.is_some()
+            || function.type_parameters.is_some()
+            || function.facts != 0
+            || name_id == host.name?
+            || name.kind != SyntaxKind::Identifier
+            || name.flags != NodeFlags::REPARSED
+            || name.parent != Some(declaration.node)
+            || name.range != host_name.range
+            || identifier.text != host_identifier.text
+            || identifier.flow_node.is_some()
+        {
+            return None;
+        }
+        let (return_tag, parameters) = tag.overload_tags().split_last()?;
+        if return_tag.kind() != JsDocTagKind::Return
+            || parameters
+                .iter()
+                .any(|tag| tag.kind() != JsDocTagKind::Parameter)
+        {
+            return None;
+        }
+        let parameters_start = parameters
+            .first()
+            .map_or(return_tag.range().start, |tag| tag.range().start);
+        if function.parameters.range != TextRange::new(parameters_start, return_tag.range().start) {
+            return None;
+        }
+        range_edges.push((
+            declaration,
+            NodeRef::new(declaration.arena, declaration.file, name_id),
+        ));
+        authenticate_jsdoc_signature_nodes(
+            arena,
+            declaration,
+            &parameters.iter().collect::<Vec<_>>(),
+            return_tag,
+            true,
+            &mut range_edges,
+        )?;
+    }
+    Some(ReparsedJsDocOverloadGroup {
+        implementation,
+        declarations,
+        range_edges,
+    })
+}
+
+fn authenticate_jsdoc_signature_nodes(
+    arena: &NodeArena,
+    declaration: NodeRef,
+    parameters: &[&JsDocTag<'_>],
+    return_tag: &JsDocTag<'_>,
+    overload: bool,
+    range_edges: &mut Vec<(NodeRef, NodeRef)>,
+) -> Option<()> {
+    let NodeData::FunctionDeclaration(function) = &arena.get(declaration.node)?.data else {
+        return None;
+    };
+    if function.parameters.has_trailing_comma || function.parameters.nodes.len() != parameters.len()
+    {
+        return None;
+    }
+    for (parameter, tag) in function.parameters.nodes.iter().copied().zip(parameters) {
+        let node = arena.get(parameter)?;
+        let NodeData::ParameterDeclaration(data) = &node.data else {
+            return None;
+        };
+        let name = arena.get(data.name)?;
+        let NodeData::Identifier(identifier) = &name.data else {
+            return None;
+        };
+        let expected_name = tag.name()?;
+        if node.kind != SyntaxKind::Parameter
+            || node.parent != Some(declaration.node)
+            || node.flags
+                != if overload {
+                    NodeFlags::REPARSED
+                } else {
+                    NodeFlags::default()
+                }
+            || overload && node.range != tag.range()
+            || data.modifiers.is_some()
+            || data.question_token.is_some()
+            || data.dot_dot_dot_token.is_some()
+            || data.initializer.is_some()
+            || data.symbol.is_some()
+            || data.facts != 0
+            || tag.is_optional()
+            || tag.is_name_first()
+            || name.kind != SyntaxKind::Identifier
+            || name.parent != Some(parameter)
+            || name.flags
+                != if overload {
+                    NodeFlags::REPARSED
+                } else {
+                    NodeFlags::default()
+                }
+            || overload && name.range != expected_name.range()
+            || identifier.text != expected_name.text()
+            || identifier.flow_node.is_some()
+        {
+            return None;
+        }
+        let parameter = NodeRef::new(declaration.arena, declaration.file, parameter);
+        let annotation = NodeRef::new(declaration.arena, declaration.file, data.type_?);
+        authenticate_jsdoc_type_node(arena, annotation, parameter, tag.type_expression()?)?;
+        range_edges.push((declaration, parameter));
+        range_edges.push((parameter, annotation));
+    }
+    let return_type = NodeRef::new(declaration.arena, declaration.file, function.type_?);
+    authenticate_jsdoc_type_node(
+        arena,
+        return_type,
+        declaration,
+        return_tag.type_expression()?,
+    )?;
+    range_edges.push((declaration, return_type));
+    Some(())
+}
+
+fn authenticate_jsdoc_type_node(
+    arena: &NodeArena,
+    annotation: NodeRef,
+    parent: NodeRef,
+    expected: &JsDocTypeExpression<'_>,
+) -> Option<()> {
+    let root = arena.get(annotation.node)?;
+    if root.flags != NodeFlags::REPARSED || root.range != expected.range() {
+        return None;
+    }
+    let source = arena.source_text()?;
+    let mut pending = vec![(annotation.node, parent.node, root.range)];
+    let mut visited = HashSet::new();
+    while let Some((node, parent, range)) = pending.pop() {
+        let record = arena.get(node)?;
+        if !visited.insert(node)
+            || record.parent != Some(parent)
+            || record.range.start > record.range.end
+            || record.range.start < range.start
+            || record.range.end > range.end
+            || source
+                .get(record.range.start.get() as usize..record.range.end.get() as usize)
+                .is_none()
+        {
+            return None;
+        }
+        record.for_each_child(|child| pending.push((child, node, record.range)));
+    }
+    (project_type(arena, annotation.node, root.range)
+        .ok()?
+        .eq(expected.type_()))
+    .then_some(())
 }
 
 fn javascript_jsdoc_arrow_expression_owner(
@@ -4243,7 +4544,9 @@ fn apply_jsdoc_tag(
             }
         }
         JsDocTagKind::Overload => {
-            if jsdoc_overload_creates_declaration(arena, declaration.node)? {
+            if declaration.overload_declarations.is_empty()
+                && jsdoc_overload_creates_declaration(arena, declaration.node)?
+            {
                 return Err(JsDocCommentError::UnsupportedOverloadDeclaration(
                     declaration.node,
                 ));

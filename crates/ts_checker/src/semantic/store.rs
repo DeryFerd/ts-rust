@@ -409,11 +409,19 @@ pub(super) struct SourceOverloadSignatureProvenance {
     pub(super) return_type: TypeId,
 }
 
-/// Immutable source/binder provenance for one local ambient overload value.
+/// The actual body declaration hidden from a source overload's call list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceOverloadImplementation {
+    pub(super) declaration: NodeRef,
+    pub(super) body: NodeRef,
+}
+
+/// Immutable source/binder provenance for one local overload value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceOverloadProvenance {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) signatures: Box<[SourceOverloadSignatureProvenance]>,
+    pub(super) implementation: Option<SourceOverloadImplementation>,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
 }
 
@@ -446,6 +454,7 @@ pub(super) struct PreparedSourceOverloadSignature {
 pub(super) struct PreparedSourceOverloadPublication {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) signatures: Vec<PreparedSourceOverloadSignature>,
+    pub(super) implementation: Option<SourceOverloadImplementation>,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
 }
 
@@ -1921,7 +1930,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 matches!(
                     provenance.family,
                     SourceCallableFamily::ArrowFunction | SourceCallableFamily::ObjectLiteralMethod
-                ) && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+                ) && (provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+                    || self.source_node_kind(provenance.declaration)
+                        == Some(SyntaxKind::FunctionExpression))
                     && provenance.captured_assignment.is_none()
                     && target != type_
                     && self.types.get(target).is_some()
@@ -2874,7 +2885,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 == Some(owner_symbol)
     }
 
-    /// Proves the exact variable, property, or method owner of a contextual callable.
+    /// Proves the exact variable, property, or method anchor of a contextual callable.
     pub(super) fn source_contextual_callable_anchor_is_exact(
         &self,
         declaration: NodeRef,
@@ -2891,7 +2902,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if anchor == owner_symbol
             || self.get_merged_symbol(owner_symbol) != Some(owner_symbol)
             || self.get_merged_symbol(anchor) != Some(anchor)
-            || self.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
+            || !matches!(
+                self.source_node_kind(declaration),
+                Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression)
+            )
             || owner.flags() != SymbolFlags::FUNCTION
             || owner.check_flags() != CheckFlags::NONE
             || owner.declarations() != Some(&[declaration])
@@ -2918,7 +2932,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return false;
         }
 
-        if symbol.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE {
+        if symbol.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+            || self.source_node_kind(declaration) == Some(SyntaxKind::FunctionExpression)
+                && symbol.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        {
             return symbol.parent().is_none()
                 && self.source_node_kind(anchor_declaration)
                     == Some(SyntaxKind::VariableDeclaration)
@@ -9560,7 +9577,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         Some(type_)
     }
 
-    /// Publishes a dependency-closed batch of local ambient overload groups.
+    /// Publishes a dependency-closed batch of local overload groups.
     ///
     /// Every source, binder, cache, and capacity edge is checked before the
     /// first callable identity is allocated. Once allocation begins, all
@@ -9595,6 +9612,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .first()
                 .and_then(|declaration| self.source_node_parent(*declaration));
             if group.signatures.len() < 2
+                || group.implementation.is_some_and(|implementation| {
+                    declaration_order.last().copied() != Some(implementation.declaration)
+                        || self.source_node_kind(implementation.body) != Some(SyntaxKind::Block)
+                        || self.source_node_parent(implementation.body)
+                            != Some(SourceNodeParent::Parent(implementation.declaration))
+                })
                 || !owners.insert(group.owner_symbol)
                 || owner.flags() != SymbolFlags::FUNCTION
                 || owner.check_flags() != CheckFlags::NONE
@@ -9767,6 +9790,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                         SourceOverloadProvenance {
                             owner_symbol: group.owner_symbol,
                             signatures: provenance_rows,
+                            implementation: group.implementation,
                             array_targets: group.array_targets,
                         },
                     )
@@ -9796,14 +9820,20 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     ..ValueSymbolLinks::default()
                 },
             ));
-            assert!(self.set_structured_type_members(
-                type_,
-                None,
-                None,
-                Some(signature_ids.clone()),
-                None,
-                None,
-            ));
+            assert!(
+                self.set_structured_type_members(
+                    type_,
+                    None,
+                    None,
+                    Some(
+                        signature_ids
+                            [..signature_ids.len() - usize::from(group.implementation.is_some())]
+                            .to_vec()
+                    ),
+                    None,
+                    None,
+                )
+            );
             for (signature, signature_id) in group.signatures.iter().zip(&signature_ids) {
                 assert!(self.set_signature_links(
                     signature.declaration,
