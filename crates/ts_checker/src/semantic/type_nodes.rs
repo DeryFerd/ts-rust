@@ -17432,7 +17432,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 || react_alias.is_some()
                 || property_alias
                 || ordinary_intersection
-                || mapped_lookup =>
+                || mapped_lookup
+                || self.plan.prop_types_key_aliases.contains_key(&symbol) =>
             {
                 None
             }
