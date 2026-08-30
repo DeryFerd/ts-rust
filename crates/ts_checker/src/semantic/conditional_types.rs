@@ -5804,11 +5804,16 @@ mod tests {
         DeclaredTypeError, DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions,
         SemanticStore, TypeNodeUnavailable, ValueSymbolLinks,
         declared::execute_type_parameter,
+        instantiated_members::validate_generic_interface_callable,
         mapper::TypeMapper,
+        object_members::{
+            plan_generic_interface, publish_generic_interface_declared_members_with_global_types,
+        },
         production::GlobalMergeCompletion,
+        reference_types::validate_direct_generic_reference,
         signatures::IndexFlags,
         type_nodes::CanonicalTypeQuery,
-        type_records::RegularLiteralLink,
+        type_records::{RegularLiteralLink, StructuredTypeData},
         types::{AccessFlags, ObjectFlags},
     };
 
@@ -5883,6 +5888,118 @@ mod tests {
         ]
     }
 
+    // Prepare the real declared call template without resolving the concrete reference.
+    #[allow(clippy::too_many_lines)] // Keep source publication and the unchanged reference proof together.
+    fn prepare_source_conditional_callable_template(
+        context: &mut CanonicalCheckerContext<'_>,
+        reference: TypeId,
+    ) {
+        let direct = validate_direct_generic_reference(context.store(), reference).unwrap();
+        assert_ne!(direct.target, reference);
+        let owner = context
+            .store()
+            .type_payload(direct.target)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let plan = {
+            let host = context.declared_type_host().unwrap();
+            plan_generic_interface(context.store(), &host, owner).unwrap()
+        };
+        assert!(plan.heritage.is_none());
+        assert!(plan.properties.is_empty());
+        assert_eq!(plan.call_signatures.len(), 1);
+        let source_file = context.source_file(plan.node.file).unwrap();
+        assert!(
+            context
+                .store()
+                .source_file_links(source_file)
+                .is_none_or(|links| !links.type_checked)
+        );
+        let record = context.store().type_payload(reference).unwrap();
+        let TypeData::TypeReference(cold) = record.data() else {
+            panic!("the source annotation must produce a concrete interface reference")
+        };
+        let flags = record.object_flags();
+        let identity = (record.flags(), record.symbol(), record.alias());
+        let cold = cold.clone();
+        assert!(!flags.contains(ObjectFlags::MEMBERS_RESOLVED));
+        assert_eq!(cold.object.structured, StructuredTypeData::default());
+        assert_eq!(cold.object.mapper, None);
+        assert!(matches!(
+            context.store().type_payload(direct.target).unwrap().data(),
+            TypeData::Interface(target)
+                if !target.declared_members_resolved && target.declared_call_signatures.is_none()
+        ));
+        assert!(
+            !context
+                .store()
+                .type_has_declared_call_set_provenance(direct.target)
+        );
+        for annotation in plan.call_type_nodes() {
+            context.get_type_from_type_node(annotation).unwrap();
+        }
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        assert!(store.publish_interface_no_base_resolution(direct.target));
+        assert_eq!(
+            publish_generic_interface_declared_members_with_global_types(
+                store,
+                &plan,
+                direct.target,
+                &[],
+                &globals,
+            ),
+            Ok(direct.target),
+        );
+        let TypeData::Interface(target) = store.type_payload(direct.target).unwrap().data() else {
+            panic!("the declared callable must keep its interface target")
+        };
+        assert!(target.declared_members_resolved);
+        let [signature] = target.declared_call_signatures.as_deref().unwrap() else {
+            panic!("the declared template must keep its one source call signature")
+        };
+        let declaration = plan.call_signatures[0].declaration;
+        assert_eq!(
+            store.signature(*signature).unwrap().declaration(),
+            Some(declaration)
+        );
+        assert_eq!(
+            store
+                .signature_links(declaration)
+                .unwrap()
+                .resolved_signature
+                .signature(),
+            Some(*signature),
+        );
+        assert!(store.type_has_declared_call_set_provenance(direct.target));
+        assert!(!store.type_has_declared_call_set_provenance(reference));
+        assert_eq!(
+            validate_direct_generic_reference(store, reference),
+            Ok(direct)
+        );
+        let record = store.type_payload(reference).unwrap();
+        let TypeData::TypeReference(actual) = record.data() else {
+            panic!("declared template preparation must keep the concrete reference")
+        };
+        assert_eq!(actual, &cold);
+        assert_eq!(record.object_flags(), flags);
+        assert_eq!((record.flags(), record.symbol(), record.alias()), identity);
+        assert!(
+            store
+                .source_file_links(source_file)
+                .is_none_or(|links| !links.type_checked)
+        );
+        assert!(matches!(
+            validate_generic_interface_callable(
+                store,
+                reference,
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+            ),
+            Some(StoredCallableSetValidation::Pending { .. })
+        ));
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)] // Check the same source query after each copied-signature mutation.
     fn conditional_callable_operands_reject_changed_copied_signatures_and_mappers() {
@@ -5905,6 +6022,7 @@ mod tests {
             let validator = source_conditional_symbol(&context, "validator");
             let annotation = source_conditional_annotation(&context, validator);
             let reference = context.get_type_from_type_node(annotation).unwrap();
+            prepare_source_conditional_callable_template(&mut context, reference);
             let cold = context
                 .store()
                 .type_payload(reference)
@@ -6063,6 +6181,7 @@ mod tests {
         let callable = source_conditional_symbol(&context, "callable");
         let annotation = source_conditional_annotation(&context, callable);
         let reference = context.get_type_from_type_node(annotation).unwrap();
+        prepare_source_conditional_callable_template(&mut context, reference);
         let result = source_conditional_symbol(&context, "Result");
         let conditional = context.get_declared_type_of_symbol(result).unwrap();
         let store = context.store_mut_for_test();
