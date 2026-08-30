@@ -1244,6 +1244,7 @@ struct PlannedClassObjectBinding {
 #[derive(Clone, Debug)]
 struct PlannedClassObjectAssignment {
     expression: NodeRef,
+    object: super::object_members::PropertyObjectPlan,
     parentheses: Vec<NodeRef>,
     receiver: PlannedExpression,
     elements: Vec<(
@@ -9377,8 +9378,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             };
             elements.push((plan, target, assignment));
         }
+        let object = super::object_members::plan_object_literal(store, host, pattern)
+            .map_err(|error| self.object_plan_error(error))?;
+        if !object.is_class_assignment() {
+            return Err(SourceCheckError::Class(pattern));
+        }
+        super::object_members::object_literal_state(store, &object)
+            .map_err(source_object_execution_error)?;
         Ok(Some(PlannedClassObjectAssignment {
             expression,
+            object,
             parentheses,
             receiver,
             elements,
@@ -34718,6 +34727,14 @@ fn check_class_statements(
                 }
             }
             PlannedClassStatement::ObjectAssignment(assignment) => {
+                if super::object_members::plan_object_literal(store, host, assignment.object.node)
+                    .map_err(source_object_execution_error)?
+                    != assignment.object
+                {
+                    return Err(SourceCheckError::Class(assignment.object.node));
+                }
+                super::object_members::object_literal_state(store, &assignment.object)
+                    .map_err(source_object_execution_error)?;
                 let snapshot = context
                     .flow
                     .snapshot_at(store, global_types, assignment.receiver.node)
@@ -34813,6 +34830,23 @@ fn check_class_statements(
                         .complete_assignment(flow.target, flow.symbol, current)
                         .map_err(|error| class_body_flow_error(flow.target, error))?;
                 }
+                let property_types = assignment
+                    .object
+                    .properties
+                    .iter()
+                    .map(|property| {
+                        store
+                            .type_node_links(property.type_node)
+                            .and_then(|links| links.resolved_type)
+                            .ok_or(SourceCheckError::Class(property.type_node))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                super::object_members::publish_object_literal(
+                    store,
+                    &assignment.object,
+                    &property_types,
+                )
+                .map_err(source_object_execution_error)?;
                 publish_expression_type(store, assignment.expression, receiver.result)?;
                 for parenthesis in assignment.parentheses.iter().rev() {
                     publish_expression_type(store, *parenthesis, receiver.result)?;

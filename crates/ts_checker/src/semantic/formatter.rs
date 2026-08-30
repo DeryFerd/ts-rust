@@ -6213,6 +6213,19 @@ fn validate_object_literal_contract(
         None => None,
     };
     let readonly = const_asserted_object_literal(store, host, type_id, *owner_declaration)?;
+    let assignment_plan = host
+        .map(|host| object_members::plan_object_literal(store, host, *owner_declaration))
+        .transpose()
+        .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
+        .filter(object_members::PropertyObjectPlan::is_class_assignment);
+    if let Some(plan) = &assignment_plan
+        && !matches!(
+            object_members::object_literal_state(store, plan),
+            Ok(Some(object_members::PropertyObjectState::Resolved(actual))) if actual == type_id
+        )
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
     let expected_check_flags = if readonly {
         CheckFlags::READONLY
     } else {
@@ -6294,8 +6307,10 @@ fn validate_object_literal_contract(
         {
             return Err(TypeDisplayUnavailable::MalformedType(type_id));
         }
-        let [declaration] = clone_record.declarations().unwrap_or_default() else {
-            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        let declaration = match clone_record.declarations().unwrap_or_default() {
+            [declaration] => declaration,
+            [first, ..] if assignment_plan.is_some() => first,
+            _ => return Err(TypeDisplayUnavailable::MalformedType(type_id)),
         };
         if clone_record.value_declaration() != Some(*declaration)
             || !matches!(
