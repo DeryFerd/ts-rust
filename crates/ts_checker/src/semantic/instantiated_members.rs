@@ -4576,18 +4576,72 @@ pub(super) fn published_interface_method_signature_return(
     }))
 }
 
+/// A call shell must use the call return reader, not the receiver copy reader.
+pub(super) fn interface_method_signature_return_for_query(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    if store
+        .published_interface_method_type_for_signature(signature)
+        .is_none()
+        && store
+            .proxy_interface_method_type_for_signature(signature)
+            .is_none()
+        && let Some(target) = store
+            .signature(signature)
+            .and_then(super::signatures::Signature::target)
+        && store.interface_method_linked_type(target).is_some()
+        && super::generic_calls::preflight_generic_call_signature_return_target(
+            store,
+            array_targets,
+            signature,
+        )
+        .is_ok_and(|source| source == target)
+    {
+        return Ok(None);
+    }
+    instantiated_interface_method_signature_return(store, signature, array_targets)
+}
+
 /// Reads a selected-method copy or an exact value already owned by a member proxy.
 pub(super) fn instantiated_interface_method_signature_return(
     store: &CanonicalTypeMapperStore,
     signature: SignatureId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    let proxy_owner = store.proxy_interface_method_type_for_signature(signature);
     if let Some(result) =
         published_interface_method_signature_return(store, signature, array_targets)?
     {
+        if let Some(owner) = proxy_owner {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(owner));
+        }
         return Ok(Some(result));
     }
-    proxy_interface_method_signature_return(store, signature, array_targets)
+    let result = proxy_interface_method_signature_return(store, signature, array_targets)?;
+    match (proxy_owner, result) {
+        (Some(owner), Some(result))
+            if result.owner == owner
+                && store
+                    .type_payload(owner)
+                    .and_then(|record| record.data().structured())
+                    .and_then(|structured| structured.signatures.as_deref())
+                    .is_some_and(|signatures| {
+                        signatures.iter().all(|&signature| {
+                            store.proxy_interface_method_type_for_signature(signature)
+                                == Some(owner)
+                        })
+                    }) =>
+        {
+            Ok(Some(result))
+        }
+        (Some(owner), _) => Err(GenericInterfaceMemberError::InvalidCachedMembers(owner)),
+        (None, Some(result)) => Err(GenericInterfaceMemberError::InvalidCachedMembers(
+            result.owner,
+        )),
+        (None, None) => Ok(None),
+    }
 }
 
 #[allow(clippy::too_many_lines)] // Follow the existing receiver and proxy cache without searching for a copy.
@@ -6736,7 +6790,10 @@ fn instantiate_generic_interface_method_type(
             Ok((signature, parameters, return_type))
         })
         .collect::<Result<Vec<_>, GenericInterfaceMemberError>>()?;
-    if !store.try_reserve_types(1) || !store.try_reserve_signatures(sources.len()) {
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_signatures(sources.len())
+        || !store.try_reserve_proxy_interface_method_signature_owners(sources.len())
+    {
         return Err(GenericInterfaceMemberError::Capacity(source).into());
     }
     let mut signatures = Vec::with_capacity(sources.len());
@@ -6759,7 +6816,15 @@ fn instantiate_generic_interface_method_type(
         .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
         .ok_or(GenericInterfaceMemberError::Capacity(source))?;
     if !store.set_object_target_and_mapper(callable, Some(source), Some(mapper))
-        || !store.set_structured_type_members(callable, None, None, Some(signatures), None, None)
+        || !store.set_structured_type_members(
+            callable,
+            None,
+            None,
+            Some(signatures.clone()),
+            None,
+            None,
+        )
+        || !store.publish_proxy_interface_method_signature_owners(callable, &signatures)
     {
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(source).into());
     }
@@ -9664,6 +9729,688 @@ mod tests {
             .and_then(|declaration| context.store().source_direct_type_annotation(declaration))
             .unwrap();
         context.get_type_from_type_node(annotation).unwrap()
+    }
+
+    mod selected_method_call_return_tests {
+        use super::*;
+        use crate::semantic::{
+            DeclaredTypeError, TypeNodeUnavailable,
+            calls::DirectCallForm,
+            generic_calls::{
+                GenericCallVectorApplicability, GenericCallVectorRequest,
+                GenericCallVectorResolution, preflight_generic_call_signature_return_target,
+            },
+            generic_method_calls::{GenericMethodCallSelection, resolve_generic_method_call},
+            production::GlobalMergeCompletion,
+        };
+
+        struct Fixture<'a> {
+            context: CanonicalCheckerContext<'a>,
+            parsed: &'a ParseResult,
+            file: FileId,
+            callable: TypeId,
+        }
+
+        fn source(methods: &str) -> ParseResult {
+            parse_source_file(&format!(
+                "interface Array<T> {{}} interface ReadonlyArray<T> {{}} \
+                 interface Plain {{ method<U>(value: U): U; }} \
+                 interface Box<T> {{ {methods} }} \
+                 interface Derived extends Box<number> {{}} \
+                 interface Other extends Box<string> {{}}"
+            ))
+        }
+
+        fn signatures(store: &CanonicalTypeMapperStore, callable: TypeId) -> Vec<SignatureId> {
+            store
+                .type_payload(callable)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .signatures
+                .as_ref()
+                .unwrap()
+                .to_vec()
+        }
+
+        fn proxy_callable(
+            context: &mut CanonicalCheckerContext<'_>,
+            parsed: &ParseResult,
+            file: FileId,
+            name: &str,
+        ) -> TypeId {
+            let owner = source_symbol(parsed, file, context, name);
+            let derived = context.get_declared_type_of_symbol(owner).unwrap();
+            let TypeData::Interface(interface) =
+                context.store().type_payload(derived).unwrap().data()
+            else {
+                panic!("the source declaration must keep its interface type")
+            };
+            let reference = interface.resolved_base_types.as_ref().unwrap()[0];
+            let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            resolve_property_with_array_targets_and_session(
+                context.store_mut_for_test(),
+                reference,
+                EscapedNameRef::source("method"),
+                Some(targets),
+                &mut session,
+            )
+            .unwrap()
+            .unwrap()
+            .type_id()
+        }
+
+        fn fixture(parsed: &ParseResult, receiver: bool) -> Fixture<'_> {
+            assert!(parsed.diagnostics.is_empty());
+            let file = FileId::new(202_932);
+            let mut context = checker_context(parsed, file, CanonicalCheckerOptions::default());
+            let callable = if receiver {
+                proxy_callable(&mut context, parsed, file, "Derived")
+            } else {
+                let owner = source_symbol(parsed, file, &context, "Plain");
+                context.get_declared_type_of_symbol(owner).unwrap();
+                let method = context
+                    .store()
+                    .symbol(owner)
+                    .unwrap()
+                    .members()
+                    .and_then(|members| context.store().symbol_table(members))
+                    .and_then(|members| members.get_source("method"))
+                    .unwrap();
+                context
+                    .store()
+                    .value_symbol_links(method)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap()
+            };
+            assert!(context.diagnostics().is_empty());
+            Fixture {
+                context,
+                parsed,
+                file,
+                callable,
+            }
+        }
+
+        fn select(fixture: &mut Fixture<'_>, recovery: bool) -> GenericCallVectorResolution {
+            let globals = fixture.context.global_types().clone();
+            let store = fixture.context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let arguments = [bootstrap.string_type];
+            let type_arguments = [bootstrap.string_type, bootstrap.number_type];
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let result = resolve_generic_method_call(
+                store,
+                &globals,
+                false,
+                GenericCallVectorRequest {
+                    form: DirectCallForm::Call,
+                    optional_chain: false,
+                    explicit_type_arguments: Some(&type_arguments[..if recovery { 2 } else { 1 }]),
+                    has_spread_argument: false,
+                    callee: fixture.callable,
+                    arguments: &arguments,
+                },
+                None,
+                &mut session,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.diagnostic.is_some(), recovery);
+            let GenericMethodCallSelection::Generic(selected) = result.selected else {
+                panic!("the real generic method must supply the selected shell")
+            };
+            assert_eq!(
+                selected.applicability(),
+                if recovery {
+                    GenericCallVectorApplicability::TypeArgumentArity {
+                        minimum: 1,
+                        maximum: 1,
+                        actual: 2,
+                    }
+                } else {
+                    GenericCallVectorApplicability::Applicable
+                }
+            );
+            selected
+        }
+
+        fn query_return(
+            fixture: &mut Fixture<'_>,
+            signature: SignatureId,
+            session: &mut InstantiationSession,
+        ) -> Result<TypeId, DeclaredTypeError> {
+            let bound = fixture.context.file(fixture.file).unwrap().1.clone();
+            let options = fixture.context.options();
+            let globals = fixture.context.global_types().clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                fixture.context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                session,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_return_type_of_signature(signature);
+            assert!(diagnostics.is_empty());
+            result
+        }
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct SignatureState {
+            declaration: Option<NodeRef>,
+            flags: SignatureFlags,
+            minimum: i32,
+            resolved_minimum: i32,
+            type_parameters: Vec<TypeId>,
+            parameters: Vec<(SemanticSymbolId, Option<ValueSymbolLinks>)>,
+            return_type: Option<TypeId>,
+            target: Option<SignatureId>,
+            mapper: Option<TypeMapperId>,
+            proxy_owner: Option<TypeId>,
+        }
+
+        fn signature_state(
+            store: &CanonicalTypeMapperStore,
+            signature: SignatureId,
+        ) -> SignatureState {
+            let record = store.signature(signature).unwrap();
+            SignatureState {
+                declaration: record.declaration(),
+                flags: record.flags(),
+                minimum: record.min_argument_count(),
+                resolved_minimum: record.resolved_min_argument_count(),
+                type_parameters: record.type_parameters().to_vec(),
+                parameters: record
+                    .parameters()
+                    .iter()
+                    .map(|&parameter| (parameter, store.value_symbol_links(parameter).cloned()))
+                    .collect(),
+                return_type: record.resolved_return_type(),
+                target: record.target(),
+                mapper: record.mapper(),
+                proxy_owner: store.proxy_interface_method_type_for_signature(signature),
+            }
+        }
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct Snapshot {
+            counts: ([usize; 6], [usize; 26]),
+            call_cache: usize,
+            proxy_owners: usize,
+            signatures: Vec<(SignatureId, SignatureState)>,
+            nodes: Vec<(
+                Option<TypeNodeLinks>,
+                Option<SignatureLinks>,
+                Option<SymbolNodeLinks>,
+            )>,
+        }
+
+        fn snapshot(fixture: &Fixture<'_>, signature: SignatureId) -> Snapshot {
+            let store = fixture.context.store();
+            let mut pending = signatures(store, fixture.callable);
+            pending.push(signature);
+            let mut seen = HashSet::new();
+            let mut recorded = Vec::new();
+            while let Some(signature) = pending.pop() {
+                if seen.insert(signature) {
+                    let state = signature_state(store, signature);
+                    pending.extend(state.target);
+                    recorded.push((signature, state));
+                }
+            }
+            Snapshot {
+                counts: property_recovery_store_counts(store),
+                call_cache: store.cached_signature_len(),
+                proxy_owners: store.proxy_interface_method_signature_owner_len(),
+                signatures: recorded,
+                nodes: fixture
+                    .parsed
+                    .arena
+                    .iter()
+                    .map(|(node, _)| {
+                        let node = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+                        (
+                            store.type_node_links(node).cloned(),
+                            store.signature_links(node).cloned(),
+                            store.symbol_node_links(node).cloned(),
+                        )
+                    })
+                    .collect(),
+            }
+        }
+
+        fn invalid(signature: SignatureId) -> DeclaredTypeError {
+            DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                signature,
+            ))
+        }
+
+        fn assert_rejected(fixture: &mut Fixture<'_>, signature: SignatureId) {
+            let before = snapshot(fixture, signature);
+            let mut session = InstantiationSession::new(InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            });
+            for _ in 0..2 {
+                assert_eq!(
+                    query_return(fixture, signature, &mut session),
+                    Err(invalid(signature))
+                );
+                assert_eq!(snapshot(fixture, signature), before);
+            }
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+        }
+
+        #[test]
+        fn selected_method_call_returns_keep_cold_recovery_shells_and_the_caller() {
+            let parsed = source("method<U>(value: U): U;");
+            let mut fixture = fixture(&parsed, false);
+            let selected = select(&mut fixture, false);
+            let first_recovery = select(&mut fixture, true);
+            let second_recovery = select(&mut fixture, true);
+            let shells = [&selected, &first_recovery, &second_recovery]
+                .map(|result| result.projection().instantiation.signature);
+            assert_ne!(shells[0], shells[1]);
+            assert_ne!(shells[1], shells[2]);
+            let original = selected.projection().generic_signature;
+            let store = fixture.context.store();
+            let original_state = signature_state(store, original);
+            let parameter = store.signature(original).unwrap().type_parameters()[0];
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+            let targets = Some(CanonicalArrayTargets::from_global_types(
+                fixture.context.global_types(),
+            ));
+            for (index, &signature) in shells.iter().enumerate() {
+                assert_eq!(store.cached_signatures_contain(signature), Some(index == 0));
+                assert_eq!(
+                    store.signature(signature).unwrap().resolved_return_type(),
+                    None
+                );
+                assert_eq!(
+                    store.proxy_interface_method_type_for_signature(signature),
+                    None
+                );
+                let before = snapshot(&fixture, signature);
+                assert_eq!(
+                    preflight_generic_call_signature_return_target(store, targets, signature),
+                    Ok(original)
+                );
+                assert_eq!(
+                    interface_method_signature_return_for_query(store, signature, targets),
+                    Ok(None)
+                );
+                assert_eq!(snapshot(&fixture, signature), before);
+            }
+            let mut limited = InstantiationSession::new(InstantiationLimits {
+                max_count: 1,
+                ..InstantiationLimits::default()
+            });
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    fixture.context.store_mut_for_test(),
+                    parameter,
+                    &[parameter],
+                    &[number],
+                    targets,
+                    &mut limited
+                ),
+                Ok(number)
+            );
+            assert_eq!((limited.query_count(), limited.total_count()), (1, 1));
+            let before = snapshot(&fixture, shells[0]);
+            assert_eq!(
+                query_return(&mut fixture, shells[0], &mut limited),
+                Err(invalid(shells[0]))
+            );
+            assert_eq!(snapshot(&fixture, shells[0]), before);
+            assert_eq!(
+                (
+                    limited.query_count(),
+                    limited.total_count(),
+                    limited.limit_event_count()
+                ),
+                (1, 1, 1)
+            );
+
+            let mut caller = InstantiationSession::new(InstantiationLimits::default());
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    fixture.context.store_mut_for_test(),
+                    parameter,
+                    &[parameter],
+                    &[number],
+                    targets,
+                    &mut caller
+                ),
+                Ok(number)
+            );
+            for (index, signature) in shells.into_iter().enumerate() {
+                assert_eq!(
+                    query_return(&mut fixture, signature, &mut caller),
+                    Ok(string)
+                );
+                assert_eq!(
+                    (caller.query_count(), caller.total_count()),
+                    (index + 2, index + 2)
+                );
+                let warm = snapshot(&fixture, signature);
+                for _ in 0..2 {
+                    assert_eq!(
+                        query_return(&mut fixture, signature, &mut caller),
+                        Ok(string)
+                    );
+                    assert_eq!(snapshot(&fixture, signature), warm);
+                    assert_eq!(
+                        (caller.query_count(), caller.total_count()),
+                        (index + 2, index + 2)
+                    );
+                }
+            }
+            assert_eq!(caller.limit_event_count(), 0);
+            assert_eq!(
+                signature_state(fixture.context.store(), original),
+                original_state
+            );
+        }
+
+        #[test]
+        fn selected_method_call_returns_reject_and_restore_damaged_shells() {
+            let parsed = source("method<U>(value: U): U;");
+            for recovery in [false, true] {
+                let mut fixture = fixture(&parsed, false);
+                let selected = select(&mut fixture, recovery);
+                let signature = selected.projection().instantiation.signature;
+                let source = selected.projection().generic_signature;
+                let mut caller = InstantiationSession::new(InstantiationLimits::default());
+                let expected = fixture
+                    .context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .string_type;
+                assert_eq!(
+                    query_return(&mut fixture, signature, &mut caller),
+                    Ok(expected)
+                );
+                let store = fixture.context.store_mut_for_test();
+                let original = signature_state(store, signature);
+                let parameter = original.parameters[0].0;
+                let links = original.parameters[0].1.clone().unwrap();
+                let source_parameter = store.signature(source).unwrap().type_parameters()[0];
+                let number = store.intrinsic_bootstrap().unwrap().number_type;
+                let wrong_mapper = store
+                    .new_type_mapper(vec![source_parameter], vec![number])
+                    .unwrap();
+                for damage in 0..6 {
+                    let store = fixture.context.store_mut_for_test();
+                    match damage {
+                        0 => assert!(
+                            store.set_signature_resolved_return_type(signature, Some(number))
+                        ),
+                        1 => assert!(store.set_signature_target_and_mapper(
+                            signature,
+                            Some(source),
+                            Some(wrong_mapper)
+                        )),
+                        2 => {
+                            let mut changed = links.clone();
+                            changed.resolved_type = Some(number);
+                            assert!(store.set_value_symbol_links(parameter, changed));
+                        }
+                        3 => assert!(store.set_signature_target_and_mapper(
+                            signature,
+                            None,
+                            original.mapper
+                        )),
+                        4 => assert!(store.set_signature_target_and_mapper(
+                            signature,
+                            Some(signature),
+                            original.mapper
+                        )),
+                        _ => assert!(
+                            store.set_signature_type_parameters(signature, vec![source_parameter])
+                        ),
+                    }
+                    assert_rejected(&mut fixture, signature);
+                    let store = fixture.context.store_mut_for_test();
+                    assert!(
+                        store.set_signature_resolved_return_type(signature, original.return_type)
+                    );
+                    assert!(store.set_signature_target_and_mapper(
+                        signature,
+                        original.target,
+                        original.mapper
+                    ));
+                    assert!(store.set_signature_type_parameters(
+                        signature,
+                        original.type_parameters.clone()
+                    ));
+                    assert!(store.set_value_symbol_links(parameter, links.clone()));
+                    assert_eq!(signature_state(store, signature), original);
+                    let before = snapshot(&fixture, signature);
+                    let count = caller.total_count();
+                    assert_eq!(
+                        query_return(&mut fixture, signature, &mut caller),
+                        Ok(expected)
+                    );
+                    assert_eq!(caller.total_count(), count);
+                    assert_eq!(snapshot(&fixture, signature), before);
+                }
+            }
+        }
+
+        #[test]
+        fn selected_generic_receiver_calls_keep_the_authenticated_intermediate_target() {
+            let parsed = source("method<U>(value: U): U;");
+            let mut fixture = fixture(&parsed, true);
+            let receiver = signatures(fixture.context.store(), fixture.callable)[0];
+            let store = fixture.context.store();
+            let source = store.signature(receiver).unwrap().target().unwrap();
+            let fresh = store.signature(receiver).unwrap().type_parameters()[0];
+            assert_ne!(fresh, store.signature(source).unwrap().type_parameters()[0]);
+            assert_eq!(
+                store.proxy_interface_method_type_for_signature(receiver),
+                Some(fixture.callable)
+            );
+            assert_eq!(store.interface_method_linked_type(receiver), None);
+            assert!(store.interface_method_linked_type(source).is_some());
+            let receiver_state = signature_state(store, receiver);
+            let selected = select(&mut fixture, false);
+            let recovery = select(&mut fixture, true);
+            let expected = fixture
+                .context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .string_type;
+            let targets = Some(CanonicalArrayTargets::from_global_types(
+                fixture.context.global_types(),
+            ));
+            let mut caller = InstantiationSession::new(InstantiationLimits::default());
+            for selected in [&selected, &recovery] {
+                let signature = selected.projection().instantiation.signature;
+                let store = fixture.context.store();
+                assert_eq!(selected.projection().generic_signature, receiver);
+                assert_eq!(store.signature(signature).unwrap().target(), Some(receiver));
+                assert_eq!(
+                    store.signature(signature).unwrap().resolved_return_type(),
+                    None
+                );
+                assert_eq!(
+                    preflight_generic_call_signature_return_target(store, targets, signature),
+                    Ok(receiver)
+                );
+                assert_eq!(
+                    interface_method_signature_return_for_query(store, signature, targets),
+                    Ok(None)
+                );
+                assert_eq!(
+                    query_return(&mut fixture, signature, &mut caller),
+                    Ok(expected)
+                );
+                let before = snapshot(&fixture, signature);
+                let count = caller.total_count();
+                for _ in 0..2 {
+                    assert_eq!(
+                        query_return(&mut fixture, signature, &mut caller),
+                        Ok(expected)
+                    );
+                    assert_eq!(snapshot(&fixture, signature), before);
+                    assert_eq!(caller.total_count(), count);
+                }
+            }
+            assert_eq!(query_return(&mut fixture, receiver, &mut caller), Ok(fresh));
+            assert_eq!(
+                signature_state(fixture.context.store(), receiver),
+                receiver_state
+            );
+            assert_eq!(caller.limit_event_count(), 0);
+        }
+
+        #[test]
+        fn receiver_method_owners_reject_missing_markers_and_coherent_call_shell_damage() {
+            let parsed = source("method<U>(): number; method<U>(value: U): U;");
+            let mut fixture = fixture(&parsed, true);
+            let other = proxy_callable(&mut fixture.context, &parsed, fixture.file, "Other");
+            assert_ne!(fixture.callable, other);
+            let copies = signatures(fixture.context.store(), fixture.callable);
+            assert_eq!(copies.len(), 2);
+            let signature = copies[0];
+            let store = fixture.context.store();
+            let source = store.signature(signature).unwrap().target().unwrap();
+            let original = signature_state(store, signature);
+            let expected = store.intrinsic_bootstrap().unwrap().number_type;
+            assert!(original.parameters.is_empty());
+            assert_eq!(original.minimum, 0);
+            assert_eq!(original.type_parameters.len(), 1);
+            assert_eq!(original.return_type, Some(expected));
+            let mut caller = InstantiationSession::new(InstantiationLimits::default());
+            assert_eq!(
+                query_return(&mut fixture, signature, &mut caller),
+                Ok(expected)
+            );
+            for copy in copies.iter().copied() {
+                for changed in [None, Some(other)] {
+                    assert_eq!(
+                        fixture
+                            .context
+                            .store_mut_for_test()
+                            .replace_proxy_interface_method_type_for_signature_for_test(
+                                copy, changed
+                            ),
+                        Some(fixture.callable)
+                    );
+                    assert_rejected(&mut fixture, signature);
+                    assert_eq!(
+                        fixture
+                            .context
+                            .store_mut_for_test()
+                            .replace_proxy_interface_method_type_for_signature_for_test(
+                                copy,
+                                Some(fixture.callable)
+                            ),
+                        changed
+                    );
+                    assert_eq!(
+                        query_return(&mut fixture, signature, &mut caller),
+                        Ok(expected)
+                    );
+                }
+            }
+            let before = snapshot(&fixture, signature);
+            assert!(
+                !fixture
+                    .context
+                    .store_mut_for_test()
+                    .publish_proxy_interface_method_signature_owners(
+                        fixture.callable,
+                        &copies[..1]
+                    )
+            );
+            assert!(
+                !fixture
+                    .context
+                    .store_mut_for_test()
+                    .publish_proxy_interface_method_signature_owners(fixture.callable, &copies)
+            );
+            assert_eq!(snapshot(&fixture, signature), before);
+
+            let store = fixture.context.store_mut_for_test();
+            assert!(store.set_signature_target_and_mapper(signature, None, original.mapper));
+            assert_rejected(&mut fixture, signature);
+            let store = fixture.context.store_mut_for_test();
+            let source_parameter = store.signature(source).unwrap().type_parameters()[0];
+            let call_mapper = store
+                .new_type_mapper(vec![source_parameter], vec![expected])
+                .unwrap();
+            assert!(store.set_signature_type_parameters(signature, Vec::new()));
+            assert!(store.set_signature_target_and_mapper(
+                signature,
+                Some(source),
+                Some(call_mapper)
+            ));
+            let targets = Some(CanonicalArrayTargets::from_global_types(
+                fixture.context.global_types(),
+            ));
+            assert_eq!(
+                preflight_generic_call_signature_return_target(
+                    fixture.context.store(),
+                    targets,
+                    signature
+                ),
+                Ok(source)
+            );
+            assert_eq!(
+                fixture.context.store().cached_signatures_contain(signature),
+                Some(false)
+            );
+            assert_rejected(&mut fixture, signature);
+            let store = fixture.context.store_mut_for_test();
+            assert!(store.set_signature_target_and_mapper(
+                signature,
+                original.target,
+                original.mapper
+            ));
+            assert!(
+                store.set_signature_type_parameters(signature, original.type_parameters.clone())
+            );
+            assert_eq!(signature_state(store, signature), original);
+            let before = snapshot(&fixture, signature);
+            for _ in 0..2 {
+                assert_eq!(
+                    query_return(&mut fixture, signature, &mut caller),
+                    Ok(expected)
+                );
+                assert_eq!(snapshot(&fixture, signature), before);
+            }
+            assert_eq!(
+                (
+                    caller.query_count(),
+                    caller.total_count(),
+                    caller.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+        }
     }
 
     #[test]

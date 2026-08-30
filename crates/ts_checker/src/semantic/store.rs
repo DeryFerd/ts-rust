@@ -768,6 +768,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     instantiated_property_alias_callables: HashMap<TypeId, InstantiatedPropertyAliasCallable>,
     published_interface_method_origins: HashMap<TypeId, PublishedInterfaceMethodOrigin>,
     published_interface_method_signature_owners: HashMap<SignatureId, TypeId>,
+    proxy_interface_method_signature_owners: HashMap<SignatureId, TypeId>,
     published_interface_method_recoveries: HashMap<TypeId, PublishedInterfaceMethodRecovery>,
     instantiated_property_alias_callable_types_by_signature: HashMap<SignatureId, TypeId>,
     instantiated_property_recoveries: HashMap<SemanticSymbolId, InstantiatedPropertyRecovery>,
@@ -949,6 +950,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             instantiated_property_alias_callables: HashMap::new(),
             published_interface_method_origins: HashMap::new(),
             published_interface_method_signature_owners: HashMap::new(),
+            proxy_interface_method_signature_owners: HashMap::new(),
             published_interface_method_recoveries: HashMap::new(),
             instantiated_property_alias_callable_types_by_signature: HashMap::new(),
             instantiated_property_recoveries: HashMap::new(),
@@ -10777,6 +10779,84 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
 }
 
 impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    pub(super) fn try_reserve_proxy_interface_method_signature_owners(
+        &mut self,
+        additional: usize,
+    ) -> bool {
+        self.proxy_interface_method_signature_owners
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    /// This owner survives changes to the copy's target, mapper, and parameters.
+    pub(super) fn proxy_interface_method_type_for_signature(
+        &self,
+        signature: SignatureId,
+    ) -> Option<TypeId> {
+        self.observe_relation_signature_read(signature);
+        self.proxy_interface_method_signature_owners
+            .get(&signature)
+            .copied()
+    }
+
+    /// Only the member proxy producer records its completed callable.
+    pub(super) fn publish_proxy_interface_method_signature_owners(
+        &mut self,
+        callable: TypeId,
+        signatures: &[SignatureId],
+    ) -> bool {
+        if signatures.is_empty()
+            || self
+                .type_payload(callable)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.signatures.as_deref())
+                != Some(signatures)
+            || signatures.iter().enumerate().any(|(index, signature)| {
+                signatures[..index].contains(signature)
+                    || self.signature(*signature).is_none()
+                    || self
+                        .proxy_interface_method_signature_owners
+                        .contains_key(signature)
+                    || self
+                        .published_interface_method_signature_owners
+                        .contains_key(signature)
+            })
+        {
+            return false;
+        }
+        for &signature in signatures {
+            self.proxy_interface_method_signature_owners
+                .insert(signature, callable);
+        }
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn proxy_interface_method_signature_owner_len(&self) -> usize {
+        self.proxy_interface_method_signature_owners.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_proxy_interface_method_type_for_signature_for_test(
+        &mut self,
+        signature: SignatureId,
+        callable: Option<TypeId>,
+    ) -> Option<TypeId> {
+        let previous = match callable {
+            Some(callable) => self
+                .proxy_interface_method_signature_owners
+                .insert(signature, callable),
+            None => self
+                .proxy_interface_method_signature_owners
+                .remove(&signature),
+        };
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        previous
+    }
+
     pub(super) fn try_reserve_published_interface_method_origins(
         &mut self,
         signature_count: usize,
