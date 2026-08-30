@@ -92,6 +92,26 @@ use super::{
     types::{ObjectFlags, TypeFlags},
 };
 
+/// The child selected by the existing signature comparison after it fails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CallableRelationFailure {
+    Arity {
+        required: usize,
+        available: usize,
+    },
+    Parameter {
+        index: usize,
+        source: TypeId,
+        target: TypeId,
+        callback_mode: Option<SignatureCheckMode>,
+    },
+    Return {
+        source: TypeId,
+        target: TypeId,
+        no_arguments: bool,
+    },
+}
+
 /// A canonical record or checker capability needed to answer a relation was
 /// unavailable. No variant is a negative relation result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4581,6 +4601,23 @@ impl<'store> RelaterSession<'store> {
         check_mode: SignatureCheckMode,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
+        self.compare_signatures_related_with_failure(
+            source,
+            target,
+            check_mode,
+            intersection_state,
+            None,
+        )
+    }
+
+    fn compare_signatures_related_with_failure(
+        &mut self,
+        source: &ValidatedSingleCallable,
+        target: &ValidatedSingleCallable,
+        check_mode: SignatureCheckMode,
+        intersection_state: IntersectionState,
+        failure: Option<&mut Option<CallableRelationFailure>>,
+    ) -> Result<Ternary, RelationUnavailable> {
         if source.signature == target.signature {
             return Ok(Ternary::True);
         }
@@ -4596,8 +4633,13 @@ impl<'store> RelaterSession<'store> {
         if !self.active_signature_pairs.insert(key) {
             return Ok(Ternary::Maybe);
         }
-        let result =
-            self.compare_signatures_related_worker(source, target, check_mode, intersection_state);
+        let result = self.compare_signatures_related_worker(
+            source,
+            target,
+            check_mode,
+            intersection_state,
+            failure,
+        );
         self.active_signature_pairs.remove(&key);
         result
     }
@@ -5344,6 +5386,7 @@ impl<'store> RelaterSession<'store> {
         target: &ValidatedSingleCallable,
         check_mode: SignatureCheckMode,
         intersection_state: IntersectionState,
+        mut failure: Option<&mut Option<CallableRelationFailure>>,
     ) -> Result<Ternary, RelationUnavailable> {
         let source_error = |error| signature_parameter_relation_error(source, error);
         let target_error = |error| signature_parameter_relation_error(target, error);
@@ -5371,6 +5414,12 @@ impl<'store> RelaterSession<'store> {
                 source_minimum > target_count
             };
         if source_has_more_parameters {
+            if let Some(failure) = failure.as_deref_mut() {
+                *failure = Some(CallableRelationFailure::Arity {
+                    required: source_minimum,
+                    available: target_count,
+                });
+            }
             return Ok(Ternary::False);
         }
 
@@ -5481,6 +5530,7 @@ impl<'store> RelaterSession<'store> {
                 } else {
                     self.project_non_nullable_callable_signature(target_type)?
                 };
+            let mut failed_callback_mode = None;
             let mut related = if let (Some(source_callback), Some(target_callback)) =
                 (source_callback.as_ref(), target_callback.as_ref())
                 && source_nullable_facts == target_nullable_facts
@@ -5491,6 +5541,7 @@ impl<'store> RelaterSession<'store> {
                     } else {
                         SignatureCheckMode::BIVARIANT_CALLBACK
                     };
+                failed_callback_mode = Some(callback_mode);
                 self.compare_signatures_related(
                     target_callback,
                     source_callback,
@@ -5559,6 +5610,14 @@ impl<'store> RelaterSession<'store> {
                 related = Ternary::False;
             }
             if related == Ternary::False {
+                if let Some(failure) = failure.as_deref_mut() {
+                    *failure = Some(CallableRelationFailure::Parameter {
+                        index,
+                        source: source_type,
+                        target: target_type,
+                        callback_mode: failed_callback_mode,
+                    });
+                }
                 return Ok(Ternary::False);
             }
             result &= related;
@@ -5599,7 +5658,17 @@ impl<'store> RelaterSession<'store> {
                 intersection_state,
             )?;
         }
-        Ok(result & related)
+        result &= related;
+        if result == Ternary::False
+            && let Some(failure) = failure
+        {
+            *failure = Some(CallableRelationFailure::Return {
+                source: source_return,
+                target: target_return,
+                no_arguments: source.parameters.is_empty() && target.parameters.is_empty(),
+            });
+        }
+        Ok(result)
     }
 
     fn property_related_to(
@@ -8976,6 +9045,64 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             strict_function_types,
             instantiation_session,
         )
+    }
+
+    /// Reuses signature comparison to identify the diagnostic child, including
+    /// its callback mode. The caller keeps the same instantiation session.
+    pub(super) fn callable_relation_failure_with_session(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        global_types: &CanonicalGlobalTypes,
+        strict_function_types: bool,
+        check_mode: SignatureCheckMode,
+        instantiation_session: &mut InstantiationSession,
+    ) -> Result<Option<CallableRelationFailure>, RelationUnavailable> {
+        if let Err(established) = self.claim_strict_function_types(strict_function_types) {
+            return Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                established,
+                requested: strict_function_types,
+            });
+        }
+        for type_ in [source, target] {
+            if !self.admit_callable_relation_type_with_array_targets(
+                type_,
+                Some(strict_function_types),
+                Some(CanonicalArrayTargets::from_global_types(global_types)),
+            )? {
+                return Err(RelationUnavailable::StructuredSignatures(type_));
+            }
+        }
+        let bootstrap = self.relation_bootstrap_facts()?;
+        let mut relation = RelaterSession::new_with_global_types_options_and_session(
+            self,
+            RelationKind::Assignable,
+            bootstrap,
+            Some(RelationGlobalTypes::from_global_types(global_types)),
+            Some(strict_function_types),
+            Some(instantiation_session),
+        );
+        relation.observe_type_surface(source);
+        relation.observe_type_surface(target);
+        let source = relation
+            .project_exact_callable_signature(source)?
+            .ok_or(RelationUnavailable::StructuredSignatures(source))?;
+        let target = relation
+            .project_exact_callable_signature(target)?
+            .ok_or(RelationUnavailable::StructuredSignatures(target))?;
+        let mut failure = None;
+        let result = relation.compare_signatures_related_with_failure(
+            &source,
+            &target,
+            check_mode,
+            IntersectionState::NONE,
+            Some(&mut failure),
+        )?;
+        Ok(if relation.finish_without_specialized_root_cache(result) {
+            None
+        } else {
+            failure
+        })
     }
 
     /// Pinned `isImplementationCompatibleWithOverload` for a source-owned,

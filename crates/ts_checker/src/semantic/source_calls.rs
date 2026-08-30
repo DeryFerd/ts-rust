@@ -61,7 +61,7 @@ use super::{
     inference::{NakedTypeCandidateError, NakedTypeInferenceError},
     instantiate::{InstantiationLimits, InstantiationSession},
     object_diagnostics::{
-        callable_assignability_details, exact_optional_property_mismatch_details,
+        callable_assignability_details_with_session, exact_optional_property_mismatch_details,
         excess_object_argument_diagnostic, missing_mapped_index_signature_details,
         this_context_mismatch_diagnostic,
     },
@@ -6117,7 +6117,7 @@ fn prepare_source_argument_mismatch_diagnostics(
             flags,
         )?
     } else {
-        let details = callable_assignability_details(
+        let details = callable_assignability_details_with_session(
             store,
             host,
             global_types,
@@ -6125,6 +6125,7 @@ fn prepare_source_argument_mismatch_diagnostics(
             parameter_type,
             flags,
             options,
+            session,
         )?;
         if details.is_empty() {
             if let Some(detail) = short_rest_tuple_argument_detail(
