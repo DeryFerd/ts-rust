@@ -3374,8 +3374,11 @@ impl CanonicalCheckerContext<'_> {
                 type_: links.resolved_type.unwrap_or(expected_cache),
             });
         }
-        if let Some(cached) = self.cached_artifact_symbol(node)?
-            && cached != symbol
+        if let Some(cached) = self
+            .store()
+            .symbol_node_links(node)
+            .and_then(|links| links.resolved_symbol)
+            && self.merged_artifact_symbol(node, cached)? != symbol
         {
             return Err(CanonicalArtifactQueryError::InvalidSymbol {
                 node,
@@ -3459,8 +3462,11 @@ impl CanonicalCheckerContext<'_> {
             return Err(invalid());
         }
         let symbol = self.merged_artifact_symbol(node, base.base_symbol)?;
-        if let Some(cached) = self.cached_artifact_symbol(node)?
-            && cached != symbol
+        if let Some(cached) = self
+            .store()
+            .symbol_node_links(node)
+            .and_then(|links| links.resolved_symbol)
+            && self.merged_artifact_symbol(node, cached)? != symbol
         {
             return Err(CanonicalArtifactQueryError::InvalidSymbol {
                 node,

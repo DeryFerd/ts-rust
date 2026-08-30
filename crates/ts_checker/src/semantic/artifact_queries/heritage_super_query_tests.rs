@@ -235,9 +235,17 @@ fn heritage_super_queries_reject_wrong_symbol_owner_and_foreign_nodes() {
                 .then_some(NodeRef::new(parsed.arena.id(), file, node))
         })
         .unwrap();
-    let wrong = context.file(file).unwrap().1.symbol(owner).unwrap();
+    let derived = context.file(file).unwrap().1.symbol(owner).unwrap();
+    let unknown = context
+        .store()
+        .intrinsic_bootstrap()
+        .unwrap()
+        .unknown_symbol;
     let base = context.get_symbol_at_location(nodes[0]).unwrap().unwrap();
-    for node in nodes {
+    for (node, wrong) in nodes
+        .into_iter()
+        .flat_map(|node| [derived, unknown].map(|symbol| (node, symbol)))
+    {
         let saved = context
             .store()
             .symbol_node_links(node)
@@ -262,6 +270,22 @@ fn heritage_super_queries_reject_wrong_symbol_owner_and_foreign_nodes() {
                     symbol: wrong
                 })
             );
+            assert_eq!(
+                context.get_symbol_at_location(node),
+                Err(CanonicalArtifactQueryError::InvalidSymbol {
+                    node,
+                    symbol: wrong
+                })
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(node)
+                    .unwrap()
+                    .resolved_symbol,
+                Some(wrong)
+            );
+            assert!(context.diagnostics().is_empty());
             assert_eq!(
                 (
                     context.store().type_len(),
