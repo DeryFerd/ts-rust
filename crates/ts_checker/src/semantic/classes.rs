@@ -92,6 +92,7 @@ pub(super) use annotations::{
     SourceClassAnnotationScope, begin_retained_source_class_annotations,
     begin_source_class_annotations, class_instance_type_edges, completed_class_symbol,
     source_class_annotation_is_owned, source_class_annotation_scope_targets,
+    with_retained_source_class_annotation_scopes,
 };
 pub(super) use query::{
     ClassValueQuery, class_query_reference_symbol, selected_class_method_return_type,
@@ -1776,6 +1777,9 @@ pub(super) fn plan_source_class_members_with_context(
         for property in &plan.annotated_properties {
             annotations::validate_source_annotation_value_cache(
                 store,
+                host,
+                context,
+                symbol,
                 property.type_node,
                 property.symbol,
             )?;
@@ -8280,7 +8284,14 @@ fn plan_constructor_parameter_with_body_mode(
         ));
     }
     if source_annotation {
-        annotations::validate_source_annotation_value_cache(store, type_node, symbol)?;
+        annotations::validate_source_annotation_value_cache(
+            store,
+            host,
+            type_context.expect("a source annotation requires query capabilities"),
+            owner,
+            type_node,
+            symbol,
+        )?;
         return Ok(PlannedConstructorParameter::SourceBody(
             ClassConstructorParameterPlan {
                 declaration: parameter,
