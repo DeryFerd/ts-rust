@@ -3735,13 +3735,19 @@ struct PlannedConditionalCaptures {
     infer: Vec<SemanticSymbolId>,
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct ConditionalCaptureParameter {
+    symbol: SemanticSymbolId,
+    is_this_type: bool,
+}
+
 /// Each source node and each parameter/node pair has a finite plan-local slot.
 /// This walk does not resolve branch types or follow referenced alias bodies.
 struct ConditionalCaptureWalk {
     source: NodeRef,
     node_limit: usize,
     nodes: HashSet<NodeRef>,
-    references: HashMap<(NodeRef, SemanticSymbolId), bool>,
+    references: HashMap<(NodeRef, ConditionalCaptureParameter), bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6083,7 +6089,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
     fn conditional_capture_query_may_reference(
         &self,
         query: NodeRef,
-        parameter: SemanticSymbolId,
+        parameter: ConditionalCaptureParameter,
         walk: &mut ConditionalCaptureWalk,
     ) -> Result<bool, DeclaredTypeError> {
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(query));
@@ -6131,16 +6137,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         };
         let Some([declaration]) = self
             .store
-            .symbol(parameter)
+            .symbol(parameter.symbol)
             .and_then(|symbol| symbol.declarations())
         else {
             return Ok(true);
         };
-        let scope = self
-            .conditional_capture_node(*declaration, walk)?
-            .parent
-            .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
-            .ok_or_else(invalid)?;
+        let scope = if parameter.is_this_type {
+            *declaration
+        } else {
+            self.conditional_capture_node(*declaration, walk)?
+                .parent
+                .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+                .ok_or_else(invalid)?
+        };
         let declarations = self
             .store
             .symbol(symbol)
@@ -6166,7 +6175,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
     fn conditional_capture_contains_reference(
         &self,
         root: NodeRef,
-        parameter: SemanticSymbolId,
+        parameter: ConditionalCaptureParameter,
         walk: &mut ConditionalCaptureWalk,
     ) -> Result<bool, DeclaredTypeError> {
         let mut pending: Vec<(NodeRef, Option<Vec<NodeRef>>)> = vec![(root, None)];
@@ -6192,11 +6201,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             let record = self.conditional_capture_node(node, walk)?;
             let mut direct = false;
             match &record.data {
+                NodeData::ThisTypeNode(_) => direct = parameter.is_this_type,
                 NodeData::TypeReferenceNode(reference)
-                    if reference
-                        .type_arguments
-                        .as_ref()
-                        .is_none_or(|arguments| arguments.nodes.is_empty()) =>
+                    if !parameter.is_this_type
+                        && reference
+                            .type_arguments
+                            .as_ref()
+                            .is_none_or(|arguments| arguments.nodes.is_empty()) =>
                 {
                     let name = NodeRef::new(node.arena, node.file, reference.type_name);
                     if matches!(
@@ -6205,7 +6216,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     ) {
                         direct = self
                             .conditional_capture_identifier_symbol(name, SymbolFlags::TYPE)?
-                            == Some(parameter);
+                            == Some(parameter.symbol);
                     }
                 }
                 NodeData::TypeQueryNode(query) => {
@@ -6256,6 +6267,139 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(root)))
     }
 
+    fn conditional_capture_may_reference(
+        &self,
+        node: NodeRef,
+        parameter: ConditionalCaptureParameter,
+        ancestors: &[NodeRef],
+        walk: &mut ConditionalCaptureWalk,
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some([declaration]) = self
+            .store
+            .symbol(parameter.symbol)
+            .and_then(|symbol| symbol.declarations())
+        else {
+            return Ok(true);
+        };
+        let container = self
+            .conditional_capture_node(*declaration, walk)?
+            .parent
+            .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent));
+        let Some(index) = ancestors
+            .iter()
+            .position(|ancestor| Some(*ancestor) == container)
+        else {
+            return Ok(true);
+        };
+        for ancestor in &ancestors[..index] {
+            let record = self.conditional_capture_node(*ancestor, walk)?;
+            if record.kind == SyntaxKind::Block {
+                return Ok(true);
+            }
+            if let NodeData::ConditionalTypeNode(conditional) = &record.data
+                && self.conditional_capture_contains_reference(
+                    NodeRef::new(ancestor.arena, ancestor.file, conditional.extends_type),
+                    parameter,
+                    walk,
+                )?
+            {
+                return Ok(true);
+            }
+        }
+        self.conditional_capture_contains_reference(node, parameter, walk)
+    }
+
+    /// Authenticate the interface parameters before using Go's source-reference
+    /// check to prove that this conditional cannot use its receiver parameter.
+    fn conditional_capture_interface_parameters(
+        &self,
+        node: NodeRef,
+        declaration: NodeRef,
+        ancestors: &[NodeRef],
+        walk: &mut ConditionalCaptureWalk,
+    ) -> Result<Vec<SemanticSymbolId>, DeclaredTypeError> {
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(declaration));
+        let unsupported = || {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node: declaration,
+                kind: SyntaxKind::InterfaceDeclaration,
+            })
+        };
+        let record = self.conditional_capture_node(declaration, walk)?;
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            return Err(invalid());
+        };
+        let bound = self.host.bound_file(declaration).ok_or_else(invalid)?;
+        let symbol = bound
+            .symbol(declaration)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+            .ok_or_else(invalid)?;
+        let owner = self.store.symbol(symbol).ok_or_else(invalid)?;
+        if !self.host.symbol_matches(self.store, declaration, symbol)
+            || !self.store.source_merged_symbol_declarations_match(symbol)
+        {
+            return Err(invalid());
+        }
+        if owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || owner.declarations() != Some(&[declaration])
+            || self
+                .store
+                .source_is_default_library_declaration(declaration)
+        {
+            return Err(unsupported());
+        }
+        let parameters = if let Some(parameters) = interface.type_parameters.as_ref() {
+            let identity =
+                object_members::plan_generic_interface_identity(self.store, self.host, symbol)
+                    .map_err(property_object_error)?;
+            if identity.node != declaration
+                || identity.symbol != symbol
+                || identity.parameters.len() != parameters.nodes.len()
+            {
+                return Err(invalid());
+            }
+            for (&parameter, &symbol) in parameters.nodes.iter().zip(&identity.parameters) {
+                let parameter = NodeRef::new(declaration.arena, declaration.file, parameter);
+                if self.conditional_capture_parameter(parameter, walk)? != symbol {
+                    return Err(invalid());
+                }
+            }
+            identity.parameters
+        } else {
+            // With no outer parameters, these facts prove that Go creates no
+            // receiver. This keeps absent and filtered-empty capture lists distinct.
+            if interface.heritage_clauses.is_some()
+                || bound.contains_this(declaration) != Some(false)
+            {
+                return Err(unsupported());
+            }
+            let identity = object_members::plan_interface(self.store, self.host, symbol)
+                .map_err(property_object_error)?;
+            if identity.node != declaration || identity.symbol != symbol {
+                return Err(invalid());
+            }
+            Vec::new()
+        };
+        if preflight_class_or_interface_reference(self.store, self.host, symbol, owner.flags())?
+            != parameters.len()
+        {
+            return Err(invalid());
+        }
+        if self.conditional_capture_may_reference(
+            node,
+            ConditionalCaptureParameter {
+                symbol,
+                is_this_type: true,
+            },
+            ancestors,
+            walk,
+        )? {
+            return Err(unsupported());
+        }
+        Ok(parameters)
+    }
+
     #[allow(clippy::too_many_lines)] // Keep lexical collection and Go's source-only filtering together.
     fn plan_conditional_captures(
         &self,
@@ -6284,9 +6428,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 NodeData::ConditionalTypeNode(_) => {
                     self.conditional_capture_infer_parameters(scope, &mut walk)?
                 }
+                NodeData::InterfaceDeclaration(_) => self
+                    .conditional_capture_interface_parameters(node, scope, &ancestors, &mut walk)?,
                 NodeData::ClassDeclaration(_)
                 | NodeData::ClassExpression(_)
-                | NodeData::InterfaceDeclaration(_)
                 | NodeData::FunctionExpression(_)
                 | NodeData::ArrowFunction(_) => {
                     return Err(type_node_unavailable(
@@ -6382,53 +6527,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if !generic_alias && let Some(candidates) = outer.take() {
             let mut retained = Vec::new();
             for parameter in candidates {
-                let declarations = self
-                    .store
-                    .symbol(parameter)
-                    .and_then(|symbol| symbol.declarations())
-                    .unwrap_or_default();
-                let possibly_referenced = if let [declaration] = declarations {
-                    let container = self
-                        .conditional_capture_node(*declaration, &mut walk)?
-                        .parent
-                        .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent));
-                    if let Some(index) = ancestors
-                        .iter()
-                        .position(|ancestor| Some(*ancestor) == container)
-                    {
-                        let mut retained_by_ancestor = false;
-                        for ancestor in &ancestors[..index] {
-                            let record = self.conditional_capture_node(*ancestor, &mut walk)?;
-                            if record.kind == SyntaxKind::Block {
-                                retained_by_ancestor = true;
-                                break;
-                            }
-                            if let NodeData::ConditionalTypeNode(conditional) = &record.data
-                                && self.conditional_capture_contains_reference(
-                                    NodeRef::new(
-                                        ancestor.arena,
-                                        ancestor.file,
-                                        conditional.extends_type,
-                                    ),
-                                    parameter,
-                                    &mut walk,
-                                )?
-                            {
-                                retained_by_ancestor = true;
-                                break;
-                            }
-                        }
-                        retained_by_ancestor
-                            || self.conditional_capture_contains_reference(
-                                node, parameter, &mut walk,
-                            )?
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                };
-                if possibly_referenced {
+                if self.conditional_capture_may_reference(
+                    node,
+                    ConditionalCaptureParameter {
+                        symbol: parameter,
+                        is_this_type: false,
+                    },
+                    &ancestors,
+                    &mut walk,
+                )? {
                     retained.push(parameter);
                 }
             }
@@ -56549,10 +56656,147 @@ mod tests {
     }
 
     #[test]
+    fn conditional_source_captures_keep_unused_and_absent_interface_parameters_distinct() {
+        for (source, outer) in [
+            (
+                "interface Shape<T> { value: string extends number ? 0 : 1; }",
+                Some(Vec::new()),
+            ),
+            (
+                "interface Shape { value: string extends number ? 0 : 1; }",
+                None,
+            ),
+        ] {
+            let fixture = fixture(source);
+            let node = capture_conditional_nodes(&fixture)[0];
+            let owner = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Shape");
+            let before = store_state(&fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    source_capture_plan(&fixture, node),
+                    Ok(PlannedConditionalCaptures {
+                        outer: outer.clone(),
+                        infer: Vec::new(),
+                    })
+                );
+                assert_eq!(store_state(&fixture.store), before);
+                assert!(fixture.store.declared_type_links(owner).is_none());
+                for (id, _) in fixture.parsed.arena.iter() {
+                    let node = NodeRef::new(fixture.parsed.arena.id(), fixture.file, id);
+                    assert!(fixture.store.type_node_links(node).is_none());
+                    assert!(fixture.store.symbol_node_links(node).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_source_captures_keep_interface_method_order_and_shadowed_owners() {
+        let fixture = fixture(concat!(
+            "interface Choice<T, Unused> { ",
+            "select<S extends T>(value: S): T extends string ? S : number; ",
+            "stable: string extends number ? 0 : 1; ",
+            "shadow<T>(value: T): T extends string ? 0 : 1; }",
+        ));
+        let outer = capture_parameter_symbol(&fixture, "T", SyntaxKind::InterfaceDeclaration);
+        let method = capture_parameter_symbol(&fixture, "S", SyntaxKind::MethodSignature);
+        let shadow = capture_parameter_symbol(&fixture, "T", SyntaxKind::MethodSignature);
+        assert_ne!(outer, shadow);
+        let nodes = capture_conditional_nodes(&fixture);
+        assert_eq!(nodes.len(), 3);
+        let before = store_state(&fixture.store);
+        for _ in 0..2 {
+            for (node, parameters) in
+                nodes
+                    .iter()
+                    .copied()
+                    .zip([vec![outer, method], Vec::new(), vec![shadow]])
+            {
+                assert_eq!(
+                    source_capture_plan(&fixture, node),
+                    Ok(PlannedConditionalCaptures {
+                        outer: Some(parameters),
+                        infer: Vec::new(),
+                    })
+                );
+            }
+            assert_eq!(store_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn conditional_source_captures_recheck_interface_owners_with_a_warm_declared_type() {
+        let mut fixture = fixture(concat!(
+            "interface Choice<T> { value: T extends string ? 0 : 1; } ",
+            "interface Other<T> { value: T extends string ? 0 : 1; }",
+        ));
+        let node = capture_conditional_nodes(&fixture)[0];
+        let owner = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Choice");
+        let declaration = named_node(&fixture, SyntaxKind::InterfaceDeclaration, "Choice");
+        let other = named_node(&fixture, SyntaxKind::InterfaceDeclaration, "Other");
+        let parameter = capture_parameter_symbol(&fixture, "T", SyntaxKind::InterfaceDeclaration);
+        let host = post_global_host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        fixture
+            .store
+            .get_declared_type_of_symbol(&host, owner)
+            .unwrap();
+        let expected = PlannedConditionalCaptures {
+            outer: Some(vec![parameter]),
+            infer: Vec::new(),
+        };
+        assert_eq!(source_capture_plan(&fixture, node), Ok(expected));
+        assert!(
+            fixture
+                .store
+                .set_symbol_declarations(owner, Some(vec![other]), None)
+        );
+        let damaged = store_state(&fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                source_capture_plan(&fixture, node),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(declaration)
+                ))
+            );
+            assert_eq!(store_state(&fixture.store), damaged);
+            assert!(fixture.store.type_node_links(node).is_none());
+        }
+        assert!(
+            fixture
+                .store
+                .set_symbol_declarations(owner, Some(vec![declaration]), None)
+        );
+        let restored = store_state(&fixture.store);
+        assert_eq!(
+            source_capture_plan(&fixture, node),
+            Ok(PlannedConditionalCaptures {
+                outer: Some(vec![parameter]),
+                infer: Vec::new(),
+            })
+        );
+        assert_eq!(store_state(&fixture.store), restored);
+    }
+
+    #[test]
     fn conditional_source_captures_do_not_omit_unproved_receiver_or_contextual_parameters() {
         for (source, kind) in [
             (
-                "interface Shape<T> { value: string extends number ? 0 : 1; }",
+                "interface Shape<T> { value: T extends this ? 0 : 1; }",
+                SyntaxKind::InterfaceDeclaration,
+            ),
+            (
+                "interface Shape<T> { value: string extends number ? T : this; }",
+                SyntaxKind::InterfaceDeclaration,
+            ),
+            (
+                "interface Shape<T> { method(value: T): string extends typeof value ? 0 : 1; }",
+                SyntaxKind::InterfaceDeclaration,
+            ),
+            (
+                concat!(
+                    "interface Shape<T> { value: T extends string ? 0 : 1; } ",
+                    "interface Shape<T> { other: T; }",
+                ),
                 SyntaxKind::InterfaceDeclaration,
             ),
             (
