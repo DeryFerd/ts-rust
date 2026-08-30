@@ -5900,7 +5900,7 @@ pub(super) fn prepare_source_constructor_overload_annotation(
             .expression_union_type_with_global_types(
                 global_types,
                 &constituents,
-                super::UnionReduction::Literal,
+                super::bootstrap::UnionReduction::Literal,
             )
             .map_err(|_| invariant(ClassInvariant::InvalidPropertyTypeCache(annotation)))?;
     }
