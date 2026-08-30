@@ -14834,7 +14834,7 @@ mod tests {
                 })
                 .unwrap()
         });
-        let [defaulted, _, plain] = references;
+        let [defaulted, _, nongeneric] = references;
         let Fixture {
             files,
             bound,
@@ -14846,7 +14846,7 @@ mod tests {
         let plan = plan_source_alias_body_type_import(store, &host, defaulted)
             .unwrap()
             .unwrap();
-        let plain_plan = plan_source_alias_body_type_import(store, &host, plain)
+        let plain_plan = plan_source_alias_body_type_import(store, &host, nongeneric)
             .unwrap()
             .unwrap();
         let mut session = InstantiationSession::new(InstantiationLimits::default());
@@ -14991,9 +14991,9 @@ mod tests {
             resolution.mapper,
             resolution.resolved_default_type,
         ));
-        let plain_links = store.type_node_links(plain).unwrap().clone();
+        let plain_links = store.type_node_links(nongeneric).unwrap().clone();
         assert!(store.set_type_node_links(
-            plain,
+            nongeneric,
             TypeNodeLinks {
                 resolved_type: Some(number),
                 ..plain_links.clone()
@@ -15001,13 +15001,18 @@ mod tests {
         ));
         let before = store_state(store);
         assert_eq!(
-            validate_source_type_import_reference_source(store, &host, &plain_plan.expected, plain),
+            validate_source_type_import_reference_source(
+                store,
+                &host,
+                &plain_plan.expected,
+                nongeneric
+            ),
             Err(invariant(SourceImportInvariant::InvalidTypeReferenceCache(
-                plain
+                nongeneric
             )))
         );
         assert_eq!(store_state(store), before);
-        assert!(store.set_type_node_links(plain, plain_links));
+        assert!(store.set_type_node_links(nongeneric, plain_links));
         let warm = state(store, &session);
         for _ in 0..2 {
             for (node, expected) in references.into_iter().zip(results) {
