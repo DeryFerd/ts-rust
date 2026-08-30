@@ -151,7 +151,7 @@ fn declaration(parsed: &ParseResult, file: FileId, kind: SyntaxKind, name: &str)
                 NodeData::ImportSpecifier(import) => import.name,
                 NodeData::ImportEqualsDeclaration(import) => import.name,
                 NodeData::MethodSignatureDeclaration(method) => method.name,
-                NodeData::PropertySignatureDeclaration(property) => property.name,
+                NodeData::PropertyDeclaration(property) => property.name,
                 NodeData::InterfaceDeclaration(interface) => interface.name,
                 NodeData::VariableDeclaration(variable) => variable.name,
                 _ => return None,
@@ -275,7 +275,7 @@ fn assert_cold_members(context: &CanonicalCheckerContext<'_>, parsed: &ParseResu
         declaration(
             parsed,
             DECLARATIONS,
-            SyntaxKind::PropertySignature,
+            SyntaxKind::PropertyDeclaration,
             "alternate",
         ),
     ] {

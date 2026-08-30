@@ -7884,7 +7884,7 @@ mod tests {
             );
             let imported_declaration =
                 alias_declaration_named(&importer, importer_file, "OnlyType");
-            let imported = alias(&bound_files, imported_declaration);
+            let selected_alias = alias(&bound_files, imported_declaration);
             let expected = declarations
                 .arena
                 .iter()
@@ -7907,7 +7907,7 @@ mod tests {
                     .unwrap();
             for _ in 0..2 {
                 let resolution = CanonicalAliasResolver::new(&mut store, &mut host)
-                    .resolve_alias(imported)
+                    .resolve_alias(selected_alias)
                     .unwrap();
                 assert_eq!(
                     resolution.target,
@@ -7917,12 +7917,12 @@ mod tests {
                 assert!(resolution.events.is_empty());
                 assert_eq!(
                     store
-                        .alias_symbol_links(imported)
+                        .alias_symbol_links(selected_alias)
                         .unwrap()
                         .type_only_declaration,
                     Some(imported_declaration)
                 );
-                assert!(store.value_symbol_links(imported).is_none());
+                assert!(store.value_symbol_links(selected_alias).is_none());
                 assert!(store.type_resolution_is_empty());
             }
         }
@@ -7962,12 +7962,12 @@ mod tests {
                 &[declaration_file],
             );
             let imported_declaration = alias_declaration_named(&importer, importer_file, "choose");
-            let imported = alias(&bound_files, imported_declaration);
+            let selected_alias = alias(&bound_files, imported_declaration);
             let mut host =
                 ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
                     .unwrap();
             let proof = host
-                .plan_ambient_method_import(&store, imported)
+                .plan_ambient_method_import(&store, selected_alias)
                 .unwrap()
                 .unwrap();
             let namespace_member = store
@@ -7982,21 +7982,24 @@ mod tests {
                 SymbolFlags::INTERFACE
             );
             if poison {
-                assert!(store.ensure_alias_symbol_links(imported));
+                assert!(store.ensure_alias_symbol_links(selected_alias));
                 assert!(store.set_alias_symbol_links(
-                    imported,
+                    selected_alias,
                     AliasSymbolLinks {
                         immediate_target: Some(namespace_member),
                         ..AliasSymbolLinks::default()
                     }
                 ));
             }
-            assert!(host.source_ambient_method_import(&store, imported).is_err());
+            assert!(
+                host.source_ambient_method_import(&store, selected_alias)
+                    .is_err()
+            );
             for _ in 0..2 {
                 assert_eq!(
                     unavailable_reason(
                         CanonicalAliasResolver::new(&mut store, &mut host)
-                            .resolve_alias(imported)
+                            .resolve_alias(selected_alias)
                             .unwrap_err()
                     ),
                     CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(
@@ -8004,10 +8007,13 @@ mod tests {
                     ),
                 );
                 assert_eq!(
-                    store.alias_symbol_links(imported).unwrap().alias_target,
+                    store
+                        .alias_symbol_links(selected_alias)
+                        .unwrap()
+                        .alias_target,
                     AliasTargetState::Unresolved
                 );
-                assert!(store.value_symbol_links(imported).is_none());
+                assert!(store.value_symbol_links(selected_alias).is_none());
                 assert!(store.value_symbol_links(proof.method_symbol()).is_none());
                 assert!(store.type_resolution_is_empty());
             }
