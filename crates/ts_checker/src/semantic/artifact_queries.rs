@@ -297,6 +297,14 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some((type_, _)) = self.class_heritage_artifact_target(node)? {
+            return Ok(type_);
+        }
+
+        if let Some((type_, _)) = self.class_super_artifact_target(node)? {
+            return Ok(type_);
+        }
+
         if supports_type_location(&self.validated_artifact_node(node)?.2.data)
             && let Some(type_) = self.cached_artifact_type(node)?
         {
@@ -429,6 +437,14 @@ impl CanonicalCheckerContext<'_> {
         }
 
         if let Some(symbol) = self.expando_artifact_symbol(node)? {
+            return Ok(Some(symbol));
+        }
+
+        if let Some((_, symbol)) = self.class_heritage_artifact_target(node)? {
+            return Ok(Some(symbol));
+        }
+
+        if let Some((_, symbol)) = self.class_super_artifact_target(node)? {
             return Ok(Some(symbol));
         }
 
@@ -3271,6 +3287,189 @@ impl CanonicalCheckerContext<'_> {
         Ok(Some(owner))
     }
 
+    /// A class base name denotes its instance here, even when checking the
+    /// extends expression retained the constructor value at that same node.
+    fn class_heritage_artifact_target(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<(TypeId, SemanticSymbolId)>, CanonicalArtifactQueryError> {
+        let (arena, bound, record) = self.validated_artifact_node(node)?;
+        let Some(reference) = record.parent.and_then(|parent| arena.get(parent)) else {
+            return Ok(None);
+        };
+        let NodeData::ExpressionWithTypeArguments(expression) = &reference.data else {
+            return Ok(None);
+        };
+        if expression.expression != node.node || expression.type_arguments.is_some() {
+            return Ok(None);
+        }
+        let Some(clause) = reference.parent.and_then(|parent| arena.get(parent)) else {
+            return Ok(None);
+        };
+        let NodeData::HeritageClause(heritage) = &clause.data else {
+            return Ok(None);
+        };
+        let Some(owner_id) = clause.parent else {
+            return Ok(None);
+        };
+        let Some(NodeData::ClassDeclaration(class)) = arena.get(owner_id).map(|node| &node.data)
+        else {
+            return Ok(None);
+        };
+        if heritage.token != SyntaxKind::ExtendsKeyword || class.type_parameters.is_some() {
+            return Ok(None);
+        }
+        let Some((base, symbol)) = self.heritage_artifact_target(node)? else {
+            return Ok(None);
+        };
+        let owner = NodeRef::new(node.arena, node.file, owner_id);
+        let owner_symbol = bound
+            .symbol(owner)
+            .and_then(|symbol| self.store().get_merged_symbol(symbol))
+            .ok_or(CanonicalArtifactQueryError::ForeignNode(owner))?;
+        let owner_type = super::declared::cached_class_type(self.store(), owner_symbol)?.ok_or(
+            CanonicalArtifactQueryError::MissingType {
+                node: owner,
+                kind: SyntaxKind::ClassDeclaration,
+            },
+        )?;
+        if super::classes::validate_class_heritage_members(self.store(), owner_type)
+            != super::classes::ClassHeritageMembersValidation::Valid
+        {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: owner_type,
+            });
+        }
+        let provenance = self
+            .store()
+            .direct_class_heritage_provenance(owner_type)
+            .ok_or(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: owner_type,
+            })?;
+        if provenance.owner_symbol != owner_symbol
+            || provenance.base_instance_type != base
+            || provenance.base_symbol != symbol
+        {
+            return Err(CanonicalArtifactQueryError::InvalidType { node, type_: base });
+        }
+        // The source-body producer retains the value expression. The older
+        // declaration producer retains the base type or leaves the name cold.
+        let expected_cache = if self.store().source_class_provenance(owner_type).is_some() {
+            provenance.base_value_type
+        } else {
+            base
+        };
+        if let Some(links) = self.store().type_node_links(node)
+            && *links != TypeNodeLinks::default()
+            && *links
+                != (TypeNodeLinks {
+                    resolved_type: Some(expected_cache),
+                    ..TypeNodeLinks::default()
+                })
+        {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: links.resolved_type.unwrap_or(expected_cache),
+            });
+        }
+        if let Some(cached) = self.cached_artifact_symbol(node)?
+            && cached != symbol
+        {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                node,
+                symbol: cached,
+            });
+        }
+        self.validate_artifact_type(node, base)?;
+        Ok(Some((base, symbol)))
+    }
+
+    /// Reads the existing class receiver proof. This does not check a body again
+    /// or replace its constructor or maps-this instance expression cache.
+    fn class_super_artifact_target(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<(TypeId, SemanticSymbolId)>, CanonicalArtifactQueryError> {
+        let (arena, _, record) = self.validated_artifact_node(node)?;
+        if record.kind != SyntaxKind::SuperKeyword {
+            return Ok(None);
+        }
+        let Some(type_) = self.cached_artifact_type(node)? else {
+            return Ok(None);
+        };
+        let invalid = || CanonicalArtifactQueryError::InvalidType { node, type_ };
+        let host = self.declared_type_host()?;
+        let access = super::source_properties::plan_class_access_context(self.store(), &host, node)
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+        let instance = super::declared::cached_class_type(self.store(), access.class_symbol())?
+            .ok_or_else(invalid)?;
+        if super::classes::validate_class_heritage_members(self.store(), instance)
+            != super::classes::ClassHeritageMembersValidation::Valid
+        {
+            return Err(invalid());
+        }
+        let base = self
+            .store()
+            .direct_class_heritage_provenance(instance)
+            .ok_or_else(invalid)?;
+        let parent = record
+            .parent
+            .and_then(|parent| arena.get(parent))
+            .ok_or_else(invalid)?;
+        let member = access.body_declaration();
+        let static_member = self.validated_artifact_node(member)?.2.kind
+            == SyntaxKind::ClassStaticBlockDeclaration
+            || ts_binder::canonical_has_syntactic_modifier(
+                arena,
+                member.node,
+                SyntaxKind::StaticKeyword,
+            );
+        let expected = if matches!(parent.data, NodeData::CallExpression(_)) || static_member {
+            base.base_value_type
+        } else {
+            let view = self
+                .store()
+                .class_instance_super_view_for_instance(instance)
+                .ok_or_else(invalid)?;
+            super::classes::validate_class_instance_super_view(
+                self.store(),
+                &host,
+                access.class_symbol(),
+                None,
+                view.receiver_type(),
+            )
+            .map_err(|_| invalid())?;
+            view.receiver_type()
+        };
+        if type_ != expected
+            || self.store().type_node_links(node)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(expected),
+                    ..TypeNodeLinks::default()
+                })
+            || self
+                .store()
+                .type_payload(type_)
+                .and_then(TypeRecord::symbol)
+                != Some(base.base_symbol)
+        {
+            return Err(invalid());
+        }
+        let symbol = self.merged_artifact_symbol(node, base.base_symbol)?;
+        if let Some(cached) = self.cached_artifact_symbol(node)?
+            && cached != symbol
+        {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                node,
+                symbol: cached,
+            });
+        }
+        Ok(Some((type_, symbol)))
+    }
+
     fn heritage_artifact_target(
         &self,
         node: NodeRef,
@@ -4190,6 +4389,9 @@ mod cold_merged_namespace_tests;
 
 #[cfg(test)]
 mod export_equals_final_invariant_tests;
+
+#[cfg(test)]
+mod heritage_super_query_tests;
 
 #[cfg(test)]
 #[path = "type_name_symbol_root_tests.rs"]
