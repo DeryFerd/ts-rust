@@ -45,7 +45,7 @@ use super::{
         MappedTypeError, MappedTypeModifiers, SupportedMappedAliasProjection,
         cached_source_mapped_lookup_instance, cached_supported_mapped_alias_instance,
         escaped_property_name_from_type, instantiate_source_mapped_lookup_instance,
-        instantiate_supported_mapped_alias_instance, source_mapped_lookup_projection,
+        instantiate_supported_mapped_alias_instance_with_session, source_mapped_lookup_projection,
         supported_mapped_alias_projection,
     },
     mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
@@ -4779,12 +4779,13 @@ fn instantiate_supported_mapped_alias(
         }
         (projection.identity_symbol, arguments)
     };
-    instantiate_supported_mapped_alias_instance(
+    instantiate_supported_mapped_alias_instance_with_session(
         store,
         projection,
         &arguments,
         (identity_symbol, &identity_arguments),
         array_targets,
+        session,
     )
     .map_err(|error| mapped_indexed_access_error(projection.type_, error))
 }

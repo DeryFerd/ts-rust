@@ -38,7 +38,7 @@ use super::{
     },
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession, MappedTemplateFrame,
-        cached_instantiation_with_vector, canonical_anonymous_union, instantiate_type_with_source,
+        cached_instantiation_with_vector, instantiate_type_with_source,
         instantiate_type_with_vector_and_session, instantiated_member_type_matches,
         with_mapped_template_frame,
     },
@@ -46,7 +46,8 @@ use super::{
     keyof_types::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
         plan_nongeneric_keyof_type_with_array_targets, resolve_nongeneric_keyof_type,
-        validate_generic_keyof_index_type, validate_source_object_literal_for_keyof,
+        resolve_nongeneric_keyof_type_with_session, validate_generic_keyof_index_type,
+        validate_source_object_literal_for_keyof,
     },
     links::{MappedSymbolLinks, TypeNodeLinks, ValueSymbolLinks},
     mapper::TypeMapperApplication,
@@ -343,17 +344,19 @@ impl SupportedMappedAliasKind {
         declared_type: TypeId,
         parameters: &[TypeId],
         arguments: &[TypeId],
+        session: Option<&mut InstantiationSession>,
     ) -> Result<TypeId, MappedTypeError> {
         match self {
             Self::Selection => {
                 store.instantiate_pick_mapped_alias(alias, declared_type, parameters, arguments)
             }
-            Self::Homomorphic(modifiers) => store.instantiate_homomorphic_mapped_alias(
+            Self::Homomorphic(modifiers) => store.instantiate_homomorphic_mapped_alias_worker(
                 alias,
                 declared_type,
                 parameters,
                 arguments,
                 modifiers,
+                session,
             ),
         }
     }
@@ -1618,6 +1621,42 @@ pub(super) fn instantiate_supported_mapped_alias_instance(
     identity: (SemanticSymbolId, &[TypeId]),
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<TypeId, MappedTypeError> {
+    instantiate_supported_mapped_alias_instance_worker(
+        store,
+        projection,
+        arguments,
+        identity,
+        array_targets,
+        None,
+    )
+}
+
+pub(super) fn instantiate_supported_mapped_alias_instance_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    projection: &SupportedMappedAliasProjection,
+    arguments: &[TypeId],
+    identity: (SemanticSymbolId, &[TypeId]),
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, MappedTypeError> {
+    instantiate_supported_mapped_alias_instance_worker(
+        store,
+        projection,
+        arguments,
+        identity,
+        array_targets,
+        Some(session),
+    )
+}
+
+fn instantiate_supported_mapped_alias_instance_worker(
+    store: &mut CanonicalTypeMapperStore,
+    projection: &SupportedMappedAliasProjection,
+    arguments: &[TypeId],
+    identity: (SemanticSymbolId, &[TypeId]),
+    array_targets: Option<CanonicalArrayTargets>,
+    session: Option<&mut InstantiationSession>,
+) -> Result<TypeId, MappedTypeError> {
     if let Some(cached) = cached_supported_mapped_alias_instance(
         store,
         projection,
@@ -1657,6 +1696,7 @@ pub(super) fn instantiate_supported_mapped_alias_instance(
             projection.declared_type,
             &projection.type_parameters,
             arguments,
+            session,
         )
         .map_err(|error| selection_alias_cache_error(projection.type_, error))?;
     let alias = store
@@ -3142,6 +3182,25 @@ impl CanonicalTypeMapperStore {
         type_arguments: &[TypeId],
         modifiers: MappedTypeModifiers,
     ) -> Result<TypeId, MappedTypeError> {
+        self.instantiate_homomorphic_mapped_alias_worker(
+            alias,
+            declared_type,
+            type_parameters,
+            type_arguments,
+            modifiers,
+            None,
+        )
+    }
+
+    fn instantiate_homomorphic_mapped_alias_worker(
+        &mut self,
+        alias: SemanticSymbolId,
+        declared_type: TypeId,
+        type_parameters: &[TypeId],
+        type_arguments: &[TypeId],
+        modifiers: MappedTypeModifiers,
+        session: Option<&mut InstantiationSession>,
+    ) -> Result<TypeId, MappedTypeError> {
         let shape = validate_homomorphic_mapped_alias_request(
             self,
             alias,
@@ -3161,8 +3220,11 @@ impl CanonicalTypeMapperStore {
         if !self.try_reserve_types(3) || !self.try_reserve_mappers(3) {
             return Err(MappedTypeError::Capacity);
         }
-        let constraint = resolve_nongeneric_keyof_type(self, &key_plan)
-            .map_err(|error| mapped_keyof_error(shape.source_argument, error))?;
+        let constraint = match session {
+            Some(session) => resolve_nongeneric_keyof_type_with_session(self, &key_plan, session),
+            None => resolve_nongeneric_keyof_type(self, &key_plan),
+        }
+        .map_err(|error| mapped_keyof_error(shape.source_argument, error))?;
 
         let outer_mapper = self
             .new_type_mapper(type_parameters.to_vec(), type_arguments.to_vec())
@@ -7306,7 +7368,14 @@ fn publish_mapped_members(
         }
     }
     let mut prepared = store
-        .prepare_type_query_types(&pending_strings, &[], &[], union_operations, 0)
+        .prepare_type_query_types_with_session(
+            &pending_strings,
+            &[],
+            &[],
+            union_operations,
+            0,
+            session,
+        )
         .map_err(mapped_cache_error)?;
     let mut resolved_keys = Vec::with_capacity(planned.len());
     let mut resolved_names = Vec::with_capacity(planned.len());
@@ -7706,12 +7775,19 @@ fn compute_mapped_property_type_worker(
         .ok_or(MappedTypeError::BootstrapUninitialized)?;
 
     if strict && optional && !type_contains_undefined_or_void(store, type_)? {
-        type_ = canonical_anonymous_union(store, &[type_, missing]).map_err(mapped_cache_error)?;
+        type_ = store
+            .literal_union_type_with_alias_and_array_targets_and_session(
+                &[type_, missing],
+                None,
+                None,
+                session,
+            )
+            .map_err(mapped_cache_error)?;
     } else if strip_optional {
         let sentinel = if exact { missing } else { undefined };
-        type_ = remove_type(store, type_, sentinel)?;
+        type_ = remove_type(store, type_, sentinel, session)?;
         if !exact {
-            type_ = remove_type(store, type_, void)?;
+            type_ = remove_type(store, type_, void, session)?;
         }
     }
     Ok(type_)
@@ -7917,7 +7993,13 @@ fn instantiate_mapped_template(
                 store, shape, key_type, sentinel, session,
             );
         }
-        Some(missing) => canonical_anonymous_union(store, &[shape.template_type, missing])
+        Some(missing) => store
+            .literal_union_type_with_alias_and_array_targets_and_session(
+                &[shape.template_type, missing],
+                None,
+                None,
+                session,
+            )
             .map_err(mapped_cache_error)?,
         None => shape.template_type,
     };
@@ -8043,7 +8125,14 @@ fn instantiate_direct_mapped_request_template(
             if mapped_optional_value_is_unchanged(store, value, sentinel)? {
                 return Ok(value);
             }
-            canonical_anonymous_union(store, &[value, sentinel]).map_err(mapped_cache_error)
+            store
+                .literal_union_type_with_alias_and_array_targets_and_session(
+                    &[value, sentinel],
+                    None,
+                    None,
+                    session,
+                )
+                .map_err(mapped_cache_error)
         },
     )
 }
@@ -8105,7 +8194,11 @@ fn indexed_mapped_template(
             .intrinsic_bootstrap()
             .map(|bootstrap| bootstrap.never_type)
             .ok_or(MappedTypeError::BootstrapUninitialized),
-        _ => canonical_anonymous_union(store, &values).map_err(mapped_cache_error),
+        _ => store
+            .literal_union_type_with_alias_and_array_targets_and_session(
+                &values, None, None, session,
+            )
+            .map_err(mapped_cache_error),
     }
 }
 
@@ -8193,6 +8286,7 @@ fn remove_type(
     store: &mut CanonicalTypeMapperStore,
     type_: TypeId,
     removed: TypeId,
+    session: &mut InstantiationSession,
 ) -> Result<TypeId, MappedTypeError> {
     if type_ == removed {
         return store
@@ -8219,7 +8313,11 @@ fn remove_type(
             .intrinsic_bootstrap()
             .map(|bootstrap| bootstrap.never_type)
             .ok_or(MappedTypeError::BootstrapUninitialized),
-        _ => canonical_anonymous_union(store, &retained).map_err(mapped_cache_error),
+        _ => store
+            .literal_union_type_with_alias_and_array_targets_and_session(
+                &retained, None, None, session,
+            )
+            .map_err(mapped_cache_error),
     }
 }
 
@@ -8322,23 +8420,39 @@ mod tests {
     };
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
-        CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, IntrinsicBootstrapOptions,
-        TypeData, TypeId,
+        CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
+        IntrinsicBootstrapOptions, TypeData, TypeId, TypeMapperId,
+        array_types::CanonicalArrayTargets,
+        bootstrap::UnionReduction,
+        callable_sets::{
+            StoredCallableSetValidation, validate_stored_callable_set_with_array_targets,
+        },
+        calls::DirectCallForm,
         conditional_types::{ConditionalTypeBranches, get_false_type_from_conditional_type},
         constraints::get_base_constraint_of_type,
         declared::{execute_type_parameter, type_list_key},
+        generic_calls::{
+            GenericCallVectorError, GenericCallVectorRequest,
+            demand_generic_call_vector_selected_return,
+        },
+        generic_method_calls::{GenericMethodCallSelection, resolve_generic_method_call},
         instantiate::{
             InstantiationError, InstantiationLimits, InstantiationSession,
-            cached_instantiation_with_vector, instantiate_type_with_vector_and_session,
+            cached_instantiation_with_vector, instantiate_type_with_session,
+            instantiate_type_with_vector_and_session,
         },
+        instantiated_members::validate_generic_interface_members,
         keyof_types::{
             NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
             resolve_nongeneric_keyof_type,
         },
-        links::TypeAliasLinks,
+        links::{TypeAliasLinks, ValueSymbolLinks},
         object_members,
         production::GlobalMergeCompletion,
         signatures::IndexFlags,
+        structured_members::{
+            InterfaceHeritageMembersValidation, validate_interface_heritage_members,
+        },
         type_nodes::{CanonicalTypeQuery, TypeNodeUnavailable, type_alias_instantiation_cache_key},
         type_records::{ConditionalTypeData, LiteralValue, StructuredTypeData, TypeCacheState},
         types::{AccessFlags, ObjectFlags},
@@ -8445,6 +8559,1031 @@ mod tests {
             bootstrap.union_cache_len(),
             store.checker_link_allocated_lengths(),
         )
+    }
+
+    const MAPPED_SESSION_LIBRARY: &str = concat!(
+        "interface Array<T> {} interface ReadonlyArray<T> {} ",
+        "interface Base<T> { value: T; [index: number]: number; }",
+    );
+
+    fn mapped_session_context<'arena>(
+        library: &'arena ParseResult,
+        parsed: &'arena ParseResult,
+    ) -> CanonicalCheckerContext<'arena> {
+        let mut binder = CanonicalBinder::new();
+        for (file, source, declaration, path) in [
+            (
+                FileId::new(1),
+                library,
+                true,
+                "\"/project/mapped-session-library.d.ts\"",
+            ),
+            (
+                FileId::new(0),
+                parsed,
+                false,
+                "\"/project/mapped-session.ts\"",
+            ),
+        ] {
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (FileId::new(1), &library.arena),
+                (FileId::new(0), &parsed.arena),
+            ],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn mapped_session_interface(store: &CanonicalTypeMapperStore, name: &str) -> TypeId {
+        let owner = store
+            .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+            .and_then(|globals| globals.get_source(name))
+            .and_then(|owner| store.get_merged_symbol(owner))
+            .unwrap();
+        store
+            .declared_type_links(owner)
+            .unwrap()
+            .declared_type
+            .unwrap()
+    }
+
+    fn mapped_session_counts(store: &CanonicalTypeMapperStore) -> ([usize; 12], [usize; 26]) {
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        (
+            [
+                store.type_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.signature_len(),
+                store.index_info_len(),
+                store.type_alias_len(),
+                store.conditional_root_len(),
+                bootstrap.union_cache_len(),
+                bootstrap.union_of_union_cache_len(),
+                store.properties_type_cache_len(),
+                store.cached_signature_len(),
+            ],
+            store.checker_link_allocated_lengths(),
+        )
+    }
+
+    struct MappedSessionProxy {
+        symbol: SemanticSymbolId,
+        mapper: TypeMapperId,
+        template: TypeId,
+        value: TypeId,
+        rejected_source: TypeId,
+        union_result: TypeId,
+    }
+
+    fn prepare_dirty_mapped_session_cache(
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+    ) -> MappedSessionProxy {
+        let derived = mapped_session_interface(store, "Derived");
+        let plain = mapped_session_interface(store, "Plain");
+        let TypeData::Interface(data) = store.type_payload(derived).unwrap().data() else {
+            panic!("Derived must retain its real inherited interface")
+        };
+        let base = data.resolved_base_types.as_ref().unwrap()[0];
+        let proxy = store
+            .symbol_table(data.reference.object.structured.members.unwrap())
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        assert!(store.instantiated_property_recovery(proxy).is_none());
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let mut setup = InstantiationSession::new(InstantiationLimits::default());
+        let source_union = store
+            .expression_union_type_with_global_types_and_session(
+                globals,
+                &[number, derived],
+                UnionReduction::Literal,
+                &mut setup,
+            )
+            .unwrap();
+        let rows = store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .union_of_union_cache_len();
+        let union_result = store
+            .expression_union_type_with_global_types_and_session(
+                globals,
+                &[source_union, plain],
+                UnionReduction::Subtype,
+                &mut setup,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .union_of_union_cache_len(),
+            rows + 1
+        );
+        let original = store.value_symbol_links(proxy).unwrap().clone();
+        assert_eq!(original.resolved_type, Some(number));
+        assert!(store.instantiated_property_recovery(proxy).is_none());
+        let mapper = original.mapper.unwrap();
+        let template = store
+            .value_symbol_links(original.target.unwrap())
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert!(matches!(
+            store.type_payload(template).unwrap().data(),
+            TypeData::TypeParameter(_)
+        ));
+        // Reopen only the real proxy's lazy value before the query. Its source,
+        // target, mapper, and all other links stay unchanged. No recovery exists.
+        let cold = ValueSymbolLinks {
+            resolved_type: None,
+            ..original
+        };
+        assert!(store.set_value_symbol_links(proxy, cold.clone()));
+        store.mark_union_cache_validation_dirty();
+        assert_eq!(store.value_symbol_links(proxy), Some(&cold));
+        assert_eq!(
+            validate_interface_heritage_members(store, derived),
+            InterfaceHeritageMembersValidation::Valid
+        );
+        assert!(
+            validate_generic_interface_members(store, base, None)
+                .unwrap()
+                .is_some()
+        );
+        MappedSessionProxy {
+            symbol: proxy,
+            mapper,
+            template,
+            value: number,
+            rejected_source: derived.max(plain),
+            union_result,
+        }
+    }
+
+    fn spent_mapped_session(
+        store: &mut CanonicalTypeMapperStore,
+        proxy: &MappedSessionProxy,
+        max_count: usize,
+    ) -> InstantiationSession {
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_count,
+            ..InstantiationLimits::default()
+        });
+        assert_eq!(
+            instantiate_type_with_session(store, proxy.template, proxy.mapper, None, &mut session),
+            Ok(proxy.value)
+        );
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        assert_eq!(session.limit_event_count(), 0);
+        assert_eq!(
+            store
+                .value_symbol_links(proxy.symbol)
+                .unwrap()
+                .resolved_type,
+            None
+        );
+        session
+    }
+
+    fn assert_mapped_alias_selected_return_preparation(
+        recovering_limit: bool,
+        recovering_replay: bool,
+    ) {
+        let library = parse_source_file(MAPPED_SESSION_LIBRARY);
+        let parsed = parse_source_file(concat!(
+            "interface Derived extends Base<number> {} ",
+            "interface Plain { value: number; } ",
+            "interface Payload { firstKey: number; secondKey: string; } ",
+            "type Copy<T> = { [K in keyof T]: T[K] }; ",
+            "interface Api { map<T>(value: T): Copy<T>; map(a: number, b: number): number; }",
+        ));
+        let mut context = mapped_session_context(&library, &parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), FileId::new(0), node),
+                    NodeRef::new(parsed.arena.id(), FileId::new(0), method.name),
+                ))
+            })
+            .unwrap();
+        let callee = context.get_type_at_location(name).unwrap();
+        let globals = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        let StoredCallableSetValidation::Valid {
+            projection: group, ..
+        } = validate_stored_callable_set_with_array_targets(context.store(), callee, Some(targets))
+        else {
+            panic!("the source method must retain its two real signatures")
+        };
+        assert_eq!(group.call_signatures.len(), 2);
+        let original = group.call_signatures[0].signature;
+        let original_signature = context.store().signature(original).unwrap();
+        assert_eq!(original_signature.declaration(), Some(declaration));
+        let template = original_signature.resolved_return_type().unwrap();
+        let projection =
+            supported_mapped_alias_projection(context.store(), template, Some(targets))
+                .unwrap()
+                .unwrap();
+        assert_eq!(projection.arguments, original_signature.type_parameters());
+        assert_eq!(
+            projection.kind,
+            SupportedMappedAliasKind::Homomorphic(MappedTypeModifiers::NONE)
+        );
+        let payload = mapped_session_interface(context.store(), "Payload");
+        let store = context.store_mut_for_test();
+        let key_plan = plan_nongeneric_keyof_type(store, payload).unwrap();
+        assert_eq!(cached_nongeneric_keyof_type(store, &key_plan), Ok(None));
+        let proxy = prepare_dirty_mapped_session_cache(store, &globals);
+        let arguments = [payload];
+        let request = GenericCallVectorRequest {
+            form: DirectCallForm::Call,
+            optional_chain: false,
+            explicit_type_arguments: Some(&arguments),
+            has_spread_argument: false,
+            callee,
+            arguments: &arguments,
+        };
+        let limits = InstantiationLimits {
+            max_count: 3,
+            ..InstantiationLimits::default()
+        };
+        let error = store.intrinsic_bootstrap().unwrap().error_type;
+        let mut limited = if recovering_limit {
+            InstantiationSession::new_recovering(store, limits, error).unwrap()
+        } else {
+            InstantiationSession::new(limits)
+        };
+        let selected =
+            resolve_generic_method_call(store, &globals, false, request, None, &mut limited)
+                .unwrap()
+                .unwrap();
+        assert_eq!(selected.diagnostic, None);
+        let GenericMethodCallSelection::Generic(generic) = &selected.selected else {
+            panic!("the one-argument call must select its generic method")
+        };
+        let signature = generic.projection().instantiation.signature;
+        assert_eq!(generic.projection().generic_signature, original);
+        assert_eq!(generic.projection().instantiation.type_arguments, arguments);
+        assert_eq!((limited.query_count(), limited.total_count()), (1, 1));
+        assert_eq!(
+            store.signature(signature).unwrap().resolved_return_type(),
+            None
+        );
+        let alias_links = store.type_alias_links(projection.alias).unwrap().clone();
+        let before = mapped_session_counts(store);
+        let scans = store.union_cache_validation_scan_count();
+        assert_eq!(
+            demand_generic_call_vector_selected_return(store, generic, &mut limited),
+            Err(GenericCallVectorError::Instantiation(
+                InstantiationError::InvalidType(template)
+            ))
+        );
+        assert_eq!(
+            (
+                limited.query_count(),
+                limited.total_count(),
+                limited.limit_event_count()
+            ),
+            (3, 3, 1)
+        );
+        assert_eq!(store.union_cache_validation_scan_count(), scans + 1);
+        assert_eq!(
+            store
+                .value_symbol_links(proxy.symbol)
+                .unwrap()
+                .resolved_type,
+            recovering_limit.then_some(error)
+        );
+        if recovering_limit {
+            assert!(
+                store
+                    .instantiated_property_recovery(proxy.symbol)
+                    .unwrap()
+                    .matches_published_links(store.value_symbol_links(proxy.symbol))
+            );
+        } else {
+            assert!(store.instantiated_property_recovery(proxy.symbol).is_none());
+        }
+        assert_eq!(
+            store.signature(signature).unwrap().resolved_return_type(),
+            None
+        );
+        assert_eq!(store.type_alias_links(projection.alias), Some(&alias_links));
+        assert_eq!(cached_nongeneric_keyof_type(store, &key_plan), Ok(None));
+        assert_eq!(mapped_session_counts(store), before);
+        assert!(store.type_resolution_is_empty());
+        let retry = demand_generic_call_vector_selected_return(store, generic, &mut limited)
+            .map(|(type_, _)| type_);
+        if recovering_limit {
+            assert_eq!(retry, Ok(error));
+        } else {
+            assert_eq!(
+                retry,
+                Err(GenericCallVectorError::Instantiation(
+                    InstantiationError::CountLimit { count: 3, limit: 3 }
+                ))
+            );
+        }
+        assert_eq!(
+            (
+                limited.query_count(),
+                limited.total_count(),
+                limited.limit_event_count()
+            ),
+            (3, 3, 2)
+        );
+        assert_eq!(mapped_session_counts(store), before);
+        assert_eq!(
+            store.signature(signature).unwrap().resolved_return_type(),
+            None
+        );
+        assert_eq!(store.type_alias_links(projection.alias), Some(&alias_links));
+        assert_eq!(cached_nongeneric_keyof_type(store, &key_plan), Ok(None));
+        if recovering_limit {
+            let mut fresh = InstantiationSession::new(InstantiationLimits::default());
+            // Keep the actual recovery receipt. It must not validate the old
+            // subtype result or become an ordinary mapped alias instance.
+            assert_eq!(
+                super::instantiate_supported_mapped_alias_instance_with_session(
+                    store,
+                    &projection,
+                    &arguments,
+                    (projection.alias, &arguments),
+                    Some(targets),
+                    &mut fresh,
+                ),
+                Err(MappedTypeError::InvalidMappedType(proxy.union_result))
+            );
+            assert_eq!(
+                (
+                    fresh.query_count(),
+                    fresh.total_count(),
+                    fresh.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+            assert_eq!(
+                store
+                    .value_symbol_links(proxy.symbol)
+                    .unwrap()
+                    .resolved_type,
+                Some(error)
+            );
+            assert!(
+                store
+                    .instantiated_property_recovery(proxy.symbol)
+                    .unwrap()
+                    .matches_published_links(store.value_symbol_links(proxy.symbol))
+            );
+            assert_eq!(store.type_alias_links(projection.alias), Some(&alias_links));
+            assert_eq!(
+                store.signature(signature).unwrap().resolved_return_type(),
+                None
+            );
+            assert_eq!(cached_nongeneric_keyof_type(store, &key_plan), Ok(None));
+            assert_eq!(mapped_session_counts(store), before);
+            assert!(store.type_resolution_is_empty());
+            assert!(context.diagnostics().is_empty());
+            return;
+        }
+        let mut adequate = if recovering_replay {
+            InstantiationSession::new_recovering(store, InstantiationLimits::default(), error)
+                .unwrap()
+        } else {
+            InstantiationSession::new(InstantiationLimits::default())
+        };
+        let result = demand_generic_call_vector_selected_return(store, generic, &mut adequate)
+            .unwrap()
+            .0;
+        let actual = supported_mapped_alias_projection(store, result, Some(targets))
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.alias, projection.alias);
+        assert_eq!(actual.declared_type, projection.declared_type);
+        assert_eq!(actual.arguments, arguments);
+        assert_eq!(actual.identity_arguments, arguments);
+        assert_eq!(actual.identity_symbol, projection.alias);
+        let TypeData::Mapped(mapped) = store.type_payload(result).unwrap().data() else {
+            unreachable!()
+        };
+        assert_eq!(
+            mapped.constraint_type,
+            cached_nongeneric_keyof_type(store, &key_plan).unwrap()
+        );
+        assert_eq!(mapped.modifiers_type, Some(payload));
+        assert_eq!(
+            store.signature(signature).unwrap().resolved_return_type(),
+            Some(result)
+        );
+        assert_eq!(
+            store.signature(original).unwrap().resolved_return_type(),
+            Some(template)
+        );
+        assert_eq!(
+            store
+                .value_symbol_links(proxy.symbol)
+                .unwrap()
+                .resolved_type,
+            Some(proxy.value)
+        );
+        assert!(adequate.total_count() >= 3);
+        assert_eq!(adequate.limit_event_count(), 0);
+        let warm = mapped_session_counts(store);
+        let count = adequate.total_count();
+        for _ in 0..2 {
+            assert_eq!(
+                resolve_generic_method_call(
+                    store,
+                    &globals,
+                    false,
+                    request,
+                    Some(signature),
+                    &mut adequate
+                ),
+                Ok(Some(selected.clone()))
+            );
+            assert_eq!(
+                demand_generic_call_vector_selected_return(store, generic, &mut adequate)
+                    .unwrap()
+                    .0,
+                result
+            );
+            assert_eq!(
+                super::instantiate_supported_mapped_alias_instance_with_session(
+                    store,
+                    &projection,
+                    &arguments,
+                    (projection.alias, &arguments),
+                    Some(targets),
+                    &mut limited,
+                ),
+                Ok(result)
+            );
+            assert_eq!(adequate.total_count(), count);
+            assert_eq!(adequate.limit_event_count(), 0);
+            assert_eq!(
+                (
+                    limited.query_count(),
+                    limited.total_count(),
+                    limited.limit_event_count()
+                ),
+                (3, 3, 2)
+            );
+            assert_eq!(mapped_session_counts(store), warm);
+            assert!(store.type_resolution_is_empty());
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn mapped_alias_selected_return_preparation_keeps_the_callers_spent_budget() {
+        for recovering_replay in [false, true] {
+            assert_mapped_alias_selected_return_preparation(false, recovering_replay);
+        }
+    }
+
+    #[test]
+    fn mapped_alias_return_recovery_keeps_the_real_dirty_cache_error_and_receipt() {
+        assert_mapped_alias_selected_return_preparation(true, false);
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum MappedValueUnionCase {
+        ExplicitOptional,
+        WrappedValue,
+        StripOptional,
+    }
+
+    fn assert_mapped_value_union_preparation(case: MappedValueUnionCase) {
+        let library = parse_source_file(MAPPED_SESSION_LIBRARY);
+        let declarations = match case {
+            MappedValueUnionCase::ExplicitOptional => concat!(
+                "interface Shape { item: number; } ",
+                "type Soft<T> = { [K in keyof T]?: T[K] }; ",
+                "declare const mapped: Soft<Shape>;",
+            ),
+            MappedValueUnionCase::WrappedValue => concat!(
+                "type DeclaredValue = number | undefined; ",
+                "interface Wrapper<T> { value: T; } ",
+                "interface Shape { item?: DeclaredValue; } ",
+                "type Cells<T> = { [K in keyof T]: Wrapper<T[K]> }; ",
+                "declare const mapped: Cells<Shape>;",
+            ),
+            MappedValueUnionCase::StripOptional => concat!(
+                "interface Shape { item?: number | string | void; } ",
+                "type Force<T> = { [K in keyof T]-?: T[K] }; ",
+                "declare const mapped: Force<Shape>;",
+            ),
+        };
+        let parsed = parse_source_file(&format!(
+            "interface Derived extends Base<number> {{}} \
+             interface Plain {{ value: number; }} {declarations}"
+        ));
+        for recovering_replay in [false, true] {
+            let mut context = mapped_session_context(&library, &parsed);
+            context.check_source_file(FileId::new(0)).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let annotation = parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    variable
+                        .type_
+                        .map(|node| NodeRef::new(parsed.arena.id(), FileId::new(0), node))
+                })
+                .unwrap();
+            let mapped = context.get_type_from_type_node(annotation).unwrap();
+            let source_property = source_property(&parsed, &context, "item");
+            let globals = context.global_types().clone();
+            let store = context.store_mut_for_test();
+            let source_links = store.value_symbol_links(source_property).unwrap().clone();
+            let source_value = source_links.resolved_type.unwrap();
+            if case == MappedValueUnionCase::WrappedValue {
+                let record = store.type_payload(source_value).unwrap();
+                let TypeData::Union(union) = record.data() else {
+                    panic!("the written annotation must retain its named union")
+                };
+                assert!(record.alias().is_some());
+                assert_eq!(
+                    union.union.types.first(),
+                    Some(&store.intrinsic_bootstrap().unwrap().undefined_type)
+                );
+            }
+            if case == MappedValueUnionCase::StripOptional {
+                let TypeData::Union(union) = store.type_payload(source_value).unwrap().data()
+                else {
+                    panic!("the source annotation must retain both values and void")
+                };
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                assert_eq!(union.union.types.len(), 3);
+                assert!(union.union.types.contains(&bootstrap.number_type));
+                assert!(union.union.types.contains(&bootstrap.string_type));
+                assert!(union.union.types.contains(&bootstrap.void_type));
+                assert!(!union.union.types.contains(&bootstrap.undefined_type));
+            }
+            let mut setup = InstantiationSession::new(InstantiationLimits::default());
+            let members = store
+                .resolve_mapped_type_members_with_session(
+                    mapped,
+                    MappedTypeModifiers::NONE,
+                    &mut setup,
+                )
+                .unwrap();
+            let [property] = members.properties() else {
+                panic!("the source mapped alias must retain one property")
+            };
+            let property = *property;
+            assert_eq!(
+                store.value_symbol_links(property).unwrap().resolved_type,
+                None
+            );
+            assert_eq!(
+                store
+                    .mapped_symbol_links(property)
+                    .unwrap()
+                    .synthetic_origin,
+                Some(source_property)
+            );
+            let shape = super::validate_mapped_shape(store, mapped).unwrap();
+            let key = store
+                .mapped_symbol_links(property)
+                .unwrap()
+                .key_type
+                .unwrap();
+            let (sources, targets) = super::mapped_template_mapping(&shape, key);
+            let proxy = prepare_dirty_mapped_session_cache(store, &globals);
+            let limit = if case == MappedValueUnionCase::WrappedValue {
+                5
+            } else {
+                1
+            };
+            let mut limited = spent_mapped_session(store, &proxy, limit);
+            let before = mapped_session_counts(store);
+            let scans = store.union_cache_validation_scan_count();
+            assert_eq!(
+                store.resolve_mapped_symbol_type_with_session(property, &mut limited),
+                Err(MappedTypeError::InvalidMappedType(proxy.rejected_source))
+            );
+            assert_eq!(
+                (
+                    limited.query_count(),
+                    limited.total_count(),
+                    limited.limit_event_count()
+                ),
+                (limit, limit, 1)
+            );
+            assert_eq!(store.union_cache_validation_scan_count(), scans + 1);
+            assert_eq!(
+                store.value_symbol_links(property).unwrap().resolved_type,
+                None
+            );
+            assert!(store.mapped_property_recovery(property).is_none());
+            assert_eq!(
+                store
+                    .value_symbol_links(proxy.symbol)
+                    .unwrap()
+                    .resolved_type,
+                None
+            );
+            assert!(store.instantiated_property_recovery(proxy.symbol).is_none());
+            assert_eq!(
+                store.value_symbol_links(source_property),
+                Some(&source_links)
+            );
+            assert!(store.type_resolution_is_empty());
+            if case == MappedValueUnionCase::WrappedValue {
+                // Wrapper mapping precedes optionality. Its complete reference
+                // may remain cached, but the mapped property must stay cold.
+                let wrapper = cached_instantiation_with_vector(
+                    store,
+                    shape.template_type,
+                    &sources,
+                    &targets,
+                    None,
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+                let TypeData::TypeReference(reference) =
+                    store.type_payload(wrapper).unwrap().data()
+                else {
+                    panic!("the completed inner mapping must retain its Wrapper reference")
+                };
+                assert_eq!(
+                    reference.resolved_type_arguments.as_deref(),
+                    Some(&[source_value][..])
+                );
+                assert_eq!(store.validate_union_constituent(wrapper), Ok(()));
+            } else {
+                assert_eq!(mapped_session_counts(store), before);
+            }
+            let failed = mapped_session_counts(store);
+            let retry_error = if case == MappedValueUnionCase::WrappedValue {
+                MappedTypeError::InstantiationCountLimit {
+                    count: limit,
+                    limit,
+                }
+            } else {
+                MappedTypeError::InvalidMappedType(proxy.rejected_source)
+            };
+            assert_eq!(
+                store.resolve_mapped_symbol_type_with_session(property, &mut limited),
+                Err(retry_error)
+            );
+            assert_eq!(
+                (
+                    limited.query_count(),
+                    limited.total_count(),
+                    limited.limit_event_count()
+                ),
+                (limit, limit, 2)
+            );
+            assert_eq!(mapped_session_counts(store), failed);
+            assert_eq!(
+                store.value_symbol_links(property).unwrap().resolved_type,
+                None
+            );
+            assert_eq!(
+                store
+                    .value_symbol_links(proxy.symbol)
+                    .unwrap()
+                    .resolved_type,
+                None
+            );
+            assert!(store.type_resolution_is_empty());
+            let error = store.intrinsic_bootstrap().unwrap().error_type;
+            let mut adequate = if recovering_replay {
+                InstantiationSession::new_recovering(store, InstantiationLimits::default(), error)
+                    .unwrap()
+            } else {
+                InstantiationSession::new(InstantiationLimits::default())
+            };
+            let result = store
+                .resolve_mapped_symbol_type_with_session(property, &mut adequate)
+                .unwrap();
+            assert!(adequate.total_count() > 0);
+            assert_eq!(adequate.limit_event_count(), 0);
+            assert_eq!(
+                store
+                    .value_symbol_links(proxy.symbol)
+                    .unwrap()
+                    .resolved_type,
+                Some(proxy.value)
+            );
+            assert!(store.instantiated_property_recovery(proxy.symbol).is_none());
+            assert!(store.mapped_property_recovery(property).is_none());
+            let TypeData::Union(union) = store.type_payload(result).unwrap().data() else {
+                panic!("the requested mapped value must retain two constituents")
+            };
+            assert_eq!(union.union.types.len(), 2);
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            match case {
+                MappedValueUnionCase::ExplicitOptional => {
+                    assert!(union.union.types.contains(&bootstrap.number_type));
+                    assert!(union.union.types.contains(&bootstrap.undefined_type));
+                }
+                MappedValueUnionCase::WrappedValue => {
+                    assert!(union.union.types.contains(&bootstrap.undefined_type));
+                    let wrapper = cached_instantiation_with_vector(
+                        store,
+                        shape.template_type,
+                        &sources,
+                        &targets,
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert!(union.union.types.contains(&wrapper));
+                }
+                MappedValueUnionCase::StripOptional => {
+                    assert!(union.union.types.contains(&bootstrap.number_type));
+                    assert!(union.union.types.contains(&bootstrap.string_type));
+                    assert!(!union.union.types.contains(&bootstrap.void_type));
+                }
+            }
+            assert_eq!(
+                store.value_symbol_links(source_property),
+                Some(&source_links)
+            );
+            let warm = mapped_session_counts(store);
+            let count = adequate.total_count();
+            for _ in 0..2 {
+                assert_eq!(
+                    store.resolve_mapped_symbol_type_with_session(property, &mut limited),
+                    Ok(result)
+                );
+                assert_eq!(
+                    store.resolve_mapped_type_members_with_session(
+                        mapped,
+                        MappedTypeModifiers::NONE,
+                        &mut adequate
+                    ),
+                    Ok(members.clone())
+                );
+                assert_eq!(
+                    (
+                        limited.query_count(),
+                        limited.total_count(),
+                        limited.limit_event_count()
+                    ),
+                    (limit, limit, 2)
+                );
+                assert_eq!(adequate.total_count(), count);
+                assert_eq!(adequate.limit_event_count(), 0);
+                assert_eq!(mapped_session_counts(store), warm);
+                assert!(store.type_resolution_is_empty());
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn mapped_explicit_optional_template_union_keeps_the_callers_spent_budget() {
+        assert_mapped_value_union_preparation(MappedValueUnionCase::ExplicitOptional);
+    }
+
+    #[test]
+    fn mapped_wrapper_optional_union_keeps_the_callers_spent_budget() {
+        assert_mapped_value_union_preparation(MappedValueUnionCase::WrappedValue);
+    }
+
+    #[test]
+    fn mapped_optional_removal_union_keeps_the_callers_spent_budget() {
+        assert_mapped_value_union_preparation(MappedValueUnionCase::StripOptional);
+    }
+
+    fn assert_mapped_remap_preparation_uses_caller(value_demand: bool) {
+        let library = parse_source_file(MAPPED_SESSION_LIBRARY);
+        let parsed = parse_source_file(concat!(
+            "interface Derived extends Base<number> {} ",
+            "interface Plain { value: number; } ",
+            "interface Shape { first: number; second: string; } ",
+            "type Merged = { [K in keyof Shape as 'both']: Shape[K] };",
+        ));
+        let mut context = mapped_session_context(&library, &parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let mapped = alias_type(&parsed, &context, "Merged");
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        let record = store.type_payload(mapped).unwrap();
+        let TypeData::Mapped(data) = record.data() else {
+            unreachable!()
+        };
+        assert_eq!(data.object.structured.members, None);
+        assert!(
+            !record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        let mut setup = InstantiationSession::new(InstantiationLimits::default());
+        let property = value_demand.then(|| {
+            let members = store
+                .resolve_mapped_type_members_with_session(
+                    mapped,
+                    MappedTypeModifiers::NONE,
+                    &mut setup,
+                )
+                .unwrap();
+            let [property] = members.properties() else {
+                panic!("the two source keys must merge into one mapped property")
+            };
+            assert_eq!(
+                store.value_symbol_links(*property).unwrap().resolved_type,
+                None
+            );
+            *property
+        });
+        let proxy = prepare_dirty_mapped_session_cache(store, &globals);
+        let mut limited = spent_mapped_session(store, &proxy, 1);
+        let before = mapped_session_counts(store);
+        let scans = store.union_cache_validation_scan_count();
+        for event in 1..=2 {
+            let result = if let Some(property) = property {
+                store
+                    .resolve_mapped_symbol_type_with_session(property, &mut limited)
+                    .map(|_| ())
+            } else {
+                store
+                    .resolve_mapped_type_members_with_session(
+                        mapped,
+                        MappedTypeModifiers::NONE,
+                        &mut limited,
+                    )
+                    .map(|_| ())
+            };
+            assert_eq!(
+                result,
+                Err(MappedTypeError::InvalidMappedType(proxy.rejected_source))
+            );
+            assert_eq!(
+                (
+                    limited.query_count(),
+                    limited.total_count(),
+                    limited.limit_event_count()
+                ),
+                (1, 1, event)
+            );
+            assert_eq!(
+                store.union_cache_validation_scan_count(),
+                scans + usize::try_from(event).unwrap()
+            );
+            assert_eq!(
+                store
+                    .value_symbol_links(proxy.symbol)
+                    .unwrap()
+                    .resolved_type,
+                None
+            );
+            assert!(store.instantiated_property_recovery(proxy.symbol).is_none());
+            if let Some(property) = property {
+                assert_eq!(
+                    store.value_symbol_links(property).unwrap().resolved_type,
+                    None
+                );
+                assert!(store.mapped_property_recovery(property).is_none());
+            } else {
+                let TypeData::Mapped(data) = store.type_payload(mapped).unwrap().data() else {
+                    unreachable!()
+                };
+                assert_eq!(data.object.structured.members, None);
+            }
+            assert_eq!(mapped_session_counts(store), before);
+            assert!(store.type_resolution_is_empty());
+        }
+        let mut adequate = InstantiationSession::new(InstantiationLimits::default());
+        let members = store
+            .resolve_mapped_type_members_with_session(
+                mapped,
+                MappedTypeModifiers::NONE,
+                &mut adequate,
+            )
+            .unwrap();
+        let [actual_property] = members.properties() else {
+            panic!("the merged source keys must keep one property")
+        };
+        let actual_property = *actual_property;
+        assert!(property.is_none_or(|property| property == actual_property));
+        assert_eq!(
+            store.symbol(actual_property).unwrap().name().as_utf8(),
+            Some("both")
+        );
+        let key = store
+            .mapped_symbol_links(actual_property)
+            .unwrap()
+            .key_type
+            .unwrap();
+        let TypeData::Union(keys) = store.type_payload(key).unwrap().data() else {
+            panic!("both original keys must remain in the mapped key union")
+        };
+        assert_eq!(keys.union.types.len(), 2);
+        for expected in ["first", "second"] {
+            assert!(
+                keys.union.types.contains(
+                    &store
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .cached_string_literal_type(expected)
+                        .unwrap()
+                )
+            );
+        }
+        let value = store
+            .resolve_mapped_symbol_type_with_session(actual_property, &mut adequate)
+            .unwrap();
+        let TypeData::Union(values) = store.type_payload(value).unwrap().data() else {
+            panic!("the merged property must keep both source value types")
+        };
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        assert_eq!(values.union.types.len(), 2);
+        assert!(values.union.types.contains(&bootstrap.number_type));
+        assert!(values.union.types.contains(&bootstrap.string_type));
+        assert!(adequate.total_count() > 0);
+        assert_eq!(adequate.limit_event_count(), 0);
+        assert_eq!(
+            store
+                .value_symbol_links(proxy.symbol)
+                .unwrap()
+                .resolved_type,
+            Some(proxy.value)
+        );
+        let warm = mapped_session_counts(store);
+        let count = adequate.total_count();
+        for _ in 0..2 {
+            assert_eq!(
+                store.resolve_mapped_type_members_with_session(
+                    mapped,
+                    MappedTypeModifiers::NONE,
+                    &mut limited
+                ),
+                Ok(members.clone())
+            );
+            assert_eq!(
+                store.resolve_mapped_symbol_type_with_session(actual_property, &mut limited),
+                Ok(value)
+            );
+            assert_eq!(
+                (
+                    limited.query_count(),
+                    limited.total_count(),
+                    limited.limit_event_count()
+                ),
+                (1, 1, 2)
+            );
+            assert_eq!(adequate.total_count(), count);
+            assert_eq!(mapped_session_counts(store), warm);
+            assert!(store.type_resolution_is_empty());
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn mapped_remapped_key_unions_keep_the_callers_spent_budget() {
+        assert_mapped_remap_preparation_uses_caller(false);
+    }
+
+    #[test]
+    fn mapped_merged_value_unions_keep_the_callers_spent_budget() {
+        assert_mapped_remap_preparation_uses_caller(true);
     }
 
     fn selection_call_fixture(
