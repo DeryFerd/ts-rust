@@ -540,8 +540,8 @@ pub(super) fn cached_source_object_union_display_types(
     if planner.cached_type_node_identity(owner, annotation)? != expected {
         return Err(invalid());
     }
-    let planned = planner.plan.unions.get(&annotation).ok_or_else(invalid)?;
-    let types = planned
+    let union = planner.plan.unions.get(&annotation).ok_or_else(invalid)?;
+    let types = union
         .types
         .iter()
         .map(|child| planner.cached_type_node_identity(owner, *child))
