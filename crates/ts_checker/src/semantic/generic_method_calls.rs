@@ -1,4 +1,4 @@
-//! Overload selection for published, uninstantiated method signatures.
+//! Overload selection for published method and source function signatures.
 //!
 //! The ordinary and generic call engines check each real candidate. This module
 //! owns declaration-group order, the two relation passes, and failure selection.
@@ -9,7 +9,7 @@ use super::{
     SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
-    callables::ValidatedSingleCallable,
+    callables::{CallableFamily, ValidatedSingleCallable},
     calls::{
         DirectCallApplicability, DirectCallError, DirectCallForm, DirectCallRequest,
         DirectCallResolution, DirectCallUnsupported, check_argument_applicability,
@@ -129,7 +129,7 @@ impl CheckedMethodCandidate {
     }
 }
 
-/// The default cache has already been authenticated by the method provider.
+/// The callable provider has already authenticated each default cache.
 fn type_argument_bounds(
     store: &CanonicalTypeMapperStore,
     callable: &ValidatedSingleCallable,
@@ -321,18 +321,19 @@ pub(super) fn resolve_generic_method_call(
     let Some(signatures) = structured.signatures.as_deref() else {
         return Ok(None);
     };
+    let declared_methods = signatures.iter().all(|signature| {
+        store
+            .interface_method_linked_type(*signature)
+            .or_else(|| store.type_literal_method_linked_type(*signature))
+            == Some(request.callee)
+    });
     if signatures.is_empty()
         || !signatures.iter().any(|signature| {
             store
                 .signature(*signature)
                 .is_some_and(|signature| !signature.type_parameters().is_empty())
         })
-        || signatures.iter().any(|signature| {
-            store
-                .interface_method_linked_type(*signature)
-                .or_else(|| store.type_literal_method_linked_type(*signature))
-                != Some(request.callee)
-        })
+        || !declared_methods && store.source_overload_provenance(request.callee).is_none()
     {
         return Ok(None);
     }
@@ -342,9 +343,11 @@ pub(super) fn resolve_generic_method_call(
         request.callee,
         Some(CanonicalArrayTargets::from_global_types(globals)),
     ) {
-        StoredCallableSetValidation::Valid { projection, .. }
-            if projection.construct_signatures.is_empty()
-                && !projection.call_signatures.is_empty() =>
+        StoredCallableSetValidation::Valid {
+            family, projection, ..
+        } if projection.construct_signatures.is_empty()
+            && !projection.call_signatures.is_empty()
+            && (declared_methods || family == CallableFamily::SourceFunctionOverloads) =>
         {
             projection
         }

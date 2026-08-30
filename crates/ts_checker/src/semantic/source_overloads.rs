@@ -31,7 +31,8 @@ use super::{
     },
     store::{
         PreparedSourceOverloadParameter, PreparedSourceOverloadPublication,
-        PreparedSourceOverloadSignature, SourceNodeParent, SourceOverloadImplementation,
+        PreparedSourceOverloadSignature, SourceCallableFamily, SourceNodeParent,
+        SourceOverloadImplementation,
     },
     type_nodes::SourceCallableTypeQueryEvidence,
     type_records::{ConstrainedTypeData, TypeCacheState, TypeData},
@@ -1427,12 +1428,35 @@ pub(super) fn validate_stored_source_overload(
                 return StoredSourceOverloadValidation::Malformed;
             };
             let plan = evidence.callable();
-            if provenance.implementation.is_none()
-                || row.type_parameters.len() != 1
+            let Some(implementation) = provenance.implementation else {
+                return StoredSourceOverloadValidation::Malformed;
+            };
+            let (body, body_mode) = if row.declaration == implementation.declaration {
+                (implementation.body, SourceCallableBodyMode::Present)
+            } else {
+                (row.declaration, SourceCallableBodyMode::OverloadDeclaration)
+            };
+            if row.type_parameters.len() != 1
+                || !plan.requires_type_query_evidence()
+                || plan.family != SourceCallableFamily::FunctionDeclaration
                 || plan.declaration != row.declaration
                 || plan.owner_symbol != owner_symbol
+                || plan.owner_parent.is_some()
+                || plan.export_local.is_some()
+                || plan.body != body
+                || plan.body_mode != body_mode
+                || plan.is_async
+                || plan.type_predicate.is_some()
                 || plan.flags != row.flags
+                || plan.min_argument_count != signature.min_argument_count()
                 || plan.array_targets != provenance.array_targets
+                || store.source_callable_type_for_owner(owner_symbol).is_some()
+                || store
+                    .source_callable_type_for_declaration(row.declaration)
+                    .is_some()
+                || store
+                    .source_callable_type_for_signature(row.signature)
+                    .is_some()
                 || plan.return_type.annotation_identity()
                     != Some((
                         row.return_annotation,
@@ -1460,6 +1484,11 @@ pub(super) fn validate_stored_source_overload(
             for (parameter, planned) in row.parameters.iter().zip(&plan.parameters) {
                 if parameter.declaration != planned.declaration
                     || parameter.symbol != planned.symbol
+                    || parameter.optional != planned.optional
+                    || planned.optional
+                    || planned.rest
+                    || planned.initializer.is_some()
+                    || planned.explicit_type_node().is_none()
                     || planned.annotation_identity()
                         != (
                             parameter.annotation,
@@ -1527,6 +1556,27 @@ pub(super) fn validate_stored_source_overload(
         edges.push(row.return_type);
     }
     StoredSourceOverloadValidation::Valid(edges)
+}
+
+/// Reads a real generic row's query proof, including the hidden implementation.
+/// Call consumers must also prove membership in the public call list.
+pub(super) fn source_overload_signature_type_query(
+    store: &CanonicalTypeMapperStore,
+    owner: TypeId,
+    signature: SignatureId,
+) -> Option<&SourceCallableTypeQueryEvidence> {
+    if !matches!(
+        validate_stored_source_overload(store, owner),
+        StoredSourceOverloadValidation::Valid(_)
+    ) {
+        return None;
+    }
+    let provenance = store.source_overload_provenance(owner)?;
+    let row = provenance
+        .signatures
+        .iter()
+        .find(|row| row.signature == signature)?;
+    store.source_callable_type_query(row.signature)
 }
 
 /// Projects one real cached signature, including the hidden implementation.

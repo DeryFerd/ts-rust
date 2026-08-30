@@ -28,7 +28,8 @@ use super::{
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
     callables::{
-        StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
+        CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
+        validate_stored_single_callable,
     },
     calls::{
         DirectCallApplicability, DirectCallArgumentTarget, DirectCallError, DirectCallForm,
@@ -62,6 +63,7 @@ use super::{
         StoredSourceCallableValidation, constrained_string_rest_tuple_parameter,
         valid_fixed_generic_source_parameter_type, validate_stored_source_callable,
     },
+    source_overloads::source_overload_signature_type_query,
     store::{
         CachedSignatureLookup, SourceCallableFamily, SourceCallableReturnProvenance,
         SourceNodeParent,
@@ -525,7 +527,7 @@ pub(super) fn resolve_generic_call_vector_with_session(
     )
 }
 
-/// Checks one actual member of a declared method's ordered callable set.
+/// Checks one actual public row of an authenticated ordered callable set.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_generic_call_candidate_with_session(
     store: &mut CanonicalTypeMapperStore,
@@ -659,7 +661,9 @@ fn generic_call_signature_candidate(
         StoredCallableSetValidation::Malformed { .. } => {
             Err(GenericCallVectorInvariant::MalformedCallable(callee).into())
         }
-        StoredCallableSetValidation::Valid { projection, .. } => {
+        StoredCallableSetValidation::Valid {
+            family, projection, ..
+        } => {
             if projection.owner != callee {
                 return Err(GenericCallVectorInvariant::CallableOwnerMismatch {
                     callee,
@@ -670,6 +674,7 @@ fn generic_call_signature_candidate(
             if !projection.construct_signatures.is_empty()
                 || projection.call_signatures.len() != 1
                     && declared_method_signature_callee(store, signature) != Some(callee)
+                    && family != CallableFamily::SourceFunctionOverloads
             {
                 return Err(GenericCallVectorUnsupported::NotExactSingleCallable(callee).into());
             }
@@ -692,15 +697,18 @@ fn generic_call_signature_callee(
     store
         .source_callable_type_for_signature(signature)
         .or_else(|| declared_method_signature_callee(store, signature))
+        .or_else(|| store.source_overload_type_for_signature(signature))
 }
 
-/// Methods use the shared omitted-void rule without changing their stored arity.
+/// Ordered source signatures use the shared omitted-void rule.
 pub(super) fn generic_call_signature_minimum_argument_count(
     store: &CanonicalTypeMapperStore,
     signature: SignatureId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<usize, GenericCallVectorError> {
-    if let Some(callee) = declared_method_signature_callee(store, signature) {
+    if let Some(callee) = declared_method_signature_callee(store, signature)
+        .or_else(|| store.source_overload_type_for_signature(signature))
+    {
         let callable = generic_call_signature_candidate(store, callee, signature, array_targets)?;
         return get_min_argument_count_with_array_targets(
             store,
@@ -1604,12 +1612,14 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
     let has_rest_parameter = signature.has_rest_parameter();
     let declared_method =
         declared_method_signature_callee(store, callable.signature) == Some(callee);
+    let source_overload =
+        store.source_overload_type_for_signature(callable.signature) == Some(callee);
     let mut expected_flags = if has_rest_parameter {
         SignatureFlags::HAS_REST_PARAMETER
     } else {
         SignatureFlags::NONE
     };
-    if declared_method
+    if (declared_method || source_overload)
         && signature
             .flags()
             .contains(SignatureFlags::HAS_LITERAL_TYPES)
@@ -2164,7 +2174,15 @@ pub(super) fn source_generic_type_parameter_constraint(
     else {
         return Ok(None);
     };
-    let Some(callee) = store.source_callable_type_for_declaration(callable_declaration) else {
+    let Some(callee) = store
+        .source_callable_type_for_declaration(callable_declaration)
+        .or_else(|| store.source_overload_type_for_declaration(callable_declaration))
+        .or_else(|| {
+            store
+                .source_declaration_symbol(callable_declaration)
+                .and_then(|owner| store.source_overload_type_for_owner(owner))
+        })
+    else {
         return Ok(None);
     };
     if store.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
@@ -2172,24 +2190,31 @@ pub(super) fn source_generic_type_parameter_constraint(
     {
         return Err(invalid().into());
     }
-    let provenance = store
-        .source_callable_provenance(callee)
-        .ok_or_else(invalid)?;
-    if !matches!(
-        validate_stored_source_callable(store, callee),
-        StoredSourceCallableValidation::Valid(_)
-    ) {
-        return Err(GenericCallVectorInvariant::MalformedCallable(callee).into());
-    }
-    let signature = store.signature(provenance.signature).ok_or(
-        GenericCallVectorInvariant::InvalidSignature(provenance.signature),
-    )?;
-    let Some(evidence) = validate_generic_call_type_query(
-        store,
-        callee,
-        provenance.signature,
-        signature.type_parameters(),
-    )?
+    let signature_id = if let Some(provenance) = store.source_callable_provenance(callee) {
+        if !matches!(
+            validate_stored_source_callable(store, callee),
+            StoredSourceCallableValidation::Valid(_)
+        ) {
+            return Err(GenericCallVectorInvariant::MalformedCallable(callee).into());
+        }
+        provenance.signature
+    } else {
+        store
+            .source_overload_provenance(callee)
+            .and_then(|provenance| {
+                provenance
+                    .signatures
+                    .iter()
+                    .find(|row| row.declaration == callable_declaration)
+            })
+            .ok_or_else(invalid)?
+            .signature
+    };
+    let signature = store
+        .signature(signature_id)
+        .ok_or(GenericCallVectorInvariant::InvalidSignature(signature_id))?;
+    let Some(evidence) =
+        validate_generic_call_type_query(store, callee, signature_id, signature.type_parameters())?
     else {
         return Ok(None);
     };
@@ -2216,7 +2241,7 @@ pub(super) fn source_generic_type_parameter_constraint(
         if parameter == type_parameter {
             selected = Some(SourceGenericConstraint {
                 callee,
-                signature: provenance.signature,
+                signature: signature_id,
                 type_parameter,
                 constraint,
                 base_constraint,
@@ -2240,6 +2265,18 @@ fn validate_generic_call_type_query<'store>(
     type_parameters: &[TypeId],
 ) -> Result<Option<&'store SourceCallableTypeQueryEvidence>, GenericCallVectorError> {
     let invalid = || GenericCallVectorInvariant::CallableSignatureMismatch(signature);
+    if store.source_overload_provenance(callee).is_some() {
+        let evidence =
+            source_overload_signature_type_query(store, callee, signature).ok_or_else(invalid)?;
+        if evidence.type_parameters().len() != type_parameters.len()
+            || evidence.type_parameters().iter().zip(type_parameters).any(
+                |(resolved, type_parameter)| resolved.provenance.type_parameter != *type_parameter,
+            )
+        {
+            return Err(invalid().into());
+        }
+        return Ok(Some(evidence));
+    }
     let evidence = store.source_callable_type_query(signature);
     let Some(provenance) = store
         .source_callable_provenance(callee)
@@ -4927,6 +4964,13 @@ fn validate_generic_call_vector_shell(
     type_arguments: &[TypeId],
     signature: SignatureId,
 ) -> Result<TypeMapperId, GenericCallVectorError> {
+    if store.source_overload_erased_signature(shape.signature) == Some(signature) {
+        return Err(GenericCallVectorInvariant::InvalidCachedInstantiation {
+            target: shape.signature,
+            signature,
+        }
+        .into());
+    }
     let original =
         store
             .signature(shape.signature)
@@ -6865,6 +6909,401 @@ mod tests {
             unions: bootstrap.union_cache_len(),
             unions_of_unions: bootstrap.union_of_union_cache_len(),
             union_validation_scans: store.union_cache_validation_scan_count(),
+        }
+    }
+
+    fn jsdoc_overload_call_source() -> ParseResult {
+        ts_parser::parse_javascript_source_file(concat!(
+            "/** @template T @param {T} value @returns {T}\n",
+            " * @overload @param {T} value @returns {T}\n",
+            " * @overload @param {T} value @param {number} count @returns {T} */\n",
+            "function keep(value) { return value; }\n",
+            "keep('text');\n",
+            "keep(2, 3);\n",
+        ))
+    }
+
+    fn checked_jsdoc_overload_context(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (CanonicalCheckerContext<'_>, TypeId, Vec<NodeRef>) {
+        assert!(parsed.diagnostics.is_empty());
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/jsdoc-overload-calls.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                no_emit: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+        else {
+            unreachable!()
+        };
+        let first = NodeRef::new(parsed.arena.id(), file, source.statements.nodes[0]);
+        let owner = context.file(file).unwrap().1.symbol(first).unwrap();
+        let callable = context
+            .store()
+            .source_overload_type_for_owner(owner)
+            .unwrap();
+        let mut calls = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                matches!(record.data, NodeData::CallExpression(_)).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        calls.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        assert_eq!(calls.len(), 2);
+        (context, callable, calls)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check real public, implementation, and erased rows together.
+    fn jsdoc_generic_call_returns_reject_hidden_and_erased_rows() {
+        let parsed = jsdoc_overload_call_source();
+        let file = FileId::new(96_620);
+        let (mut context, callee, calls) = checked_jsdoc_overload_context(&parsed, file);
+        let rows = context
+            .store()
+            .source_overload_provenance(callee)
+            .unwrap()
+            .signatures
+            .clone();
+        assert_eq!(rows.len(), 3);
+        let arrays = Some(CanonicalArrayTargets::from_global_types(
+            context.global_types(),
+        ));
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let before = vector_cache_graph_counts(context.store());
+        for row in &rows {
+            let parameter = row.type_parameters[0].type_parameter;
+            let proof = source_generic_type_parameter_constraint(context.store(), parameter)
+                .unwrap()
+                .unwrap();
+            assert_eq!(proof.callee, callee);
+            assert_eq!(proof.signature, row.signature);
+            assert_eq!(proof.type_parameter, parameter);
+            assert_eq!(proof.constraint, None);
+            assert!(
+                source_overload_signature_type_query(context.store(), callee, row.signature)
+                    .is_some()
+            );
+        }
+        for (index, call) in calls.iter().copied().enumerate() {
+            let selected = context
+                .store()
+                .signature_links(call)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            let result = context
+                .store()
+                .signature(selected)
+                .unwrap()
+                .resolved_return_type()
+                .unwrap();
+            assert_eq!(
+                generic_call_signature_candidate(
+                    context.store(),
+                    callee,
+                    rows[index].signature,
+                    arrays
+                )
+                .unwrap()
+                .signature,
+                rows[index].signature
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    preflight_generic_call_signature_return_target(
+                        context.store(),
+                        arrays,
+                        selected
+                    ),
+                    Ok(rows[index].signature)
+                );
+                assert_eq!(
+                    demand_generic_call_signature_return_with_session(
+                        context.store_mut_for_test(),
+                        arrays,
+                        selected,
+                        &mut session,
+                    ),
+                    Ok(result)
+                );
+            }
+        }
+        let implementation = rows[2].signature;
+        let hidden_error = GenericCallVectorInvariant::CallableSignatureMismatch(implementation);
+        assert_eq!(
+            generic_call_signature_candidate(context.store(), callee, implementation, arrays),
+            Err(hidden_error.into())
+        );
+        for row in &rows {
+            let erased = context
+                .store()
+                .source_overload_erased_signature(row.signature)
+                .unwrap();
+            assert_eq!(
+                generic_call_signature_candidate(context.store(), callee, erased, arrays),
+                Err(GenericCallVectorInvariant::CallableSignatureMismatch(erased).into())
+            );
+            let expected = if row.signature == implementation {
+                hidden_error
+            } else {
+                GenericCallVectorInvariant::InvalidCachedInstantiation {
+                    target: row.signature,
+                    signature: erased,
+                }
+            };
+            for _ in 0..2 {
+                assert_eq!(
+                    preflight_generic_call_signature_return_target(context.store(), arrays, erased),
+                    Err(expected.into())
+                );
+                assert_eq!(
+                    demand_generic_call_signature_return_with_session(
+                        context.store_mut_for_test(),
+                        arrays,
+                        erased,
+                        &mut session,
+                    ),
+                    Err(expected.into())
+                );
+            }
+        }
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(vector_cache_graph_counts(context.store()), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Damage each unselected row and replay both public and body queries.
+    fn jsdoc_generic_calls_recheck_unselected_and_hidden_row_proofs() {
+        use crate::semantic::generic_method_calls::{
+            GenericMethodCallError, resolve_generic_method_call,
+        };
+
+        for row_index in [1, 2] {
+            for damage in 0..4 {
+                let parsed = jsdoc_overload_call_source();
+                let file = FileId::new(96_621);
+                let (mut context, callee, calls) = checked_jsdoc_overload_context(&parsed, file);
+                let rows = context
+                    .store()
+                    .source_overload_provenance(callee)
+                    .unwrap()
+                    .signatures
+                    .clone();
+                let selected = context
+                    .store()
+                    .signature_links(calls[0])
+                    .unwrap()
+                    .resolved_signature
+                    .signature()
+                    .unwrap();
+                let NodeData::CallExpression(call) = &parsed.arena.get(calls[0].node).unwrap().data
+                else {
+                    unreachable!()
+                };
+                let argument = context
+                    .get_type_at_location(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        call.arguments.nodes[0],
+                    ))
+                    .unwrap();
+                let globals = context.global_types().clone();
+                let arrays = Some(CanonicalArrayTargets::from_global_types(&globals));
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                let body_parameter = rows[2].type_parameters[0].type_parameter;
+                let mut session = InstantiationSession::new(InstantiationLimits::default());
+                assert_eq!(
+                    context
+                        .store_mut_for_test()
+                        .is_type_assignable_to_with_session(
+                            body_parameter,
+                            number,
+                            Some(&globals),
+                            None,
+                            &mut session,
+                        ),
+                    Ok(false)
+                );
+                let damaged = &rows[row_index];
+                match damage {
+                    0 => {
+                        assert!(
+                            context
+                                .store_mut_for_test()
+                                .replace_source_callable_type_query_for_test(
+                                    damaged.signature,
+                                    None
+                                )
+                                .is_some()
+                        );
+                    }
+                    1 => {
+                        let evidence = context
+                            .store_mut_for_test()
+                            .replace_source_callable_type_query_for_test(rows[0].signature, None)
+                            .unwrap();
+                        context
+                            .store_mut_for_test()
+                            .replace_source_callable_type_query_for_test(
+                                rows[0].signature,
+                                Some(std::sync::Arc::clone(&evidence)),
+                            );
+                        context
+                            .store_mut_for_test()
+                            .replace_source_callable_type_query_for_test(
+                                damaged.signature,
+                                Some(evidence),
+                            );
+                    }
+                    2 => {
+                        assert_eq!(
+                            context
+                                .store_mut_for_test()
+                                .replace_source_overload_type_for_declaration_for_test(
+                                    damaged.declaration,
+                                    None
+                                ),
+                            Some(callee)
+                        );
+                    }
+                    3 => {
+                        assert!(context.store_mut_for_test().set_signature_flags(
+                            damaged.signature,
+                            SignatureFlags::HAS_LITERAL_TYPES,
+                        ));
+                    }
+                    _ => unreachable!(),
+                }
+                let before = vector_cache_graph_counts(context.store());
+                for _ in 0..2 {
+                    assert_eq!(
+                        resolve_generic_method_call(
+                            context.store_mut_for_test(),
+                            &globals,
+                            false,
+                            vector_request(callee, None, &[argument]),
+                            Some(selected),
+                            &mut session,
+                        ),
+                        Err(GenericMethodCallError::Invalid(callee))
+                    );
+                    assert_eq!(
+                        preflight_generic_call_signature_return_target(
+                            context.store(),
+                            arrays,
+                            selected
+                        ),
+                        Err(GenericCallVectorInvariant::MalformedCallable(callee).into())
+                    );
+                    assert_eq!(
+                        demand_generic_call_signature_return_with_session(
+                            context.store_mut_for_test(),
+                            arrays,
+                            selected,
+                            &mut session,
+                        ),
+                        Err(GenericCallVectorInvariant::MalformedCallable(callee).into())
+                    );
+                    assert_eq!(
+                        context
+                            .store_mut_for_test()
+                            .is_type_assignable_to_with_session(
+                                body_parameter,
+                                number,
+                                Some(&globals),
+                                None,
+                                &mut session,
+                            ),
+                        Err(RelationUnavailable::MalformedFunctionType(callee))
+                    );
+                    assert_eq!(vector_cache_graph_counts(context.store()), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jsdoc_generic_calls_reject_hidden_and_erased_public_list_entries() {
+        use crate::semantic::generic_method_calls::{
+            GenericMethodCallError, resolve_generic_method_call,
+        };
+
+        for erased in [false, true] {
+            let parsed = jsdoc_overload_call_source();
+            let file = FileId::new(96_622);
+            let (mut context, callee, _) = checked_jsdoc_overload_context(&parsed, file);
+            let rows = context
+                .store()
+                .source_overload_provenance(callee)
+                .unwrap()
+                .signatures
+                .clone();
+            let invalid = if erased {
+                context
+                    .store()
+                    .source_overload_erased_signature(rows[0].signature)
+                    .unwrap()
+            } else {
+                rows[2].signature
+            };
+            assert!(context.store_mut_for_test().set_structured_type_members(
+                callee,
+                None,
+                None,
+                Some(vec![invalid, rows[1].signature]),
+                None,
+                None,
+            ));
+            let globals = context.global_types().clone();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let before = vector_cache_graph_counts(context.store());
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            for _ in 0..2 {
+                assert_eq!(
+                    resolve_generic_method_call(
+                        context.store_mut_for_test(),
+                        &globals,
+                        false,
+                        vector_request(callee, None, &[number]),
+                        None,
+                        &mut session,
+                    ),
+                    Err(GenericMethodCallError::Invalid(callee))
+                );
+                assert_eq!(vector_cache_graph_counts(context.store()), before);
+            }
         }
     }
 

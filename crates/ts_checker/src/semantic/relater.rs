@@ -79,6 +79,7 @@ use super::{
     },
     signatures::{ElementFlags, SignatureFlags, Ternary, TupleElementInfo},
     source_callables::validate_source_callable_signature_identity,
+    source_overloads::source_overload_signature_type_query,
     store::{RelationObservationToken, SemanticStore, SourceNodeParent},
     structured_members::{
         InterfaceHeritageMembersValidation, inherited_generic_property_reference,
@@ -86,6 +87,7 @@ use super::{
     },
     template_types::StringMappingKind,
     tuple_types::{CanonicalTupleTypeRequest, TupleShape, TupleTypeError},
+    type_nodes::SourceCallableTypeQueryEvidence,
     type_records::{
         CacheHashKey, ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord,
     },
@@ -466,6 +468,55 @@ fn authenticated_nullish_object_nonmatch(
     }
 }
 
+/// Reads the real declaration's query proof without treating a group as a singleton.
+fn source_parameter_query_evidence(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    callable_declaration: ts_ast::NodeRef,
+) -> Result<Option<&SourceCallableTypeQueryEvidence>, RelationUnavailable> {
+    if let Some(callable) = store.source_callable_type_for_declaration(callable_declaration) {
+        let Some(provenance) = store.source_callable_provenance(callable) else {
+            return Ok(None);
+        };
+        let Some(evidence) = store.source_callable_type_query(provenance.signature) else {
+            return Ok(None);
+        };
+        if evidence.callable().declaration != callable_declaration
+            || validate_source_callable_signature_identity(
+                store,
+                evidence.callable(),
+                provenance.signature,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+        Ok(Some(evidence))
+    } else if let Some(callable) = store
+        .source_overload_type_for_declaration(callable_declaration)
+        .or_else(|| {
+            store
+                .source_declaration_symbol(callable_declaration)
+                .and_then(|owner| store.source_overload_type_for_owner(owner))
+        })
+    {
+        let invalid = || RelationUnavailable::MalformedFunctionType(callable);
+        let row = store
+            .source_overload_provenance(callable)
+            .and_then(|provenance| {
+                provenance
+                    .signatures
+                    .iter()
+                    .find(|row| row.declaration == callable_declaration)
+            })
+            .ok_or_else(invalid)?;
+        source_overload_signature_type_query(store, callable, row.signature)
+            .map(Some)
+            .ok_or_else(invalid)
+    } else {
+        Ok(None)
+    }
+}
+
 /// After simple relations, a concrete scalar and an unconstrained source parameter
 /// cannot be assigned in either direction. The signature proof excludes recovery.
 fn authenticated_scalar_source_parameter_nonmatch(
@@ -515,21 +566,10 @@ fn authenticated_scalar_source_parameter_nonmatch(
     else {
         return Ok(false);
     };
-    let Some(callable) = store.source_callable_type_for_declaration(callable_declaration) else {
-        return Ok(false);
-    };
-    let Some(provenance) = store.source_callable_provenance(callable) else {
-        return Ok(false);
-    };
-    let Some(evidence) = store.source_callable_type_query(provenance.signature) else {
+    let Some(evidence) = source_parameter_query_evidence(store, callable_declaration)? else {
         return Ok(false);
     };
     let plan = evidence.callable();
-    if plan.declaration != callable_declaration
-        || validate_source_callable_signature_identity(store, plan, provenance.signature).is_err()
-    {
-        return Ok(false);
-    }
     let Some(index) = evidence.type_parameters().iter().position(|row| {
         row.provenance.type_parameter == parameter
             && row.provenance.symbol == symbol
