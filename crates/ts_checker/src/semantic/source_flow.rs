@@ -556,7 +556,7 @@ fn own_class_flow_reference_symbol(
     }
     let symbol = store
         .symbol(symbol)
-        .and_then(|record| record.export_symbol())
+        .and_then(ts_binder::semantic::Symbol::export_symbol)
         .unwrap_or(symbol);
     store
         .get_merged_symbol(symbol)
@@ -6466,7 +6466,7 @@ mod tests {
         let field = context
             .store()
             .symbol(declared)
-            .and_then(|symbol| symbol.members())
+            .and_then(ts_binder::semantic::Symbol::members)
             .and_then(|members| context.store().symbol_table(members))
             .and_then(|members| members.get_source("value"))
             .unwrap();

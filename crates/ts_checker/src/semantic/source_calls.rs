@@ -6288,7 +6288,7 @@ fn prepare_legacy_source_call_diagnostic(
     if let Some(signature) = overload_note {
         let declaration = store
             .signature(signature)
-            .and_then(|signature| signature.declaration())
+            .and_then(super::signatures::Signature::declaration)
             .ok_or(SourceCheckError::Call(plan.node))?;
         for diagnostic in &mut result {
             let message = diagnostic

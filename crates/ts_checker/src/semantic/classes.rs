@@ -1008,7 +1008,7 @@ fn source_constructor_parameter(
 fn source_parameter_property<T>(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
-    parameter: ClassConstructorParameterPlan<T>,
+    parameter: &ClassConstructorParameterPlan<T>,
 ) -> Result<Option<ClassPropertyPlan>, ClassError> {
     let Some(property) = parameter.property else {
         return Ok(None);
@@ -1474,16 +1474,16 @@ pub(super) fn plan_source_class_members_with_context(
                         kind: record.kind,
                     }));
                 }
-                for &parameter in &constructor.parameters {
+                for parameter in &constructor.parameters {
                     if let Some(property) = source_parameter_property(store, host, parameter)? {
                         plan.sources
                             .push(source_property_origin(store, symbol, &property));
                         match parameter.type_ {
                             ClassBodyParameterType::Known(type_) => {
-                                plan.properties.push((property, type_))
+                                plan.properties.push((property, type_));
                             }
                             ClassBodyParameterType::Annotation(_) => {
-                                plan.annotated_properties.push(property)
+                                plan.annotated_properties.push(property);
                             }
                             ClassBodyParameterType::ClassReference { .. }
                             | ClassBodyParameterType::Tuple(_) => {
@@ -8037,13 +8037,13 @@ fn plan_constructor_parameter_with_body_mode(
         || type_record.flags.0 != 0
         || type_record.parent != Some(parameter.node)
         || type_record.range.start < name_record.range.end
-        || !matches!(
+        || !(matches!(
             type_record.data,
             NodeData::KeywordTypeNode(_)
                 | NodeData::TypeReferenceNode(_)
                 | NodeData::UnionTypeNode(_)
                 | NodeData::ParenthesizedTypeNode(_)
-        ) && !(source_body
+        ) || source_body
             && matches!(
                 type_record.data,
                 NodeData::ArrayTypeNode(_) | NodeData::TypeOperatorNode(_)

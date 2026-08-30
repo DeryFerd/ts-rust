@@ -59457,7 +59457,7 @@ fn with_retained_class_annotation_scopes<T>(
         for (node, symbol) in owners {
             let Some(declaration) = store
                 .symbol(symbol)
-                .and_then(|owner| owner.value_declaration())
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
             else {
                 continue;
             };

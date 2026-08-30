@@ -1,6 +1,14 @@
 //! Class annotation queries retain the real owner while its members are checked.
 
-use super::*;
+use super::{
+    CanonicalArrayTargets, CanonicalGlobalTypes, CanonicalTypeMapperStore, CheckFlags, ClassError,
+    ClassHeritageMembersValidation, ClassInvariant, ClassTypeQueryContext, DeclaredTypeHost,
+    NodeData, NodeRef, ObjectFlags, SemanticSymbolId, SourceClassPlan, StructuredTypeData,
+    SymbolFlags, SyntaxKind, TypeData, TypeId, TypeRecord, ValueSymbolLinks, bound_symbol,
+    exact_class_instance_identity, invariant, preflight_class_or_interface_reference,
+    source_class_binding, source_class_plan_is_current, validate_class_heritage_members,
+    validate_source_class_header, validate_source_class_stored_header,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::semantic) struct SourceClassAnnotationScope {
@@ -198,9 +206,7 @@ pub(in crate::semantic) fn begin_source_class_annotations(
         if !store.begin_source_class_annotation_scope(instance, scope) {
             return Err(invalid());
         }
-        let result = if source_class_annotation_scope_targets(store, instance) != Some(targets) {
-            Err(invalid())
-        } else {
+        let result = if source_class_annotation_scope_targets(store, instance) == Some(targets) {
             validate_source_class_header(
                 store,
                 host,
@@ -208,6 +214,8 @@ pub(in crate::semantic) fn begin_source_class_annotations(
                     .source_class_provenance(instance)
                     .expect("the retained source class was checked before opening its scope"),
             )
+        } else {
+            Err(invalid())
         };
         if let Err(error) = result {
             if !store.end_source_class_annotation_scope(instance) {
@@ -317,12 +325,16 @@ mod tests {
     use ts_ast::FileId;
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName,
     };
     use ts_parser::{ParseResult, parse_source_file};
 
+    use super::super::SourceClassProvenance;
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, IntrinsicBootstrapOptions, SourceFileLinks,
+        CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
+        DeclaredTypeError, IntrinsicBootstrapOptions, SourceFileLinks, SymbolNodeLinks,
+        TypeNodeLinks, TypeNodeUnavailable, bootstrap::LiteralTypeCacheError,
         production::GlobalMergeCompletion,
     };
 
