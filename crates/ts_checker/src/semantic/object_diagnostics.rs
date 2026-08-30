@@ -1685,13 +1685,13 @@ fn recursive_callable_mismatch_chain_inner(
         return Ok(None);
     }
 
-    if !matches!(
+    if !(matches!(
         (source.parameters.as_slice(), target.parameters.as_slice()),
         (_, []) if target_callable.min_argument_count == 0
-    ) && !(source.parameters.len() == 1
+    ) || (source.parameters.len() == 1
         && target.parameters.len() == 1
         && source_callable.min_argument_count == 1
-        && target_callable.min_argument_count == 1)
+        && target_callable.min_argument_count == 1))
     {
         return Ok(None);
     }
