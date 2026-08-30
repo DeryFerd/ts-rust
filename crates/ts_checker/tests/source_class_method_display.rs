@@ -1,12 +1,12 @@
-use ts_ast::{FileId, NodeData, NodeId, NodeRef, SyntaxKind};
+use ts_ast::{FileId, NodeData, NodeId, NodeRef};
 use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions, CanonicalSourceFileFacts,
     CanonicalSourceLanguage, EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SignatureId,
-    SourceCheckError, TypeId, artifact_queries::CanonicalArtifactQueryError,
-    signatures::SignatureFlags,
+    SourceCheckError, TypeData, TypeId, artifact_queries::CanonicalArtifactQueryError,
+    signatures::SignatureFlags, type_records::StructuredTypeData,
 };
 use ts_options::ScriptTarget;
 use ts_parser::{ParseResult, parse_source_file};
@@ -207,14 +207,25 @@ fn is_checked(context: &CanonicalCheckerContext<'_>) -> bool {
         .is_some_and(|links| links.type_checked)
 }
 
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
+}
+
 fn signatures(context: &CanonicalCheckerContext<'_>, method_type: TypeId) -> Vec<SignatureId> {
-    let structured = context
-        .store()
-        .type_payload(method_type)
-        .unwrap()
-        .data()
-        .structured()
-        .unwrap();
+    let structured =
+        structured_data(context.store().type_payload(method_type).unwrap().data()).unwrap();
     let signatures = structured.signatures.clone().unwrap();
     assert_eq!(structured.call_signature_count, signatures.len());
     signatures
@@ -355,7 +366,7 @@ fn assert_display_read_only(
             })
             .map(|type_| {
                 let record = store.type_payload(type_).unwrap();
-                let members = record.data().structured().map(|structured| {
+                let members = structured_data(record.data()).map(|structured| {
                     (
                         structured.members,
                         structured.properties.clone(),
@@ -497,12 +508,7 @@ fn original_abstract_method_keeps_full_signature_in_each_query_order() {
             &[method.declaration]
         );
         let class_type = context.get_type_at_location(class_name).unwrap();
-        let members = context
-            .store()
-            .type_payload(class_type)
-            .unwrap()
-            .data()
-            .structured()
+        let members = structured_data(context.store().type_payload(class_type).unwrap().data())
             .unwrap()
             .members
             .unwrap();
