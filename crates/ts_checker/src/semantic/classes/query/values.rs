@@ -2,7 +2,7 @@
 
 use super::super::{
     completed_source_class_method_type, completed_source_class_property_type,
-    emit_standard_class_fields,
+    emit_standard_class_fields, plan_property_with_body_mode,
 };
 use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
@@ -718,6 +718,37 @@ impl ClassValueQuery<'_, '_, '_> {
         }
         let name = NodeRef::new(declaration.arena, declaration.file, property.name);
         let name_record = preflight_node(self.store, self.host, name)?;
+        if name_record.kind == SyntaxKind::PrivateIdentifier
+            && let Some(initializer) = property.initializer
+            && self.store.source_node_kind(NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                initializer,
+            )) == Some(SyntaxKind::ObjectLiteralExpression)
+        {
+            let owner = self
+                .store
+                .symbol(class.symbol)
+                .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(class.symbol)))?;
+            let planned = plan_property_with_body_mode(
+                self.store,
+                self.host,
+                class.symbol,
+                declaration,
+                owner.members(),
+                owner.exports().ok_or_else(reject)?,
+                true,
+            )?;
+            return completed_source_class_property_type(
+                self.store,
+                self.host,
+                class.symbol,
+                symbol,
+                declaration,
+                planned.type_node,
+            )?
+            .ok_or_else(reject);
+        }
         let NodeData::Identifier(identifier) = &name_record.data else {
             return Err(reject());
         };

@@ -332,6 +332,9 @@ fn preflight_type_annotation_worker(
         &mut HashSet::new(),
         &mut references,
         source_class.is_some(),
+        source_class.is_some_and(|owner| {
+            super::classes::source_class_method_annotation_is_owned(store, host, owner, node)
+        }),
     );
     if supported {
         for &reference in &references {
@@ -2205,6 +2208,48 @@ impl TypeQueryPlan {
                     bootstrap.regular_false_type
                 }),
             }
+        } else if let Some(object) = self.type_literals.get(&node) {
+            let mut properties = Vec::with_capacity(object.properties.len());
+            let mut complete = true;
+            for property in &object.properties {
+                if let Some(type_) = self.cached_annotation_type(
+                    store,
+                    host,
+                    array_targets,
+                    property.type_node,
+                    active,
+                )? {
+                    properties.push(type_);
+                } else {
+                    complete = false;
+                }
+            }
+            match object_members::type_literal_state(store, object)
+                .map_err(property_object_error)?
+            {
+                Some(
+                    PropertyObjectState::Resolved(type_)
+                    | PropertyObjectState::EmptyBootstrap(type_),
+                ) => {
+                    if !complete {
+                        return Err(invalid());
+                    }
+                    object_members::validate_resolved_property_types(store, object, &properties)
+                        .map_err(property_object_error)?;
+                    Some(type_)
+                }
+                Some(PropertyObjectState::Shell(_)) => return Err(invalid()),
+                None => {
+                    if object.properties.iter().any(|property| {
+                        store
+                            .value_symbol_links(property.symbol)
+                            .is_some_and(|links| links != &ValueSymbolLinks::default())
+                    }) {
+                        return Err(invalid());
+                    }
+                    None
+                }
+            }
         } else {
             let record = preflight_node(store, host, node)?;
             if let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data {
@@ -2258,6 +2303,7 @@ impl TypeQueryPlan {
         let needs_node_cache = self.references.contains_key(&node)
             || self.arrays.contains_key(&node)
             || self.unions.contains_key(&node)
+            || self.type_literals.contains_key(&node)
             || self
                 .literals
                 .get(&node)
@@ -2294,6 +2340,7 @@ impl TypeQueryPlan {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Only owned method roots admit property-only type literals.
 fn planned_constructor_annotation_shape(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2302,6 +2349,7 @@ fn planned_constructor_annotation_shape(
     active: &mut HashSet<NodeRef>,
     references: &mut Vec<NodeRef>,
     source_class: bool,
+    source_method: bool,
 ) -> bool {
     if !active.insert(node) {
         return false;
@@ -2316,6 +2364,7 @@ fn planned_constructor_annotation_shape(
                 active,
                 references,
                 source_class,
+                source_method,
             )
         })
     } else if source_class && let Some(array) = plan.arrays.get(&node) {
@@ -2327,7 +2376,30 @@ fn planned_constructor_annotation_shape(
             active,
             references,
             true,
+            source_method,
         )
+    } else if source_method && let Some(object) = plan.type_literals.get(&node) {
+        object.kind == object_members::PropertyObjectKind::TypeLiteral
+            && object.alias_symbol.is_none()
+            && object.heritage.is_none()
+            && object.methods.is_empty()
+            && object.accessors.is_empty()
+            && object.object_literal_getters.is_empty()
+            && object.spreads.is_empty()
+            && object.indexes.is_empty()
+            && object.call_signatures.is_empty()
+            && object.properties.iter().all(|property| {
+                planned_constructor_annotation_shape(
+                    store,
+                    host,
+                    plan,
+                    property.type_node,
+                    active,
+                    references,
+                    source_class,
+                    true,
+                )
+            })
     } else if let Some(reference) = plan.references.get(&node) {
         references.push(node);
         if source_class && reference.global_array_target.is_some() {
@@ -2340,6 +2412,7 @@ fn planned_constructor_annotation_shape(
                     active,
                     references,
                     true,
+                    source_method,
                 )
         } else {
             reference.type_arguments.is_empty()
@@ -2355,6 +2428,7 @@ fn planned_constructor_annotation_shape(
                                     active,
                                     references,
                                     source_class,
+                                    source_method,
                                 )
                         })
                     } else {
@@ -2399,6 +2473,7 @@ fn planned_constructor_annotation_shape(
                     active,
                     references,
                     source_class,
+                    source_method,
                 )
             }
             Some(NodeData::TypeOperatorNode(operator))
@@ -2412,6 +2487,7 @@ fn planned_constructor_annotation_shape(
                     active,
                     references,
                     true,
+                    source_method,
                 )
             }
             _ => false,
@@ -5680,6 +5756,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             &mut HashSet::new(),
             &mut Vec::new(),
             self.source_class_annotation.is_some(),
+            self.source_class_annotation.is_some_and(|owner| {
+                super::classes::source_class_method_annotation_is_owned(
+                    self.store, self.host, owner, node,
+                )
+            }),
         ) {
             if let Some(reference) = self.plan.references.get(&node)
                 && reference.arity == PlannedTypeReferenceArity::Valid

@@ -3578,10 +3578,10 @@ impl AssignmentPlanner<'_, '_> {
         statement: NodeRef,
     ) -> Result<Option<OwnClassPropertyAssignmentPlan>, AssignmentPlanError> {
         self.preflight_program()?;
-        if !self
+        if self
             .bound
             .source_facts()
-            .is_some_and(|facts| !facts.is_javascript_file())
+            .is_none_or(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
         {
             return Ok(None);
         }

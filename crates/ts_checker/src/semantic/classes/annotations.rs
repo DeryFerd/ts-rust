@@ -1,6 +1,15 @@
 //! Class annotation queries retain the real owner while its members are checked.
 
-use super::*;
+use super::{
+    CanonicalArrayTargets, CanonicalGlobalTypes, CanonicalTypeMapperStore, CheckFlags, ClassError,
+    ClassHeritageMembersValidation, ClassInvariant, ClassPropertySide, ClassTypeQueryContext,
+    DeclaredTypeHost, NodeData, NodeRef, ObjectFlags, SemanticSymbolId, SourceClassPlan,
+    StructuredTypeData, SymbolFlags, SyntaxKind, TypeData, TypeId, TypeRecord, ValueSymbolLinks,
+    bound_symbol, class_property_modifiers, exact_class_instance_identity, invariant,
+    preflight_class_or_interface_reference, source_class_binding, source_class_plan_is_current,
+    validate_class_heritage_members, validate_source_class_header,
+    validate_source_class_stored_header,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::semantic) struct SourceClassAnnotationScope {
@@ -15,6 +24,9 @@ pub(in crate::semantic) fn source_class_annotation_is_owned(
     owner: SemanticSymbolId,
     annotation: NodeRef,
 ) -> bool {
+    if source_class_method_annotation_is_owned(store, host, owner, annotation) {
+        return true;
+    }
     let Some(record) = host.node(annotation) else {
         return false;
     };
@@ -51,6 +63,106 @@ pub(in crate::semantic) fn source_class_annotation_is_owned(
             && preflight_class_or_interface_reference(store, host, owner, SymbolFlags::CLASS)
                 == Ok(0)
     })
+}
+
+/// A method parameter uses its own literal, local symbol, and actual class member.
+pub(in crate::semantic) fn source_class_method_annotation_is_owned(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    annotation: NodeRef,
+) -> bool {
+    let owned = || {
+        let annotation_record = host.node(annotation)?;
+        if annotation_record.kind != SyntaxKind::TypeLiteral
+            || !matches!(annotation_record.data, NodeData::TypeLiteralNode(_))
+        {
+            return None;
+        }
+        let parameter = NodeRef::new(annotation.arena, annotation.file, annotation_record.parent?);
+        let parameter_record = host.node(parameter)?;
+        let NodeData::ParameterDeclaration(data) = &parameter_record.data else {
+            return None;
+        };
+        let method = NodeRef::new(annotation.arena, annotation.file, parameter_record.parent?);
+        let method_record = host.node(method)?;
+        let NodeData::MethodDeclaration(method_data) = &method_record.data else {
+            return None;
+        };
+        let declaration = NodeRef::new(annotation.arena, annotation.file, method_record.parent?);
+        let class_record = host.node(declaration)?;
+        let NodeData::ClassDeclaration(class) = &class_record.data else {
+            return None;
+        };
+        if data.type_ != Some(annotation.node)
+            || data.dot_dot_dot_token.is_some()
+            || data.question_token.is_some()
+            || data.initializer.is_some()
+            || data.modifiers.is_some()
+            || method_record.kind != SyntaxKind::MethodDeclaration
+            || method_data.type_parameters.is_some()
+            || method_data
+                .parameters
+                .nodes
+                .iter()
+                .filter(|&&node| node == parameter.node)
+                .count()
+                != 1
+            || class_record.kind != SyntaxKind::ClassDeclaration
+            || class.type_parameters.is_some()
+            || class
+                .members
+                .nodes
+                .iter()
+                .filter(|&&node| node == method.node)
+                .count()
+                != 1
+            || bound_symbol(store, host, declaration) != Some(owner)
+            || preflight_class_or_interface_reference(store, host, owner, SymbolFlags::CLASS)
+                != Ok(0)
+        {
+            return None;
+        }
+        let method_symbol = bound_symbol(store, host, method)?;
+        let method_owner = store.symbol(method_symbol)?;
+        let (side, readonly) = class_property_modifiers(
+            store,
+            host,
+            method,
+            NodeRef::new(method.arena, method.file, method_data.name),
+            method_data.modifiers.as_ref(),
+            None,
+        )
+        .ok()?;
+        let class_owner = store.symbol(owner)?;
+        let table = match side {
+            ClassPropertySide::Instance => class_owner.members(),
+            ClassPropertySide::Static => class_owner.exports(),
+        }?;
+        let symbol = bound_symbol(store, host, parameter)?;
+        let parameter_owner = store.symbol(symbol)?;
+        let bound = host.bound_file(parameter)?;
+        if readonly
+            || method_owner.flags() != SymbolFlags::METHOD
+            || method_owner.parent() != Some(owner)
+            || store.get_merged_symbol(method_symbol) != Some(method_symbol)
+            || !method_owner.declarations()?.contains(&method)
+            || store.symbol_table(table)?.get(method_owner.name()) != Some(method_symbol)
+            || parameter_owner.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || parameter_owner.declarations() != Some(&[parameter])
+            || parameter_owner.value_declaration() != Some(parameter)
+            || parameter_owner.parent().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || store
+                .symbol_table(bound.locals(method)?)?
+                .get(parameter_owner.name())
+                != Some(symbol)
+        {
+            return None;
+        }
+        Some(())
+    };
+    owned().is_some()
 }
 
 pub(in crate::semantic) fn completed_class_symbol(
@@ -198,9 +310,7 @@ pub(in crate::semantic) fn begin_source_class_annotations(
         if !store.begin_source_class_annotation_scope(instance, scope) {
             return Err(invalid());
         }
-        let result = if source_class_annotation_scope_targets(store, instance) != Some(targets) {
-            Err(invalid())
-        } else {
+        let result = if source_class_annotation_scope_targets(store, instance) == Some(targets) {
             validate_source_class_header(
                 store,
                 host,
@@ -208,6 +318,8 @@ pub(in crate::semantic) fn begin_source_class_annotations(
                     .source_class_provenance(instance)
                     .expect("the retained source class was checked before opening its scope"),
             )
+        } else {
+            Err(invalid())
         };
         if let Err(error) = result {
             if !store.end_source_class_annotation_scope(instance) {
@@ -317,12 +429,19 @@ mod tests {
     use ts_ast::FileId;
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName,
     };
     use ts_parser::{ParseResult, parse_source_file};
 
+    use super::super::{
+        ClassBodyParameterType, SourceClassProvenance, plan_source_class_members_with_type_context,
+        preflight_source_class_annotation,
+    };
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, IntrinsicBootstrapOptions, SourceFileLinks,
+        CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
+        DeclaredTypeError, IntrinsicBootstrapOptions, SourceFileLinks, SymbolNodeLinks,
+        TypeNodeLinks, TypeNodeUnavailable, bootstrap::LiteralTypeCacheError,
         production::GlobalMergeCompletion,
     };
 
@@ -371,6 +490,328 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn method_context(source: &ParseResult) -> CanonicalCheckerContext<'_> {
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                FILE,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/methods.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&source.arena, FILE)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(FILE, &source.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn method_snapshot(
+        context: &CanonicalCheckerContext<'_>,
+    ) -> (String, CanonicalCheckerDiagnostics) {
+        (
+            format!("{:?}", context.store()),
+            context.diagnostics().clone(),
+        )
+    }
+
+    #[test]
+    fn method_type_literal_annotations_reject_changed_nested_caches_and_parameter_owners() {
+        for warm in [false, true] {
+            for damage in 0..6 {
+                let source = parse_source_file(concat!(
+                    "class Model { ",
+                    "read(source: { first: { value: number }; second: { value: string } }): void {} ",
+                    "static read(source: { first: { value: number }; second: { value: string } }): void {} ",
+                    "} class Other {}",
+                ));
+                let mut context = method_context(&source);
+                let (_, owner) = self_class_owner(&context, &source);
+                let other = context
+                    .store()
+                    .symbol_table(context.globals())
+                    .unwrap()
+                    .get_source("Other")
+                    .unwrap();
+                let options = context.options();
+                let globals = context.global_types().clone();
+                let query_context = ClassTypeQueryContext::new(&globals, options);
+                let bound = context.file(FILE).unwrap().1.clone();
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&source.arena, &bound)],
+                    GlobalMergeCompletion::for_test(options.name_resolution),
+                )
+                .unwrap();
+                let plan = plan_source_class_members_with_type_context(
+                    context.store(),
+                    &host,
+                    owner,
+                    Some(&query_context),
+                )
+                .unwrap();
+                assert_eq!(plan.annotation_nodes().len(), 2);
+                let parameter = plan.methods[0].method.parameters[0];
+                let root = parameter.type_node.unwrap();
+                assert_eq!(parameter.type_, ClassBodyParameterType::Annotation(root));
+                let object = crate::semantic::object_members::plan_type_literal(
+                    context.store(),
+                    &host,
+                    root,
+                    None,
+                )
+                .unwrap();
+                let nested = object.properties[1].type_node;
+                let nested_object = crate::semantic::object_members::plan_type_literal(
+                    context.store(),
+                    &host,
+                    nested,
+                    None,
+                )
+                .unwrap();
+                let leaf = nested_object.properties[0].symbol;
+                let before = method_snapshot(&context);
+                assert!(source_class_method_annotation_is_owned(
+                    context.store(),
+                    &host,
+                    owner,
+                    root
+                ));
+                assert!(!source_class_method_annotation_is_owned(
+                    context.store(),
+                    &host,
+                    other,
+                    root
+                ));
+                assert_eq!(
+                    preflight_source_class_annotation(
+                        context.store(),
+                        &host,
+                        &globals,
+                        options.into(),
+                        root,
+                        other
+                    )
+                    .err(),
+                    Some(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(root)
+                    ))
+                );
+                assert_eq!(method_snapshot(&context), before);
+                let members = warm.then(|| {
+                    context.check_source_file(FILE).unwrap();
+                    context.get_nongeneric_class_members(owner).unwrap()
+                });
+                let root_links = context
+                    .store()
+                    .type_node_links(root)
+                    .cloned()
+                    .unwrap_or_default();
+                let nested_links = context
+                    .store()
+                    .type_node_links(nested)
+                    .cloned()
+                    .unwrap_or_default();
+                let parameter_links = context
+                    .store()
+                    .value_symbol_links(parameter.symbol)
+                    .cloned()
+                    .unwrap_or_default();
+                let leaf_links = context
+                    .store()
+                    .value_symbol_links(leaf)
+                    .cloned()
+                    .unwrap_or_default();
+                let wrong = if damage == 5 {
+                    context
+                        .get_type_from_type_node(
+                            plan.methods[1].method.parameters[0].type_node.unwrap(),
+                        )
+                        .unwrap()
+                } else {
+                    context.store().intrinsic_bootstrap().unwrap().number_type
+                };
+                let store = context.store_mut_for_test();
+                match damage {
+                    0 | 5 => {
+                        assert!(store.set_type_node_links(
+                            root,
+                            TypeNodeLinks {
+                                resolved_type: Some(wrong),
+                                ..TypeNodeLinks::default()
+                            }
+                        ));
+                        assert!(store.set_value_symbol_links(
+                            parameter.symbol,
+                            ValueSymbolLinks {
+                                resolved_type: Some(wrong),
+                                ..ValueSymbolLinks::default()
+                            }
+                        ));
+                    }
+                    1 => {
+                        assert!(store.set_type_node_links(
+                            nested,
+                            TypeNodeLinks {
+                                resolved_type: Some(wrong),
+                                ..TypeNodeLinks::default()
+                            }
+                        ));
+                    }
+                    2 => {
+                        assert!(store.set_value_symbol_links(
+                            leaf,
+                            ValueSymbolLinks {
+                                resolved_type: Some(wrong),
+                                ..ValueSymbolLinks::default()
+                            }
+                        ));
+                    }
+                    3 => {
+                        assert!(store.set_value_symbol_links(
+                            parameter.symbol,
+                            ValueSymbolLinks {
+                                resolved_type: Some(wrong),
+                                ..ValueSymbolLinks::default()
+                            }
+                        ));
+                    }
+                    4 => {
+                        assert!(store.set_symbol_relationships(
+                            parameter.symbol,
+                            None,
+                            None,
+                            Some(owner),
+                            None
+                        ));
+                    }
+                    _ => unreachable!(),
+                }
+                let expected = match damage {
+                    0 | 1 | 5 => ClassError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidLiteralType(if damage == 1 {
+                            nested
+                        } else {
+                            root
+                        }),
+                    )),
+                    2 => {
+                        ClassError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(if warm {
+                            TypeNodeUnavailable::InvalidLiteralType(nested)
+                        } else {
+                            TypeNodeUnavailable::InvalidTypeReference(nested)
+                        }))
+                    }
+                    3 => invariant(ClassInvariant::InvalidPropertyValueCache(parameter.symbol)),
+                    4 => invariant(ClassInvariant::InvalidPropertySymbol(parameter.declaration)),
+                    _ => unreachable!(),
+                };
+                let poisoned = method_snapshot(&context);
+                for _ in 0..2 {
+                    assert_eq!(
+                        plan_source_class_members_with_type_context(
+                            context.store(),
+                            &host,
+                            owner,
+                            Some(&query_context)
+                        ),
+                        Err(expected),
+                        "warm={warm}, damage={damage}"
+                    );
+                    if warm {
+                        assert_eq!(context.get_nongeneric_class_members(owner), Err(expected));
+                        let provenance = context
+                            .store()
+                            .source_class_provenance_for_symbol(owner)
+                            .unwrap();
+                        assert!(
+                            context
+                                .store()
+                                .source_class_annotation_scope(provenance.instance_type())
+                                .is_none()
+                        );
+                        if damage == 0 || damage == 5 {
+                            assert_eq!(
+                                validate_source_class_stored_header(context.store(), provenance),
+                                Err(invariant(ClassInvariant::InvalidInstanceMembers(owner)))
+                            );
+                        }
+                    } else {
+                        assert!(
+                            context
+                                .store()
+                                .source_class_provenance_for_symbol(owner)
+                                .is_none()
+                        );
+                        assert!(context.store().declared_type_links(owner).is_none());
+                    }
+                    assert_eq!(method_snapshot(&context), poisoned);
+                }
+                let store = context.store_mut_for_test();
+                assert!(store.set_type_node_links(root, root_links));
+                assert!(store.set_type_node_links(nested, nested_links));
+                assert!(store.set_value_symbol_links(parameter.symbol, parameter_links));
+                assert!(store.set_value_symbol_links(leaf, leaf_links));
+                assert!(store.set_symbol_relationships(parameter.symbol, None, None, None, None));
+                if let Some(members) = members {
+                    assert_eq!(context.get_nongeneric_class_members(owner), Ok(members));
+                } else {
+                    // A valid nested query can precede the enclosing parameter query.
+                    context.get_type_from_type_node(nested).unwrap();
+                    assert_eq!(
+                        plan_source_class_members_with_type_context(
+                            context.store(),
+                            &host,
+                            owner,
+                            Some(&query_context)
+                        )
+                        .unwrap(),
+                        plan
+                    );
+                    context.check_source_file(FILE).unwrap();
+                }
+                assert!(
+                    context.diagnostics().is_empty(),
+                    "{:?}",
+                    context.diagnostics()
+                );
+                let provenance = context
+                    .store()
+                    .source_class_provenance_for_symbol(owner)
+                    .unwrap();
+                assert!(provenance.complete);
+                assert_eq!(provenance.prepared.plan, plan);
+                assert_eq!(provenance.prepared.annotation_types.len(), 2);
+                assert!(
+                    context
+                        .store()
+                        .source_class_annotation_scope(provenance.instance_type())
+                        .is_none()
+                );
+                let complete = method_snapshot(&context);
+                context.recheck_source_file(FILE).unwrap();
+                assert_eq!(method_snapshot(&context), complete);
+            }
+        }
     }
 
     const SELF_CLASS: &str = concat!(

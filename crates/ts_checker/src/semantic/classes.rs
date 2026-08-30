@@ -57,6 +57,8 @@
 //! paired accessors retain their class brand. Private fields also admit
 //! `null as any`; methods can return private members or evaluate one
 //! authenticated private tagged-template console call.
+//! Unannotated private object fields use the source object checker and normal
+//! widening. Member queries reuse their types only after source completion.
 //! One authenticated class/interface merge can retain a string auto-accessor
 //! and its shared binder-owned property symbol in either declaration order.
 //! A transformed instance field may reference its own constructor parameter and
@@ -75,7 +77,8 @@
 //! diagnostics without replacing binder-owned property symbols.
 //! Direct inherited field calls through `super` retain their exact TS2855 span.
 //! Source-body plans also retain required class-reference constructor parameters,
-//! fixed keyword tuple method parameters, and function-typed fields.
+//! fixed keyword tuple and required property-only type literal method parameters,
+//! and function-typed fields.
 //! Tuple annotations use the ordinary type-node query before method publication.
 //! The source executor checks field initializers before publishing their inferred types.
 //! Direct null fields use the same executor and retain strict-null widening and diagnostics.
@@ -92,6 +95,7 @@ pub(super) use annotations::{
     SourceClassAnnotationScope, begin_retained_source_class_annotations,
     begin_source_class_annotations, class_instance_type_edges, completed_class_symbol,
     source_class_annotation_is_owned, source_class_annotation_scope_targets,
+    source_class_method_annotation_is_owned,
 };
 pub(super) use query::{
     ClassValueQuery, class_query_reference_symbol, selected_class_method_return_type,
@@ -172,6 +176,10 @@ const PROTOTYPE_NAME: &str = "prototype";
 #[cfg(test)]
 #[path = "classes/polymorphic_super_tests.rs"]
 mod polymorphic_super_tests;
+
+#[cfg(test)]
+#[path = "classes/private_object_initializer_tests.rs"]
+mod private_object_initializer_tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ClassPropertySide {
@@ -448,7 +456,7 @@ impl SourceClassPlan {
         self.type_query_context.as_ref()
     }
 
-    /// Written field and constructor types checked by the source type query.
+    /// Written field, constructor, and method types checked by the source type query.
     pub(super) fn annotation_nodes(&self) -> &[NodeRef] {
         &self.annotations
     }
@@ -1008,7 +1016,7 @@ fn source_constructor_parameter(
 fn source_parameter_property<T>(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
-    parameter: ClassConstructorParameterPlan<T>,
+    parameter: &ClassConstructorParameterPlan<T>,
 ) -> Result<Option<ClassPropertyPlan>, ClassError> {
     let Some(property) = parameter.property else {
         return Ok(None);
@@ -1474,16 +1482,16 @@ pub(super) fn plan_source_class_members_with_context(
                         kind: record.kind,
                     }));
                 }
-                for &parameter in &constructor.parameters {
+                for parameter in &constructor.parameters {
                     if let Some(property) = source_parameter_property(store, host, parameter)? {
                         plan.sources
                             .push(source_property_origin(store, symbol, &property));
                         match parameter.type_ {
                             ClassBodyParameterType::Known(type_) => {
-                                plan.properties.push((property, type_))
+                                plan.properties.push((property, type_));
                             }
                             ClassBodyParameterType::Annotation(_) => {
-                                plan.annotated_properties.push(property)
+                                plan.annotated_properties.push(property);
                             }
                             ClassBodyParameterType::ClassReference { .. }
                             | ClassBodyParameterType::Tuple(_) => {
@@ -1509,6 +1517,7 @@ pub(super) fn plan_source_class_members_with_context(
                     plan.header.ambient,
                     true,
                     array_targets,
+                    type_context,
                 )?;
                 let return_type = method
                     .return_type_node
@@ -1626,6 +1635,7 @@ pub(super) fn plan_source_class_members_with_context(
                                 | SyntaxKind::ArrowFunction
                                 | SyntaxKind::Identifier
                                 | SyntaxKind::NullKeyword
+                                | SyntaxKind::ObjectLiteralExpression
                         )
                     ) || source_enum_member_const_assertion(store, host, initializer)?)
                 {
@@ -1760,6 +1770,16 @@ pub(super) fn plan_source_class_members_with_context(
                         })
                     }),
             )
+            .chain(plan.methods.iter().flat_map(|method| {
+                method
+                    .method
+                    .parameters
+                    .iter()
+                    .filter_map(|parameter| match parameter.type_ {
+                        ClassBodyParameterType::Annotation(node) => Some(node),
+                        _ => None,
+                    })
+            }))
             .collect();
         plan.annotations.sort_unstable();
         plan.annotations.dedup();
@@ -2585,6 +2605,26 @@ fn validate_source_class_stored_layout(
                         != Some(type_))
         {
             return Err(reject());
+        }
+        if let Some(type_) = type_
+            && store.source_node_kind(property.type_node)
+                == Some(SyntaxKind::ObjectLiteralExpression)
+        {
+            let initializer = validate_private_object_property_type(
+                store,
+                property,
+                type_,
+                plan.type_query_context
+                    .as_ref()
+                    .map(|context| &context.global_types),
+            )?;
+            validate_property_cache_state_with_types(
+                store,
+                property,
+                type_,
+                Some(initializer),
+                Ok(Some(type_)),
+            )?;
         }
     }
     for (index, method) in plan.methods.iter().enumerate() {
@@ -4663,6 +4703,19 @@ pub(super) fn complete_source_class_body(
             return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
                 body.declaration,
             )));
+        }
+        let property = &prepared.plan.initialized_properties[index];
+        if store.source_node_kind(property.type_node) == Some(SyntaxKind::ObjectLiteralExpression) {
+            validate_private_object_property_type(
+                store,
+                property,
+                type_,
+                prepared
+                    .plan
+                    .type_query_context
+                    .as_ref()
+                    .map(|context| &context.global_types),
+            )?;
         }
         Some((index, symbol, type_))
     } else {
@@ -8037,13 +8090,13 @@ fn plan_constructor_parameter_with_body_mode(
         || type_record.flags.0 != 0
         || type_record.parent != Some(parameter.node)
         || type_record.range.start < name_record.range.end
-        || !matches!(
+        || !(matches!(
             type_record.data,
             NodeData::KeywordTypeNode(_)
                 | NodeData::TypeReferenceNode(_)
                 | NodeData::UnionTypeNode(_)
                 | NodeData::ParenthesizedTypeNode(_)
-        ) && !(source_body
+        ) || source_body
             && matches!(
                 type_record.data,
                 NodeData::ArrayTypeNode(_) | NodeData::TypeOperatorNode(_)
@@ -10243,6 +10296,7 @@ fn plan_class_method_parameter_with_body_mode(
     previous_end: ts_core::TextPos,
     source_body: bool,
     array_targets: Option<CanonicalArrayTargets>,
+    type_context: Option<&ClassTypeQueryContext>,
 ) -> Result<ClassMethodParameterPlan, ClassError> {
     let reject = || accessor_member_error(method, SyntaxKind::MethodDeclaration);
     let record = preflight_node(store, host, parameter)?;
@@ -10410,6 +10464,19 @@ fn plan_class_method_parameter_with_body_mode(
                 Some(type_node),
                 ClassBodyParameterType::Tuple(type_node),
                 cached,
+            )
+        } else if source_body
+            && type_context.is_some()
+            && data.question_token.is_none()
+            && type_record.kind == SyntaxKind::TypeLiteral
+            && matches!(type_record.data, NodeData::TypeLiteralNode(_))
+        {
+            (
+                Some(type_node),
+                ClassBodyParameterType::Annotation(type_node),
+                store
+                    .type_node_links(type_node)
+                    .and_then(|links| links.resolved_type),
             )
         } else {
             return Err(reject());
@@ -11016,6 +11083,7 @@ fn plan_method(
         ambient,
         false,
         None,
+        None,
     )
 }
 
@@ -11029,6 +11097,7 @@ fn plan_method_with_body_mode(
     ambient: bool,
     source_body: bool,
     array_targets: Option<CanonicalArrayTargets>,
+    type_context: Option<&ClassTypeQueryContext>,
 ) -> Result<ClassMethodPlan, ClassError> {
     let (instance_members, static_members) = member_tables;
     let record = preflight_node(store, host, declaration)?;
@@ -11106,6 +11175,7 @@ fn plan_method_with_body_mode(
                 previous_end,
                 source_body,
                 array_targets,
+                type_context,
             )?;
             if optional_seen && !planned.optional {
                 return Err(accessor_member_error(
@@ -12125,6 +12195,16 @@ fn plan_property_with_body_mode(
                 {
                     None
                 }
+                NodeData::ObjectLiteralExpression(_)
+                    if source_body
+                        && private
+                        && merged_auto_accessor.is_none()
+                        && property.type_.is_none()
+                        && initializer_node == type_node
+                        && initializer_record.kind == SyntaxKind::ObjectLiteralExpression =>
+                {
+                    None
+                }
                 _ => {
                     return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
                 }
@@ -12208,7 +12288,9 @@ fn plan_property_with_body_mode(
                     }
                     (None, Some(literal.text.clone()), None, None)
                 }
-                NodeData::KeywordExpression(_) => (None, None, None, None),
+                NodeData::KeywordExpression(_) | NodeData::ObjectLiteralExpression(_) => {
+                    (None, None, None, None)
+                }
                 NodeData::AsExpression(_) if enum_const_assertion => (None, None, None, None),
                 NodeData::AsExpression(assertion) => {
                     let operand = NodeRef::new(member.arena, member.file, assertion.expression);
@@ -17400,6 +17482,45 @@ fn validate_query_property_cache_state(
         resolved_property_value_type(store, property, property_type)
     };
     validate_property_cache_state_with_types(store, property, property_type, None, value)
+}
+
+/// Checks the original object and its canonical widened type without evaluating it.
+fn validate_private_object_property_type(
+    store: &CanonicalTypeMapperStore,
+    property: &ClassPropertyPlan,
+    property_type: TypeId,
+    global_types: Option<&CanonicalGlobalTypes>,
+) -> Result<TypeId, ClassError> {
+    let invalid = || invariant(ClassInvariant::InvalidPropertyTypeCache(property.type_node));
+    let initializer = property.type_node;
+    let raw = store
+        .type_node_links(initializer)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    let record = store.type_payload(raw).ok_or_else(invalid)?;
+    if property.initializer_node != Some(initializer)
+        || store.source_node_kind(initializer) != Some(SyntaxKind::ObjectLiteralExpression)
+        || store.source_node_parent(initializer)
+            != Some(SourceNodeParent::Parent(property.declaration))
+        || store.source_node_kind(property.name_node) != Some(SyntaxKind::PrivateIdentifier)
+        || store
+            .symbol(property.symbol)
+            .is_none_or(|symbol| !symbol.name().is_private_identifier())
+        || record.symbol().is_none()
+        || record.symbol() != store.source_declaration_symbol(initializer)
+        || !store.validate_fresh_object_literal_for_relation(raw)
+        || if record
+            .object_flags()
+            .intersects(ObjectFlags::REQUIRES_WIDENING)
+        {
+            !store.validate_cached_widened_type(raw, property_type, global_types)
+        } else {
+            raw != property_type
+        }
+    {
+        return Err(invalid());
+    }
+    Ok(raw)
 }
 
 fn validate_property_cache_state_with_types(
