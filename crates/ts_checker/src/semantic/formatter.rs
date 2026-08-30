@@ -2206,6 +2206,7 @@ fn validate_source_function_namespace_origin(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // Keep cold and completed class ownership checks together.
 fn display_validated_class_type(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2264,11 +2265,20 @@ fn display_validated_class_type(
     if type_id != instance && Some(type_id) != value {
         return Ok(None);
     }
-    let [declaration] = owner.declarations().unwrap_or_default() else {
-        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    let declaration = match owner.declarations().unwrap_or_default() {
+        [declaration] => *declaration,
+        [_, _]
+            if !cold_instance && owner.flags() == (SymbolFlags::CLASS | SymbolFlags::INTERFACE) =>
+        {
+            // The completed class proof authenticates this merged owner's class declaration.
+            owner
+                .value_declaration()
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?
+        }
+        _ => return Err(TypeDisplayUnavailable::MalformedType(type_id)),
     };
     let declaration_node = host
-        .node(*declaration)
+        .node(declaration)
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
     let NodeData::ClassDeclaration(class) = &declaration_node.data else {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
@@ -2278,14 +2288,14 @@ fn display_validated_class_type(
             || owner.check_flags() != CheckFlags::NONE
             || owner.parent().is_some()
             || owner.export_symbol().is_some()
-            || owner.value_declaration() != Some(*declaration)
+            || owner.value_declaration() != Some(declaration)
             || store.get_merged_symbol(symbol) != Some(symbol)
             || class
                 .type_parameters
                 .as_ref()
                 .is_some_and(|parameters| !parameters.nodes.is_empty())
             || host
-                .bound_file(*declaration)
+                .bound_file(declaration)
                 .is_none_or(|bound| declaration_node.parent != Some(bound.source_file().node)))
     {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
@@ -2294,7 +2304,7 @@ fn display_validated_class_type(
         .name
         .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-    if !host.symbol_matches(store, *declaration, symbol)
+    if !host.symbol_matches(store, declaration, symbol)
         || !host.node(name).is_some_and(|node| {
             matches!(&node.data, NodeData::Identifier(name)
                 if owner.name().as_utf8() == Some(name.text.as_str()))
@@ -12693,6 +12703,306 @@ mod tests {
                     .type_to_string(members.shells().value_type())
                     .unwrap(),
                 format!("typeof {name}")
+            );
+        }
+    }
+
+    const MERGED_AUTO_ACCESSOR_DISPLAY_SOURCES: [&str; 2] = [
+        r#"class Foo { accessor x: string = "abc"; } interface Foo { x: string; }"#,
+        r#"interface Foo { x: string; } class Foo { accessor x: string = "abc"; }"#,
+    ];
+
+    fn source_class_display_owner(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (SemanticSymbolId, NodeRef) {
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        (owner, declaration)
+    }
+
+    fn source_class_display_types(
+        context: &CanonicalCheckerContext<'_>,
+        owner: SemanticSymbolId,
+    ) -> [TypeId; 2] {
+        [
+            context
+                .store()
+                .declared_type_links(owner)
+                .unwrap()
+                .declared_type
+                .unwrap(),
+            context
+                .store()
+                .value_symbol_links(owner)
+                .unwrap()
+                .resolved_type
+                .unwrap(),
+        ]
+    }
+
+    fn assert_source_class_display_without_writes(
+        context: &CanonicalCheckerContext<'_>,
+        type_: TypeId,
+        declaration: NodeRef,
+        expected: Result<&str, TypeDisplayUnavailable>,
+    ) {
+        let before = format!("{:?}", context.store());
+        for _ in 0..2 {
+            assert_eq!(context.type_to_string(type_), expected.map(str::to_owned));
+            assert_eq!(format!("{:?}", context.store()), before);
+            assert_eq!(
+                context.type_to_string_at_location_with_flags(
+                    type_,
+                    declaration,
+                    CanonicalTypeFormatFlags::NO_TRUNCATION
+                        | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE,
+                ),
+                expected.map(str::to_owned),
+            );
+            assert_eq!(format!("{:?}", context.store()), before);
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn merged_auto_accessor_class_display_preserves_both_source_orders_and_replay() {
+        for source in MERGED_AUTO_ACCESSOR_DISPLAY_SOURCES {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(280);
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let (owner, declaration) = source_class_display_owner(&context, &parsed, file);
+            let record = context.store().symbol(owner).unwrap();
+            assert_eq!(record.flags(), SymbolFlags::CLASS | SymbolFlags::INTERFACE);
+            assert_eq!(record.declarations().unwrap().len(), 2);
+            assert_eq!(record.value_declaration(), Some(declaration));
+            let types = source_class_display_types(&context, owner);
+            assert_eq!(
+                validate_class_heritage_members(context.store(), types[0]),
+                ClassHeritageMembersValidation::Valid,
+            );
+            let NodeData::ClassDeclaration(class) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("the owner must retain its class declaration")
+            };
+            let name = NodeRef::new(declaration.arena, file, class.name.unwrap());
+            assert_eq!(context.get_type_at_location(name).unwrap(), types[0]);
+            for (type_, expected) in types.into_iter().zip(["Foo", "typeof Foo"]) {
+                assert_source_class_display_without_writes(
+                    &context,
+                    type_,
+                    declaration,
+                    Ok(expected),
+                );
+            }
+
+            let warm = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(source_class_display_types(&context, owner), types);
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+            for (type_, expected) in types.into_iter().zip(["Foo", "typeof Foo"]) {
+                assert_source_class_display_without_writes(
+                    &context,
+                    type_,
+                    declaration,
+                    Ok(expected),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merged_auto_accessor_class_display_rejects_changed_owner_declarations() {
+        for source in MERGED_AUTO_ACCESSOR_DISPLAY_SOURCES {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(281);
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let (owner, declaration) = source_class_display_owner(&context, &parsed, file);
+            let types = source_class_display_types(&context, owner);
+            let declarations = context
+                .store()
+                .symbol(owner)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .to_vec();
+            let interface = declarations
+                .iter()
+                .copied()
+                .find(|node| *node != declaration)
+                .unwrap();
+            for (changed, value) in [
+                (declarations.clone(), None),
+                (declarations.clone(), Some(interface)),
+                (vec![declaration], Some(declaration)),
+                (vec![declarations[1], declarations[0]], Some(declaration)),
+                (vec![declaration, declaration], Some(declaration)),
+            ] {
+                assert!(context.store_mut_for_test().set_symbol_declarations(
+                    owner,
+                    Some(changed),
+                    value
+                ));
+                assert_eq!(
+                    validate_class_heritage_members(context.store(), types[0]),
+                    ClassHeritageMembersValidation::Malformed,
+                );
+                for type_ in types {
+                    assert_source_class_display_without_writes(
+                        &context,
+                        type_,
+                        declaration,
+                        Err(TypeDisplayUnavailable::MalformedType(type_)),
+                    );
+                }
+                assert!(context.store_mut_for_test().set_symbol_declarations(
+                    owner,
+                    Some(declarations.clone()),
+                    Some(declaration),
+                ));
+                assert_eq!(
+                    validate_class_heritage_members(context.store(), types[0]),
+                    ClassHeritageMembersValidation::Valid,
+                );
+                for (type_, expected) in types.into_iter().zip(["Foo", "typeof Foo"]) {
+                    assert_source_class_display_without_writes(
+                        &context,
+                        type_,
+                        declaration,
+                        Ok(expected),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn merged_auto_accessor_class_display_rejects_changed_constructor_cache() {
+        for source in MERGED_AUTO_ACCESSOR_DISPLAY_SOURCES {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(282);
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let (owner, declaration) = source_class_display_owner(&context, &parsed, file);
+            let types = source_class_display_types(&context, owner);
+            let original = context.store().value_symbol_links(owner).unwrap().clone();
+            let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                owner,
+                ValueSymbolLinks {
+                    resolved_type: Some(wrong),
+                    ..original.clone()
+                },
+            ));
+            assert_eq!(
+                validate_class_heritage_members(context.store(), types[0]),
+                ClassHeritageMembersValidation::Malformed,
+            );
+            for type_ in types {
+                assert_source_class_display_without_writes(
+                    &context,
+                    type_,
+                    declaration,
+                    Err(TypeDisplayUnavailable::MalformedType(type_)),
+                );
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(owner, original)
+            );
+            for (type_, expected) in types.into_iter().zip(["Foo", "typeof Foo"]) {
+                assert_source_class_display_without_writes(
+                    &context,
+                    type_,
+                    declaration,
+                    Ok(expected),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merged_auto_accessor_class_display_keeps_cold_and_other_merges_rejected() {
+        for source in MERGED_AUTO_ACCESSOR_DISPLAY_SOURCES {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(283);
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            let (owner, declaration) = source_class_display_owner(&context, &parsed, file);
+            let instance = context.get_declared_type_of_symbol(owner).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .type_payload(instance)
+                    .unwrap()
+                    .object_flags(),
+                ObjectFlags::CLASS | ObjectFlags::REFERENCE,
+            );
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert_source_class_display_without_writes(
+                &context,
+                instance,
+                declaration,
+                Err(TypeDisplayUnavailable::MalformedType(instance)),
+            );
+        }
+
+        let parsed = parse_source_file("class Model { public run() {} } namespace Model {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(284);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let (owner, declaration) = source_class_display_owner(&context, &parsed, file);
+        let members = context.get_nongeneric_class_members(owner).unwrap();
+        assert_eq!(
+            context.store().symbol(owner).unwrap().flags(),
+            SymbolFlags::CLASS | SymbolFlags::NAMESPACE_MODULE,
+        );
+        assert_eq!(
+            validate_class_heritage_members(context.store(), members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+        for type_ in [
+            members.shells().instance_type(),
+            members.shells().value_type(),
+        ] {
+            assert_source_class_display_without_writes(
+                &context,
+                type_,
+                declaration,
+                Err(TypeDisplayUnavailable::MalformedType(type_)),
             );
         }
     }
