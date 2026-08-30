@@ -1324,7 +1324,7 @@ mod tests {
                         None
                     )),
                     Damage::BaseCache => {
-                        assert!(store.set_resolved_base_constraint(mapped, Some(string)))
+                        assert!(store.set_resolved_base_constraint(mapped, Some(string)));
                     }
                 }
                 let poisoned_owner = store.type_payload(mapped).unwrap().symbol();
@@ -1359,7 +1359,7 @@ mod tests {
                 match damage {
                     Damage::Owner => assert!(store.set_type_symbol(mapped, owner)),
                     Damage::DeclarationCache => {
-                        assert!(store.set_type_node_links(declaration, links))
+                        assert!(store.set_type_node_links(declaration, links));
                     }
                     Damage::Mapper => assert!(store.set_object_target_and_mapper(
                         mapped,
