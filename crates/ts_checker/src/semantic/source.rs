@@ -54117,9 +54117,14 @@ fn recover_deferred_constructor_class_order(
     diagnostics: &CanonicalCheckerDiagnostics,
     error: SourceCheckError,
 ) -> bool {
-    let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(failure)) = error else {
+    if !matches!(
+        error,
+        SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Class(_) | UnsupportedSourceSyntax::New(_)
+        )
+    ) {
         return false;
-    };
+    }
     let Some(facts) = bound.source_facts() else {
         return false;
     };
@@ -54312,7 +54317,16 @@ fn recover_deferred_constructor_class_order(
     let Ok(last_plan) = plan_nongeneric_class_member_query(store, host, last.symbol) else {
         return false;
     };
-    [first.declaration, field, constructor, annotation].contains(&failure)
+    let expected_failure = match error {
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(failure)) => {
+            [first.declaration, field, constructor, annotation].contains(&failure)
+        }
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(failure)) => {
+            failure == construction
+        }
+        _ => false,
+    };
+    expected_failure
         && first.symbol != middle.symbol
         && first.symbol != last.symbol
         && middle.symbol != last.symbol
@@ -78852,6 +78866,165 @@ mod tests {
     }
 
     #[test]
+    fn deferred_constructor_order_recovery_matches_only_the_actual_failure_node() {
+        let source = parsed(DEFERRED_CLASS_ORDER_SOURCE);
+        let file = FileId::new(11_760);
+        let context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let declaration = context
+            .store()
+            .symbol(global_symbol(&context, "bar"))
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .unwrap();
+        let NodeData::ClassDeclaration(class) = &source.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the retained owner is the first class")
+        };
+        let [field, constructor] = class.members.nodes.as_slice() else {
+            panic!("the retained class has its original field and constructor")
+        };
+        let field = NodeRef::new(source.arena.id(), file, *field);
+        let constructor = NodeRef::new(source.arena.id(), file, *constructor);
+        let NodeData::PropertyDeclaration(property) = &source.arena.get(field.node).unwrap().data
+        else {
+            panic!("the first member is the original annotated field")
+        };
+        let annotation = NodeRef::new(source.arena.id(), file, property.type_.unwrap());
+        let construction = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::NewExpression(new_expression) =
+            &source.arena.get(construction.node).unwrap().data
+        else {
+            panic!("the actual construction retains its expression")
+        };
+        let callee = NodeRef::new(source.arena.id(), file, new_expression.expression);
+        let recovers = |failure| {
+            recover_deferred_constructor_class_order(
+                &source.arena,
+                &bound,
+                &host,
+                context.store(),
+                context.diagnostics(),
+                SourceCheckError::Unsupported(failure),
+            )
+        };
+        let cold = observable_state(&context, file);
+
+        for anchor in [declaration, field, constructor, annotation] {
+            assert!(recovers(UnsupportedSourceSyntax::Class(anchor)));
+            assert!(!recovers(UnsupportedSourceSyntax::New(anchor)));
+        }
+        assert!(recovers(UnsupportedSourceSyntax::New(construction)));
+        assert!(!recovers(UnsupportedSourceSyntax::Class(construction)));
+        for anchor in [bound.source_file(), callee] {
+            assert!(!recovers(UnsupportedSourceSyntax::Class(anchor)));
+            assert!(!recovers(UnsupportedSourceSyntax::New(anchor)));
+        }
+        assert!(!recovers(UnsupportedSourceSyntax::Property(construction)));
+        assert_eq!(observable_state(&context, file), cold);
+        assert!(!is_type_checked(&context, file));
+        for name in ["bar", "baz", "foo"] {
+            let symbol = global_symbol(&context, name);
+            assert!(context.store().declared_type_links(symbol).is_none());
+            assert!(context.store().value_symbol_links(symbol).is_none());
+        }
+    }
+
+    #[test]
+    fn deferred_constructor_order_recovery_keeps_new_expression_caches_cold() {
+        let source = parsed(DEFERRED_CLASS_ORDER_SOURCE);
+        let file = FileId::new(11_761);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let construction = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let recovers = |context: &CanonicalCheckerContext<'_>| {
+            recover_deferred_constructor_class_order(
+                &source.arena,
+                &bound,
+                &host,
+                context.store(),
+                context.diagnostics(),
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(construction)),
+            )
+        };
+        let cold = observable_state(&context, file);
+        assert!(context.store().type_node_links(construction).is_none());
+        assert!(context.store().symbol_node_links(construction).is_none());
+        assert!(recovers(&context));
+        assert_eq!(observable_state(&context, file), cold);
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            construction,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+        assert!(!recovers(&context));
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(construction, TypeNodeLinks::default())
+        );
+        let restored = observable_state(&context, file);
+        assert!(recovers(&context));
+        assert_eq!(observable_state(&context, file), restored);
+
+        let target = global_symbol(&context, "foo");
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            construction,
+            SymbolNodeLinks {
+                resolved_symbol: Some(target),
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+        assert!(!recovers(&context));
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_symbol_node_links(construction, SymbolNodeLinks::default())
+        );
+        let restored = observable_state(&context, file);
+        assert!(recovers(&context));
+        assert_eq!(observable_state(&context, file), restored);
+        assert!(!is_type_checked(&context, file));
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
     fn class_order_recovery_rejects_unrelated_inheritance_and_constructor_shapes() {
         for (index, text) in [
             String::from("class A extends B {} class B {}"),
@@ -79614,15 +79787,16 @@ mod tests {
             let base = global_symbol(&context, "Super");
             let interface = global_symbol(&context, "Options");
             let cold = observable_state(&context, file);
+            let result = context.check_source_file(file);
 
             assert!(
                 matches!(
-                    context.check_source_file(file),
+                    result,
                     Err(SourceCheckError::Unsupported(
                         UnsupportedSourceSyntax::Class(_)
                     ))
                 ),
-                "{text}",
+                "{text}: {result:?}",
             );
             assert_eq!(observable_state(&context, file), cold, "{text}");
             for symbol in [owner, base, interface] {
