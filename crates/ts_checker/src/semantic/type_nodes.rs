@@ -337,6 +337,242 @@ pub(super) fn validate_cached_merged_global_value_annotation(
     Ok(())
 }
 
+/// Replays an unchanged parameter's object union without publishing query state.
+/// The returned order belongs to this annotation, not to the canonical union.
+#[allow(clippy::too_many_lines)] // Source, member, and union cache proofs must agree.
+pub(super) fn cached_source_object_union_display_types(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    annotation: NodeRef,
+    expected: TypeId,
+) -> Result<Option<Vec<TypeId>>, DeclaredTypeError> {
+    let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidUnionType(annotation));
+    let record = preflight_node(store, host, annotation)?;
+    let NodeData::UnionTypeNode(union) = &record.data else {
+        return Ok(None);
+    };
+    for &child in &union.types.nodes {
+        let child = NodeRef::new(annotation.arena, annotation.file, child);
+        if !matches!(
+            preflight_node(store, host, child)?.kind,
+            SyntaxKind::TypeLiteral | SyntaxKind::TypeReference
+        ) {
+            return Ok(None);
+        }
+    }
+    let parameter = NodeRef::new(
+        annotation.arena,
+        annotation.file,
+        record.parent.ok_or_else(invalid)?,
+    );
+    if !matches!(&preflight_node(store, host, parameter)?.data,
+        NodeData::ParameterDeclaration(data) if data.type_ == Some(annotation.node))
+    {
+        return Err(invalid());
+    }
+    let owner = store
+        .source_declaration_symbol(parameter)
+        .ok_or_else(invalid)?;
+    if !host.symbol_matches(store, parameter, owner) {
+        return Err(invalid());
+    }
+    let targets = global_types.map(CanonicalArrayTargets::from_global_types);
+    let aliases = HashMap::new();
+    let mut planner = TypeQueryPlanner::new(
+        store,
+        host,
+        targets.map(CanonicalArrayTargets::array_type),
+        targets,
+        store
+            .claimed_strict_builtin_iterator_return()
+            .ok_or_else(invalid)?,
+        &aliases,
+    );
+    planner.lazy_interface_values = true;
+    planner.replay_cached_annotations = true;
+
+    // Select the source family before planning. Do not expand an alias or a
+    // callable member merely to decide whether to reuse this annotation.
+    let mut pending = vec![annotation];
+    let mut visited = HashSet::new();
+    let mut annotation_nodes = BTreeSet::new();
+    while let Some(node) = pending.pop() {
+        if !visited.insert(node) {
+            return Err(invalid());
+        }
+        let kind = preflight_node(store, host, node)?.kind;
+        let is_type_node = (SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
+            .contains(&(kind as u16));
+        if kind.is_keyword_type() || is_type_node {
+            annotation_nodes.insert(node);
+        }
+        if is_type_node
+            && !matches!(
+                kind,
+                SyntaxKind::TypeReference
+                    | SyntaxKind::TypeLiteral
+                    | SyntaxKind::UnionType
+                    | SyntaxKind::LiteralType
+                    | SyntaxKind::ParenthesizedType
+            )
+        {
+            return Ok(None);
+        }
+        if matches!(
+            kind,
+            SyntaxKind::MethodSignature
+                | SyntaxKind::CallSignature
+                | SyntaxKind::ConstructSignature
+                | SyntaxKind::GetAccessor
+                | SyntaxKind::SetAccessor
+        ) {
+            return Ok(None);
+        }
+        if kind == SyntaxKind::TypeReference {
+            let symbol = planner.resolve_uncached_type_reference_symbol(node)?;
+            let flags = store.symbol(symbol).ok_or_else(invalid)?.flags();
+            let top_level = preflight_node(store, host, node)?.parent == Some(annotation.node);
+            if !flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+                && (top_level || !flags.contains(SymbolFlags::TYPE_PARAMETER))
+            {
+                return Ok(None);
+            }
+        }
+        pending.extend(store.source_direct_children(node).ok_or_else(invalid)?);
+    }
+    planner.plan_type_node(annotation)?;
+
+    for node in annotation_nodes {
+        let cached = planner.cached_type_node_identity(owner, node)?;
+        let syntax = preflight_node(store, host, node)?;
+        if syntax.kind == SyntaxKind::ParenthesizedType {
+            planner.validate_replayed_annotation_cache(node)?;
+        } else if !store.source_direct_type_annotation_is_exact(node, cached) {
+            return Err(invalid());
+        }
+        if (syntax.kind.is_keyword_type() || planner.plan.literals.contains_key(&node))
+            && planner.plan.cached_annotation_type(
+                store,
+                host,
+                targets,
+                node,
+                &mut HashSet::new(),
+            )? != Some(cached)
+        {
+            return Err(invalid());
+        }
+        if let Some(reference) = planner.plan.references.get(&node) {
+            let resolved = planner.resolve_uncached_type_reference_symbol(node)?;
+            if store.get_merged_symbol(resolved) != Some(reference.symbol)
+                || reference.arity != PlannedTypeReferenceArity::Valid
+                || store.symbol_node_links(node)
+                    != Some(&SymbolNodeLinks {
+                        resolved_symbol: Some(reference.symbol),
+                    })
+            {
+                return Err(invalid());
+            }
+            let flags = store.symbol(reference.symbol).ok_or_else(invalid)?.flags();
+            if flags.contains(SymbolFlags::TYPE_PARAMETER) {
+                if cached_ordinary_type_parameter_owner(store, cached) != Some(reference.symbol) {
+                    return Err(invalid());
+                }
+            } else {
+                planner.validate_cached_class_or_interface_reference(
+                    owner,
+                    node,
+                    reference.symbol,
+                    cached,
+                )?;
+            }
+        } else if store
+            .symbol_node_links(node)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+        {
+            return Err(invalid());
+        }
+        if let Some(literal) = planner.plan.type_literals.get(&node) {
+            if !matches!(object_members::type_literal_state(store, literal).map_err(property_object_error)?,
+                Some(PropertyObjectState::Resolved(actual) | PropertyObjectState::EmptyBootstrap(actual))
+                    if actual == cached)
+            {
+                return Err(invalid());
+            }
+            let properties = literal
+                .properties
+                .iter()
+                .map(|property| planner.cached_type_node_identity(owner, property.type_node))
+                .collect::<Result<Vec<_>, _>>()?;
+            let indexes = literal
+                .index_type_nodes()
+                .map(|(key, value)| {
+                    Ok((
+                        planner.cached_type_node_identity(owner, key)?,
+                        planner.cached_type_node_identity(owner, value)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, DeclaredTypeError>>()?;
+            object_members::validate_resolved_declared_member_types(
+                store,
+                literal,
+                &properties,
+                &indexes,
+                &[],
+            )
+            .map_err(property_object_error)?;
+        }
+        if let Some(union) = planner.plan.unions.get(&node) {
+            let types = union
+                .types
+                .iter()
+                .map(|child| planner.cached_type_node_identity(owner, *child))
+                .collect::<Result<Vec<_>, _>>()?;
+            if store
+                .cached_literal_union_type_with_alias(&types, None, targets)
+                .map_err(type_construction_error)?
+                != Some(cached)
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    if planner.cached_type_node_identity(owner, annotation)? != expected {
+        return Err(invalid());
+    }
+    let planned = planner.plan.unions.get(&annotation).ok_or_else(invalid)?;
+    let types = planned
+        .types
+        .iter()
+        .map(|child| planner.cached_type_node_identity(owner, *child))
+        .collect::<Result<Vec<_>, _>>()?;
+    if types.iter().any(|type_| {
+        store
+            .type_payload(*type_)
+            .is_none_or(|record| record.flags() != TypeFlags::OBJECT)
+    }) {
+        return Err(invalid());
+    }
+    let record = store.type_payload(expected).ok_or_else(invalid)?;
+    let TypeData::Union(canonical) = record.data() else {
+        return Ok(None);
+    };
+    if record.alias().is_some()
+        || canonical.origin.is_some()
+        || canonical.union.types.len() != types.len()
+        || types.iter().collect::<HashSet<_>>().len() != types.len()
+    {
+        return Ok(None);
+    }
+    if types
+        .iter()
+        .any(|type_| !canonical.union.types.contains(type_))
+    {
+        return Err(invalid());
+    }
+    Ok(Some(types))
+}
+
 /// Keeps the checked source identities while the ordinary query publishes its types.
 /// Parentheses, keywords, and null do not require their own node cache entries.
 pub(super) struct ConstructorAnnotationProof {
