@@ -20,13 +20,14 @@ use super::{
     },
     signatures::SignatureFlags,
     source_callables::{
-        CallableTypePredicatePlan, SourceCallableError, SourceCallablePlan,
+        CallableTypePredicatePlan, SourceCallableBodyMode, SourceCallableError, SourceCallablePlan,
         SourceCallableReturnPlan, cached_annotation_identity, plan_callable_type_predicate,
-        plan_source_ambient_overload_declaration, valid_optional_type,
+        plan_source_ambient_overload_declaration, plan_source_jsdoc_overload_declaration,
+        valid_optional_type,
     },
     store::{
         PreparedSourceOverloadParameter, PreparedSourceOverloadPublication,
-        PreparedSourceOverloadSignature, SourceNodeParent,
+        PreparedSourceOverloadSignature, SourceNodeParent, SourceOverloadImplementation,
     },
     type_records::{ConstrainedTypeData, TypeCacheState, TypeData},
     types::{ObjectFlags, TypeFlags},
@@ -36,6 +37,7 @@ use super::{
 pub(super) struct SourceOverloadPlan {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) declarations: Vec<SourceCallablePlan>,
+    pub(super) implementation: Option<SourceOverloadImplementation>,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
 }
 
@@ -668,6 +670,60 @@ pub(super) fn plan_source_ambient_overload_group(
     declarations: &[NodeRef],
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<SourceOverloadPlan, SourceOverloadError> {
+    plan_source_overload_group(store, host, owner_symbol, declarations, None, array_targets)
+}
+
+pub(super) fn plan_source_jsdoc_overload_group(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner_symbol: SemanticSymbolId,
+    declarations: &[NodeRef],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceOverloadPlan, SourceOverloadError> {
+    let first = declarations
+        .first()
+        .copied()
+        .ok_or(SourceOverloadError::Invariant(
+            SourceOverloadInvariant::EmptyGroup,
+        ))?;
+    let (arena, _) = host.source(first).ok_or(SourceOverloadError::Invariant(
+        SourceOverloadInvariant::Group(first),
+    ))?;
+    let group = super::jsdoc::authenticated_jsdoc_overload_group(arena, first)
+        .filter(|group| group.declarations == declarations)
+        .ok_or(SourceOverloadError::Unsupported(first))?;
+    let Some(NodeData::FunctionDeclaration(function)) =
+        arena.get(group.implementation.node).map(|node| &node.data)
+    else {
+        return Err(SourceOverloadError::Invariant(
+            SourceOverloadInvariant::Group(first),
+        ));
+    };
+    let body = function.body.ok_or(SourceOverloadError::Invariant(
+        SourceOverloadInvariant::Group(group.implementation),
+    ))?;
+    let implementation = SourceOverloadImplementation {
+        declaration: group.implementation,
+        body: NodeRef::new(first.arena, first.file, body),
+    };
+    plan_source_overload_group(
+        store,
+        host,
+        owner_symbol,
+        declarations,
+        Some(implementation),
+        array_targets,
+    )
+}
+
+fn plan_source_overload_group(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner_symbol: SemanticSymbolId,
+    declarations: &[NodeRef],
+    implementation: Option<SourceOverloadImplementation>,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceOverloadPlan, SourceOverloadError> {
     let Some(first) = declarations.first().copied() else {
         return Err(SourceOverloadError::Invariant(
             SourceOverloadInvariant::EmptyGroup,
@@ -727,7 +783,12 @@ pub(super) fn plan_source_ambient_overload_group(
         if bound.local_symbol(*declaration).is_some() {
             return Err(SourceOverloadError::Unsupported(*declaration));
         }
-        plans.push(plan_source_ambient_overload_declaration(
+        let planner = if implementation.is_some() {
+            plan_source_jsdoc_overload_declaration
+        } else {
+            plan_source_ambient_overload_declaration
+        };
+        plans.push(planner(
             store,
             host,
             *declaration,
@@ -739,6 +800,7 @@ pub(super) fn plan_source_ambient_overload_group(
     let plan = SourceOverloadPlan {
         owner_symbol,
         declarations: plans,
+        implementation,
         array_targets,
     };
     validate_plan_state(store, &plan)?;
@@ -924,6 +986,7 @@ pub(super) fn prepare_source_overload_publication(
     Ok(PreparedSourceOverloadPublication {
         owner_symbol: plan.owner_symbol,
         signatures,
+        implementation: plan.implementation,
         array_targets: plan.array_targets,
     })
 }
@@ -1008,6 +1071,25 @@ fn source_overload_state(
         .ok_or(SourceOverloadError::Invariant(
             SourceOverloadInvariant::EmptyGroup,
         ))?;
+    if plan.declarations.len() < 2
+        || plan
+            .declarations
+            .iter()
+            .enumerate()
+            .any(|(index, declaration)| match plan.implementation {
+                Some(implementation) if index + 1 == plan.declarations.len() => {
+                    declaration.declaration != implementation.declaration
+                        || declaration.body != implementation.body
+                        || declaration.body_mode != SourceCallableBodyMode::Present
+                }
+                Some(_) => declaration.body_mode != SourceCallableBodyMode::OverloadDeclaration,
+                None => declaration.body_mode != SourceCallableBodyMode::AmbientDeclaration,
+            })
+    {
+        return Err(SourceOverloadError::Invariant(
+            SourceOverloadInvariant::Group(first.declaration),
+        ));
+    }
     let owner_links = store.value_symbol_links(plan.owner_symbol);
     let declarations_cold = plan.declarations.iter().all(|declaration| {
         store
@@ -1077,6 +1159,7 @@ fn source_overload_state(
                 SourceOverloadInvariant::Cache(first.declaration),
             ))?;
     if provenance.owner_symbol != plan.owner_symbol
+        || provenance.implementation != plan.implementation
         || provenance.array_targets != plan.array_targets
         || provenance.signatures.len() != plan.declarations.len()
     {
@@ -1131,6 +1214,7 @@ fn prepared_matches_plan(
     prepared: &PreparedSourceOverloadPublication,
 ) -> bool {
     plan.owner_symbol == prepared.owner_symbol
+        && plan.implementation == prepared.implementation
         && plan.array_targets == prepared.array_targets
         && plan.declarations.len() == prepared.signatures.len()
         && plan
@@ -1197,6 +1281,9 @@ pub(super) fn validate_stored_source_overload(
         .iter()
         .map(|signature| signature.signature)
         .collect::<Vec<_>>();
+    let public_count = signatures
+        .len()
+        .saturating_sub(usize::from(provenance.implementation.is_some()));
     let TypeData::Object(object) = record.data() else {
         return StoredSourceOverloadValidation::Malformed;
     };
@@ -1226,8 +1313,14 @@ pub(super) fn validate_stored_source_overload(
         || object.structured.constrained != ConstrainedTypeData::default()
         || object.structured.members.is_some()
         || object.structured.properties.is_some()
-        || object.structured.signatures.as_deref() != Some(signatures.as_slice())
-        || object.structured.call_signature_count != signatures.len()
+        || object.structured.signatures.as_deref() != Some(&signatures[..public_count])
+        || object.structured.call_signature_count != public_count
+        || provenance.implementation.is_some_and(|implementation| {
+            declarations.last().copied() != Some(implementation.declaration)
+                || store.source_node_kind(implementation.body) != Some(SyntaxKind::Block)
+                || store.source_node_parent(implementation.body)
+                    != Some(SourceNodeParent::Parent(implementation.declaration))
+        })
         || object.structured.index_infos.is_some()
         || object
             .structured
@@ -1364,6 +1457,40 @@ pub(super) fn validate_stored_source_overload(
         edges.push(row.return_type);
     }
     StoredSourceOverloadValidation::Valid(edges)
+}
+
+/// Projects one real cached signature, including the hidden implementation.
+/// This does not allocate a callable type or change the public call list.
+pub(super) fn source_overload_signature_projection(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    signature: SignatureId,
+) -> Option<super::callables::ValidatedSingleCallable> {
+    if !matches!(
+        validate_stored_source_overload(store, type_),
+        StoredSourceOverloadValidation::Valid(_)
+    ) {
+        return None;
+    }
+    let row = store
+        .source_overload_provenance(type_)?
+        .signatures
+        .iter()
+        .find(|row| row.signature == signature)?;
+    let record = store.signature(signature)?;
+    Some(super::callables::ValidatedSingleCallable {
+        owner: type_,
+        signature,
+        parameters: row
+            .parameters
+            .iter()
+            .map(|parameter| parameter.call_type)
+            .collect(),
+        rest_parameter: None,
+        min_argument_count: usize::try_from(record.min_argument_count()).ok()?,
+        return_type: Some(row.return_type),
+        strict_variance_exempt: false,
+    })
 }
 
 #[cfg(test)]

@@ -524,11 +524,19 @@ pub(super) struct SourceOverloadSignatureProvenance {
     pub(super) return_type: TypeId,
 }
 
-/// Immutable source/binder provenance for one local ambient overload value.
+/// The actual body declaration hidden from a source overload's call list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceOverloadImplementation {
+    pub(super) declaration: NodeRef,
+    pub(super) body: NodeRef,
+}
+
+/// Immutable source/binder provenance for one local overload value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceOverloadProvenance {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) signatures: Box<[SourceOverloadSignatureProvenance]>,
+    pub(super) implementation: Option<SourceOverloadImplementation>,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
 }
 
@@ -561,6 +569,7 @@ pub(super) struct PreparedSourceOverloadSignature {
 pub(super) struct PreparedSourceOverloadPublication {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) signatures: Vec<PreparedSourceOverloadSignature>,
+    pub(super) implementation: Option<SourceOverloadImplementation>,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
 }
 
@@ -614,6 +623,13 @@ pub(super) struct ResolvedSourceCallableTypeParameter {
     pub(super) default_type: TypeId,
 }
 
+/// Published receiver and value types stay separate from mutable signature links.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CallableSignatureParameterTypes {
+    this_type: Option<TypeId>,
+    parameters: Vec<TypeId>,
+}
+
 /// Dependency-closed inputs for publishing one source generic callable.
 ///
 /// The opaque syntax proof is produced only by source planning. The store
@@ -630,6 +646,7 @@ pub(super) struct PreparedSourceGenericCallablePublication<'a> {
     pub(super) export_local: Option<SemanticSymbolId>,
     pub(super) type_parameters: Vec<ResolvedSourceCallableTypeParameter>,
     pub(super) query_evidence: Option<Arc<SourceCallableTypeQueryEvidence>>,
+    pub(super) this_parameter: Option<SemanticSymbolId>,
     pub(super) parameters: Vec<SemanticSymbolId>,
     pub(super) flags: SignatureFlags,
     pub(super) min_argument_count: i32,
@@ -827,7 +844,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     /// discriminator and origin-preservation mode.
     properties_types: HashMap<PropertiesTypeCacheKey, TypeId>,
     function_signature_return_annotations: HashMap<SignatureId, (NodeRef, bool)>,
-    callable_signature_parameter_types: HashMap<SignatureId, Vec<TypeId>>,
+    callable_signature_parameter_types: HashMap<SignatureId, CallableSignatureParameterTypes>,
     checked_source_callable_returns: HashMap<SignatureId, TypeId>,
     signature_return_provenance: HashMap<SignatureId, SignatureReturnProvenance>,
     canonical_tuple_targets: HashMap<CanonicalTupleTargetKey, CanonicalTupleTargetProvenance>,
@@ -1205,6 +1222,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .source_file_facts
                 .get(&node.file)
                 .is_some_and(|facts| !facts.is_javascript_file() && facts.is_external_module())
+    }
+
+    /// Reads the registered source language without restricting module ownership.
+    #[must_use]
+    pub(super) fn source_is_typescript(&self, node: NodeRef) -> bool {
+        self.contains_node_ref(node)
+            && self
+                .source_file_facts
+                .get(&node.file)
+                .is_some_and(|facts| !facts.is_javascript_file())
     }
 
     /// Checks immutable binder ownership, including canonical merged-symbol redirects.
@@ -2592,7 +2619,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 matches!(
                     provenance.family,
                     SourceCallableFamily::ArrowFunction | SourceCallableFamily::ObjectLiteralMethod
-                ) && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+                ) && (provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+                    || self.source_node_kind(provenance.declaration)
+                        == Some(SyntaxKind::FunctionExpression))
                     && provenance.captured_assignment.is_none()
                     && target != type_
                     && self.types.get(target).is_some()
@@ -3249,7 +3278,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             let Some(target_parameters) = self
                 .callable_signature_parameter_types
                 .get(&target_signature)
-                .map(Vec::as_slice)
+                .map(|types| types.parameters.as_slice())
             else {
                 return false;
             };
@@ -3545,7 +3574,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 == Some(owner_symbol)
     }
 
-    /// Proves the exact variable, property, or method owner of a contextual callable.
+    /// Proves the exact variable, property, or method anchor of a contextual callable.
     pub(super) fn source_contextual_callable_anchor_is_exact(
         &self,
         declaration: NodeRef,
@@ -3562,7 +3591,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if anchor == owner_symbol
             || self.get_merged_symbol(owner_symbol) != Some(owner_symbol)
             || self.get_merged_symbol(anchor) != Some(anchor)
-            || self.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
+            || !matches!(
+                self.source_node_kind(declaration),
+                Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression)
+            )
             || owner.flags() != SymbolFlags::FUNCTION
             || owner.check_flags() != CheckFlags::NONE
             || owner.declarations() != Some(&[declaration])
@@ -3589,7 +3621,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return false;
         }
 
-        if symbol.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE {
+        if symbol.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+            || self.source_node_kind(declaration) == Some(SyntaxKind::FunctionExpression)
+                && symbol.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        {
             return symbol.parent().is_none()
                 && self.source_node_kind(anchor_declaration)
                     == Some(SyntaxKind::VariableDeclaration)
@@ -5333,8 +5368,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     .callable_signature_parameter_types
                     .get(&signature_id)
                     .is_some_and(|cached| {
-                        cached.len() != signature.parameters().len()
-                            || signature.parameters().iter().zip(cached).any(
+                        cached.parameters.len() != signature.parameters().len()
+                            || signature.parameters().iter().zip(&cached.parameters).any(
                                 |(parameter, expected)| {
                                     self.value_symbol_links(*parameter)
                                         .and_then(|links| links.resolved_type)
@@ -5569,7 +5604,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             _ => return None,
         }
 
-        if let Some(parameter_types) = self.callable_signature_parameter_types.get(&signature) {
+        if let Some(parameter_types) = self.callable_signature_parameter_types(signature) {
             if parameter_types.len() != signature_record.parameters().len() {
                 return None;
             }
@@ -8297,8 +8332,21 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         &mut self,
         parameter_types: Vec<(SignatureId, Vec<TypeId>)>,
     ) -> bool {
+        self.set_callable_signature_parameter_types_with_this_batch(
+            parameter_types
+                .into_iter()
+                .map(|(signature, types)| (signature, None, types))
+                .collect(),
+        )
+    }
+
+    /// Publishes a source receiver without adding it to the signature's value list.
+    pub(super) fn set_callable_signature_parameter_types_with_this_batch(
+        &mut self,
+        parameter_types: Vec<(SignatureId, Option<TypeId>, Vec<TypeId>)>,
+    ) -> bool {
         let mut signatures = HashSet::with_capacity(parameter_types.len());
-        if parameter_types.iter().any(|(signature, types)| {
+        if parameter_types.iter().any(|(signature, this_type, types)| {
             !signatures.insert(*signature)
                 || self
                     .callable_signature_parameter_types
@@ -8307,6 +8355,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 || self
                     .signature(*signature)
                     .is_none_or(|record| record.parameters().len() != types.len())
+                || this_type.is_some_and(|type_| {
+                    self.types.get(type_).is_none()
+                        || self.signature(*signature).is_none_or(|record| {
+                            record.this_parameter().is_none()
+                                || record.declaration().is_none_or(|declaration| {
+                                    !self.node_is_source_callable_declaration(declaration)
+                                })
+                        })
+                })
                 || self.signature(*signature).is_some_and(|record| {
                     record.declaration().is_some_and(|declaration| {
                         self.node_is_global_interface_method(declaration)
@@ -8328,11 +8385,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
         let relation_dirty = parameter_types
             .iter()
-            .any(|(signature, _)| self.relation_signature_is_observable(*signature));
-        for (signature, types) in parameter_types {
-            let previous = self
-                .callable_signature_parameter_types
-                .insert(signature, types);
+            .any(|(signature, _, _)| self.relation_signature_is_observable(*signature));
+        for (signature, this_type, parameters) in parameter_types {
+            let previous = self.callable_signature_parameter_types.insert(
+                signature,
+                CallableSignatureParameterTypes {
+                    this_type,
+                    parameters,
+                },
+            );
             assert!(
                 previous.is_none(),
                 "callable parameter provenance was prevalidated absent"
@@ -8351,7 +8412,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.observe_relation_signature_read(signature);
         self.callable_signature_parameter_types
             .get(&signature)
-            .map(Vec::as_slice)
+            .map(|types| types.parameters.as_slice())
+    }
+
+    pub(super) fn callable_signature_this_parameter_type(
+        &self,
+        signature: SignatureId,
+    ) -> Option<TypeId> {
+        self.observe_relation_signature_read(signature);
+        self.callable_signature_parameter_types
+            .get(&signature)
+            .and_then(|types| types.this_type)
     }
 
     pub(super) fn callable_signature_parameter_types_len(&self) -> usize {
@@ -10428,7 +10499,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         Some(type_)
     }
 
-    /// Publishes a dependency-closed batch of local ambient overload groups.
+    /// Publishes a dependency-closed batch of local overload groups.
     ///
     /// Every source, binder, cache, and capacity edge is checked before the
     /// first callable identity is allocated. Once allocation begins, all
@@ -10463,6 +10534,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .first()
                 .and_then(|declaration| self.source_node_parent(*declaration));
             if group.signatures.len() < 2
+                || group.implementation.is_some_and(|implementation| {
+                    declaration_order.last().copied() != Some(implementation.declaration)
+                        || self.source_node_kind(implementation.body) != Some(SyntaxKind::Block)
+                        || self.source_node_parent(implementation.body)
+                            != Some(SourceNodeParent::Parent(implementation.declaration))
+                })
                 || !owners.insert(group.owner_symbol)
                 || owner.flags() != SymbolFlags::FUNCTION
                 || owner.check_flags() != CheckFlags::NONE
@@ -10635,6 +10712,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                         SourceOverloadProvenance {
                             owner_symbol: group.owner_symbol,
                             signatures: provenance_rows,
+                            implementation: group.implementation,
                             array_targets: group.array_targets,
                         },
                     )
@@ -10664,14 +10742,20 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     ..ValueSymbolLinks::default()
                 },
             ));
-            assert!(self.set_structured_type_members(
-                type_,
-                None,
-                None,
-                Some(signature_ids.clone()),
-                None,
-                None,
-            ));
+            assert!(
+                self.set_structured_type_members(
+                    type_,
+                    None,
+                    None,
+                    Some(
+                        signature_ids
+                            [..signature_ids.len() - usize::from(group.implementation.is_some())]
+                            .to_vec()
+                    ),
+                    None,
+                    None,
+                )
+            );
             for (signature, signature_id) in group.signatures.iter().zip(&signature_ids) {
                 assert!(self.set_signature_links(
                     signature.declaration,
@@ -11159,9 +11243,13 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             return false;
         }
         let relation_dirty = self.relation_signature_is_observable(signature);
-        let previous = self
-            .callable_signature_parameter_types
-            .insert(signature, parameter_types);
+        let previous = self.callable_signature_parameter_types.insert(
+            signature,
+            CallableSignatureParameterTypes {
+                this_type: None,
+                parameters: parameter_types,
+            },
+        );
         assert!(
             previous.is_none(),
             "the partial construct parameter list was absent"
@@ -12110,6 +12198,20 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         &mut self,
         prepared: PreparedSourceGenericCallablePublication<'_>,
     ) -> Option<(TypeId, SignatureId)> {
+        let written_this =
+            super::source_callables::source_callable_this_parameter(self, prepared.declaration)
+                .ok()?;
+        if prepared.this_parameter != written_this.map(|parameter| parameter.symbol)
+            || prepared.this_parameter.is_some_and(|parameter| {
+                parameter == prepared.owner_symbol
+                    || prepared.parameters.contains(&parameter)
+                    || self
+                        .value_symbol_links(parameter)
+                        .is_some_and(|links| links != &ValueSymbolLinks::default())
+            })
+        {
+            return None;
+        }
         let next_signature_local =
             NonZeroU32::new(u32::try_from(self.signature_len().checked_add(1)?).ok()?)?;
         let next_signature =
@@ -12260,16 +12362,20 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                     .source_callable_alias_owners
                     .contains_key(&alias.owner())
                 && (prepared.return_annotation == Some(alias.owner_annotation())
-                    || prepared.parameters.iter().any(|parameter| {
-                        self.symbol(*parameter)
-                            .and_then(Symbol::value_declaration)
-                            .is_some_and(|declaration| {
-                                self.source_return_annotation_belongs_to(
-                                    declaration,
-                                    alias.owner_annotation(),
-                                )
-                            })
-                    }))
+                    || prepared
+                        .parameters
+                        .iter()
+                        .chain(prepared.this_parameter.iter())
+                        .any(|parameter| {
+                            self.symbol(*parameter)
+                                .and_then(Symbol::value_declaration)
+                                .is_some_and(|declaration| {
+                                    self.source_return_annotation_belongs_to(
+                                        declaration,
+                                        alias.owner_annotation(),
+                                    )
+                                })
+                        }))
                 && (alias.owner() == prepared.owner_symbol && alias.has_cold_value(self)
                     || prepared
                         .syntax
@@ -12398,7 +12504,11 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             .iter()
             .map(|row| row.provenance.type_parameter)
             .collect::<Vec<_>>();
-        let value_link_reservations = prepared.parameters.len().checked_add(1)?;
+        let value_link_reservations = prepared
+            .parameters
+            .len()
+            .checked_add(usize::from(prepared.this_parameter.is_some()))?
+            .checked_add(1)?;
         if !self.try_reserve_types(1)
             || !self.try_reserve_signatures(1)
             || !self.try_reserve_source_callable_provenance(1)
@@ -12430,7 +12540,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                 prepared.flags,
                 Some(prepared.declaration),
                 type_parameter_ids,
-                None,
+                prepared.this_parameter,
                 prepared.parameters,
                 None,
                 None,
@@ -12579,6 +12689,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             || plan.type_parameter_syntax.as_ref() != prepared.syntax
             || evidence.type_parameters() != prepared.type_parameters.as_slice()
             || evidence.base_constraints().len() != prepared.type_parameters.len()
+            || plan.this_parameter.map(|parameter| parameter.symbol) != prepared.this_parameter
             || !plan
                 .parameters
                 .iter()
@@ -20324,6 +20435,7 @@ mod tests {
                 export_local: plan.export_local,
                 type_parameters: vec![resolved],
                 query_evidence: None,
+                this_parameter: None,
                 parameters,
                 flags: plan.flags,
                 min_argument_count: minimum,
@@ -20475,6 +20587,7 @@ mod tests {
                 export_local: plan.export_local,
                 type_parameters: vec![resolved],
                 query_evidence: None,
+                this_parameter: None,
                 parameters: vec![value],
                 flags: plan.flags,
                 min_argument_count: 1,

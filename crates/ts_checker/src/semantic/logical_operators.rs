@@ -591,7 +591,7 @@ fn collect_union_leaves(
     Ok(())
 }
 
-fn base_type_of_literal_type(
+pub(super) fn base_type_of_literal_type(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
     type_: TypeId,

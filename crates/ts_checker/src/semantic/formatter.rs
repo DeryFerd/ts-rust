@@ -3048,13 +3048,28 @@ fn display_source_overload_set(
     let provenance = store
         .source_overload_provenance(type_id)
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let signatures = store
+        .type_payload(type_id)
+        .and_then(|record| record.data().structured())
+        .and_then(|structured| structured.signatures.as_deref())
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
     if !visiting.insert(type_id) {
         return Err(TypeDisplayUnavailable::CyclicType(type_id));
     }
     let result = (|| {
-        let mut result = String::from("{ ");
-        state.add(4);
-        for row in &provenance.signatures {
+        let overloaded = signatures.len() > 1;
+        let mut result = if overloaded {
+            state.add(4);
+            String::from("{ ")
+        } else {
+            String::new()
+        };
+        for signature in signatures {
+            let row = provenance
+                .signatures
+                .iter()
+                .find(|row| row.signature == *signature)
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
             if !host.symbol_matches(store, row.declaration, provenance.owner_symbol) {
                 return Err(TypeDisplayUnavailable::MalformedType(type_id));
             }
@@ -3069,8 +3084,9 @@ fn display_source_overload_set(
                 visiting,
                 &mut result,
             )?;
-            result.push_str(": ");
-            state.add(2);
+            let separator = if overloaded { ": " } else { " => " };
+            result.push_str(separator);
+            state.add(separator.len());
             result.push_str(&display_type_worker(
                 store,
                 Some(host),
@@ -3080,10 +3096,14 @@ fn display_source_overload_set(
                 state,
                 visiting,
             )?);
-            result.push_str("; ");
-            state.add(2);
+            if overloaded {
+                result.push_str("; ");
+                state.add(2);
+            }
         }
-        result.push('}');
+        if overloaded {
+            result.push('}');
+        }
         Ok(result)
     })();
     visiting.remove(&type_id);

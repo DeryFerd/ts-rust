@@ -76,6 +76,7 @@ pub(super) struct PlannedCrossFileGlobalRead {
 }
 
 /// One computed object binding whose symbol belongs to the binding element.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PlannedComputedBindingElement {
     pub(super) declaration: NodeRef,
@@ -105,6 +106,7 @@ pub(super) struct PlannedObjectBindingElement {
     pub(super) initializer: Option<NodeRef>,
     pub(super) rest: bool,
     pub(super) excluded_properties: Vec<String>,
+    pub(super) excluded_computed_keys: Vec<NodeRef>,
     pub(super) name: NodeRef,
     pub(super) symbol: SemanticSymbolId,
 }
@@ -389,6 +391,7 @@ fn plan_variable_declaration(
 }
 
 /// Proves one top-level `{ [key]: name }` binding without publishing its type.
+#[cfg(test)]
 pub(super) fn plan_top_level_computed_binding_element(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -967,11 +970,6 @@ pub(super) fn plan_function_object_parameter_bindings(
             let property = NodeRef::new(element.arena, element.file, property);
             let property_record = binding_child_node(arena, store, property, element)?;
             if let NodeData::ComputedPropertyName(computed) = &property_record.data {
-                if contextual_arrow {
-                    return Err(VariablePlanError::Unsupported(
-                        VariableUnsupported::BindingPattern(property),
-                    ));
-                }
                 let key = NodeRef::new(property.arena, property.file, computed.expression);
                 let key_record = binding_child_node(arena, store, key, property)?;
                 if !matches!(
@@ -979,6 +977,8 @@ pub(super) fn plan_function_object_parameter_bindings(
                     SyntaxKind::StringLiteral
                         | SyntaxKind::NumericLiteral
                         | SyntaxKind::NoSubstitutionTemplateLiteral
+                        | SyntaxKind::Identifier
+                        | SyntaxKind::CallExpression
                 ) {
                     return Err(VariablePlanError::Unsupported(
                         VariableUnsupported::BindingPattern(key),
@@ -1172,7 +1172,7 @@ fn plan_object_binding_pattern(
     }
 
     let mut excluded_properties = Vec::with_capacity(pattern_data.elements.nodes.len());
-    let mut has_dynamic_computed_property = false;
+    let mut excluded_computed_keys = Vec::new();
     for (index, element) in pattern_data.elements.nodes.iter().enumerate() {
         let element = NodeRef::new(pattern.arena, pattern.file, *element);
         let element_record = binding_child_node(arena, store, element, pattern)?;
@@ -1254,6 +1254,12 @@ fn plan_object_binding_pattern(
                     {
                         key.text.clone()
                     }
+                    NodeData::BigIntLiteral(key)
+                        if key_record.kind == SyntaxKind::BigIntLiteral
+                            && key.token_flags.0 == 0 =>
+                    {
+                        key.text.clone()
+                    }
                     NodeData::NoSubstitutionTemplateLiteral(key)
                         if key_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral
                             && key.token_flags.0 == 0
@@ -1330,7 +1336,6 @@ fn plan_object_binding_pattern(
                 || pattern_data.elements.has_trailing_comma
                 || data.property_name.is_some()
                 || initializer.is_some()
-                || has_dynamic_computed_property
             {
                 return Err(VariablePlanError::Unsupported(
                     VariableUnsupported::BindingPattern(element),
@@ -1407,13 +1412,21 @@ fn plan_object_binding_pattern(
             return Err(VariableInvariant::InvalidBindingPattern(element).into());
         }
         if !rest {
-            has_dynamic_computed_property |= computed_key.is_some_and(|key| {
+            if let Some(key) = computed_key.filter(|key| {
                 matches!(
-                    store.source_node_kind(key),
-                    Some(SyntaxKind::Identifier | SyntaxKind::CallExpression)
+                    store.source_node_kind(*key),
+                    Some(
+                        SyntaxKind::Identifier
+                            | SyntaxKind::CallExpression
+                            | SyntaxKind::NumericLiteral
+                            | SyntaxKind::BigIntLiteral
+                    )
                 )
-            });
-            excluded_properties.push(property_name.clone());
+            }) {
+                excluded_computed_keys.push(key);
+            } else {
+                excluded_properties.push(property_name.clone());
+            }
         }
         planned.push(PlannedObjectBindingElement {
             element,
@@ -1425,6 +1438,11 @@ fn plan_object_binding_pattern(
             rest,
             excluded_properties: if rest {
                 excluded_properties.clone()
+            } else {
+                Vec::new()
+            },
+            excluded_computed_keys: if rest {
+                excluded_computed_keys.clone()
             } else {
                 Vec::new()
             },
@@ -3345,18 +3363,18 @@ mod tests {
 
     #[test]
     fn typed_function_object_parameters_reject_unsupported_binding_shapes() {
-        for (index, source) in [
-            "function read({ value }: { value: number } = { value: 1 }) {}",
-            "function read({ value = 1 }: { value?: number }) {}",
-            "function read({ ...rest }: { value: number }) {}",
-            "function read({ [key]: value }: { value: number }) {}",
-            "function read({ nested: { value } }: { nested: { value: number } }) {}",
-            "function read({ value }) {}",
-            "function read<T>({ value }: { value: number }) {}",
-            "declare function read({ value }: { value: number }): void;",
-            "declare namespace Scope { function read({ value }: { value: number }) {} }",
-            "type Shape<T> = { value: T }; function read({ value }: Shape<number>) {}",
-            "namespace Scope { export interface Shape { value: number } } function read({ value }: Scope.Shape) {}",
+        for (index, (source, retains_computed_key)) in [
+            ("function read({ value }: { value: number } = { value: 1 }) {}", false),
+            ("function read({ value = 1 }: { value?: number }) {}", false),
+            ("function read({ ...rest }: { value: number }) {}", false),
+            ("function read({ [key]: value }: { value: number }) {}", true),
+            ("function read({ nested: { value } }: { nested: { value: number } }) {}", false),
+            ("function read({ value }) {}", false),
+            ("function read<T>({ value }: { value: number }) {}", false),
+            ("declare function read({ value }: { value: number }): void;", false),
+            ("declare namespace Scope { function read({ value }: { value: number }) {} }", false),
+            ("type Shape<T> = { value: T }; function read({ value }: Shape<number>) {}", false),
+            ("namespace Scope { export interface Shape { value: number } } function read({ value }: Scope.Shape) {}", false),
         ]
         .into_iter()
         .enumerate()
@@ -3368,21 +3386,42 @@ mod tests {
                 fixture.store.symbol_len(),
                 fixture.store.checker_link_allocated_lengths(),
             );
-            assert!(
-                matches!(
-                    plan_function_object_parameter_bindings(
-                        &fixture.parsed.arena,
-                        &fixture.bound,
-                        &fixture.store,
-                        function,
-                        parameter,
-                    ),
-                    Err(VariablePlanError::Unsupported(
-                        VariableUnsupported::BindingPattern(_)
-                    )),
-                ),
-                "{source}"
+            let result = plan_function_object_parameter_bindings(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                function,
+                parameter,
             );
+            if retains_computed_key {
+                let planned = result.unwrap();
+                let [binding] = planned.as_slice() else {
+                    panic!("expected one computed parameter binding")
+                };
+                let NodeData::ComputedPropertyName(computed) =
+                    &fixture.parsed.arena.get(binding.property.node).unwrap().data
+                else {
+                    panic!("expected the original computed property name")
+                };
+                let key = NodeRef::new(function.arena, function.file, computed.expression);
+                assert_eq!(binding.computed_key, Some(key));
+                assert_eq!(
+                    fixture.store.source_node_parent(key),
+                    Some(SourceNodeParent::Parent(binding.property)),
+                );
+                assert!(fixture.store.type_node_links(key).is_none());
+                assert!(fixture.store.value_symbol_links(binding.symbol).is_none());
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(VariablePlanError::Unsupported(
+                            VariableUnsupported::BindingPattern(_)
+                        )),
+                    ),
+                    "{source}"
+                );
+            }
             assert_eq!(
                 (
                     fixture.store.type_len(),
@@ -3956,19 +3995,28 @@ mod tests {
             fixture.store.checker_link_allocated_lengths(),
         );
 
-        assert!(matches!(
-            plan_top_level_object_binding_elements(
-                &fixture.parsed.arena,
-                &fixture.bound,
-                &fixture.store,
-                declaration,
-                VariableBindingKind::Const,
-                false,
-            ),
-            Err(VariablePlanError::Unsupported(
-                VariableUnsupported::BindingPattern(_)
-            ))
-        ));
+        let planned = plan_top_level_object_binding_elements(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            declaration,
+            VariableBindingKind::Const,
+            false,
+        )
+        .unwrap();
+        let [selected, rest] = planned.as_slice() else {
+            panic!("expected one computed binding and its rest binding")
+        };
+        let key = selected.computed_key.unwrap();
+        assert_eq!(rest.excluded_computed_keys, vec![key]);
+        assert!(rest.excluded_properties.is_empty());
+        assert_eq!(
+            fixture.store.source_node_parent(key),
+            Some(SourceNodeParent::Parent(selected.property)),
+        );
+        for binding in &planned {
+            assert!(fixture.store.value_symbol_links(binding.symbol).is_none());
+        }
         assert_eq!(
             (
                 fixture.store.type_len(),

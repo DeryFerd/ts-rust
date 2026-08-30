@@ -1764,10 +1764,12 @@ pub(super) fn check_direct_source_property_with_session(
         plan,
         receiver_type,
         session,
+        true,
         |store, receiver, name, session| {
             resolve_direct_source_own_property(store, global_types, receiver, name, session)
         },
     )
+    .map(|(checked, _)| checked)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Uses the caller's source query for unresolved members.
@@ -1781,7 +1783,62 @@ pub(super) fn check_direct_source_property_with_source(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<CheckedSourceProperty, SourcePropertyQueryError> {
+    check_direct_source_property_with_source_mode(
+        store,
+        host,
+        global_types,
+        options,
+        plan,
+        receiver_type,
+        session,
+        diagnostics,
+        true,
+    )
+    .map(|(checked, _)| checked)
+}
+
+/// Resolves a dotted call target without caching a provisional source read.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn source_property_type_for_effects(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<(TypeId, Option<SemanticSymbolId>), SourcePropertyQueryError> {
+    check_direct_source_property_with_source_mode(
+        store,
+        host,
+        global_types,
+        options,
+        plan,
+        receiver_type,
+        session,
+        diagnostics,
+        false,
+    )
+    .map(|(checked, symbol)| (checked.type_, symbol))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn check_direct_source_property_with_source_mode(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    publish: bool,
+) -> Result<(CheckedSourceProperty, Option<SemanticSymbolId>), SourcePropertyQueryError> {
     if matches!(plan.position, SourcePropertyPosition::WriteTarget(_)) {
+        if !publish {
+            return Err(unsupported_access(plan.node).into());
+        }
         return check_direct_source_property_with_session(
             store,
             Some(global_types),
@@ -1789,6 +1846,7 @@ pub(super) fn check_direct_source_property_with_source(
             receiver_type,
             session,
         )
+        .map(|checked| (checked, None))
         .map_err(SourcePropertyQueryError::Property);
     }
     check_direct_source_property_worker(
@@ -1797,6 +1855,7 @@ pub(super) fn check_direct_source_property_with_source(
         plan,
         receiver_type,
         session,
+        publish,
         |store, receiver, name, session| {
             let property_alias =
                 super::object_aliases::property_object_alias_projection(store, receiver)?.is_some();
@@ -2084,13 +2143,14 @@ fn check_direct_source_property_worker<E>(
     plan: &SourcePropertyPlan,
     receiver_type: TypeId,
     session: &mut InstantiationSession,
+    publish: bool,
     mut resolve_own_property: impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
         &str,
         &mut InstantiationSession,
     ) -> Result<Option<ResolvedOwnProperty>, E>,
-) -> Result<CheckedSourceProperty, E>
+) -> Result<(CheckedSourceProperty, Option<SemanticSymbolId>), E>
 where
     E: From<SourcePropertyError> + From<RelationUnavailable>,
 {
@@ -2108,6 +2168,9 @@ where
         )
     };
     if let SourcePropertyPrivacy::Private { enclosing_class } = plan.privacy {
+        if !publish {
+            return Err(unsupported_access(plan.node).into());
+        }
         return check_private_source_property(
             store,
             plan,
@@ -2115,6 +2178,7 @@ where
             error_type,
             enclosing_class,
         )
+        .map(|checked| (checked, None))
         .map_err(E::from);
     }
     let (receiver_type, propagate_undefined) = if plan.optional && receiver_type != any {
@@ -2402,11 +2466,16 @@ where
         type_
     };
 
-    publish_property_links(store, plan.node, property, type_)?;
-    Ok(CheckedSourceProperty {
-        type_,
-        diagnostics: diagnostic.into_iter().collect(),
-    })
+    if publish {
+        publish_property_links(store, plan.node, property, type_)?;
+    }
+    Ok((
+        CheckedSourceProperty {
+            type_,
+            diagnostics: diagnostic.into_iter().collect(),
+        },
+        property,
+    ))
 }
 
 fn class_context_member(
