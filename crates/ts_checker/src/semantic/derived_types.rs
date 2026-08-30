@@ -2257,11 +2257,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     ) -> bool {
         self.observe_relation_derived_cache_source_read(union);
         self.observe_relation_derived_cache_source_read(source);
-        if self
-            .derived_types
-            .contextual_widened_types
-            .get(&(union, source))
-            != Some(&target)
+        if source == target
+            || self
+                .derived_types
+                .contextual_widened_types
+                .get(&(union, source))
+                != Some(&target)
         {
             return false;
         }
@@ -2303,8 +2304,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .collect::<Vec<_>>();
         let retained = source_shape.object_flags
             & (ObjectFlags::JS_LITERAL | ObjectFlags::NON_INFERRABLE_TYPE);
-        if source == target
-            || target_shape.flags != TypeFlags::OBJECT
+        if target_shape.flags != TypeFlags::OBJECT
             || target_shape.object_flags
                 != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED | retained
             || target_shape.symbol != source_shape.symbol
