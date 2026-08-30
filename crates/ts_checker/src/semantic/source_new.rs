@@ -1066,7 +1066,7 @@ pub(super) fn plan_direct_default_new_with_type_context(
         (SourceNewTarget::ConstructorOverloads(Box::new(class)), None)
     } else if let Some(class) = prior_source_classes
         .get(&symbol)
-        .filter(|_| symbol_record.flags() == SymbolFlags::CLASS)
+        .filter(|class| symbol_record.flags() == SymbolFlags::CLASS && !class.has_object_base())
     {
         if !class.has_own_default_constructor() || early_preparation {
             return Err(unsupported(SourceNewUnsupported::Constructor(constructor)));

@@ -437,6 +437,10 @@ impl SourceClassPlan {
             && self.header.null_base.is_none()
     }
 
+    pub(super) const fn has_object_base(&self) -> bool {
+        self.header.base.is_some()
+    }
+
     pub(super) const fn is_abstract(&self) -> bool {
         self.header.abstract_class
     }
