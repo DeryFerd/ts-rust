@@ -4095,7 +4095,7 @@ pub(super) fn source_object_property_arrow_symbol(
 }
 
 /// Authenticates one unparenthesized callback in a direct, array, or global sort call.
-#[allow(clippy::too_many_lines)] // Validate the callback, array owner, and top-level container.
+#[allow(clippy::too_many_lines)] // Validate the callback, array owner, and source container.
 pub(super) fn source_direct_call_argument_arrow_is_exact(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -4237,6 +4237,9 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
                 && store.source_node_parent(statement)
                     == Some(SourceNodeParent::Parent(bound.source_file()))
         }
+        NodeData::BinaryExpression(_) => {
+            source_captured_assignment_callback_is_exact(store, host, call, callee, container)?
+        }
         _ => false,
     };
     Ok(container_valid
@@ -4255,6 +4258,212 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
                 && symbol.export_symbol().is_none()
         })
         && callee_valid)
+}
+
+/// Keeps an Array callback inside the existing captured-local assignment proof.
+#[allow(clippy::too_many_lines)] // The assignment, captured receiver, and library member share one owner check.
+fn source_captured_assignment_callback_is_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    call: NodeRef,
+    callee: NodeRef,
+    assignment: NodeRef,
+) -> Result<bool, SourceCallableError> {
+    let assignment_record = preflight_node(store, host, assignment)?;
+    let NodeData::BinaryExpression(binary) = &assignment_record.data else {
+        return Ok(false);
+    };
+    let callee_record = preflight_node(store, host, callee)?;
+    let NodeData::PropertyAccessExpression(access) = &callee_record.data else {
+        return Ok(false);
+    };
+    let target = NodeRef::new(assignment.arena, assignment.file, binary.left);
+    let operator = NodeRef::new(assignment.arena, assignment.file, binary.operator_token);
+    let receiver = NodeRef::new(callee.arena, callee.file, access.expression);
+    let target_record = preflight_node(store, host, target)?;
+    let receiver_record = preflight_node(store, host, receiver)?;
+    let operator_record = preflight_node(store, host, operator)?;
+    let (NodeData::Identifier(target_name), NodeData::Identifier(receiver_name)) =
+        (&target_record.data, &receiver_record.data)
+    else {
+        return Ok(false);
+    };
+    if assignment_record.kind != SyntaxKind::BinaryExpression
+        || assignment_record.flags.0 != 0
+        || binary.right != call.node
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.modifiers.is_some()
+        || binary.facts != 0
+        || operator_record.kind != SyntaxKind::EqualsToken
+        || operator_record.parent != Some(assignment.node)
+        || operator_record.flags.0 != 0
+        || target_record.kind != SyntaxKind::Identifier
+        || target_record.parent != Some(assignment.node)
+        || target_record.flags.0 != 0
+        || target_name.flow_node.is_some()
+        || receiver_record.kind != SyntaxKind::Identifier
+        || receiver_record.parent != Some(callee.node)
+        || receiver_record.flags.0 != 0
+        || receiver_name.flow_node.is_some()
+    {
+        return Ok(false);
+    }
+    let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(assignment) else {
+        return Ok(false);
+    };
+    let statement_record = preflight_node(store, host, statement)?;
+    let NodeData::ExpressionStatement(expression) = &statement_record.data else {
+        return Ok(false);
+    };
+    let Some(SourceNodeParent::Parent(body)) = store.source_node_parent(statement) else {
+        return Ok(false);
+    };
+    let body_record = preflight_node(store, host, body)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Ok(false);
+    };
+    let Some(SourceNodeParent::Parent(writer)) = store.source_node_parent(body) else {
+        return Ok(false);
+    };
+    let writer_record = preflight_node(store, host, writer)?;
+    let NodeData::ArrowFunction(arrow) = &writer_record.data else {
+        return Ok(false);
+    };
+    let (arena, bound) = host
+        .source(call)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidSyntax(call)))?;
+    if statement_record.kind != SyntaxKind::ExpressionStatement
+        || statement_record.flags.0 != 0
+        || expression.expression != assignment.node
+        || expression.flow_node.is_some()
+        || body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || block.facts != 0
+        || block
+            .statements
+            .nodes
+            .iter()
+            .filter(|node| **node == statement.node)
+            .count()
+            != 1
+        || writer_record.kind != SyntaxKind::ArrowFunction
+        || arrow.body != body.node
+        || bound.container(call) != Some(writer)
+        || bound.flow_container(call) != Some(writer)
+        || bound.container(receiver) != Some(writer)
+        || bound.flow_container(receiver) != Some(writer)
+    {
+        return Ok(false);
+    }
+    let mut callback_host = host.name_resolver_host(store)?;
+    let mut resolver =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(DeclaredTypeError::from)?;
+    let Some(symbol) = resolver
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(target)),
+            &target_name.text,
+            SymbolFlags::VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?
+    else {
+        return Ok(false);
+    };
+    if resolver
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(receiver)),
+            &receiver_name.text,
+            SymbolFlags::VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?
+        != Some(symbol)
+    {
+        return Ok(false);
+    }
+    for node in [target, receiver] {
+        if store
+            .symbol_node_links(node)
+            .is_some_and(|links| links.resolved_symbol.is_some_and(|actual| actual != symbol))
+        {
+            return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(node)));
+        }
+    }
+    if super::source_flow::plan_source_captured_local(store, host, writer, target, symbol)
+        .map_err(|_| invariant(SourceCallableInvariant::InvalidOwnerSymbol(target)))?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    let declaration = store
+        .symbol(symbol)
+        .and_then(ts_binder::semantic::Symbol::value_declaration)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(target)))?;
+    let declaration_record = preflight_node(store, host, declaration)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Ok(false);
+    };
+    let Some(annotation) = variable.type_ else {
+        return Ok(false);
+    };
+    let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
+    let annotation_record = preflight_node(store, host, annotation)?;
+    let NodeData::ArrayTypeNode(array) = &annotation_record.data else {
+        return Ok(false);
+    };
+    let element = NodeRef::new(annotation.arena, annotation.file, array.element_type);
+    if annotation_record.kind != SyntaxKind::ArrayType
+        || annotation_record.flags.0 != 0
+        || annotation_record.parent != Some(declaration.node)
+        || preflight_node(store, host, element)?.parent != Some(annotation.node)
+    {
+        return Ok(false);
+    }
+    let Some(name) = super::source_calls::source_global_array_callback_method_name(host, callee)
+    else {
+        return Ok(false);
+    };
+    let Some(array) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("Array"))
+        .and_then(|array| store.get_merged_symbol(array))
+    else {
+        return Ok(false);
+    };
+    let Some(method) = store
+        .symbol(array)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source(&name))
+        .and_then(|method| store.get_merged_symbol(method))
+    else {
+        return Ok(false);
+    };
+    if store
+        .authenticated_interface_method_owner(method)
+        .is_none_or(|(owner, _)| owner != array)
+    {
+        return Ok(false);
+    }
+    let name = NodeRef::new(callee.arena, callee.file, access.name);
+    for node in [callee, name] {
+        if store
+            .symbol_node_links(node)
+            .is_some_and(|links| links.resolved_symbol.is_some_and(|actual| actual != method))
+        {
+            return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(node)));
+        }
+    }
+    Ok(true)
 }
 
 /// Authenticates an anonymous function assigned to a real class prototype method.
@@ -20998,6 +21207,416 @@ mod tests {
         );
         assert_eq!(publication_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep real captured owners, cache corruption, and restoration in one source fixture.
+    fn captured_assignment_callback_ownership_is_read_only_cold_and_warm() {
+        let library = parse_source_file(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let parsed = parse_source_file(concat!(
+            "type Observer<T> = { next: (value: T) => void; };\n",
+            "type Subscription = { unsubscribe: () => void; };\n",
+            "export default <T>(seed: T): T => {\n",
+            "  let _observers: Observer<T>[] = [];\n",
+            "  const subscribe = (observer: Observer<T>): Subscription => {\n",
+            "    _observers.push(observer);\n",
+            "    return {\n",
+            "      unsubscribe: () => {\n",
+            "        _observers = _observers.filter((o) => o !== observer);\n",
+            "      },\n",
+            "    };\n",
+            "  };\n",
+            "  return seed;\n",
+            "};\n",
+        ));
+        let library_file = FileId::new(8_282);
+        let file = FileId::new(8_283);
+        let files = [(library_file, &library), (file, &parsed)];
+        let mut binder = CanonicalBinder::new();
+        for (id, source) in files {
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let is_library = id == library_file;
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    id,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(if is_library {
+                            "\"/lib/lib.es5.d.ts\""
+                        } else {
+                            "\"/project/captured-filter.ts\""
+                        }),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_library,
+                        is_library,
+                        if is_library {
+                            CanonicalModuleState::Script
+                        } else {
+                            CanonicalModuleState::External
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+        for (id, source) in files {
+            binder
+                .bind_typescript_declaration_slice(&source.arena, id)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .into_iter()
+                .map(|(id, source)| (id, &source.arena))
+                .collect(),
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, &library_bound), (&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let callback = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction
+                    && record.parent.is_some_and(|parent| {
+                        parsed.arena.get(parent).unwrap().kind == SyntaxKind::CallExpression
+                    }))
+                .then_some(reference(node))
+            })
+            .unwrap();
+        let owner = bound.symbol(callback).unwrap();
+        let NodeData::ArrowFunction(callback_data) = &host.node(callback).unwrap().data else {
+            unreachable!()
+        };
+        let parameter = reference(callback_data.parameters.nodes[0]);
+        let call = reference(host.node(callback).unwrap().parent.unwrap());
+        let NodeData::CallExpression(call_data) = &host.node(call).unwrap().data else {
+            unreachable!()
+        };
+        let callee = reference(call_data.expression);
+        let NodeData::PropertyAccessExpression(access) = &host.node(callee).unwrap().data else {
+            unreachable!()
+        };
+        let receiver = reference(access.expression);
+        let method_name = reference(access.name);
+        let assignment = reference(host.node(call).unwrap().parent.unwrap());
+        let NodeData::BinaryExpression(binary) = &host.node(assignment).unwrap().data else {
+            unreachable!()
+        };
+        let target = reference(binary.left);
+        let writer = bound.container(call).unwrap();
+        let writer_owner = bound.symbol(writer).unwrap();
+        let cold = generic_transaction_state(context.store());
+        let plan = plan_source_callable(context.store(), &host, callback, owner, None).unwrap();
+        assert_eq!(plan.declaration, callback);
+        assert_eq!(plan.owner_symbol, owner);
+        assert_eq!(plan.parameters.len(), 1);
+        assert_eq!(plan.parameters[0].declaration, parameter);
+        assert_eq!(plan.parameters[0].symbol, bound.symbol(parameter).unwrap());
+        assert!(plan.parameters[0].is_implicit_any());
+        assert_eq!(plan.parameters[0].explicit_type_node(), None);
+        assert_eq!(plan.min_argument_count, 1);
+        assert!(plan.return_type.is_inferred());
+        assert_eq!(plan.body.node, callback_data.body);
+        assert_eq!(generic_transaction_state(context.store()), cold);
+        assert!(
+            context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
+        assert!(context.store().signature_links(callback).is_none());
+        assert!(
+            context
+                .store()
+                .value_symbol_links(plan.parameters[0].symbol)
+                .is_none()
+        );
+
+        // Allocate empty cache slots once so each poison can restore the exact slot state.
+        for node in [target, receiver, callee, method_name] {
+            assert!(context.store().symbol_node_links(node).is_none());
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(node, SymbolNodeLinks::default())
+            );
+        }
+        let empty_slots = generic_transaction_state(context.store());
+        for node in [target, receiver, callee, method_name] {
+            assert!(context.store_mut_for_test().set_symbol_node_links(
+                node,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(owner)
+                },
+            ));
+            let poisoned = generic_transaction_state(context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    plan_source_callable(context.store(), &host, callback, owner, None),
+                    Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(node))),
+                );
+                assert_eq!(generic_transaction_state(context.store()), poisoned);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(node, SymbolNodeLinks::default())
+            );
+            assert_eq!(
+                plan_source_callable(context.store(), &host, callback, owner, None),
+                Ok(plan.clone())
+            );
+            assert_eq!(generic_transaction_state(context.store()), empty_slots);
+        }
+
+        let original_writer = context.store().symbol(writer_owner).unwrap();
+        let declarations = original_writer.declarations().unwrap().to_vec();
+        let value_declaration = original_writer.value_declaration();
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            writer_owner,
+            Some(declarations.clone()),
+            Some(callback),
+        ));
+        let poisoned = generic_transaction_state(context.store());
+        assert_eq!(
+            plan_source_callable(context.store(), &host, callback, owner, None),
+            Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
+                target
+            ))),
+        );
+        assert_eq!(generic_transaction_state(context.store()), poisoned);
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            writer_owner,
+            Some(declarations),
+            value_declaration
+        ));
+        assert_eq!(
+            plan_source_callable(context.store(), &host, callback, owner, None),
+            Ok(plan.clone())
+        );
+        assert_eq!(generic_transaction_state(context.store()), empty_slots);
+
+        let array_owner = context
+            .store()
+            .type_payload(context.global_types().array_type)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let method = context
+            .store()
+            .symbol(array_owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("filter"))
+            .unwrap();
+        let method_record = context.store().symbol(method).unwrap();
+        let relationships = (
+            method_record.members(),
+            method_record.exports(),
+            method_record.parent(),
+            method_record.export_symbol(),
+        );
+        assert_eq!(
+            context.store().authenticated_interface_method_owner(method),
+            Some((array_owner, context.global_types().array_type))
+        );
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            method,
+            relationships.0,
+            relationships.1,
+            Some(writer_owner),
+            relationships.3,
+        ));
+        let poisoned = generic_transaction_state(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                source_direct_call_argument_arrow_is_exact(context.store(), &host, callback),
+                Ok(false)
+            );
+            assert_eq!(
+                plan_source_callable(context.store(), &host, callback, owner, None),
+                Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::MissingParameterType(parameter)
+                )),
+            );
+            assert_eq!(
+                context.store().symbol(method).unwrap().parent(),
+                Some(writer_owner)
+            );
+            assert_eq!(generic_transaction_state(context.store()), poisoned);
+        }
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            method,
+            relationships.0,
+            relationships.1,
+            relationships.2,
+            relationships.3
+        ));
+        assert_eq!(
+            plan_source_callable(context.store(), &host, callback, owner, None),
+            Ok(plan.clone())
+        );
+        assert_eq!(generic_transaction_state(context.store()), empty_slots);
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let warm = generic_transaction_state(context.store());
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        assert!(matches!(
+            validate_stored_source_callable(context.store(), callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        for _ in 0..2 {
+            assert_eq!(
+                plan_source_callable(context.store(), &host, callback, owner, None),
+                Ok(plan.clone())
+            );
+            assert_eq!(generic_transaction_state(context.store()), warm);
+        }
+        let receiver_links = context.store().symbol_node_links(receiver).unwrap().clone();
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            receiver,
+            SymbolNodeLinks {
+                resolved_symbol: Some(writer_owner)
+            }
+        ));
+        let poisoned = generic_transaction_state(context.store());
+        assert_eq!(
+            source_direct_call_argument_arrow_is_exact(context.store(), &host, callback),
+            Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
+                receiver
+            )))
+        );
+        assert_eq!(generic_transaction_state(context.store()), poisoned);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_symbol_node_links(receiver, receiver_links)
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            context.store().source_callable_type_for_owner(owner),
+            Some(callable)
+        );
+        assert_eq!(generic_transaction_state(context.store()), warm);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both rejected sources retain a real captured target and an authenticated global method.
+    fn captured_assignment_callbacks_require_the_same_declared_array_receiver() {
+        for (index, source) in [
+            concat!(
+                "interface Array<T> { filter(predicate: (value: T) => unknown): T[]; } ",
+                "function factory<T>(): void { ",
+                "let values: T[] = []; let other: T[] = []; ",
+                "const reset = () => { values = other.filter(value => value); }; }",
+            ),
+            concat!(
+                "interface Array<T> { filter(predicate: (value: T) => unknown): T[]; } ",
+                "interface Lookalike { filter(predicate: (value: string) => unknown): Lookalike; } ",
+                "function factory(): void { let values: Lookalike; ",
+                "const reset = () => { values = values.filter(value => value); }; }",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture = QueryFixture::new(source, FileId::new(8_284 + u32::try_from(index).unwrap()));
+            let array = fixture
+                .bound
+                .locals(fixture.bound.source_file())
+                .and_then(|locals| fixture.store.symbol_table(locals))
+                .and_then(|locals| locals.get_source("Array"))
+                .unwrap();
+            let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+            fixture.store.merge_global_symbol(globals, array).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let array_type = fixture.store.get_declared_type_of_symbol(&host, array).unwrap();
+            let method = fixture
+                .store
+                .symbol(array)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| fixture.store.symbol_table(members))
+                .and_then(|members| members.get_source("filter"))
+                .unwrap();
+            assert_eq!(fixture.store.authenticated_interface_method_owner(method), Some((array, array_type)));
+            let reference = |node| NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+            let callback = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction
+                        && record.parent.is_some_and(|parent| {
+                            fixture.parsed.arena.get(parent).unwrap().kind == SyntaxKind::CallExpression
+                        }))
+                    .then_some(reference(node))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(callback).unwrap();
+            let NodeData::ArrowFunction(arrow) = &host.node(callback).unwrap().data else {
+                unreachable!()
+            };
+            let parameter = reference(arrow.parameters.nodes[0]);
+            let call = reference(host.node(callback).unwrap().parent.unwrap());
+            let assignment = reference(host.node(call).unwrap().parent.unwrap());
+            let NodeData::BinaryExpression(binary) = &host.node(assignment).unwrap().data else {
+                unreachable!()
+            };
+            let target = reference(binary.left);
+            let writer = fixture.bound.container(call).unwrap();
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &fixture.parsed.arena.get(variable.name)?.data else {
+                        return None;
+                    };
+                    (name.text == "values").then_some(reference(node))
+                })
+                .unwrap();
+            let symbol = fixture.bound.symbol(declaration).unwrap();
+            let before = generic_transaction_state(&fixture.store);
+            let captured = super::super::source_flow::plan_source_captured_local(&fixture.store, &host, writer, target, symbol).unwrap().unwrap();
+            assert_eq!(captured.declaration(), declaration);
+            assert_eq!(captured.symbol(), symbol);
+            assert_eq!(captured.writing_callable(), writer);
+            for _ in 0..2 {
+                assert_eq!(source_direct_call_argument_arrow_is_exact(&fixture.store, &host, callback), Ok(false));
+                assert_eq!(
+                    plan_source_callable(&fixture.store, &host, callback, owner, None),
+                    Err(SourceCallableError::Unsupported(SourceCallableUnsupported::MissingParameterType(parameter))),
+                );
+                assert_eq!(generic_transaction_state(&fixture.store), before);
+                assert!(fixture.store.source_callable_type_for_owner(owner).is_none());
+                assert!(fixture.store.signature_links(callback).is_none());
+                assert!(fixture.store.value_symbol_links(fixture.bound.symbol(parameter).unwrap()).is_none());
+            }
+        }
     }
 
     #[test]
