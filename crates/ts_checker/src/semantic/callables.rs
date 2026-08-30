@@ -7,6 +7,9 @@
 //! free of `FunctionTypeNode` storage details lets later source-callable
 //! providers participate without borrowing `FunctionType` provenance.
 
+use ts_ast::{NodeData, NodeRef, SyntaxKind};
+use ts_binder::SymbolFlags;
+
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
@@ -20,6 +23,7 @@ use super::{
         source_callable_display_projection, stored_source_callable_family,
         validate_stored_source_callable,
     },
+    type_records::TypeData,
 };
 
 /// Provider family for an exact, independently validated callable object.
@@ -109,6 +113,7 @@ pub(super) struct ValidatedSingleCallSignatureDisplay {
 pub(super) enum SingleCallableDisplayError {
     FunctionType(FunctionTypeDisplayError),
     SourceCallable(SourceCallableDisplayError),
+    MalformedMethod,
 }
 
 /// Returns the installed provider brand without attempting cache validation.
@@ -252,7 +257,7 @@ pub(super) fn validate_stored_single_callable_provider(
     }
 }
 
-/// Produces the display overlay for one branded callable provider.
+/// Produces the display overlay from the callable's source-owning provider.
 pub(super) fn single_callable_display_projection(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -270,7 +275,7 @@ pub(super) fn single_callable_display_projection(
             .map_err(SingleCallableDisplayError::FunctionType);
     }
     let Some(family) = single_callable_family(store, type_) else {
-        return Ok(None);
+        return fixed_method_display_projection(store, host, type_, global_types);
     };
     match family {
         CallableFamily::FunctionType => function_type_display_projection(
@@ -295,6 +300,245 @@ pub(super) fn single_callable_display_projection(
             Ok(None)
         }
     }
+}
+
+/// Reads nonempty fixed method parameters after the source and stored owners agree.
+pub(super) fn fixed_method_display_projection(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+    global_types: Option<&CanonicalGlobalTypes>,
+) -> Result<Option<ValidatedSingleCallSignatureDisplay>, SingleCallableDisplayError> {
+    let invalid = || SingleCallableDisplayError::MalformedMethod;
+    let Some(record) = store.type_payload(type_) else {
+        return Ok(None);
+    };
+    let Some(method) = record.symbol() else {
+        return Ok(None);
+    };
+    let method_record = store.symbol(method).ok_or_else(invalid)?;
+    if !method_record.flags().contains(SymbolFlags::METHOD) {
+        return Ok(None);
+    }
+    let array_targets = global_types.map(CanonicalArrayTargets::from_global_types);
+    if let TypeData::Object(object) = record.data()
+        && (object.target.is_some() || object.mapper.is_some())
+    {
+        let StoredCallableSetValidation::Valid {
+            family: CallableFamily::DeclaredCallSignatures,
+            projection,
+            edges,
+        } = validate_stored_callable_set_with_array_targets(store, type_, array_targets)
+        else {
+            return Err(invalid());
+        };
+        if projection.owner != type_ {
+            return Err(invalid());
+        }
+        for edge in edges {
+            store
+                .validate_cached_array_capability_with_pending_functions(array_targets, edge, &[])
+                .map_err(|_| invalid())?;
+        }
+        // Proven copies keep their existing display provider and fresh parameter scope.
+        return Ok(None);
+    }
+    let declaration = method_record.value_declaration().ok_or_else(invalid)?;
+    let node = host.node(declaration).ok_or_else(invalid)?;
+    let parent = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        node.parent.ok_or_else(invalid)?,
+    );
+    let parent_node = host.node(parent).ok_or_else(invalid)?;
+    let (name, parameters, type_parameters, return_annotation, class_method) =
+        match (&node.data, &parent_node.data) {
+            (NodeData::MethodDeclaration(method), NodeData::ClassDeclaration(_))
+                if node.kind == SyntaxKind::MethodDeclaration
+                    && parent_node.kind == SyntaxKind::ClassDeclaration =>
+            {
+                (
+                    method.name,
+                    &method.parameters.nodes,
+                    method.type_parameters.as_ref(),
+                    method.type_,
+                    true,
+                )
+            }
+            (
+                NodeData::MethodSignatureDeclaration(method),
+                NodeData::InterfaceDeclaration(_) | NodeData::TypeLiteralNode(_),
+            ) if node.kind == SyntaxKind::MethodSignature => (
+                method.name,
+                &method.parameters.nodes,
+                method.type_parameters.as_ref(),
+                method.type_,
+                false,
+            ),
+            _ => return Ok(None),
+        };
+    if parameters.is_empty()
+        || type_parameters.is_some()
+        || method_record.name().is_private_identifier()
+        || method_record.name().is_reserved_member_name()
+        || method_record.name().is_late_bound()
+    {
+        return Ok(None);
+    }
+    let owner = method_record.parent().ok_or_else(invalid)?;
+    let name = NodeRef::new(declaration.arena, declaration.file, name);
+    if !host.symbol_matches(store, declaration, method)
+        || !host.symbol_matches(store, parent, owner)
+        || !host.node(name).is_some_and(|node| {
+            node.parent == Some(declaration.node)
+                && matches!(&node.data, NodeData::Identifier(name)
+                    if method_record.name().as_utf8() == Some(name.text.as_str()))
+        })
+    {
+        return Err(invalid());
+    }
+
+    let overloads = if class_method {
+        // Cold selected and legacy class methods keep their existing display path.
+        if store.source_class_provenance_for_symbol(owner).is_none() {
+            return Ok(None);
+        }
+        if super::classes::completed_source_class_members(store, host, owner)
+            .map_err(|_| invalid())?
+            .is_none()
+        {
+            return Err(invalid());
+        }
+        super::classes::source_class_method_overloads(store, type_).map_err(|_| invalid())?
+    } else {
+        let plan = super::object_members::plan_selected_interface_method(store, host, method)
+            .map_err(|_| invalid())?;
+        if super::object_members::interface_method_value_state(store, &plan)
+            .map_err(|_| invalid())?
+            != Some(type_)
+        {
+            return Err(invalid());
+        }
+        None
+    };
+    let StoredCallableSetValidation::Valid { projection, .. } =
+        validate_stored_callable_set_with_array_targets(store, type_, array_targets)
+    else {
+        return Err(invalid());
+    };
+    if projection.owner != type_ || !projection.construct_signatures.is_empty() {
+        return Err(invalid());
+    }
+    if let Some(overloads) = &overloads
+        && projection.call_signatures.as_ref() != overloads.signatures.as_slice()
+    {
+        return Err(invalid());
+    }
+    // A single public overload still has a hidden implementation to authenticate.
+    for callable in projection.call_signatures.iter().chain(
+        overloads
+            .as_ref()
+            .map(|overloads| &overloads.implementation),
+    ) {
+        let returned = callable.return_type.ok_or_else(invalid)?;
+        for edge in callable
+            .parameters
+            .iter()
+            .copied()
+            .chain(callable.rest_parameter)
+            .chain(std::iter::once(returned))
+        {
+            store
+                .validate_cached_array_capability_with_pending_functions(array_targets, edge, &[])
+                .map_err(|_| invalid())?;
+        }
+    }
+    if overloads.is_some() {
+        return Ok(None);
+    }
+    let [callable] = projection.call_signatures.as_ref() else {
+        return Ok(None);
+    };
+    let signature = store.signature(callable.signature).ok_or_else(invalid)?;
+    if method_record.declarations() != Some(&[declaration])
+        || signature.declaration() != Some(declaration)
+        || !signature.type_parameters().is_empty()
+        || signature.this_parameter().is_some()
+        || signature.target().is_some()
+        || signature.mapper().is_some()
+        || signature.resolved_type_predicate().is_some()
+        || signature.parameters().len() != parameters.len()
+    {
+        return Err(invalid());
+    }
+    if callable.rest_parameter.is_some()
+        || callable.min_argument_count != parameters.len()
+        || method_record.flags().contains(SymbolFlags::OPTIONAL)
+    {
+        return Ok(None);
+    }
+    let mut display = Vec::with_capacity(parameters.len());
+    for ((node, symbol), value_type) in parameters
+        .iter()
+        .zip(signature.parameters())
+        .zip(&callable.parameters)
+    {
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *node);
+        let record = host.node(parameter).ok_or_else(invalid)?;
+        let NodeData::ParameterDeclaration(data) = &record.data else {
+            return Err(invalid());
+        };
+        if data.dot_dot_dot_token.is_some()
+            || data.question_token.is_some()
+            || data.initializer.is_some()
+            || data.modifiers.is_some()
+        {
+            return Ok(None);
+        }
+        let Some(annotation) = data.type_ else {
+            return Ok(None);
+        };
+        let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
+        let name = NodeRef::new(declaration.arena, declaration.file, data.name);
+        let name_node = host.node(name).ok_or_else(invalid)?;
+        let NodeData::Identifier(identifier) = &name_node.data else {
+            return Ok(None);
+        };
+        if record.kind != SyntaxKind::Parameter
+            || record.parent != Some(declaration.node)
+            || name_node.parent != Some(parameter.node)
+            || !host.symbol_matches(store, parameter, *symbol)
+            || store
+                .symbol(*symbol)
+                .is_none_or(|symbol| symbol.name().as_utf8() != Some(identifier.text.as_str()))
+            || store.source_direct_type_annotation(parameter) != Some(annotation)
+            || !store.source_direct_type_annotation_is_exact(annotation, *value_type)
+        {
+            return Err(invalid());
+        }
+        display.push(ValidatedSingleCallParameterDisplay {
+            name: identifier.text.clone(),
+            value_type: *value_type,
+            annotation_type: Some(*value_type),
+            optional: false,
+            rest: false,
+        });
+    }
+    let returned = callable.return_type.ok_or_else(invalid)?;
+    if return_annotation.is_some_and(|annotation| {
+        !store.source_direct_type_annotation_is_exact(
+            NodeRef::new(declaration.arena, declaration.file, annotation),
+            returned,
+        )
+    }) {
+        return Err(invalid());
+    }
+    Ok(Some(ValidatedSingleCallSignatureDisplay {
+        owner: type_,
+        signature: callable.signature,
+        parameters: display,
+        return_type: Some(returned),
+    }))
 }
 
 fn validated_single_callable(
