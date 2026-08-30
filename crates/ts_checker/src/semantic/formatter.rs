@@ -18375,7 +18375,7 @@ mod tests {
         let contextual = context
             .get_declared_type_of_symbol(contextual_owner)
             .unwrap();
-        let bound = &context.file(file).unwrap().1;
+        let bound = context.file(file).unwrap().1;
         let owner = bound.symbol(annotation).unwrap();
         let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
         let plan =
@@ -18776,8 +18776,7 @@ mod tests {
             context.type_to_string_with_flags(type_id, flags).unwrap(),
             "{ [name: string]: 'item'[]; }"
         );
-        let host =
-            DeclaredTypeHost::new([(&parsed.arena, &context.file(file).unwrap().1)]).unwrap();
+        let host = DeclaredTypeHost::new([(&parsed.arena, context.file(file).unwrap().1)]).unwrap();
         let mut state = DisplayState {
             approximate_length: 63,
             ..DisplayState::default()
