@@ -6928,7 +6928,13 @@ fn linear_antecedent(flow: FlowRef, node: &FlowNode) -> Result<FlowRef, SourceFl
 }
 
 fn label_antecedents(flow: FlowRef, node: &FlowNode) -> Result<&[FlowRef], SourceFlowError> {
-    if node.antecedents.len() < 2 {
+    let minimum = match source_flow_kind(flow, node.flags)? {
+        SourceFlowKind::LoopLabel => 1,
+        SourceFlowKind::BranchLabel => 2,
+        _ => return Err(SourceFlowInvariant::InvalidAntecedents(flow).into()),
+    };
+    // A terminal break can leave the binder's loop label with only its entry edge.
+    if node.antecedents.len() < minimum {
         return Err(SourceFlowInvariant::InvalidAntecedents(flow).into());
     }
     let mut unique = HashSet::with_capacity(node.antecedents.len());
@@ -8426,6 +8432,271 @@ mod tests {
         assert_eq!(
             label_antecedents(branch, &node),
             Err(SourceFlowInvariant::InvalidAntecedents(branch).into()),
+        );
+    }
+
+    const SINGLE_EDGE_LOOP_SOURCE: &str = "declare const value: number; for (;;) { value; break; }";
+
+    fn single_edge_loop_nodes(parsed: &ParseResult, file: FileId) -> (NodeRef, NodeRef, NodeRef) {
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let (statement, body) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::ForStatement(iteration) => Some((node, iteration.statement)),
+                _ => None,
+            })
+            .unwrap();
+        let NodeData::Block(block) = &parsed.arena.get(body).unwrap().data else {
+            panic!("expected the actual loop body")
+        };
+        let [expression, jump] = block.statements.nodes.as_slice() else {
+            panic!("expected the source read and terminal break")
+        };
+        let NodeData::ExpressionStatement(expression) =
+            &parsed.arena.get(*expression).unwrap().data
+        else {
+            panic!("expected the source expression statement")
+        };
+        assert_eq!(
+            parsed.arena.get(*jump).unwrap().kind,
+            SyntaxKind::BreakStatement
+        );
+        (
+            reference(statement),
+            reference(expression.expression),
+            reference(*jump),
+        )
+    }
+
+    #[test]
+    fn single_edge_loop_label_checks_the_real_terminal_break_and_replays() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(SINGLE_EDGE_LOOP_SOURCE);
+        let file = FileId::new(32_209);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let (statement, read, jump) = single_edge_loop_nodes(&parsed, file);
+        let entry = bound.flow_at(statement).unwrap();
+        let label = bound.flow_at(read).unwrap();
+        let row = flow_node(bound.flow_graph(), label).unwrap();
+        assert_eq!(
+            source_flow_kind(label, row.flags),
+            Ok(SourceFlowKind::LoopLabel)
+        );
+        assert_eq!(label_antecedents(label, &row), Ok([entry].as_slice()));
+        assert_eq!(bound.flow_at(jump), Some(label));
+        assert_eq!(
+            bound.flow_graph().container_end(bound.source_file()),
+            Some(label)
+        );
+        let plan = SourceFlowPlan::preflight_source_statement(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            statement,
+            [statement, read, jump],
+            [],
+            [],
+            [],
+            [],
+        )
+        .unwrap();
+        assert_eq!(plan.end, Some(label));
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let owner = bound
+            .symbol(captured_variable(&parsed, file, "value"))
+            .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(owner)
+                .unwrap()
+                .resolved_type,
+            Some(number)
+        );
+        assert_eq!(context.get_type_at_location(read), Ok(number));
+        let globals = context.global_types().clone();
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot(),
+                context.store().type_node_links(read).cloned(),
+                context.store().value_symbol_links(owner).cloned(),
+                context
+                    .store()
+                    .source_file_links(context.source_file(file).unwrap())
+                    .cloned(),
+                context.diagnostics().clone(),
+            )
+        };
+        let before = snapshot(&context);
+        for _ in 0..2 {
+            let mut frame = plan
+                .frame_with_captured_locals(
+                    context.store(),
+                    &host,
+                    &bound,
+                    [(owner, number)].into(),
+                )
+                .unwrap();
+            for point in [read, jump, read] {
+                let actual = frame
+                    .snapshot_for_symbols_at(context.store_mut_for_test(), &globals, point, [owner])
+                    .unwrap();
+                assert_eq!(actual.type_of(owner), Some(number));
+                assert!(actual.reachable);
+                assert!(!actual.incomplete);
+            }
+            let exit = frame
+                .snapshot_for_symbols_at_end(context.store_mut_for_test(), &globals, [owner])
+                .unwrap();
+            assert_eq!(exit.type_of(owner), Some(number));
+            assert!(exit.reachable);
+            assert!(!exit.incomplete);
+            assert!(frame.visiting.is_empty());
+            assert!(frame.loop_snapshots.is_empty());
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(snapshot(&context), before);
+        }
+    }
+
+    #[test]
+    fn single_edge_loop_label_rejects_changed_kind_and_shape() {
+        let parsed = parse_source_file(SINGLE_EDGE_LOOP_SOURCE);
+        let file = FileId::new(32_210);
+        let context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1;
+        let (statement, read, _) = single_edge_loop_nodes(&parsed, file);
+        let label = bound.flow_at(read).unwrap();
+        let entry = bound.flow_at(statement).unwrap();
+        let original = flow_node(bound.flow_graph(), label).unwrap();
+        assert_eq!(label_antecedents(label, &original), Ok([entry].as_slice()));
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        let mut empty = original.clone();
+        empty.antecedents.clear();
+        let mut duplicate = original.clone();
+        duplicate.antecedents.push(entry);
+        let mut linear = original.clone();
+        linear.antecedent = Some(entry);
+        let mut payload = original.clone();
+        payload.payload = Some(FlowNodePayload::Ast(statement));
+        let mut branch = original.clone();
+        branch.flags = FlowFlags::BRANCH_LABEL;
+        let mut wrong_kind = original.clone();
+        wrong_kind.flags = FlowFlags::START;
+        wrong_kind.antecedents.push(label);
+        for changed in [empty, duplicate, linear, payload, branch, wrong_kind] {
+            assert_eq!(
+                label_antecedents(label, &changed),
+                Err(SourceFlowInvariant::InvalidAntecedents(label).into())
+            );
+            assert_eq!(label_antecedents(label, &original), Ok([entry].as_slice()));
+        }
+        let mut composite = original.clone();
+        composite.flags = FlowFlags::LOOP_LABEL | FlowFlags::BRANCH_LABEL;
+        assert_eq!(
+            label_antecedents(label, &composite),
+            Err(SourceFlowInvariant::InvalidFlowFlags {
+                flow: label,
+                flags: composite.flags
+            }
+            .into())
+        );
+        for metadata in [
+            FlowFlags::REFERENCED,
+            FlowFlags::SHARED,
+            FlowFlags::REFERENCED | FlowFlags::SHARED,
+        ] {
+            let mut annotated = original.clone();
+            annotated.flags = FlowFlags::LOOP_LABEL | metadata;
+            assert_eq!(label_antecedents(label, &annotated), Ok([entry].as_slice()));
+        }
+        assert_eq!(flow_node(bound.flow_graph(), label).unwrap(), original);
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn single_edge_loop_label_keeps_foreign_flow_and_source_owner_rejection() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(SINGLE_EDGE_LOOP_SOURCE);
+        let file = FileId::new(32_211);
+        let context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1;
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let (statement, read, jump) = single_edge_loop_nodes(&parsed, file);
+        let plan = SourceFlowPlan::preflight_source_statement(
+            &parsed.arena,
+            bound,
+            context.store(),
+            &host,
+            statement,
+            [statement, read, jump],
+            [],
+            [],
+            [],
+            [],
+        )
+        .unwrap();
+        let foreign = parse_source_file(SINGLE_EDGE_LOOP_SOURCE);
+        let foreign_file = FileId::new(32_212);
+        let foreign_context = loop_context(&foreign, foreign_file);
+        let foreign_bound = foreign_context.file(foreign_file).unwrap().1;
+        let (_, foreign_read, _) = single_edge_loop_nodes(&foreign, foreign_file);
+        let foreign_flow = foreign_bound.flow_at(foreign_read).unwrap();
+        let mut foreign_point = plan.clone();
+        foreign_point.points.insert(read, foreign_flow);
+        let mut foreign_exit = plan.clone();
+        foreign_exit.end = Some(foreign_flow);
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for changed in [foreign_point, foreign_exit] {
+            assert_eq!(
+                changed.validate_flow_paths(bound),
+                Err(SourceFlowInvariant::ForeignFlow(foreign_flow).into())
+            );
+            assert_eq!(plan.validate_flow_paths(bound), Ok(()));
+        }
+        let mut wrong_owner = plan.clone();
+        wrong_owner.region.as_mut().unwrap().statement = read;
+        assert!(matches!(
+            wrong_owner.frame_with_captured_locals(context.store(), &host, bound, HashMap::new()),
+            Err(SourceFlowError::Invariant(SourceFlowInvariant::InvalidSourceRegion(node))) if node == read
+        ));
+        plan.frame_with_captured_locals(context.store(), &host, bound, HashMap::new())
+            .unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before
         );
     }
 
