@@ -2404,9 +2404,10 @@ fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSym
     };
     let method = record.flags().contains(SymbolFlags::METHOD);
     let accessor = record.flags().intersects(SymbolFlags::ACCESSOR);
+    let merged_method = method && store.source_merged_method_has_exact_declarations(property);
     let late = record.name().is_late_bound()
         || record.check_flags().contains(CheckFlags::LATE)
-        || record.flags().contains(SymbolFlags::TRANSIENT);
+        || record.flags().contains(SymbolFlags::TRANSIENT) && !merged_method;
     let expected_flags = if method {
         SymbolFlags::METHOD
     } else if accessor {
@@ -2422,7 +2423,7 @@ fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSym
         SymbolFlags::OPTIONAL
     } else {
         SymbolFlags::NONE
-    } | if late {
+    } | if late || merged_method {
         SymbolFlags::TRANSIENT
     } else {
         SymbolFlags::NONE

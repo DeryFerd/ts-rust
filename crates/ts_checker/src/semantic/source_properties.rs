@@ -3790,7 +3790,9 @@ fn resolve_published_global_object_constructor_method(
         return Ok(None);
     };
     let method = store.symbol(symbol).ok_or_else(invalid)?;
-    if method.flags() != SymbolFlags::METHOD
+    if method.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::METHOD
+        || method.flags().contains(SymbolFlags::TRANSIENT)
+            && !store.source_merged_method_has_exact_declarations(symbol)
         || method.check_flags() != CheckFlags::NONE
         || method.name().as_utf8() != Some(plan.name.as_str())
         || store.authenticated_interface_method_owner(symbol) != Some((owner, receiver_type))
