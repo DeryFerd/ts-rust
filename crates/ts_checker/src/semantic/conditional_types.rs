@@ -18,8 +18,9 @@ use super::{
     constraints::{self, ConstraintError},
     declared::{cached_ordinary_type_parameter_owner, malformed_alias_merge},
     instantiate::{
-        InstantiationError, InstantiationLimits, InstantiationSession, canonical_anonymous_union,
-        instantiate_type_with_session, instantiate_type_with_vector_and_session,
+        InstantiationError, InstantiationLimits, InstantiationSession,
+        cached_instantiation_with_vector, canonical_anonymous_union, instantiate_type_with_session,
+        instantiate_type_with_vector_and_session,
     },
     mapper::CanonicalTypeMapperStore,
     object_members::{StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
@@ -123,6 +124,49 @@ impl ConditionalTypeProduction {
     pub(super) const fn root(&self) -> ConditionalRootId {
         self.definition.root
     }
+}
+
+/// The source producer and its complete root arguments, before a second mapper.
+/// Only the conditional owner can construct this proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ConditionalRemapProjection {
+    production: ConditionalTypeProduction,
+    arguments: Vec<TypeId>,
+}
+
+impl ConditionalRemapProjection {
+    pub(super) const fn type_id(&self) -> TypeId {
+        self.production.type_
+    }
+
+    pub(super) fn parameters(&self) -> &[TypeId] {
+        &self.production.definition.outer_type_parameters
+    }
+
+    pub(super) fn arguments(&self) -> &[TypeId] {
+        &self.arguments
+    }
+
+    pub(super) fn alias(&self) -> Option<ConditionalAliasIdentity<'_>> {
+        self.production
+            .alias
+            .as_ref()
+            .map(RetainedConditionalAlias::identity)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConditionalRemapLookup {
+    Cold,
+    Hit(TypeId),
+    NeedsSourceEvaluation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConditionalRemapResult {
+    Deferred(TypeId),
+    Recovered(TypeId),
+    NeedsSourceEvaluation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -478,6 +522,484 @@ pub(super) fn conditional_alias_projection(
 ) -> Result<Option<ConditionalAliasIdentity<'_>>, ConditionalTypeError> {
     let proof = validated_conditional_production(store, conditional)?;
     Ok(proof.alias.as_ref().map(RetainedConditionalAlias::identity))
+}
+
+/// Reconstructs the old mapper without allocating a composite mapper or reading branches.
+pub(super) fn conditional_remap_projection(
+    store: &CanonicalTypeMapperStore,
+    conditional: TypeId,
+) -> Result<ConditionalRemapProjection, ConditionalTypeError> {
+    let production = validated_conditional_production(store, conditional)?;
+    conditional_snapshot(store, conditional)?;
+    let definition = &production.definition;
+    let node_query = store
+        .conditional_query_production(ConditionalQueryKey::Node(definition.node))
+        .ok_or(ConditionalTypeError::InvalidTypeNodeCache(definition.node))?;
+    if node_query.definition != *definition
+        || store
+            .type_node_links(definition.node)
+            .and_then(|links| links.resolved_type)
+            != Some(node_query.result)
+    {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(definition.node));
+    }
+    validate_query_production(store, node_query)?;
+    if let Some(alias) = &definition.alias {
+        validate_remap_source_alias_links(store, alias.identity(), definition)?;
+    }
+    if let Some(reference) = production.alias_reference {
+        let origin = store
+            .conditional_query_production(ConditionalQueryKey::AliasReference(reference))
+            .ok_or(ConditionalTypeError::InvalidTypeNodeCache(reference))?;
+        if origin.definition != *definition
+            || origin.alias.as_ref().map(|(symbol, _)| *symbol)
+                != production.alias.as_ref().map(|alias| alias.symbol)
+            || store
+                .type_node_links(reference)
+                .and_then(|links| links.resolved_type)
+                != Some(origin.result)
+        {
+            return Err(ConditionalTypeError::InvalidTypeNodeCache(reference));
+        }
+        validate_query_production(store, origin)?;
+        if let Some((symbol, arguments)) = &origin.alias {
+            validate_remap_source_alias_links(
+                store,
+                ConditionalAliasIdentity {
+                    symbol: *symbol,
+                    type_arguments: arguments,
+                },
+                definition,
+            )?;
+        }
+    }
+    if !production.mapped_parameters.is_empty()
+        && production.mapped_parameters != definition.outer_type_parameters
+    {
+        return Err(ConditionalTypeError::InvalidConditional(conditional));
+    }
+    let arguments = if production.mapped_parameters.is_empty() {
+        definition.outer_type_parameters.clone()
+    } else {
+        production.type_arguments.clone()
+    };
+    let projection = ConditionalRemapProjection {
+        production: production.clone(),
+        arguments,
+    };
+    // A distributed constituent may have no separate root-cache entry. An
+    // existing entry or retained query must still pass the complete cache proof.
+    remap_cached_result(
+        store,
+        &projection,
+        projection.arguments(),
+        projection.alias(),
+    )?;
+    Ok(projection)
+}
+
+fn validate_remap_source_alias_links(
+    store: &CanonicalTypeMapperStore,
+    source: ConditionalAliasIdentity<'_>,
+    definition: &ConditionalDefinition,
+) -> Result<(), ConditionalTypeError> {
+    let invalid = || ConditionalTypeError::InvalidAliasSymbol(source.symbol);
+    let links = store.type_alias_links(source.symbol);
+    if links.is_some_and(|links| {
+        links.is_constructor_declared_property
+            || links
+                .type_parameters
+                .as_deref()
+                .is_some_and(|parameters| parameters != source.type_arguments)
+    }) {
+        return Err(invalid());
+    }
+    let Some(proof) =
+        store.conditional_query_production(ConditionalQueryKey::AliasDeclaration(source.symbol))
+    else {
+        // A direct query of the conditional node may precede alias publication.
+        // That cold state cannot excuse contradictory installed alias results.
+        return if links.is_some_and(|links| {
+            links.declared_type.is_some()
+                || links
+                    .instantiations
+                    .as_ref()
+                    .is_some_and(|cache| !cache.is_empty())
+        }) {
+            Err(invalid())
+        } else {
+            Ok(())
+        };
+    };
+    let links = links.ok_or_else(invalid)?;
+    if proof.definition != *definition || links.declared_type != Some(proof.result) {
+        return Err(invalid());
+    }
+    validate_conditional_alias_declaration(store, source.symbol, proof.result)?;
+    if proof.type_arguments.is_empty() {
+        if links
+            .instantiations
+            .as_ref()
+            .is_some_and(|cache| !cache.is_empty())
+        {
+            return Err(invalid());
+        }
+    } else if links
+        .instantiations
+        .as_ref()
+        .and_then(|cache| cache.get(&super::declared::type_list_key(&proof.type_arguments)))
+        != Some(&proof.result)
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn validate_conditional_remap_inputs(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    arguments: &[TypeId],
+    alias: Option<ConditionalAliasIdentity<'_>>,
+) -> Result<(), ConditionalTypeError> {
+    if conditional_remap_projection(store, projection.type_id())? != *projection {
+        return Err(ConditionalTypeError::InvalidConditional(
+            projection.type_id(),
+        ));
+    }
+    if arguments.len() != projection.parameters().len() {
+        return Err(ConditionalTypeError::InvalidInstantiationArity {
+            expected: projection.parameters().len(),
+            actual: arguments.len(),
+        });
+    }
+    let mut visiting = HashSet::new();
+    for argument in arguments {
+        validate_conditional_operand(store, *argument, &mut visiting)?;
+    }
+    if alias.map(|alias| (alias.symbol, alias.type_arguments.len()))
+        != projection
+            .alias()
+            .map(|alias| (alias.symbol, alias.type_arguments.len()))
+    {
+        return Err(ConditionalTypeError::InvalidConditional(
+            projection.type_id(),
+        ));
+    }
+    if let Some(alias) = alias {
+        validate_alias_identity(store, alias, &mut visiting)?;
+    }
+    // Without a real alias-reference origin the visible alias is the root alias.
+    // A remap cannot create a new source alias or claim a new reference node.
+    if projection.production.alias_reference.is_none() {
+        let expected = mapped_root_alias(
+            store,
+            projection.production.definition.root,
+            projection.parameters(),
+            arguments,
+        )?;
+        if alias
+            != expected
+                .as_ref()
+                .map(|(symbol, arguments)| ConditionalAliasIdentity {
+                    symbol: *symbol,
+                    type_arguments: arguments,
+                })
+        {
+            return Err(ConditionalTypeError::InvalidConditional(
+                projection.type_id(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remap_query_alias<'a>(
+    projection: &ConditionalRemapProjection,
+    alias: Option<ConditionalAliasIdentity<'a>>,
+) -> Option<ConditionalAliasIdentity<'a>> {
+    projection.production.alias_reference.and(alias)
+}
+
+fn remap_cache_key(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    arguments: &[TypeId],
+    alias: Option<ConditionalAliasIdentity<'_>>,
+) -> Result<CacheHashKey, ConditionalTypeError> {
+    let alias = remap_query_alias(projection, alias)
+        .map(|alias| {
+            store
+                .symbol_store()
+                .assigned_global_symbol_id(alias.symbol)
+                .map(|symbol| (symbol, alias.type_arguments))
+                .ok_or(ConditionalTypeError::InvalidAliasSymbol(alias.symbol))
+        })
+        .transpose()?;
+    Ok(conditional_type_key_parts(arguments, alias, false))
+}
+
+fn remap_cached_result(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    arguments: &[TypeId],
+    alias: Option<ConditionalAliasIdentity<'_>>,
+) -> Result<Option<TypeId>, ConditionalTypeError> {
+    let root = projection.production.definition.root;
+    let record = store
+        .conditional_root(root)
+        .ok_or(ConditionalTypeError::InvalidRoot(root))?;
+    let cache = match record.instantiations() {
+        TypeCacheState::Unallocated if projection.parameters().is_empty() => return Ok(None),
+        TypeCacheState::Allocated(cache) if !projection.parameters().is_empty() => cache,
+        _ => return Err(ConditionalTypeError::InvalidInstantiationCache(root)),
+    };
+    let key = remap_cache_key(store, projection, arguments, alias)?;
+    let Some(cached) = cache.get(&key).copied() else {
+        return if store
+            .conditional_query_production(ConditionalQueryKey::Instantiation(root, key))
+            .is_some()
+        {
+            Err(ConditionalTypeError::InvalidInstantiationCache(root))
+        } else {
+            Ok(None)
+        };
+    };
+    validate_cached_instantiation(
+        store,
+        root,
+        key,
+        cached,
+        projection.parameters(),
+        arguments,
+        remap_query_alias(projection, alias),
+        false,
+    )?;
+    Ok(Some(cached))
+}
+
+/// A proved subset of Go's `isDeferredType`. A reference such as Array<T>
+/// does not qualify merely because one of its arguments is a type parameter.
+fn remap_check_stays_deferred(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<bool, ConditionalTypeError> {
+    if !visiting.insert(type_) {
+        return Err(ConditionalTypeError::InvalidType(type_));
+    }
+    let record = store
+        .type_payload(type_)
+        .ok_or(ConditionalTypeError::InvalidType(type_))?;
+    let result = match record.data() {
+        TypeData::TypeParameter(_) => record.flags() == TypeFlags::TYPE_PARAMETER,
+        TypeData::Conditional(_) => {
+            validated_conditional_production(store, type_)?;
+            true
+        }
+        TypeData::IndexedAccess(indexed) => {
+            if super::indexed_access_types::cached_deferred_indexed_access_type(
+                store,
+                indexed.object_type,
+                indexed.index_type,
+                indexed.access_flags,
+            )
+            .map_err(ConditionalTypeError::InvalidType)?
+                != Some(type_)
+            {
+                return Err(ConditionalTypeError::InvalidType(type_));
+            }
+            true
+        }
+        TypeData::Index(_) => {
+            super::keyof_types::validate_generic_keyof_index_type(store, type_)
+                .map_err(|_| ConditionalTypeError::InvalidType(type_))?;
+            true
+        }
+        TypeData::Union(data) => data.union.types.iter().try_fold(false, |generic, type_| {
+            Ok::<_, ConditionalTypeError>(
+                generic | remap_check_stays_deferred(store, *type_, visiting)?,
+            )
+        })?,
+        TypeData::Intersection(data) => {
+            data.intersection
+                .types
+                .iter()
+                .try_fold(false, |generic, type_| {
+                    Ok::<_, ConditionalTypeError>(
+                        generic | remap_check_stays_deferred(store, *type_, visiting)?,
+                    )
+                })?
+        }
+        _ => false,
+    };
+    visiting.remove(&type_);
+    Ok(result)
+}
+
+fn remap_can_defer(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    check_type: TypeId,
+    extends_type: TypeId,
+) -> Result<bool, ConditionalTypeError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(ConditionalTypeError::MissingBootstrap)?;
+    if [check_type, extends_type]
+        .iter()
+        .any(|type_| *type_ == bootstrap.error_type || *type_ == bootstrap.wildcard_type)
+        || (projection.production.definition.is_distributive
+            && type_flags(store, check_type)?.intersects(TypeFlags::UNION | TypeFlags::NEVER))
+    {
+        return Ok(false);
+    }
+    remap_check_stays_deferred(store, check_type, &mut HashSet::new())
+}
+
+/// Read-only replay checks deferral before accepting even a valid concrete cache hit.
+pub(super) fn cached_deferred_conditional_remap(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    arguments: &[TypeId],
+    alias: Option<ConditionalAliasIdentity<'_>>,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<ConditionalRemapLookup, ConditionalTypeError> {
+    validate_conditional_remap_inputs(store, projection, arguments, alias)?;
+    let cached = remap_cached_result(store, projection, arguments, alias)?;
+    let definition = &projection.production.definition;
+    let mapped = [definition.check_type, definition.extends_type].map(|type_| {
+        cached_instantiation_with_vector(
+            store,
+            type_,
+            projection.parameters(),
+            arguments,
+            array_targets,
+            None,
+        )
+    });
+    let [check, extends] = mapped;
+    let (Some(check), Some(extends)) = (check?, extends?) else {
+        return Ok(ConditionalRemapLookup::Cold);
+    };
+    if !remap_can_defer(store, projection, check, extends)? {
+        return Ok(ConditionalRemapLookup::NeedsSourceEvaluation);
+    }
+    if let Some(cached) = cached {
+        let result = validated_conditional_production(store, cached)?;
+        if result.definition != *definition
+            || result.check_type != check
+            || result.extends_type != extends
+            || result
+                .alias
+                .as_ref()
+                .map(RetainedConditionalAlias::identity)
+                != alias
+        {
+            return Err(ConditionalTypeError::InvalidInstantiationCache(
+                definition.root,
+            ));
+        }
+        Ok(ConditionalRemapLookup::Hit(cached))
+    } else if arguments == projection.arguments() && alias == projection.alias() {
+        Ok(ConditionalRemapLookup::Hit(projection.type_id()))
+    } else {
+        Ok(ConditionalRemapLookup::Cold)
+    }
+}
+
+/// Remaps only a still-deferred conditional. Branch nodes and lazy branch caches
+/// are not inputs to this operation and remain owned by the source query.
+pub(super) fn remap_deferred_conditional_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    arguments: &[TypeId],
+    alias: Option<ConditionalAliasIdentity<'_>>,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<ConditionalRemapResult, ConditionalTypeError> {
+    match cached_deferred_conditional_remap(store, projection, arguments, alias, array_targets)? {
+        ConditionalRemapLookup::Hit(type_) => return Ok(ConditionalRemapResult::Deferred(type_)),
+        ConditionalRemapLookup::NeedsSourceEvaluation => {
+            return Ok(ConditionalRemapResult::NeedsSourceEvaluation);
+        }
+        ConditionalRemapLookup::Cold => {}
+    }
+    let definition = &projection.production.definition;
+    let mark = session.limit_event_mark();
+    let mut operands = Vec::with_capacity(2);
+    for operand in [definition.check_type, definition.extends_type] {
+        operands.push(instantiate_type_with_vector_and_session(
+            store,
+            operand,
+            projection.parameters(),
+            arguments,
+            array_targets,
+            session,
+        )?);
+        if session.limit_event_occurred_since(mark)
+            && let Some(error) = session.recovery_error_type()
+        {
+            return Ok(ConditionalRemapResult::Recovered(error));
+        }
+    }
+    let (check_type, extends_type) = (operands[0], operands[1]);
+    if !remap_can_defer(store, projection, check_type, extends_type)? {
+        return Ok(ConditionalRemapResult::NeedsSourceEvaluation);
+    }
+    // Dependency demand may have completed an existing root entry. Validate it
+    // again before reserving or publishing any conditional result.
+    if let ConditionalRemapLookup::Hit(cached) =
+        cached_deferred_conditional_remap(store, projection, arguments, alias, array_targets)?
+    {
+        return Ok(ConditionalRemapResult::Deferred(cached));
+    }
+    let root = definition.root;
+    let key = remap_cache_key(store, projection, arguments, alias)?;
+    let TypeCacheState::Allocated(cache) = store
+        .conditional_root(root)
+        .ok_or(ConditionalTypeError::InvalidRoot(root))?
+        .instantiations()
+    else {
+        return Err(ConditionalTypeError::InvalidInstantiationCache(root));
+    };
+    let mut cache = cache.clone();
+    if !store.try_reserve_conditional_productions(0, 1) {
+        return Err(ConditionalTypeError::Capacity);
+    }
+    let alias_source = projection
+        .production
+        .alias_reference
+        .zip(alias)
+        .map(|(reference, alias)| (alias, reference));
+    let result = deferred_conditional(
+        store,
+        root,
+        check_type,
+        extends_type,
+        projection.parameters(),
+        arguments,
+        alias_source,
+    )?;
+    cache.insert(key, result);
+    if !store.set_conditional_root_instantiations(root, TypeCacheState::Allocated(cache)) {
+        return Err(ConditionalTypeError::InvalidInstantiationCache(root));
+    }
+    let proof = ConditionalQueryProduction {
+        key: ConditionalQueryKey::Instantiation(root, key),
+        definition: definition.clone(),
+        type_arguments: arguments.to_vec(),
+        alias: remap_query_alias(projection, alias)
+            .map(|alias| (alias.symbol, alias.type_arguments.to_vec())),
+        for_constraint: false,
+        result,
+        source_declaration: None,
+        result_alias: retain_result_alias(store, result)?,
+    };
+    validate_query_production(store, &proof)?;
+    if !store.publish_conditional_query_production(proof) {
+        return Err(ConditionalTypeError::InvalidInstantiationCache(root));
+    }
+    Ok(ConditionalRemapResult::Deferred(result))
 }
 
 /// A reduced conditional keeps its source root's alias separate from its result.
@@ -6161,6 +6683,519 @@ mod tests {
             store.mapper_len(),
             store.conditional_production_lengths(),
         )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep source order, mapper order, and later branch demand together.
+    fn deferred_conditional_remap_keeps_source_order_and_lazy_branch_caches() {
+        use crate::semantic::instantiate::instantiate_type_with_vector;
+
+        for declaration_first in [false, true] {
+            let mut fixture = Fixture::new(concat!(
+                "type Select<Check, Value> = Check extends string ? Value : boolean; ",
+                "type Forward<Left, Right> = Select<Right, Left>; ",
+                "type Next<NewLeft, NewRight> = NewLeft;",
+            ));
+            if declaration_first {
+                fixture.declared_alias("Select");
+            }
+            let source = fixture.declared_alias("Forward");
+            let left = fixture.type_parameter("Left");
+            let right = fixture.type_parameter("Right");
+            let new_left = fixture.type_parameter("NewLeft");
+            let new_right = fixture.type_parameter("NewRight");
+            let value = fixture.type_parameter("Value");
+            let owner = fixture.alias_symbol("Forward");
+            let projection = conditional_remap_projection(&fixture.store, source).unwrap();
+            assert_eq!(projection.arguments(), &[right, left]);
+            assert_eq!(
+                projection.alias(),
+                Some(ConditionalAliasIdentity {
+                    symbol: owner,
+                    type_arguments: &[left, right],
+                })
+            );
+            let source_data = conditional_snapshot(&fixture.store, source).unwrap();
+            let source_alias = fixture.store.type_alias_links(owner).cloned();
+            let nodes = fixture
+                .parsed
+                .arena
+                .iter()
+                .map(|(node, _)| NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+                .collect::<Vec<_>>();
+            let node_links = |store: &CanonicalTypeMapperStore| {
+                nodes
+                    .iter()
+                    .map(|node| store.type_node_links(*node).cloned())
+                    .collect::<Vec<_>>()
+            };
+            let original_links = node_links(&fixture.store);
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    &fixture.store,
+                    source,
+                    &[left, right],
+                    &[new_left, new_right],
+                    None,
+                    None,
+                ),
+                Ok(None)
+            );
+            let result = instantiate_type_with_vector(
+                &mut fixture.store,
+                source,
+                &[left, right],
+                &[new_left, new_right],
+            )
+            .unwrap();
+            let mapped = conditional_remap_projection(&fixture.store, result).unwrap();
+            assert_eq!(mapped.arguments(), &[new_right, new_left]);
+            assert_eq!(mapped.parameters(), projection.parameters());
+            assert_eq!(
+                mapped.production.alias_reference,
+                projection.production.alias_reference
+            );
+            assert_eq!(
+                mapped.alias(),
+                Some(ConditionalAliasIdentity {
+                    symbol: owner,
+                    type_arguments: &[new_left, new_right],
+                })
+            );
+            let result_data = conditional_snapshot(&fixture.store, result).unwrap();
+            assert_eq!(result_data.root, source_data.root);
+            assert_eq!(result_data.check_type, new_right);
+            assert_eq!(result_data.extends_type, source_data.extends_type);
+            assert!(result_data.resolved_true_type.is_none());
+            assert!(result_data.resolved_false_type.is_none());
+            assert!(result_data.resolved_inferred_true_type.is_none());
+            assert_eq!(
+                conditional_snapshot(&fixture.store, source).unwrap(),
+                source_data
+            );
+            assert_eq!(node_links(&fixture.store), original_links);
+            assert_eq!(fixture.store.type_alias_links(owner).cloned(), source_alias);
+            let warm = conditional_allocation_counts(&fixture.store);
+            for _ in 0..2 {
+                assert_eq!(fixture.declared_alias("Forward"), source);
+                assert_eq!(
+                    cached_instantiation_with_vector(
+                        &fixture.store,
+                        source,
+                        &[left, right],
+                        &[new_left, new_right],
+                        None,
+                        None,
+                    ),
+                    Ok(Some(result))
+                );
+                assert_eq!(
+                    instantiate_type_with_vector(
+                        &mut fixture.store,
+                        source,
+                        &[left, right],
+                        &[new_left, new_right],
+                    ),
+                    Ok(result)
+                );
+                assert_eq!(conditional_allocation_counts(&fixture.store), warm);
+                assert_eq!(node_links(&fixture.store), original_links);
+            }
+
+            // A later legitimate source branch demand must not invalidate the
+            // remap proof. The raw branch is Value, not a cached mapped result.
+            let boolean = fixture.store.intrinsic_bootstrap().unwrap().boolean_type;
+            assert_eq!(
+                get_true_type_from_conditional_type(
+                    &mut fixture.store,
+                    result,
+                    branches(value, boolean),
+                    None,
+                    None,
+                ),
+                Ok(new_left)
+            );
+            assert_eq!(
+                get_false_type_from_conditional_type(
+                    &mut fixture.store,
+                    result,
+                    branches(value, boolean),
+                    None,
+                    None,
+                ),
+                Ok(boolean)
+            );
+            let warm = conditional_allocation_counts(&fixture.store);
+            assert_eq!(
+                instantiate_type_with_vector(
+                    &mut fixture.store,
+                    source,
+                    &[left, right],
+                    &[new_left, new_right],
+                ),
+                Ok(result)
+            );
+            assert_eq!(conditional_allocation_counts(&fixture.store), warm);
+            assert_eq!(
+                conditional_snapshot(&fixture.store, source).unwrap(),
+                source_data
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_conditional_remap_does_not_use_a_warm_concrete_result() {
+        use crate::semantic::instantiate::instantiate_type_with_vector;
+
+        for concrete_first in [false, true] {
+            let mut fixture =
+                Fixture::new("type Select<Value> = Value extends string ? number : boolean;");
+            let source = fixture.declared_alias("Select");
+            let parameter = fixture.type_parameter("Value");
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let (string, number, boolean) = (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.boolean_type,
+            );
+            if concrete_first {
+                assert_eq!(
+                    get_conditional_type_instantiation(
+                        &mut fixture.store,
+                        ConditionalTypeInstantiation {
+                            conditional_type: source,
+                            type_arguments: &[string],
+                            branches: branches(number, boolean),
+                            alias: None,
+                            for_constraint: false,
+                        },
+                        None,
+                        None,
+                    ),
+                    Ok(number)
+                );
+            }
+            let root = conditional_snapshot(&fixture.store, source).unwrap().root;
+            let root_cache = fixture
+                .store
+                .conditional_root(root)
+                .unwrap()
+                .instantiations()
+                .clone();
+            let before = conditional_allocation_counts(&fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    cached_instantiation_with_vector(
+                        &fixture.store,
+                        source,
+                        &[parameter],
+                        &[string],
+                        None,
+                        None,
+                    ),
+                    Err(InstantiationError::UnsupportedType(source))
+                );
+                assert_eq!(
+                    instantiate_type_with_vector(
+                        &mut fixture.store,
+                        source,
+                        &[parameter],
+                        &[string]
+                    ),
+                    Err(InstantiationError::UnsupportedType(source))
+                );
+                assert_eq!(conditional_allocation_counts(&fixture.store), before);
+                assert_eq!(
+                    fixture
+                        .store
+                        .conditional_root(root)
+                        .unwrap()
+                        .instantiations(),
+                    &root_cache
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each corruption is restored before replaying the same source request.
+    fn deferred_conditional_remap_rejects_and_restores_source_and_result_caches() {
+        use crate::semantic::instantiate::instantiate_type_with_vector;
+
+        for corruption in 0..10 {
+            let mut fixture = Fixture::new(concat!(
+                "type Select<Value> = Value extends string ? number : boolean; ",
+                "type Forward<Other> = Select<Other>; type Next<After> = After;",
+            ));
+            let source = fixture.declared_alias("Forward");
+            let parameter = fixture.type_parameter("Other");
+            let argument = fixture.type_parameter("After");
+            let result =
+                instantiate_type_with_vector(&mut fixture.store, source, &[parameter], &[argument])
+                    .unwrap();
+            let projection = conditional_remap_projection(&fixture.store, source).unwrap();
+            let root = projection.production.definition.root;
+            let source_owner = projection.alias().unwrap().symbol;
+            let root_owner = projection
+                .production
+                .definition
+                .alias
+                .as_ref()
+                .unwrap()
+                .symbol;
+            let original_source_alias_links = fixture
+                .store
+                .type_alias_links(source_owner)
+                .unwrap()
+                .clone();
+            let original_root_alias_links =
+                fixture.store.type_alias_links(root_owner).unwrap().clone();
+            let key = remap_cache_key(
+                &fixture.store,
+                &projection,
+                &[argument],
+                Some(ConditionalAliasIdentity {
+                    symbol: projection.alias().unwrap().symbol,
+                    type_arguments: &[argument],
+                }),
+            )
+            .unwrap();
+            let original_cache = fixture
+                .store
+                .conditional_root(root)
+                .unwrap()
+                .instantiations()
+                .clone();
+            let original_root_alias = fixture.store.conditional_root(root).unwrap().alias();
+            let result_data = conditional_snapshot(&fixture.store, result).unwrap();
+            let alias = fixture.store.type_payload(result).unwrap().alias().unwrap();
+            let original_alias_arguments = fixture
+                .store
+                .type_alias(alias)
+                .unwrap()
+                .type_arguments()
+                .map(<[TypeId]>::to_vec);
+            let reference = projection.production.alias_reference.unwrap();
+            let original_reference_links =
+                fixture.store.type_node_links(reference).unwrap().clone();
+            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            match corruption {
+                0 | 1 => {
+                    let TypeCacheState::Allocated(mut cache) = original_cache.clone() else {
+                        unreachable!()
+                    };
+                    assert_eq!(cache.remove(&key), Some(result));
+                    if corruption == 1 {
+                        cache.insert(key, source);
+                    }
+                    assert!(fixture.store.set_conditional_root_instantiations(
+                        root,
+                        TypeCacheState::Allocated(cache)
+                    ));
+                }
+                2 => {
+                    assert!(fixture.store.set_conditional_resolution(
+                        result, None, None, None, None, None, None, None,
+                    ))
+                }
+                3 => assert!(
+                    fixture
+                        .store
+                        .set_type_alias_arguments(alias, Some(vec![number]))
+                ),
+                4 => assert!(fixture.store.set_conditional_root_alias(root, None)),
+                5 => {
+                    let mut links = original_reference_links.clone();
+                    links.resolved_type = Some(number);
+                    assert!(fixture.store.set_type_node_links(reference, links));
+                }
+                6..=8 => {
+                    let mut links = original_source_alias_links.clone();
+                    match corruption {
+                        6 => links.declared_type = Some(number),
+                        7 => links.type_parameters = Some(vec![argument]),
+                        8 => {
+                            let key = super::super::declared::type_list_key(&[parameter]);
+                            assert_eq!(
+                                links.instantiations.as_mut().unwrap().insert(key, number),
+                                Some(source)
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(fixture.store.set_type_alias_links(source_owner, links));
+                }
+                9 => {
+                    let mut links = original_root_alias_links.clone();
+                    links.declared_type = Some(number);
+                    assert!(fixture.store.set_type_alias_links(root_owner, links));
+                }
+                _ => unreachable!(),
+            }
+            let before = conditional_allocation_counts(&fixture.store);
+            let link_counts = fixture.store.checker_link_allocated_lengths();
+            let poisoned_source_alias_links = fixture.store.type_alias_links(source_owner).cloned();
+            let poisoned_root_alias_links = fixture.store.type_alias_links(root_owner).cloned();
+            let poisoned_cache = fixture
+                .store
+                .conditional_root(root)
+                .unwrap()
+                .instantiations()
+                .clone();
+            for _ in 0..2 {
+                assert_eq!(
+                    cached_instantiation_with_vector(
+                        &fixture.store,
+                        source,
+                        &[parameter],
+                        &[argument],
+                        None,
+                        None,
+                    ),
+                    Err(InstantiationError::InvalidType(source)),
+                    "corruption {corruption}"
+                );
+                let mut session = InstantiationSession::new(InstantiationLimits::default());
+                let mark = session.limit_event_mark();
+                assert_eq!(
+                    instantiate_type_with_vector_and_session(
+                        &mut fixture.store,
+                        source,
+                        &[parameter],
+                        &[argument],
+                        None,
+                        &mut session,
+                    ),
+                    Err(InstantiationError::InvalidType(source)),
+                    "corruption {corruption}"
+                );
+                assert_eq!(session.limit_event_mark(), mark);
+                assert_eq!(conditional_allocation_counts(&fixture.store), before);
+                assert_eq!(fixture.store.checker_link_allocated_lengths(), link_counts);
+                assert_eq!(
+                    fixture.store.type_alias_links(source_owner).cloned(),
+                    poisoned_source_alias_links
+                );
+                assert_eq!(
+                    fixture.store.type_alias_links(root_owner).cloned(),
+                    poisoned_root_alias_links
+                );
+                assert_eq!(
+                    fixture
+                        .store
+                        .conditional_root(root)
+                        .unwrap()
+                        .instantiations(),
+                    &poisoned_cache
+                );
+            }
+            assert!(
+                fixture
+                    .store
+                    .set_conditional_root_instantiations(root, original_cache)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_conditional_root_alias(root, original_root_alias)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_type_alias_arguments(alias, original_alias_arguments)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_type_node_links(reference, original_reference_links)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_type_alias_links(source_owner, original_source_alias_links)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_type_alias_links(root_owner, original_root_alias_links)
+            );
+            assert!(fixture.store.set_conditional_resolution(
+                result,
+                result_data.resolved_true_type,
+                result_data.resolved_false_type,
+                result_data.resolved_inferred_true_type,
+                result_data.resolved_default_constraint,
+                result_data.resolved_constraint_of_distributive,
+                result_data.mapper,
+                result_data.combined_mapper,
+            ));
+            let warm = conditional_allocation_counts(&fixture.store);
+            assert_eq!(
+                instantiate_type_with_vector(&mut fixture.store, source, &[parameter], &[argument]),
+                Ok(result)
+            );
+            assert_eq!(conditional_allocation_counts(&fixture.store), warm);
+        }
+    }
+
+    #[test]
+    fn deferred_conditional_remap_checks_later_alias_publication() {
+        use crate::semantic::instantiate::instantiate_type_with_vector;
+
+        let mut fixture = Fixture::new(concat!(
+            "type Select<Value> = Value extends string ? number : boolean; ",
+            "type Next<Other> = Other;",
+        ));
+        let node = fixture.conditional();
+        let owner = fixture.alias_symbol("Select");
+        let parameter = fixture.type_parameter("Value");
+        let argument = fixture.type_parameter("Other");
+        let source = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let source = CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(node)
+            .unwrap();
+            assert!(diagnostics.is_empty());
+            source
+        };
+        assert!(
+            fixture
+                .store
+                .conditional_query_production(ConditionalQueryKey::AliasDeclaration(owner))
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .type_alias_links(owner)
+                .is_none_or(|links| links.declared_type.is_none())
+        );
+        let result =
+            instantiate_type_with_vector(&mut fixture.store, source, &[parameter], &[argument])
+                .unwrap();
+        assert_eq!(fixture.declared_alias("Select"), source);
+        let links = fixture.store.type_alias_links(owner).unwrap().clone();
+        assert_eq!(links.declared_type, Some(source));
+        let warm = conditional_allocation_counts(&fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                instantiate_type_with_vector(&mut fixture.store, source, &[parameter], &[argument]),
+                Ok(result)
+            );
+            assert_eq!(fixture.store.type_alias_links(owner), Some(&links));
+            assert_eq!(conditional_allocation_counts(&fixture.store), warm);
+        }
     }
 
     #[test]

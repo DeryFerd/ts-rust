@@ -51217,6 +51217,228 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // The unchanged prop-types source proves the deferred return's real owners.
+    fn deferred_conditional_remap_keeps_the_one_of_type_infer_template_cold() {
+        use crate::semantic::conditional_types::conditional_remap_projection;
+        use crate::semantic::instantiate::{
+            cached_instantiation_with_vector, instantiate_type_with_vector_and_session,
+        };
+
+        let library = parse_source_file(concat!(
+            "type NonNullable<T> = T & {}; ",
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Error { name: string; message: string; stack?: string; }",
+        ));
+        let declarations = parse_source_file(concat!(
+            "declare module 'prop-types' { ",
+            "export const nominalTypeHack: unique symbol; ",
+            "export interface Validator<T> { ",
+            "(props: object, propName: string, componentName: string, ",
+            "location: string, propFullName: string): Error | null; ",
+            "[nominalTypeHack]?: T; ",
+            "} ",
+            "export interface Requireable<T> extends Validator<T | undefined | null> { ",
+            "isRequired: Validator<NonNullable<T>>; ",
+            "} ",
+            "export type InferType<V> = V extends Validator<infer T> ? T : any; ",
+            "export function oneOfType<T extends Validator<any>>(types: T[]): ",
+            "Requireable<NonNullable<InferType<T>>>; ",
+            "}",
+        ));
+        let PropTypesInferPropsFixture {
+            library,
+            declarations,
+            library_file,
+            declaration_file,
+            files,
+            mut store,
+        } = prop_types_declaration_fixture(library, declarations, true);
+        let bound = files.get(&declaration_file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&declarations.arena, bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let node = |node| NodeRef::new(declarations.arena.id(), declaration_file, node);
+        let function = declarations
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::FunctionDeclaration(function) => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let first_argument = |id| {
+            let NodeData::TypeReferenceNode(reference) = &declarations.arena.get(id).unwrap().data
+            else {
+                unreachable!()
+            };
+            let [argument] = reference.type_arguments.as_ref().unwrap().nodes.as_slice() else {
+                unreachable!()
+            };
+            *argument
+        };
+        let request = node(first_argument(function.type_.unwrap()));
+        let infer_request = node(first_argument(request.node));
+        let validator = declarations
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration
+                    && declaration_name(&declarations.arena, record) == Some("Validator"))
+                .then_some(id)
+            })
+            .unwrap();
+        let NodeData::InterfaceDeclaration(validator_data) =
+            &declarations.arena.get(validator).unwrap().data
+        else {
+            unreachable!()
+        };
+        let target_parameter = node(validator_data.type_parameters.as_ref().unwrap().nodes[0]);
+        let target_owner = bound.symbol(target_parameter).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let (original_return, target_parameter) = {
+            let mut query = CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            (
+                query.get_type_from_type_node(request).unwrap(),
+                query.get_declared_type_of_symbol(target_owner).unwrap(),
+            )
+        };
+        let source = store
+            .type_node_links(infer_request)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let TypeData::Conditional(source_data) = store.type_payload(source).unwrap().data() else {
+            unreachable!()
+        };
+        let source_data = source_data.clone();
+        let source_parameter = source_data.check_type;
+        assert_ne!(source_parameter, target_parameter);
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(&store, target_parameter),
+            Some(target_owner)
+        );
+        let extends = validate_direct_generic_reference(&store, source_data.extends_type).unwrap();
+        assert_eq!(
+            store.type_payload(extends.target).unwrap().symbol(),
+            bound.symbol(node(validator))
+        );
+        assert_eq!(extends.type_arguments.len(), 1);
+        assert_eq!(
+            store
+                .conditional_root(source_data.root)
+                .unwrap()
+                .infer_type_parameters(),
+            Some(extends.type_arguments.as_slice())
+        );
+        let source_projection = conditional_remap_projection(&store, source).unwrap();
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            declarations
+                .arena
+                .iter()
+                .map(|(id, _)| store.type_node_links(node(id)).cloned())
+                .collect::<Vec<_>>()
+        };
+        let source_links = snapshot(&store);
+        let signatures = store.signature_len();
+        assert_eq!(
+            cached_instantiation_with_vector(
+                &store,
+                source,
+                &[source_parameter],
+                &[target_parameter],
+                None,
+                None,
+            ),
+            Ok(None)
+        );
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let result = instantiate_type_with_vector_and_session(
+            &mut store,
+            source,
+            &[source_parameter],
+            &[target_parameter],
+            None,
+            &mut session,
+        )
+        .unwrap();
+        let mapped = conditional_remap_projection(&store, result).unwrap();
+        assert_eq!(mapped.arguments(), &[target_parameter]);
+        assert_eq!(
+            mapped.alias(),
+            Some(ConditionalAliasIdentity {
+                symbol: source_projection.alias().unwrap().symbol,
+                type_arguments: &[target_parameter],
+            })
+        );
+        let TypeData::Conditional(result_data) = store.type_payload(result).unwrap().data() else {
+            unreachable!()
+        };
+        assert_eq!(result_data.root, source_data.root);
+        assert_eq!(result_data.check_type, target_parameter);
+        assert_eq!(result_data.extends_type, source_data.extends_type);
+        assert!(result_data.resolved_true_type.is_none());
+        assert!(result_data.resolved_false_type.is_none());
+        assert!(result_data.resolved_inferred_true_type.is_none());
+        assert_eq!(snapshot(&store), source_links);
+        assert_eq!(store.signature_len(), signatures);
+        let warm = non_nullable_conditional_counts(&store);
+        for _ in 0..2 {
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(request),
+                Ok(original_return)
+            );
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    &mut store,
+                    source,
+                    &[source_parameter],
+                    &[target_parameter],
+                    None,
+                    &mut session,
+                ),
+                Ok(result)
+            );
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    &store,
+                    source,
+                    &[source_parameter],
+                    &[target_parameter],
+                    None,
+                    None,
+                ),
+                Ok(Some(result))
+            );
+            assert_eq!(snapshot(&store), source_links);
+            assert_eq!(non_nullable_conditional_counts(&store), warm);
+        }
+        assert_eq!(
+            conditional_remap_projection(&store, source).unwrap(),
+            source_projection
+        );
+        assert_eq!(session.limit_event_count(), 0);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn non_nullable_intersections_require_the_exact_default_library_declaration() {
         for (mut fixture, name) in [
             (fixture("type NonNullable<T> = T & {};"), "NonNullable"),

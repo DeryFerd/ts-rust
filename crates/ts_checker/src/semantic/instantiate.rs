@@ -6,10 +6,10 @@
 //! full-arity generic class/interface references, indexed accesses, generic
 //! `keyof` indexes, authenticated selection-shaped mapped aliases, deferred
 //! intersections, template literals, intrinsic string mappings, ordinary
-//! property-object aliases, inline intersection objects, closed declaration-owned
-//! values, and unions with canonical alias arguments and union origins. Other
-//! object and signature instantiation needs
-//! its owning caches and is rejected.
+//! property-object aliases, inline intersection objects, authenticated deferred
+//! conditionals, closed declaration-owned values, and unions with canonical
+//! alias arguments and union origins. Other object and signature instantiation
+//! needs its owning caches and is rejected.
 
 use std::collections::{HashMap, HashSet};
 
@@ -17,7 +17,12 @@ use super::{
     TypeAliasId, TypeId, TypeMapperId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
-    conditional_types::conditional_alias_projection,
+    conditional_types::{
+        ConditionalAliasIdentity, ConditionalRemapLookup, ConditionalRemapProjection,
+        ConditionalRemapResult, ConditionalTypeError, cached_deferred_conditional_remap,
+        conditional_alias_projection, conditional_remap_projection,
+        remap_deferred_conditional_with_session,
+    },
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
     indexed_access_types::{
         cached_deferred_indexed_access_type, get_instantiated_indexed_access_type,
@@ -1418,6 +1423,7 @@ pub(super) fn with_mapped_template_frame<E>(
                 instantiation_cache_key(store, template, None)
             }
         },
+        |_, _, _| Ok(()),
         map_error,
         |store, session, _| work(store, session),
     )
@@ -1560,6 +1566,36 @@ fn instantiate_type_with_alias_input_and_receipt(
         mapping,
         session,
         |store| instantiation_cache_key_for_input(store, type_, alias),
+        |store, key, cached| {
+            if !matches!(
+                store.type_payload(type_).map(TypeRecord::data),
+                Some(TypeData::Conditional(_))
+            ) {
+                return Ok(());
+            }
+            let InstantiationCacheKey::Type { alias, .. } = key else {
+                return Err(InstantiationError::InvalidType(type_));
+            };
+            let alias = match alias {
+                InstantiationAliasCacheKey::None => None,
+                InstantiationAliasCacheKey::Some {
+                    symbol,
+                    type_arguments,
+                } => Some((*symbol, type_arguments.as_slice())),
+            };
+            if cached_instantiated_type_worker(
+                store,
+                type_,
+                mapping,
+                array_targets,
+                alias,
+                &mut HashSet::new(),
+            )? != Some(cached)
+            {
+                return Err(InstantiationError::InvalidType(type_));
+            }
+            Ok(())
+        },
         std::convert::identity,
         |store, session, key| {
             let InstantiationCacheKey::Type { alias, .. } = key else {
@@ -1592,6 +1628,11 @@ fn with_instantiation_frame<E>(
     cache_key: impl FnOnce(
         &CanonicalTypeMapperStore,
     ) -> Result<InstantiationCacheKey, InstantiationError>,
+    validate_cached: impl FnOnce(
+        &CanonicalTypeMapperStore,
+        &InstantiationCacheKey,
+        TypeId,
+    ) -> Result<(), InstantiationError>,
     map_error: impl Fn(InstantiationError) -> E,
     work: impl FnOnce(
         &mut CanonicalTypeMapperStore,
@@ -1624,7 +1665,7 @@ fn with_instantiation_frame<E>(
 
     // Rust IDs can carry foreign provenance, unlike the upstream pointers.
     // Validate the complete cache identity before mutating the dynamic stack.
-    let key = cache_key(store).map_err(map_error)?;
+    let key = cache_key(store).map_err(&map_error)?;
     let mapping_identity = mapping.identity();
     let existing_index = session
         .active_mappers
@@ -1640,6 +1681,7 @@ fn with_instantiation_frame<E>(
         session.active_mappers.len() - 1
     };
     if let Some(cached) = session.active_mappers[frame_index].cache.get(&key) {
+        validate_cached(store, &key, *cached).map_err(map_error)?;
         return Ok(*cached);
     }
 
@@ -1906,6 +1948,9 @@ fn could_contain_installed_type_variables_worker(
                         )?)
                 })
         }
+        TypeData::Conditional(_) => conditional_remap_projection(store, type_)
+            .map(|_| true)
+            .map_err(|error| conditional_remap_error(type_, error)),
         TypeData::TemplateLiteral(template) => {
             if template.types.is_empty() || template.texts.len() != template.types.len() + 1 {
                 Err(TemplateTypeError::InvalidTemplate(type_).into())
@@ -2748,6 +2793,18 @@ fn cached_instantiated_type_worker(
                 active,
             )
         }
+        TypeData::Conditional(_) => {
+            let projection = conditional_remap_projection(store, template)
+                .map_err(|error| conditional_remap_error(template, error))?;
+            cached_instantiated_deferred_conditional(
+                store,
+                &projection,
+                mapping,
+                array_targets,
+                alias_override,
+                active,
+            )
+        }
         TypeData::IndexedAccess(indexed) => {
             let object = cached_instantiated_type_worker(
                 store,
@@ -3090,6 +3147,93 @@ fn cached_instantiated_type_worker(
     })();
     active.remove(&template);
     result
+}
+
+fn conditional_remap_error(source: TypeId, error: ConditionalTypeError) -> InstantiationError {
+    match error {
+        ConditionalTypeError::Instantiation(error) => error,
+        ConditionalTypeError::InvalidMapper(mapper) => InstantiationError::InvalidMapper(mapper),
+        ConditionalTypeError::Capacity => {
+            InstantiationError::Union(LiteralTypeCacheError::Capacity)
+        }
+        _ => InstantiationError::InvalidType(source),
+    }
+}
+
+fn validate_conditional_alias_override(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+) -> Result<(), InstantiationError> {
+    if let Some((symbol, arguments)) = alias_override {
+        validate_borrowed_alias_input(store, projection.type_id(), symbol, arguments)?;
+        if projection
+            .alias()
+            .map(|alias| (alias.symbol, alias.type_arguments.len()))
+            != Some((symbol, arguments.len()))
+        {
+            return Err(InstantiationError::UnsupportedType(projection.type_id()));
+        }
+    }
+    Ok(())
+}
+
+fn cached_instantiated_deferred_conditional(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+    active: &mut HashSet<TypeId>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    validate_conditional_alias_override(store, projection, alias_override)?;
+    let mut arguments = Vec::with_capacity(projection.arguments().len());
+    for (parameter, argument) in projection.parameters().iter().zip(projection.arguments()) {
+        let mapped = if parameter == argument {
+            cached_apply_mapping(store, *parameter, mapping, array_targets)?
+        } else {
+            cached_instantiated_type_worker(store, *argument, mapping, array_targets, None, active)?
+        };
+        let Some(mapped) = mapped else {
+            return Ok(None);
+        };
+        arguments.push(mapped);
+    }
+    let mut alias_arguments = Vec::new();
+    if let Some(alias) = projection.alias() {
+        for argument in alias.type_arguments {
+            let Some(mapped) = cached_instantiated_type_worker(
+                store,
+                *argument,
+                mapping,
+                array_targets,
+                None,
+                active,
+            )?
+            else {
+                return Ok(None);
+            };
+            alias_arguments.push(mapped);
+        }
+    }
+    let alias = projection.alias().map(|alias| ConditionalAliasIdentity {
+        symbol: alias.symbol,
+        type_arguments: &alias_arguments,
+    });
+    if alias_override.is_some()
+        && alias_override != alias.map(|alias| (alias.symbol, alias.type_arguments))
+    {
+        return Err(InstantiationError::UnsupportedType(projection.type_id()));
+    }
+    match cached_deferred_conditional_remap(store, projection, &arguments, alias, array_targets)
+        .map_err(|error| conditional_remap_error(projection.type_id(), error))?
+    {
+        ConditionalRemapLookup::Cold => Ok(None),
+        ConditionalRemapLookup::Hit(type_) => Ok(Some(type_)),
+        ConditionalRemapLookup::NeedsSourceEvaluation => {
+            Err(InstantiationError::UnsupportedType(projection.type_id()))
+        }
+    }
 }
 
 fn cached_instantiated_mapped_alias(
@@ -3785,6 +3929,7 @@ enum InstantiationWork {
     PropertyObjectAlias(PropertyObjectAliasProjection),
     InlinePropertyObject(InlinePropertyObjectProjection),
     SupportedMappedAlias(SupportedMappedAliasProjection),
+    DeferredConditional(Box<ConditionalRemapProjection>),
     Index {
         target: TypeId,
     },
@@ -3838,6 +3983,10 @@ fn instantiate_type_worker(
                     .map_err(|error| mapped_indexed_access_error(type_, error))?
                     .ok_or(InstantiationError::UnsupportedType(type_))?,
             ),
+            TypeData::Conditional(_) => InstantiationWork::DeferredConditional(Box::new(
+                conditional_remap_projection(store, type_)
+                    .map_err(|error| conditional_remap_error(type_, error))?,
+            )),
             TypeData::IndexedAccess(indexed) => InstantiationWork::IndexedAccess {
                 object: indexed.object_type,
                 index: indexed.index_type,
@@ -4025,7 +4174,88 @@ fn instantiate_type_worker(
             alias,
             session,
         ),
+        InstantiationWork::DeferredConditional(projection) => instantiate_deferred_conditional(
+            store,
+            &projection,
+            mapping,
+            array_targets,
+            alias,
+            session,
+        ),
         InstantiationWork::Unsupported => Err(InstantiationError::UnsupportedType(type_)),
+    }
+}
+
+fn instantiate_deferred_conditional(
+    store: &mut CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    validate_conditional_alias_override(store, projection, alias_override)?;
+    let mark = session.limit_event_mark();
+    let mut arguments = Vec::with_capacity(projection.arguments().len());
+    for (parameter, argument) in projection.parameters().iter().zip(projection.arguments()) {
+        // Go's composite mapper traverses a changed first result through the
+        // second mapper. An unchanged parameter needs only its direct mapping.
+        let mapped = if parameter == argument {
+            apply_mapping(store, *parameter, mapping, array_targets, session)?
+        } else {
+            instantiate_type_with_alias(store, *argument, mapping, array_targets, None, session)?
+        };
+        if session.limit_event_occurred_since(mark)
+            && let Some(error) = session.recovery_error_type()
+        {
+            return Ok(error);
+        }
+        arguments.push(mapped);
+    }
+    let mut alias_arguments = Vec::new();
+    if let Some(alias) = projection.alias() {
+        for argument in alias.type_arguments {
+            let mapped = instantiate_type_with_alias(
+                store,
+                *argument,
+                mapping,
+                array_targets,
+                None,
+                session,
+            )?;
+            if session.limit_event_occurred_since(mark)
+                && let Some(error) = session.recovery_error_type()
+            {
+                return Ok(error);
+            }
+            alias_arguments.push(mapped);
+        }
+    }
+    let alias = projection.alias().map(|alias| ConditionalAliasIdentity {
+        symbol: alias.symbol,
+        type_arguments: &alias_arguments,
+    });
+    if alias_override.is_some()
+        && alias_override != alias.map(|alias| (alias.symbol, alias.type_arguments))
+    {
+        return Err(InstantiationError::UnsupportedType(projection.type_id()));
+    }
+    match remap_deferred_conditional_with_session(
+        store,
+        projection,
+        &arguments,
+        alias,
+        array_targets,
+        session,
+    )
+    .map_err(|error| conditional_remap_error(projection.type_id(), error))?
+    {
+        ConditionalRemapResult::Deferred(type_) | ConditionalRemapResult::Recovered(type_) => {
+            Ok(type_)
+        }
+        ConditionalRemapResult::NeedsSourceEvaluation => {
+            Err(InstantiationError::UnsupportedType(projection.type_id()))
+        }
     }
 }
 
@@ -8787,6 +9017,480 @@ mod tests {
             store.validate_deferred_intersection_type(result),
             Ok(projection)
         );
+    }
+
+    const DEFERRED_CONDITIONAL_ARRAY_LIBRARY: &str = concat!(
+        "type NonNullable<T> = T & {}; ",
+        "interface Array<T> {} interface ReadonlyArray<T> {}",
+    );
+    const DEFERRED_CONDITIONAL_ARRAY_SOURCE: &str = concat!(
+        "type Select<Check, Value> = Check extends string ? Value : boolean; ",
+        "type Forward<Other> = Select<Other, Other[]>;",
+    );
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both mapper representations must preserve the nested source argument.
+    fn deferred_conditional_remap_composes_nested_array_arguments() {
+        for stored_mapper in [false, true] {
+            let library = parse_source_file(DEFERRED_CONDITIONAL_ARRAY_LIBRARY);
+            let source = parse_source_file(DEFERRED_CONDITIONAL_ARRAY_SOURCE);
+            let mut fixture = non_nullable_conditional_fixture(&library, &source, true);
+            let targets = CanonicalArrayTargets::from_global_types(fixture.context.global_types());
+            let store = fixture.context.store_mut_for_test();
+            let parameter = fixture.argument_parameter;
+            let argument = fixture.parameter;
+            let projection = conditional_remap_projection(store, fixture.argument).unwrap();
+            assert_eq!(projection.arguments().len(), 2);
+            assert_eq!(projection.arguments()[0], parameter);
+            let original_array = projection.arguments()[1];
+            assert_eq!(
+                store
+                    .canonical_array_reference_with_targets(targets, original_array)
+                    .unwrap()
+                    .unwrap()
+                    .element_type,
+                parameter
+            );
+            let mapper = store.new_simple_type_mapper(parameter, argument).unwrap();
+            let before = conditional_remap_projection(store, fixture.argument).unwrap();
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    store,
+                    fixture.argument,
+                    &[parameter],
+                    &[argument],
+                    Some(targets),
+                    None,
+                ),
+                Ok(None)
+            );
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let result = if stored_mapper {
+                instantiate_type_with_session(
+                    store,
+                    fixture.argument,
+                    mapper,
+                    Some(targets),
+                    &mut session,
+                )
+            } else {
+                instantiate_type_with_vector_and_session(
+                    store,
+                    fixture.argument,
+                    &[parameter],
+                    &[argument],
+                    Some(targets),
+                    &mut session,
+                )
+            }
+            .unwrap();
+            let mapped = conditional_remap_projection(store, result).unwrap();
+            assert_eq!(mapped.arguments()[0], argument);
+            assert_ne!(mapped.arguments()[1], original_array);
+            let mapped_array = store
+                .canonical_array_reference_with_targets(targets, mapped.arguments()[1])
+                .unwrap()
+                .unwrap();
+            assert_eq!(mapped_array.element_type, argument);
+            assert_eq!(
+                mapped.alias(),
+                Some(ConditionalAliasIdentity {
+                    symbol: projection.alias().unwrap().symbol,
+                    type_arguments: &[argument],
+                })
+            );
+            let TypeData::Conditional(data) = store.type_payload(result).unwrap().data() else {
+                unreachable!()
+            };
+            assert_eq!(data.check_type, argument);
+            assert!(data.resolved_true_type.is_none());
+            assert!(data.resolved_false_type.is_none());
+            assert_eq!(
+                conditional_remap_projection(store, fixture.argument).unwrap(),
+                before
+            );
+            assert_eq!(session.depth, 0);
+            assert!(session.active_mappers.is_empty());
+            assert_eq!(session.limit_event_count(), 0);
+            let warm = deferred_intersection_store_state(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    cached_instantiation_with_vector(
+                        store,
+                        fixture.argument,
+                        &[parameter],
+                        &[argument],
+                        Some(targets),
+                        None,
+                    ),
+                    Ok(Some(result))
+                );
+                assert_eq!(
+                    instantiate_type_with_session(
+                        store,
+                        fixture.argument,
+                        mapper,
+                        Some(targets),
+                        &mut session,
+                    ),
+                    Ok(result)
+                );
+                assert_eq!(deferred_intersection_store_state(store), warm);
+            }
+
+            // A generic argument inside Array<T> does not itself prove that a
+            // conditional check remains deferred in Go.
+            let conditional_counts = store.conditional_production_lengths();
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    store,
+                    fixture.argument,
+                    &[parameter],
+                    &[mapped.arguments()[1]],
+                    Some(targets),
+                    &mut session,
+                ),
+                Err(InstantiationError::UnsupportedType(fixture.argument))
+            );
+            assert_eq!(store.conditional_production_lengths(), conditional_counts);
+            assert_eq!(session.depth, 0);
+            assert!(session.active_mappers.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Nested limits, scratch replay, and a healthy retry share the same source shell.
+    fn deferred_conditional_remap_limits_do_not_publish_normal_results() {
+        for limits in [
+            InstantiationLimits {
+                max_depth: 2,
+                max_count: 100,
+            },
+            InstantiationLimits {
+                max_depth: 100,
+                max_count: 2,
+            },
+        ] {
+            let library = parse_source_file(DEFERRED_CONDITIONAL_ARRAY_LIBRARY);
+            let source = parse_source_file(DEFERRED_CONDITIONAL_ARRAY_SOURCE);
+            let mut fixture = non_nullable_conditional_fixture(&library, &source, true);
+            let targets = CanonicalArrayTargets::from_global_types(fixture.context.global_types());
+            let store = fixture.context.store_mut_for_test();
+            let parameter = fixture.argument_parameter;
+            let argument = fixture.parameter;
+            let mapper = store.new_simple_type_mapper(parameter, argument).unwrap();
+            let error_type = store.intrinsic_bootstrap().unwrap().error_type;
+            let TypeData::Conditional(data) = store.type_payload(fixture.argument).unwrap().data()
+            else {
+                unreachable!()
+            };
+            let root = data.root;
+            let root_cache = store
+                .conditional_root(root)
+                .unwrap()
+                .instantiations()
+                .clone();
+            let production_lengths = store.conditional_production_lengths();
+            let aliases = store.type_alias_len();
+            let mut fail_fast = InstantiationSession::new(limits);
+            assert_eq!(
+                instantiate_type_with_session(
+                    store,
+                    fixture.argument,
+                    mapper,
+                    Some(targets),
+                    &mut fail_fast,
+                ),
+                Err(if limits.max_depth == 2 {
+                    InstantiationError::DepthLimit { depth: 2, limit: 2 }
+                } else {
+                    InstantiationError::CountLimit { count: 2, limit: 2 }
+                })
+            );
+            assert_eq!(fail_fast.depth, 0);
+            assert!(fail_fast.active_mappers.is_empty());
+            assert_eq!(fail_fast.limit_event_count(), 1);
+
+            let mut recovering =
+                InstantiationSession::new_recovering(store, limits, error_type).unwrap();
+            recovering.active_mappers.push(ActiveMapperFrame {
+                mapping: InstantiationMappingIdentity::Stored(mapper),
+                cache: HashMap::new(),
+            });
+            let scratch_key = instantiation_cache_key(store, fixture.argument, None).unwrap();
+            for _ in 0..2 {
+                let mark = recovering.limit_event_mark();
+                assert_eq!(
+                    instantiate_type_with_session(
+                        store,
+                        fixture.argument,
+                        mapper,
+                        Some(targets),
+                        &mut recovering,
+                    ),
+                    Ok(error_type)
+                );
+                assert!(recovering.limit_event_occurred_since(mark));
+                assert_eq!(recovering.depth, 0);
+                assert_eq!(recovering.active_mappers.len(), 1);
+                assert!(
+                    !recovering.active_mappers[0]
+                        .cache
+                        .contains_key(&scratch_key)
+                );
+                assert_eq!(
+                    store.conditional_root(root).unwrap().instantiations(),
+                    &root_cache
+                );
+                assert_eq!(store.conditional_production_lengths(), production_lengths);
+                assert_eq!(store.type_alias_len(), aliases);
+                assert_eq!(
+                    cached_instantiation_with_vector(
+                        store,
+                        fixture.argument,
+                        &[parameter],
+                        &[argument],
+                        Some(targets),
+                        None,
+                    ),
+                    Ok(None)
+                );
+            }
+            recovering.active_mappers.pop().unwrap();
+            let mut healthy = InstantiationSession::new(InstantiationLimits::default());
+            let result = instantiate_type_with_session(
+                store,
+                fixture.argument,
+                mapper,
+                Some(targets),
+                &mut healthy,
+            )
+            .unwrap();
+            assert_ne!(result, error_type);
+            assert_eq!(healthy.depth, 0);
+            assert!(healthy.active_mappers.is_empty());
+            assert_eq!(healthy.limit_event_count(), 0);
+            let warm = deferred_intersection_store_state(store);
+            assert_eq!(
+                instantiate_type_with_session(
+                    store,
+                    fixture.argument,
+                    mapper,
+                    Some(targets),
+                    &mut healthy,
+                ),
+                Ok(result)
+            );
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    store,
+                    fixture.argument,
+                    &[parameter],
+                    &[argument],
+                    Some(targets),
+                    None,
+                ),
+                Ok(Some(result))
+            );
+            assert_eq!(deferred_intersection_store_state(store), warm);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One retained frame must reject each damaged destination and then replay it.
+    fn deferred_conditional_remap_scratch_hits_validate_the_destination() {
+        for corruption in 0..4 {
+            let (mut store, types) = source_alias_instantiation_fixture(
+                concat!(
+                    "type Select<Value> = Value extends string ? number : boolean; ",
+                    "type Forward<Other> = Select<Other>; type Next<After> = After;",
+                ),
+                &["Forward", "Next"],
+            );
+            let [source, argument] = types.as_slice() else {
+                unreachable!()
+            };
+            let parameter = conditional_remap_projection(&store, *source)
+                .unwrap()
+                .arguments()[0];
+            let mapper = store.new_simple_type_mapper(parameter, *argument).unwrap();
+            let scratch_key = instantiation_cache_key(&store, *source, None).unwrap();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            session.active_mappers.push(ActiveMapperFrame {
+                mapping: InstantiationMappingIdentity::Stored(mapper),
+                cache: HashMap::new(),
+            });
+            let result =
+                instantiate_type_with_session(&mut store, *source, mapper, None, &mut session)
+                    .unwrap();
+            assert_eq!(
+                session.active_mappers[0].cache.get(&scratch_key),
+                Some(&result)
+            );
+            let TypeData::Conditional(data) = store.type_payload(result).unwrap().data() else {
+                unreachable!()
+            };
+            let root = data.root;
+            let original_cache = store
+                .conditional_root(root)
+                .unwrap()
+                .instantiations()
+                .clone();
+            let TypeCacheState::Allocated(cache) = &original_cache else {
+                unreachable!()
+            };
+            let keys = cache
+                .iter()
+                .filter_map(|(key, value)| (*value == result).then_some(*key))
+                .collect::<Vec<_>>();
+            let [key] = keys.as_slice() else {
+                panic!("the deferred result must have one root cache key")
+            };
+            let alias = store.type_payload(result).unwrap().alias().unwrap();
+            let original_alias_arguments = store
+                .type_alias(alias)
+                .unwrap()
+                .type_arguments()
+                .map(<[TypeId]>::to_vec);
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            match corruption {
+                0 | 1 => {
+                    let mut cache = cache.clone();
+                    assert_eq!(cache.remove(key), Some(result));
+                    if corruption == 1 {
+                        cache.insert(*key, *source);
+                    }
+                    assert!(store.set_conditional_root_instantiations(
+                        root,
+                        TypeCacheState::Allocated(cache)
+                    ));
+                }
+                2 => assert!(store.set_type_alias_arguments(alias, Some(vec![number]))),
+                3 => {
+                    session.active_mappers[0]
+                        .cache
+                        .insert(scratch_key.clone(), *source);
+                }
+                _ => unreachable!(),
+            }
+            let before = deferred_intersection_store_state(&store);
+            let budget = (
+                session.depth,
+                session.count,
+                session.total_count,
+                session.limit_event_mark(),
+            );
+            let poisoned_cache = store
+                .conditional_root(root)
+                .unwrap()
+                .instantiations()
+                .clone();
+            for _ in 0..2 {
+                assert_eq!(
+                    instantiate_type_with_session(&mut store, *source, mapper, None, &mut session,),
+                    Err(InstantiationError::InvalidType(*source)),
+                    "corruption {corruption}"
+                );
+                assert_eq!(deferred_intersection_store_state(&store), before);
+                assert_eq!(
+                    (
+                        session.depth,
+                        session.count,
+                        session.total_count,
+                        session.limit_event_mark()
+                    ),
+                    budget
+                );
+                assert_eq!(session.active_mappers.len(), 1);
+                assert_eq!(
+                    store.conditional_root(root).unwrap().instantiations(),
+                    &poisoned_cache
+                );
+            }
+            assert!(store.set_conditional_root_instantiations(root, original_cache));
+            assert!(store.set_type_alias_arguments(alias, original_alias_arguments));
+            session.active_mappers[0].cache.insert(scratch_key, result);
+            assert_eq!(
+                instantiate_type_with_session(&mut store, *source, mapper, None, &mut session,),
+                Ok(result)
+            );
+            assert_eq!(
+                (
+                    session.depth,
+                    session.count,
+                    session.total_count,
+                    session.limit_event_mark()
+                ),
+                budget
+            );
+            assert_eq!(deferred_intersection_store_state(&store), before);
+            session.active_mappers.pop().unwrap();
+            assert!(session.active_mappers.is_empty());
+        }
+    }
+
+    #[test]
+    fn deferred_conditional_remap_does_not_recover_for_an_earlier_event_or_error_argument() {
+        let (mut store, types) = source_alias_instantiation_fixture(
+            concat!(
+                "type Select<Check, Value> = Check extends string ? Value : boolean; ",
+                "type Next<Other> = Other;",
+            ),
+            &["Select", "Next"],
+        );
+        let [source, argument] = types.as_slice() else {
+            unreachable!()
+        };
+        let projection = conditional_remap_projection(&store, *source).unwrap();
+        let error_type = store.intrinsic_bootstrap().unwrap().error_type;
+        let mut session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits::default(),
+            error_type,
+        )
+        .unwrap();
+        session.limit_event_generation = 7;
+        let mark = session.limit_event_mark();
+        let result = instantiate_type_with_vector_and_session(
+            &mut store,
+            *source,
+            projection.parameters(),
+            &[*argument, error_type],
+            None,
+            &mut session,
+        )
+        .unwrap();
+        assert_ne!(result, error_type);
+        assert_eq!(session.limit_event_mark(), mark);
+        let mapped = conditional_remap_projection(&store, result).unwrap();
+        assert_eq!(mapped.arguments(), &[*argument, error_type]);
+        assert_eq!(session.depth, 0);
+        assert!(session.active_mappers.is_empty());
+        let warm = deferred_intersection_store_state(&store);
+        assert_eq!(
+            cached_instantiation_with_vector(
+                &store,
+                *source,
+                projection.parameters(),
+                &[*argument, error_type],
+                None,
+                None,
+            ),
+            Ok(Some(result))
+        );
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                &mut store,
+                *source,
+                projection.parameters(),
+                &[*argument, error_type],
+                None,
+                &mut session,
+            ),
+            Ok(result)
+        );
+        assert_eq!(session.limit_event_mark(), mark);
+        assert_eq!(deferred_intersection_store_state(&store), warm);
     }
 
     #[test]
