@@ -78,6 +78,8 @@
 //! fixed keyword tuple method parameters, and function-typed fields.
 //! Tuple annotations use the ordinary type-node query before method publication.
 //! The source executor checks field initializers before publishing their inferred types.
+//! Direct null
+//! fields use the same executor and retain strict-null widening and diagnostics.
 //! Other nonempty executable bodies, general heritage, and non-primitive
 //! field and return annotations remain later class stages.
 
@@ -1434,6 +1436,7 @@ pub(super) fn plan_source_class_members_with_context(
                             SyntaxKind::PropertyAccessExpression
                                 | SyntaxKind::ArrowFunction
                                 | SyntaxKind::Identifier
+                                | SyntaxKind::NullKeyword
                         )
                     ) || source_enum_member_const_assertion(store, host, initializer)?)
                 {
@@ -11629,6 +11632,14 @@ fn plan_property_with_body_mode(
                 NodeData::NumericLiteral(literal) => Some(literal.text.as_str()),
                 NodeData::Identifier(identifier) => Some(identifier.text.as_str()),
                 NodeData::StringLiteral(literal) => Some(literal.text.as_str()),
+                NodeData::KeywordExpression(keyword)
+                    if source_body
+                        && merged_auto_accessor.is_none()
+                        && initializer_record.kind == SyntaxKind::NullKeyword
+                        && keyword.flow_node.is_none() =>
+                {
+                    Some("null")
+                }
                 NodeData::AsExpression(_) if private || enum_const_assertion => None,
                 NodeData::PropertyAccessExpression(_) | NodeData::ArrowFunction(_)
                     if source_body && merged_auto_accessor.is_none() =>
@@ -11718,6 +11729,7 @@ fn plan_property_with_body_mode(
                     }
                     (None, Some(literal.text.clone()), None, None)
                 }
+                NodeData::KeywordExpression(_) => (None, None, None, None),
                 NodeData::AsExpression(_) if enum_const_assertion => (None, None, None, None),
                 NodeData::AsExpression(assertion) => {
                     let operand = NodeRef::new(member.arena, member.file, assertion.expression);

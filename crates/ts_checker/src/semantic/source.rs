@@ -33951,6 +33951,40 @@ fn check_planned_class_body(
                 } else {
                     widened_fresh_literal_union_type(store, global_types, type_)?
                 };
+                if options.no_implicit_any
+                    && store.type_payload(type_).is_some_and(|record| {
+                        record.flags().intersects(TypeFlags::NULLABLE)
+                            && record
+                                .object_flags()
+                                .contains(ObjectFlags::CONTAINS_WIDENING_TYPE)
+                    })
+                {
+                    let Some(NodeData::PropertyDeclaration(property)) =
+                        host.node(body.declaration).map(|record| &record.data)
+                    else {
+                        return Err(SourceCheckError::Class(body.declaration));
+                    };
+                    let name =
+                        NodeRef::new(body.declaration.arena, body.declaration.file, property.name);
+                    let name_text = match host.node(name).map(|record| &record.data) {
+                        Some(NodeData::Identifier(identifier)) => &identifier.text,
+                        Some(NodeData::PrivateIdentifier(identifier)) => &identifier.text,
+                        _ => return Err(SourceCheckError::Class(name)),
+                    };
+                    merge_retry_diagnostic(
+                        diagnostics,
+                        CanonicalCheckerDiagnostic {
+                            node: Some(name),
+                            range_override: None,
+                            diagnostic: Diagnostic::with_arguments(
+                                message_by_code(7008)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(7008))?,
+                                [name_text.as_str(), "any"],
+                            ),
+                            related_information: Vec::new(),
+                        },
+                    );
+                }
                 store.get_widened_type_with_global_types(type_, global_types)?
             };
             Some(type_)
