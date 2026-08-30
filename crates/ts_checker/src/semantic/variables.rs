@@ -970,11 +970,6 @@ pub(super) fn plan_function_object_parameter_bindings(
             let property = NodeRef::new(element.arena, element.file, property);
             let property_record = binding_child_node(arena, store, property, element)?;
             if let NodeData::ComputedPropertyName(computed) = &property_record.data {
-                if contextual_arrow {
-                    return Err(VariablePlanError::Unsupported(
-                        VariableUnsupported::BindingPattern(property),
-                    ));
-                }
                 let key = NodeRef::new(property.arena, property.file, computed.expression);
                 let key_record = binding_child_node(arena, store, key, property)?;
                 if !matches!(

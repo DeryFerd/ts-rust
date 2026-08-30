@@ -1429,7 +1429,15 @@ struct PlannedObjectParameterBindings {
 #[derive(Clone, Debug)]
 struct PlannedContextualArrow {
     source: SourceContextualArrowPlan,
+    computed_keys: Vec<PlannedContextualComputedKey>,
+    computed_key_flow: Option<SourceFlowPlan>,
     body: PlannedArrowBody,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedContextualComputedKey {
+    expression: PlannedExpression,
+    read: Option<(NodeRef, SemanticSymbolId)>,
 }
 
 #[derive(Clone, Debug)]
@@ -4347,12 +4355,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             statements.push(PlannedStatement::Arrow(index));
                         }
                         PlannedVariableStatement::ContextualArrow(arrow) => {
-                            let body = self.plan_contextual_arrow_body(&arrow)?;
+                            let arrow = self.plan_contextual_arrow(*arrow)?;
                             let index = contextual_arrows.len();
-                            contextual_arrows.push(PlannedContextualArrow {
-                                source: *arrow,
-                                body,
-                            });
+                            contextual_arrows.push(arrow);
                             statements.push(PlannedStatement::ContextualArrow(index));
                         }
                         PlannedVariableStatement::Variables(variables) => {
@@ -11932,13 +11937,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         })
     }
 
-    fn plan_contextual_arrow_body(
+    fn plan_contextual_arrow(
         &mut self,
-        arrow: &SourceContextualArrowPlan,
-    ) -> Result<PlannedArrowBody, SourceCheckError> {
+        arrow: SourceContextualArrowPlan,
+    ) -> Result<PlannedContextualArrow, SourceCheckError> {
         let prior_variables = self.prior_variables.clone();
         let readable_variables = self.readable_variables.clone();
         let planned = (|| {
+            let mut parameter_symbols = HashSet::new();
             for parameter in &arrow.parameters {
                 for symbol in std::iter::once(parameter.symbol).chain(
                     parameter
@@ -11952,9 +11958,62 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     {
                         return Err(SourceCheckError::Arrow(parameter.declaration));
                     }
+                    parameter_symbols.insert(symbol);
                 }
             }
 
+            let mut computed_keys = Vec::new();
+            for binding in arrow
+                .parameters
+                .iter()
+                .filter_map(|parameter| parameter.object_bindings.as_ref())
+                .flatten()
+            {
+                let Some(key) = binding.computed_key else {
+                    continue;
+                };
+                let expression = self.plan_computed_binding_key(key, binding.property)?;
+                let read_expression = match &expression.kind {
+                    PlannedExpressionKind::Call(call) => &call.callee,
+                    _ => &expression,
+                };
+                let read = match &read_expression.kind {
+                    PlannedExpressionKind::Identifier(read) => {
+                        if parameter_symbols.contains(&read.value_symbol) {
+                            return Err(self.unsupported(
+                                key,
+                                self.node(key)?.kind,
+                                SourceSyntaxRole::VariableName,
+                            ));
+                        }
+                        Some((read_expression.node, read.value_symbol))
+                    }
+                    _ => None,
+                };
+                computed_keys.push(PlannedContextualComputedKey { expression, read });
+            }
+            let computed_key_flow = if computed_keys.is_empty() {
+                None
+            } else {
+                let (store, _) = self
+                    .semantic
+                    .ok_or(SourceCheckError::Arrow(arrow.declaration))?;
+                Some(
+                    SourceFlowPlan::preflight_linear(
+                        self.arena,
+                        self.bound,
+                        store,
+                        arrow.declaration,
+                        computed_keys
+                            .iter()
+                            .filter_map(|key| key.read.map(|(node, _)| node)),
+                        [],
+                        [],
+                        [],
+                    )
+                    .map_err(|error| contextual_arrow_flow_error(arrow.declaration, error))?,
+                )
+            };
             let body = match arrow.return_origin {
                 SourceContextualReturnOrigin::InferredEmptyBody { .. } => PlannedArrowBody::Empty,
                 SourceContextualReturnOrigin::InferredConciseExpression { expression } => {
@@ -11966,7 +12025,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     ..
                 } => self.plan_arrow_return_expression(statement, expression)?,
             };
-            Ok(body)
+            Ok(PlannedContextualArrow {
+                source: arrow,
+                computed_keys,
+                computed_key_flow,
+                body,
+            })
         })();
         self.prior_variables = prior_variables;
         self.readable_variables = readable_variables;
@@ -40671,7 +40735,7 @@ fn check_callable_object_parameter_bindings(
     let mut binding_types = Vec::with_capacity(bindings.len());
     for element in &planned.elements {
         let binding = &element.binding;
-        let type_ = if let Some(key) = &element.computed_key {
+        let computed_type = if let Some(key) = &element.computed_key {
             let checked = check_expression_type(
                 store,
                 host,
@@ -40686,54 +40750,21 @@ fn check_callable_object_parameter_bindings(
                 None,
                 deferred,
             )?;
-            issue_computed_binding_name_diagnostic(
-                store,
-                global_types,
-                diagnostics,
-                binding.property,
-                checked.result,
-            )?;
-            if let Some(property_name) = literal_computed_property_name(store, checked.result) {
-                object_parameter_property_type(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    diagnostics,
-                    parent_type,
-                    key.node,
-                    &property_name,
-                )?
-            } else {
-                let checked = check_computed_binding_element(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    binding.element,
-                    parent_type,
-                    checked.result,
-                )
-                .map_err(|error| SourcePlanner::element_plan_error(binding.element, error))?;
-                if let Some(diagnostic) = checked.diagnostic {
-                    merge_retry_diagnostic(diagnostics, diagnostic);
-                }
-                checked.type_
-            }
+            Some(checked.result)
         } else {
-            object_parameter_property_type(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                diagnostics,
-                parent_type,
-                binding.property,
-                &binding.property_name,
-            )?
+            None
         };
+        let type_ = checked_object_parameter_binding_type(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            binding,
+            parent_type,
+            computed_type,
+        )?;
         let expected = ValueSymbolLinks {
             resolved_type: Some(type_),
             ..ValueSymbolLinks::default()
@@ -40763,6 +40794,75 @@ fn check_callable_object_parameter_bindings(
         flow_types.insert(symbol, type_);
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // Functions and arrows use the same checked key and parent type.
+fn checked_object_parameter_binding_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    binding: &PlannedObjectBindingElement,
+    parent_type: TypeId,
+    computed_type: Option<TypeId>,
+) -> Result<TypeId, SourceCheckError> {
+    if let Some(key) = binding.computed_key {
+        let type_ = computed_type.ok_or(SourceCheckError::Variable(
+            VariableInvariant::InvalidBindingPattern(binding.element),
+        ))?;
+        issue_computed_binding_name_diagnostic(
+            store,
+            global_types,
+            diagnostics,
+            binding.property,
+            type_,
+        )?;
+        if let Some(property_name) = literal_computed_property_name(store, type_) {
+            return object_parameter_property_type(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                parent_type,
+                key,
+                &property_name,
+            );
+        }
+        let checked = check_computed_binding_element(
+            store,
+            host,
+            global_types,
+            options,
+            binding.element,
+            parent_type,
+            type_,
+        )
+        .map_err(|error| SourcePlanner::element_plan_error(binding.element, error))?;
+        if let Some(diagnostic) = checked.diagnostic {
+            merge_retry_diagnostic(diagnostics, diagnostic);
+        }
+        return Ok(checked.type_);
+    }
+    if computed_type.is_some() {
+        return Err(SourceCheckError::Variable(
+            VariableInvariant::InvalidBindingPattern(binding.element),
+        ));
+    }
+    object_parameter_property_type(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        parent_type,
+        binding.property,
+        &binding.property_name,
+    )
 }
 
 #[allow(clippy::too_many_arguments)] // Conditional effects retain the active source checker state.
@@ -52487,6 +52587,88 @@ fn preflight_contextual_source_publication(
     Ok(())
 }
 
+fn contextual_arrow_flow_error(node: NodeRef, error: SourceFlowError) -> SourceCheckError {
+    match error {
+        SourceFlowError::Array(error) => error.into(),
+        SourceFlowError::Relation(error) => error.into(),
+        SourceFlowError::Join { error, .. }
+        | SourceFlowError::Narrowing {
+            error: LogicalBinaryError::Literal(error),
+            ..
+        } => error.into(),
+        SourceFlowError::Unsupported(SourceFlowUnsupported::Call(call)) => {
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(call))
+        }
+        SourceFlowError::Unsupported(_) | SourceFlowError::Narrowing { .. } => {
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(node))
+        }
+        SourceFlowError::Invariant(_) => SourceCheckError::Arrow(node),
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // The arrow's parameter flow never updates creation-time flow.
+fn check_contextual_computed_parameter_keys(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    arrow: &PlannedContextualArrow,
+) -> Result<HashMap<NodeRef, TypeId>, SourceCheckError> {
+    let mut checked_keys = HashMap::new();
+    let Some(flow) = &arrow.computed_key_flow else {
+        return if arrow.computed_keys.is_empty() {
+            Ok(checked_keys)
+        } else {
+            Err(SourceCheckError::Arrow(arrow.source.declaration))
+        };
+    };
+    let bound = host
+        .bound_file(arrow.source.declaration)
+        .ok_or(SourceCheckError::Arrow(arrow.source.declaration))?;
+    let mut frame = flow
+        .frame(bound, flow_types.clone())
+        .map_err(|error| contextual_arrow_flow_error(arrow.source.declaration, error))?;
+    for key in &arrow.computed_keys {
+        let snapshot = key
+            .read
+            .map(|(node, symbol)| {
+                frame
+                    .snapshot_for_symbols_at(store, global_types, node, [symbol])
+                    .map_err(|error| contextual_arrow_flow_error(arrow.source.declaration, error))
+            })
+            .transpose()?;
+        let checked = check_expression_type(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            snapshot
+                .as_ref()
+                .map_or(flow_types, |snapshot| snapshot.types()),
+            type_import_execution,
+            &key.expression,
+            None,
+            deferred,
+        )?;
+        if checked_keys
+            .insert(key.expression.node, checked.result)
+            .is_some()
+        {
+            return Err(SourceCheckError::Arrow(key.expression.node));
+        }
+    }
+    Ok(checked_keys)
+}
+
 #[allow(clippy::too_many_arguments)] // Share the caller's source property query and cache checks.
 fn contextual_object_parameter_binding_types(
     store: &mut CanonicalTypeMapperStore,
@@ -52497,6 +52679,7 @@ fn contextual_object_parameter_binding_types(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     parameter: &super::source_arrows::SourceContextualParameterPlan,
     parent_type: TypeId,
+    computed_key_types: Option<&HashMap<NodeRef, TypeId>>,
 ) -> Result<Vec<(SemanticSymbolId, ValueSymbolLinks)>, SourceCheckError> {
     let Some(bindings) = &parameter.object_bindings else {
         return Ok(Vec::new());
@@ -52511,16 +52694,30 @@ fn contextual_object_parameter_binding_types(
     }
     let mut binding_types = Vec::with_capacity(bindings.len());
     for binding in bindings {
-        let type_ = object_parameter_property_type(
+        let computed_type = if let Some(key) = binding.computed_key {
+            // Warm preparation has no deferred capture frame. Execution checks
+            // these leaves after it checks their keys in the arrow's real flow.
+            let Some(computed_key_types) = computed_key_types else {
+                continue;
+            };
+            Some(
+                *computed_key_types
+                    .get(&key)
+                    .ok_or(SourceCheckError::Arrow(key))?,
+            )
+        } else {
+            None
+        };
+        let type_ = checked_object_parameter_binding_type(
             store,
             host,
             global_types,
             options,
             session,
             diagnostics,
+            binding,
             parent_type,
-            binding.property,
-            &binding.property_name,
+            computed_type,
         )?;
         let expected = ValueSymbolLinks {
             resolved_type: Some(type_),
@@ -52594,6 +52791,19 @@ fn materialize_contextual_source_arrow(
     let mut prepared_parameters = Vec::with_capacity(parameters.len());
     let mut binding_types = Vec::new();
     let mut flow_types = current_flow_types.clone();
+    let computed_key_types = check_contextual_computed_parameter_keys(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        current_flow_types,
+        type_import_execution,
+        deferred,
+        arrow,
+    )?;
     for (parameter, syntax) in parameters.iter().zip(&plan.parameters) {
         let base = match parameter.origin {
             SourceContextualParameterOrigin::ExplicitAnnotation { type_node } => {
@@ -52656,6 +52866,7 @@ fn materialize_contextual_source_arrow(
             diagnostics,
             syntax,
             type_,
+            Some(&computed_key_types),
         )? {
             let type_ = links
                 .resolved_type
@@ -62345,6 +62556,7 @@ pub(super) fn check_source_file(
                     &mut binding_diagnostics,
                     parameter,
                     type_,
+                    None,
                 )?;
             }
         }
@@ -65686,6 +65898,26 @@ pub(super) fn check_source_file(
                     diagnostics,
                     arrow.source.declaration,
                 )?;
+                let captured_flow_types = if arrow.computed_keys.is_empty() {
+                    None
+                } else {
+                    Some(
+                        SourceArrowCaptureContext {
+                            declared_types: &top_level_declared_types,
+                            mutable_symbols: Some(&mutable_variables),
+                            outer: None,
+                            flow: None,
+                            assignments: &capture_assignments,
+                            value_exports: &local_named_exports,
+                        }
+                        .flow_types(
+                            store,
+                            host,
+                            arrow.source.declaration,
+                            &current_flow_types,
+                        )?,
+                    )
+                };
                 let (target, _) = materialize_contextual_source_arrow(
                     store,
                     host,
@@ -65694,7 +65926,7 @@ pub(super) fn check_source_file(
                     options,
                     session,
                     diagnostics,
-                    &current_flow_types,
+                    captured_flow_types.as_ref().unwrap_or(&current_flow_types),
                     &type_import_execution,
                     &type_import_capabilities,
                     &mut deferred,
@@ -112403,6 +112635,190 @@ class Foo2 {
             );
             context.check_source_file(file).unwrap();
             assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn computed_contextual_arrow_plans_keep_key_reads_in_the_deferred_flow() {
+        let source = parsed(concat!(
+            "const key = 'value'; ",
+            "const read: (input: { value: number }) => number = ({ [key]: chosen }) => chosen;",
+        ));
+        let file = FileId::new(202_840);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let before = observable_state(&context, file);
+        let arrow = {
+            let (_, bound) = context.file(file).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let mut plan = SourcePlanner::new_semantic_with_global_types(
+                &source.arena,
+                bound,
+                context.source_file(file).unwrap(),
+                context.store(),
+                &host,
+                context.global_types(),
+                context.options(),
+            )
+            .finish()
+            .unwrap();
+            assert_eq!(plan.contextual_arrows.len(), 1);
+            plan.contextual_arrows.pop().unwrap()
+        };
+        assert_eq!(observable_state(&context, file), before);
+        let [key] = arrow.computed_keys.as_slice() else {
+            panic!("the real computed key must retain one expression plan")
+        };
+        let symbol = variable_symbol(&context, &source, file, "key");
+        assert_eq!(key.read, Some((key.expression.node, symbol)));
+        let (_, bound) = context.file(file).unwrap();
+        let start = bound
+            .flow_graph()
+            .container_start(arrow.source.declaration)
+            .unwrap();
+        assert_eq!(bound.flow_at(key.expression.node), Some(start));
+        assert_eq!(
+            bound.flow_container(key.expression.node),
+            Some(arrow.source.declaration)
+        );
+        assert_ne!(bound.flow_at(arrow.source.declaration), Some(start));
+        assert!(arrow.computed_key_flow.is_some());
+        context.check_source_file(file).unwrap();
+        let key_type = resolved_node_type(&context, key.expression.node);
+        assert_eq!(context.type_to_string(key_type).unwrap(), "\"value\"");
+        let warm = observable_state(&context, file);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                context.get_type_at_location(key.expression.node),
+                Ok(key_type)
+            );
+            assert_eq!(observable_state(&context, file), warm);
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn computed_contextual_arrow_bindings_reject_stale_key_and_leaf_types() {
+        let source = parsed(concat!(
+            "const key = 'value'; ",
+            "const read: (input: { value: number }) => number = ({ [key]: chosen }) => chosen;",
+        ));
+        let file = FileId::new(202_841);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let binding = source
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                (record.kind == SyntaxKind::BindingElement).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    id,
+                ))
+            })
+            .unwrap();
+        let key = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ComputedPropertyName(computed) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(source.arena.id(), file, computed.expression))
+            })
+            .unwrap();
+        let leaf = context.file(file).unwrap().1.symbol(binding).unwrap();
+        let leaf_links = context.store().value_symbol_links(leaf).unwrap().clone();
+        let key_links = context.store().type_node_links(key).unwrap().clone();
+        let key_type = key_links.resolved_type.unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for poison_key in [false, true] {
+            mark_source_unchecked(&mut context, file);
+            if poison_key {
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    key,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+            } else {
+                assert!(context.store_mut_for_test().set_value_symbol_links(
+                    leaf,
+                    ValueSymbolLinks {
+                        resolved_type: Some(string),
+                        ..ValueSymbolLinks::default()
+                    }
+                ));
+            }
+            let expected = if poison_key {
+                SourceCheckError::Assertion(SourceAssertionError::InvalidExpressionCache {
+                    node: key,
+                    cached: Some(number),
+                    expected: key_type,
+                })
+            } else {
+                SourceCheckError::Arrow(binding)
+            };
+            let before = observable_state(&context, file);
+            for _ in 0..2 {
+                assert_eq!(context.check_source_file(file), Err(expected));
+                assert_eq!(observable_state(&context, file), before);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(key, key_links.clone())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(leaf, leaf_links.clone())
+            );
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn computed_contextual_arrow_keys_reject_real_parameter_and_sibling_dependencies() {
+        for text in [
+            "const read: (key: 'value', input: { value: number }) => number = (key, { [key]: chosen }) => chosen;",
+            "const key = 'value'; const read: (input: { key: 'value'; value: number }) => number = ({ key, [key]: chosen }) => chosen;",
+        ] {
+            let source = parsed(text);
+            let file = FileId::new(202_842);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let key = source
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::ComputedPropertyName(computed) = &record.data else {
+                        return None;
+                    };
+                    Some(NodeRef::new(source.arena.id(), file, computed.expression))
+                })
+                .unwrap();
+            let before = observable_state(&context, file);
+            for _ in 0..2 {
+                assert_eq!(
+                    context.check_source_file(file),
+                    Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Syntax {
+                            node: key,
+                            kind: SyntaxKind::Identifier,
+                            role: SourceSyntaxRole::VariableName,
+                        }
+                    ))
+                );
+                assert_eq!(observable_state(&context, file), before);
+                assert!(context.diagnostics().is_empty());
+            }
         }
     }
 

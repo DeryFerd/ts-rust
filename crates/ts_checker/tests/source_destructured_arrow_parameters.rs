@@ -573,11 +573,91 @@ fn missing_contextual_object_arrow_binding_keeps_property_diagnostics_on_replay(
 }
 
 #[test]
+fn computed_literal_arrow_binding_keeps_the_original_source_and_property_type() {
+    let source =
+        "const read: (input: { value: number }) => number = ({ [\"value\"]: value }) => value;";
+    let parsed = parse_source_file(source);
+    let mut context = context(&parsed);
+    let parts = arrow_parts(&parsed);
+    let parameter = parts.parameters[0];
+    let [(element, name)]: [(NodeRef, NodeRef); 1] =
+        bindings(&parsed, parameter).try_into().unwrap();
+    let computed = only_node(&parsed, SyntaxKind::ComputedPropertyName);
+    let NodeData::ComputedPropertyName(computed_name) =
+        &parsed.arena.get(computed.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let key = node(&parsed, computed_name.expression);
+    assert_eq!(node_text(source, &parsed, key), "\"value\"");
+    assert!(!is_checked(&context));
+    assert!(context.store().signature_links(parts.arrow).is_none());
+    let key_type = context.get_type_at_location(key).unwrap();
+    assert!(is_checked(&context));
+    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+    assert_eq!(context.type_to_string(key_type).unwrap(), "\"value\"");
+    let parent_type = context.get_type_at_location(parameter).unwrap();
+    assert_eq!(
+        context.get_type_at_location(parts.contextual_parameters[0]),
+        Ok(parent_type),
+    );
+    assert_eq!(
+        context.type_to_string(parent_type).unwrap(),
+        "{ value: number; }"
+    );
+    let parent = symbol(&context, parameter);
+    let leaf = symbol(&context, element);
+    let owner = symbol(&context, parts.arrow);
+    assert_ne!(parent, leaf);
+    assert_ne!(owner, parent);
+    assert_eq!(
+        context.get_symbol_declarations(parent).unwrap(),
+        &[parameter]
+    );
+    assert_eq!(context.get_symbol_declarations(leaf).unwrap(), &[element]);
+    let callable = context.get_type_at_location(parts.arrow).unwrap();
+    assert_eq!(
+        context.store().type_payload(callable).unwrap().symbol(),
+        Some(owner)
+    );
+    assert_eq!(
+        context.type_to_string(callable).unwrap(),
+        "({ [\"value\"]: value }: { value: number; }) => number",
+    );
+    let signature = context
+        .store()
+        .signature_links(parts.arrow)
+        .unwrap()
+        .resolved_signature
+        .signature()
+        .unwrap();
+    assert_eq!(
+        context.store().signature(signature).unwrap().parameters(),
+        &[parent]
+    );
+    assert_eq!(context.get_return_type_of_signature(signature), Ok(number));
+    let read = body_read(&parsed, &parts, "value");
+    let mut types = vec![
+        (key, key_type),
+        (parameter, parent_type),
+        (parts.arrow, callable),
+    ];
+    let mut symbols = vec![(parameter, parent)];
+    for location in [element, name, read] {
+        assert_eq!(context.get_type_at_location(location), Ok(number));
+        assert_eq!(context.get_symbol_at_location(location), Ok(Some(leaf)));
+        types.push((location, number));
+        symbols.push((location, leaf));
+    }
+    assert!(context.diagnostics().is_empty());
+    assert_replay(&mut context, parts.arrow, &types, &symbols);
+}
+
+#[test]
 fn later_destructured_arrow_forms_stay_unsupported_without_publication() {
     for source in [
         "const read: (input: [number]) => number = ([value]) => value;",
         "const read: (input: { nested: { value: number } }) => number = ({ nested: { value } }) => value;",
-        "const read: (input: { value: number }) => number = ({ [\"value\"]: value }) => value;",
         "const read: (input: { value?: number }) => number = ({ value = 1 }) => value;",
         "const read: (input: { value: number }) => number = ({ value } = { value: 1 }) => value;",
         "const read: (input: { value: number; other: string }) => number = ({ value, ...rest }) => value;",
