@@ -16113,6 +16113,38 @@ fn property_initializer_number(property: &ClassPropertyPlan) -> Option<Number> {
         .map(|literal| ts_jsnum::from_string(literal))
 }
 
+// Bootstrap zero is valid before literal evaluation creates its fresh partner.
+fn cold_property_initializer_zero_type(
+    store: &CanonicalTypeMapperStore,
+    property: &ClassPropertyPlan,
+) -> Result<Option<TypeId>, ClassError> {
+    let Some(number) =
+        property_initializer_number(property).filter(|number| *number == Number::new(0.0))
+    else {
+        return Ok(None);
+    };
+    let invalid = || invariant(ClassInvariant::InvalidPropertyTypeCache(property.type_node));
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let regular = bootstrap
+        .cached_number_literal_type(number)
+        .ok_or_else(invalid)?;
+    let record = store.type_payload(regular).ok_or_else(invalid)?;
+    let TypeData::Literal(literal) = record.data() else {
+        return Err(invalid());
+    };
+    if regular != bootstrap.zero_type
+        || record.flags() != TypeFlags::NUMBER_LITERAL
+        || record.object_flags() != ObjectFlags::NONE
+        || record.symbol().is_some()
+        || record.alias().is_some()
+        || literal.regular_type != regular
+        || !matches!(literal.value, super::type_records::LiteralValue::Number(value) if value == number)
+    {
+        return Err(invalid());
+    }
+    Ok(literal.fresh_type.is_none().then_some(regular))
+}
+
 fn property_initializer_fresh_literal_type(
     store: &CanonicalTypeMapperStore,
     property: &ClassPropertyPlan,
@@ -16167,6 +16199,9 @@ fn property_initializer_fresh_literal_type(
         }
         Some(regular)
     } else if let Some(number) = property_initializer_number(property) {
+        if cold_property_initializer_zero_type(store, property)?.is_some() {
+            return Ok(None);
+        }
         bootstrap.cached_number_literal_type(number)
     } else {
         return Ok(None);
@@ -16195,6 +16230,9 @@ fn resolved_property_value_type(
     }
     if !property.readonly || property.initializer_node != Some(property.type_node) {
         return Ok(Some(planned_type));
+    }
+    if let Some(regular) = cold_property_initializer_zero_type(store, property)? {
+        return Ok(Some(regular));
     }
     let bootstrap = store
         .intrinsic_bootstrap()
@@ -17360,46 +17398,13 @@ fn validate_property_cache_state(
     )
 }
 
-// Bootstrap zero has no fresh partner until a literal query prepares it.
-// Keep this query state separate from full source-plan admission.
+// Both query and source plans validate cold literals without preparing them.
 fn validate_query_property_cache_state(
     store: &CanonicalTypeMapperStore,
     property: &ClassPropertyPlan,
     property_type: TypeId,
 ) -> Result<(), ClassError> {
-    let Some(number) =
-        property_initializer_number(property).filter(|number| *number == Number::new(0.0))
-    else {
-        return validate_property_cache_state(store, property, property_type);
-    };
-    let invalid = || invariant(ClassInvariant::InvalidPropertyTypeCache(property.type_node));
-    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
-    let regular = bootstrap
-        .cached_number_literal_type(number)
-        .ok_or_else(invalid)?;
-    let record = store.type_payload(regular).ok_or_else(invalid)?;
-    let TypeData::Literal(literal) = record.data() else {
-        return Err(invalid());
-    };
-    if regular != bootstrap.zero_type
-        || record.flags() != TypeFlags::NUMBER_LITERAL
-        || record.object_flags() != ObjectFlags::NONE
-        || record.symbol().is_some()
-        || record.alias().is_some()
-        || literal.regular_type != regular
-        || !matches!(literal.value, super::type_records::LiteralValue::Number(value) if value == number)
-    {
-        return Err(invalid());
-    }
-    if literal.fresh_type.is_some() {
-        return validate_property_cache_state(store, property, property_type);
-    }
-    let value = if property.readonly && property.initializer_node == Some(property.type_node) {
-        Ok(Some(regular))
-    } else {
-        resolved_property_value_type(store, property, property_type)
-    };
-    validate_property_cache_state_with_types(store, property, property_type, None, value)
+    validate_property_cache_state(store, property, property_type)
 }
 
 fn validate_property_cache_state_with_types(
@@ -43901,6 +43906,194 @@ mod tests {
             ),
             poisoned,
         );
+    }
+
+    #[test]
+    fn bootstrap_zero_class_plans_keep_cold_and_selected_query_identity() {
+        for (source, readonly, annotated, static_) in [
+            ("class Model { value = 0; }", false, false, false),
+            ("class Model { readonly value = 0; }", true, false, false),
+            (
+                "class Model { readonly value: number = 0; }",
+                true,
+                true,
+                false,
+            ),
+            ("class Model { static value = 0; }", false, false, true),
+            (
+                "class Model { static readonly value = 0; }",
+                true,
+                false,
+                true,
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+            let zero = fixture.store.intrinsic_bootstrap().unwrap().zero_type;
+            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            let literal = fixture.store.type_payload(zero).unwrap().clone();
+            let TypeData::Literal(data) = literal.data() else {
+                panic!("bootstrap zero is a literal")
+            };
+            assert_eq!(data.fresh_type, None);
+            let cold = source_class_snapshot!(fixture.store, zero);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("the field belongs to one direct class")
+            };
+            let property = if static_ {
+                &class.class.static_properties[0]
+            } else {
+                &class.class.properties[0]
+            };
+            let initializer = property.initializer_node.unwrap();
+            let expected = if readonly && !annotated { zero } else { number };
+            assert_eq!(property.readonly, readonly);
+            assert_eq!(property.type_node != initializer, annotated);
+            assert_eq!(
+                property_initializer_fresh_literal_type(&fixture.store, property),
+                Ok(None)
+            );
+            assert_eq!(
+                resolved_property_value_type(&fixture.store, property, number),
+                Ok(Some(expected))
+            );
+            let selected =
+                query::plan_selected_class_member(&fixture.store, &host, property.symbol).unwrap();
+            assert_eq!(source_class_snapshot!(fixture.store, zero), cold);
+            assert_eq!(fixture.store.type_payload(zero), Some(&literal));
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(property.symbol).is_none());
+            assert!(fixture.store.type_node_links(initializer).is_none());
+
+            assert_eq!(
+                query::execute_selected_class_member(&mut fixture.store, &host, &selected),
+                Ok(expected)
+            );
+            let fresh = fixture.store.fresh_type_of_literal_type(zero).unwrap();
+            assert_ne!(fresh, zero);
+            assert_eq!(
+                fixture.store.type_node_links(initializer),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(fresh),
+                    ..TypeNodeLinks::default()
+                })
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+            let selected_warm = source_class_snapshot!(fixture.store, zero);
+            assert_eq!(
+                query::execute_selected_class_member(&mut fixture.store, &host, &selected),
+                Ok(expected)
+            );
+            assert_eq!(source_class_snapshot!(fixture.store, zero), selected_warm);
+            assert_eq!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Ok(plan.clone())
+            );
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+            let instance = members.shells().instance_type();
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, instance),
+                ClassHeritageMembersValidation::Valid
+            );
+            let warm = source_class_snapshot!(fixture.store, instance);
+            assert_eq!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+                Ok(members)
+            );
+            assert_eq!(source_class_snapshot!(fixture.store, instance), warm);
+        }
+    }
+
+    #[test]
+    fn bootstrap_zero_class_plans_reject_damaged_cold_and_warm_literal_links() {
+        for warm in [false, true] {
+            for poison_symbol in [false, true] {
+                let mut fixture = fixture("class Model { readonly value = 0; }");
+                let owner = class_symbol(&fixture, "Model");
+                let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+                let plan =
+                    plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+                let ClassMemberQueryPlan::Direct(class) = &plan else {
+                    panic!("the field belongs to one direct class")
+                };
+                let property = &class.class.properties[0];
+                let selected =
+                    query::plan_selected_class_member(&fixture.store, &host, property.symbol)
+                        .unwrap();
+                let zero = fixture.store.intrinsic_bootstrap().unwrap().zero_type;
+                if warm {
+                    assert_eq!(
+                        query::execute_selected_class_member(&mut fixture.store, &host, &selected),
+                        Ok(zero)
+                    );
+                }
+                let literal = fixture.store.type_payload(zero).unwrap().clone();
+                let TypeData::Literal(data) = literal.data() else {
+                    panic!("bootstrap zero is a literal")
+                };
+                let fresh = data.fresh_type;
+                let damaged_type = if poison_symbol {
+                    let target = fresh.unwrap_or(zero);
+                    assert!(fixture.store.set_type_symbol(target, Some(owner)));
+                    target
+                } else {
+                    assert!(fixture.store.set_literal_links(zero, Some(zero), zero));
+                    zero
+                };
+                let damaged = fixture.store.type_payload(damaged_type).unwrap().clone();
+                let value = fixture.store.value_symbol_links(property.symbol).cloned();
+                let initializer = fixture.store.type_node_links(property.type_node).cloned();
+                let before = source_class_snapshot!(fixture.store, zero);
+                let expected =
+                    invariant(ClassInvariant::InvalidPropertyTypeCache(property.type_node));
+                for _ in 0..2 {
+                    assert_eq!(
+                        plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                        Err(expected)
+                    );
+                    assert_eq!(
+                        query::plan_selected_class_member(&fixture.store, &host, property.symbol),
+                        Err(expected)
+                    );
+                    assert_eq!(source_class_snapshot!(fixture.store, zero), before);
+                    assert_eq!(fixture.store.type_payload(damaged_type), Some(&damaged));
+                    assert_eq!(
+                        fixture.store.value_symbol_links(property.symbol),
+                        value.as_ref()
+                    );
+                    assert_eq!(
+                        fixture.store.type_node_links(property.type_node),
+                        initializer.as_ref()
+                    );
+                    assert!(fixture.store.declared_type_links(owner).is_none());
+                    assert!(fixture.store.value_symbol_links(owner).is_none());
+                }
+                if poison_symbol {
+                    assert!(fixture.store.set_type_symbol(damaged_type, None));
+                } else {
+                    assert!(fixture.store.set_literal_links(zero, fresh, zero));
+                }
+                let restored = source_class_snapshot!(fixture.store, zero);
+                assert_eq!(
+                    plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                    Ok(plan.clone())
+                );
+                assert_eq!(
+                    query::plan_selected_class_member(&fixture.store, &host, property.symbol),
+                    Ok(selected.clone())
+                );
+                assert_eq!(source_class_snapshot!(fixture.store, zero), restored);
+                assert_eq!(
+                    query::execute_selected_class_member(&mut fixture.store, &host, &selected),
+                    Ok(zero)
+                );
+            }
+        }
     }
 
     #[test]
