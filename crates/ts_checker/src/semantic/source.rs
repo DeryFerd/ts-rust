@@ -70133,7 +70133,7 @@ mod tests {
         let imports = SourceTypeImportExecution {
             value_uses: HashMap::new(),
             annotation_capabilities: &capabilities,
-            property_flow: super::source_flow::OwnClassPropertyFlow::default(),
+            property_flow: super::super::source_flow::OwnClassPropertyFlow::default(),
         };
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
         let mut check = |context: &mut CanonicalCheckerContext<'_>,
@@ -117266,7 +117266,7 @@ class Foo2 {
             &SourceTypeImportExecution {
                 value_uses: HashMap::new(),
                 annotation_capabilities: &capabilities,
-                property_flow: super::source_flow::OwnClassPropertyFlow::default(),
+                property_flow: super::super::source_flow::OwnClassPropertyFlow::default(),
             },
             &mut Vec::new(),
             &mut execution,

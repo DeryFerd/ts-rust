@@ -6767,7 +6767,7 @@ mod tests {
                 };
                 Some((
                     NodeRef::new(parsed.arena.id(), file, node),
-                    NodeRef::new(parsed.arena.id(), file, binding.name),
+                    NodeRef::new(parsed.arena.id(), file, binding.name?),
                     NodeRef::new(parsed.arena.id(), file, record.parent?),
                 ))
             })
