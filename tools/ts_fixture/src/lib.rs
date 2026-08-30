@@ -7398,9 +7398,8 @@ mod tests {
 
         assert!(compilation.diagnostics.is_empty());
         assert!(compilation.outputs.is_empty());
-        assert_eq!(variant.unsupported_details.len(), 1);
         assert!(
-            variant.unsupported_details[0].contains("kind: ForStatement, role: Statement"),
+            variant.unsupported_details.is_empty(),
             "{:?}",
             variant.unsupported_details
         );
@@ -7410,6 +7409,45 @@ mod tests {
             .unsupported_details
             .extend(variant.unsupported_details);
         let comparison = compare_diagnostic_artifacts("", &artifact, &compilation.diagnostics);
+        assert!(comparison.is_exact());
+        assert_eq!(comparison.status(), DiagnosticVariantStatus::ExactMatch);
+
+        let case = Case::parse(
+            "unsupported.ts",
+            concat!(
+                "// @module: esnext\n",
+                "// @outDir: out\n",
+                "// @filename: unsupported.ts\n",
+                "for (let [index] = [0]; index < 1; ++index) {}\n",
+            ),
+        )
+        .unwrap();
+        let mut runs = compile_case_matrix_with_checker(&case, FixtureChecker::Canonical).unwrap();
+        assert_eq!(runs.len(), 1);
+        let (variant, compilation) = runs.remove(0);
+        assert!(compilation.diagnostics.is_empty());
+        assert!(compilation.outputs.is_empty());
+        let [detail] = variant.unsupported_details.as_slice() else {
+            panic!(
+                "expected one typed checker detail: {:?}",
+                variant.unsupported_details
+            )
+        };
+        assert!(
+            detail.starts_with("experimental canonical checker: "),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("kind: ArrayBindingPattern, role: Statement"),
+            "{detail}"
+        );
+
+        let mut artifact = render_error_baseline(&case, &compilation.diagnostics);
+        artifact
+            .unsupported_details
+            .extend(variant.unsupported_details);
+        let comparison = compare_diagnostic_artifacts("", &artifact, &compilation.diagnostics);
+        assert!(!comparison.is_exact());
         assert_eq!(
             comparison.status(),
             DiagnosticVariantStatus::UnsupportedDetail
