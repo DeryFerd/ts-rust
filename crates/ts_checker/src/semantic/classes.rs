@@ -1532,6 +1532,24 @@ pub(super) fn plan_source_class_members_with_context(
     plan_source_class_expandos(store, host, &mut plan)?;
     validate_source_class_member_tables(store, &plan)?;
     plan.bindings = capture_source_class_bindings(store, &plan)?;
+    if let Some(retained) = store.source_class_provenance_for_symbol(symbol)
+        && plan.array_targets != retained.prepared.plan.array_targets
+        && !plan.methods.iter().any(|method| {
+            method.method.parameters.iter().any(|parameter| {
+                parameter.type_node.is_some_and(|annotation| {
+                    store.source_node_kind(annotation) == Some(SyntaxKind::ArrayType)
+                })
+            })
+        })
+    {
+        // Methods without array annotations do not read these targets.
+        // Reuse a saved input only when every other source-plan field matches.
+        let current_targets = plan.array_targets;
+        plan.array_targets = retained.prepared.plan.array_targets;
+        if plan != retained.prepared.plan {
+            plan.array_targets = current_targets;
+        }
+    }
     Ok(plan)
 }
 
@@ -4415,7 +4433,7 @@ pub(super) fn check_source_class_method_overloads(
             }
             let declaration = store
                 .signature(overload.signature)
-                .and_then(|signature| signature.declaration())
+                .and_then(super::signatures::Signature::declaration)
                 .filter(|declaration| host.node(*declaration).is_some())
                 .ok_or(SourceCheckError::Class(implementation))?;
             diagnostics.push((
@@ -8117,14 +8135,11 @@ fn constructor_date_initializer_error(
         SourceNewError::Unsupported(_) => {
             accessor_member_error(constructor, SyntaxKind::Constructor)
         }
-        SourceNewError::Invariant(_) => {
+        SourceNewError::Invariant(_) | SourceNewError::Call { .. } => {
             invariant(ClassInvariant::InvalidPropertyTypeCache(initializer))
         }
         SourceNewError::DeclaredType(error) => error.into(),
         SourceNewError::Class(error) => error,
-        SourceNewError::Call { .. } => {
-            invariant(ClassInvariant::InvalidPropertyTypeCache(initializer))
-        }
     }
 }
 
@@ -31971,6 +31986,113 @@ mod tests {
             source_class_snapshot!(fixture.store, prepared.instance_type),
             before
         );
+    }
+
+    #[test]
+    fn source_body_replay_keeps_unused_array_context_and_checks_array_methods() {
+        for (annotation, needs_array) in [("number", false), ("string[]", true)] {
+            let mut fixture = fixture(&format!(
+                "interface Array<T> {{}} interface ReadonlyArray<T> {{}} \
+                 class Subject {{ method(value: {annotation}): void {{}} }}",
+            ));
+            let symbol = class_symbol(&fixture, "Subject");
+            let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+            let globals_table = fixture.store.intrinsic_bootstrap().unwrap().globals;
+            let globals = crate::semantic::global_types::initialize_global_library_types(
+                &mut fixture.store,
+                &host,
+                globals_table,
+                false,
+            )
+            .unwrap();
+            let targets = CanonicalArrayTargets::from_global_types(&globals);
+            let array_annotation = fixture.parsed.arena.iter().find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrayType).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            });
+            assert_eq!(array_annotation.is_some(), needs_array);
+            if let Some(annotation) = array_annotation {
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    &mut fixture.store,
+                    &host,
+                    &globals,
+                    CanonicalCheckerOptions::default(),
+                    &mut InstantiationSession::new(InstantiationLimits::default()),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(annotation)
+                .unwrap();
+                assert!(diagnostics.is_empty());
+            }
+            let plan = plan_source_class_members_with_context(
+                &fixture.store,
+                &host,
+                symbol,
+                needs_array.then_some(targets),
+                None,
+            )
+            .unwrap();
+            assert_eq!(plan.array_targets, needs_array.then_some(targets));
+            assert!(plan.constructor_overloads.is_empty());
+            let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+            let before = source_class_snapshot!(fixture.store, prepared.instance_type);
+            for _ in 0..2 {
+                let current = plan_source_class_members_with_context(
+                    &fixture.store,
+                    &host,
+                    symbol,
+                    Some(targets),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(current, plan);
+                assert_eq!(
+                    prepare_source_class_members(&mut fixture.store, &host, &current),
+                    Ok(prepared.clone())
+                );
+                assert_eq!(
+                    source_class_snapshot!(fixture.store, prepared.instance_type),
+                    before
+                );
+            }
+            let mut changed_body = plan.clone();
+            changed_body.bodies[0].return_annotation = None;
+            assert_eq!(
+                finish_source_class_members(&mut fixture.store, &host, &changed_body, &prepared),
+                Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())))
+            );
+            assert_eq!(
+                source_class_snapshot!(fixture.store, prepared.instance_type),
+                before
+            );
+            if let Some(annotation) = array_annotation {
+                let swapped = CanonicalArrayTargets::for_test(
+                    globals.readonly_array_type,
+                    globals.array_type,
+                );
+                assert_eq!(
+                    plan_source_class_members_with_context(
+                        &fixture.store,
+                        &host,
+                        symbol,
+                        Some(swapped),
+                        None,
+                    ),
+                    Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                        annotation
+                    )))
+                );
+                assert_eq!(
+                    source_class_snapshot!(fixture.store, prepared.instance_type),
+                    before
+                );
+            }
+        }
     }
 
     #[test]

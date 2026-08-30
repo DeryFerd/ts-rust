@@ -5301,7 +5301,7 @@ pub(super) fn check_source_constructor_overload_new(
         Some(
             store
                 .signature(group.implementation.signature)
-                .and_then(|signature| signature.declaration())
+                .and_then(Signature::declaration)
                 .ok_or_else(|| {
                     invariant(SourceNewInvariant::InvalidClassPlan(class.declaration()))
                 })?,

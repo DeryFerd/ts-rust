@@ -33604,11 +33604,11 @@ fn check_planned_source_class(
     {
         let overload = store
             .signature(incompatible)
-            .and_then(|signature| signature.declaration())
+            .and_then(super::signatures::Signature::declaration)
             .ok_or(SourceCheckError::Class(declaration))?;
         let implementation = store
             .signature(overloads.implementation.signature)
-            .and_then(|signature| signature.declaration())
+            .and_then(super::signatures::Signature::declaration)
             .ok_or(SourceCheckError::Class(declaration))?;
         if !class.source.bodies().iter().any(|body| {
             body.kind == ClassBodyKind::Constructor && body.declaration == implementation
@@ -59028,8 +59028,7 @@ fn prepare_source_class_parameter(
             symbol,
             Some(&context),
         )
-    {
-        if super::classes::prepare_source_constructor_overload_annotation(
+        && super::classes::prepare_source_constructor_overload_annotation(
             store,
             host,
             global_types,
@@ -59040,9 +59039,8 @@ fn prepare_source_class_parameter(
             error,
         )
         .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?
-        {
-            return Ok(true);
-        }
+    {
+        return Ok(true);
     }
     if parameter_data.question_token.is_none()
         && !matches!(
