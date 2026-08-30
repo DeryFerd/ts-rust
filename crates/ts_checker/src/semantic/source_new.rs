@@ -34,10 +34,11 @@ use super::{
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::CallableFamily,
     classes::{
-        ClassConstructorVisibility, ClassMemberPlan, ClassMemberQueryPlan,
-        authenticated_class_constructor_value, execute_nongeneric_class_member_query,
-        optional_constructor_parameter_type, plan_nongeneric_class_member_query,
-        preflight_nongeneric_class_member_query,
+        ClassConstructorVisibility, ClassMemberPlan, ClassMemberQueryPlan, SourceClassPlan,
+        authenticated_class_constructor_value, completed_source_class_members,
+        execute_nongeneric_class_member_query, optional_constructor_parameter_type,
+        plan_nongeneric_class_member_query, preflight_nongeneric_class_member_query,
+        source_class_plan_is_current,
     },
     declared::{execute_type_parameter, preflight_class_or_interface_reference},
     functions::plan_function_type,
@@ -108,6 +109,10 @@ pub(super) enum SourceNewError {
     Invariant(SourceNewInvariant),
     DeclaredType(DeclaredTypeError),
     Class(ClassError),
+    Call {
+        node: NodeRef,
+        error: super::calls::DirectCallError,
+    },
 }
 
 impl SourceNewError {
@@ -136,6 +141,7 @@ impl SourceNewError {
                 | SourceNewInvariant::InvalidConstructSignature(_) => None,
             },
             Self::Class(error) => error.node(),
+            Self::Call { node, .. } => Some(node),
             Self::DeclaredType(_) => None,
         }
     }
@@ -179,6 +185,8 @@ pub(super) struct SourceDefaultNewPlan {
 #[derive(Clone, Debug)]
 enum SourceNewTarget {
     Class(Box<ClassMemberQueryPlan>),
+    ConstructorOverloads(Box<super::classes::SourceClassPlan>),
+    SourceClass(Box<SourceClassPlan>),
     ImportedClass(Box<SourceImportBindingPlan>),
     Declared(SourceDeclaredConstructorPlan),
     ClassUnion(SourceClassUnionConstructorPlan),
@@ -407,6 +415,10 @@ impl SourceDefaultNewPlan {
         self.argument.iter().chain(&self.additional_arguments)
     }
 
+    pub(super) fn argument_nodes(&self) -> impl Iterator<Item = NodeRef> + '_ {
+        self.arguments().map(|argument| argument.node)
+    }
+
     /// Returns the exact access or abstract-instantiation diagnostic for a class.
     pub(super) fn constructor_accessibility_diagnostic(
         &self,
@@ -415,6 +427,10 @@ impl SourceDefaultNewPlan {
         store: &CanonicalTypeMapperStore,
         host: &DeclaredTypeHost<'_>,
     ) -> Result<Option<(u32, String)>, SourceNewError> {
+        if let SourceNewTarget::SourceClass(class) = &self.target {
+            preflight_direct_default_new(store, host, self)?;
+            return Ok(class.is_abstract().then_some((2511, String::new())));
+        }
         if let SourceNewTarget::ClassUnion(union) = &self.target {
             return Ok(union
                 .classes
@@ -678,9 +694,37 @@ pub(super) fn plan_direct_default_new(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     prior_classes: &HashMap<SemanticSymbolId, ClassMemberPlan>,
+    prior_source_classes: &HashMap<SemanticSymbolId, SourceClassPlan>,
     import_bindings: &HashMap<SemanticSymbolId, SourceImportBindingPlan>,
     node: NodeRef,
     early_preparation: bool,
+) -> Result<SourceDefaultNewPlan, SourceNewError> {
+    plan_direct_default_new_with_type_context(
+        arena,
+        bound,
+        store,
+        host,
+        prior_classes,
+        prior_source_classes,
+        import_bindings,
+        node,
+        early_preparation,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_direct_default_new_with_type_context(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    prior_classes: &HashMap<SemanticSymbolId, ClassMemberPlan>,
+    prior_source_classes: &HashMap<SemanticSymbolId, SourceClassPlan>,
+    import_bindings: &HashMap<SemanticSymbolId, SourceImportBindingPlan>,
+    node: NodeRef,
+    early_preparation: bool,
+    type_context: Option<&super::classes::ClassTypeQueryContext>,
 ) -> Result<SourceDefaultNewPlan, SourceNewError> {
     let record = arena
         .get(node.node)
@@ -1000,6 +1044,37 @@ pub(super) fn plan_direct_default_new(
         }
         let global = plan_global_promise_constructor(store, host, constructor, symbol, executor)?;
         (SourceNewTarget::GlobalPromise(global), None)
+    } else if symbol_record.flags() == SymbolFlags::CLASS
+        && let Some(class) = super::classes::plan_source_constructor_overload_class(
+            store,
+            host,
+            symbol,
+            type_context,
+        )?
+    {
+        let declaration = class.declaration();
+        if !declaration.is_for(node.arena, node.file)
+            || host
+                .node(declaration)
+                .is_none_or(|declaration| declaration.range.end > record.range.start)
+        {
+            return Err(unsupported(SourceNewUnsupported::ConstructorNotPrior {
+                node: constructor,
+                symbol,
+            }));
+        }
+        (SourceNewTarget::ConstructorOverloads(Box::new(class)), None)
+    } else if let Some(class) = prior_source_classes
+        .get(&symbol)
+        .filter(|class| symbol_record.flags() == SymbolFlags::CLASS && !class.has_object_base())
+    {
+        if !class.has_own_default_constructor() || early_preparation {
+            return Err(unsupported(SourceNewUnsupported::Constructor(constructor)));
+        }
+        if argument.is_some() || !additional_arguments.is_empty() || !type_arguments.is_empty() {
+            return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+        }
+        (SourceNewTarget::SourceClass(Box::new(class.clone())), None)
     } else if symbol_record.flags() == SymbolFlags::CLASS {
         let class = if let Some(class) = prior_classes.get(&symbol) {
             ClassMemberQueryPlan::Direct(class.clone())
@@ -1121,14 +1196,16 @@ pub(super) fn plan_direct_default_new(
             &target,
             SourceNewTarget::Class(class) if class.constructor_minimum_argument_count() == 0
         );
-    if !matches!(&target, SourceNewTarget::ImportedClass(_))
-        && (argument.is_some() != parameter.is_some() && !omitted_defaulted_class_parameter
-            || argument
-                .as_ref()
-                .zip(parameter)
-                .is_some_and(|(argument, parameter)| {
-                    !argument_matches_parameter(store, argument, parameter)
-                }))
+    if !matches!(
+        &target,
+        SourceNewTarget::ImportedClass(_) | SourceNewTarget::ConstructorOverloads(_)
+    ) && (argument.is_some() != parameter.is_some() && !omitted_defaulted_class_parameter
+        || argument
+            .as_ref()
+            .zip(parameter)
+            .is_some_and(|(argument, parameter)| {
+                !argument_matches_parameter(store, argument, parameter)
+            }))
     {
         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
     }
@@ -1163,6 +1240,7 @@ pub(super) fn plan_global_date_initializer(
         bound,
         store,
         host,
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
         node,
@@ -3701,6 +3779,24 @@ pub(super) fn preflight_direct_default_new(
         }
     }
     match &plan.target {
+        SourceNewTarget::ConstructorOverloads(class) => {
+            if super::classes::plan_source_constructor_overload_class(
+                store,
+                host,
+                class.symbol(),
+                class.type_query_context(),
+            )?
+            .as_ref()
+                != Some(class.as_ref())
+            {
+                return Err(invariant(SourceNewInvariant::InvalidClassPlan(
+                    class.declaration(),
+                )));
+            }
+        }
+        SourceNewTarget::SourceClass(class) => {
+            resolved_source_class_constructor(store, host, plan, class)?;
+        }
         SourceNewTarget::Class(class) => {
             preflight_nongeneric_class_member_query(store, host, class)?;
             if constructor_parameter(store, host, class)? != plan.parameter {
@@ -3920,6 +4016,17 @@ pub(super) fn prepare_direct_default_news(
 
     for plan in plans {
         match &plan.target {
+            SourceNewTarget::ConstructorOverloads(class) => {
+                super::classes::prepare_source_class_members_with_type_queries(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    class,
+                )?;
+            }
             SourceNewTarget::DeclaredInterface(declared) => {
                 global_error::prepare(
                     store,
@@ -5022,6 +5129,16 @@ pub(super) fn check_direct_default_new(
     preflight_direct_default_new(store, host, plan)?;
     preflight_prepared_default_new_cache(store, host, plan)?;
     let selected = match &plan.target {
+        SourceNewTarget::ConstructorOverloads(_) => {
+            return Err(unsupported(SourceNewUnsupported::Arguments(plan.node)));
+        }
+        SourceNewTarget::SourceClass(class) => {
+            resolved_source_class_constructor(store, host, plan, class)?.ok_or_else(|| {
+                invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                ))
+            })?
+        }
         SourceNewTarget::Class(class) => {
             let members = execute_nongeneric_class_member_query(store, host, class)?;
             let selected = CheckedSourceDefaultNew {
@@ -5095,13 +5212,121 @@ pub(super) fn check_direct_default_new(
             })?
         }
     };
-    let CheckedSourceDefaultNew {
+    publish_checked_default_new(store, host, plan, selected)
+}
+
+fn publish_checked_default_new(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    selected: CheckedSourceDefaultNew,
+) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    let argument_types = materialize_new_argument_types(store, plan)?;
+    publish_default_new_links(store, host, plan, selected, &argument_types)
+}
+
+/// A selected public constructor and a note from its checked hidden implementation.
+pub(super) struct CheckedSourceConstructorOverloadNew {
+    pub(super) checked: CheckedSourceDefaultNew,
+    pub(super) resolution: super::calls::DirectCallResolution,
+    pub(super) implementation_note: Option<NodeRef>,
+}
+
+pub(super) fn check_source_constructor_overload_new(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    plan: &SourceDefaultNewPlan,
+) -> Result<Option<CheckedSourceConstructorOverloadNew>, SourceNewError> {
+    let SourceNewTarget::ConstructorOverloads(class) = &plan.target else {
+        return Ok(None);
+    };
+    preflight_direct_default_new(store, host, plan)?;
+    preflight_prepared_default_new_cache(store, host, plan)?;
+    let group = super::classes::source_class_constructor_overloads(store, host, class.symbol())?
+        .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(class.declaration())))?;
+    let arguments = materialize_new_argument_types(store, plan)?;
+    let value_type = group.members.shells().value_type();
+    let instance_type = group.members.shells().instance_type();
+    if group.signatures.iter().any(|signature| {
+        signature.owner != value_type
+            || signature.return_type != Some(instance_type)
+            || store
+                .signature(signature.signature)
+                .is_none_or(|record| !record.flags().contains(SignatureFlags::CONSTRUCT))
+    }) {
+        return Err(invariant(SourceNewInvariant::InvalidClassPlan(
+            class.declaration(),
+        )));
+    }
+    let request = super::calls::DirectCallRequest {
+        form: super::calls::DirectCallForm::New,
+        callee: value_type,
+        arguments: &arguments,
+        optional_chain: false,
+        type_argument_count: 0,
+        has_spread_argument: false,
+    };
+    let resolution = super::calls::resolve_direct_call_candidates(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        &group.signatures,
+    )
+    .map_err(|error| SourceNewError::Call {
+        node: plan.node,
+        error,
+    })?;
+    if resolution.projection.return_type != instance_type {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    }
+    let implementation_note = if matches!(
+        resolution.applicability,
+        super::calls::DirectCallApplicability::ArgumentNotAssignable { .. }
+    ) && super::calls::class_overload_implementation_accepts_arguments(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        &group.implementation,
+    )
+    .map_err(|error| SourceNewError::Call {
+        node: plan.node,
+        error,
+    })? {
+        Some(
+            store
+                .signature(group.implementation.signature)
+                .and_then(Signature::declaration)
+                .ok_or_else(|| {
+                    invariant(SourceNewInvariant::InvalidClassPlan(class.declaration()))
+                })?,
+        )
+    } else {
+        None
+    };
+    let selected = CheckedSourceDefaultNew {
         value_type,
         instance_type,
-        signature,
-    } = selected;
-    let argument_types = plan
-        .arguments()
+        signature: resolution.projection.signature,
+    };
+    let checked = publish_default_new_links(store, host, plan, selected, &arguments)?;
+    Ok(Some(CheckedSourceConstructorOverloadNew {
+        checked,
+        resolution,
+        implementation_note,
+    }))
+}
+
+fn materialize_new_argument_types(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &SourceDefaultNewPlan,
+) -> Result<Vec<TypeId>, SourceNewError> {
+    plan.arguments()
         .map(|argument| {
             let regular = match &argument.value {
                 SourceNewArgumentValue::String(value) => {
@@ -5139,7 +5364,21 @@ pub(super) fn check_direct_default_new(
                 .fresh_type_of_literal_type(regular)
                 .map_err(|error| literal_cache_error(argument.node, error))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn publish_default_new_links(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    selected: CheckedSourceDefaultNew,
+    argument_types: &[TypeId],
+) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    let CheckedSourceDefaultNew {
+        value_type,
+        instance_type,
+        signature,
+    } = selected;
     preflight_publication_cache(
         store,
         host,
@@ -5147,7 +5386,7 @@ pub(super) fn check_direct_default_new(
         value_type,
         instance_type,
         signature,
-        &argument_types,
+        argument_types,
     )?;
 
     let symbol_links = SymbolNodeLinks {
@@ -5169,7 +5408,7 @@ pub(super) fn check_direct_default_new(
     assert!(store.set_type_node_links(plan.constructor, constructor_links));
     assert!(store.set_signature_links(plan.node, signature_links));
     assert!(store.set_type_node_links(plan.node, expression_links));
-    for (argument, argument_type) in plan.arguments().zip(argument_types) {
+    for (argument, &argument_type) in plan.arguments().zip(argument_types) {
         assert!(store.set_type_node_links(
             argument.node,
             TypeNodeLinks {
@@ -5192,6 +5431,49 @@ pub(super) fn check_direct_default_new(
         instance_type,
         signature,
     })
+}
+
+// The source executor must complete the retained class before this use can publish.
+fn resolved_source_class_constructor(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    class: &SourceClassPlan,
+) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidClassPlan(class.declaration()));
+    if class.symbol() != plan.resolved_symbol
+        || !class.has_own_default_constructor()
+        || plan.argument.is_some()
+        || !plan.additional_arguments.is_empty()
+        || !plan.type_arguments.is_empty()
+        || plan.parameter.is_some()
+        || plan.executor.is_some()
+        || plan.early_preparation
+        || !source_class_plan_is_current(store, host, class)?
+    {
+        return Err(invalid());
+    }
+    let declaration = host.node(class.declaration()).ok_or_else(invalid)?;
+    let expression = host.node(plan.node).ok_or_else(invalid)?;
+    if !class.declaration().is_for(plan.node.arena, plan.node.file)
+        || declaration.range.end > expression.range.start
+    {
+        return Err(invalid());
+    }
+    let Some(members) = completed_source_class_members(store, host, class.symbol())? else {
+        return Ok(None);
+    };
+    let selected = CheckedSourceDefaultNew {
+        value_type: members.shells().value_type(),
+        instance_type: members.shells().instance_type(),
+        signature: members.default_construct_signature(),
+    };
+    if authenticated_class_constructor_value(store, class.symbol())
+        != Some((selected.value_type, selected.signature))
+    {
+        return Err(invalid());
+    }
+    Ok(Some(selected))
 }
 
 fn preflight_prepared_default_new_cache(
@@ -6347,6 +6629,44 @@ fn preflight_default_new_cache(
     }
 
     match &plan.target {
+        SourceNewTarget::ConstructorOverloads(class) => {
+            let group =
+                super::classes::source_class_constructor_overloads(store, host, class.symbol())?;
+            if constructor_type.is_some_and(|type_| {
+                group
+                    .as_ref()
+                    .is_none_or(|group| group.members.shells().value_type() != type_)
+            }) || result_type.is_some_and(|type_| {
+                group
+                    .as_ref()
+                    .is_none_or(|group| group.members.shells().instance_type() != type_)
+            }) || signature.is_some_and(|signature| {
+                group.as_ref().is_none_or(|group| {
+                    !group
+                        .signatures
+                        .iter()
+                        .any(|candidate| candidate.signature == signature)
+                })
+            }) {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+        }
+        SourceNewTarget::SourceClass(class) => {
+            let resolved = resolved_source_class_constructor(store, host, plan, class)?;
+            if constructor_type.is_some_and(|constructor| {
+                resolved.is_none_or(|resolved| constructor != resolved.value_type)
+            }) || result_type.is_some_and(|result| {
+                resolved.is_none_or(|resolved| result != resolved.instance_type)
+            }) || signature.is_some_and(|signature| {
+                resolved.is_none_or(|resolved| signature != resolved.signature)
+            }) {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+        }
         SourceNewTarget::Class(class) => {
             let instance = store
                 .declared_type_links(class.symbol())
@@ -7307,6 +7627,163 @@ mod tests {
             None,
         ));
         (context, object, owner, value_type, object_type, signature)
+    }
+
+    #[test]
+    fn source_class_default_new_reuses_completed_caches_and_rejects_foreign_signatures() {
+        let parsed = parse_source_file(concat!(
+            "class Model { read() { return 1; } } ",
+            "class Other { read() { return 2; } } ",
+            "const model = new Model();",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(202_420);
+        let mut context = context(&parsed, file);
+        let owner = class_symbol(&parsed, file, &context, "Model");
+        let other = class_symbol(&parsed, file, &context, "Other");
+        let (construction, constructor) = variable_new(&parsed, file, "model");
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (value, signature) =
+            authenticated_class_constructor_value(context.store(), owner).unwrap();
+        let instance = context
+            .store()
+            .declared_type_links(owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(constructor)
+                .unwrap()
+                .resolved_type,
+            Some(value)
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(construction)
+                .unwrap()
+                .resolved_type,
+            Some(instance)
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(constructor)
+                .unwrap()
+                .resolved_symbol,
+            Some(owner)
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature_links(construction)
+                .unwrap()
+                .resolved_signature,
+            ResolvedSignatureState::Resolved(signature),
+        );
+        let selected = context.store().signature(signature).unwrap();
+        assert_eq!(selected.flags(), SignatureFlags::CONSTRUCT);
+        assert!(selected.declaration().is_none());
+        assert!(selected.parameters().is_empty());
+        assert!(selected.type_parameters().is_empty());
+        assert_eq!(selected.min_argument_count(), 0);
+        assert_eq!(selected.resolved_return_type(), Some(instance));
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().clone(),
+            )
+        };
+        let warm = snapshot(&context);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(snapshot(&context), warm);
+        assert_eq!(
+            authenticated_class_constructor_value(context.store(), owner),
+            Some((value, signature))
+        );
+        let (_, foreign) = authenticated_class_constructor_value(context.store(), other).unwrap();
+        assert_ne!(foreign, signature);
+        assert!(context.store_mut_for_test().set_signature_links(
+            construction,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(foreign),
+                ..SignatureLinks::default()
+            },
+        ));
+        let poisoned = snapshot(&context);
+        assert_eq!(
+            context.recheck_source_file(file),
+            Err(SourceCheckError::Call(construction))
+        );
+        assert_eq!(snapshot(&context), poisoned);
+        assert_eq!(
+            authenticated_class_constructor_value(context.store(), owner),
+            Some((value, signature))
+        );
+    }
+
+    #[test]
+    fn source_class_default_new_keeps_abstract_and_explicit_constructor_boundaries() {
+        let parsed = parse_source_file(concat!(
+            "abstract class Model { read() { return 1; } } ",
+            "const model = new Model();",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(202_421);
+        let mut abstract_context = context(&parsed, file);
+        let (construction, _) = variable_new(&parsed, file, "model");
+        abstract_context.check_source_file(file).unwrap();
+        let [diagnostic] = abstract_context.diagnostics().as_slice() else {
+            panic!("abstract construction must retain its one diagnostic");
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2511);
+        assert_eq!(diagnostic.node, Some(construction));
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Cannot create an instance of an abstract class."
+        );
+        let diagnostics = abstract_context.diagnostics().clone();
+        abstract_context.recheck_source_file(file).unwrap();
+        assert_eq!(abstract_context.diagnostics(), &diagnostics);
+
+        for (source, explicit_constructor) in [
+            (
+                "class Model { private constructor() {} read() { return 1; } } const model = new Model();",
+                true,
+            ),
+            (
+                "class Model { read() { return 1; } } const model = new Model(1);",
+                false,
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut context = context(&parsed, file);
+            let owner = class_symbol(&parsed, file, &context, "Model");
+            let (construction, constructor) = variable_new(&parsed, file, "model");
+            let rejected = if explicit_constructor {
+                constructor
+            } else {
+                construction
+            };
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+                    rejected
+                ))),
+                "{source}",
+            );
+            assert!(context.store().declared_type_links(owner).is_none());
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert!(context.store().signature_links(construction).is_none());
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
@@ -8706,6 +9183,7 @@ mod tests {
             source_bound,
             context.store(),
             &host,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             expression,

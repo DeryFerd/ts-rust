@@ -1574,8 +1574,11 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             files,
             store,
             global_types,
+            instantiation_session,
+            diagnostics,
             ..
         } = self;
+        instantiation_session.reset_query();
         let host = DeclaredTypeHost::from_registry(
             store,
             files,
@@ -1583,6 +1586,55 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         )
         .map_err(DeclaredTypeError::from)?;
         let type_context = ClassTypeQueryContext::new(global_types, *options);
+        let overload_plan = loop {
+            match super::classes::plan_source_constructor_overload_class(
+                store,
+                &host,
+                symbol,
+                Some(&type_context),
+            ) {
+                Ok(plan) => break plan,
+                Err(error) => {
+                    if !super::classes::prepare_source_constructor_overload_annotation(
+                        store,
+                        &host,
+                        global_types,
+                        *options,
+                        instantiation_session,
+                        diagnostics,
+                        symbol,
+                        error,
+                    )? {
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        if let Some(plan) = overload_plan {
+            super::classes::prepare_source_class_members_with_type_queries(
+                store,
+                &host,
+                global_types,
+                *options,
+                instantiation_session,
+                diagnostics,
+                &plan,
+            )?;
+            return super::classes::source_class_constructor_overloads(store, &host, symbol)?
+                .map(|overloads| overloads.members)
+                .ok_or(super::classes::ClassError::Invariant(
+                    super::classes::ClassInvariant::InvalidConstructSignature(symbol),
+                ));
+        }
+        if let Some(members) = super::classes::completed_source_class_members(store, &host, symbol)?
+        {
+            return Ok(members);
+        }
+        if store.source_class_provenance_for_symbol(symbol).is_some() {
+            return Err(super::classes::ClassError::Invariant(
+                super::classes::ClassInvariant::InvalidInstanceMembers(symbol),
+            ));
+        }
         let plan = plan_nongeneric_class_member_query_with_type_context(
             store,
             &host,

@@ -129,6 +129,127 @@ pub(super) struct CanonicalTypeQueryOptions {
     pub no_implicit_any: bool,
 }
 
+/// Checks fixed keyword tuples through the ordinary type-node planner.
+/// This slice needs no generic instantiation or global array capability.
+pub(super) fn preflight_fixed_keyword_tuple_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Option<TypeId>, DeclaredTypeError> {
+    let record = preflight_node(store, host, node)?;
+    let unsupported = || {
+        type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+            node,
+            kind: record.kind,
+        })
+    };
+    if record.kind != SyntaxKind::TupleType {
+        return Err(unsupported());
+    }
+    let aliases = HashMap::new();
+    let mut planner = TypeQueryPlanner::new(
+        store,
+        host,
+        None,
+        None,
+        store
+            .claimed_strict_builtin_iterator_return()
+            .unwrap_or(false),
+        &aliases,
+    );
+    planner.replay_cached_annotations = true;
+    planner.plan_type_node(node)?;
+    let tuple = planner.plan.tuples.get(&node).ok_or_else(unsupported)?;
+    if tuple.readonly()
+        || tuple.elements().iter().any(|element| {
+            element.info().flags() != ElementFlags::REQUIRED
+                || !host
+                    .node(element.type_node())
+                    .is_some_and(|record| matches!(record.data, NodeData::KeywordTypeNode(_)))
+        })
+    {
+        return Err(unsupported());
+    }
+    if let Some(cached) = tuple.cached_type()
+        && cached_fixed_keyword_tuple_annotation(store, node)? != cached
+    {
+        return Err(type_node_unavailable(
+            TypeNodeUnavailable::InvalidTupleType(node),
+        ));
+    }
+    Ok(tuple.cached_type())
+}
+
+/// Validates a published fixed tuple against its retained source elements.
+pub(super) fn cached_fixed_keyword_tuple_annotation(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+) -> Result<TypeId, DeclaredTypeError> {
+    let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTupleType(node));
+    let type_ = store
+        .type_node_links(node)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    let elements = store.source_direct_children(node).ok_or_else(invalid)?;
+    let tuple = store
+        .canonical_tuple_shape(type_)
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+    if store.source_node_kind(node) != Some(SyntaxKind::TupleType)
+        || tuple.is_readonly()
+        || elements.len() != tuple.element_types().len()
+        || !store.source_direct_type_annotation_is_exact(node, type_)
+        || store
+            .symbol_node_links(node)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+    {
+        return Err(invalid());
+    }
+    for ((element, info), type_) in elements
+        .iter()
+        .zip(tuple.element_infos())
+        .zip(tuple.element_types())
+    {
+        let annotation = if store.source_node_kind(*element) == Some(SyntaxKind::NamedTupleMember) {
+            let children = store.source_direct_children(*element).ok_or_else(invalid)?;
+            let [name, annotation] = children.as_slice() else {
+                return Err(invalid());
+            };
+            if store.source_node_kind(*name) != Some(SyntaxKind::Identifier)
+                || info.labeled_declaration() != Some(*element)
+                || store.type_node_links(*element).is_some_and(|links| {
+                    links != &TypeNodeLinks::default()
+                        && links
+                            != &TypeNodeLinks {
+                                resolved_type: Some(*type_),
+                                ..TypeNodeLinks::default()
+                            }
+                })
+                || store
+                    .symbol_node_links(*element)
+                    .is_some_and(|links| links != &SymbolNodeLinks::default())
+            {
+                return Err(invalid());
+            }
+            *annotation
+        } else {
+            if info.labeled_declaration().is_some() {
+                return Err(invalid());
+            }
+            *element
+        };
+        if info.flags() != ElementFlags::REQUIRED
+            || !store
+                .source_node_kind(annotation)
+                .is_some_and(SyntaxKind::is_keyword_type)
+            || !store.source_direct_type_annotation_is_exact(annotation, *type_)
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(type_)
+}
+
 /// Preflights an annotation without claiming options or writing checker state.
 /// Callers without a diagnostic channel must not admit recovery plans.
 pub(super) fn preflight_type_annotation(
@@ -87534,6 +87655,91 @@ mod tests {
             functions::StoredFunctionTypeValidation::Valid(_)
         ));
         assert_eq!(fixture.store.callable_signature_parameter_types_len(), 2);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn fixed_keyword_tuple_cache_rejects_other_elements_and_poisoned_labels() {
+        let mut fixture = fixture(concat!(
+            "type Pair = [number, string]; ",
+            "type Other = [string, number]; ",
+            "type Named = [left: number, right: string];",
+        ));
+        let pair_symbol = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Pair");
+        let other_symbol = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Other");
+        let named_symbol = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Named");
+        let pair_node = alias_parts(&fixture, "Pair").2;
+        let named_node = alias_parts(&fixture, "Named").2;
+        {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let cold = function_store_state(&fixture.store);
+            assert_eq!(
+                preflight_fixed_keyword_tuple_annotation(&fixture.store, &host, pair_node),
+                Ok(None),
+            );
+            assert_eq!(function_store_state(&fixture.store), cold);
+        }
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let [pair, other, named] = [pair_symbol, other_symbol, named_symbol].map(|symbol| {
+            query_declared(
+                &mut fixture,
+                symbol,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+        });
+        assert_eq!(
+            cached_fixed_keyword_tuple_annotation(&fixture.store, pair_node),
+            Ok(pair),
+        );
+        assert_eq!(
+            cached_fixed_keyword_tuple_annotation(&fixture.store, named_node),
+            Ok(named),
+        );
+        assert!(fixture.store.set_type_node_links(
+            pair_node,
+            TypeNodeLinks {
+                resolved_type: Some(other),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = function_store_state(&fixture.store);
+        assert_eq!(
+            cached_fixed_keyword_tuple_annotation(&fixture.store, pair_node),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTupleType(pair_node)
+            )),
+        );
+        assert_eq!(function_store_state(&fixture.store), poisoned);
+
+        let label = fixture
+            .store
+            .canonical_tuple_shape(named)
+            .unwrap()
+            .unwrap()
+            .element_infos()[0]
+            .labeled_declaration()
+            .unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_type_node_links(
+            label,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = function_store_state(&fixture.store);
+        assert_eq!(
+            cached_fixed_keyword_tuple_annotation(&fixture.store, named_node),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTupleType(named_node)
+            )),
+        );
+        assert_eq!(function_store_state(&fixture.store), poisoned);
         assert!(diagnostics.is_empty());
     }
 

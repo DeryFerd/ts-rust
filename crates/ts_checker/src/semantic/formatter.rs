@@ -37,8 +37,8 @@ use super::{
         single_callable_family, validate_stored_single_callable,
     },
     classes::{
-        ClassHeritageMembersValidation, validate_class_heritage_members,
-        validate_cold_class_instance_for_display,
+        ClassHeritageMembersValidation, SourceClassMethodOverloads,
+        validate_class_heritage_members, validate_cold_class_instance_for_display,
     },
     conditional_types::conditional_alias_projection,
     declared::cached_ordinary_type_parameter_owner,
@@ -1316,6 +1316,22 @@ fn display_object_type(
     }
 
     if let Some(host) = host
+        && let Some(overloads) =
+            validated_source_class_method_display(store, host, global_types, type_id)?
+    {
+        return display_source_class_method_overloads(
+            store,
+            host,
+            global_types,
+            type_id,
+            &overloads,
+            flags,
+            state,
+            visiting,
+        );
+    }
+
+    if let Some(host) = host
         && let Some(return_type) = validated_class_method_return_type(store, host, type_id, record)?
     {
         if !visiting.insert(type_id) {
@@ -1627,6 +1643,129 @@ fn display_validated_enum_value(
     let name = display_symbol_name(store, Some(host), type_id, owner, state)?;
     state.add(7);
     Ok(Some(format!("typeof {name}")))
+}
+
+fn validated_source_class_method_display(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+) -> Result<Option<SourceClassMethodOverloads>, TypeDisplayUnavailable> {
+    let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
+    let Some(overloads) =
+        super::classes::source_class_method_overloads(store, type_id).map_err(|_| invalid())?
+    else {
+        return Ok(None);
+    };
+    let class = store
+        .type_payload(type_id)
+        .and_then(TypeRecord::symbol)
+        .and_then(|method| store.symbol(method))
+        .and_then(ts_binder::semantic::Symbol::parent)
+        .ok_or_else(invalid)?;
+    if super::classes::completed_source_class_members(store, host, class)
+        .map_err(|_| invalid())?
+        .is_none()
+    {
+        return Err(invalid());
+    }
+    let StoredCallableSetValidation::Valid { projection, .. } =
+        validate_stored_callable_set(store, type_id)
+    else {
+        return Err(invalid());
+    };
+    if projection.owner != type_id
+        || projection.call_signatures.as_ref() != overloads.signatures.as_slice()
+        || !projection.construct_signatures.is_empty()
+    {
+        return Err(invalid());
+    }
+    // The implementation is hidden, but its array dependencies still need the caller's authority.
+    for callable in overloads
+        .signatures
+        .iter()
+        .chain(std::iter::once(&overloads.implementation))
+    {
+        let returned = callable.return_type.ok_or_else(invalid)?;
+        for type_ in callable
+            .parameters
+            .iter()
+            .copied()
+            .chain(callable.rest_parameter)
+            .chain(std::iter::once(returned))
+        {
+            global_types
+                .map_or_else(
+                    || store.validate_union_constituent(type_),
+                    |globals| store.validate_union_constituent_with_global_types(globals, type_),
+                )
+                .map_err(|_| invalid())?;
+        }
+    }
+    Ok(Some(overloads))
+}
+
+#[allow(clippy::too_many_arguments)] // Reuse the caller's signature and recursive display state.
+fn display_source_class_method_overloads(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+    overloads: &SourceClassMethodOverloads,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    if !visiting.insert(type_id) {
+        return Err(TypeDisplayUnavailable::CyclicType(type_id));
+    }
+    let result = (|| {
+        let overloaded = overloads.signatures.len() > 1;
+        let mut result = if overloaded {
+            state.add(2);
+            String::from("{ ")
+        } else {
+            String::new()
+        };
+        for callable in &overloads.signatures {
+            state.add(3);
+            append_validated_signature_parameters(
+                store,
+                host,
+                global_types,
+                type_id,
+                callable.signature,
+                &callable.parameters,
+                flags,
+                state,
+                visiting,
+                &mut result,
+            )?;
+            result.push_str(if overloaded { ": " } else { " => " });
+            result.push_str(&display_signature_return(
+                store,
+                Some(host),
+                global_types,
+                type_id,
+                callable.signature,
+                callable
+                    .return_type
+                    .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?,
+                flags,
+                state,
+                visiting,
+            )?);
+            if overloaded {
+                result.push_str("; ");
+            }
+        }
+        if overloaded {
+            result.push('}');
+        }
+        Ok(result)
+    })();
+    visiting.remove(&type_id);
+    result
 }
 
 fn validated_class_method_return_type(
@@ -13552,6 +13691,363 @@ mod tests {
                         | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE,
                 ),
                 expected.map(str::to_owned),
+            );
+            assert_eq!(format!("{:?}", context.store()), before);
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    const SOURCE_CLASS_METHOD_OVERLOAD_DISPLAY: &str = concat!(
+        "interface Array<T> {} interface ReadonlyArray<T> {} ",
+        "class Model { ",
+        "choose(text: string): number; ",
+        "choose(values: string[]): string; ",
+        "choose(input: any): any { return input; } ",
+        "}",
+    );
+
+    fn source_class_method_display_parts(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (SemanticSymbolId, TypeId, Vec<NodeRef>) {
+        let (owner, _) = source_class_display_owner(context, parsed, file);
+        let store = context.store();
+        let method = store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("choose"))
+            .unwrap();
+        let declarations = store
+            .symbol(method)
+            .unwrap()
+            .declarations()
+            .unwrap()
+            .to_vec();
+        let callable = store
+            .value_symbol_links(method)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        (method, callable, declarations)
+    }
+
+    #[test]
+    fn source_class_method_overload_display_keeps_public_signatures_and_replay() {
+        let parsed = parse_source_file(SOURCE_CLASS_METHOD_OVERLOAD_DISPLAY);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(148_310);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let (_, callable, declarations) =
+            source_class_method_display_parts(&context, &parsed, file);
+        let overloads =
+            crate::semantic::classes::source_class_method_overloads(context.store(), callable)
+                .unwrap()
+                .unwrap();
+        assert_eq!(declarations.len(), 3);
+        assert_eq!(overloads.signatures.len(), 2);
+        assert_eq!(
+            overloads
+                .signatures
+                .iter()
+                .map(|signature| {
+                    context
+                        .store()
+                        .signature(signature.signature)
+                        .unwrap()
+                        .declaration()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>(),
+            declarations[..2],
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature(overloads.implementation.signature)
+                .unwrap()
+                .declaration(),
+            Some(declarations[2]),
+        );
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            overloads.signatures[0].return_type,
+            Some(bootstrap.number_type)
+        );
+        assert_eq!(
+            overloads.signatures[1].return_type,
+            Some(bootstrap.string_type)
+        );
+        assert_eq!(
+            overloads.implementation.return_type,
+            Some(bootstrap.any_type)
+        );
+        let names = declarations
+            .iter()
+            .map(|declaration| {
+                let NodeData::MethodDeclaration(method) =
+                    &parsed.arena.get(declaration.node).unwrap().data
+                else {
+                    panic!("the group retains its method declarations");
+                };
+                NodeRef::new(declaration.arena, declaration.file, method.name)
+            })
+            .collect::<Vec<_>>();
+        for &name in &names {
+            assert_eq!(context.get_type_at_location(name).unwrap(), callable);
+        }
+        let warm = alias_display_cache_counts(&context);
+        for _ in 0..2 {
+            for &declaration in &declarations {
+                assert_source_class_display_without_writes(
+                    &mut context,
+                    callable,
+                    declaration,
+                    Ok("{ (text: string): number; (values: string[]): string; }"),
+                );
+            }
+            context.recheck_source_file(file).unwrap();
+            for &name in &names {
+                assert_eq!(context.get_type_at_location(name).unwrap(), callable);
+            }
+            assert_eq!(
+                crate::semantic::classes::source_class_method_overloads(context.store(), callable)
+                    .unwrap(),
+                Some(overloads.clone()),
+            );
+            assert_eq!(alias_display_cache_counts(&context), warm);
+        }
+        let foreign = parse_source_file("class Other {}");
+        let location = NodeRef::new(foreign.arena.id(), file, foreign.source_file);
+        let before = format!("{:?}", context.store());
+        assert_eq!(
+            context.type_to_string_at_location(callable, location),
+            Err(TypeDisplayUnavailable::SymbolDisplay(
+                SymbolDisplayError::InvalidLocation(location)
+            )),
+        );
+        assert_eq!(format!("{:?}", context.store()), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One real group checks later declarations, hidden signatures, and its owner.
+    fn source_class_method_overload_display_rejects_changed_owner_and_hidden_signatures() {
+        let parsed = parse_source_file(SOURCE_CLASS_METHOD_OVERLOAD_DISPLAY);
+        let file = FileId::new(148_311);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let (method, callable, declarations) =
+            source_class_method_display_parts(&context, &parsed, file);
+        let overloads =
+            crate::semantic::classes::source_class_method_overloads(context.store(), callable)
+                .unwrap()
+                .unwrap();
+        let expected = "{ (text: string): number; (values: string[]): string; }";
+        assert_source_class_display_without_writes(
+            &mut context,
+            callable,
+            declarations[0],
+            Ok(expected),
+        );
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for signature in [
+            overloads.signatures[1].signature,
+            overloads.implementation.signature,
+        ] {
+            let original = context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type();
+            assert_ne!(original, Some(number));
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_resolved_return_type(signature, Some(number))
+            );
+            assert_source_class_display_without_writes(
+                &mut context,
+                callable,
+                declarations[0],
+                Err(TypeDisplayUnavailable::MalformedType(callable)),
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_resolved_return_type(signature, original)
+            );
+            assert_source_class_display_without_writes(
+                &mut context,
+                callable,
+                declarations[0],
+                Ok(expected),
+            );
+        }
+        let parameter = context
+            .store()
+            .signature(overloads.implementation.signature)
+            .unwrap()
+            .parameters()[0];
+        let original = context
+            .store()
+            .value_symbol_links(parameter)
+            .unwrap()
+            .clone();
+        let mut changed = original.clone();
+        changed.resolved_type = Some(number);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(parameter, changed)
+        );
+        assert_source_class_display_without_writes(
+            &mut context,
+            callable,
+            declarations[0],
+            Err(TypeDisplayUnavailable::MalformedType(callable)),
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(parameter, original)
+        );
+        for changed in [
+            vec![declarations[0], declarations[2], declarations[1]],
+            declarations[..2].to_vec(),
+        ] {
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                method,
+                Some(changed),
+                Some(declarations[0])
+            ));
+            assert_source_class_display_without_writes(
+                &mut context,
+                callable,
+                declarations[0],
+                Err(TypeDisplayUnavailable::MalformedType(callable)),
+            );
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                method,
+                Some(declarations.clone()),
+                Some(declarations[0])
+            ));
+            assert_source_class_display_without_writes(
+                &mut context,
+                callable,
+                declarations[0],
+                Ok(expected),
+            );
+        }
+        let owner = context.store().symbol(method).unwrap().parent().unwrap();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_symbol_relationships(method, None, None, None, None)
+        );
+        assert_source_class_display_without_writes(
+            &mut context,
+            callable,
+            declarations[0],
+            Err(TypeDisplayUnavailable::MalformedType(callable)),
+        );
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            method,
+            None,
+            None,
+            Some(owner),
+            None
+        ));
+        assert_source_class_display_without_writes(
+            &mut context,
+            callable,
+            declarations[0],
+            Ok(expected),
+        );
+    }
+
+    #[test]
+    fn source_class_method_overload_display_keeps_hidden_array_authority() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "class Model { choose(value: any): void; choose(items: string[]): void {} }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(148_312);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let (_, callable, declarations) =
+            source_class_method_display_parts(&context, &parsed, file);
+        let overloads =
+            crate::semantic::classes::source_class_method_overloads(context.store(), callable)
+                .unwrap()
+                .unwrap();
+        assert_eq!(overloads.signatures.len(), 1);
+        assert_eq!(
+            overloads.signatures[0].parameters,
+            [context.store().intrinsic_bootstrap().unwrap().any_type]
+        );
+        let TypeData::TypeReference(array) = context
+            .store()
+            .type_payload(overloads.implementation.parameters[0])
+            .unwrap()
+            .data()
+        else {
+            panic!("the hidden implementation retains its real array annotation");
+        };
+        let globals = context.global_types().clone();
+        assert_eq!(array.object.target, Some(globals.array_type));
+        assert_source_class_display_without_writes(
+            &mut context,
+            callable,
+            declarations[0],
+            Ok("(value: any) => void"),
+        );
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, context.file(file).unwrap().1)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let flags = CanonicalTypeFormatFlags::NO_TRUNCATION;
+        let before = format!("{:?}", context.store());
+        let mut swapped = globals.clone();
+        swapped.array_type = globals.readonly_array_type;
+        let mut missing = globals.clone();
+        missing.array_type = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .empty_generic_type;
+        missing.readonly_array_type = missing.array_type;
+        for _ in 0..2 {
+            for wrong in [&swapped, &missing] {
+                assert_eq!(
+                    type_to_string_with_host_global_types_and_flags(
+                        context.store(),
+                        &host,
+                        wrong,
+                        callable,
+                        flags
+                    ),
+                    Err(TypeDisplayUnavailable::MalformedType(callable)),
+                );
+                assert_eq!(format!("{:?}", context.store()), before);
+            }
+            assert_eq!(
+                type_to_string_with_host_and_flags(context.store(), &host, callable, flags),
+                Err(TypeDisplayUnavailable::MalformedType(callable)),
+            );
+            assert_eq!(
+                type_to_string_with_host_global_types_and_flags(
+                    context.store(),
+                    &host,
+                    &globals,
+                    callable,
+                    flags
+                )
+                .unwrap(),
+                "(value: any) => void",
             );
             assert_eq!(format!("{:?}", context.store()), before);
         }

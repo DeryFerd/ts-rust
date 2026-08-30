@@ -5660,24 +5660,29 @@ fn extra_fixed_argument_diagnostic_range(
     plan: SourceCallDiagnosticSite<'_>,
     first_extra: usize,
 ) -> Result<CanonicalCheckerDiagnosticRange, SourceCheckError> {
-    let first = plan
-        .arguments
-        .get(first_extra)
-        .ok_or(SourceCheckError::Call(plan.node))?;
-    let last = plan
-        .arguments
-        .last()
-        .ok_or(SourceCheckError::Call(plan.node))?;
-    let first_range = host
-        .node(first.node)
-        .ok_or(SourceCheckError::Call(plan.node))?
-        .range;
-    let last_range = host
-        .node(last.node)
-        .ok_or(SourceCheckError::Call(plan.node))?
-        .range;
-    Ok(CanonicalCheckerDiagnosticRange::new(
+    extra_source_argument_diagnostic_range(
+        host,
         plan.node,
+        plan.arguments.iter().map(|argument| argument.node),
+        first_extra,
+    )
+}
+
+pub(super) fn extra_source_argument_diagnostic_range(
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    arguments: impl IntoIterator<Item = NodeRef>,
+    first_extra: usize,
+) -> Result<CanonicalCheckerDiagnosticRange, SourceCheckError> {
+    let mut arguments = arguments.into_iter();
+    let first = arguments
+        .nth(first_extra)
+        .ok_or(SourceCheckError::Call(node))?;
+    let last = arguments.last().unwrap_or(first);
+    let first_range = host.node(first).ok_or(SourceCheckError::Call(node))?.range;
+    let last_range = host.node(last).ok_or(SourceCheckError::Call(node))?.range;
+    Ok(CanonicalCheckerDiagnosticRange::new(
+        node,
         TextRange::new(first_range.start, last_range.end),
     ))
 }
@@ -5743,7 +5748,7 @@ fn arrow_argument_diagnostic_range(
     )))
 }
 
-fn missing_argument_related_information(
+pub(super) fn missing_argument_related_information(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     call: NodeRef,
@@ -6173,7 +6178,7 @@ fn prepare_legacy_source_call_diagnostic(
     argument_types: &[TypeId],
     resolution: ResolvedLegacySourceCall,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
-    prepare_fixed_source_call_diagnostic(
+    let mut result = prepare_fixed_source_call_diagnostic(
         store,
         host,
         global_types,
@@ -6183,7 +6188,57 @@ fn prepare_legacy_source_call_diagnostic(
         plan.into(),
         argument_types,
         resolution,
-    )
+    )?;
+    if matches!(
+        resolution.applicability,
+        DirectCallApplicability::ArgumentNotAssignable { .. }
+    ) && let Some(declaration) = store
+        .signature(resolution.signature)
+        .and_then(super::signatures::Signature::declaration)
+        && let Some(symbol) = host
+            .bound_file(declaration)
+            .and_then(|bound| bound.symbol(declaration))
+        && let Some(type_) = store
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+        && let Some(overloads) = super::classes::source_class_method_overloads(store, type_)
+            .map_err(|error| class_call_error(plan.node, error))?
+        && overloads
+            .signatures
+            .iter()
+            .any(|callable| callable.signature == resolution.signature)
+        && super::calls::class_overload_implementation_accepts_arguments(
+            store,
+            global_types,
+            options.strict_function_types,
+            DirectCallRequest {
+                form: plan.form,
+                optional_chain: false,
+                type_argument_count: 0,
+                has_spread_argument: false,
+                callee: type_,
+                arguments: argument_types,
+            },
+            &overloads.implementation,
+        )
+        .map_err(|error| direct_class_call_error(plan.node, error))?
+    {
+        let declaration = store
+            .signature(overloads.implementation.signature)
+            .and_then(super::signatures::Signature::declaration)
+            .ok_or(SourceCheckError::Call(plan.node))?;
+        for diagnostic in &mut result {
+            diagnostic
+                .related_information
+                .push(CanonicalCheckerRelatedInformation {
+                    node: Some(declaration),
+                    diagnostic: Diagnostic::new(
+                        message_by_code(2793).ok_or(SourceCheckError::MissingDiagnostic(2793))?,
+                    ),
+                });
+        }
+    }
+    Ok(result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7166,7 +7221,10 @@ fn class_method_receiver_types(
             let member = class_member_source(store, host, symbol)
                 .map_err(|error| class_call_error(context.receiver(), error))?;
             if member.declaring_class != identities.class_symbol
-                || member.declaration != identities.body_declaration
+                || store
+                    .symbol(symbol)
+                    .and_then(|symbol| symbol.declarations())
+                    .is_none_or(|declarations| !declarations.contains(&identities.body_declaration))
                 || !matches!(member.origin, ClassMemberOrigin::Method)
             {
                 return Err(invalid());
@@ -7310,7 +7368,14 @@ fn source_class_method_target(
         || target.class_symbol() != source.declaring_class
         || target.declaration() != Some(source.declaration)
         || preflight_call_cache_state(store, plan.node)?.is_some_and(|(_, signature)| {
-            signature != target.callable().signature || target.pending_return_body().is_some()
+            (signature != target.callable().signature
+                && target.overloads().is_none_or(|overloads| {
+                    !overloads
+                        .signatures
+                        .iter()
+                        .any(|callable| callable.signature == signature)
+                }))
+                || target.pending_return_body().is_some()
         })
     {
         return Err(invalid());
@@ -7337,6 +7402,28 @@ fn class_call_argument_contextual_type(
             | PlannedExpressionKind::Template(_)
     ) {
         return Ok(None);
+    }
+    if let Some(overloads) = target.overloads() {
+        let mut contextual_type = None;
+        for callable in &overloads.signatures {
+            if arguments.len() < callable.min_argument_count
+                || arguments.len() > callable.parameters.len()
+            {
+                continue;
+            }
+            let type_ = super::calls::try_get_type_at_position(
+                store,
+                Some(globals),
+                callable,
+                argument_index,
+            )
+            .map_err(|error| direct_class_call_error(node, error))?;
+            if contextual_type.is_some_and(|previous| type_ != Some(previous)) {
+                return Ok(None);
+            }
+            contextual_type = type_;
+        }
+        return Ok(contextual_type);
     }
     super::calls::try_get_type_at_position(store, Some(globals), target.callable(), argument_index)
         .map_err(|error| direct_class_call_error(node, error))
@@ -7473,11 +7560,7 @@ fn resolve_source_class_call(
 }
 
 fn same_class_call_target(first: &ClassBodyCallable, second: &ClassBodyCallable) -> bool {
-    first.kind() == second.kind()
-        && first.class_symbol() == second.class_symbol()
-        && first.declaration() == second.declaration()
-        && first.callable() == second.callable()
-        && first.pending_return_body() == second.pending_return_body()
+    first == second
 }
 
 fn legacy_class_call_resolution(resolution: &DirectCallResolution) -> ResolvedLegacySourceCall {

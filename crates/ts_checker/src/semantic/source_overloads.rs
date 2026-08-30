@@ -170,6 +170,29 @@ impl From<LiteralTypeCacheError> for SourceOverloadError {
     }
 }
 
+/// Checks the implementation against visible declarations in their original order.
+pub(super) fn first_incompatible_source_overload(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    session: &mut super::instantiate::InstantiationSession,
+    implementation: &super::callables::ValidatedSingleCallable,
+    overloads: &[super::callables::ValidatedSingleCallable],
+) -> Result<Option<SignatureId>, super::RelationUnavailable> {
+    for overload in overloads {
+        if !store.is_implementation_compatible_with_overload(
+            implementation,
+            overload,
+            global_types,
+            strict_function_types,
+            session,
+        )? {
+            return Ok(Some(overload.signature));
+        }
+    }
+    Ok(None)
+}
+
 /// Authenticates an implicitly or explicitly exported ambient overload group.
 ///
 /// Generic declarations and rest parameters remain intact. Their later type

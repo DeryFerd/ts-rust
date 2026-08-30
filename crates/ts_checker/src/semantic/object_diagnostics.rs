@@ -1649,7 +1649,7 @@ pub(super) fn callable_assignability_details(
 }
 
 #[allow(clippy::too_many_arguments)] // The complete diagnostic record is built transactionally.
-fn missing_property_diagnostic(
+pub(super) fn missing_property_diagnostic(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
