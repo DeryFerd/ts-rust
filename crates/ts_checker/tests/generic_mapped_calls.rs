@@ -926,7 +926,7 @@ fn invalid_pick_key_keeps_the_pinned_diagnostic_and_recovery_types() {
     assert_eq!(node.file, SOURCE_FILE);
     let range = diagnostic.range_override.map_or_else(
         || fixture.source.arena.get(node.node).unwrap().range,
-        |range| range.range(),
+        ts_checker::semantic::CanonicalCheckerDiagnosticRange::range,
     );
     assert_eq!(range, TextRange::new(TextPos::new(118), TextPos::new(121)));
 
