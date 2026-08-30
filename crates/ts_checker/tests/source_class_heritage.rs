@@ -797,7 +797,7 @@ fn unsupported_later_derived_annotation_rejects_before_base_or_derived_publicati
 }
 
 #[test]
-fn implements_only_heritage_stays_a_typed_unsupported_boundary() {
+fn implements_only_heritage_checks_the_original_property_interface() {
     let parsed = parse_source_file(concat!(
         "interface Shape { value: string; }\n",
         "class Model implements Shape { value: string; }\n",
@@ -806,17 +806,60 @@ fn implements_only_heritage_stays_a_typed_unsupported_boundary() {
     let file = FileId::new(4);
     let mut context = checker_context(&parsed, file);
     let model = class_symbol(&parsed, file, &context, "Model");
-    let before = (
+    let shape = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            matches!(record.data, NodeData::InterfaceDeclaration(_)).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .unwrap();
+    let shape = context.file(file).unwrap().1.symbol(shape).unwrap();
+    let shape = context.store().get_merged_symbol(shape).unwrap();
+
+    context.check_source_file(file).unwrap();
+    let members = context.get_nongeneric_class_members(model).unwrap();
+    let shape_type = context.get_declared_type_of_symbol(shape).unwrap();
+    assert_eq!(members.base(), None);
+    assert_eq!(names(&context, members.instance_properties()), ["value"]);
+    assert_eq!(
+        context.is_type_assignable_to(members.shells().instance_type(), shape_type),
+        Ok(true)
+    );
+    assert!(context.diagnostics().is_empty());
+    assert!(is_type_checked(&context, file));
+    assert_eq!(
+        context
+            .store()
+            .declared_type_links(model)
+            .and_then(|links| links.declared_type),
+        Some(members.shells().instance_type())
+    );
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(model)
+            .and_then(|links| links.resolved_type),
+        Some(members.shells().value_type())
+    );
+    let warm = (
         context.store().type_len(),
         context.store().signature_len(),
         context.store().symbol_store().symbol_table_len(),
         context.store().relation_state_snapshot(),
     );
-
-    assert!(matches!(
-        context.get_nongeneric_class_members(model),
-        Err(ClassError::Unsupported(ClassUnsupported::Heritage(_)))
-    ));
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        context.get_nongeneric_class_members(model).unwrap(),
+        members
+    );
+    assert_eq!(
+        context.get_declared_type_of_symbol(shape).unwrap(),
+        shape_type
+    );
     assert_eq!(
         (
             context.store().type_len(),
@@ -824,20 +867,8 @@ fn implements_only_heritage_stays_a_typed_unsupported_boundary() {
             context.store().symbol_store().symbol_table_len(),
             context.store().relation_state_snapshot(),
         ),
-        before
+        warm
     );
-    assert!(
-        context
-            .store()
-            .declared_type_links(model)
-            .and_then(|links| links.declared_type)
-            .is_none()
-    );
-    assert!(
-        context
-            .store()
-            .value_symbol_links(model)
-            .and_then(|links| links.resolved_type)
-            .is_none()
-    );
+    assert!(context.diagnostics().is_empty());
+    assert!(is_type_checked(&context, file));
 }

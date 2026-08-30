@@ -115,11 +115,12 @@ use super::{
         ClassGrammarDiagnostic, ClassGrammarDiagnosticPlan, ClassHeritageMembersValidation,
         ClassMemberPlan, ClassMemberQueryPlan, ClassTypeQueryContext, ExportedJsxArrowClassPlan,
         PreparedSourceClass, SourceClassPlan, check_class_heritage_compatibility,
-        complete_source_class_body, execute_exported_jsx_arrow_class,
-        execute_nongeneric_class_member_query, finish_source_class_members,
-        plan_anonymous_abstract_class_expression_grammar, plan_class_grammar_diagnostics,
-        plan_exported_jsx_arrow_class, plan_exported_static_member_name_grammar_diagnostics,
-        plan_nongeneric_class_member_query, plan_nongeneric_class_member_query_with_type_context,
+        check_class_implementation_compatibility, complete_source_class_body,
+        execute_exported_jsx_arrow_class, execute_nongeneric_class_member_query,
+        finish_source_class_members, plan_anonymous_abstract_class_expression_grammar,
+        plan_class_grammar_diagnostics, plan_exported_jsx_arrow_class,
+        plan_exported_static_member_name_grammar_diagnostics, plan_nongeneric_class_member_query,
+        plan_nongeneric_class_member_query_with_type_context,
         preflight_nongeneric_class_member_query, prepare_source_class_members,
         validate_class_heritage_members,
     },
@@ -33446,6 +33447,16 @@ fn check_planned_source_class(
         declaration,
         &members,
     )?;
+    check_class_implementation_compatibility(
+        store,
+        host,
+        global_types,
+        options,
+        diagnostics,
+        session,
+        declaration,
+        &members,
+    )?;
     for body in class.source.bodies() {
         if let Some(diagnostic) = method_overload_diagnostics.remove(&body.declaration) {
             merge_retry_diagnostic(diagnostics, diagnostic);
@@ -61816,6 +61827,16 @@ pub(super) fn check_source_file(
                     global_types,
                     options,
                     diagnostics,
+                    declaration,
+                    &materialized,
+                )?;
+                check_class_implementation_compatibility(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    diagnostics,
+                    session,
                     declaration,
                     &materialized,
                 )?;
