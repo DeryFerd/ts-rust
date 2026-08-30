@@ -31,18 +31,33 @@ These runs overlap and must not be added together as unique passing tests.
 
 ## Selected projects
 
-| Target | Complete upstream scope | Why use it | Last source-backed Rust stop |
+| Target | Complete upstream scope | Why use it | Fresh Rust construction result |
 | --- | --- | --- | --- |
-| TanStack Query core | `packages/query-core/tsconfig.prod.json`, 23 roots | Strict ESNext/Bundler package. Dependencies and declaration outputs are prepared. Saved Go cold and warm diagnostics are empty. | Generic provider setter in `TimeoutManager`, after class field preparation. |
-| Hono | `tsconfig.build.json`, 188 roots | Strict library build with ES2022 target. Dependencies are prepared. Saved Go cold diagnostics are empty. | `HTTPException extends Error`, before the class body is checked. |
+| TanStack Query core | `packages/query-core/tsconfig.prod.json`, 23 roots | Strict ESNext/Bundler package. Dependencies and declaration outputs are prepared. Saved Go cold and warm diagnostics are empty. | Unsupported arrow in `timeoutManager.ts`. |
+| Hono | `tsconfig.build.json`, 188 roots | Strict library build with ES2022 target. Dependencies are prepared. Saved Go cold diagnostics are empty. | Unsupported class in `http-exception.ts`. |
 
 Roots are not the complete dependency graph. The saved Go runs load 186 files
 for Query core and 352 for Hono. The first target does not include React Query
 or the entire TanStack repository. The second does not include every Hono
 test, example, or project reference.
 
-The Rust stops above are historical. A fresh current-build check must establish
-the next failure. One first failure does not tell us how many remain.
+Both fresh checks ran once on clean compiler `db4988b261625c67d770f9d6290b9684d6395680`.
+Its project reporter was already built. This is a diagnostic candidate with
+known component-test failures, not the accepted compiler source.
+
+Neither check returned a Program graph or reached the canonical checker
+callback. Cold diagnostics, type and symbol artifacts, and replay are
+unavailable. Both processes returned zero because they wrote an unsupported
+report. Neither project passed. Source, dependencies, configs, libraries, and
+compiler bytes stayed unchanged. Both runtime services are stopped.
+
+The [Query result](../target/wave202-demo-query-current-probe-1-closure.md)
+supersedes the old generic-setter trace for this compiler. The
+[Hono result](../target/wave202-demo-hono-current-probe-1-report.md) identifies
+the class but not its inner rejecting guard. A separate source audit proves
+missing constructor-valued heritage and ordinary annotated constructor
+defaults. Those repairs are in progress. One first failure does not tell us
+how many remain.
 
 Pinned project commits:
 
