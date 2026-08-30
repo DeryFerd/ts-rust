@@ -100,6 +100,8 @@ impl PreparedEntityName {
     }
 }
 
+// Each flag retains a separate checked syntax fact.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceNodeFacts {
     kind: SyntaxKind,
