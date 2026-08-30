@@ -1630,6 +1630,11 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         {
             return Ok(members);
         }
+        if store.source_class_provenance_for_symbol(symbol).is_some() {
+            return Err(super::classes::ClassError::Invariant(
+                super::classes::ClassInvariant::InvalidInstanceMembers(symbol),
+            ));
+        }
         let plan = plan_nongeneric_class_member_query_with_type_context(
             store,
             &host,

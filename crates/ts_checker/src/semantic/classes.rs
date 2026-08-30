@@ -429,6 +429,18 @@ impl SourceClassPlan {
         &self.bodies
     }
 
+    pub(super) fn has_own_default_constructor(&self) -> bool {
+        !self.header.ambient
+            && self.constructor.is_none()
+            && self.constructor_overloads.is_empty()
+            && self.header.base.is_none()
+            && self.header.null_base.is_none()
+    }
+
+    pub(super) const fn is_abstract(&self) -> bool {
+        self.header.abstract_class
+    }
+
     pub(super) fn tuple_parameter_annotations(&self) -> impl Iterator<Item = NodeRef> + '_ {
         self.methods
             .iter()
@@ -1838,6 +1850,21 @@ fn source_table_matches(
     }
 }
 
+/// Rechecks the full source plan with its retained array and type-query inputs.
+pub(super) fn source_class_plan_is_current(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceClassPlan,
+) -> Result<bool, ClassError> {
+    Ok(plan_source_class_members_with_context(
+        store,
+        host,
+        plan.symbol(),
+        plan.array_targets,
+        plan.type_query_context.as_ref(),
+    )? == *plan)
+}
+
 fn validate_source_class_header(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1845,14 +1872,7 @@ fn validate_source_class_header(
 ) -> Result<(), ClassError> {
     let prepared = &provenance.prepared;
     let plan = &prepared.plan;
-    if plan_source_class_members_with_context(
-        store,
-        host,
-        plan.symbol(),
-        plan.array_targets,
-        plan.type_query_context.as_ref(),
-    )? != *plan
-    {
+    if !source_class_plan_is_current(store, host, plan)? {
         return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
     }
     if source_class_base_members(store, host, plan)? != provenance.base_members {
@@ -2365,14 +2385,7 @@ pub(super) fn prepare_source_class_members_with_type_queries(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     plan: &SourceClassPlan,
 ) -> Result<PreparedSourceClass, ClassError> {
-    if plan_source_class_members_with_context(
-        store,
-        host,
-        plan.symbol(),
-        plan.array_targets,
-        plan.type_query_context.as_ref(),
-    )? != *plan
-    {
+    if !source_class_plan_is_current(store, host, plan)? {
         return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
     }
     for annotation in plan.tuple_parameter_annotations() {
@@ -2395,14 +2408,7 @@ pub(super) fn prepare_source_class_members(
     host: &DeclaredTypeHost<'_>,
     plan: &SourceClassPlan,
 ) -> Result<PreparedSourceClass, ClassError> {
-    if plan_source_class_members_with_context(
-        store,
-        host,
-        plan.symbol(),
-        plan.array_targets,
-        plan.type_query_context.as_ref(),
-    )? != *plan
-    {
+    if !source_class_plan_is_current(store, host, plan)? {
         return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
     }
     for method in &plan.methods {
@@ -4336,10 +4342,7 @@ pub(super) fn completed_source_class_members(
         return Ok(None);
     };
     validate_source_class_header(store, host, provenance)?;
-    if !provenance.complete {
-        return Err(invariant(ClassInvariant::InvalidInstanceMembers(symbol)));
-    }
-    Ok(Some(provenance.members.clone()))
+    Ok(provenance.complete.then(|| provenance.members.clone()))
 }
 
 fn completed_source_class_method_type(

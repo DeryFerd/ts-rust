@@ -2402,7 +2402,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     recovered_anonymous_variables: HashSet<SemanticSymbolId>,
     planned_ambient_namespaces: HashSet<SemanticSymbolId>,
     planned_classes: HashSet<SemanticSymbolId>,
-    source_body_classes: HashSet<SemanticSymbolId>,
+    source_body_classes: HashMap<SemanticSymbolId, SourceClassPlan>,
     class_body: Option<ClassBodyPlan>,
     prior_enums: HashSet<SemanticSymbolId>,
     prior_classes: HashMap<SemanticSymbolId, ClassMemberPlan>,
@@ -2455,7 +2455,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             recovered_anonymous_variables: HashSet::new(),
             planned_ambient_namespaces: HashSet::new(),
             planned_classes: HashSet::new(),
-            source_body_classes: HashSet::new(),
+            source_body_classes: HashMap::new(),
             class_body: None,
             prior_enums: HashSet::new(),
             prior_classes: HashMap::new(),
@@ -2512,7 +2512,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             recovered_anonymous_variables: HashSet::new(),
             planned_ambient_namespaces: HashSet::new(),
             planned_classes: HashSet::new(),
-            source_body_classes: HashSet::new(),
+            source_body_classes: HashMap::new(),
             class_body: None,
             prior_enums: HashSet::new(),
             prior_classes: HashMap::new(),
@@ -8789,7 +8789,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         {
             return Err(SourceCheckError::Class(declaration));
         }
-        self.source_body_classes.insert(symbol);
+        self.source_body_classes.insert(symbol, source.clone());
         let mut bodies = Vec::with_capacity(source.bodies().len());
         for body in source.bodies() {
             if body.class_declaration != declaration || body.class_symbol != symbol {
@@ -9501,7 +9501,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Ok(());
         }
         if let PlannedExpressionKind::Identifier(read) = property.receiver.unparenthesized().kind
-            && self.source_body_classes.contains(&read.value_symbol)
+            && self.source_body_classes.contains_key(&read.value_symbol)
         {
             // Named JavaScript receivers need source flow outside a class-body token.
             return Err(SourceCheckError::Unsupported(
@@ -18933,6 +18933,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             store,
             host,
             &self.prior_classes,
+            &self.source_body_classes,
             &self.value_import_bindings,
             access,
             false,
@@ -22656,6 +22657,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         store,
                         host,
                         &self.prior_classes,
+                        &self.source_body_classes,
                         &self.value_import_bindings,
                         expression,
                         early_preparation,
