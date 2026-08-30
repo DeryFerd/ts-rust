@@ -3390,6 +3390,35 @@ pub(super) fn validate_stored_declared_call_set(
         }
     }
 
+    validate_declared_call_signature_records(
+        store,
+        type_,
+        owner,
+        owner_declaration,
+        owner_declarations,
+        signatures,
+        call_signature_count,
+        own_signature_count,
+        inherited_base,
+        constructor_interface,
+        member_edges,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Both interface forms share the same source signature proof.
+fn validate_declared_call_signature_records(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    owner_declarations: &[NodeRef],
+    signatures: &[SignatureId],
+    call_signature_count: usize,
+    own_signature_count: usize,
+    inherited_base: Option<TypeId>,
+    constructor_interface: bool,
+    member_edges: Vec<TypeId>,
+) -> StoredDeclaredCallSetValidation {
     let mut edges = Vec::new();
     let mut seen_signatures = HashSet::with_capacity(signatures.len());
     for (index, signature) in signatures.iter().copied().enumerate() {
@@ -3648,6 +3677,82 @@ pub(super) fn validate_stored_declared_call_set(
     }
     edges.extend(member_edges);
     StoredDeclaredCallSetValidation::Valid(edges)
+}
+
+/// Validates the declared call template before any reference substitutes its types.
+/// Generic member validation separately proves the interface's property table.
+pub(super) fn generic_declared_call_signature_edges(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+) -> Option<Vec<TypeId>> {
+    let record = store.type_payload(target)?;
+    let TypeData::Interface(interface) = record.data() else {
+        return None;
+    };
+    let owner = record.symbol()?;
+    let owner_record = store.symbol(owner)?;
+    let members = store.symbol_table(owner_record.members()?)?;
+    let call_symbol = members.get(InternalSymbolName::Call.as_ref());
+    if interface.declared_construct_signatures.is_some()
+        || members.get(InternalSymbolName::New.as_ref()).is_some()
+    {
+        return None;
+    }
+    let Some(signatures) = interface.declared_call_signatures.as_deref() else {
+        return (call_symbol.is_none() && !store.type_has_declared_call_set_provenance(target))
+            .then(Vec::new);
+    };
+    let [signature] = signatures else {
+        return None;
+    };
+    let [declaration] = owner_record.declarations()? else {
+        return None;
+    };
+    let symbol = call_symbol?;
+    let symbol_record = store.symbol(symbol)?;
+    let signature_record = store.signature(*signature)?;
+    let call = signature_record.declaration()?;
+    if validate_direct_generic_reference(store, target)
+        .ok()?
+        .target
+        != target
+        || !store.type_has_declared_call_set_provenance(target)
+        || !interface.declared_members_resolved
+        || interface.resolved_base_types.is_some()
+        || !signature_record.type_parameters().is_empty()
+        || signature_record.has_rest_parameter()
+        || signature_record.resolved_type_predicate().is_some()
+        || symbol_record.flags() != SymbolFlags::SIGNATURE
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name() != InternalSymbolName::Call.as_ref()
+        || symbol_record.declarations() != Some(&[call])
+        || symbol_record.value_declaration().is_some()
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.export_symbol().is_some()
+        || store.get_parent_of_symbol(symbol) != Some(owner)
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || !store.source_declaration_belongs_to_symbol(call, symbol)
+        || !store.source_declaration_belongs_to_symbol(*declaration, owner)
+    {
+        return None;
+    }
+    match validate_declared_call_signature_records(
+        store,
+        target,
+        owner,
+        *declaration,
+        &[*declaration],
+        signatures,
+        signatures.len(),
+        signatures.len(),
+        None,
+        false,
+        Vec::new(),
+    ) {
+        StoredDeclaredCallSetValidation::Valid(edges) => Some(edges),
+        _ => None,
+    }
 }
 
 fn validate_declared_call_set_member_edges(
@@ -9344,7 +9449,9 @@ pub(super) fn plan_generic_interface(
         TypeLiteralMemberPolicy::GenericInterface,
     )?;
     plan.heritage = heritage;
-    if let Some(call) = plan.call_signatures.first() {
+    if let Some(call) = plan.call_signatures.first()
+        && !supported_generic_interface_call(&plan)
+    {
         return Err(PropertyObjectError::UnsupportedMember {
             node: call.declaration,
             kind: call.syntax_kind(),
@@ -9354,10 +9461,31 @@ pub(super) fn plan_generic_interface(
         != parameter_symbols.as_ref().map_or(0, Vec::len)
             + plan.raw_property_count()
             + usize::from(!plan.indexes.is_empty())
+            + usize::from(!plan.call_signatures.is_empty())
     {
         return Err(invalid());
     }
     Ok(plan)
+}
+
+/// The enclosing interface supplies the mapper. Call-owned generics, overloads,
+/// constructors, and inherited call sets keep their existing unsupported boundary.
+fn supported_generic_interface_call(plan: &PropertyObjectPlan) -> bool {
+    let [call] = plan.call_signatures.as_slice() else {
+        return false;
+    };
+    plan.kind == PropertyObjectKind::Interface
+        && plan.declarations.len() == 1
+        && plan.heritage.is_none()
+        && plan.methods.is_empty()
+        && plan.accessors.is_empty()
+        && plan.indexes.is_empty()
+        && call.type_parameters.is_empty()
+        && call.type_predicate.is_none()
+        && !call.implicit_any_return
+        && !call.is_construct()
+        && !call.flags.contains(SignatureFlags::HAS_REST_PARAMETER)
+        && call.parameters.iter().all(|parameter| !parameter.optional)
 }
 
 /// Validates a reopened generic interface without reading its member annotations.
@@ -19074,8 +19202,22 @@ fn valid_planned_call_signature_set(
             .iter()
             .any(PlannedCallSignature::is_construct),
     );
+    let enclosing_parameter_count = if supported_generic_interface_call(plan) {
+        members
+            .iter()
+            .filter(|(_, symbol)| {
+                store.symbol(*symbol).is_some_and(|record| {
+                    record.flags().contains(SymbolFlags::TYPE_PARAMETER)
+                        && store.get_parent_of_symbol(*symbol) == Some(plan.symbol)
+                })
+            })
+            .count()
+    } else {
+        0
+    };
     members.len()
         == family_count
+            .saturating_add(enclosing_parameter_count)
             .saturating_add(plan.properties.len())
             .saturating_add(usize::from(!plan.indexes.is_empty()))
         && (plan.kind == PropertyObjectKind::Interface
@@ -20666,6 +20808,22 @@ pub(super) fn publish_declared_members(
         return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
     }
     let type_ = state.type_id();
+    let generic_interface = store.type_payload(type_).is_some_and(|record| {
+        matches!(record.data(), TypeData::Interface(_))
+            && record.object_flags().contains(ObjectFlags::REFERENCE)
+    });
+    if generic_interface
+        && (!supported_generic_interface_call(plan)
+            || state.is_resolved()
+            || store.type_payload(type_).is_none_or(|record| {
+                let TypeData::Interface(interface) = record.data() else {
+                    return true;
+                };
+                !valid_generic_publication_target(store, plan, type_, record, interface)
+            }))
+    {
+        return Err(invalid_cache(plan, type_));
+    }
     if !valid_planned_call_signature_set(store, plan) {
         return Err(invalid_cache(plan, type_));
     }
@@ -20816,7 +20974,17 @@ pub(super) fn publish_declared_members(
         .filter_map(|signature| signature.type_predicate)
         .filter(|predicate| store.symbol_node_links(predicate.parameter_name).is_none())
         .count();
+    let generic_member_table = if generic_interface && !plan.properties.is_empty() {
+        Some(
+            PreparedSymbolTable::new(plan.properties.len())
+                .ok_or(PropertyObjectError::Capacity(plan.node))?,
+        )
+    } else {
+        None
+    };
     if !store.try_reserve_index_infos(plan.indexes.len())
+        || !store
+            .try_reserve_checker_symbol_allocations(0, usize::from(generic_member_table.is_some()))
         || !store.try_reserve_signatures(cold_signature_count)
         || !store.try_reserve_value_symbol_links(missing_accessor_links)
         || !store.try_reserve_function_signature_return_annotations(annotated_signature_count)
@@ -20852,6 +21020,20 @@ pub(super) fn publish_declared_members(
         }
     }
 
+    let declared_members = if generic_interface {
+        generic_member_table.map(|table| {
+            let members = store.alloc_prepared_symbol_table(table);
+            for property in &plan.properties {
+                assert_eq!(
+                    store.insert_symbol(members, property.name.clone(), property.symbol),
+                    Some(None),
+                );
+            }
+            members
+        })
+    } else {
+        plan.members
+    };
     let index_infos = plan
         .indexes
         .iter()
@@ -20992,20 +21174,22 @@ pub(super) fn publish_declared_members(
             assert!(store.set_interface_declared_members(
                 type_,
                 true,
-                plan.members,
+                declared_members,
                 published_calls.clone(),
                 published_constructs.clone(),
                 published_index_infos.clone(),
             ));
-            assert!(store.set_interface_base_resolution(type_, true, None, None));
-            assert!(store.set_structured_type_members(
-                type_,
-                plan.members,
-                plan.expected_properties(),
-                published_calls,
-                published_constructs,
-                published_index_infos,
-            ));
+            if !generic_interface {
+                assert!(store.set_interface_base_resolution(type_, true, None, None));
+                assert!(store.set_structured_type_members(
+                    type_,
+                    plan.members,
+                    plan.expected_properties(),
+                    published_calls,
+                    published_constructs,
+                    published_index_infos,
+                ));
+            }
         }
         PropertyObjectKind::ObjectLiteral => {
             unreachable!("object-literal plans were rejected before publication")
@@ -21147,7 +21331,7 @@ fn publish_generic_interface_declared_members_worker(
     };
     if plan.kind != PropertyObjectKind::Interface
         || plan.alias_symbol.is_some()
-        || !plan.call_signatures.is_empty()
+        || !plan.call_signatures.is_empty() && !supported_generic_interface_call(plan)
         || plan.properties.len() != property_types.len()
         || property_types
             .iter()
@@ -21226,6 +21410,31 @@ fn publish_generic_interface_declared_members_worker(
         || !unresolved_property_links(store, plan)
     {
         return Err(invalid());
+    }
+    if !plan.call_signatures.is_empty() {
+        let call_types = plan
+            .call_signatures
+            .iter()
+            .map(|call| {
+                Some(ResolvedCallSignatureTypes {
+                    parameter_types: call
+                        .parameters
+                        .iter()
+                        .map(|parameter| planned_call_parameter_type(store, parameter))
+                        .collect::<Option<Vec<_>>>()?,
+                    return_type: cached_planned_type_identity(store, call.return_type)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(invalid)?;
+        return publish_declared_members(
+            store,
+            plan,
+            PropertyObjectState::Shell(target),
+            property_types,
+            &index_types,
+            &call_types,
+        );
     }
     let prepared = if plan.properties.is_empty() {
         None
@@ -21471,7 +21680,12 @@ fn valid_generic_publication_target(
         || reference.type_arguments.is_empty()
         || !interface.base_types_resolved
         || interface.resolved_base_constructor_type.is_some()
-        || interface.declared_call_signatures.is_some()
+        || if interface.declared_members_resolved {
+            interface.declared_call_signatures.as_deref()
+                != resolved_call_signature_ids(store, plan).as_deref()
+        } else {
+            interface.declared_call_signatures.is_some()
+        }
         || interface.declared_construct_signatures.is_some()
         || if interface.declared_members_resolved {
             !valid_declared_index_infos(store, interface.declared_index_infos.as_deref(), plan)
@@ -21482,6 +21696,8 @@ fn valid_generic_publication_target(
             != reference.type_arguments.len()
                 + plan.raw_property_count()
                 + usize::from(!plan.indexes.is_empty())
+                + usize::from(!plan.call_signatures.is_empty())
+        || !valid_planned_call_signature_set(store, plan)
     {
         return false;
     }
@@ -21738,6 +21954,11 @@ fn valid_generic_publication_target(
             return false;
         }
     }
+    for call in &plan.call_signatures {
+        if !symbols.insert(call.symbol) {
+            return false;
+        }
+    }
     raw_table.iter().all(|(name, symbol)| {
         store
             .get_merged_symbol(symbol)
@@ -21881,8 +22102,12 @@ fn valid_generic_structured_members(
         return structured == &StructuredTypeData::default();
     }
     if structured.constrained != ConstrainedTypeData::default()
-        || structured.signatures.is_some()
-        || structured.call_signature_count != 0
+        || structured.signatures.as_deref() != interface.declared_call_signatures.as_deref()
+        || structured.call_signature_count
+            != interface
+                .declared_call_signatures
+                .as_ref()
+                .map_or(0, Vec::len)
         || structured
             .object_type_without_abstract_construct_signatures
             .is_some()

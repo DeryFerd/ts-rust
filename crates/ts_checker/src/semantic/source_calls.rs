@@ -5217,6 +5217,18 @@ fn resolve_source_call_once(
         argument_types,
         explicit_type_arguments,
     } = request;
+    if matches!(
+        super::instantiated_members::validate_generic_interface_callable(
+            store,
+            callee_type,
+            Some(CanonicalArrayTargets::from_global_types(global_types)),
+        ),
+        Some(StoredCallableSetValidation::Pending { .. })
+    ) {
+        return Err(SourceCallResolutionError::Relation(
+            RelationUnavailable::UnresolvedStructuredMembers(callee_type),
+        ));
+    }
     let nongeneric_type_arguments = if explicit_type_arguments.is_some() {
         match validate_stored_callable_set(store, callee_type) {
             StoredCallableSetValidation::Valid { projection, .. }

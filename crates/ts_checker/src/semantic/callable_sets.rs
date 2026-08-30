@@ -93,6 +93,13 @@ pub(super) fn validate_stored_callable_set_with_array_targets(
     type_: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> StoredCallableSetValidation {
+    if let Some(validation) = super::instantiated_members::validate_generic_interface_callable(
+        store,
+        type_,
+        array_targets,
+    ) {
+        return validation;
+    }
     if let Some(validation) = validate_stored_recovered_method_callable_set(store, type_) {
         return validation;
     }
@@ -1492,7 +1499,7 @@ fn alias_owner_of_method_type(
     result
 }
 
-fn validated_instantiated_method_parameter_types(
+pub(super) fn validated_instantiated_method_parameter_types(
     store: &CanonicalTypeMapperStore,
     signature: SignatureId,
     original: &ValidatedSingleCallable,

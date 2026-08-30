@@ -28335,6 +28335,34 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .map(CanonicalArrayTargets::from_global_types);
         let invalid_method =
             || type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature));
+        if let Some(owner) = self.store.declared_call_set_type_for_signature(signature)
+            && let Some(validation) =
+                super::instantiated_members::validate_generic_interface_callable(
+                    self.store,
+                    owner,
+                    array_targets,
+                )
+        {
+            self.reject_type_reference_alias_capabilities()?;
+            let declaration = self
+                .store
+                .signature(signature)
+                .and_then(Signature::declaration)
+                .ok_or_else(invalid_method)?;
+            if preflight_node(self.store, self.host, declaration)?.kind != SyntaxKind::CallSignature
+            {
+                return Err(invalid_method());
+            }
+            let StoredCallableSetValidation::Valid { projection, .. } = validation else {
+                return Err(invalid_method());
+            };
+            return projection
+                .call_signatures
+                .iter()
+                .find(|callable| callable.signature == signature)
+                .and_then(|callable| callable.return_type)
+                .ok_or_else(invalid_method);
+        }
         if let Some(method) =
             published_interface_method_signature_return(self.store, signature, array_targets)
                 .map_err(|_| invalid_method())?

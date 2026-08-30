@@ -28,6 +28,7 @@ use super::{
     callable_sets::{
         CallableSetProjection, StoredCallableSetValidation, instantiated_method_type_matches,
         validate_stored_callable_set, validated_instantiated_method_mapper,
+        validated_instantiated_method_parameter_types,
     },
     callables::{
         CallableFamily, ValidatedSingleCallParameterDisplay, ValidatedSingleCallSignatureDisplay,
@@ -353,6 +354,7 @@ struct GenericInterfaceShape {
     target_arguments: Vec<TypeId>,
     properties: Vec<DeclaredProperty>,
     index_infos: Vec<IndexInfoId>,
+    call_signatures: Vec<SignatureId>,
     base_types: Vec<TypeId>,
     inherited_properties: Vec<SemanticSymbolId>,
     inherited_index_infos: Vec<IndexInfoId>,
@@ -1568,11 +1570,12 @@ struct ColdMembersPlan {
 }
 
 #[derive(Debug)]
-struct ColdIndexValues {
+struct ColdMemberValues {
     mapper: Option<TypeMapperId>,
     mapper_sources: Vec<TypeId>,
     mapper_targets: Vec<TypeId>,
     indexes: Vec<ColdIndexValue>,
+    call_signatures: Vec<SignatureId>,
 }
 
 #[derive(Debug)]
@@ -2857,8 +2860,8 @@ pub(super) fn resolve_members_with_array_targets_and_session(
     }) {
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(reference));
     }
-    // Go substitutes own indexes before it resolves inherited members.
-    let indexes = prepare_cold_index_values(store, &shape, array_targets, session)?;
+    // Go substitutes own signatures and indexes before it resolves inherited members.
+    let values = prepare_cold_member_values(store, &shape, array_targets, session)?;
     if !shape.inherited_members_ready {
         materialize_inherited_members(store, &shape, array_targets, session)?;
         shape = validate_shape(store, reference, array_targets)?;
@@ -2867,7 +2870,7 @@ pub(super) fn resolve_members_with_array_targets_and_session(
         }
     }
     let plan = prepare_cold_members(store, &shape)?;
-    publish_cold_members(store, &shape, plan, indexes, array_targets)
+    publish_cold_members(store, &shape, plan, values, array_targets)
 }
 
 /// Validates the declaration graph and any published member cache without
@@ -2879,6 +2882,71 @@ pub(super) fn validate_generic_interface_members(
 ) -> Result<Option<InstantiatedInterfaceMembers>, GenericInterfaceMemberError> {
     let shape = validate_shape(store, reference, array_targets)?;
     validate_warm_members(store, &shape, array_targets)
+}
+
+/// Exposes a generic interface's existing declared or instantiated call set.
+/// A cold instance is pending until member demand applies its enclosing mapper.
+pub(super) fn validate_generic_interface_callable(
+    store: &CanonicalTypeMapperStore,
+    reference: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<StoredCallableSetValidation> {
+    let record = store.type_payload(reference)?;
+    let target = match record.data() {
+        TypeData::Interface(interface)
+            if record.object_flags().contains(ObjectFlags::REFERENCE) =>
+        {
+            interface.reference.object.target?
+        }
+        TypeData::TypeReference(reference) => reference.object.target?,
+        _ => return None,
+    };
+    let TypeData::Interface(interface) = store.type_payload(target)?.data() else {
+        return None;
+    };
+    if interface.declared_call_signatures.is_none()
+        && !store.type_has_declared_call_set_provenance(target)
+        && !store.type_has_declared_call_set_provenance(reference)
+    {
+        return None;
+    }
+    let family = CallableFamily::DeclaredCallSignatures;
+    let validated = (|| {
+        let shape = validate_shape(store, reference, array_targets).ok()?;
+        let warm = validate_warm_members(store, &shape, array_targets).ok()?;
+        if shape.call_signatures.is_empty() {
+            return None;
+        }
+        if warm.is_none() && reference != target {
+            return (!store.type_has_declared_call_set_provenance(reference))
+                .then_some(StoredCallableSetValidation::Pending { family });
+        }
+        let signatures = if reference == target {
+            shape.call_signatures.as_slice()
+        } else {
+            record.data().structured()?.signatures.as_deref()?
+        };
+        let call_signatures =
+            generic_interface_call_projections(store, &shape, signatures, array_targets).ok()?;
+        let mut edges =
+            super::object_members::generic_declared_call_signature_edges(store, target)?;
+        append_validated_generic_interface_type_edges(store, &shape, array_targets, &mut edges)
+            .ok()?;
+        for callable in &call_signatures {
+            edges.extend_from_slice(&callable.parameters);
+            edges.extend(callable.return_type);
+        }
+        Some(StoredCallableSetValidation::Valid {
+            family,
+            projection: CallableSetProjection {
+                owner: reference,
+                call_signatures: call_signatures.into_boxed_slice(),
+                construct_signatures: Box::new([]),
+            },
+            edges,
+        })
+    })();
+    Some(validated.unwrap_or(StoredCallableSetValidation::Malformed { family }))
 }
 
 /// Returns argument and member type edges without resolving cold tables or values.
@@ -2894,13 +2962,14 @@ pub(super) fn validated_generic_interface_type_edges(
         let target = validate_shape(store, shape.target, array_targets)?;
         append_validated_generic_interface_type_edges(store, &target, array_targets, &mut edges)?;
     }
-    append_validated_generic_callable_type_edges(store, reference, &mut edges)?;
+    append_validated_generic_callable_type_edges(store, reference, array_targets, &mut edges)?;
     Ok(edges)
 }
 
 fn append_validated_generic_callable_type_edges(
     store: &CanonicalTypeMapperStore,
     reference: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
     edges: &mut Vec<TypeId>,
 ) -> Result<(), GenericInterfaceMemberError> {
     let mut visited = HashSet::new();
@@ -2910,14 +2979,24 @@ fn append_validated_generic_callable_type_edges(
         if !visited.insert(type_) {
             continue;
         }
-        match validate_stored_callable_set(store, type_) {
+        match super::callable_sets::validate_stored_callable_set_with_array_targets(
+            store,
+            type_,
+            array_targets,
+        ) {
             StoredCallableSetValidation::Valid {
                 edges: dependencies,
                 ..
             } => edges.extend(dependencies),
-            // A pending callable still needs its source owner to resolve it.
+            // Cold generic references already retain their declared call template.
+            // Graph validation need not specialize a callable that is only a property type.
             StoredCallableSetValidation::Pending { .. } => {
-                return Err(GenericInterfaceMemberError::UnsupportedPropertyType(type_));
+                let shape = validate_shape(store, type_, array_targets)
+                    .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?;
+                if shape.call_signatures.is_empty() {
+                    return Err(GenericInterfaceMemberError::UnsupportedPropertyType(type_));
+                }
+                append_validated_generic_interface_type_edges(store, &shape, array_targets, edges)?;
             }
             StoredCallableSetValidation::Malformed { .. } => {
                 return Err(GenericInterfaceMemberError::InvalidCachedMembers(reference));
@@ -2963,6 +3042,32 @@ fn append_validated_generic_interface_type_edges(
         .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
             shape.reference,
         ))?;
+    for &signature in shape
+        .call_signatures
+        .iter()
+        .chain(structured.signatures.as_deref().unwrap_or_default())
+    {
+        let record =
+            store
+                .signature(signature)
+                .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
+                    shape.reference,
+                ))?;
+        let return_type = record.resolved_return_type().ok_or(
+            GenericInterfaceMemberError::InvalidCachedMembers(shape.reference),
+        )?;
+        for parameter in record.parameters() {
+            edges.push(
+                store
+                    .value_symbol_links(*parameter)
+                    .and_then(|links| links.resolved_type)
+                    .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
+                        shape.reference,
+                    ))?,
+            );
+        }
+        edges.push(return_type);
+    }
     for &index in shape
         .index_infos
         .iter()
@@ -6780,6 +6885,13 @@ fn validate_shape(
         target_arguments: direct.type_arguments,
         properties,
         index_infos,
+        call_signatures: store
+            .type_payload(direct.target)
+            .and_then(|record| match record.data() {
+                TypeData::Interface(interface) => interface.declared_call_signatures.clone(),
+                _ => None,
+            })
+            .unwrap_or_default(),
         base_types,
         inherited_properties: Vec::new(),
         inherited_index_infos: Vec::new(),
@@ -6799,6 +6911,7 @@ fn validate_shape(
             target_arguments: shape.source_parameters.clone(),
             properties: shape.properties.clone(),
             index_infos: shape.index_infos.clone(),
+            call_signatures: shape.call_signatures.clone(),
             base_types: shape.base_types.clone(),
             inherited_properties: Vec::new(),
             inherited_index_infos: Vec::new(),
@@ -6856,6 +6969,19 @@ fn validate_declared_target(
 
     let mapper_parameters = mapper_parameters_for_target(store, target, &source_parameters)?;
     active.push(target);
+    let call_edges = super::object_members::generic_declared_call_signature_edges(store, target)
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
+    for type_ in call_edges {
+        member_type_requires_instantiation(store, type_, &mapper_parameters, array_targets)?;
+        validate_nested_reference_targets(
+            store,
+            type_,
+            array_targets,
+            active,
+            validated,
+            &mut HashSet::new(),
+        )?;
+    }
     let base_types = store
         .type_payload(target)
         .and_then(|record| match record.data() {
@@ -7265,14 +7391,21 @@ fn declared_target_header(
             .resolved_base_types
             .as_ref()
             .is_some_and(Vec::is_empty)
-        || interface.declared_call_signatures.is_some()
+        || !interface.declared_members_resolved && interface.declared_call_signatures.is_some()
         || interface.declared_construct_signatures.is_some()
         || (!record
             .object_flags()
             .contains(ObjectFlags::MEMBERS_RESOLVED)
             && structured != &StructuredTypeData::default())
-        || structured.signatures.is_some()
-        || structured.call_signature_count != 0
+        || record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+            && (structured.signatures.as_deref() != interface.declared_call_signatures.as_deref()
+                || structured.call_signature_count
+                    != interface
+                        .declared_call_signatures
+                        .as_ref()
+                        .map_or(0, Vec::len))
         || structured.constrained != ConstrainedTypeData::default()
         || structured
             .object_type_without_abstract_construct_signatures
@@ -7359,6 +7492,10 @@ fn declared_target_header(
         .as_deref()
         .unwrap_or_default()
         .to_vec();
+    if super::object_members::generic_declared_call_signature_edges(store, target).is_none() {
+        return Err(GenericInterfaceMemberError::InvalidTarget(target));
+    }
+    let call_symbol = raw_table.get(InternalSymbolName::Call.as_ref());
     let index_symbol = raw_table.get(InternalSymbolName::Index.as_ref());
     if index_infos.is_empty() != index_symbol.is_none()
         || interface
@@ -7539,6 +7676,7 @@ fn declared_target_header(
         != early_count
             .checked_add(parameter_symbols.len())
             .and_then(|count| count.checked_add(usize::from(index_symbol.is_some())))
+            .and_then(|count| count.checked_add(usize::from(call_symbol.is_some())))
             .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?
     {
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
@@ -7562,7 +7700,8 @@ fn declared_target_header(
         };
         (!seen.contains(&canonical)
             && !parameter_symbols.contains(&canonical)
-            && Some(canonical) != index_symbol)
+            && Some(canonical) != index_symbol
+            && Some(canonical) != call_symbol)
             || store
                 .symbol(symbol)
                 .is_none_or(|record| record.name() != name)
@@ -8151,6 +8290,107 @@ fn validate_nested_reference_targets(
     Ok(())
 }
 
+/// Proves copied call signatures with the same mapper and parameter checks as
+/// generic methods. The target keeps its original signature and binder symbols.
+fn generic_interface_call_projections(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    signatures: &[SignatureId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Vec<ValidatedSingleCallable>, GenericInterfaceMemberError> {
+    let invalid = || GenericInterfaceMemberError::InvalidCachedMembers(shape.reference);
+    if signatures.len() != shape.call_signatures.len() {
+        return Err(invalid());
+    }
+    let sources = mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
+    let targets = shape
+        .target_arguments
+        .iter()
+        .copied()
+        .chain(std::iter::once(shape.reference))
+        .collect::<Vec<_>>();
+    let mut result = Vec::with_capacity(signatures.len());
+    for (&signature, &original) in signatures.iter().zip(&shape.call_signatures) {
+        let source = store.signature(original).ok_or_else(invalid)?;
+        let actual = store.signature(signature).ok_or_else(invalid)?;
+        let parameters = store
+            .callable_signature_parameter_types(original)
+            .ok_or_else(invalid)?
+            .to_vec();
+        let source_return = source.resolved_return_type().ok_or_else(invalid)?;
+        let template = ValidatedSingleCallable {
+            owner: shape.target,
+            signature: original,
+            parameters,
+            rest_parameter: None,
+            min_argument_count: usize::try_from(source.min_argument_count())
+                .map_err(|_| invalid())?,
+            return_type: Some(source_return),
+            strict_variance_exempt: false,
+        };
+        if store.declared_call_set_type_for_signature(signature) != Some(shape.reference) {
+            return Err(invalid());
+        }
+        if shape.reference == shape.target {
+            if signature != original {
+                return Err(invalid());
+            }
+            result.push(template);
+            continue;
+        }
+        let mapper = actual.mapper().ok_or_else(invalid)?;
+        let return_type = actual.resolved_return_type().ok_or_else(invalid)?;
+        if signature == original
+            || store.type_mapper_has_exact_endpoints(mapper, &sources, &targets) != Some(true)
+            || actual.flags() != (source.flags() & SignatureFlags::PROPAGATING_FLAGS)
+            || actual.declaration() != source.declaration()
+            || !actual.type_parameters().is_empty()
+            || actual.this_parameter().is_some()
+            || actual.min_argument_count() != source.min_argument_count()
+            || actual.resolved_min_argument_count() != -1
+            || actual.resolved_type_predicate().is_some()
+            || actual.target() != Some(original)
+            || actual.isolated_signature_type().is_some()
+            || actual.composite().is_some()
+            || store.signature_has_circular_return_type(signature)
+            || store
+                .function_signature_return_annotation(signature)
+                .is_some()
+            || !instantiated_method_type_matches(
+                store,
+                source_return,
+                return_type,
+                mapper,
+                array_targets,
+            )
+        {
+            return Err(invalid());
+        }
+        let parameters = validated_instantiated_method_parameter_types(
+            store,
+            signature,
+            &template,
+            mapper,
+            array_targets,
+        )
+        .ok_or_else(invalid)?;
+        if store
+            .callable_signature_parameter_types(signature)
+            .is_some()
+        {
+            return Err(invalid());
+        }
+        result.push(ValidatedSingleCallable {
+            owner: shape.reference,
+            signature,
+            parameters,
+            return_type: Some(return_type),
+            ..template
+        });
+    }
+    Ok(result)
+}
+
 #[allow(clippy::too_many_lines)] // Warm replay validates the complete transactional cache shape.
 fn validate_warm_members(
     store: &CanonicalTypeMapperStore,
@@ -8217,8 +8457,9 @@ fn validate_warm_members(
             ));
         }
     };
-    if structured.signatures.is_some()
-        || structured.call_signature_count != 0
+    if structured.call_signature_count != shape.call_signatures.len()
+        || structured.signatures.as_ref().map_or(0, Vec::len) != shape.call_signatures.len()
+        || structured.signatures.as_ref().is_some_and(Vec::is_empty)
         || structured.constrained != ConstrainedTypeData::default()
         || structured
             .object_type_without_abstract_construct_signatures
@@ -8228,6 +8469,12 @@ fn validate_warm_members(
             shape.reference,
         ));
     }
+    let callables = generic_interface_call_projections(
+        store,
+        shape,
+        structured.signatures.as_deref().unwrap_or_default(),
+        array_targets,
+    )?;
     let (own_properties, inherited_properties) = properties.split_at(shape.properties.len());
     let mapper_targets = shape
         .target_arguments
@@ -8260,6 +8507,12 @@ fn validate_warm_members(
             } else {
                 None
             }
+        })
+        .or_else(|| {
+            callables
+                .first()
+                .and_then(|callable| store.signature(callable.signature))
+                .and_then(super::signatures::Signature::mapper)
         });
     if mapper.is_none()
         && shape
@@ -8269,6 +8522,12 @@ fn validate_warm_members(
         || mapper.is_some_and(|mapper| {
             store.type_mapper_has_exact_endpoints(mapper, &all_parameters, &mapper_targets)
                 != Some(true)
+        })
+        || callables.iter().any(|callable| {
+            store
+                .signature(callable.signature)
+                .and_then(super::signatures::Signature::mapper)
+                .is_some_and(|call_mapper| Some(call_mapper) != mapper)
         })
     {
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(
@@ -8542,12 +8801,58 @@ fn prepare_cold_members(
     Ok(ColdMembersPlan { table, properties })
 }
 
-fn prepare_cold_index_values(
+fn prepare_cold_call_signatures(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    mapper: Option<TypeMapperId>,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<Vec<SignatureId>, GenericInterfaceMemberError> {
+    let mut signatures = Vec::with_capacity(shape.call_signatures.len());
+    for &original in &shape.call_signatures {
+        if shape.reference == shape.target {
+            signatures.push(original);
+            continue;
+        }
+        let parameters = store
+            .callable_signature_parameter_types(original)
+            .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?
+            .to_vec();
+        let return_type = store
+            .signature(original)
+            .and_then(super::signatures::Signature::resolved_return_type)
+            .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?;
+        let owner = store
+            .type_payload(shape.target)
+            .and_then(super::type_records::TypeRecord::symbol)
+            .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?;
+        let limit_mark = session.limit_event_mark();
+        signatures.push(instantiate_generic_method_signature(
+            store,
+            original,
+            &parameters,
+            return_type,
+            mapper.ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?,
+            array_targets,
+            session,
+            owner,
+            shape.reference,
+        )?);
+        if session.limit_event_occurred_since(limit_mark) {
+            return Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                shape.reference,
+            ));
+        }
+    }
+    Ok(signatures)
+}
+
+fn prepare_cold_member_values(
     store: &mut CanonicalTypeMapperStore,
     shape: &GenericInterfaceShape,
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut InstantiationSession,
-) -> Result<ColdIndexValues, GenericInterfaceMemberError> {
+) -> Result<ColdMemberValues, GenericInterfaceMemberError> {
     let mapper_sources =
         mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
     let mapper_targets = shape
@@ -8556,11 +8861,12 @@ fn prepare_cold_index_values(
         .copied()
         .chain(std::iter::once(shape.reference))
         .collect::<Vec<_>>();
-    let requires_mapper = !shape.index_infos.is_empty()
-        && shape
-            .properties
-            .iter()
-            .any(|property| property.requires_proxy);
+    let requires_mapper = !shape.call_signatures.is_empty() && shape.reference != shape.target
+        || !shape.index_infos.is_empty()
+            && shape
+                .properties
+                .iter()
+                .any(|property| property.requires_proxy);
     if !store.try_reserve_mappers(usize::from(requires_mapper)) {
         return Err(GenericInterfaceMemberError::Capacity(shape.reference));
     }
@@ -8569,6 +8875,8 @@ fn prepare_cold_index_values(
             .new_type_mapper(mapper_sources.clone(), mapper_targets.clone())
             .expect("prevalidated mapper endpoints remain store-owned")
     });
+    let call_signatures =
+        prepare_cold_call_signatures(store, shape, mapper, array_targets, session)?;
     let mut indexes = Vec::with_capacity(shape.index_infos.len());
     for source in &shape.index_infos {
         let info = store
@@ -8622,27 +8930,30 @@ fn prepare_cold_index_values(
             recovery,
         });
     }
-    Ok(ColdIndexValues {
+    Ok(ColdMemberValues {
         mapper,
         mapper_sources,
         mapper_targets,
         indexes,
+        call_signatures,
     })
 }
 
+#[allow(clippy::too_many_lines)] // Publish mapped signatures, properties, and indexes after reservation.
 fn publish_cold_members(
     store: &mut CanonicalTypeMapperStore,
     shape: &GenericInterfaceShape,
     plan: ColdMembersPlan,
-    indexes: ColdIndexValues,
+    values: ColdMemberValues,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<InstantiatedInterfaceMembers, GenericInterfaceMemberError> {
-    let ColdIndexValues {
+    let ColdMemberValues {
         mapper,
         mapper_sources,
         mapper_targets,
         indexes,
-    } = indexes;
+        call_signatures,
+    } = values;
     let count = indexes
         .len()
         .checked_add(shape.inherited_index_infos.len())
@@ -8659,6 +8970,14 @@ fn publish_cold_members(
     if !store.try_reserve_index_infos(indexes.len())
         || !store.try_reserve_instantiated_index_recoveries(recovery_count)
         || !store.try_reserve_mappers(usize::from(needs_mapper))
+        || !store.try_reserve_declared_call_set_provenance(
+            usize::from(shape.reference != shape.target && !call_signatures.is_empty()),
+            if shape.reference != shape.target {
+                call_signatures.len()
+            } else {
+                0
+            },
+        )
     {
         return Err(GenericInterfaceMemberError::Capacity(shape.reference));
     }
@@ -8712,11 +9031,14 @@ fn publish_cold_members(
     }
     index_infos.extend_from_slice(&shape.inherited_index_infos);
     let (members, properties) = publish_prepared_property_table(store, plan, mapper);
+    if shape.reference != shape.target && !call_signatures.is_empty() {
+        assert!(store.set_declared_call_set_provenance(shape.reference, &call_signatures));
+    }
     assert!(store.set_structured_type_members(
         shape.reference,
         members,
         (!properties.is_empty()).then(|| properties.clone()),
-        None,
+        (!call_signatures.is_empty()).then_some(call_signatures),
         None,
         (!index_infos.is_empty()).then_some(index_infos),
     ));
@@ -8913,6 +9235,142 @@ mod tests {
             .and_then(|declaration| context.store().source_direct_type_annotation(declaration))
             .unwrap();
         context.get_type_from_type_node(annotation).unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One fixture checks signature, parameter, and mapper mutations.
+    fn generic_interface_call_caches_reject_changed_parameters_returns_and_mappers() {
+        let parsed = parse_source_file(concat!(
+            "interface Callable<T> { (value: T): T; } ",
+            "declare const callable: Callable<string>; callable('value');",
+        ));
+        let file = FileId::new(202_621);
+        for corruption in 0..3 {
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let reference =
+                property_object_alias_variable_type(&parsed, file, &mut context, "callable");
+            let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+                validate_generic_interface_callable(context.store(), reference, None)
+            else {
+                panic!("the checked call must retain its generic-interface signature")
+            };
+            let signature = projection.call_signatures[0].signature;
+            let parameter = context.store().signature(signature).unwrap().parameters()[0];
+            let source = context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .target()
+                .unwrap();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let store = context.store_mut_for_test();
+            match corruption {
+                0 => {
+                    assert!(store.set_signature_resolved_return_type(signature, Some(number)));
+                }
+                1 => {
+                    let mut links = store.value_symbol_links(parameter).unwrap().clone();
+                    links.resolved_type = Some(number);
+                    assert!(store.set_value_symbol_links(parameter, links));
+                }
+                _ => {
+                    let source_parameter = store.signature(source).unwrap().parameters()[0];
+                    let template = store
+                        .value_symbol_links(source_parameter)
+                        .unwrap()
+                        .resolved_type
+                        .unwrap();
+                    let mapper = store.new_type_mapper(vec![template], vec![number]).unwrap();
+                    assert!(store.set_signature_target_and_mapper(
+                        signature,
+                        Some(source),
+                        Some(mapper)
+                    ));
+                }
+            }
+            let warm = (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+            );
+            for _ in 0..2 {
+                assert!(matches!(
+                    validate_stored_callable_set(store, reference),
+                    StoredCallableSetValidation::Malformed {
+                        family: CallableFamily::DeclaredCallSignatures,
+                    }
+                ));
+                assert_eq!(
+                    resolve_members_with_array_targets(store, reference, None),
+                    Err(GenericInterfaceMemberError::InvalidCachedMembers(reference)),
+                );
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.mapper_len()
+                    ),
+                    warm,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generic_interface_call_limits_leave_the_instance_unpublished() {
+        let parsed = parse_source_file(concat!(
+            "interface Callable<T> { (value: T): T; } ",
+            "declare const callable: Callable<string>;",
+        ));
+        let file = FileId::new(202_622);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let reference =
+            property_object_alias_variable_type(&parsed, file, &mut context, "callable");
+        let store = context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let error_type = bootstrap.error_type;
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            error_type,
+        )
+        .unwrap();
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            resolve_members_with_array_targets_and_session(store, reference, None, &mut session),
+            Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                reference
+            )),
+        );
+        assert!(session.limit_event_occurred_since(mark));
+        assert!(!store.type_has_declared_call_set_provenance(reference));
+        assert_eq!(
+            store.type_payload(reference).unwrap().data().structured(),
+            Some(&StructuredTypeData::default()),
+        );
+        assert_eq!(
+            validate_generic_interface_callable(store, reference, None),
+            Some(StoredCallableSetValidation::Pending {
+                family: CallableFamily::DeclaredCallSignatures,
+            }),
+        );
+        resolve_members_with_array_targets(store, reference, None).unwrap();
+        let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+            validate_generic_interface_callable(store, reference, None)
+        else {
+            panic!("a fresh session must resolve the untouched declared call template")
+        };
+        assert_eq!(projection.call_signatures[0].parameters, [string]);
+        assert_eq!(projection.call_signatures[0].return_type, Some(string));
     }
 
     #[test]
