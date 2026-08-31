@@ -64,6 +64,7 @@ fn facts_mut<TypePayload, MapperPayload>(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keep class and interface membership proofs beside the unchanged role queries.
 fn class_annotation_roles_keep_written_types_with_initializers_and_absence() {
     let parsed = parse_source_file(concat!(
         "class Roles { typed: number; initialized: string = 'value'; absent; inferred = 1; ",
@@ -73,21 +74,88 @@ fn class_annotation_roles_keep_written_types_with_initializers_and_absence() {
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(98_350);
     let holders = annotation_holders(&parsed, file);
-    assert_eq!(holders.len(), 8);
+    let mut classes = parsed.arena.iter().filter_map(|(id, record)| {
+        if let NodeData::ClassDeclaration(class) = &record.data {
+            Some((id, class))
+        } else {
+            None
+        }
+    });
+    let (class_id, class) = classes.next().unwrap();
+    assert!(classes.next().is_none());
+    let mut class_holder_ids = Vec::new();
+    for &member in &class.members.nodes {
+        let record = parsed.arena.get(member).unwrap();
+        assert_eq!(record.parent, Some(class_id));
+        match &record.data {
+            NodeData::PropertyDeclaration(_) => class_holder_ids.push(member),
+            NodeData::ConstructorDeclaration(constructor) => {
+                for &parameter in &constructor.parameters.nodes {
+                    let record = parsed.arena.get(parameter).unwrap();
+                    assert_eq!(record.kind, SyntaxKind::Parameter);
+                    assert_eq!(record.parent, Some(member));
+                    class_holder_ids.push(parameter);
+                }
+            }
+            _ => panic!("the class contains only fields and its constructor"),
+        }
+    }
+    let class_holders = class_holder_ids
+        .iter()
+        .map(|id| {
+            let mut matching = holders.iter().filter(|role| role.declaration.node == *id);
+            let role = matching.next().unwrap();
+            assert!(matching.next().is_none());
+            role
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(class_holders.len(), 8);
     assert_eq!(
-        holders
+        class_holders
             .iter()
             .filter(|role| role.annotation.is_some())
             .count(),
         4
     );
     assert_eq!(
-        holders
+        class_holders
             .iter()
             .filter(|role| role.annotation.is_some() && role.initializer.is_some())
             .count(),
         2
     );
+    let mut interfaces = parsed.arena.iter().filter_map(|(id, record)| {
+        if let NodeData::InterfaceDeclaration(interface) = &record.data {
+            Some((id, interface))
+        } else {
+            None
+        }
+    });
+    let (interface_id, interface) = interfaces.next().unwrap();
+    assert!(interfaces.next().is_none());
+    let [field] = interface.members.nodes.as_slice() else {
+        panic!("the interface contains exactly one field")
+    };
+    let mut remaining = holders
+        .iter()
+        .filter(|role| !class_holder_ids.contains(&role.declaration.node));
+    let interface_holder = remaining.next().unwrap();
+    assert!(remaining.next().is_none());
+    assert_eq!(interface_holder.declaration.node, *field);
+    let record = parsed.arena.get(*field).unwrap();
+    assert_eq!(record.kind, SyntaxKind::PropertyDeclaration);
+    assert_eq!(record.parent, Some(interface_id));
+    let NodeData::PropertyDeclaration(property) = &record.data else {
+        panic!("the parser retains the interface field as a property declaration")
+    };
+    let reference = |id| NodeRef::new(parsed.arena.id(), file, id);
+    assert_eq!(interface_holder.name, reference(property.name));
+    assert_eq!(interface_holder.annotation, property.type_.map(reference));
+    let annotation = parsed.arena.get(property.type_.unwrap()).unwrap();
+    assert_eq!(annotation.kind, SyntaxKind::NumberKeyword);
+    assert_eq!(annotation.parent, Some(*field));
+    assert_eq!(property.initializer, None);
+    assert_eq!(interface_holder.initializer, None);
     let mut store = RoleStore::new();
     assert!(store.register_ast_scope(AstScope::new(file, &parsed.arena)));
     for role in &holders {
