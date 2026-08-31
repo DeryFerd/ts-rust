@@ -30,12 +30,13 @@ The selected original corpus has 423 exact diagnostic results in 511 executions
 and 62 exact semantic results in 95 executions. These are limited test sets,
 not complete TypeScript compatibility. Two supported artifact mismatches still
 prevent acceptance. Their fixes are combined with the parser at `706299ac`.
-Its full check passed formatting, then stopped at a parser function-length
-lint before running tests. The [core/parser result](../target/wave202-core-parser-combined-full-1-quality-report.md)
-retains that failure and the nine unattempted stages. The artifact fixes still
-need execution. The lint correction is committed at `3b45a90d`. Its next full
-check is prepared with the same 6,550 tests. The primary branch uses the
-previously accepted compiler source.
+Its first full check stopped at a parser function-length lint. The correction
+at `3b45a90d` passed formatting in the second check, then stopped on three
+Clippy findings. All 6,550 tests remain unrun on that source. The
+[latest core/parser result](../target/wave202-core-parser-combined-full-2-quality-report.md)
+retains every compiler error and the nine unattempted stages. A separate pair
+is reviewing the three small lint fixes. The artifact fixes still need
+execution. The primary branch uses the previously accepted compiler source.
 
 The five parser repairs are committed at `b1746a95`, with 28 new tests.
 Static diagnosis links them to all 55 Hono syntax diagnostics and all 25 Query
@@ -66,7 +67,11 @@ The alias batch at `26337753` completed all 5,099 tests. It passed 5,082 and
 failed 17. Four old failures now pass, and no old passing test regressed.
 Independent review and cleanup are closed. The
 [alias result](../target/wave202-alias-wrapper-numeric-method-focused-1-runtime.md)
-retains every failure. This batch is not accepted yet.
+retains every failure. The next repair batch stopped at a test import error
+before listing any of its 5,104 tests. That one-line import fix is committed
+and independently reviewed at `bc967441`. A fresh retry is being prepared.
+The 5,082 passes and 17 failures remain the last complete alias measurement.
+This batch is not accepted yet.
 
 The first shared project compiler is committed and independently verified at
 `b71b4158`. It combines the repaired library, class work, core, parser and
@@ -74,23 +79,26 @@ project reporter. It also adds conditional expression operands, annotated
 local callbacks, object-method captured writes and imported interface heritage.
 All 859 source files match the reviewed commit. Its source inventory has
 7,293 tests in 235 harnesses, including the two test API corrections above.
-These tests have not run on that combined source. The project runner is now
-being tied to this exact commit for the first shared measurement.
+These tests have not run on that combined source. Its first project build
+failed on an access to a nonexistent AST field. Neither project ran. The
+[failed build result](../target/wave202-demo-shared-project-census-2-result.md)
+has an independent review and closed cleanup. The exact one-line correction
+is committed and independently reviewed at `3b293b28`. All tests stay unchanged.
+The next run will build that source once and check both original projects.
 
-Parallel diagnosis covered 128 of the 159 measured library failures. Two
-shared causes explain 28 first stops: conditional alias publication and warm
-union preparation. Separate repair pairs now own those paths. Another pair
-owns a property-kind correction for six failures and one test setup error.
-These are diagnosed causes, not 35 new passing tests. Later assertions still
-need execution.
+Separate repair pairs committed fixes for three causes linked to 35 measured
+library failures: conditional alias publication, warm union preparation and
+property-kind checks. The last group includes one test setup correction.
+These are source fixes, not 35 new passing tests. Later assertions still need
+execution. These fixes stay outside the immediate project retry.
 
 ## Next work
 
-1. Build `b71b4158` once and measure both unchanged projects with that same
+1. Build `3b293b28` once and measure both unchanged projects with that same
    binary. Keep this source fixed. Do not wait for later feature patches or
    unrelated test repairs.
-2. Run the prepared core/parser and alias checks in parallel with the project
-   measurement. Keep all tests and report every failure.
+2. Finish the small core/parser and alias build fixes. Run their unchanged
+   test selections in parallel with the project measurement. Report every failure.
 3. Fix the measured library and class failures in separate worktrees. Combine
    those repairs after the first project measurement.
 4. Prioritize the next actual project failure and any shared dependency. Repeat until
