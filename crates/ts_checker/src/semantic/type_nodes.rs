@@ -3873,7 +3873,12 @@ impl SourceAliasOperandSource {
             || malformed_alias_merge(alias.flags())
             || alias.declarations() != Some(&[self.declaration])
             || store.get_merged_symbol(self.alias) != Some(self.alias)
-            || store.source_declaration_symbol(self.declaration) != Some(self.alias)
+            || super::object_aliases::validate_source_alias_binding(
+                store,
+                self.declaration,
+                self.alias,
+            )
+            .is_err()
             || !store.source_symbol_declarations_match(self.alias)
             || store.source_node_kind(self.declaration) != Some(SyntaxKind::TypeAliasDeclaration)
             || store.source_node_parent(self.header.name)
@@ -45628,6 +45633,224 @@ export type Env = {
                 );
                 assert_eq!(union_state(&fixture.store), before);
                 assert_eq!(format!("{:?}", fixture.store), restored);
+            }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Keep cold and warm binding damage and exact restoration together.
+        fn source_alias_bound_sources_reject_changed_export_bindings_cold_and_warm() {
+            #[derive(Clone, Copy, Debug)]
+            enum Damage {
+                LocalTarget,
+                ExportEntry,
+                LocalFlags,
+                ExportParent,
+            }
+            for warm in [false, true] {
+                for damage in [
+                    Damage::LocalTarget,
+                    Damage::ExportEntry,
+                    Damage::LocalFlags,
+                    Damage::ExportParent,
+                ] {
+                    let mut fixture = fixture_with_options(
+                        "export type Bound<T extends string = string> = T;\n\
+                         export type Other<T extends string = string> = T;",
+                        CanonicalModuleState::External,
+                        IntrinsicBootstrapOptions {
+                            strict_null_checks: true,
+                            exact_optional_property_types: false,
+                        },
+                        |_| {},
+                    );
+                    let declaration = alias_parts(&fixture, "Bound").0;
+                    let alias = node_symbol(&fixture, declaration);
+                    let other = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Other");
+                    let bound = fixture.files.get(&fixture.file).unwrap();
+                    let local = bound.local_symbol(declaration).unwrap();
+                    let module = bound.symbol(bound.source_file()).unwrap();
+                    let exports = fixture.store.symbol(module).unwrap().exports().unwrap();
+                    let alias_record = fixture.store.symbol(alias).unwrap().clone();
+                    let local_record = fixture.store.symbol(local).unwrap().clone();
+                    assert_ne!(local, alias);
+                    assert_eq!(local_record.flags(), SymbolFlags::NONE);
+                    assert_eq!(local_record.export_symbol(), Some(alias));
+                    assert_eq!(alias_record.parent(), Some(module));
+                    assert_eq!(fixture.store.source_declaration_symbol(declaration), None);
+                    assert_eq!(
+                        fixture
+                            .store
+                            .symbol_store()
+                            .source_binding_symbols(declaration),
+                        Some([Some(alias), Some(local)])
+                    );
+                    assert_eq!(
+                        crate::semantic::object_aliases::validate_source_alias_binding(
+                            &fixture.store,
+                            declaration,
+                            other
+                        ),
+                        Err(crate::semantic::relater::RelationUnavailable::Symbol(other))
+                    );
+                    let root = constraint(&fixture, "Bound", 0);
+                    let default = alias_type_parameter_default(&fixture, "Bound", 0);
+                    let operands = [source(&fixture, root), source(&fixture, default)];
+                    assert_eq!(operands[0].kind, SourceAliasOperandKind::Constraint);
+                    assert_eq!(operands[1].kind, SourceAliasOperandKind::Default);
+                    for operand in &operands {
+                        assert_eq!(operand.alias(), alias);
+                        assert_eq!(operand.declaration(), declaration);
+                        assert_eq!(operand.validate_retained(&fixture.store), Ok(()));
+                    }
+                    let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+                    let mut session = InstantiationSession::new(InstantiationLimits::default());
+                    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                    assert_eq!(
+                        run(
+                            &mut fixture,
+                            Query::Node(root),
+                            &mut session,
+                            &mut diagnostics
+                        ),
+                        Ok(string)
+                    );
+                    assert!(fixture.store.type_alias_links(alias).is_none());
+                    let declared = warm.then(|| {
+                        run(
+                            &mut fixture,
+                            Query::Declared(alias),
+                            &mut session,
+                            &mut diagnostics,
+                        )
+                        .unwrap()
+                    });
+                    let alias_links = fixture.store.type_alias_links(alias).cloned();
+                    match damage {
+                        Damage::LocalTarget => assert!(fixture.store.set_symbol_relationships(
+                            local,
+                            local_record.members(),
+                            local_record.exports(),
+                            local_record.parent(),
+                            Some(other)
+                        )),
+                        Damage::ExportEntry => assert_eq!(
+                            fixture.store.insert_symbol(
+                                exports,
+                                alias_record.name().clone(),
+                                other
+                            ),
+                            Some(Some(alias))
+                        ),
+                        Damage::LocalFlags => assert!(fixture.store.set_symbol_flags(
+                            local,
+                            SymbolFlags::TYPE_ALIAS,
+                            local_record.check_flags()
+                        )),
+                        Damage::ExportParent => assert!(fixture.store.set_symbol_relationships(
+                            alias,
+                            alias_record.members(),
+                            alias_record.exports(),
+                            None,
+                            alias_record.export_symbol()
+                        )),
+                    }
+                    let before = union_state(&fixture.store);
+                    let rows = format!("{:?}", fixture.store);
+                    let counts = (
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_count(),
+                    );
+                    let error = type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeAliasDeclaration(declaration),
+                    );
+                    for _ in 0..2 {
+                        for operand in &operands {
+                            assert_eq!(operand.validate_retained(&fixture.store), Err(error));
+                            assert_eq!(
+                                run(
+                                    &mut fixture,
+                                    Query::Node(operand.root()),
+                                    &mut session,
+                                    &mut diagnostics
+                                ),
+                                Err(error),
+                                "{warm:?} {damage:?}"
+                            );
+                        }
+                    }
+                    assert_eq!(union_state(&fixture.store), before);
+                    assert_eq!(format!("{:?}", fixture.store), rows);
+                    assert_eq!(fixture.store.type_alias_links(alias), alias_links.as_ref());
+                    assert_eq!(
+                        (
+                            session.query_count(),
+                            session.total_count(),
+                            session.limit_event_count()
+                        ),
+                        counts
+                    );
+                    match damage {
+                        Damage::LocalTarget => assert!(fixture.store.set_symbol_relationships(
+                            local,
+                            local_record.members(),
+                            local_record.exports(),
+                            local_record.parent(),
+                            local_record.export_symbol()
+                        )),
+                        Damage::ExportEntry => assert_eq!(
+                            fixture.store.insert_symbol(
+                                exports,
+                                alias_record.name().clone(),
+                                alias
+                            ),
+                            Some(Some(other))
+                        ),
+                        Damage::LocalFlags => assert!(fixture.store.set_symbol_flags(
+                            local,
+                            local_record.flags(),
+                            local_record.check_flags()
+                        )),
+                        Damage::ExportParent => assert!(fixture.store.set_symbol_relationships(
+                            alias,
+                            alias_record.members(),
+                            alias_record.exports(),
+                            alias_record.parent(),
+                            alias_record.export_symbol()
+                        )),
+                    }
+                    let restored = format!("{:?}", fixture.store);
+                    for operand in &operands {
+                        assert_eq!(operand.validate_retained(&fixture.store), Ok(()));
+                        assert_eq!(
+                            run(
+                                &mut fixture,
+                                Query::Node(operand.root()),
+                                &mut session,
+                                &mut diagnostics
+                            ),
+                            Ok(string)
+                        );
+                    }
+                    assert_eq!(union_state(&fixture.store), before);
+                    assert_eq!(format!("{:?}", fixture.store), restored);
+                    let result = run(
+                        &mut fixture,
+                        Query::Declared(alias),
+                        &mut session,
+                        &mut diagnostics,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        cached_ordinary_type_parameter_owner(&fixture.store, result),
+                        Some(operands[0].parameter().1)
+                    );
+                    if let Some(declared) = declared {
+                        assert_eq!(result, declared);
+                        assert_eq!(fixture.store.type_alias_links(alias), alias_links.as_ref());
+                    }
+                    assert!(diagnostics.is_empty());
+                }
             }
         }
     }

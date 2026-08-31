@@ -2959,6 +2959,20 @@ fn source_symbols<M>(
     Ok(Some((source_symbol, alias_symbol)))
 }
 
+/// Checks the primary source binding and its complete local/export relation.
+pub(super) fn validate_source_alias_binding<M>(
+    store: &SemanticStore<TypeRecord, M>,
+    declaration: NodeRef,
+    alias: SemanticSymbolId,
+) -> Result<(), RelationUnavailable> {
+    if bound_declaration_symbol(store, declaration) != Some(alias)
+        || !store.source_declaration_belongs_to_symbol(declaration, alias)
+    {
+        return Err(RelationUnavailable::Symbol(alias));
+    }
+    validate_alias_binding(store, declaration, alias)
+}
+
 fn validate_alias_binding<M>(
     store: &SemanticStore<TypeRecord, M>,
     declaration: NodeRef,

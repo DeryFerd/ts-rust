@@ -15337,8 +15337,10 @@ impl SourceAliasClosedObject {
             return Err(invalid());
         }
         for property in &plan.properties {
-            if store.source_node_kind(property.declaration) != Some(SyntaxKind::PropertySignature)
-                || store.source_declaration_symbol(property.declaration) != Some(property.symbol)
+            if !matches!(
+                store.source_node_kind(property.declaration),
+                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+            ) || store.source_declaration_symbol(property.declaration) != Some(property.symbol)
                 || !store.source_symbol_declarations_match(property.symbol)
                 || store.source_direct_type_annotation(property.declaration)
                     != Some(property.type_node)
@@ -29545,6 +29547,138 @@ mod generic_publication_tests {
             }),
         );
         assert_eq!(state(&fixture.store), poisoned);
+    }
+
+    fn closed_property_declaration_fixture() -> (Fixture, SourceAliasClosedObject, NodeRef) {
+        let mut fixture = interface_fixture(
+            "interface Owner {} type Shape = { item?: string }; class Other { item?: string; }",
+            48_936,
+        );
+        let node = |kind| {
+            fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap()
+        };
+        let literal = node(SyntaxKind::TypeLiteral);
+        let alias = fixture
+            .bound
+            .symbol(node(SyntaxKind::TypeAliasDeclaration))
+            .unwrap();
+        let class = node(SyntaxKind::ClassDeclaration);
+        let foreign = fixture
+            .store
+            .source_child_with_kind(class, SyntaxKind::PropertyDeclaration)
+            .unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_type_literal(&fixture.store, &host, literal, Some(alias)).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(alias)
+        .unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let proof = source_alias_closed_object(
+            &fixture.store,
+            &host,
+            &plan,
+            type_,
+            vec![string],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(diagnostics.is_empty());
+        (fixture, proof, foreign)
+    }
+
+    #[test]
+    fn source_alias_closed_objects_keep_property_declarations_and_reject_foreign_rows() {
+        let (mut fixture, proof, foreign) = closed_property_declaration_fixture();
+        let property = &proof.plan.properties[0];
+        assert!(property.optional);
+        assert_eq!(
+            fixture.store.source_node_kind(property.declaration),
+            Some(SyntaxKind::PropertyDeclaration)
+        );
+        assert_eq!(
+            fixture.store.source_node_kind(foreign),
+            Some(SyntaxKind::PropertyDeclaration)
+        );
+        let expected = Err(invalid_cache(&proof.plan, proof.type_));
+        let snapshot = format!("{:?}", fixture.store);
+        for damage in 0..4 {
+            let mut changed = proof.clone();
+            match damage {
+                0 => changed.plan.kind = PropertyObjectKind::ObjectLiteral,
+                1 => changed.plan.properties[0].declaration = foreign,
+                2 => changed.plan.properties[0].symbol = fixture.bound.symbol(foreign).unwrap(),
+                3 => {
+                    changed.plan.properties[0].type_node = fixture
+                        .store
+                        .source_direct_type_annotation(foreign)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    changed.validate_retained(&fixture.store),
+                    Err(invalid_cache(&changed.plan, changed.type_))
+                );
+                assert_eq!(format!("{:?}", fixture.store), snapshot);
+                assert_eq!(proof.validate_retained(&fixture.store), Ok(()));
+            }
+        }
+        let original = fixture
+            .store
+            .value_symbol_links(property.symbol)
+            .unwrap()
+            .clone();
+        let mut changed = original.clone();
+        changed.resolved_type = Some(fixture.store.intrinsic_bootstrap().unwrap().number_type);
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(property.symbol, changed)
+        );
+        let poisoned = format!("{:?}", fixture.store);
+        for _ in 0..2 {
+            assert_eq!(proof.validate_retained(&fixture.store), expected);
+            assert_eq!(format!("{:?}", fixture.store), poisoned);
+        }
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(property.symbol, original)
+        );
+        let restored = format!("{:?}", fixture.store);
+        let host = host(&fixture.parsed, &fixture.bound);
+        assert_eq!(proof.validate_retained(&fixture.store), Ok(()));
+        assert_eq!(
+            source_alias_closed_object(
+                &fixture.store,
+                &host,
+                &proof.plan,
+                proof.type_,
+                proof.property_types.clone(),
+                Vec::new()
+            ),
+            Ok(proof)
+        );
+        assert_eq!(format!("{:?}", fixture.store), restored);
     }
 
     #[test]
