@@ -497,6 +497,42 @@ pub(super) fn resolve_object_property_by_key_with_source(
     let record = store
         .type_payload(receiver)
         .ok_or(RelationUnavailable::Type(receiver))?;
+    let source_class_target = match record.data() {
+        TypeData::TypeReference(reference) => reference.object.target.filter(|target| {
+            store.source_class_provenance(*target).is_some()
+                && store
+                    .type_payload(*target)
+                    .is_some_and(|record| record.object_flags().contains(ObjectFlags::CLASS))
+        }),
+        _ => None,
+    };
+    if source_class_target.is_some() {
+        return resolve_instantiated_object_property_by_key_with_source(
+            store,
+            host,
+            global_types,
+            options,
+            receiver,
+            name,
+            session,
+            diagnostics,
+        );
+    }
+    if store.source_class_provenance(receiver).is_some()
+        && matches!(record.data(), TypeData::Interface(class)
+            if class.reference.resolved_type_arguments.as_deref() == Some(&[]))
+    {
+        return resolve_completed_class_origin_property_by_key_with_source(
+            store,
+            host,
+            global_types,
+            options,
+            receiver,
+            name,
+            session,
+            diagnostics,
+        );
+    }
     let nongeneric_origin = matches!(record.data(), TypeData::Interface(_))
         && validate_nongeneric_interface_argument_origin(store, receiver).is_ok();
     let generic = match record.data() {
@@ -739,6 +775,62 @@ pub(super) fn resolve_object_property_by_key_with_source(
 }
 
 #[allow(clippy::too_many_arguments)] // Keep the source host and limits with the selected proxy.
+fn resolve_completed_class_origin_property_by_key_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    receiver: TypeId,
+    name: EscapedNameRef<'_>,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
+    let members = super::classes::completed_source_class_receiver_members(store, receiver)
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+    let Some(table) = members.instance_members() else {
+        return Ok(None);
+    };
+    let Some(symbol) = store.symbol_table(table).ok_or_else(invalid)?.get(name) else {
+        return Ok(None);
+    };
+    if !members.instance_properties().contains(&symbol) {
+        return Err(invalid().into());
+    }
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
+    let optional = record.flags().contains(SymbolFlags::OPTIONAL);
+    let readonly = record.check_flags().contains(CheckFlags::READONLY);
+    if super::instantiated_members::completed_source_class_origin_member_mapping(
+        store,
+        receiver,
+        symbol,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+    )
+    .map_err(|error| source_generic_member_error(receiver, &error))?
+    .is_none()
+    {
+        return resolve_object_property_by_key(store, Some(global_types), receiver, name, session)
+            .map_err(Into::into);
+    }
+    let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+    )?
+    .get_type_of_instantiated_interface_property(receiver, symbol)?;
+    Ok(Some(ResolvedOwnProperty {
+        symbol,
+        type_,
+        optional,
+        readonly,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)] // Keep the source host and limits with the selected proxy.
 fn resolve_instantiated_object_property_by_key_with_source(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -777,7 +869,13 @@ fn resolve_instantiated_object_property_by_key_with_source(
         .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
     let optional = record.flags().contains(SymbolFlags::OPTIONAL);
     let readonly = record.check_flags().contains(CheckFlags::READONLY);
-    let type_ = if record.flags().contains(SymbolFlags::METHOD) {
+    let source_class = store.type_payload(receiver).is_some_and(|record| {
+        matches!(record.data(), TypeData::TypeReference(reference)
+        if reference.object.target.is_some_and(|target| {
+            store.source_class_provenance(target).is_some()
+        }))
+    });
+    let type_ = if record.flags().contains(SymbolFlags::METHOD) || source_class {
         CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,

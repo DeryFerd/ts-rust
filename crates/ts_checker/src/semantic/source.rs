@@ -1,8 +1,8 @@
 //! Atomic canonical checking for the first source-statement slice.
 //!
 //! This module deliberately supports only unmodified type aliases and simple
-//! interfaces, top-level nongeneric classes with primitive annotated fields
-//! and at most one exact direct preceding local nongeneric base, exported
+//! interfaces, top-level classes checked under their declaration type parameters
+//! and at most one completed direct preceding local base, exported
 //! generic ambient declaration-file classes, empty exported classes,
 //! exact construction of preceding admitted classes, imported ambient classes,
 //! and declared constructors inside top-level values, assignments, property
@@ -73,6 +73,7 @@
 //! Static class elements retain their exact class and lexical `this` captures.
 //! Source class bodies use checked receiver tokens and binder flow. Inferred
 //! member types finish only after their expressions or bodies have been checked.
+//! Class formals belong to constructor signatures, not ordinary method signatures.
 //! Class bodies retain local truthiness branches and plain object destructuring.
 //! Deferred arrows keep lexical class receivers without constructor flow.
 //! Exported namespace classes retain lexical `this` in async static arrows.
@@ -122,12 +123,12 @@ use super::{
         ClassGrammarDiagnostic, ClassGrammarDiagnosticPlan, ClassHeritageMembersValidation,
         ClassMemberPlan, ClassMemberQueryPlan, ClassTypeQueryContext, ExportedJsxArrowClassPlan,
         PreparedSourceClass, SourceClassPlan, check_class_heritage_compatibility,
-        check_class_implementation_compatibility, complete_source_class_body,
-        execute_exported_jsx_arrow_class, execute_nongeneric_class_member_query,
-        finish_source_class_members, plan_anonymous_abstract_class_expression_grammar,
-        plan_class_grammar_diagnostics, plan_exported_jsx_arrow_class,
-        plan_exported_static_member_name_grammar_diagnostics, plan_nongeneric_class_member_query,
-        plan_nongeneric_class_member_query_with_type_context,
+        check_class_heritage_compatibility_with_session, check_class_implementation_compatibility,
+        complete_source_class_body, execute_exported_jsx_arrow_class,
+        execute_nongeneric_class_member_query, finish_source_class_members,
+        plan_anonymous_abstract_class_expression_grammar, plan_class_grammar_diagnostics,
+        plan_exported_jsx_arrow_class, plan_exported_static_member_name_grammar_diagnostics,
+        plan_nongeneric_class_member_query, plan_nongeneric_class_member_query_with_type_context,
         preflight_nongeneric_class_member_query, prepare_source_class_members_with_type_queries,
         validate_class_heritage_members,
     },
@@ -8844,6 +8845,85 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 _ => return Ok(false),
             }
         }
+    }
+
+    fn is_direct_class_method_constructor_return(
+        &self,
+        expression: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let Some(body) = &self.class_body else {
+            return Ok(false);
+        };
+        let Some((store, host)) = self.semantic else {
+            return Ok(false);
+        };
+        if !matches!(body.kind, ClassBodyKind::Method { .. }) {
+            return Ok(false);
+        }
+        let Some(class) = self.source_body_classes.get(&body.class_symbol) else {
+            return Ok(false);
+        };
+        if class.declaration() != body.class_declaration
+            || class.symbol() != body.class_symbol
+            || !class.bodies().contains(body)
+            || !super::classes::source_class_plan_is_current(store, host, class)
+                .map_err(|error| Self::class_plan_error(body.class_declaration, error))?
+        {
+            return Ok(false);
+        }
+        let Some(statement) = self
+            .node(expression)?
+            .parent
+            .map(|node| self.reference(node))
+        else {
+            return Ok(false);
+        };
+        let record = self.node(statement)?;
+        let NodeData::ReturnStatement(returned) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::ReturnStatement
+            || record.flags.0 != 0
+            || record.parent != Some(body.body.node)
+            || returned.expression != Some(expression.node)
+            || returned.flow_node.is_some()
+            || returned.facts != 0
+            || self.bound.container(expression) != Some(body.declaration)
+            || self.bound.container(statement) != Some(body.declaration)
+            || self.bound.flow_container(statement) != Some(body.declaration)
+            || self.bound.flow_at(statement).is_none()
+        {
+            return Ok(false);
+        }
+        let record = self.node(body.body)?;
+        let NodeData::Block(block) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::Block
+            || record.flags.0 != 0
+            || record.parent != Some(body.declaration.node)
+            || block.flow_node.is_some()
+            || block.next_container.is_some()
+            || block.facts != 0
+            || block.statements.has_trailing_comma
+            || block
+                .statements
+                .nodes
+                .iter()
+                .filter(|&&node| node == statement.node)
+                .count()
+                != 1
+        {
+            return Ok(false);
+        }
+        let record = self.node(body.declaration)?;
+        let NodeData::MethodDeclaration(method) = &record.data else {
+            return Ok(false);
+        };
+        Ok(record.kind == SyntaxKind::MethodDeclaration
+            && record.parent == Some(body.class_declaration.node)
+            && method.body == Some(body.body.node)
+            && method.type_parameters.is_none())
     }
 
     fn is_recovered_missing_arrow_body(
@@ -23620,7 +23700,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ))
             }
             SyntaxKind::NewExpression => {
-                if !self.is_top_level_constructor_expression(expression)? {
+                let method_return = self.is_direct_class_method_constructor_return(expression)?;
+                if !method_return && !self.is_top_level_constructor_expression(expression)? {
                     return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
                         expression,
                     )));
@@ -23650,6 +23731,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         self.class_type_context.as_ref(),
                     )
                     .map_err(|error| Self::new_plan_error(expression, error))?;
+                if method_return && !construction.is_generic_source_class() {
+                    return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+                        expression,
+                    )));
+                }
                 if let Some(binding) = self
                     .value_import_bindings
                     .get(&construction.resolved_symbol())
@@ -28090,6 +28176,12 @@ fn class_expression_nodes(
                 pending.push(&call.callee);
             }
             PlannedExpressionKind::SuperCall(call) => pending.extend(call.arguments().iter().rev()),
+            PlannedExpressionKind::New(construction) if construction.is_generic_source_class() => {
+                let arguments = construction
+                    .checked_expression_arguments()
+                    .ok_or(SourceCheckError::Call(construction.node()))?;
+                pending.extend(arguments.iter().rev());
+            }
             PlannedExpressionKind::Array(elements) => pending.extend(elements.iter().rev()),
             PlannedExpressionKind::Object { properties, .. } => {
                 pending.extend(
@@ -34254,16 +34346,50 @@ fn check_expression_type_with_capture_context(
         PlannedExpressionKind::New(construction) => {
             preflight_direct_default_new(store, host, construction)
                 .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+            let generic = construction.is_generic_source_class();
+            let access = if generic {
+                class_flow
+                    .as_ref()
+                    .map(|context| context.flow.access_token().clone())
+            } else {
+                None
+            };
+            if generic {
+                super::source_new::preflight_source_generic_class_new_with_context(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    construction,
+                    access.as_ref(),
+                )
+                .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+                super::source_calls::emit_source_new_type_argument_grammar_diagnostics(
+                    host,
+                    diagnostics,
+                    construction,
+                )?;
+                if contextual_type.is_some()
+                    && construction
+                        .written_type_argument_nodes()
+                        .is_none_or(<[NodeRef]>::is_empty)
+                {
+                    return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+                        construction.node(),
+                    )));
+                }
+            }
             if let Some(arguments) = construction.checked_expression_arguments() {
                 let mut argument_types = Vec::with_capacity(arguments.len());
                 for (index, argument) in arguments.iter().enumerate() {
-                    let contextual = if matches!(
-                        argument.unparenthesized().kind,
-                        PlannedExpressionKind::Array(_)
-                            | PlannedExpressionKind::Object { .. }
-                            | PlannedExpressionKind::Arrow(_)
-                            | PlannedExpressionKind::Template(_)
-                    ) {
+                    let contextual = if !generic
+                        && matches!(
+                            argument.unparenthesized().kind,
+                            PlannedExpressionKind::Array(_)
+                                | PlannedExpressionKind::Object { .. }
+                                | PlannedExpressionKind::Arrow(_)
+                                | PlannedExpressionKind::Template(_)
+                        ) {
                         super::source_new::source_class_constructor_argument_contextual_type(
                             store,
                             host,
@@ -34296,6 +34422,99 @@ fn check_expression_type_with_capture_context(
                         )?
                         .result,
                     );
+                }
+                if generic {
+                    let explicit_type_arguments =
+                        super::source_calls::resolve_explicit_source_type_arguments(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            diagnostics,
+                            construction.written_type_argument_nodes(),
+                        )?;
+                    let prepared = super::source_new::check_source_generic_class_new(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        construction,
+                        access.as_ref(),
+                        &argument_types,
+                        explicit_type_arguments.as_deref(),
+                    )
+                    .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+                    let mut staged = CanonicalCheckerDiagnostics::default();
+                    let call_diagnostics =
+                        match (prepared.resolution(), prepared.access_diagnostic()) {
+                            (Some(resolution), None) => {
+                                super::source_calls::prepare_source_generic_constructor_diagnostics(
+                                    store,
+                                    host,
+                                    global_types,
+                                    options,
+                                    session,
+                                    &mut staged,
+                                    construction,
+                                    &argument_types,
+                                    explicit_type_arguments.as_deref(),
+                                    resolution,
+                                )?
+                            }
+                            (None, Some((code, declaring_type))) => {
+                                let message = message_by_code(code)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(code))?;
+                                let diagnostic = match code {
+                                    2511 => Diagnostic::new(message),
+                                    2673 | 2674 => {
+                                        let mut flags =
+                                            CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+                                        if options.no_error_truncation {
+                                            flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+                                        }
+                                        let name = type_to_string_with_host_global_types_and_flags(
+                                            store,
+                                            host,
+                                            global_types,
+                                            declaring_type,
+                                            flags,
+                                        )?;
+                                        Diagnostic::with_arguments(message, [name])
+                                    }
+                                    _ => return Err(SourceCheckError::Call(construction.node())),
+                                };
+                                vec![CanonicalCheckerDiagnostic {
+                                    node: Some(construction.node()),
+                                    range_override: None,
+                                    diagnostic,
+                                    related_information: Vec::new(),
+                                }]
+                            }
+                            _ => return Err(SourceCheckError::Call(construction.node())),
+                        };
+                    let checked = super::source_new::publish_source_generic_class_new(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        construction,
+                        access.as_ref(),
+                        &argument_types,
+                        explicit_type_arguments.as_deref(),
+                        prepared,
+                    )
+                    .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+                    merge_retry_diagnostics(diagnostics, staged);
+                    for diagnostic in call_diagnostics {
+                        merge_retry_diagnostic(diagnostics, diagnostic);
+                    }
+                    return Ok(CheckedExpressionTypes::leaf(
+                        checked.instance_type,
+                        checked.instance_type,
+                    ));
                 }
                 let (checked, resolution) = super::source_new::check_source_class_expression_new(
                     store,
@@ -34438,6 +34657,7 @@ fn check_expression_type_with_capture_context(
                     call,
                     index,
                     &access,
+                    session,
                 )?;
                 arguments.push(
                     check_expression_type_with_capture_context(
@@ -35402,6 +35622,17 @@ fn check_planned_source_class(
         super::classes::begin_source_class_annotations(store, host, global_types, &class.source)
             .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
     let result = (|| {
+        if !class.source.type_parameters().is_empty() {
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .resolve_source_class_type_parameters(class.source.symbol())?;
+        }
         for &annotation in class.source.annotation_nodes() {
             session.reset_query();
             let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
@@ -35527,12 +35758,13 @@ fn check_planned_source_class(
                 return Err(SourceCheckError::Class(implementation));
             }
         }
-        check_class_heritage_compatibility(
+        check_class_heritage_compatibility_with_session(
             store,
             host,
             global_types,
             options,
             diagnostics,
+            session,
             declaration,
             &members,
         )?;
@@ -36703,6 +36935,7 @@ fn check_class_statements(
                         property,
                         receiver.result,
                         &mut context.flow,
+                        session,
                     )
                     .map_err(|error| {
                         SourcePlanner::property_plan_error(property.property(), error)
@@ -36787,6 +37020,7 @@ fn check_class_statements(
                         property,
                         receiver.result,
                         &mut context.flow,
+                        session,
                     )
                     .map_err(|error| {
                         SourcePlanner::property_plan_error(property.property(), error)
@@ -124207,6 +124441,395 @@ class Foo2 {
             }
             let warm = observable_state(&context, file);
             context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn generic_class_bodies_keep_origin_formals_and_signature_roles() {
+        let source = parsed(concat!(
+            "class Box<T> { value: T; ",
+            "constructor(value: T) { this.value = value; } ",
+            "read(): T { return this.value; } ",
+            "replace(value: T): T { const next: T = value; ",
+            "this.value = next; return this.read(); } }",
+        ));
+        let file = FileId::new(202_1801);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                strict_property_initialization: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let class_symbol = global_symbol(&context, "Box");
+        let declaration = context
+            .store()
+            .symbol(class_symbol)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let NodeData::ClassDeclaration(class) = &source.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("Box must retain its real class declaration")
+        };
+        let [parameter] = class.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+            panic!("Box has one written type parameter")
+        };
+        let parameter = NodeRef::new(source.arena.id(), file, *parameter);
+        let parameter_symbol = context.file(file).unwrap().1.symbol(parameter).unwrap();
+        let formal = context
+            .store()
+            .declared_type_links(parameter_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let instance = context
+            .store()
+            .declared_type_links(class_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Interface(origin) = context.store().type_payload(instance).unwrap().data()
+        else {
+            panic!("the source body must retain the class origin")
+        };
+        assert_eq!(
+            origin.reference.resolved_type_arguments.as_deref(),
+            Some([formal].as_slice())
+        );
+        assert_ne!(origin.this_type, Some(formal));
+        let field = declared_object_property_symbol(&context, instance, "value");
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(field)
+                .unwrap()
+                .resolved_type,
+            Some(formal)
+        );
+        for member in &class.members.nodes {
+            let declaration = NodeRef::new(source.arena.id(), file, *member);
+            let record = source.arena.get(*member).unwrap();
+            if !matches!(
+                record.kind,
+                SyntaxKind::Constructor | SyntaxKind::MethodDeclaration
+            ) {
+                continue;
+            }
+            let signature = context
+                .store()
+                .signature_links(declaration)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            let signature = context.store().signature(signature).unwrap();
+            if record.kind == SyntaxKind::Constructor {
+                assert_eq!(signature.type_parameters(), [formal]);
+                assert_eq!(signature.resolved_return_type(), Some(instance));
+            } else {
+                assert!(signature.type_parameters().is_empty());
+                assert_eq!(signature.resolved_return_type(), Some(formal));
+            }
+            for &parameter in signature.parameters() {
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(parameter)
+                        .unwrap()
+                        .resolved_type,
+                    Some(formal)
+                );
+            }
+        }
+        assert_eq!(variable_value_type(&context, &source, file, "next"), formal);
+        let call = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(resolved_node_type(&context, call), formal);
+        let warm = observable_state(&context, file);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+            assert_eq!(resolved_node_type(&context, call), formal);
+        }
+    }
+
+    #[test]
+    fn generic_new_keeps_contextual_inference_out_of_the_concrete_argument_route() {
+        for (construction, explicit, grammar_error) in [
+            ("new Box<number>()", true, false),
+            ("new Box()", false, false),
+            ("new Box<>()", false, true),
+        ] {
+            let source = parsed(&format!(
+                "class Box<T = string> {{}} const model: Box<number> = {construction};"
+            ));
+            let file = FileId::new(203_1802);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let node = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let NodeData::NewExpression(expression) = &source.arena.get(node.node).unwrap().data
+            else {
+                panic!("the fixture must retain its real New expression")
+            };
+            let constructor = NodeRef::new(source.arena.id(), file, expression.expression);
+            let checked = context.check_source_file(file);
+            if explicit {
+                checked.unwrap();
+                assert!(context.diagnostics().is_empty());
+                let instance = resolved_node_type(&context, node);
+                let reference = super::super::reference_types::validate_direct_generic_reference(
+                    context.store(),
+                    instance,
+                )
+                .unwrap();
+                assert_eq!(
+                    reference.type_arguments,
+                    [context.store().intrinsic_bootstrap().unwrap().number_type]
+                );
+                let owner = global_symbol(&context, "Box");
+                assert_eq!(
+                    context
+                        .store()
+                        .declared_type_links(owner)
+                        .unwrap()
+                        .declared_type,
+                    Some(reference.target),
+                );
+                let warm = observable_state(&context, file);
+                for _ in 0..2 {
+                    context.recheck_source_file(file).unwrap();
+                    assert_eq!(observable_state(&context, file), warm);
+                }
+            } else {
+                let expected = SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(node));
+                assert_eq!(checked, Err(expected));
+                assert!(!is_type_checked(&context, file));
+                assert!(
+                    context
+                        .store()
+                        .type_node_links(node)
+                        .and_then(|links| links.resolved_type)
+                        .is_none()
+                );
+                assert!(
+                    context
+                        .store()
+                        .signature_links(node)
+                        .and_then(|links| links.resolved_signature.signature())
+                        .is_none()
+                );
+                assert!(
+                    context
+                        .store()
+                        .symbol_node_links(constructor)
+                        .and_then(|links| links.resolved_symbol)
+                        .is_none()
+                );
+                assert!(
+                    context
+                        .store()
+                        .type_node_links(constructor)
+                        .and_then(|links| links.resolved_type)
+                        .is_none()
+                );
+                assert_eq!(
+                    context
+                        .diagnostics()
+                        .as_slice()
+                        .iter()
+                        .map(|diagnostic| diagnostic.diagnostic.code())
+                        .collect::<Vec<_>>(),
+                    if grammar_error {
+                        vec![1099]
+                    } else {
+                        Vec::new()
+                    },
+                );
+                let warm = observable_state(&context, file);
+                for _ in 0..2 {
+                    assert_eq!(context.check_source_file(file), Err(expected));
+                    assert_eq!(observable_state(&context, file), warm);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generic_new_method_return_requires_the_saved_class_body() {
+        let source = parsed(concat!(
+            "class Base<T> { protected constructor(value: T) {} } ",
+            "class Child extends Base<string> { constructor() { super('seed'); } ",
+            "make(): Base<number> { return new Base<number>(1); } }",
+        ));
+        let file = FileId::new(203_1803);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let node = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let instance = resolved_node_type(&context, node);
+        let reference = super::super::reference_types::validate_direct_generic_reference(
+            context.store(),
+            instance,
+        )
+        .unwrap();
+        assert_eq!(
+            reference.type_arguments,
+            [context.store().intrinsic_bootstrap().unwrap().number_type]
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_payload(reference.target)
+                .unwrap()
+                .symbol(),
+            Some(global_symbol(&context, "Base")),
+        );
+        let warm = observable_state(&context, file);
+        {
+            let bound = context.file(file).unwrap().1;
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let make_planner = || {
+                SourcePlanner::new_semantic_with_global_types(
+                    &source.arena,
+                    bound,
+                    context.source_file(file).unwrap(),
+                    context.store(),
+                    &host,
+                    context.global_types(),
+                    context.options(),
+                )
+            };
+            let plan = make_planner().finish().unwrap();
+            let [
+                PlannedStatement::SourceClass(base),
+                PlannedStatement::SourceClass(child),
+            ] = plan.statements.as_slice()
+            else {
+                panic!("the fixture must retain both actual class plans")
+            };
+            let (index, body) = child
+                .source
+                .bodies()
+                .iter()
+                .enumerate()
+                .find(|(_, body)| matches!(body.kind, ClassBodyKind::Method { .. }))
+                .unwrap();
+            let [
+                PlannedClassStatement::Return {
+                    expression: Some(expression),
+                    ..
+                },
+            ] = child.bodies[index].statements.as_slice()
+            else {
+                panic!("the method must retain its actual return expression")
+            };
+            assert_eq!(expression.node, node);
+            let nodes = class_expression_nodes(expression).unwrap();
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(nodes[0].node, node);
+            assert_eq!(node_text(&source, nodes[1].node), "1");
+            let PlannedExpressionKind::New(construction) = &expression.kind else {
+                panic!("the return must retain a real New plan")
+            };
+            assert!(construction.is_generic_source_class());
+            assert!(
+                super::super::source_new::preflight_source_generic_class_new_with_context(
+                    context.store(),
+                    &host,
+                    context.global_types(),
+                    context.options(),
+                    construction,
+                    None,
+                )
+                .is_err()
+            );
+            let mut planner = make_planner();
+            planner
+                .source_body_classes
+                .insert(base.source.symbol(), base.source.clone());
+            planner
+                .source_body_classes
+                .insert(child.source.symbol(), child.source.clone());
+            planner.class_body = Some(body.clone());
+            assert!(
+                planner
+                    .is_direct_class_method_constructor_return(node)
+                    .unwrap()
+            );
+            planner.class_body.as_mut().unwrap().declaration = body.class_declaration;
+            assert!(
+                !planner
+                    .is_direct_class_method_constructor_return(node)
+                    .unwrap()
+            );
+            planner.class_body = Some(body.clone());
+            planner.source_body_classes.remove(&child.source.symbol());
+            assert!(
+                !planner
+                    .is_direct_class_method_constructor_return(node)
+                    .unwrap()
+            );
+            planner
+                .source_body_classes
+                .insert(child.source.symbol(), child.source.clone());
+            assert!(
+                planner
+                    .is_direct_class_method_constructor_return(node)
+                    .unwrap()
+            );
+            planner.class_body = None;
+            assert!(
+                !planner
+                    .is_direct_class_method_constructor_return(node)
+                    .unwrap()
+            );
+        }
+        assert_eq!(observable_state(&context, file), warm);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(resolved_node_type(&context, node), instance);
             assert_eq!(observable_state(&context, file), warm);
         }
     }
