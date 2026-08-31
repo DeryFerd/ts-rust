@@ -30,6 +30,7 @@ use super::{
     bootstrap::LiteralTypeCacheError,
     callable_sets::{
         CallableSetProjection, StoredCallableSetValidation, validate_stored_callable_set,
+        validate_stored_callable_set_with_array_targets,
     },
     callables::{
         CallableFamily, SingleCallableDisplayError, StoredSingleCallableValidation,
@@ -1323,7 +1324,12 @@ fn display_object_type(
     }
 
     if let Some(host) = host
-        && let Some(projection) = validated_declared_method_display(store, type_id, record)?
+        && let Some(projection) = validated_declared_method_display(
+            store,
+            type_id,
+            record,
+            global_types.map(CanonicalArrayTargets::from_global_types),
+        )?
     {
         return display_declared_method_signatures(
             store,
@@ -1943,6 +1949,7 @@ fn validated_declared_method_display(
     store: &CanonicalTypeMapperStore,
     type_id: TypeId,
     record: &TypeRecord,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<CallableSetProjection>, TypeDisplayUnavailable> {
     let Some(method) = record.symbol().and_then(|symbol| store.symbol(symbol)) else {
         return Ok(None);
@@ -1977,12 +1984,41 @@ fn validated_declared_method_display(
     {
         return Ok(None);
     }
-    match validate_stored_callable_set(store, type_id) {
-        StoredCallableSetValidation::Valid { projection, .. }
-            if projection.owner == type_id
-                && !projection.call_signatures.is_empty()
-                && projection.construct_signatures.is_empty() =>
+    let generic_class_method = completed_class_method
+        && method.declarations().is_some_and(|declarations| {
+            declarations.iter().any(|&declaration| {
+                store
+                    .source_direct_children(declaration)
+                    .is_some_and(|children| {
+                        children.into_iter().any(|child| {
+                            store.source_node_kind(child) == Some(SyntaxKind::TypeParameter)
+                        })
+                    })
+            })
+        });
+    let validation = if generic_class_method {
+        validate_stored_callable_set_with_array_targets(store, type_id, array_targets)
+    } else {
+        validate_stored_callable_set(store, type_id)
+    };
+    match validation {
+        StoredCallableSetValidation::Valid {
+            projection, edges, ..
+        } if projection.owner == type_id
+            && !projection.call_signatures.is_empty()
+            && projection.construct_signatures.is_empty() =>
         {
+            if generic_class_method {
+                for edge in edges {
+                    store
+                        .validate_cached_array_capability_with_pending_functions(
+                            array_targets,
+                            edge,
+                            &[],
+                        )
+                        .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+                }
+            }
             Ok(Some(projection))
         }
         _ => Err(TypeDisplayUnavailable::MalformedType(type_id)),
@@ -2030,10 +2066,17 @@ fn display_declared_method_signatures(
             let parameters = match host.node(declaration).map(|node| &node.data) {
                 Some(NodeData::MethodSignatureDeclaration(method)) => &method.parameters.nodes,
                 Some(NodeData::MethodDeclaration(method))
-                    if method.type_parameters.is_none()
-                        && signature.type_parameters().is_empty()
-                        && signature.target().is_none()
-                        && signature.mapper().is_none() =>
+                    if signature.target().is_none()
+                        && signature.mapper().is_none()
+                        && (method.type_parameters.is_none()
+                            && signature.type_parameters().is_empty()
+                            || method.type_parameters.is_some()
+                                && super::classes::source_class_generic_method_callee(
+                                    store,
+                                    callable.signature,
+                                    global_types.map(CanonicalArrayTargets::from_global_types),
+                                )
+                                .is_ok_and(|callee| callee == Some(type_id))) =>
                 {
                     &method.parameters.nodes
                 }
@@ -2133,6 +2176,21 @@ fn append_declared_method_type_parameters(
             .as_ref()
             .map_or(&[][..], |parameters| parameters.nodes.as_slice()),
         Some(NodeData::MethodDeclaration(method)) if method.type_parameters.is_none() => &[],
+        Some(NodeData::MethodDeclaration(method))
+            if signature_record.target().is_none()
+                && signature_record.mapper().is_none()
+                && super::classes::source_class_generic_method_callee(
+                    store,
+                    signature,
+                    global_types.map(CanonicalArrayTargets::from_global_types),
+                )
+                .is_ok_and(|callee| callee == Some(owner)) =>
+        {
+            method
+                .type_parameters
+                .as_ref()
+                .map_or(&[][..], |parameters| parameters.nodes.as_slice())
+        }
         _ => return Err(TypeDisplayUnavailable::MalformedType(owner)),
     };
     let original = signature_record
@@ -5370,7 +5428,11 @@ fn display_array_type(
             .flags()
             .intersects(TypeFlags::UNION_OR_INTERSECTION)
             && element_record.alias().is_none();
-        let function_parentheses = is_unaliased_single_callable_type(store, element_type);
+        let function_parentheses = is_unaliased_single_callable_type_with_array_targets(
+            store,
+            element_type,
+            Some(CanonicalArrayTargets::from_global_types(global_types)),
+        );
         let type_query_parentheses = element_record.alias().is_none()
             && matches!(element_record.data(), TypeData::Object(_))
             && element_record
@@ -7185,9 +7247,14 @@ fn validated_property(
                 let method = store
                     .type_payload(property_type)
                     .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-                let projection = validated_declared_method_display(store, property_type, method)?
-                    .filter(|projection| projection.call_signatures.len() == 1)
-                    .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                let projection = validated_declared_method_display(
+                    store,
+                    property_type,
+                    method,
+                    global_types.map(CanonicalArrayTargets::from_global_types),
+                )?
+                .filter(|projection| projection.call_signatures.len() == 1)
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
                 return Ok(StructuralPropertyDisplay::Method {
                     name: display_name,
                     projection,
@@ -8041,14 +8108,29 @@ fn display_union_constituent(
 ) -> Result<String, TypeDisplayUnavailable> {
     let displayed =
         display_type_worker(store, host, global_types, type_id, flags, state, visiting)?;
-    Ok(if is_unaliased_single_callable_type(store, type_id) {
-        format!("({displayed})")
-    } else {
-        displayed
-    })
+    Ok(
+        if is_unaliased_single_callable_type_with_array_targets(
+            store,
+            type_id,
+            global_types.map(CanonicalArrayTargets::from_global_types),
+        ) {
+            format!("({displayed})")
+        } else {
+            displayed
+        },
+    )
 }
 
+#[cfg(test)]
 fn is_unaliased_single_callable_type(store: &CanonicalTypeMapperStore, type_id: TypeId) -> bool {
+    is_unaliased_single_callable_type_with_array_targets(store, type_id, None)
+}
+
+fn is_unaliased_single_callable_type_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> bool {
     let Some(record) = store
         .type_payload(type_id)
         .filter(|record| record.alias().is_none())
@@ -8056,9 +8138,9 @@ fn is_unaliased_single_callable_type(store: &CanonicalTypeMapperStore, type_id: 
         return false;
     };
     single_callable_family(store, type_id).is_some()
-        || validated_declared_method_display(store, type_id, record).is_ok_and(|projection| {
-            projection.is_some_and(|projection| projection.call_signatures.len() == 1)
-        })
+        || validated_declared_method_display(store, type_id, record, array_targets).is_ok_and(
+            |projection| projection.is_some_and(|projection| projection.call_signatures.len() == 1),
+        )
         || matches!(record.data(), TypeData::Object(_))
             && record.data().structured().is_some_and(|structured| {
                 structured.call_signature_count == 0
@@ -17081,6 +17163,156 @@ mod tests {
                 Err(TypeDisplayUnavailable::MalformedType(callable)),
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the real generic method, Array context, and restored display together.
+    fn generic_class_method_display_keeps_formals_array_authority_and_replay() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "class Model { read<T extends number>(value: T[],): T[] { return value; } }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(148_319);
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let callable = context
+            .store()
+            .value_symbol_links(symbol)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let signature = context
+            .store()
+            .signature_links(declaration)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        let record = context.store().signature(signature).unwrap();
+        let formals = record.type_parameters().to_vec();
+        let [formal] = formals.as_slice() else {
+            panic!("the method keeps its one real formal")
+        };
+        let [parameter] = record.parameters() else {
+            panic!("the method keeps its one required parameter")
+        };
+        let returned = record.resolved_return_type().unwrap();
+        assert_eq!(record.target(), None);
+        assert_eq!(record.mapper(), None);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(*parameter)
+                .unwrap()
+                .resolved_type,
+            Some(returned)
+        );
+        let TypeData::TypeReference(array) = context.store().type_payload(returned).unwrap().data()
+        else {
+            panic!("the source return keeps its real Array reference")
+        };
+        assert_eq!(array.object.target, Some(context.global_types().array_type));
+        assert_eq!(
+            array.resolved_type_arguments.as_deref(),
+            Some(&[*formal][..])
+        );
+        let expected = "<T extends number>(value: T[]) => T[]";
+        assert_source_class_display_without_writes(
+            &mut context,
+            callable,
+            declaration,
+            Ok(expected),
+        );
+        for erase_formals in [false, true] {
+            if erase_formals {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_type_parameters(signature, Vec::new(),)
+                );
+            } else {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_target_and_mapper(signature, Some(signature), None,)
+                );
+            }
+            assert_source_class_display_without_writes(
+                &mut context,
+                callable,
+                declaration,
+                Err(TypeDisplayUnavailable::MalformedType(callable)),
+            );
+            if erase_formals {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_type_parameters(signature, formals.clone(),)
+                );
+            } else {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_target_and_mapper(signature, None, None,)
+                );
+            }
+            assert_source_class_display_without_writes(
+                &mut context,
+                callable,
+                declaration,
+                Ok(expected),
+            );
+        }
+        let globals = context.global_types().clone();
+        let mut swapped = globals.clone();
+        swapped.array_type = globals.readonly_array_type;
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, context.file(file).unwrap().1)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let flags = CanonicalTypeFormatFlags::NO_TRUNCATION;
+        let before = format!("{:?}", context.store());
+        let mut state = DisplayState {
+            format_flags: flags,
+            ..DisplayState::default()
+        };
+        let mut visiting = HashSet::new();
+        for _ in 0..2 {
+            for authority in [None, Some(&swapped), Some(&globals)] {
+                let result = display_union_constituent(
+                    context.store(),
+                    Some(&host),
+                    authority,
+                    callable,
+                    flags,
+                    &mut state,
+                    &mut visiting,
+                );
+                if authority == Some(&globals) {
+                    assert_eq!(result, Ok(format!("({expected})")));
+                } else {
+                    assert_eq!(result, Err(TypeDisplayUnavailable::MalformedType(callable)));
+                }
+                assert!(state.method_type_parameters.is_empty());
+                assert!(visiting.is_empty());
+                assert_eq!(format!("{:?}", context.store()), before);
+            }
+        }
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

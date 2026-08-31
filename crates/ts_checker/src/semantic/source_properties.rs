@@ -3016,6 +3016,32 @@ fn resolve_direct_source_own_property(
             EscapedNameRef::source(name),
             session,
         )
+    } else if store.type_payload(receiver).is_some_and(|record| {
+        matches!(record.data(), TypeData::Interface(_))
+            && record.object_flags().contains(ObjectFlags::CLASS)
+    }) && store.source_class_provenance(receiver).is_some()
+    {
+        let property = super::object_members::resolve_object_property_by_key(
+            store,
+            global_types,
+            receiver,
+            EscapedNameRef::source(name),
+            session,
+        )?;
+        if property.is_none()
+            && store
+                .type_payload(receiver)
+                .and_then(|record| record.data().structured())
+                .is_some_and(|structured| {
+                    structured
+                        .signatures
+                        .as_ref()
+                        .is_some_and(|signatures| !signatures.is_empty())
+                })
+        {
+            return Err(RelationUnavailable::StructuredSignatures(receiver).into());
+        }
+        Ok(property)
     } else {
         store.resolved_own_property(receiver, name)
     }
@@ -4305,8 +4331,12 @@ fn class_property_accessibility(
         .and_then(|links| links.resolved_type)
         == Some(receiver_type);
     if !static_side && receiver_type != receiver_class {
-        if super::instantiated_members::class_reference_field_target(store, receiver_type)
-            .map_err(|_| invalid())?
+        if super::instantiated_members::class_reference_field_target(
+            store,
+            receiver_type,
+            global_types.map(CanonicalArrayTargets::from_global_types),
+        )
+        .map_err(|_| invalid())?
             != Some(receiver_class)
         {
             return Err(invalid());

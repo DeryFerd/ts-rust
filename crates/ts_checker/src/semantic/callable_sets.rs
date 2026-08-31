@@ -32,9 +32,9 @@ use super::{
     links::ValueSymbolLinks,
     mapper::TypeMapperApplication,
     object_members::{
-        StoredDeclaredCallSetValidation, declared_method_type_parameter_view,
-        declared_method_value_links, declared_method_value_types,
-        validate_stored_declared_call_set,
+        StoredDeclaredCallSetValidation, declared_class_method_type_parameter_view,
+        declared_method_type_parameter_view, declared_method_value_links,
+        declared_method_value_types, validate_stored_declared_call_set,
     },
     reference_types::validate_direct_generic_reference,
     signatures::SignatureFlags,
@@ -263,7 +263,8 @@ pub(super) fn validate_stored_callable_set_with_array_targets(
         return validation;
     }
 
-    if let Some(validation) = validate_stored_class_method_callable_set(store, type_) {
+    if let Some(validation) = validate_stored_class_method_callable_set(store, type_, array_targets)
+    {
         return validation;
     }
 
@@ -346,7 +347,8 @@ fn validate_stored_recovered_method_callable_set(
         if recovery.result_type() != type_ {
             return None;
         }
-        let class_method = completed_source_class_method_callable(store, recovery.source_type());
+        let class_method =
+            completed_source_class_method_callable(store, recovery.source_type(), array_targets);
         let (source, mut edges) = if let Some((_, projection, edges)) = &class_method {
             for &edge in edges {
                 store
@@ -1191,7 +1193,8 @@ fn validate_stored_instantiated_class_method_callable_set(
     }
     let family = CallableFamily::DeclaredCallSignatures;
     let authenticated = (|| {
-        let (_, original, mut edges) = completed_source_class_method_callable(store, source)?;
+        let (_, original, mut edges) =
+            completed_source_class_method_callable(store, source, array_targets)?;
         super::instantiated_members::completed_source_class_method_receiver(
             store,
             source,
@@ -1786,7 +1789,7 @@ fn validated_instantiated_method_parameter_types_with_targets(
         .callable_signature_parameter_types(original.signature)
         .is_none()
     {
-        completed_source_class_method_signature_type(store, original.signature)?;
+        completed_source_class_method_signature_type(store, original.signature, array_targets)?;
         Some(validated_method_signature_parameter_types(
             store,
             original.signature,
@@ -2560,10 +2563,11 @@ pub(super) fn validated_method_annotation_type(
     Some(resolved)
 }
 
-/// A copied class method must keep a completed source owner and its hidden implementation.
+/// Only ordinary methods supply completed source signatures for receiver copies.
 pub(super) fn completed_source_class_method_callable(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<(TypeId, CallableSetProjection, Vec<TypeId>)> {
     let record = store.type_payload(type_)?;
     let TypeData::Object(object) = record.data() else {
@@ -2591,12 +2595,24 @@ pub(super) fn completed_source_class_method_callable(
         projection,
         mut edges,
         ..
-    } = validate_stored_class_method_callable_set(store, type_)?
+    } = validate_stored_class_method_callable_set(store, type_, array_targets)?
     else {
         return None;
     };
+    if projection.call_signatures.iter().any(|callable| {
+        store
+            .signature(callable.signature)
+            .is_none_or(|signature| !signature.type_parameters().is_empty())
+    }) {
+        return None;
+    }
     if let Some(overloads) = super::classes::source_class_method_overloads(store, type_).ok()? {
-        if projection.call_signatures.as_ref() != overloads.signatures.as_slice() {
+        if projection.call_signatures.as_ref() != overloads.signatures.as_slice()
+            || !store
+                .signature(overloads.implementation.signature)?
+                .type_parameters()
+                .is_empty()
+        {
             return None;
         }
         edges.extend(overloads.implementation.parameters);
@@ -2610,6 +2626,7 @@ pub(super) fn completed_source_class_method_callable(
 pub(super) fn completed_source_class_method_signature_type(
     store: &CanonicalTypeMapperStore,
     signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<TypeId> {
     let declaration = store.signature(signature)?.declaration()?;
     if store.source_node_kind(declaration) != Some(SyntaxKind::MethodDeclaration) {
@@ -2619,7 +2636,7 @@ pub(super) fn completed_source_class_method_signature_type(
         .source_declaration_symbol(declaration)
         .and_then(|symbol| store.get_merged_symbol(symbol))?;
     let value = store.value_symbol_links(method)?.resolved_type?;
-    let (_, projection, _) = completed_source_class_method_callable(store, value)?;
+    let (_, projection, _) = completed_source_class_method_callable(store, value, array_targets)?;
     projection
         .call_signatures
         .iter()
@@ -2630,6 +2647,7 @@ pub(super) fn completed_source_class_method_signature_type(
 fn validate_stored_class_method_callable_set(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<StoredCallableSetValidation> {
     let method_symbol = store.type_payload(type_)?.symbol()?;
     let method = store.symbol(method_symbol)?;
@@ -2717,7 +2735,8 @@ fn validate_stored_class_method_callable_set(
         for (callable, declaration) in projection.call_signatures.iter().zip(visible) {
             let signature = callable.signature;
             let return_type = callable.return_type?;
-            if store.signature(signature)?.declaration() != Some(*declaration)
+            let record = store.signature(signature)?;
+            if record.declaration() != Some(*declaration)
                 || store.signature_links(*declaration)
                     != Some(&SignatureLinks {
                         resolved_signature: ResolvedSignatureState::Resolved(signature),
@@ -2725,6 +2744,29 @@ fn validate_stored_class_method_callable_set(
                     })
             {
                 return None;
+            }
+            let source_has_type_parameters = store
+                .source_direct_children(*declaration)?
+                .into_iter()
+                .any(|child| store.source_node_kind(child) == Some(SyntaxKind::TypeParameter));
+            if source_has_type_parameters || !record.type_parameters().is_empty() {
+                if super::classes::source_class_generic_method_callee(
+                    store,
+                    signature,
+                    array_targets,
+                )
+                .ok()?
+                    != Some(type_)
+                {
+                    return None;
+                }
+                let parameters =
+                    declared_class_method_type_parameter_view(store, record, *declaration)?;
+                for parameter in parameters {
+                    edges.push(parameter.type_parameter);
+                    edges.extend(parameter.constraint);
+                    edges.extend(parameter.default_type);
+                }
             }
             edges.extend(&callable.parameters);
             edges.extend(callable.rest_parameter);
