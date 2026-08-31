@@ -1552,6 +1552,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     ///
     /// This admits top-level nongeneric TypeScript declarations and named class expressions
     /// in top-level variable initializers. Heritage remains a separate query.
+    /// Empty nongeneric classes in unmerged ambient namespaces also retain
+    /// their exact source-owned instance and value shells.
     /// It does not mark a source checked or admit it to the class writers.
     ///
     /// # Errors
@@ -2514,13 +2516,13 @@ struct GlobalInitialization {
 }
 
 #[allow(clippy::too_many_lines)] // Preserves pinned initializeChecker phase order visibly.
-fn initialize_globals<'source, 'arena, 'manifest>(
+fn initialize_globals<'source, 'arena>(
     store: &mut CanonicalTypeMapperStore,
     file_order: &[FileId],
     files: &'source ProductionAliasSourceRegistry<'arena>,
     strict_bind_call_apply: bool,
     name_resolution_options: CanonicalNameResolverOptions,
-    aliases: &mut ProductionAliasTargetHost<'source, 'arena, 'manifest>,
+    aliases: &mut ProductionAliasTargetHost<'source, 'arena, '_>,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<GlobalInitialization, CanonicalGlobalInitializationError> {
     let (globals, undefined_symbol) = store

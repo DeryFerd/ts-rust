@@ -30,7 +30,7 @@ use super::{
     bootstrap::LiteralTypeCacheError,
     callable_sets::{
         CallableSetProjection, StoredCallableSetValidation, validate_stored_callable_set,
-        validate_stored_callable_set_with_array_targets,
+        validate_stored_callable_set_with_array_targets, validated_method_annotation_type,
     },
     callables::{
         CallableFamily, SingleCallableDisplayError, StoredSingleCallableValidation,
@@ -2106,13 +2106,21 @@ fn display_declared_method_signatures(
                 .copied()
                 .chain(callable.rest_parameter)
                 .collect::<Vec<_>>();
+            let display_parameters = declared_method_parameter_display_types(
+                store,
+                host,
+                type_id,
+                callable.signature,
+                &parameter_types,
+                state,
+            )?;
             append_validated_signature_parameters(
                 store,
                 host,
                 global_types,
                 type_id,
                 callable.signature,
-                &parameter_types,
+                display_parameters.as_deref().unwrap_or(&parameter_types),
                 flags,
                 state,
                 visiting,
@@ -2150,6 +2158,201 @@ fn display_declared_method_signatures(
     state.method_type_parameters.truncate(scope_length);
     visiting.remove(&type_id);
     result
+}
+
+/// Reuse a proved optional keyword annotation without changing its value type.
+#[allow(clippy::too_many_lines)] // Keep the source slot and optional-wrapper proof together.
+fn declared_method_parameter_display_types(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: TypeId,
+    signature: SignatureId,
+    parameter_types: &[TypeId],
+    state: &DisplayState,
+) -> Result<Option<Vec<TypeId>>, TypeDisplayUnavailable> {
+    let invalid = || TypeDisplayUnavailable::MalformedType(owner);
+    if state.location.is_none() {
+        return Ok(None);
+    }
+    let signature_record = store.signature(signature).ok_or_else(invalid)?;
+    if signature_record.target().is_some()
+        || signature_record.mapper().is_some()
+        || !signature_record.type_parameters().is_empty()
+    {
+        return Ok(None);
+    }
+    let method = signature_record.declaration().ok_or_else(invalid)?;
+    let method_node = host.node(method).ok_or_else(invalid)?;
+    let source_parameters = match &method_node.data {
+        NodeData::MethodSignatureDeclaration(data) if data.type_parameters.is_none() => {
+            &data.parameters
+        }
+        NodeData::MethodDeclaration(data) if data.type_parameters.is_none() => &data.parameters,
+        NodeData::MethodSignatureDeclaration(_) | NodeData::MethodDeclaration(_) => {
+            return Ok(None);
+        }
+        _ => return Err(invalid()),
+    };
+    if source_parameters.nodes.len() != signature_record.parameters().len()
+        || parameter_types.len() != signature_record.parameters().len()
+    {
+        return Err(invalid());
+    }
+    // These signatures keep their existing display path, including other parameters.
+    for parameter in &source_parameters.nodes {
+        let declaration = NodeRef::new(method.arena, method.file, *parameter);
+        let Some(NodeData::ParameterDeclaration(data)) =
+            host.node(declaration).map(|node| &node.data)
+        else {
+            return Err(invalid());
+        };
+        if data.initializer.is_some()
+            || data.dot_dot_dot_token.is_some()
+            || data.modifiers.is_some()
+        {
+            return Ok(None);
+        }
+    }
+
+    let mut display_parameters = None;
+    for (index, (parameter, value_type)) in signature_record
+        .parameters()
+        .iter()
+        .zip(parameter_types)
+        .enumerate()
+    {
+        let declaration = NodeRef::new(
+            method.arena,
+            method.file,
+            *source_parameters.nodes.get(index).ok_or_else(invalid)?,
+        );
+        let node = host.node(declaration).ok_or_else(invalid)?;
+        let NodeData::ParameterDeclaration(data) = &node.data else {
+            return Err(invalid());
+        };
+        let (Some(question), Some(annotation)) = (data.question_token, data.type_) else {
+            continue;
+        };
+        let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
+        let annotation_node = host.node(annotation).ok_or_else(invalid)?;
+        if !annotation_node.kind.is_keyword_type() {
+            continue;
+        }
+        let question = NodeRef::new(declaration.arena, declaration.file, question);
+        let question_node = host.node(question).ok_or_else(invalid)?;
+        let name = NodeRef::new(declaration.arena, declaration.file, data.name);
+        let name_node = host.node(name).ok_or_else(invalid)?;
+        let NodeData::Identifier(identifier) = &name_node.data else {
+            return Err(invalid());
+        };
+        let parameter_record = store.symbol(*parameter).ok_or_else(invalid)?;
+        let method_symbol = store
+            .type_payload(owner)
+            .and_then(TypeRecord::symbol)
+            .ok_or_else(invalid)?;
+        let owner_symbol = store
+            .symbol(method_symbol)
+            .and_then(|record| record.parent())
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(invalid)?;
+        let source_owner = NodeRef::new(
+            method.arena,
+            method.file,
+            method_node.parent.ok_or_else(invalid)?,
+        );
+        let owner_node = host.node(source_owner).ok_or_else(invalid)?;
+        let source_children = store.source_direct_children(method).ok_or_else(invalid)?;
+        if !host.symbol_matches(store, method, method_symbol)
+            || !host.symbol_matches(store, source_owner, owner_symbol)
+            || store.source_node_kind(source_owner) != Some(owner_node.kind)
+            || store.source_node_kind(method) != Some(method_node.kind)
+            || store.source_node_parent(method) != Some(SourceNodeParent::Parent(source_owner))
+            || method_node.range.start < owner_node.range.start
+            || method_node.range.end > owner_node.range.end
+            || source_parameters.range.start < method_node.range.start
+            || source_parameters.range.end > method_node.range.end
+            || !source_children
+                .into_iter()
+                .filter(|child| store.source_node_kind(*child) == Some(SyntaxKind::Parameter))
+                .map(|child| child.node)
+                .eq(source_parameters.nodes.iter().copied())
+            || node.kind != SyntaxKind::Parameter
+            || node.flags.0 != 0
+            || node.parent != Some(method.node)
+            || store.source_node_kind(declaration) != Some(SyntaxKind::Parameter)
+            || store.source_node_parent(declaration) != Some(SourceNodeParent::Parent(method))
+            || node.range.start < source_parameters.range.start
+            || node.range.end > source_parameters.range.end
+            || data.symbol.is_some()
+            || data.facts != 0
+            || !host.symbol_matches(store, declaration, *parameter)
+            || store.get_merged_symbol(*parameter) != Some(*parameter)
+            || parameter_record.declarations() != Some(&[declaration])
+            || parameter_record.value_declaration() != Some(declaration)
+            || parameter_record.name().as_utf8() != Some(identifier.text.as_str())
+            || store.value_symbol_links(*parameter)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(*value_type),
+                    ..ValueSymbolLinks::default()
+                })
+            || store
+                .callable_signature_parameter_types(signature)
+                .is_some_and(|cached| cached != parameter_types)
+            || name_node.kind != SyntaxKind::Identifier
+            || name_node.flags.0 != 0
+            || name_node.parent != Some(declaration.node)
+            || store.source_node_kind(name) != Some(SyntaxKind::Identifier)
+            || store.source_node_parent(name) != Some(SourceNodeParent::Parent(declaration))
+            || store.source_identifier_text(name) != Some(identifier.text.as_str())
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || identifier.text == "this"
+            || name_node.range.start < node.range.start
+            || name_node.range.end > node.range.end
+            || question_node.kind != SyntaxKind::QuestionToken
+            || question_node.flags.0 != 0
+            || question_node.parent != Some(declaration.node)
+            || !matches!(question_node.data, NodeData::Token(_))
+            || store.source_node_kind(question) != Some(SyntaxKind::QuestionToken)
+            || store.source_node_parent(question) != Some(SourceNodeParent::Parent(declaration))
+            || store.source_child_with_kind(declaration, SyntaxKind::QuestionToken)
+                != Some(question)
+            || question_node.range.start < name_node.range.end
+            || question_node.range.end > annotation_node.range.start
+            || annotation_node.flags.0 != 0
+            || annotation_node.parent != Some(declaration.node)
+            || !matches!(annotation_node.data, NodeData::KeywordTypeNode(_))
+            || store.source_node_kind(annotation) != Some(annotation_node.kind)
+            || store.source_node_parent(annotation) != Some(SourceNodeParent::Parent(declaration))
+            || store.source_direct_type_annotation(declaration) != Some(annotation)
+            || annotation_node.range.start < name_node.range.end
+            || annotation_node.range.end > node.range.end
+        {
+            return Err(invalid());
+        }
+        let annotation_type =
+            validated_method_annotation_type(store, annotation).ok_or_else(invalid)?;
+        if !store.source_direct_type_annotation_is_exact(annotation, annotation_type) {
+            return Err(invalid());
+        }
+        if store
+            .intrinsic_bootstrap()
+            .ok_or_else(invalid)?
+            .options
+            .strict_null_checks
+        {
+            store
+                .validate_optional_parameter_type_metadata(annotation_type, *value_type)
+                .map_err(|_| invalid())?;
+        } else if annotation_type != *value_type {
+            return Err(invalid());
+        }
+        if annotation_type != *value_type {
+            display_parameters.get_or_insert_with(|| parameter_types.to_vec())[index] =
+                annotation_type;
+        }
+    }
+    Ok(display_parameters)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Check source names before admitting fresh parameters.
@@ -2383,6 +2586,13 @@ fn display_validated_module_namespace(
         else {
             return Ok(None);
         };
+        let owner_record = store
+            .symbol(owner)
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        // An empty namespace keeps the synthetic default property's structural display.
+        if !owner_record.flags().contains(SymbolFlags::VALUE_MODULE) {
+            return Ok(None);
+        }
         let name = display_symbol_name(store, Some(host), type_id, owner, state)?;
         state.add(7);
         return Ok(Some(format!("typeof {name}")));
@@ -8486,6 +8696,10 @@ fn truncate_display(
     truncated.push_str(ELLIPSIS);
     Ok(truncated)
 }
+
+#[cfg(test)]
+#[path = "formatter_optional_declared_method_tests.rs"]
+mod formatter_optional_declared_method_tests;
 
 #[cfg(test)]
 mod tests {
@@ -19438,6 +19652,339 @@ mod tests {
             context.type_to_string(namespace),
             Err(TypeDisplayUnavailable::MalformedType(namespace))
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both real owners, query orders, and proof restoration together.
+    fn synthetic_namespace_display_keeps_empty_and_value_owners_separate() {
+        use crate::semantic::{
+            CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+            CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
+        };
+
+        for value_namespace in [false, true] {
+            let provider = parse_source_file(if value_namespace {
+                concat!(
+                    "declare function foo(): void;\n",
+                    "declare namespace foo { export const version: number; }\n",
+                    "export = foo;\n",
+                )
+            } else {
+                concat!(
+                    "declare function foo(): void;\n",
+                    "declare namespace foo {}\n",
+                    "export = foo;\n",
+                )
+            });
+            let importer =
+                parse_source_file("import * as renamed from \"./foo\";\nconst copied = renamed;\n");
+            let provider_file = FileId::new(14_104);
+            let importer_file = FileId::new(14_105);
+            let sources = [
+                (provider_file, &provider, "\"/foo.d.ts\"", true),
+                (importer_file, &importer, "\"/index.ts\"", false),
+            ];
+            let function = provider
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        provider.arena.id(),
+                        provider_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let specifier = importer
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::ImportDeclaration(import) = &record.data else {
+                        return None;
+                    };
+                    Some(NodeRef::new(
+                        importer.arena.id(),
+                        importer_file,
+                        import.module_specifier,
+                    ))
+                })
+                .unwrap();
+            let (binding, name) = importer
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::NamespaceImport(import) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(importer.arena.id(), importer_file, node),
+                        NodeRef::new(importer.arena.id(), importer_file, import.name),
+                    ))
+                })
+                .unwrap();
+            let (copied, read) = importer
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(importer.arena.id(), importer_file, node),
+                        NodeRef::new(importer.arena.id(), importer_file, variable.initializer?),
+                    ))
+                })
+                .unwrap();
+
+            for query_first in [false, true] {
+                let mut binder = CanonicalBinder::new();
+                for (file, parsed, path, declaration) in sources {
+                    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                    binder
+                        .bind_source_file_with_facts(
+                            &parsed.arena,
+                            parsed.source_file,
+                            file,
+                            CanonicalSourceFileFacts::new(
+                                EscapedName::source(path),
+                                CanonicalSourceLanguage::TypeScript,
+                                declaration,
+                                CanonicalModuleState::External,
+                            ),
+                        )
+                        .unwrap();
+                }
+                for (file, parsed, _, _) in sources {
+                    binder
+                        .bind_typescript_declaration_slice(&parsed.arena, file)
+                        .unwrap();
+                }
+                let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+                    binder.finish(),
+                    sources
+                        .map(|(file, parsed, _, _)| (file, &parsed.arena))
+                        .into_iter()
+                        .collect(),
+                    CanonicalCheckerOptions {
+                        intrinsic: IntrinsicBootstrapOptions {
+                            strict_null_checks: true,
+                            exact_optional_property_types: false,
+                        },
+                        no_implicit_any: true,
+                        strict_function_types: true,
+                        no_emit: true,
+                        module_kind: ts_options::ModuleKind::NodeNext,
+                        name_resolution: CanonicalNameResolverOptions {
+                            emit_target: ts_options::ScriptTarget::EsNext,
+                            ..CanonicalNameResolverOptions::default()
+                        },
+                        ..CanonicalCheckerOptions::default()
+                    },
+                    CanonicalModuleResolutionManifestInput::new([
+                        CanonicalModuleResolutionEntry::resolved(
+                            specifier,
+                            CanonicalResolvedModuleInput::new(
+                                provider_file,
+                                CanonicalModuleResolutionMode::Esm,
+                                CanonicalModuleResolutionMode::CommonJs,
+                            ),
+                        ),
+                    ]),
+                )
+                .unwrap();
+                let original = context
+                    .file(provider_file)
+                    .unwrap()
+                    .1
+                    .symbol(function)
+                    .unwrap();
+                let alias = context
+                    .file(importer_file)
+                    .unwrap()
+                    .1
+                    .symbol(binding)
+                    .unwrap();
+                assert!(context.store().value_symbol_links(original).is_none());
+                assert!(context.store().value_symbol_links(alias).is_none());
+                let cold = query_first.then(|| context.get_type_at_location(name).unwrap());
+                for file in [provider_file, importer_file] {
+                    context.check_source_file(file).unwrap();
+                }
+                assert!(context.diagnostics().is_empty());
+                let namespace = context.get_type_at_location(name).unwrap();
+                assert_eq!(context.get_type_at_location(read), Ok(namespace));
+                if let Some(cold) = cold {
+                    assert_eq!(cold, namespace);
+                }
+                let store = context.store();
+                let synthetic = store
+                    .alias_symbol_links(alias)
+                    .unwrap()
+                    .alias_target
+                    .symbol()
+                    .unwrap();
+                let callable = store.source_callable_type_for_owner(original).unwrap();
+                assert_ne!(synthetic, original);
+                assert_ne!(namespace, callable);
+                let flags = SymbolFlags::FUNCTION
+                    | if value_namespace {
+                        SymbolFlags::VALUE_MODULE
+                    } else {
+                        SymbolFlags::NAMESPACE_MODULE
+                    };
+                for owner in [original, synthetic] {
+                    assert_eq!(store.symbol(owner).unwrap().flags(), flags);
+                }
+                let signature = store
+                    .source_callable_provenance(callable)
+                    .unwrap()
+                    .signature;
+                let original_signature = store.signature_links(function).unwrap().clone();
+                let record = store.type_payload(namespace).unwrap();
+                assert!(record.symbol().is_none());
+                let structured = record.data().structured().unwrap();
+                assert_eq!(structured.call_signature_count, 0);
+                assert!(structured.signatures.is_none());
+                let default = store
+                    .symbol_table(structured.members.unwrap())
+                    .unwrap()
+                    .get(InternalSymbolName::Default.as_ref())
+                    .unwrap();
+                assert_eq!(
+                    store.value_symbol_links(default).unwrap().resolved_type,
+                    Some(callable)
+                );
+                let origin = store.export_type_links(synthetic).unwrap().clone();
+                let expected = if value_namespace {
+                    "typeof foo"
+                } else {
+                    "{ default: () => void; }"
+                };
+                let located = if value_namespace {
+                    "typeof renamed"
+                } else {
+                    expected
+                };
+                let display_flags = CanonicalTypeFormatFlags::NO_TRUNCATION
+                    | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE;
+                let assert_display = |context: &mut CanonicalCheckerContext<'_>| {
+                    let before = format!("{:?}", context.store());
+                    assert_eq!(context.type_to_string(namespace).unwrap(), expected);
+                    for location in [binding, copied] {
+                        assert_eq!(
+                            context
+                                .type_to_string_at_location_with_flags(
+                                    namespace,
+                                    location,
+                                    display_flags
+                                )
+                                .unwrap(),
+                            located,
+                        );
+                    }
+                    assert_eq!(
+                        context.type_to_string(callable).unwrap(),
+                        if value_namespace {
+                            "typeof foo"
+                        } else {
+                            "() => void"
+                        },
+                    );
+                    assert_eq!(format!("{:?}", context.store()), before);
+                };
+                assert_display(&mut context);
+                let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                    let store = context.store();
+                    (
+                        (
+                            store.type_len(),
+                            store.symbol_len(),
+                            store.signature_len(),
+                            store.mapper_len(),
+                            store.symbol_store().symbol_table_len(),
+                            store.checker_link_allocated_lengths(),
+                        ),
+                        [original, synthetic, alias, default].map(|symbol| {
+                            (
+                                store.value_symbol_links(symbol).cloned(),
+                                store.alias_symbol_links(symbol).cloned(),
+                                store.export_type_links(symbol).cloned(),
+                            )
+                        }),
+                        sources
+                            .iter()
+                            .flat_map(|(file, parsed, _, _)| {
+                                parsed.arena.iter().map(move |(node, _)| {
+                                    let node = NodeRef::new(parsed.arena.id(), *file, node);
+                                    (
+                                        store.type_node_links(node).cloned(),
+                                        store.symbol_node_links(node).cloned(),
+                                        store.signature_links(node).cloned(),
+                                    )
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                        context.diagnostics().as_slice().to_vec(),
+                    )
+                };
+                let warm = snapshot(&context);
+                for forced in [false, true] {
+                    for file in [importer_file, provider_file] {
+                        if forced {
+                            context.recheck_source_file(file).unwrap();
+                        } else {
+                            context.check_source_file(file).unwrap();
+                        }
+                    }
+                    for node in [name, read] {
+                        assert_eq!(context.get_type_at_location(node), Ok(namespace));
+                    }
+                    assert_display(&mut context);
+                    assert_eq!(snapshot(&context), warm);
+                    assert_eq!(
+                        context
+                            .store()
+                            .source_callable_provenance(callable)
+                            .unwrap()
+                            .signature,
+                        signature
+                    );
+                    assert_eq!(
+                        context.store().signature_links(function),
+                        Some(&original_signature)
+                    );
+                }
+
+                let mut damaged = origin.clone();
+                damaged.originating_import = None;
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_export_type_links(synthetic, damaged)
+                );
+                let damaged_store = format!("{:?}", context.store());
+                assert_eq!(
+                    context.type_to_string(namespace),
+                    Err(TypeDisplayUnavailable::MalformedType(namespace))
+                );
+                assert_eq!(
+                    context.type_to_string_at_location_with_flags(
+                        namespace,
+                        binding,
+                        display_flags
+                    ),
+                    Err(TypeDisplayUnavailable::MalformedType(namespace)),
+                );
+                assert_eq!(format!("{:?}", context.store()), damaged_store);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_export_type_links(synthetic, origin)
+                );
+                assert_display(&mut context);
+                assert_eq!(snapshot(&context), warm);
+            }
+        }
     }
 
     #[test]

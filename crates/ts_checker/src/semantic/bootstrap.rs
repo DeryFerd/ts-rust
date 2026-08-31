@@ -15626,6 +15626,10 @@ mod tests {
 
     #[test]
     fn derived_object_subtype_discriminants_preserve_nested_and_contextual_provenance() {
+        use crate::semantic::relation::{
+            IntersectionState, RelationCacheSnapshot, RelationComparisonResult, RelationKind,
+        };
+
         let parsed = parse_source_file(concat!(
             "interface Array<T> {} ",
             "interface NestedFirst { kind: 'first'; values: number[] } ",
@@ -15742,7 +15746,110 @@ mod tests {
                 .unwrap();
             assert!(store.validate_contextual_widened_object_property(*member, optional));
         }
+
+        // A and B retain the initializer owners, not the declared interfaces.
+        let [a_owner, b_owner] =
+            [context_first, context_second].map(|source| record(store, source).symbol().unwrap());
+        assert_ne!(a_owner, b_owner);
+        let [a, b] = [a_owner, b_owner].map(|owner| {
+            contextual_members
+                .iter()
+                .copied()
+                .find(|member| record(store, *member).symbol() == Some(owner))
+                .unwrap()
+        });
+        assert_eq!(contextual_members.as_slice(), &[a, b]);
+        let [a_properties, b_properties] = [a, b].map(|member| {
+            record(store, member)
+                .data()
+                .structured()
+                .and_then(|structured| structured.properties.as_deref())
+                .unwrap()
+                .to_vec()
+        });
+        for (properties, names) in [
+            (&a_properties, ["kind", "first", "second"]),
+            (&b_properties, ["first", "kind", "second"]),
+        ] {
+            assert_eq!(
+                properties
+                    .iter()
+                    .map(|property| store.symbol(*property).unwrap().name().as_utf8().unwrap())
+                    .collect::<Vec<_>>(),
+                names,
+            );
+        }
+        let (number, undefined) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.undefined_type)
+        };
+        assert_eq!(
+            store
+                .value_symbol_links(a_properties[1])
+                .unwrap()
+                .resolved_type,
+            Some(number),
+        );
+        for (optional, donor) in [
+            (a_properties[2], b_properties[2]),
+            (b_properties[0], a_properties[1]),
+        ] {
+            let optional_record = store.symbol(optional).unwrap();
+            let donor_record = store.symbol(donor).unwrap();
+            assert!(optional_record.flags().contains(SymbolFlags::OPTIONAL));
+            assert!(!donor_record.flags().contains(SymbolFlags::OPTIONAL));
+            let links = store.value_symbol_links(optional).unwrap();
+            assert_eq!(links.resolved_type, Some(undefined));
+            assert_eq!(links.target, Some(donor));
+            assert_eq!(optional_record.declarations(), donor_record.declarations());
+            assert_eq!(
+                optional_record.value_declaration(),
+                donor_record.value_declaration(),
+            );
+            assert_eq!(optional_record.parent(), donor_record.parent());
+        }
+        for (property, value) in [
+            (a_properties[0], "context-first"),
+            (b_properties[1], "context-second"),
+        ] {
+            let type_ = store
+                .value_symbol_links(property)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert_eq!(
+                literal_data(store, type_).value,
+                LiteralValue::String(value.into()),
+            );
+        }
+
+        // Declaration order makes B.first the first unit property. A.first is
+        // number, so B -> A reaches the strict relation and fails on kind.
+        // A -> B is skipped by the unequal kind discriminants. Widening used
+        // Literal reduction, so neither direction has been queried yet.
         let contextual_relations = store.relation_state_snapshot();
+        assert_eq!(
+            contextual_relations.strict_subtype,
+            RelationCacheSnapshot::default(),
+        );
+        let contextual_counts = (
+            store.type_len(),
+            store.symbol_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+        let [b_to_a, a_to_b] = [(b, a), (a, b)].map(|(source, target)| {
+            store
+                .relation_key_if_available(source, target, IntersectionState::NONE, false, false)
+                .unwrap()
+                .key()
+        });
+        assert_ne!(b_to_a, a_to_b);
+        for key in [b_to_a, a_to_b] {
+            assert_eq!(
+                store.relation_cache_get(RelationKind::StrictSubtype, key),
+                RelationComparisonResult::NONE,
+            );
+        }
         assert_eq!(
             store.expression_union_type_with_global_types(
                 &global_types,
@@ -15751,7 +15858,62 @@ mod tests {
             ),
             Ok(contextual),
         );
-        assert_eq!(store.relation_state_snapshot(), contextual_relations);
+        let mut expected_relations = contextual_relations;
+        expected_relations.strict_subtype = RelationCacheSnapshot {
+            allocated: true,
+            entries: 1,
+        };
+        assert_eq!(store.relation_state_snapshot(), expected_relations);
+        assert_eq!(
+            store.relation_cache_get(RelationKind::StrictSubtype, b_to_a),
+            RelationComparisonResult::FAILED,
+        );
+        assert_eq!(
+            store.relation_cache_get(RelationKind::StrictSubtype, a_to_b),
+            RelationComparisonResult::NONE,
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            contextual_counts,
+        );
+
+        let contextual_warm = (
+            store.type_len(),
+            store.symbol_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            store.relation_state_snapshot(),
+        );
+        for members in [[a, b], [b, a]] {
+            assert_eq!(
+                store.expression_union_type_with_global_types(
+                    &global_types,
+                    &members,
+                    UnionReduction::Subtype,
+                ),
+                Ok(contextual),
+            );
+            assert_eq!(
+                store.relation_cache_get(RelationKind::StrictSubtype, b_to_a),
+                RelationComparisonResult::FAILED,
+            );
+            assert_eq!(
+                store.relation_cache_get(RelationKind::StrictSubtype, a_to_b),
+                RelationComparisonResult::NONE,
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                    store.relation_state_snapshot(),
+                ),
+                contextual_warm,
+            );
+        }
 
         let property = record(store, widened_first)
             .data()

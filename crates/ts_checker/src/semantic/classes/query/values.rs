@@ -85,7 +85,7 @@ fn annotation_type_if_ready(
                     .and_then(|links| links.declared_type)
             } else if owner.flags() == SymbolFlags::CLASS {
                 let class = plan_class_query(store, host, symbol)?;
-                class_query_shell_state(store, &class)?.instance
+                class_query_shell_state(store, host, &class)?.instance
             } else if owner.flags() == SymbolFlags::INTERFACE
                 && preflight_class_or_interface_reference(
                     store,
@@ -134,7 +134,7 @@ fn member_binding(
     let invalid = || invariant(ClassInvariant::InvalidPropertyValueCache(symbol));
     let record = store.symbol(symbol).ok_or_else(invalid)?;
     let class = plan_class_query(store, host, record.parent().ok_or_else(invalid)?)?;
-    class_query_shell_state(store, &class)?;
+    class_query_shell_state(store, host, &class)?;
     let [declaration] = record.declarations().unwrap_or_default() else {
         let declaration = record.value_declaration().unwrap_or(class.declaration);
         return Err(unsupported(ClassUnsupported::Member {
@@ -296,7 +296,7 @@ fn initialized_type_if_ready(
     let symbol = match &record.data {
         NodeData::NewExpression(_) => {
             let plan = default_new_query_plan(store, host, node)?;
-            return Ok(class_query_shell_state(store, &plan)?.instance);
+            return Ok(class_query_shell_state(store, host, &plan)?.instance);
         }
         NodeData::PropertyAccessExpression(_) => {
             class_query_reference_symbol(store, host, node)?
@@ -415,7 +415,7 @@ fn default_new_query_plan(
     {
         return Err(reject());
     }
-    class_query_shell_state(store, &plan)?;
+    class_query_shell_state(store, host, &plan)?;
     Ok(plan)
 }
 
@@ -1204,7 +1204,7 @@ impl ClassValueQuery<'_, '_, '_> {
         let owner = bound_symbol(self.store, self.host, initializer)
             .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(initializer)))?;
         let class = plan_class_query(self.store, self.host, owner)?;
-        let state = class_query_shell_state(self.store, &class)?;
+        let state = class_query_shell_state(self.store, self.host, &class)?;
         let symbol = bound_symbol(self.store, self.host, declaration)
             .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(declaration)))?;
         let invalid = || invariant(ClassInvariant::InvalidPropertyValueCache(symbol));

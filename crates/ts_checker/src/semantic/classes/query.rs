@@ -308,7 +308,7 @@ pub(in crate::semantic) fn plan_selected_class_member(
     let record = store.symbol(symbol).ok_or_else(invalid)?;
     let owner = record.parent().ok_or_else(invalid)?;
     let class = plan_class_query(store, host, owner)?;
-    class_query_shell_state(store, &class)?;
+    class_query_shell_state(store, host, &class)?;
     let declaration = record.value_declaration().ok_or_else(|| {
         unsupported(ClassUnsupported::Member {
             node: class.declaration,

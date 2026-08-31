@@ -3547,7 +3547,10 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::CloseBraceToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
-            if !signature_only && self.current.kind == SyntaxKind::FunctionKeyword {
+            if !signature_only
+                && self.current.kind == SyntaxKind::FunctionKeyword
+                && !self.class_function_keyword_starts_member()
+            {
                 self.error_current("Declaration expected.");
                 recovered_at_statement = true;
                 break;
@@ -3635,6 +3638,26 @@ impl<'a> Parser<'a> {
             nodes: members,
             has_trailing_comma: false,
         }
+    }
+
+    fn class_function_keyword_starts_member(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let next = self.scanner.scan();
+        self.scanner.rewind(checkpoint);
+        next.flags.contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+            || matches!(
+                next.kind,
+                SyntaxKind::OpenParenToken
+                    | SyntaxKind::LessThanToken
+                    | SyntaxKind::ExclamationToken
+                    | SyntaxKind::ColonToken
+                    | SyntaxKind::EqualsToken
+                    | SyntaxKind::QuestionToken
+                    | SyntaxKind::OpenBracketToken
+                    | SyntaxKind::SemicolonToken
+                    | SyntaxKind::CloseBraceToken
+                    | SyntaxKind::EndOfFile
+            )
     }
 
     fn class_var_keyword_starts_recovered_statement(&mut self) -> bool {
@@ -7535,8 +7558,8 @@ impl<'a> Parser<'a> {
             return false;
         }
         let checkpoint = self.scanner.mark();
-        let mut depth = 1_u32;
         let mut delimiter_depth = 0_u32;
+        let mut result = false;
         let mut token = self.scanner.scan();
         while token.kind != SyntaxKind::EndOfFile {
             match token.kind {
@@ -7552,21 +7575,14 @@ impl<'a> Parser<'a> {
                     delimiter_depth -= 1;
                 }
                 SyntaxKind::SemicolonToken if delimiter_depth == 0 => break,
-                SyntaxKind::LessThanToken => depth += 1,
-                SyntaxKind::GreaterThanToken => {
-                    depth -= 1;
-                    if depth == 0 {
-                        token = self.scanner.scan();
-                        break;
-                    }
-                }
                 _ => {}
             }
+            let closing_token = (token.kind == SyntaxKind::GreaterThanToken).then_some(token.range);
             token = self.scanner.scan();
-        }
-        self.scanner.rewind(checkpoint);
-        depth == 0
-            && (token.kind == SyntaxKind::OpenParenToken
+            let Some(closing_token) = closing_token else {
+                continue;
+            };
+            if (token.kind == SyntaxKind::OpenParenToken
                 || matches!(
                     token.kind,
                     SyntaxKind::NoSubstitutionTemplateLiteral | SyntaxKind::TemplateHead
@@ -7594,6 +7610,33 @@ impl<'a> Parser<'a> {
                         | SyntaxKind::SatisfiesKeyword
                         | SyntaxKind::ExclamationToken
                 ))
+                && self.type_arguments_match_closing_token(closing_token)
+            {
+                result = true;
+                break;
+            }
+        }
+        self.scanner.rewind(checkpoint);
+        result
+    }
+
+    fn type_arguments_match_closing_token(&self, closing: TextRange) -> bool {
+        let start = self.current.range.start;
+        let Some(mut probe) = self.generic_arrow_lookahead_parser(start, closing.end) else {
+            return false;
+        };
+        if probe.current.kind == SyntaxKind::LessThanLessThanToken {
+            probe.current = probe.scanner.rescan_less_than_token();
+        }
+        let Some((_, Some(parsed_closing))) = probe.parse_type_arguments_with_closing_token()
+        else {
+            return false;
+        };
+        // Recoverable type errors stay in the live parse. Only the actual delimiter
+        // and complete candidate span decide this isolated lookahead.
+        start.get() + parsed_closing.start.get() == closing.start.get()
+            && start.get() + parsed_closing.end.get() == closing.end.get()
+            && probe.current.kind == SyntaxKind::EndOfFile
     }
 
     fn parse_await_expression(&mut self) -> NodeId {
@@ -7891,6 +7934,9 @@ impl<'a> Parser<'a> {
         {
             return false;
         }
+        if let Some(result) = self.parenthesized_arrow_prefix() {
+            return result;
+        }
         let checkpoint = self.scanner.mark();
         let mut parenthesis_depth = 1_u32;
         let mut brace_depth = 0_u32;
@@ -8016,6 +8062,52 @@ impl<'a> Parser<'a> {
         }
         self.scanner.rewind(checkpoint);
         false
+    }
+
+    // None keeps the existing lookahead for an uncertain parameter head.
+    fn parenthesized_arrow_prefix(&mut self) -> Option<bool> {
+        let checkpoint = self.scanner.mark();
+        let first = self.scanner.scan().kind;
+        let result = match first {
+            SyntaxKind::CloseParenToken => Some(matches!(
+                self.scanner.scan().kind,
+                SyntaxKind::EqualsGreaterThanToken
+                    | SyntaxKind::ColonToken
+                    | SyntaxKind::OpenBraceToken
+            )),
+            SyntaxKind::OpenBracketToken | SyntaxKind::OpenBraceToken => None,
+            SyntaxKind::DotDotDotToken => Some(true),
+            _ => {
+                let next = self.scanner.scan().kind;
+                if first.is_modifier()
+                    && first != SyntaxKind::AsyncKeyword
+                    && self.token_is_identifier_in_current_context(next)
+                {
+                    Some(next != SyntaxKind::AsKeyword)
+                } else if !self.token_is_identifier_in_current_context(first)
+                    && first != SyntaxKind::ThisKeyword
+                {
+                    Some(false)
+                } else {
+                    match next {
+                        SyntaxKind::ColonToken => Some(true),
+                        SyntaxKind::QuestionToken => Some(matches!(
+                            self.scanner.scan().kind,
+                            SyntaxKind::ColonToken
+                                | SyntaxKind::CommaToken
+                                | SyntaxKind::EqualsToken
+                                | SyntaxKind::CloseParenToken
+                        )),
+                        SyntaxKind::CommaToken
+                        | SyntaxKind::EqualsToken
+                        | SyntaxKind::CloseParenToken => None,
+                        _ => Some(false),
+                    }
+                }
+            }
+        };
+        self.scanner.rewind(checkpoint);
+        result
     }
 
     fn is_parenthesized_function_type(&mut self) -> bool {
@@ -10183,7 +10275,6 @@ impl<'a> Parser<'a> {
                 .current
                 .flags
                 .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
-                && (self.is_index_signature() || self.line_broken_bracket_starts_method())
             {
                 break;
             }
@@ -10235,31 +10326,6 @@ impl<'a> Parser<'a> {
             NodeData::JsDocNonNullableType(Box::new(JsDocNonNullableTypeData { type_: type_node })),
             &[type_node],
         )
-    }
-
-    fn line_broken_bracket_starts_method(&mut self) -> bool {
-        if self.current.kind != SyntaxKind::OpenBracketToken {
-            return false;
-        }
-        let checkpoint = self.scanner.mark();
-        let name = self.scanner.scan().kind;
-        let close = self.scanner.scan().kind;
-        let mut next = self.scanner.scan().kind;
-        if matches!(
-            next,
-            SyntaxKind::QuestionToken | SyntaxKind::ExclamationToken
-        ) {
-            next = self.scanner.scan().kind;
-        }
-        self.scanner.rewind(checkpoint);
-        matches!(
-            name,
-            SyntaxKind::Identifier
-                | SyntaxKind::StringLiteral
-                | SyntaxKind::NumericLiteral
-                | SyntaxKind::BigIntLiteral
-        ) && close == SyntaxKind::CloseBracketToken
-            && matches!(next, SyntaxKind::OpenParenToken | SyntaxKind::LessThanToken)
     }
 
     fn next_token_starts_type(&mut self) -> bool {
@@ -11072,6 +11138,11 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type_arguments(&mut self) -> Option<NodeList> {
+        self.parse_type_arguments_with_closing_token()
+            .map(|(arguments, _)| arguments)
+    }
+
+    fn parse_type_arguments_with_closing_token(&mut self) -> Option<(NodeList, Option<TextRange>)> {
         if self.current.kind != SyntaxKind::LessThanToken {
             return None;
         }
@@ -11088,19 +11159,26 @@ impl<'a> Parser<'a> {
             self.bump();
             has_trailing_comma = self.current.kind == SyntaxKind::GreaterThanToken;
         }
-        let end = if self.current.kind == SyntaxKind::GreaterThanToken {
-            self.consume().range.end
+        let (end, closing_token) = if self.current.kind == SyntaxKind::GreaterThanToken {
+            let closing_token = self.consume().range;
+            (closing_token.end, Some(closing_token))
         } else {
             self.error_current("Expected '>'.");
-            arguments
-                .last()
-                .map_or(self.current.range.start, |id| self.node_end(*id))
+            (
+                arguments
+                    .last()
+                    .map_or(self.current.range.start, |id| self.node_end(*id)),
+                None,
+            )
         };
-        Some(NodeList {
-            range: TextRange::new(start, end),
-            nodes: arguments,
-            has_trailing_comma,
-        })
+        Some((
+            NodeList {
+                range: TextRange::new(start, end),
+                nodes: arguments,
+                has_trailing_comma,
+            },
+            closing_token,
+        ))
     }
 
     fn parse_type_arguments_of_type_reference(&mut self) -> Option<NodeList> {
@@ -11496,6 +11574,8 @@ fn is_type_start_kind(kind: SyntaxKind) -> bool {
                 | SyntaxKind::OpenBracketToken
                 | SyntaxKind::OpenParenToken
                 | SyntaxKind::LessThanToken
+                | SyntaxKind::BarToken
+                | SyntaxKind::AmpersandToken
                 | SyntaxKind::TemplateHead
                 | SyntaxKind::StringLiteral
                 | SyntaxKind::NumericLiteral

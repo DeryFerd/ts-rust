@@ -488,22 +488,38 @@ fn review_global_binding_capture_keeps_exports_valid_after_ambient_module_checks
                 let owner = fixture.owner(context, "Value");
                 let (declared, value) = identities(context, owner);
                 assert_healthy(context, fixture, owner, declared, value);
-                assert!(
-                    context
-                        .store()
+                {
+                    let store = context.store();
+                    let source_modules = [1, 2].map(|index| {
+                        let (_, bound) = context.file(fixture.files[index]).unwrap();
+                        let locals = bound.locals(bound.source_file()).unwrap();
+                        store
+                            .symbol_table(locals)
+                            .unwrap()
+                            .get(module_name)
+                            .unwrap()
+                    });
+                    assert_ne!(source_modules[0], source_modules[1]);
+                    let module = store.get_merged_symbol(source_modules[0]).unwrap();
+                    assert_eq!(store.get_merged_symbol(source_modules[1]), Some(module));
+
+                    let raw = store
                         .symbol_table(globals)
                         .unwrap()
                         .get(module_name)
-                        .is_none()
-                );
-                assert!(
-                    context
-                        .store()
-                        .source_global_bindings()
-                        .unwrap()
-                        .get(module_name)
-                        .is_none()
-                );
+                        .unwrap();
+                    assert_eq!(store.get_merged_symbol(raw), Some(module));
+                    let record = store.symbol(module).unwrap();
+                    assert_eq!(record.name(), module_name);
+
+                    let captured = store.source_global_bindings().unwrap();
+                    assert_eq!(captured.table, globals);
+                    let binding = captured.get(module_name).unwrap();
+                    assert_eq!(binding.table_symbol, raw);
+                    assert_eq!(binding.symbol, module);
+                    assert_eq!(binding.flags, record.flags());
+                    assert_eq!(binding.declarations(), record.declarations());
+                }
                 let retained = format!("{:?}", context.store().source_global_bindings());
                 for index in check_order {
                     context.check_source_file(fixture.files[index]).unwrap();

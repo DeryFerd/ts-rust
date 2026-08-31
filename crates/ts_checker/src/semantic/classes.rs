@@ -10017,6 +10017,7 @@ pub(super) struct ClassQueryPlan {
     abstract_class: bool,
     expression: bool,
     export_local: Option<SemanticSymbolId>,
+    ambient_namespace: Option<super::source_namespaces::AmbientNamespaceClassQueryOwner>,
     members: Vec<ts_ast::NodeId>,
 }
 
@@ -29682,7 +29683,7 @@ fn shell_state(
     Ok(ClassShellState { instance, value })
 }
 
-/// Plans only the source binding needed by a lazy class identity query.
+/// Plans source bindings for top-level classes and empty ambient namespace classes.
 #[allow(clippy::too_many_lines)] // The declaration and expression bindings have different owners.
 pub(super) fn plan_class_query(
     store: &CanonicalTypeMapperStore,
@@ -29805,22 +29806,48 @@ pub(super) fn plan_class_query(
     } else {
         declaration
     };
-    if host
-        .node(statement)
-        .is_none_or(|statement| statement.parent != Some(source.node))
-        || source_data
-            .statements
-            .nodes
-            .iter()
-            .filter(|node| **node == statement.node)
-            .count()
-            != 1
+    let ambient_namespace = if !expression
+        && record.parent.is_some_and(|parent| {
+            host.node(NodeRef::new(declaration.arena, declaration.file, parent))
+                .is_some_and(|parent| parent.kind == SyntaxKind::ModuleBlock)
+        }) {
+        if !members.nodes.is_empty() || modifiers.is_some() {
+            return Err(unsupported(ClassUnsupported::NestedDeclaration(
+                declaration,
+            )));
+        }
+        Some(
+            super::source_namespaces::plan_ambient_namespace_class_query_owner(
+                store,
+                host,
+                symbol,
+                declaration,
+            )
+            .map_err(|_| invalid())?
+            .ok_or_else(|| unsupported(ClassUnsupported::NestedDeclaration(declaration)))?,
+        )
+    } else {
+        None
+    };
+    if ambient_namespace.is_none()
+        && (host
+            .node(statement)
+            .is_none_or(|statement| statement.parent != Some(source.node))
+            || source_data
+                .statements
+                .nodes
+                .iter()
+                .filter(|node| **node == statement.node)
+                .count()
+                != 1)
     {
         return Err(unsupported(ClassUnsupported::NestedDeclaration(
             declaration,
         )));
     }
-    let (ambient, abstract_class, export_local) = if expression {
+    let (ambient, abstract_class, export_local) = if let Some(namespace) = ambient_namespace {
+        (true, false, Some(namespace.export_local()))
+    } else if expression {
         (false, false, None)
     } else {
         let modifiers = plan_class_declaration_modifiers(
@@ -29856,6 +29883,7 @@ pub(super) fn plan_class_query(
         abstract_class,
         expression,
         export_local,
+        ambient_namespace,
         members: members.nodes.clone(),
     })
 }
@@ -29919,6 +29947,7 @@ fn query_class_expression_statement(
 
 fn class_query_shell_state(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     plan: &ClassQueryPlan,
 ) -> Result<ClassShellState, ClassError> {
     let invalid_instance = || invariant(ClassInvariant::InvalidInstanceCache(plan.symbol));
@@ -29931,6 +29960,17 @@ fn class_query_shell_state(
         && store
             .declared_type_links(plan.symbol)
             .is_some_and(|links| links != &super::DeclaredTypeLinks::default())
+    {
+        return Err(invalid_instance());
+    }
+    if plan.ambient_namespace.is_some()
+        && store.declared_type_links(plan.symbol).is_some_and(|links| {
+            links
+                != &(super::DeclaredTypeLinks {
+                    declared_type: instance,
+                    ..super::DeclaredTypeLinks::default()
+                })
+        })
     {
         return Err(invalid_instance());
     }
@@ -29949,6 +29989,13 @@ fn class_query_shell_state(
             }
             if exact_static_shell(store, plan.symbol, type_) {
                 StaticShellState::WarmShell(type_)
+            } else if plan.ambient_namespace.is_some() {
+                let shells = empty_ambient_namespace_class_shells(store, host, plan.symbol)?
+                    .ok_or_else(invalid_value)?;
+                if instance != Some(shells.instance_type) || type_ != shells.value_type {
+                    return Err(invalid_value());
+                }
+                StaticShellState::WarmMembers(type_)
             } else if instance.is_some_and(|instance| {
                 validate_class_heritage_members(store, instance)
                     == ClassHeritageMembersValidation::Valid
@@ -29986,6 +30033,155 @@ fn class_query_shell_state(
         return Err(invalid_value());
     }
     Ok(ClassShellState { instance, value })
+}
+
+/// Checks namespace query caches and the existing empty-class member proof.
+pub(super) fn validate_ambient_namespace_class_query_shell(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<(), ClassError> {
+    let plan = plan_class_query(store, host, symbol)?;
+    if plan.ambient_namespace.is_none() {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+    }
+    class_query_shell_state(store, host, &plan)?;
+    Ok(())
+}
+
+/// Selects the full heritage worker only after proving its retained derived state.
+#[allow(clippy::too_many_lines)] // Recheck the actual source owner before distinguishing cold and completed claims.
+pub(super) fn ambient_class_heritage_requires_full_members(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<bool, ClassError> {
+    let invalid = || invariant(ClassInvariant::InvalidOwnerSymbol(symbol));
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return Err(invalid());
+    };
+    let source = bound.source_file();
+    let source_record = preflight_node(store, host, source)?;
+    let NodeData::SourceFile(source_data) = &source_record.data else {
+        return Err(invalid());
+    };
+    if record.kind != SyntaxKind::ClassDeclaration
+        || record.flags.0 & (NODE_FLAG_JSDOC | NODE_FLAG_HAS_ERROR) != 0
+        || record.parent != Some(source.node)
+        || source_record.kind != SyntaxKind::SourceFile
+        || source_record.parent.is_some()
+        || source_data
+            .statements
+            .nodes
+            .iter()
+            .filter(|&&node| node == declaration.node)
+            .count()
+            != 1
+        || bound
+            .source_facts()
+            .is_none_or(|facts| !facts.is_javascript_file() || facts.is_external_module())
+        || class.type_parameters.is_some()
+        || class.modifiers.is_some()
+        || class.heritage_clauses.is_none()
+        || !class.members.nodes.is_empty()
+        || class.members.has_trailing_comma
+        || class.flow_node.is_some()
+        || class.local_symbol.is_some()
+        || class.symbol.is_some()
+        || class.next_container.is_some()
+        || class.facts != 0
+        || owner.flags() != SymbolFlags::CLASS
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.declarations() != Some(&[declaration])
+        || owner.value_declaration() != Some(declaration)
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || bound.symbol(declaration) != Some(symbol)
+        || bound.local_symbol(declaration).is_some()
+        || !host.symbol_matches(store, declaration, symbol)
+        || !store.source_symbol_declarations_match(symbol)
+        || !store.source_declaration_belongs_to_symbol(declaration, symbol)
+    {
+        return Err(invalid());
+    }
+    let name = class
+        .name
+        .map(|name| NodeRef::new(declaration.arena, declaration.file, name))
+        .ok_or_else(invalid)?;
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid());
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(declaration.node)
+        || name_record.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || owner.name().as_utf8() != Some(identifier.text.as_str())
+        || bound
+            .locals(source)
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get(owner.name()))
+            != Some(symbol)
+    {
+        return Err(invalid());
+    }
+    let instance = store
+        .declared_type_links(symbol)
+        .and_then(|links| links.declared_type);
+    if store.declared_type_initialization_in_progress(symbol)
+        || store.declared_type_links(symbol).is_some_and(|links| {
+            links
+                != &super::DeclaredTypeLinks {
+                    declared_type: instance,
+                    ..super::DeclaredTypeLinks::default()
+                }
+        })
+    {
+        return Err(invariant(ClassInvariant::InvalidInstanceCache(symbol)));
+    }
+    let retained = store.has_direct_class_heritage_claim_for_symbol(symbol)
+        || store.source_class_provenance_for_symbol(symbol).is_some()
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+        || instance.is_some_and(|instance| has_instance_member_publication(store, instance));
+    if retained {
+        let members = if store.source_class_provenance_for_symbol(symbol).is_some() {
+            completed_source_class_members(store, host, symbol)?
+                .ok_or_else(|| invariant(ClassInvariant::InvalidHeritageCache(symbol)))?
+        } else {
+            let ClassMemberQueryPlan::Derived { class, base } =
+                plan_nongeneric_class_member_query(store, host, symbol)?
+            else {
+                return Err(invariant(ClassInvariant::InvalidHeritageCache(symbol)));
+            };
+            let surfaces = prepare_derived_member_surfaces(store, &class, &base)?;
+            let base_state = validated_nongeneric_class_member_state(store, host, &base)?;
+            derived_class_member_state(store, &class, base_state.as_ref(), &surfaces)?
+                .ok_or_else(|| invariant(ClassInvariant::InvalidHeritageCache(symbol)))?
+        };
+        if members.shells.declaration != declaration
+            || members.shells.symbol != symbol
+            || instance != Some(members.shells.instance_type)
+            || validate_class_heritage_members(store, members.shells.instance_type)
+                != ClassHeritageMembersValidation::Valid
+        {
+            return Err(invariant(ClassInvariant::InvalidInstanceMembers(symbol)));
+        }
+        return Ok(true);
+    }
+    if let Some(instance) = instance {
+        validate_cold_class_instance_for_display(store, host, symbol, instance)?;
+    } else {
+        validate_cold_class_binding_tables(store, host, symbol, declaration, &class.members.nodes)?;
+    }
+    Ok(false)
 }
 
 /// Checks a cold class name without publishing member types or constructor state.
@@ -30281,7 +30477,7 @@ pub(super) fn execute_class_query_shells(
     if plan_class_query(store, host, plan.symbol)? != *plan {
         return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration)));
     }
-    let state = class_query_shell_state(store, plan)?;
+    let state = class_query_shell_state(store, host, plan)?;
     if let StaticShellState::WarmShell(value_type) | StaticShellState::WarmMembers(value_type) =
         state.value
     {
@@ -30316,7 +30512,7 @@ pub(super) fn execute_class_query_shells(
         base_constructor,
         None,
     )?;
-    let after = class_query_shell_state(store, plan)?;
+    let after = class_query_shell_state(store, host, plan)?;
     if after.instance != Some(instance_type)
         || after.value != StaticShellState::WarmShell(value_type)
     {
@@ -30345,21 +30541,33 @@ pub(super) fn class_query_type_side(
     {
         return Ok(None);
     }
-    if let Some(shells) = empty_ambient_namespace_class_shells(store, host, symbol)? {
-        return Ok(if type_ == shells.instance_type {
-            Some(ClassQueryTypeSide::Instance)
-        } else if type_ == shells.value_type {
-            Some(ClassQueryTypeSide::Value)
-        } else {
-            None
-        });
+    if let Some(declaration) = store.symbol(symbol).and_then(Symbol::value_declaration)
+        && empty_ambient_namespace_class_syntax(host, declaration)
+        && super::source_namespaces::plan_ambient_namespace_class_query_owner(
+            store,
+            host,
+            symbol,
+            declaration,
+        )
+        .map_err(|_| invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))?
+        .is_none()
+    {
+        if let Some(shells) = empty_ambient_namespace_class_shells(store, host, symbol)? {
+            return Ok(if type_ == shells.instance_type {
+                Some(ClassQueryTypeSide::Instance)
+            } else if type_ == shells.value_type {
+                Some(ClassQueryTypeSide::Value)
+            } else {
+                None
+            });
+        }
     }
     let plan = match plan_class_query(store, host, symbol) {
         Ok(plan) => plan,
         Err(ClassError::Unsupported(_)) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let state = class_query_shell_state(store, &plan)?;
+    let state = class_query_shell_state(store, host, &plan)?;
     if state.instance == Some(type_) {
         return Ok(Some(ClassQueryTypeSide::Instance));
     }
@@ -30397,7 +30605,7 @@ pub(super) fn class_query_is_this_type(
         Err(ClassError::Unsupported(_)) => return Ok(false),
         Err(error) => return Err(error),
     };
-    let state = class_query_shell_state(store, &plan)?;
+    let state = class_query_shell_state(store, host, &plan)?;
     Ok(state
         .instance
         .and_then(|instance| exact_class_instance_identity(store, symbol, instance))
@@ -40732,6 +40940,301 @@ mod query_tests {
         (owner, field, declaration, initializer, parameter)
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)] // Damage and restore each real owner and cache on its own graph.
+    fn ambient_namespace_class_query_shells_reject_changed_owner_and_cache_state() {
+        let parsed =
+            parse_source_file("declare namespace Library { class Entry {} class Other {} }");
+        let file = FileId::new(14_414);
+        for warm in [false, true] {
+            for poison in [
+                "export",
+                "local",
+                "declaration",
+                "prototype",
+                "instance",
+                "declared_flags",
+                "value",
+                "namespace_value",
+                "resolved_exports",
+                "namespace_exports_table",
+                "class_exports_table",
+                "base_constructor",
+            ] {
+                let mut context = context(&parsed, file, CanonicalModuleState::Script);
+                let (declaration, owner) = class(&context, &parsed, file, "Entry");
+                let (other_declaration, other) = class(&context, &parsed, file, "Other");
+                let instance = context.get_declared_type_of_symbol(owner).unwrap();
+                let prior = warm.then(|| context.get_class_query_shells(owner).unwrap());
+                let other_shells = context.get_class_query_shells(other).unwrap();
+                let owner_record = context.store().symbol(owner).unwrap().clone();
+                let namespace = owner_record.parent().unwrap();
+                let namespace_record = context.store().symbol(namespace).unwrap().clone();
+                let namespace_exports = namespace_record.exports().unwrap();
+                let local = context
+                    .file(file)
+                    .unwrap()
+                    .1
+                    .local_symbol(declaration)
+                    .unwrap();
+                let local_record = context.store().symbol(local).unwrap().clone();
+                let prototype = context
+                    .store()
+                    .symbol_table(owner_record.exports().unwrap())
+                    .unwrap()
+                    .get_source("prototype")
+                    .unwrap();
+                let prototype_record = context.store().symbol(prototype).unwrap().clone();
+                let declared = context.store().declared_type_links(owner).unwrap().clone();
+                let value = context
+                    .store()
+                    .value_symbol_links(owner)
+                    .cloned()
+                    .unwrap_or_default();
+                let namespace_value = context
+                    .store()
+                    .value_symbol_links(namespace)
+                    .cloned()
+                    .unwrap_or_default();
+                let namespace_links = context
+                    .store()
+                    .module_symbol_links(namespace)
+                    .cloned()
+                    .unwrap_or_default();
+                let TypeData::Interface(instance_data) =
+                    context.store().type_payload(instance).unwrap().data()
+                else {
+                    panic!("the class must retain its declared instance")
+                };
+                let base_constructor = instance_data.resolved_base_constructor_type;
+                let store = context.store_mut_for_test();
+                match poison {
+                    "export" => assert_eq!(
+                        store.insert_symbol(namespace_exports, EscapedName::source("Entry"), other),
+                        Some(Some(owner))
+                    ),
+                    "local" => assert!(store.set_symbol_relationships(
+                        local,
+                        local_record.members(),
+                        local_record.exports(),
+                        local_record.parent(),
+                        Some(other)
+                    )),
+                    "declaration" => assert!(store.set_symbol_declarations(
+                        owner,
+                        Some(vec![declaration]),
+                        Some(other_declaration)
+                    )),
+                    "prototype" => assert!(store.set_symbol_flags(
+                        prototype,
+                        SymbolFlags::PROPERTY,
+                        prototype_record.check_flags()
+                    )),
+                    "instance" => assert!(store.set_declared_type_links(
+                        owner,
+                        super::super::DeclaredTypeLinks {
+                            declared_type: Some(other_shells.instance_type()),
+                            ..declared.clone()
+                        }
+                    )),
+                    "declared_flags" => assert!(store.set_declared_type_links(
+                        owner,
+                        super::super::DeclaredTypeLinks {
+                            enum_checked: true,
+                            ..declared.clone()
+                        }
+                    )),
+                    "value" => assert!(store.set_value_symbol_links(
+                        owner,
+                        ValueSymbolLinks {
+                            resolved_type: Some(other_shells.value_type()),
+                            ..ValueSymbolLinks::default()
+                        }
+                    )),
+                    "namespace_value" => assert!(store.set_value_symbol_links(
+                        namespace,
+                        ValueSymbolLinks {
+                            resolved_type: Some(other_shells.value_type()),
+                            ..ValueSymbolLinks::default()
+                        }
+                    )),
+                    "resolved_exports" => {
+                        let foreign = store.clone_symbol_table(namespace_exports).unwrap();
+                        assert_ne!(foreign, namespace_exports);
+                        let mut links = namespace_links.clone();
+                        links.resolved_exports = Some(foreign);
+                        assert!(store.set_module_symbol_links(namespace, links));
+                    }
+                    "namespace_exports_table" => {
+                        let copied = store.clone_symbol_table(namespace_exports).unwrap();
+                        assert_ne!(copied, namespace_exports);
+                        assert!(store.set_symbol_relationships(
+                            namespace,
+                            namespace_record.members(),
+                            Some(copied),
+                            namespace_record.parent(),
+                            namespace_record.export_symbol()
+                        ));
+                    }
+                    "class_exports_table" => {
+                        let exports = owner_record.exports().unwrap();
+                        let copied = store.clone_symbol_table(exports).unwrap();
+                        assert_ne!(copied, exports);
+                        assert!(store.set_symbol_relationships(
+                            owner,
+                            owner_record.members(),
+                            Some(copied),
+                            owner_record.parent(),
+                            owner_record.export_symbol()
+                        ));
+                    }
+                    "base_constructor" => assert!(store.set_interface_base_resolution(
+                        instance,
+                        false,
+                        Some(other_shells.value_type()),
+                        None
+                    )),
+                    _ => unreachable!(),
+                }
+                let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                    (
+                        format!("{:?}", context.store()),
+                        context.diagnostics().clone(),
+                    )
+                };
+                let changed = snapshot(&context);
+                for _ in 0..2 {
+                    assert!(
+                        context.get_class_query_shells(owner).is_err(),
+                        "{warm}, {poison}"
+                    );
+                    assert_eq!(snapshot(&context), changed);
+                }
+                let store = context.store_mut_for_test();
+                assert!(
+                    store
+                        .insert_symbol(namespace_exports, EscapedName::source("Entry"), owner)
+                        .is_some()
+                );
+                assert!(store.set_symbol_relationships(
+                    local,
+                    local_record.members(),
+                    local_record.exports(),
+                    local_record.parent(),
+                    local_record.export_symbol()
+                ));
+                for (symbol, record) in [(owner, &owner_record), (namespace, &namespace_record)] {
+                    assert!(store.set_symbol_relationships(
+                        symbol,
+                        record.members(),
+                        record.exports(),
+                        record.parent(),
+                        record.export_symbol()
+                    ));
+                }
+                assert!(store.set_symbol_declarations(
+                    owner,
+                    owner_record.declarations().map(<[NodeRef]>::to_vec),
+                    owner_record.value_declaration()
+                ));
+                assert!(store.set_symbol_flags(
+                    prototype,
+                    prototype_record.flags(),
+                    prototype_record.check_flags()
+                ));
+                assert!(store.set_declared_type_links(owner, declared));
+                assert!(store.set_value_symbol_links(owner, value));
+                assert!(store.set_value_symbol_links(namespace, namespace_value));
+                assert!(store.set_module_symbol_links(namespace, namespace_links));
+                assert!(store.set_interface_base_resolution(
+                    instance,
+                    false,
+                    base_constructor,
+                    None
+                ));
+                let restored = context.get_class_query_shells(owner).unwrap();
+                assert_eq!(restored.instance_type(), instance);
+                if let Some(prior) = prior {
+                    assert_eq!(restored, prior);
+                }
+                let after = snapshot(&context);
+                assert_eq!(context.get_class_query_shells(owner), Ok(restored));
+                assert_eq!(snapshot(&context), after);
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ambient_namespace_class_queries_keep_runtime_generic_and_merged_boundaries() {
+        for source in [
+            "namespace Library { export class Entry {} }",
+            "declare namespace Library { class Entry<T> {} }",
+            "declare namespace Library { class Entry { value: string; } }",
+            "declare namespace Library { class Base {} class Entry extends Base {} }",
+            "declare namespace Library { interface Entry {} class Entry {} }",
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(14_415);
+            let mut context = context(&parsed, file, CanonicalModuleState::Script);
+            let (_, owner) = class(&context, &parsed, file, "Entry");
+            let before = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert!(context.get_class_query_shells(owner).is_err(), "{source}");
+                assert_eq!(format!("{:?}", context.store()), before);
+            }
+            assert!(context.store().declared_type_links(owner).is_none());
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert!(context.diagnostics().is_empty());
+        }
+
+        let parsed = parse_source_file(concat!(
+            "declare namespace Library { class Entry {} } ",
+            "declare namespace Library { class Other {} }",
+        ));
+        let file = FileId::new(14_416);
+        let mut context = context(&parsed, file, CanonicalModuleState::Script);
+        let (_, owner) = class(&context, &parsed, file, "Entry");
+        let instance = context.get_declared_type_of_symbol(owner).unwrap();
+        for resolved_exports in [false, true] {
+            if resolved_exports {
+                let namespace = context.store().symbol(owner).unwrap().parent().unwrap();
+                let exports = context
+                    .store()
+                    .symbol(namespace)
+                    .unwrap()
+                    .exports()
+                    .unwrap();
+                let copied = context
+                    .store_mut_for_test()
+                    .clone_symbol_table(exports)
+                    .unwrap();
+                let mut links = context
+                    .store()
+                    .module_symbol_links(namespace)
+                    .cloned()
+                    .unwrap_or_default();
+                links.resolved_exports = Some(copied);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_module_symbol_links(namespace, links)
+                );
+            }
+            let before = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert!(matches!(
+                    context.get_class_query_shells(owner),
+                    Err(ClassError::Unsupported(_))
+                ));
+                assert_eq!(context.type_to_string(instance).unwrap(), "Entry");
+                assert_eq!(format!("{:?}", context.store()), before);
+            }
+        }
+        assert!(context.store().value_symbol_links(owner).is_none());
+        assert!(context.diagnostics().is_empty());
+    }
+
     fn standard_field_query_counts(
         context: &CanonicalCheckerContext<'_>,
     ) -> ([usize; 4], [usize; 26]) {
@@ -41870,6 +42373,260 @@ mod javascript_qualified_base_tests {
                     )
                 })
                 .collect(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both real producer orders retain the same pair and distinct query-owner limits.
+    fn ambient_class_query_and_member_orders_keep_the_original_pair() {
+        for merged in [false, true] {
+            for query_first in [false, true] {
+                let ambient = parse_source_file(if merged {
+                    "declare namespace Library { class Base {} } declare namespace Library { class Other {} }"
+                } else {
+                    AMBIENT
+                });
+                let javascript = parse_javascript_source_file("");
+                let mut context = context(
+                    &ambient,
+                    &javascript,
+                    true,
+                    CanonicalSourceLanguage::JavaScript,
+                );
+                let (declaration, base) = class(&context, &ambient, AMBIENT_FILE, "Base");
+                let source = context.source_file(AMBIENT_FILE).unwrap();
+                let source_links = context.store().source_file_links(source).cloned();
+                let query_shells = if query_first && !merged {
+                    Some(context.get_class_query_shells(base).unwrap())
+                } else {
+                    None
+                };
+                if merged {
+                    let before = format!("{:?}", context.store());
+                    assert!(matches!(
+                        context.get_class_query_shells(base),
+                        Err(ClassError::Unsupported(_))
+                    ));
+                    assert_eq!(format!("{:?}", context.store()), before);
+                }
+                assert_eq!(
+                    context.store().source_file_links(source),
+                    source_links.as_ref()
+                );
+                if query_first {
+                    context.check_source_file(AMBIENT_FILE).unwrap();
+                }
+                let members = context.get_nongeneric_class_members(base).unwrap();
+                let shells = members.shells();
+                if let Some(query_shells) = query_shells {
+                    assert_eq!(shells, query_shells);
+                }
+                if !query_first {
+                    assert_eq!(
+                        context.store().source_file_links(source),
+                        source_links.as_ref()
+                    );
+                }
+                if !merged {
+                    assert_eq!(context.get_class_query_shells(base), Ok(shells));
+                }
+                context.check_source_file(AMBIENT_FILE).unwrap();
+                let stable = format!("{:?}", context.store());
+                for _ in 0..2 {
+                    if merged {
+                        assert!(matches!(
+                            context.get_class_query_shells(base),
+                            Err(ClassError::Unsupported(_))
+                        ));
+                    } else {
+                        assert_eq!(context.get_class_query_shells(base), Ok(shells));
+                    }
+                    let host = context.declared_type_host().unwrap();
+                    assert_eq!(
+                        super::super::source_namespaces::plan_ambient_namespace_class_query_owner(
+                            context.store(),
+                            &host,
+                            base,
+                            declaration,
+                        )
+                        .unwrap()
+                        .is_some(),
+                        !merged,
+                    );
+                    assert_eq!(
+                        class_query_type_side(context.store(), &host, shells.instance_type()),
+                        Ok(Some(ClassQueryTypeSide::Instance)),
+                    );
+                    assert_eq!(
+                        class_query_type_side(context.store(), &host, shells.value_type()),
+                        Ok(Some(ClassQueryTypeSide::Value)),
+                    );
+                    assert_eq!(
+                        super::super::source_namespaces::validate_ambient_namespace_class_for_display(
+                            context.store(),
+                            &host,
+                            base,
+                            declaration,
+                        ),
+                        Ok(()),
+                    );
+                    assert_eq!(format!("{:?}", context.store()), stable);
+                    assert_eq!(
+                        context.get_nongeneric_class_members(base),
+                        Ok(members.clone())
+                    );
+                    context.recheck_source_file(AMBIENT_FILE).unwrap();
+                    assert_eq!(format!("{:?}", context.store()), stable);
+                    assert!(
+                        context
+                            .store()
+                            .source_class_provenance_for_symbol(base)
+                            .is_none()
+                    );
+                    assert!(context.diagnostics().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Damage each real query/member state without retrying another proof family.
+    fn ambient_class_state_reads_reject_damage_without_query_fallback() {
+        for members_ready in [false, true] {
+            for damage in 0..7 {
+                if damage == 6 && !members_ready {
+                    continue;
+                }
+                let ambient = parse_source_file(AMBIENT);
+                let javascript = parse_javascript_source_file("");
+                let mut context = context(
+                    &ambient,
+                    &javascript,
+                    true,
+                    CanonicalSourceLanguage::JavaScript,
+                );
+                let (declaration, base) = class(&context, &ambient, AMBIENT_FILE, "Base");
+                let (_, other) = class(&context, &ambient, AMBIENT_FILE, "Other");
+                let shells = context.get_class_query_shells(base).unwrap();
+                let other_shells = context.get_class_query_shells(other).unwrap();
+                let members =
+                    members_ready.then(|| context.get_nongeneric_class_members(base).unwrap());
+                context.check_source_file(AMBIENT_FILE).unwrap();
+                let namespace = context.store().symbol(base).unwrap().parent().unwrap();
+                let declared = context.store().declared_type_links(base).unwrap().clone();
+                let value = context.store().value_symbol_links(base).unwrap().clone();
+                let namespace_value = context.store().value_symbol_links(namespace).cloned();
+                let namespace_links = context.store().module_symbol_links(namespace).cloned();
+                let flags = context
+                    .store()
+                    .type_payload(shells.instance_type())
+                    .unwrap()
+                    .object_flags();
+                let exports = context
+                    .store()
+                    .symbol(namespace)
+                    .unwrap()
+                    .exports()
+                    .unwrap();
+                let changed_exports = (damage == 4).then(|| {
+                    context
+                        .store_mut_for_test()
+                        .clone_symbol_table(exports)
+                        .unwrap()
+                });
+                let store = context.store_mut_for_test();
+                match damage {
+                    0 => {
+                        let mut changed = declared.clone();
+                        changed.enum_checked = true;
+                        assert!(store.set_declared_type_links(base, changed));
+                    }
+                    1 => {
+                        let mut changed = declared.clone();
+                        changed.declared_type = Some(other_shells.instance_type());
+                        assert!(store.set_declared_type_links(base, changed));
+                    }
+                    2 => {
+                        let mut changed = value.clone();
+                        changed.resolved_type = Some(other_shells.value_type());
+                        assert!(store.set_value_symbol_links(base, changed));
+                    }
+                    3 => assert!(store.set_value_symbol_links(
+                        namespace,
+                        ValueSymbolLinks {
+                            resolved_type: Some(other_shells.value_type()),
+                            ..ValueSymbolLinks::default()
+                        },
+                    )),
+                    4 => {
+                        let mut changed = namespace_links.clone().unwrap_or_default();
+                        changed.resolved_exports = changed_exports;
+                        assert!(store.set_module_symbol_links(namespace, changed));
+                    }
+                    5 => assert!(store.set_type_object_flags(
+                        shells.instance_type(),
+                        if members_ready {
+                            flags & !ObjectFlags::MEMBERS_RESOLVED
+                        } else {
+                            flags | ObjectFlags::MEMBERS_RESOLVED
+                        },
+                    )),
+                    6 => assert!(store.set_signature_resolved_return_type(
+                        members.as_ref().unwrap().default_construct_signature,
+                        Some(other_shells.instance_type()),
+                    )),
+                    _ => unreachable!(),
+                }
+                let before = (
+                    format!("{:?}", context.store()),
+                    context.diagnostics().clone(),
+                );
+                for _ in 0..2 {
+                    assert!(
+                        context.get_class_query_shells(base).is_err(),
+                        "{members_ready}/{damage}"
+                    );
+                    let host = context.declared_type_host().unwrap();
+                    assert!(
+                        class_query_type_side(context.store(), &host, shells.value_type()).is_err()
+                    );
+                    assert_eq!(
+                        super::super::source_namespaces::validate_ambient_namespace_class_for_display(
+                            context.store(),
+                            &host,
+                            base,
+                            declaration,
+                        ),
+                        Err(SourceCheckError::Class(declaration)),
+                    );
+                    assert_eq!(
+                        (
+                            format!("{:?}", context.store()),
+                            context.diagnostics().clone()
+                        ),
+                        before,
+                    );
+                }
+                let store = context.store_mut_for_test();
+                assert!(store.set_declared_type_links(base, declared));
+                assert!(store.set_value_symbol_links(base, value));
+                assert!(
+                    store.set_value_symbol_links(namespace, namespace_value.unwrap_or_default())
+                );
+                assert!(
+                    store.set_module_symbol_links(namespace, namespace_links.unwrap_or_default())
+                );
+                assert!(store.set_type_object_flags(shells.instance_type(), flags));
+                if let Some(members) = members {
+                    assert!(store.set_signature_resolved_return_type(
+                        members.default_construct_signature,
+                        Some(shells.instance_type()),
+                    ));
+                }
+                assert_eq!(context.get_class_query_shells(base), Ok(shells));
+                context.recheck_source_file(AMBIENT_FILE).unwrap();
+                assert!(context.diagnostics().is_empty());
+            }
         }
     }
 
