@@ -1,10 +1,13 @@
-//! Source-ordered function statements and their binder identities.
+//! Source-ordered callable statements and their binder identities.
 //!
 //! Returning branches retain local declarations, expression statements, and
 //! their actual return nodes. A trailing return path can supply the false path
 //! of an if without an else. Fallthrough branches retain their calls and local
 //! declarations before the final return. Expression checking, narrowing, and
 //! return inference stay in the source checker.
+//! The common statement list retains nested blocks and conditional early returns
+//! for synchronous nongeneric functions and arrows. Its leaves use these same
+//! local, expression, condition, and return syntax checks.
 
 use std::collections::HashSet;
 
@@ -28,6 +31,7 @@ use super::{
 const NODE_FLAG_LET: u32 = 1 << 0;
 const NODE_FLAG_CONST: u32 = 1 << 1;
 const MAX_NESTED_CAPTURED_LOOPS: usize = 8;
+const MAX_CALLABLE_STATEMENT_DEPTH: usize = 64;
 
 /// The exact syntactic owner at which the closed statement proof stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -472,6 +476,109 @@ pub(super) struct SourceLinearFunctionStatementsSyntax {
     pub(super) unreachable_ranges: Vec<CanonicalCheckerDiagnosticRange>,
 }
 
+/// One source-owned statement list shared by functions and arrows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableStatementListSyntax {
+    pub(super) callable: SourceCallablePlan,
+    pub(super) statements: Vec<SourceCallableStatementSyntax>,
+    pub(super) has_implicit_return: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum SourceCallableStatementSyntax {
+    Leaf(SourceLinearFunctionStatementSyntax),
+    Empty(NodeRef),
+    Block {
+        block: NodeRef,
+        statements: Vec<Self>,
+    },
+    If(Box<SourceCallableIfSyntax>),
+    Return {
+        statement: NodeRef,
+        expression: Option<NodeRef>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableIfSyntax {
+    pub(super) control: SourceControlIfSyntax,
+    pub(super) condition_identifier: Option<NodeRef>,
+    pub(super) typeof_condition: Option<SourceTypeofConditionSyntax>,
+    pub(super) equality_condition: Option<SourceEqualityConditionSyntax>,
+    pub(super) then_statements: Vec<SourceCallableStatementSyntax>,
+    pub(super) else_statements: Vec<SourceCallableStatementSyntax>,
+}
+
+impl SourceCallableStatementListSyntax {
+    /// Returns only the lexical scope retained by the complete source walk.
+    pub(super) fn statement_scope(&self, wanted: NodeRef) -> Option<NodeRef> {
+        let mut pending = self
+            .statements
+            .iter()
+            .map(|statement| (statement, self.callable.declaration))
+            .collect::<Vec<_>>();
+        while let Some((statement, scope)) = pending.pop() {
+            let node = match statement {
+                SourceCallableStatementSyntax::Leaf(
+                    SourceLinearFunctionStatementSyntax::Local(local),
+                ) => local.statement,
+                SourceCallableStatementSyntax::Leaf(
+                    SourceLinearFunctionStatementSyntax::Expression { statement, .. },
+                )
+                | SourceCallableStatementSyntax::Return { statement, .. } => *statement,
+                SourceCallableStatementSyntax::Empty(node) => *node,
+                SourceCallableStatementSyntax::Block { block, statements } => {
+                    pending.extend(statements.iter().map(|statement| (statement, *block)));
+                    *block
+                }
+                SourceCallableStatementSyntax::If(branch) => {
+                    pending.extend(
+                        branch
+                            .then_statements
+                            .iter()
+                            .map(|statement| (statement, scope)),
+                    );
+                    pending.extend(
+                        branch
+                            .else_statements
+                            .iter()
+                            .map(|statement| (statement, scope)),
+                    );
+                    branch.control.statement
+                }
+                SourceCallableStatementSyntax::Leaf(_) => return None,
+            };
+            if node == wanted {
+                return Some(scope);
+            }
+        }
+        None
+    }
+
+    pub(super) fn expression_scope(&self, wanted: NodeRef) -> Option<NodeRef> {
+        let mut pending = self.statements.iter().collect::<Vec<_>>();
+        while let Some(statement) = pending.pop() {
+            match statement {
+                SourceCallableStatementSyntax::Leaf(
+                    SourceLinearFunctionStatementSyntax::Expression {
+                        statement,
+                        expression,
+                    },
+                ) if *expression == wanted => return self.statement_scope(*statement),
+                SourceCallableStatementSyntax::Block { statements, .. } => {
+                    pending.extend(statements)
+                }
+                SourceCallableStatementSyntax::If(branch) => {
+                    pending.extend(&branch.then_statements);
+                    pending.extend(&branch.else_statements);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
 /// One initialized lexical declaration or expression inside a loop body.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SourceLoopFunctionStatementSyntax {
@@ -703,6 +810,7 @@ pub(super) fn plan_source_function_statements_syntax(
         bound,
         store,
         callable,
+        statement_scope: None,
     }
     .plan()
 }
@@ -1382,6 +1490,7 @@ pub(super) fn plan_source_function_for_in_statement_syntax(
         bound,
         store,
         callable,
+        statement_scope: None,
     }
     .plan_for_in()
 }
@@ -1398,6 +1507,7 @@ pub(super) fn plan_source_function_for_of_statement_syntax(
         bound,
         store,
         callable,
+        statement_scope: None,
     }
     .plan_for_of()
 }
@@ -1717,6 +1827,7 @@ fn plan_source_scoped_iteration_statement_syntax(
                     bound,
                     store,
                     callable,
+                    statement_scope: None,
                 }
                 .plan_local_statement(body_statement, control.body, container)?;
                 statements.extend(
@@ -4508,6 +4619,7 @@ pub(super) fn plan_source_linear_function_statements_syntax(
         bound,
         store,
         callable,
+        statement_scope: None,
     }
     .plan_linear()
 }
@@ -4524,6 +4636,7 @@ pub(super) fn plan_source_loop_function_statements_syntax(
         bound,
         store,
         callable,
+        statement_scope: None,
     }
     .plan_loop()
 }
@@ -4540,6 +4653,7 @@ pub(super) fn plan_source_conditional_enum_function_statements_syntax(
         bound,
         store,
         callable,
+        statement_scope: None,
     }
     .plan_conditional_enum()
 }
@@ -4556,6 +4670,7 @@ pub(super) fn plan_source_switch_function_statements_syntax(
         bound,
         store,
         callable,
+        statement_scope: None,
     }
     .plan_switch()
 }
@@ -4572,6 +4687,7 @@ pub(super) fn plan_source_void_switch_function_statements_syntax(
         bound,
         store,
         callable,
+        statement_scope: None,
     }
     .plan_void_switch()
 }
@@ -4588,6 +4704,7 @@ pub(super) fn plan_source_typeof_switch_function_statements_syntax(
         bound,
         store,
         callable,
+        statement_scope: None,
     }
     .plan_typeof_switch()
 }
@@ -4609,8 +4726,26 @@ pub(super) fn plan_source_joined_function_statements_syntax(
         bound,
         store,
         callable,
+        statement_scope: None,
     }
     .plan_joined()
+}
+
+/// Proves the common synchronous statement grammar without publishing state.
+pub(super) fn plan_source_callable_statement_list_syntax(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    callable: &SourceCallablePlan,
+) -> Result<SourceCallableStatementListSyntax, SourceFunctionStatementsError> {
+    SyntaxPlanner {
+        arena,
+        bound,
+        store,
+        callable,
+        statement_scope: None,
+    }
+    .plan_callable_statement_list()
 }
 
 struct SyntaxPlanner<'a> {
@@ -4618,9 +4753,297 @@ struct SyntaxPlanner<'a> {
     bound: &'a BoundFile,
     store: &'a CanonicalTypeMapperStore,
     callable: &'a SourceCallablePlan,
+    /// Set only while walking an authenticated common statement list.
+    statement_scope: Option<NodeRef>,
 }
 
 impl SyntaxPlanner<'_> {
+    fn plan_callable_statement_list(
+        &self,
+    ) -> Result<SourceCallableStatementListSyntax, SourceFunctionStatementsError> {
+        let declaration = self.callable.declaration;
+        if !declaration.is_for(self.arena.id(), self.bound.file_id())
+            || self.bound.node_arena_id() != self.arena.id()
+            || self.bound.node_arena_revision() != self.arena.revision()
+        {
+            return Err(SourceFunctionStatementsInvariant::BoundSourceMismatch(declaration).into());
+        }
+        let record = self.node(declaration)?;
+        if self.callable.is_async
+            || !self.callable.type_parameters.is_empty()
+            || self.callable.type_predicate.is_some()
+            || self
+                .bound
+                .source_facts()
+                .is_none_or(|facts| facts.is_javascript_file() || facts.is_declaration_file())
+        {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        }
+        match &record.data {
+            NodeData::FunctionDeclaration(function)
+                if record.kind == SyntaxKind::FunctionDeclaration
+                    && self.callable.family == SourceCallableFamily::FunctionDeclaration
+                    && function.body == Some(self.callable.body.node)
+                    && function.type_
+                        == self.callable.return_type.type_node().map(|node| node.node)
+                    && function.type_parameters.is_none()
+                    && function.asterisk_token.is_none() =>
+            {
+                if self.bound.symbol(declaration) != Some(self.callable.owner_symbol)
+                    || !function
+                        .parameters
+                        .nodes
+                        .iter()
+                        .copied()
+                        .map(|node| self.reference(node))
+                        .eq(self
+                            .callable
+                            .all_parameters()
+                            .map(|parameter| parameter.declaration))
+                    || self.callable.all_parameters().any(|parameter| {
+                        !source_parameter_declarations_are_exact(
+                            self.store,
+                            declaration,
+                            parameter.declaration,
+                            parameter.symbol,
+                        )
+                    })
+                {
+                    return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(
+                        declaration,
+                    )
+                    .into());
+                }
+            }
+            NodeData::ArrowFunction(arrow)
+                if record.kind == SyntaxKind::ArrowFunction
+                    && self.callable.family == SourceCallableFamily::ArrowFunction
+                    && arrow.type_parameters.is_none()
+                    && arrow.modifiers.is_none()
+                    && arrow.asterisk_token.is_none() =>
+            {
+                self.validate_for_of_arrow_callable()?
+            }
+            _ => {
+                return Err(self.unsupported(
+                    declaration,
+                    record.kind,
+                    SourceFunctionStatementsRole::Callable,
+                ));
+            }
+        }
+        let body = self.callable.body;
+        self.validate_range(body, declaration)?;
+        let nodes = self.plan_body(body, declaration)?;
+        let statements = self.plan_callable_list(&nodes, body, declaration, 0)?;
+        let flow = self.bound.flow_graph();
+        if flow.container_is_complete(declaration) != Some(true) {
+            return Err(SourceFunctionStatementsError::Unsupported(
+                SourceFunctionStatementsUnsupported::IncompleteFlow(declaration),
+            ));
+        }
+        if flow.container_start(declaration).is_none() {
+            return Err(SourceFunctionStatementsInvariant::MissingFlowStart(declaration).into());
+        }
+        if flow.container_return(declaration).is_some() {
+            return Err(
+                SourceFunctionStatementsInvariant::UnexpectedReturnFlow(declaration).into(),
+            );
+        }
+        Ok(SourceCallableStatementListSyntax {
+            callable: self.callable.clone(),
+            statements,
+            has_implicit_return: flow.container_end(declaration).is_some(),
+        })
+    }
+
+    fn plan_callable_list(
+        &self,
+        nodes: &[NodeId],
+        parent: NodeRef,
+        scope: NodeRef,
+        depth: usize,
+    ) -> Result<Vec<SourceCallableStatementSyntax>, SourceFunctionStatementsError> {
+        if depth >= MAX_CALLABLE_STATEMENT_DEPTH {
+            return Err(self.unsupported(
+                parent,
+                self.node(parent)?.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+        let planner = SyntaxPlanner {
+            arena: self.arena,
+            bound: self.bound,
+            store: self.store,
+            callable: self.callable,
+            statement_scope: Some(scope),
+        };
+        let mut statements = Vec::new();
+        for &node in nodes {
+            let statement = self.reference(node);
+            if self.bound.flow_graph().is_unreachable(statement) == Some(true) {
+                return Err(self.unsupported(
+                    statement,
+                    self.node(statement)?.kind,
+                    SourceFunctionStatementsRole::BodyStatement,
+                ));
+            }
+            statements.extend(planner.plan_callable_statement(statement, parent, scope, depth)?);
+        }
+        Ok(statements)
+    }
+
+    fn plan_callable_statement(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        scope: NodeRef,
+        depth: usize,
+    ) -> Result<Vec<SourceCallableStatementSyntax>, SourceFunctionStatementsError> {
+        let callable = self.callable.declaration;
+        let kind = self.node(statement)?.kind;
+        let result = match kind {
+            SyntaxKind::VariableStatement => {
+                return self
+                    .plan_local_statement(statement, parent, callable)
+                    .map(|locals| {
+                        locals
+                            .into_iter()
+                            .map(|local| {
+                                SourceCallableStatementSyntax::Leaf(
+                                    SourceLinearFunctionStatementSyntax::Local(local),
+                                )
+                            })
+                            .collect()
+                    });
+            }
+            SyntaxKind::ExpressionStatement => {
+                let expression =
+                    self.plan_linear_expression_statement(statement, parent, callable, false)?;
+                SourceCallableStatementSyntax::Leaf(
+                    SourceLinearFunctionStatementSyntax::Expression {
+                        statement,
+                        expression,
+                    },
+                )
+            }
+            SyntaxKind::EmptyStatement => {
+                self.validate_empty_statement(statement, parent, callable)?;
+                SourceCallableStatementSyntax::Empty(statement)
+            }
+            SyntaxKind::ReturnStatement => SourceCallableStatementSyntax::Return {
+                statement,
+                expression: self.plan_linear_return(statement, parent, callable)?,
+            },
+            SyntaxKind::Block => {
+                let record = self.node(statement)?;
+                let NodeData::Block(block) = &record.data else {
+                    return Err(self.unsupported(
+                        statement,
+                        kind,
+                        SourceFunctionStatementsRole::BranchBlock,
+                    ));
+                };
+                if record.flags.0 != 0
+                    || record.parent != Some(parent.node)
+                    || block.flow_node.is_some()
+                    || block.next_container.is_some()
+                    || block.statements.has_trailing_comma
+                    || block.facts != 0
+                {
+                    return Err(self.unsupported(
+                        statement,
+                        kind,
+                        SourceFunctionStatementsRole::BranchBlock,
+                    ));
+                }
+                self.validate_range(statement, parent)?;
+                self.validate_container(statement, callable)?;
+                self.validate_block_scope_container(statement, scope)?;
+                self.validate_node_list(
+                    statement,
+                    block.statements.range,
+                    &block.statements.nodes,
+                )?;
+                SourceCallableStatementSyntax::Block {
+                    block: statement,
+                    statements: self.plan_callable_list(
+                        &block.statements.nodes,
+                        statement,
+                        statement,
+                        depth + 1,
+                    )?,
+                }
+            }
+            SyntaxKind::IfStatement => SourceCallableStatementSyntax::If(Box::new(
+                self.plan_callable_if(statement, parent, scope, depth)?,
+            )),
+            _ => {
+                return Err(self.unsupported(
+                    statement,
+                    kind,
+                    SourceFunctionStatementsRole::BodyStatement,
+                ));
+            }
+        };
+        Ok(vec![result])
+    }
+
+    fn plan_callable_if(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        scope: NodeRef,
+        depth: usize,
+    ) -> Result<SourceCallableIfSyntax, SourceFunctionStatementsError> {
+        let control = plan_source_control_if_syntax(self.arena, self.bound, statement, parent)?;
+        if !control.nested_export_diagnostics.is_empty() {
+            return Err(self.unsupported(
+                statement,
+                SyntaxKind::IfStatement,
+                SourceFunctionStatementsRole::IfStatement,
+            ));
+        }
+        if self.node(control.then_statement)?.kind == SyntaxKind::EmptyStatement {
+            return Err(self.unsupported(
+                control.then_statement,
+                SyntaxKind::EmptyStatement,
+                SourceFunctionStatementsRole::BranchBlock,
+            ));
+        }
+        self.validate_container(statement, self.callable.declaration)?;
+        self.validate_block_scope_container(statement, scope)?;
+        let condition = match self.plan_condition(control.condition, self.callable.declaration) {
+            Ok(condition) => Some(condition),
+            Err(error @ SourceFunctionStatementsError::Unsupported(_))
+                if self.condition_requires_narrowing(control.condition)? =>
+            {
+                return Err(error);
+            }
+            Err(SourceFunctionStatementsError::Unsupported(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let then_statements =
+            self.plan_callable_list(&[control.then_statement.node], statement, scope, depth + 1)?;
+        let else_statements = control
+            .else_statement
+            .map(|branch| self.plan_callable_list(&[branch.node], statement, scope, depth + 1))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(SourceCallableIfSyntax {
+            control,
+            condition_identifier: condition.map(|condition| condition.identifier),
+            typeof_condition: condition.and_then(|condition| condition.typeof_condition),
+            equality_condition: condition.and_then(|condition| condition.equality_condition),
+            then_statements,
+            else_statements,
+        })
+    }
+
     fn plan_void_switch(
         &self,
     ) -> Result<SourceVoidSwitchFunctionStatementsSyntax, SourceFunctionStatementsError> {
@@ -8923,6 +9346,9 @@ impl SyntaxPlanner<'_> {
         parent: NodeRef,
         callable: NodeRef,
     ) -> Result<NodeRef, SourceFunctionStatementsError> {
+        if let Some(scope) = self.statement_scope {
+            return Ok(scope);
+        }
         if parent == self.callable.body {
             return Ok(callable);
         }
@@ -10356,6 +10782,11 @@ impl SyntaxPlanner<'_> {
         node: NodeRef,
         expected: NodeRef,
     ) -> Result<(), SourceFunctionStatementsError> {
+        let expected = if expected == self.callable.declaration {
+            self.statement_scope.unwrap_or(expected)
+        } else {
+            expected
+        };
         let actual = self.bound.block_scope_container(node);
         if actual != Some(expected) {
             return Err(

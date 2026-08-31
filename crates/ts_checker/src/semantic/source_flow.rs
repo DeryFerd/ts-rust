@@ -58,7 +58,8 @@ use super::{
         validate_own_class_property_write_target,
     },
     source_statements::{
-        SourceCapturedIterationStatementSyntax, SourceLinearLogicalStatementSyntax,
+        SourceCallableStatementListSyntax, SourceCapturedIterationStatementSyntax,
+        SourceLinearLogicalStatementSyntax, plan_source_callable_statement_list_syntax,
         plan_source_for_statement_syntax, plan_source_linear_logical_statement_syntax,
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
@@ -1431,9 +1432,22 @@ fn validate_retained_captured_origin(
     container: NodeRef,
     assignment: SourceFlowAssignment,
     origin: SourceCapturedFlowOrigin,
+    statement_list: Option<&SourceCallableStatementListSyntax>,
 ) -> Result<(), SourceFlowError> {
     let local = origin.local();
     let invalid = || SourceFlowInvariant::InvalidCapturedLocal(local.target);
+    let scope = match statement_list {
+        Some(syntax) => match origin {
+            SourceCapturedFlowOrigin::Assignment(assignment) => {
+                syntax.statement_scope(assignment.statement)
+            }
+            SourceCapturedFlowOrigin::ArrayMutation(mutation) => {
+                syntax.expression_scope(mutation.mutation.call)
+            }
+        }
+        .ok_or_else(invalid)?,
+        None => container,
+    };
     if assignment != origin.assignment()
         || local.writing_callable != container
         || local.declaring_callable == container
@@ -1454,7 +1468,7 @@ fn validate_retained_captured_origin(
         || bound.container(local.target) != Some(container)
         || bound.flow_container(local.target) != Some(container)
         || bound.container(assignment.declaration) != Some(container)
-        || bound.block_scope_container(assignment.declaration) != Some(container)
+        || bound.block_scope_container(assignment.declaration) != Some(scope)
     {
         return Err(invalid().into());
     }
@@ -1479,13 +1493,31 @@ fn validate_captured_flow_origin(
     host: &DeclaredTypeHost<'_>,
     container: NodeRef,
     origin: SourceCapturedFlowOrigin,
+    statement_list: Option<&SourceCallableStatementListSyntax>,
 ) -> Result<(), SourceFlowError> {
     validate_source_captured_local(store, host, &origin.local())?;
-    validate_retained_captured_origin(bound, container, origin.assignment(), origin)?;
+    validate_retained_captured_origin(
+        bound,
+        container,
+        origin.assignment(),
+        origin,
+        statement_list,
+    )?;
     match origin {
         SourceCapturedFlowOrigin::Assignment(assignment) => {
             let invalid = || SourceFlowInvariant::InvalidCapturedLocal(assignment.local.target);
-            validate_arrow_statement(arena, bound, store, container, assignment.statement)?;
+            match statement_list {
+                Some(syntax) => validate_statement_list_expression(
+                    arena,
+                    bound,
+                    syntax,
+                    assignment.statement,
+                    assignment.expression,
+                )?,
+                None => {
+                    validate_arrow_statement(arena, bound, store, container, assignment.statement)?
+                }
+            }
             let target = arena
                 .get(assignment.local.target.node)
                 .ok_or_else(invalid)?;
@@ -1527,7 +1559,10 @@ fn validate_captured_flow_origin(
         SourceCapturedFlowOrigin::ArrayMutation(captured) => {
             let mutation = captured.mutation;
             let invalid = || SourceFlowInvariant::InvalidArrayMutation(mutation.call);
-            validate_linear_direct_call(arena, bound, store, container, mutation.call)?;
+            match statement_list {
+                Some(syntax) => validate_statement_list_call(arena, bound, syntax, mutation.call)?,
+                None => validate_linear_direct_call(arena, bound, store, container, mutation.call)?,
+            };
             if mutation.receiver != captured.local.target
                 || mutation.declaration != captured.local.declaration
                 || mutation.symbol != captured.local.symbol
@@ -1597,6 +1632,7 @@ pub(super) struct SourceFlowPlan {
     assignment_order: Vec<NodeRef>,
     assignment_declarations: HashMap<NodeRef, NodeRef>,
     captured_origins: HashMap<NodeRef, SourceCapturedFlowOrigin>,
+    statement_list: Option<SourceCallableStatementListSyntax>,
     calls: HashMap<NodeRef, NodeRef>,
     logical_statements: Vec<SourceLogicalStatementFlow>,
     class_body: Option<ClassBodyPlan>,
@@ -1907,6 +1943,7 @@ struct SourceFlowCoverage {
 struct SourceFlowEffects {
     assignment_declarations: HashMap<NodeRef, NodeRef>,
     captured_origins: HashMap<NodeRef, SourceCapturedFlowOrigin>,
+    statement_list: Option<SourceCallableStatementListSyntax>,
     calls: HashMap<NodeRef, NodeRef>,
     logical_statements: Vec<SourceLogicalStatementFlow>,
     class_body: Option<ClassBodyPlan>,
@@ -2187,6 +2224,127 @@ fn source_node_is_descendant_of(
 }
 
 impl SourceFlowPlan {
+    pub(super) fn statement_list_is_exact(
+        &self,
+        syntax: &SourceCallableStatementListSyntax,
+    ) -> bool {
+        self.container == syntax.callable.declaration
+            && self.statement_list.as_ref() == Some(syntax)
+    }
+
+    /// Adds exact statement scopes to the existing callable flow worker.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_statement_list(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        syntax: &SourceCallableStatementListSyntax,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        logical_conditions: Vec<SourceTruthinessCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+        captures: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
+        array_mutations: impl IntoIterator<Item = SourceFlowArrayMutation>,
+    ) -> Result<Self, SourceFlowError> {
+        validate_statement_list_source(arena, bound, store, host, syntax)?;
+        let container = syntax.callable.declaration;
+        let points = points.into_iter().collect::<Vec<_>>();
+        let mut conditions = conditions.into_iter().collect::<Vec<_>>();
+        conditions.extend(retained_linear_truthiness_conditions(
+            arena,
+            bound,
+            container,
+            &points,
+            logical_conditions,
+        )?);
+        let mut assignments = assignments.into_iter().collect::<Vec<_>>();
+        let mut effects = SourceFlowEffects {
+            statement_list: Some(syntax.clone()),
+            ..SourceFlowEffects::default()
+        };
+        for assignment in parameter_assignments {
+            validate_parameter_assignment_in_list(
+                arena,
+                bound,
+                store,
+                container,
+                assignment,
+                Some(syntax),
+            )?;
+            if effects
+                .assignment_declarations
+                .insert(assignment.target, assignment.parameter)
+                .is_some()
+            {
+                return Err(SourceFlowInvariant::DuplicateAssignment(assignment.target).into());
+            }
+            assignments.push(SourceFlowAssignment {
+                declaration: assignment.target,
+                symbol: assignment.symbol,
+            });
+        }
+        for capture in captures {
+            let origin = SourceCapturedFlowOrigin::Assignment(capture);
+            validate_captured_flow_origin(
+                arena,
+                bound,
+                store,
+                host,
+                container,
+                origin,
+                Some(syntax),
+            )?;
+            let assignment = origin.assignment();
+            if effects
+                .assignment_declarations
+                .contains_key(&assignment.declaration)
+                || effects
+                    .captured_origins
+                    .insert(assignment.declaration, origin)
+                    .is_some()
+            {
+                return Err(
+                    SourceFlowInvariant::DuplicateAssignment(assignment.declaration).into(),
+                );
+            }
+            assignments.push(assignment);
+        }
+        for mutation in array_mutations {
+            validate_array_mutation_in_list(arena, bound, container, mutation, Some(syntax))?;
+            if effects
+                .assignment_declarations
+                .insert(mutation.call, mutation.declaration)
+                .is_some()
+            {
+                return Err(SourceFlowInvariant::DuplicateAssignment(mutation.call).into());
+            }
+            assignments.push(SourceFlowAssignment {
+                declaration: mutation.call,
+                symbol: mutation.symbol,
+            });
+        }
+        for call in calls {
+            let statement = validate_statement_list_call(arena, bound, syntax, call)?;
+            if effects.calls.insert(call, statement).is_some() {
+                return Err(SourceFlowInvariant::DuplicateCall(call).into());
+            }
+        }
+        Self::preflight_with_effects(
+            bound,
+            container,
+            (syntax.callable.family
+                == super::source_callables::SourceCallableFamily::ArrowFunction)
+                .then_some(container),
+            points,
+            conditions,
+            assignments,
+            effects,
+        )
+    }
+
     pub(super) fn contains_call(&self, call: NodeRef) -> bool {
         self.calls.contains_key(&call)
     }
@@ -2798,7 +2956,7 @@ impl SourceFlowPlan {
             let host = host.ok_or(SourceFlowInvariant::InvalidCapturedLocal(
                 origin.local().target,
             ))?;
-            validate_captured_flow_origin(arena, bound, store, host, container, origin)?;
+            validate_captured_flow_origin(arena, bound, store, host, container, origin, None)?;
             let assignment = origin.assignment();
             if effects
                 .assignment_declarations
@@ -2963,7 +3121,13 @@ impl SourceFlowPlan {
                         SourceFlowInvariant::DuplicateAssignment(assignment.declaration).into(),
                     );
                 }
-                validate_retained_captured_origin(bound, container, assignment, *origin)?;
+                validate_retained_captured_origin(
+                    bound,
+                    container,
+                    assignment,
+                    *origin,
+                    effects.statement_list.as_ref(),
+                )?;
             } else if let Some(parameter) =
                 effects.assignment_declarations.get(&assignment.declaration)
             {
@@ -3062,6 +3226,7 @@ impl SourceFlowPlan {
             assignment_order,
             assignment_declarations: effects.assignment_declarations,
             captured_origins: effects.captured_origins,
+            statement_list: effects.statement_list,
             calls: effects.calls,
             logical_statements: effects.logical_statements,
             class_body: effects.class_body,
@@ -3094,6 +3259,15 @@ impl SourceFlowPlan {
         bound: &'graph BoundFile,
         base: SourceFlowTypes,
     ) -> Result<SourceFlowFrame<'plan, 'graph>, SourceFlowError> {
+        if let Some(syntax) = &self.statement_list {
+            let (arena, _) = host
+                .source(self.container)
+                .ok_or(SourceFlowInvariant::ForeignNode(self.container))?;
+            validate_statement_list_source(arena, bound, store, host, syntax)?;
+            if syntax.callable.declaration != self.container {
+                return Err(SourceFlowInvariant::ForeignNode(self.container).into());
+            }
+        }
         if let Some(region) = self.region {
             let (arena, _) = host
                 .source(region.statement)
@@ -3121,8 +3295,22 @@ impl SourceFlowPlan {
                 .assignments
                 .get(&target)
                 .ok_or(SourceFlowInvariant::UnknownAssignment(target))?;
-            validate_retained_captured_origin(bound, self.container, *assignment, *origin)?;
-            validate_captured_flow_origin(arena, bound, store, host, self.container, *origin)?;
+            validate_retained_captured_origin(
+                bound,
+                self.container,
+                *assignment,
+                *origin,
+                self.statement_list.as_ref(),
+            )?;
+            validate_captured_flow_origin(
+                arena,
+                bound,
+                store,
+                host,
+                self.container,
+                *origin,
+                self.statement_list.as_ref(),
+            )?;
         }
         self.frame_with_validated_captures(bound, base)
     }
@@ -3195,7 +3383,13 @@ impl SourceFlowPlan {
             if self.assignment_declarations.contains_key(&target) {
                 return Err(SourceFlowInvariant::DuplicateAssignment(target).into());
             }
-            validate_retained_captured_origin(bound, self.container, *assignment, *origin)?;
+            validate_retained_captured_origin(
+                bound,
+                self.container,
+                *assignment,
+                *origin,
+                self.statement_list.as_ref(),
+            )?;
             if !base.contains_key(&assignment.symbol) {
                 return Err(SourceFlowInvariant::MissingCurrentType(assignment.symbol).into());
             }
@@ -6881,12 +7075,126 @@ fn validate_class_local_assignment(
     Ok(())
 }
 
+fn validate_statement_list_source(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    syntax: &SourceCallableStatementListSyntax,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(syntax.callable.declaration);
+    let callable = super::source_callables::plan_source_callable(
+        store,
+        host,
+        syntax.callable.declaration,
+        syntax.callable.owner_symbol,
+        syntax.callable.array_targets,
+    )
+    .map_err(|_| invalid())?;
+    if callable != syntax.callable {
+        return Err(invalid().into());
+    }
+    let actual = plan_source_callable_statement_list_syntax(arena, bound, store, &syntax.callable)
+        .map_err(|_| invalid())?;
+    if actual != *syntax {
+        return Err(invalid().into());
+    }
+    Ok(())
+}
+
+fn validate_statement_list_expression(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    syntax: &SourceCallableStatementListSyntax,
+    statement: NodeRef,
+    expression: NodeRef,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(expression);
+    let scope = syntax.statement_scope(statement).ok_or_else(invalid)?;
+    let container = syntax.callable.declaration;
+    if syntax.expression_scope(expression) != Some(scope)
+        || [statement, expression, scope, container]
+            .into_iter()
+            .any(|node| !node.is_for(arena.id(), bound.file_id()) || !bound.contains(node))
+        || bound.container(statement) != Some(container)
+        || bound.container(expression) != Some(container)
+        || bound.block_scope_container(statement) != Some(scope)
+        || bound.block_scope_container(expression) != Some(scope)
+    {
+        return Err(invalid().into());
+    }
+    let record = arena.get(statement.node).ok_or_else(invalid)?;
+    let NodeData::ExpressionStatement(data) = &record.data else {
+        return Err(invalid().into());
+    };
+    let expression_record = arena.get(expression.node).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::ExpressionStatement
+        || record.flags.0 != 0
+        || data.expression != expression.node
+        || data.flow_node.is_some()
+        || expression_record.parent != Some(statement.node)
+        || expression_record.flags.0 != 0
+        || expression_record.range.start < record.range.start
+        || expression_record.range.end > record.range.end
+    {
+        return Err(invalid().into());
+    }
+    validate_node_container(bound, bound.flow_graph(), container, statement)
+}
+
+fn validate_statement_list_call(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    syntax: &SourceCallableStatementListSyntax,
+    expression: NodeRef,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(expression);
+    let record = arena.get(expression.node).ok_or_else(invalid)?;
+    let NodeData::CallExpression(call) = &record.data else {
+        return Err(invalid().into());
+    };
+    let callee = arena.get(call.expression).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::CallExpression
+        || record.flags.0 != 0
+        || call.question_dot_token.is_some()
+        || call.symbol.is_some()
+        || call.facts != 0
+        || !matches!(
+            callee.kind,
+            SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression
+        )
+        || callee.parent != Some(expression.node)
+        || callee.range.start < record.range.start
+        || callee.range.end > record.range.end
+    {
+        return Err(invalid().into());
+    }
+    let statement = NodeRef::new(
+        expression.arena,
+        expression.file,
+        record.parent.ok_or_else(invalid)?,
+    );
+    validate_statement_list_expression(arena, bound, syntax, statement, expression)?;
+    Ok(statement)
+}
+
 fn validate_parameter_assignment(
     arena: &NodeArena,
     bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
     container: NodeRef,
     assignment: SourceFlowParameterAssignment,
+) -> Result<(), SourceFlowError> {
+    validate_parameter_assignment_in_list(arena, bound, store, container, assignment, None)
+}
+
+fn validate_parameter_assignment_in_list(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    container: NodeRef,
+    assignment: SourceFlowParameterAssignment,
+    statement_list: Option<&SourceCallableStatementListSyntax>,
 ) -> Result<(), SourceFlowError> {
     let invalid = || SourceFlowInvariant::InvalidParameterAssignment(assignment.target);
     if !assignment.target.is_for(arena.id(), bound.file_id())
@@ -6896,7 +7204,8 @@ fn validate_parameter_assignment(
         || bound.symbol(assignment.parameter) != Some(assignment.symbol)
         || bound.container(assignment.parameter) != Some(container)
         || bound.container(assignment.target) != Some(container)
-        || bound.block_scope_container(assignment.target) != Some(container)
+        || statement_list.is_none()
+            && bound.block_scope_container(assignment.target) != Some(container)
         || bound.flow_container(assignment.target) != Some(container)
     {
         return Err(invalid().into());
@@ -6999,11 +7308,31 @@ fn validate_parameter_assignment(
         || statement.flags.0 != 0
         || statement_data.expression != target.parent.ok_or_else(invalid)?
         || statement_data.flow_node.is_some()
-        || body.kind != SyntaxKind::Block
-        || body.parent != Some(container.node)
-        || function_body != statement.parent
+        || statement_list.is_none()
+            && (body.kind != SyntaxKind::Block
+                || body.parent != Some(container.node)
+                || function_body != statement.parent)
     {
         return Err(invalid().into());
+    }
+    if let Some(syntax) = statement_list {
+        let expression_ref = NodeRef::new(
+            container.arena,
+            container.file,
+            target.parent.ok_or_else(invalid)?,
+        );
+        let statement_ref = NodeRef::new(
+            container.arena,
+            container.file,
+            expression.parent.ok_or_else(invalid)?,
+        );
+        validate_statement_list_expression(arena, bound, syntax, statement_ref, expression_ref)?;
+        if function_body != Some(syntax.callable.body.node)
+            || bound.block_scope_container(assignment.target)
+                != syntax.statement_scope(statement_ref)
+        {
+            return Err(invalid().into());
+        }
     }
     Ok(())
 }
@@ -7196,8 +7525,21 @@ fn validate_array_mutation(
     container: NodeRef,
     mutation: SourceFlowArrayMutation,
 ) -> Result<(), SourceFlowError> {
+    validate_array_mutation_in_list(arena, bound, container, mutation, None)
+}
+
+fn validate_array_mutation_in_list(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    container: NodeRef,
+    mutation: SourceFlowArrayMutation,
+    statement_list: Option<&SourceCallableStatementListSyntax>,
+) -> Result<(), SourceFlowError> {
     let invalid = || SourceFlowInvariant::InvalidArrayMutation(mutation.call);
-    validate_direct_call(arena, bound, container, mutation.call)?;
+    match statement_list {
+        Some(syntax) => validate_statement_list_call(arena, bound, syntax, mutation.call)?,
+        None => validate_direct_call(arena, bound, container, mutation.call)?,
+    };
     if bound.symbol(mutation.declaration) != Some(mutation.symbol)
         || bound.container(mutation.declaration) != Some(container)
         || bound.container(mutation.receiver) != Some(container)
@@ -11252,6 +11594,7 @@ mod tests {
             calls: HashMap::new(),
             logical_statements: Vec::new(),
             class_body: None,
+            statement_list: None,
             property_assignments: HashMap::new(),
             region: None,
             updates: HashMap::new(),
