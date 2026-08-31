@@ -398,13 +398,16 @@ fn assert_display_read_only(
         )
     };
     let before = snapshot(context);
+    let raw = format!("{:?}", context.store());
     for _ in 0..2 {
         for &(type_, location, expected) in displays {
             assert_eq!(context.type_to_string(type_).unwrap(), expected);
+            assert_eq!(format!("{:?}", context.store()), raw);
             assert_eq!(
                 context.type_to_string_at_location(type_, location).unwrap(),
                 expected
             );
+            assert_eq!(format!("{:?}", context.store()), raw);
         }
     }
     assert_eq!(snapshot(context), before);
@@ -859,12 +862,39 @@ fn assert_supported_method_overload_row(
     )];
     assert_display_read_only(context, parsed, &displays);
     let snapshot = |context: &CanonicalCheckerContext<'_>| {
-        (
-            format!("{:?}", context.store()),
-            context.diagnostics().clone(),
-        )
+        const TOKEN: &str = ", next_relation_observation_token: ";
+        const DERIVED: &str = ", derived_types: ";
+        const VALIDATION: &str = ", union_cache_needs_validation: ";
+
+        let complete = format!("{:?}", context.store());
+        assert!(complete.starts_with("SemanticStore { "));
+        for field in [TOKEN, DERIVED, VALIDATION] {
+            assert_eq!(complete.matches(field).count(), 1, "{field}");
+        }
+        let (state, dirty) = complete
+            .rsplit_once(VALIDATION)
+            .expect("the final union validation field is present");
+        let dirty = match dirty {
+            "true }" => true,
+            "false }" => false,
+            _ => panic!("the final union validation field must be a bool"),
+        };
+        let (prefix, token_and_suffix) = state
+            .split_once(TOKEN)
+            .expect("the observation counter is present");
+        let (token_text, suffix) = token_and_suffix
+            .split_once(DERIVED)
+            .expect("the counter is followed by the derived type caches");
+        let token = token_text
+            .parse::<u64>()
+            .expect("the observation counter is a u64");
+        assert_eq!(token.to_string(), token_text);
+        let state =
+            format!("{prefix}{TOKEN}<counter>{DERIVED}{suffix}{VALIDATION}<validation-state> }}");
+        ((state, context.diagnostics().clone()), token, dirty)
     };
-    let warm = snapshot(context);
+    let (warm, mut token, dirty) = snapshot(context);
+    assert!(dirty);
     for _ in 0..2 {
         context.recheck_source_file(FILE).unwrap();
         assert!(is_checked(context));
@@ -888,7 +918,11 @@ fn assert_supported_method_overload_row(
             );
         }
         assert_display_read_only(context, parsed, &displays);
-        assert_eq!(snapshot(context), warm);
+        let (replayed, replay_token, replay_dirty) = snapshot(context);
+        assert_eq!(replayed, warm);
+        assert_eq!(replay_token, token.checked_add(4).unwrap());
+        assert!(!replay_dirty);
+        token = replay_token;
     }
 }
 
