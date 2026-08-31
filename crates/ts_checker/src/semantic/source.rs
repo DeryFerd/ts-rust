@@ -24707,6 +24707,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             condition_target.kind,
             PlannedExpressionKind::Boolean(_) | PlannedExpressionKind::Null
         );
+        let composed_condition = matches!(
+            &condition_target.kind,
+            PlannedExpressionKind::Binary(binary)
+                if !binary.operator.is_assignment_operator()
+                    && binary.operator != SyntaxKind::CommaToken
+        );
         match &condition_target.kind {
             PlannedExpressionKind::Identifier(condition_read)
                 if !contextual
@@ -24715,6 +24721,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         PlannedIdentifierReadKind::Variable | PlannedIdentifierReadKind::Unresolved
                     ) => {}
             PlannedExpressionKind::Boolean(_) | PlannedExpressionKind::Null => {}
+            PlannedExpressionKind::Binary(_) if !contextual && composed_condition => {}
             PlannedExpressionKind::Call(_)
                 if !contextual
                     && (direct_return
@@ -24727,9 +24734,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ));
             }
         }
-        let Some(condition_expectation) =
+        let Some(condition_expectation) = (if composed_condition {
+            Some(ConditionalScalarExpectation::Dynamic)
+        } else {
             self.conditional_scalar_expectation(&condition, direct_return)?
-        else {
+        }) else {
             return Err(self.unsupported(
                 condition_target.node,
                 SyntaxKind::Identifier,
@@ -24749,7 +24758,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::VariableInitializer,
             ));
         }
-        let Some(when_true_expectation) =
+        let Some(mut when_true_expectation) =
             self.conditional_scalar_expectation(&when_true, direct_return)?
         else {
             return Err(self.unsupported(
@@ -24759,6 +24768,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         };
         if !constant_condition
+            && !composed_condition
             && matches!(
                 when_true_expectation,
                 ConditionalScalarExpectation::Exact {
@@ -24773,6 +24783,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::VariableInitializer,
             ));
         }
+        if composed_condition
+            && matches!(&when_true.unparenthesized().kind,
+                PlannedExpressionKind::Identifier(read)
+                    if read.kind == PlannedIdentifierReadKind::Variable)
+        {
+            // Equality can narrow a declared scalar to a literal in this branch.
+            when_true_expectation = ConditionalScalarExpectation::Dynamic;
+        }
         let when_false = self.plan_expression(when_false)?;
         let when_false_supported = if direct_return {
             conditional_return_operand_plan_is_supported(&when_false)
@@ -24786,7 +24804,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::VariableInitializer,
             ));
         }
-        let Some(when_false_expectation) =
+        let Some(mut when_false_expectation) =
             self.conditional_scalar_expectation(&when_false, direct_return)?
         else {
             return Err(self.unsupported(
@@ -24796,6 +24814,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         };
         if !constant_condition
+            && !composed_condition
             && matches!(
                 when_false_expectation,
                 ConditionalScalarExpectation::Exact {
@@ -24809,6 +24828,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 self.node(when_false.node)?.kind,
                 SourceSyntaxRole::VariableInitializer,
             ));
+        }
+        if composed_condition
+            && matches!(&when_false.unparenthesized().kind,
+                PlannedExpressionKind::Identifier(read)
+                    if read.kind == PlannedIdentifierReadKind::Variable)
+        {
+            when_false_expectation = ConditionalScalarExpectation::Dynamic;
         }
         let expected_result = self.conditional_expected_result(
             when_true_expectation,
@@ -26235,7 +26261,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     current = parent;
                 }
                 NodeData::ConditionalExpression(conditional)
-                    if conditional.when_true == current.node
+                    if conditional.condition == current.node
+                        || conditional.when_true == current.node
                         || conditional.when_false == current.node =>
                 {
                     current = parent;
@@ -29217,7 +29244,7 @@ fn preflight_uncached_conditional_operand_links(
     }
     if matches!(
         &expression.unparenthesized().kind,
-        PlannedExpressionKind::Binary(binary) if binary.operator == SyntaxKind::CommaToken
+        PlannedExpressionKind::Binary(_)
     ) {
         if let Some(links) = store.type_node_links(expression.node) {
             let expected = links
@@ -33402,7 +33429,7 @@ fn check_expression_type_with_capture_context(
                 || conditional.condition_expectation == ConditionalScalarExpectation::Dynamic
                     && matches!(
                         conditional.condition.unparenthesized().kind,
-                        PlannedExpressionKind::Call(_)
+                        PlannedExpressionKind::Call(_) | PlannedExpressionKind::Binary(_)
                     ) {
                 check_expression_type_with_capture_context(
                     store,
@@ -33486,6 +33513,23 @@ fn check_expression_type_with_capture_context(
                     let mut falsy_flow = current_flow_types.clone();
                     falsy_flow.insert(read.value_symbol, falsy);
                     Some((truthy_flow, falsy_flow))
+                }
+                PlannedExpressionKind::Binary(_) => {
+                    let truthy = conditional_equality_branch_flow(
+                        store,
+                        global_types,
+                        current_flow_types,
+                        &conditional.condition,
+                        TruthinessAssumption::Truthy,
+                    )?;
+                    let falsy = conditional_equality_branch_flow(
+                        store,
+                        global_types,
+                        current_flow_types,
+                        &conditional.condition,
+                        TruthinessAssumption::Falsy,
+                    )?;
+                    truthy.zip(falsy)
                 }
                 _ => None,
             };
@@ -34506,6 +34550,21 @@ fn check_expression_type_with_capture_context(
                     publish_expression_type(store, node, boolean)?;
                     left = CheckedExpressionTypes::leaf(boolean, boolean);
                 } else {
+                    if node == binary.node
+                        && let Some(result) = conditional_nullish_equality_result(
+                            store,
+                            host,
+                            global_types,
+                            binary,
+                            (left.raw, right.raw),
+                            current_flow_types,
+                        )?
+                    {
+                        publish_expression_type(store, node, result)?;
+                        left = CheckedExpressionTypes::leaf(result, result);
+                        left_node = node;
+                        continue;
+                    }
                     if let Some(result) = authenticated_filter_predicate_nullish_comparison(
                         store,
                         host,
@@ -39450,6 +39509,143 @@ fn validate_conditional_scalar_expectation(
     }
 }
 
+/// Both branch execution and return assignment use the checked equality operands.
+fn conditional_equality_branch_flow(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    condition: &PlannedExpression,
+    assumption: TruthinessAssumption,
+) -> Result<Option<HashMap<SemanticSymbolId, TypeId>>, SourceCheckError> {
+    let PlannedExpressionKind::Binary(binary) = &condition.unparenthesized().kind else {
+        return Ok(None);
+    };
+    let (strict, equal) = match binary.operator {
+        SyntaxKind::EqualsEqualsEqualsToken => (true, true),
+        SyntaxKind::ExclamationEqualsEqualsToken => (true, false),
+        SyntaxKind::EqualsEqualsToken => (false, true),
+        SyntaxKind::ExclamationEqualsToken => (false, false),
+        _ => return Ok(None),
+    };
+    let left = binary.left.unparenthesized();
+    let right = binary.right.unparenthesized();
+    let (read, value) = match (&left.kind, &right.kind) {
+        (PlannedExpressionKind::Identifier(read), _) => (read, right),
+        (_, PlannedExpressionKind::Identifier(read)) => (read, left),
+        _ => return Ok(None),
+    };
+    if read.kind != PlannedIdentifierReadKind::Variable
+        || !matches!(
+            value.kind,
+            PlannedExpressionKind::Null
+                | PlannedExpressionKind::GlobalUndefined
+                | PlannedExpressionKind::String(_)
+                | PlannedExpressionKind::Number { .. }
+                | PlannedExpressionKind::BigInt { .. }
+                | PlannedExpressionKind::Boolean(_)
+        )
+    {
+        return Ok(None);
+    }
+    let current = flow_types
+        .get(&read.value_symbol)
+        .copied()
+        .ok_or(SourceCheckError::Variable(
+            VariableInvariant::MissingCurrentFlowType(read.value_symbol),
+        ))?;
+    let value_type = store
+        .type_node_links(value.node)
+        .and_then(|links| links.resolved_type)
+        .ok_or(SourceCheckError::Conditional(value.node))?;
+    let narrowed = narrow_by_equality(
+        store,
+        global_types,
+        current,
+        value_type,
+        strict,
+        equal == (assumption == TruthinessAssumption::Truthy),
+        None,
+    )
+    .map_err(|error| match error {
+        SourceEqualityNarrowingError::Union(error) => error.into(),
+        SourceEqualityNarrowingError::Relation(error) => error.into(),
+        SourceEqualityNarrowingError::UnsupportedType(_) => {
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                node: condition.node,
+                kind: SyntaxKind::BinaryExpression,
+                role: SourceSyntaxRole::BinaryExpression,
+            })
+        }
+        _ => SourceCheckError::Conditional(condition.node),
+    })?;
+    let mut updated = flow_types.clone();
+    updated.insert(read.value_symbol, narrowed);
+    Ok(Some(updated))
+}
+
+/// A real ternary condition shares the loop condition's nullable equality proof.
+fn conditional_nullish_equality_result(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    binary: &PrimitiveBinaryPlan,
+    operands: (TypeId, TypeId),
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let Some(equality) = planned_nullish_equality(binary) else {
+        return Ok(None);
+    };
+    let mut current = binary.node;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return Err(SourceCheckError::Conditional(current));
+        }
+        let Some(parent) = host.node(current).and_then(|record| record.parent) else {
+            return Ok(None);
+        };
+        let parent = NodeRef::new(current.arena, current.file, parent);
+        match host.node(parent).map(|record| &record.data) {
+            Some(NodeData::ParenthesizedExpression(parenthesized))
+                if parenthesized.expression == current.node =>
+            {
+                current = parent
+            }
+            Some(NodeData::ConditionalExpression(conditional))
+                if conditional.condition == current.node =>
+            {
+                break;
+            }
+            _ => return Ok(None),
+        }
+    }
+    let (identifier_type, value_type) = if equality.identifier.node == binary.left.node {
+        operands
+    } else {
+        (operands.1, operands.0)
+    };
+    if flow_types.get(&equality.symbol) != Some(&identifier_type) {
+        return Err(SourceCheckError::Conditional(binary.node));
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    let expected_value = match equality.value.kind {
+        PlannedExpressionKind::Null => bootstrap.null_widening_type,
+        PlannedExpressionKind::GlobalUndefined => bootstrap.undefined_widening_type,
+        _ => return Err(SourceCheckError::Conditional(binary.node)),
+    };
+    if value_type != expected_value {
+        return Err(SourceCheckError::Conditional(equality.value.node));
+    }
+    for type_ in [identifier_type, value_type, bootstrap.boolean_type] {
+        store.validate_union_constituent_with_global_types(global_types, type_)?;
+    }
+    Ok(Some(bootstrap.boolean_type))
+}
+
 fn required_property_logical_parts(
     binary: &LogicalBinaryPlan,
 ) -> Result<(&SourcePropertyPlan, &SourcePropertyPlan), SourceCheckError> {
@@ -41316,6 +41512,13 @@ fn check_conditional_return_branches(
                 updated.insert(read.value_symbol, narrowed);
                 Some(updated)
             }
+            PlannedExpressionKind::Binary(_) => conditional_equality_branch_flow(
+                store,
+                global_types,
+                flow_types,
+                &conditional.condition,
+                assumption,
+            )?,
             _ => None,
         };
         let flow_types = branch_flow.as_ref().unwrap_or(flow_types);
@@ -46921,7 +47124,16 @@ fn planned_loop_nullish_equality(
     let PlannedExpressionKind::Binary(binary) = &expression.kind else {
         return None;
     };
-    if binary.node != expression.node || !binary.prefix.is_empty() {
+    if binary.node != expression.node {
+        return None;
+    }
+    planned_nullish_equality(binary)
+}
+
+fn planned_nullish_equality(
+    binary: &PrimitiveBinaryPlan,
+) -> Option<PlannedLoopNullishEquality<'_>> {
+    if !binary.prefix.is_empty() {
         return None;
     }
     let (strict, equal) = match binary.operator {
