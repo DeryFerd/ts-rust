@@ -18,7 +18,9 @@ pub use project_graph::{
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    convert::Infallible,
     path::Path,
+    time::{Duration, Instant},
 };
 
 use ts_ast::{FileId, Node, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
@@ -331,6 +333,171 @@ pub enum CanonicalProgramCheckError {
         node: NodeRef,
     },
     DiagnosticFormat(FormatError),
+}
+
+/// Whether a diagnostic observer requests another census operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusControl {
+    Continue,
+    Stop,
+}
+
+/// The actual operation, independent of the returned error's classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusPhase {
+    Load,
+    Preparation,
+    Binding,
+    Context,
+    Source,
+    PostSource,
+}
+
+/// Root indices refer to the Program input roster, without census deduplication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusAttempt {
+    Ordinary,
+    Root(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusLoadDisposition {
+    Ready,
+    ConfigUnavailable,
+    NoCheck,
+}
+
+/// Original source policy, never a census-specific exclusion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusSkipReason {
+    NoCheck,
+    DefaultLibrary,
+    DeclarationFile,
+    NoCheckDirective,
+    UncheckedJavaScript,
+}
+
+/// A completed source call does not establish an empty diagnostic set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusOutcome {
+    Complete,
+    Skipped(CanonicalCensusSkipReason),
+    Unloaded,
+    Failure {
+        phase: CanonicalCensusPhase,
+        error: CanonicalProgramCheckError,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusCompletion {
+    Complete,
+    LoadUnavailable,
+    NoCheck,
+    PreparationFailed,
+    Stopped,
+}
+
+/// Owned events from a diagnostic-only, serial cold-root census.
+///
+/// Phase completion records a returned operation, not a successful check.
+/// Only an attempt outcome describes its result. Missing outcomes remain
+/// incomplete, including when an observer stops after a phase event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusEvent {
+    LoadStarted,
+    Loaded {
+        disposition: CanonicalCensusLoadDisposition,
+        roots: Option<Vec<ProgramGraphRoot>>,
+        elapsed: Duration,
+    },
+    LoadFailed {
+        error: CanonicalProgramCheckError,
+        elapsed: Duration,
+    },
+    AttemptStarted {
+        attempt: CanonicalCensusAttempt,
+    },
+    PhaseStarted {
+        attempt: CanonicalCensusAttempt,
+        phase: CanonicalCensusPhase,
+    },
+    PhaseFinished {
+        attempt: CanonicalCensusAttempt,
+        phase: CanonicalCensusPhase,
+        elapsed: Duration,
+    },
+    AttemptFinished {
+        attempt: CanonicalCensusAttempt,
+        outcome: CanonicalCensusOutcome,
+        elapsed: Duration,
+    },
+}
+
+#[derive(Debug)]
+enum CanonicalObservedCheckError<E> {
+    Failure {
+        phase: CanonicalCensusPhase,
+        error: CanonicalProgramCheckError,
+    },
+    Observer(E),
+    Stopped,
+}
+
+#[derive(Debug)]
+enum CanonicalCensusObservationError<E> {
+    Error(E),
+    Stopped,
+}
+
+impl<E> From<CanonicalCensusObservationError<E>> for CanonicalObservedCheckError<E> {
+    fn from(error: CanonicalCensusObservationError<E>) -> Self {
+        match error {
+            CanonicalCensusObservationError::Error(error) => Self::Observer(error),
+            CanonicalCensusObservationError::Stopped => Self::Stopped,
+        }
+    }
+}
+
+fn observe_canonical_census<E>(
+    program: Option<&Program>,
+    event: CanonicalCensusEvent,
+    observer: &mut impl FnMut(
+        Option<&Program>,
+        CanonicalCensusEvent,
+    ) -> Result<CanonicalCensusControl, E>,
+) -> Result<(), CanonicalCensusObservationError<E>> {
+    match observer(program, event).map_err(CanonicalCensusObservationError::Error)? {
+        CanonicalCensusControl::Continue => Ok(()),
+        CanonicalCensusControl::Stop => Err(CanonicalCensusObservationError::Stopped),
+    }
+}
+
+fn canonical_census_outcome<E>(
+    result: Result<CanonicalCensusOutcome, CanonicalObservedCheckError<E>>,
+) -> Result<CanonicalCensusOutcome, CanonicalCensusObservationError<E>> {
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(CanonicalObservedCheckError::Failure { phase, error }) => {
+            Ok(CanonicalCensusOutcome::Failure { phase, error })
+        }
+        Err(CanonicalObservedCheckError::Observer(error)) => {
+            Err(CanonicalCensusObservationError::Error(error))
+        }
+        Err(CanonicalObservedCheckError::Stopped) => Err(CanonicalCensusObservationError::Stopped),
+    }
+}
+
+fn census_preparation_failed(outcome: &CanonicalCensusOutcome) -> bool {
+    matches!(
+        outcome,
+        CanonicalCensusOutcome::Failure {
+            phase: CanonicalCensusPhase::Preparation
+                | CanonicalCensusPhase::Binding
+                | CanonicalCensusPhase::Context,
+            ..
+        }
+    )
 }
 
 /// A helper dependency could not provide an exact export, value, or signature.
@@ -1838,6 +2005,12 @@ struct CanonicalCheckedSource<'arena> {
     runtime: CanonicalReplayJsxRuntime,
 }
 
+struct CanonicalPreparedChecker<'arena> {
+    context: CanonicalCheckerContext<'arena>,
+    bind_diagnostics: Vec<ProgramDiagnostic>,
+    check_files: Vec<(FileId, String, bool, bool)>,
+}
+
 #[derive(Debug)]
 enum CanonicalReplayJsxRuntime {
     Preserve,
@@ -3044,6 +3217,25 @@ impl Program {
         config_path: &str,
         queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
     ) -> Result<(Self, Option<T>), CanonicalProgramCheckError> {
+        let (mut program, disposition) =
+            Self::load_canonical_config_program(file_system, config_path)?;
+        if disposition == CanonicalCensusLoadDisposition::ConfigUnavailable {
+            return Ok((program, None));
+        }
+        let mut result = None;
+        if !program.options.no_check {
+            let (diagnostics, query_result) = program.check_program_canonical(queries)?;
+            program.diagnostics.extend(diagnostics);
+            result = Some(query_result);
+        }
+        program.diagnostics.sort_by(compare_program_diagnostics);
+        Ok((program, result))
+    }
+
+    fn load_canonical_config_program(
+        file_system: &dyn FileSystem,
+        config_path: &str,
+    ) -> Result<(Self, CanonicalCensusLoadDisposition), CanonicalProgramCheckError> {
         let ProgramConfigInputs {
             config_path,
             current_directory,
@@ -3072,7 +3264,7 @@ impl Program {
                         checker: ProgramChecker::Canonical,
                         ..Self::default()
                     },
-                    None,
+                    CanonicalCensusLoadDisposition::ConfigUnavailable,
                 ));
             }
         };
@@ -3099,14 +3291,199 @@ impl Program {
             program.diagnostics.extend(output_diagnostics);
         }
         program.add_config_diagnostics(diagnostics);
-        let mut result = None;
-        if !program.options.no_check {
-            let (diagnostics, query_result) = program.check_program_canonical(queries)?;
-            program.diagnostics.extend(diagnostics);
-            result = Some(query_result);
+        let disposition = if program.options.no_check {
+            CanonicalCensusLoadDisposition::NoCheck
+        } else {
+            CanonicalCensusLoadDisposition::Ready
+        };
+        Ok((program, disposition))
+    }
+
+    /// Diagnoses cold roots with complete fresh bindings and original inputs.
+    ///
+    /// The normal-order control uses the ordinary checker with a no-op query
+    /// callback. Each eligible cold root then gets its own complete context.
+    /// Contexts are dropped before attempt outcomes are observed. The scoped
+    /// Program borrow is for reporting only, and is never a checked Program.
+    /// No cold attempt collects Program diagnostics, artifacts, or replay.
+    ///
+    /// Observers can stop between events. An error stops immediately without
+    /// another callback. A caller must open its output before this call and
+    /// flush events as they arrive to retain evidence on process interruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns the observer's error unchanged. Compiler failures are owned
+    /// event payloads, with their actual phase kept separate from their code.
+    pub fn run_canonical_root_census<E>(
+        file_system: &dyn FileSystem,
+        config_path: &str,
+        mut observer: impl FnMut(
+            Option<&Program>,
+            CanonicalCensusEvent,
+        ) -> Result<CanonicalCensusControl, E>,
+    ) -> Result<CanonicalCensusCompletion, E> {
+        match Self::run_canonical_root_census_observed(file_system, config_path, &mut observer) {
+            Ok(completion) => Ok(completion),
+            Err(CanonicalCensusObservationError::Error(error)) => Err(error),
+            Err(CanonicalCensusObservationError::Stopped) => Ok(CanonicalCensusCompletion::Stopped),
         }
-        program.diagnostics.sort_by(compare_program_diagnostics);
-        Ok((program, result))
+    }
+
+    fn run_canonical_root_census_observed<E>(
+        file_system: &dyn FileSystem,
+        config_path: &str,
+        observer: &mut impl FnMut(
+            Option<&Program>,
+            CanonicalCensusEvent,
+        ) -> Result<CanonicalCensusControl, E>,
+    ) -> Result<CanonicalCensusCompletion, CanonicalCensusObservationError<E>> {
+        observe_canonical_census(None, CanonicalCensusEvent::LoadStarted, observer)?;
+        let started = Instant::now();
+        let (program, disposition) =
+            match Self::load_canonical_config_program(file_system, config_path) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    observe_canonical_census(
+                        None,
+                        CanonicalCensusEvent::LoadFailed {
+                            error,
+                            elapsed: started.elapsed(),
+                        },
+                        observer,
+                    )?;
+                    return Ok(CanonicalCensusCompletion::LoadUnavailable);
+                }
+            };
+        let elapsed = started.elapsed();
+        let roots = (disposition != CanonicalCensusLoadDisposition::ConfigUnavailable)
+            .then(|| program.project_graph_snapshot().roots);
+        observe_canonical_census(
+            Some(&program),
+            CanonicalCensusEvent::Loaded {
+                disposition,
+                roots: roots.clone(),
+                elapsed,
+            },
+            observer,
+        )?;
+        let Some(roots) = roots else {
+            return Ok(CanonicalCensusCompletion::LoadUnavailable);
+        };
+        program.run_canonical_census_attempts(roots, observer)
+    }
+
+    fn run_canonical_census_attempts<E>(
+        &self,
+        roots: Vec<ProgramGraphRoot>,
+        observer: &mut impl FnMut(
+            Option<&Program>,
+            CanonicalCensusEvent,
+        ) -> Result<CanonicalCensusControl, E>,
+    ) -> Result<CanonicalCensusCompletion, CanonicalCensusObservationError<E>> {
+        let attempt = CanonicalCensusAttempt::Ordinary;
+        let started = Instant::now();
+        observe_canonical_census(
+            Some(self),
+            CanonicalCensusEvent::AttemptStarted { attempt },
+            observer,
+        )?;
+        let outcome = if self.options.no_check {
+            CanonicalCensusOutcome::Skipped(CanonicalCensusSkipReason::NoCheck)
+        } else {
+            canonical_census_outcome(
+                self.check_program_canonical_observed(|_, _| (), attempt, observer)
+                    .map(|_| CanonicalCensusOutcome::Complete),
+            )?
+        };
+        let preparation_failed = census_preparation_failed(&outcome);
+        observe_canonical_census(
+            Some(self),
+            CanonicalCensusEvent::AttemptFinished {
+                attempt,
+                outcome,
+                elapsed: started.elapsed(),
+            },
+            observer,
+        )?;
+        if preparation_failed {
+            return Ok(CanonicalCensusCompletion::PreparationFailed);
+        }
+
+        for (index, root) in roots.into_iter().enumerate() {
+            let attempt = CanonicalCensusAttempt::Root(index);
+            let started = Instant::now();
+            observe_canonical_census(
+                Some(self),
+                CanonicalCensusEvent::AttemptStarted { attempt },
+                observer,
+            )?;
+            let outcome = match root.file_id {
+                Some(file) => canonical_census_outcome(
+                    self.check_canonical_census_root(file, attempt, observer),
+                )?,
+                None => CanonicalCensusOutcome::Unloaded,
+            };
+            let preparation_failed = census_preparation_failed(&outcome);
+            observe_canonical_census(
+                Some(self),
+                CanonicalCensusEvent::AttemptFinished {
+                    attempt,
+                    outcome,
+                    elapsed: started.elapsed(),
+                },
+                observer,
+            )?;
+            if preparation_failed {
+                return Ok(CanonicalCensusCompletion::PreparationFailed);
+            }
+        }
+        Ok(if self.options.no_check {
+            CanonicalCensusCompletion::NoCheck
+        } else {
+            CanonicalCensusCompletion::Complete
+        })
+    }
+
+    fn check_canonical_census_root<E>(
+        &self,
+        file: FileId,
+        attempt: CanonicalCensusAttempt,
+        observer: &mut impl FnMut(
+            Option<&Program>,
+            CanonicalCensusEvent,
+        ) -> Result<CanonicalCensusControl, E>,
+    ) -> Result<CanonicalCensusOutcome, CanonicalObservedCheckError<E>> {
+        let Some(source) = self.source_file_by_id(file) else {
+            return Ok(CanonicalCensusOutcome::Unloaded);
+        };
+        if self.options.no_check {
+            return Ok(CanonicalCensusOutcome::Skipped(
+                CanonicalCensusSkipReason::NoCheck,
+            ));
+        }
+        if let Some(reason) = self
+            .canonical_source_header_skip(
+                source.is_default_library,
+                ts_path::is_declaration_file(&source.file_name),
+            )
+            .or_else(|| {
+                self.canonical_source_text_skip(
+                    is_javascript_file_name(&source.file_name),
+                    &source.source_text,
+                )
+            })
+        {
+            return Ok(CanonicalCensusOutcome::Skipped(reason));
+        }
+        let CanonicalPreparedChecker { mut context, .. } =
+            self.prepare_canonical_checker_observed(attempt, observer)?;
+        self.observe_canonical_phase(attempt, CanonicalCensusPhase::Source, observer, || {
+            self.check_canonical_source(&mut context, source)
+                .map(|_| ())
+        })?;
+        drop(context);
+        Ok(CanonicalCensusOutcome::Complete)
     }
 
     fn from_config_with_overrides(
@@ -5050,111 +5427,260 @@ impl Program {
         sources
     }
 
-    #[allow(clippy::too_many_lines)]
     fn check_program_canonical<T>(
         &self,
         queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
     ) -> Result<(Vec<ProgramDiagnostic>, T), CanonicalProgramCheckError> {
-        let mut binder = CanonicalBinder::new();
-        let sources = self.canonical_semantic_sources();
-        let source_facts = sources
-            .iter()
-            .map(|source| canonical_source_file_facts(source, &self.options))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        for (source, facts) in sources.iter().zip(source_facts) {
-            binder
-                .bind_source_file_with_facts(
-                    &source.parse.arena,
-                    source.parse.source_file,
-                    source.id,
-                    facts,
-                )
-                .map_err(|error| CanonicalProgramCheckError::Bind {
-                    file_name: source.file_name.clone(),
-                    error,
-                })?;
+        match self.check_program_canonical_observed(
+            queries,
+            CanonicalCensusAttempt::Ordinary,
+            &mut |_, _| Ok::<_, Infallible>(CanonicalCensusControl::Continue),
+        ) {
+            Ok(result) => Ok(result),
+            Err(CanonicalObservedCheckError::Failure { error, .. }) => Err(error),
+            Err(CanonicalObservedCheckError::Observer(never)) => match never {},
+            Err(CanonicalObservedCheckError::Stopped) => {
+                unreachable!("the ordinary checker observer never stops")
+            }
         }
+    }
 
-        for source in &sources {
-            let result = if is_javascript_file_name(&source.file_name) {
-                binder.bind_javascript_declaration_slice(&source.parse.arena, source.id)
-            } else {
-                binder.bind_typescript_declaration_slice(&source.parse.arena, source.id)
-            };
-            result.map_err(|error| CanonicalProgramCheckError::DeclarationBind {
-                file_name: source.file_name.clone(),
-                error,
+    fn check_program_canonical_observed<T, E>(
+        &self,
+        queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
+        attempt: CanonicalCensusAttempt,
+        observer: &mut impl FnMut(
+            Option<&Program>,
+            CanonicalCensusEvent,
+        ) -> Result<CanonicalCensusControl, E>,
+    ) -> Result<(Vec<ProgramDiagnostic>, T), CanonicalObservedCheckError<E>> {
+        let CanonicalPreparedChecker {
+            mut context,
+            bind_diagnostics,
+            check_files,
+        } = self.prepare_canonical_checker_observed(attempt, observer)?;
+        let checked_sources =
+            self.observe_canonical_phase(attempt, CanonicalCensusPhase::Source, observer, || {
+                self.check_canonical_sources(&mut context, check_files)
             })?;
-        }
+        self.observe_canonical_phase(attempt, CanonicalCensusPhase::PostSource, observer, || {
+            self.finish_canonical_check(context, bind_diagnostics, checked_sources, queries)
+        })
+    }
 
-        let mut bind_diagnostics = Vec::new();
-        for source in &sources {
-            // Keep declaration files bound so their symbols remain available
-            // to importers, but mirror pinned SkipTypeChecking by suppressing
-            // their bind diagnostics together with checker diagnostics.
-            if self.options.skip_lib_check && ts_path::is_declaration_file(&source.file_name)
-                || source_check_js_directive(&source.source_text) == Some(false)
-            {
-                continue;
-            }
-            let bound = binder.file(source.id).ok_or_else(|| {
-                CanonicalProgramCheckError::MissingBoundFile {
-                    file_name: source.file_name.clone(),
-                    file: source.id,
-                }
-            })?;
-            for diagnostic in bound.diagnostics() {
-                bind_diagnostics.push(
-                    self.canonical_program_diagnostic(
-                        Some(diagnostic.node),
-                        None,
-                        &diagnostic.diagnostic,
-                        diagnostic
-                            .related_information
-                            .iter()
-                            .map(|related| (Some(related.node), &related.diagnostic)),
-                    )?,
-                );
-            }
-            self.add_top_level_await_identifier_diagnostics(source, bound, &mut bind_diagnostics)?;
-            if bound
-                .source_facts()
-                .is_some_and(CanonicalSourceFileFacts::is_external_or_common_js_module)
-            {
-                bind_diagnostics.extend(self.canonical_commonjs_object_collisions(source)?);
-            }
-        }
+    fn observe_canonical_phase<T, E>(
+        &self,
+        attempt: CanonicalCensusAttempt,
+        phase: CanonicalCensusPhase,
+        observer: &mut impl FnMut(
+            Option<&Program>,
+            CanonicalCensusEvent,
+        ) -> Result<CanonicalCensusControl, E>,
+        operation: impl FnOnce() -> Result<T, CanonicalProgramCheckError>,
+    ) -> Result<T, CanonicalObservedCheckError<E>> {
+        observe_canonical_census(
+            Some(self),
+            CanonicalCensusEvent::PhaseStarted { attempt, phase },
+            observer,
+        )?;
+        let started = Instant::now();
+        let result = operation();
+        observe_canonical_census(
+            Some(self),
+            CanonicalCensusEvent::PhaseFinished {
+                attempt,
+                phase,
+                elapsed: started.elapsed(),
+            },
+            observer,
+        )?;
+        result.map_err(|error| CanonicalObservedCheckError::Failure { phase, error })
+    }
 
-        let ordered_arenas = sources
-            .iter()
-            .map(|source| (source.id, &source.parse.arena))
-            .collect();
-        let check_files = sources
-            .iter()
-            .filter(|source| !source.is_default_library)
-            .map(|source| {
-                (
-                    source.id,
-                    source.file_name.clone(),
-                    ts_path::is_declaration_file(&source.file_name),
-                    is_javascript_file_name(&source.file_name),
-                )
+    #[allow(clippy::too_many_lines)] // Keep complete binding and context construction in order.
+    fn prepare_canonical_checker_observed<E>(
+        &self,
+        attempt: CanonicalCensusAttempt,
+        observer: &mut impl FnMut(
+            Option<&Program>,
+            CanonicalCensusEvent,
+        ) -> Result<CanonicalCensusControl, E>,
+    ) -> Result<CanonicalPreparedChecker<'_>, CanonicalObservedCheckError<E>> {
+        observe_canonical_census(
+            Some(self),
+            CanonicalCensusEvent::PhaseStarted {
+                attempt,
+                phase: CanonicalCensusPhase::Preparation,
+            },
+            observer,
+        )?;
+        let started = Instant::now();
+        let result = (|| {
+            let (
+                bindings,
+                ordered_arenas,
+                options,
+                module_resolutions,
+                bind_diagnostics,
+                check_files,
+            ) = self.observe_canonical_phase(
+                attempt,
+                CanonicalCensusPhase::Binding,
+                observer,
+                || {
+                    let mut binder = CanonicalBinder::new();
+                    let sources = self.canonical_semantic_sources();
+                    let source_facts = sources
+                        .iter()
+                        .map(|source| canonical_source_file_facts(source, &self.options))
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    for (source, facts) in sources.iter().zip(source_facts) {
+                        binder
+                            .bind_source_file_with_facts(
+                                &source.parse.arena,
+                                source.parse.source_file,
+                                source.id,
+                                facts,
+                            )
+                            .map_err(|error| CanonicalProgramCheckError::Bind {
+                                file_name: source.file_name.clone(),
+                                error,
+                            })?;
+                    }
+
+                    for source in &sources {
+                        let result = if is_javascript_file_name(&source.file_name) {
+                            binder.bind_javascript_declaration_slice(&source.parse.arena, source.id)
+                        } else {
+                            binder.bind_typescript_declaration_slice(&source.parse.arena, source.id)
+                        };
+                        result.map_err(|error| CanonicalProgramCheckError::DeclarationBind {
+                            file_name: source.file_name.clone(),
+                            error,
+                        })?;
+                    }
+
+                    let mut bind_diagnostics = Vec::new();
+                    for source in &sources {
+                        // Keep declaration files bound so their symbols remain available
+                        // to importers, but mirror pinned SkipTypeChecking by suppressing
+                        // their bind diagnostics together with checker diagnostics.
+                        if self.options.skip_lib_check
+                            && ts_path::is_declaration_file(&source.file_name)
+                            || source_check_js_directive(&source.source_text) == Some(false)
+                        {
+                            continue;
+                        }
+                        let bound = binder.file(source.id).ok_or_else(|| {
+                            CanonicalProgramCheckError::MissingBoundFile {
+                                file_name: source.file_name.clone(),
+                                file: source.id,
+                            }
+                        })?;
+                        for diagnostic in bound.diagnostics() {
+                            bind_diagnostics.push(
+                                self.canonical_program_diagnostic(
+                                    Some(diagnostic.node),
+                                    None,
+                                    &diagnostic.diagnostic,
+                                    diagnostic
+                                        .related_information
+                                        .iter()
+                                        .map(|related| (Some(related.node), &related.diagnostic)),
+                                )?,
+                            );
+                        }
+                        self.add_top_level_await_identifier_diagnostics(
+                            source,
+                            bound,
+                            &mut bind_diagnostics,
+                        )?;
+                        if bound
+                            .source_facts()
+                            .is_some_and(CanonicalSourceFileFacts::is_external_or_common_js_module)
+                        {
+                            bind_diagnostics
+                                .extend(self.canonical_commonjs_object_collisions(source)?);
+                        }
+                    }
+
+                    let ordered_arenas = sources
+                        .iter()
+                        .map(|source| (source.id, &source.parse.arena))
+                        .collect::<Vec<_>>();
+                    let check_files = sources
+                        .iter()
+                        .filter(|source| !source.is_default_library)
+                        .map(|source| {
+                            (
+                                source.id,
+                                source.file_name.clone(),
+                                ts_path::is_declaration_file(&source.file_name),
+                                is_javascript_file_name(&source.file_name),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let options = self.canonical_checker_options();
+                    let module_resolutions = self.canonical_module_resolution_manifest()?;
+                    Ok((
+                        binder.finish(),
+                        ordered_arenas,
+                        options,
+                        module_resolutions,
+                        bind_diagnostics,
+                        check_files,
+                    ))
+                },
+            )?;
+            let context = self.observe_canonical_phase(
+                attempt,
+                CanonicalCensusPhase::Context,
+                observer,
+                || {
+                    CanonicalCheckerContext::new_with_module_resolutions(
+                        bindings,
+                        ordered_arenas,
+                        options,
+                        module_resolutions,
+                    )
+                    .map_err(CanonicalProgramCheckError::Context)
+                },
+            )?;
+            Ok::<_, CanonicalObservedCheckError<E>>(CanonicalPreparedChecker {
+                context,
+                bind_diagnostics,
+                check_files,
             })
-            .collect::<Vec<_>>();
-        let options = self.canonical_checker_options();
-        let module_resolutions = self.canonical_module_resolution_manifest()?;
-        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
-            binder.finish(),
-            ordered_arenas,
-            options,
-            module_resolutions,
-        )
-        .map_err(CanonicalProgramCheckError::Context)?;
+        })();
+        if !matches!(
+            &result,
+            Err(CanonicalObservedCheckError::Observer(_) | CanonicalObservedCheckError::Stopped)
+        ) {
+            observe_canonical_census(
+                Some(self),
+                CanonicalCensusEvent::PhaseFinished {
+                    attempt,
+                    phase: CanonicalCensusPhase::Preparation,
+                    elapsed: started.elapsed(),
+                },
+                observer,
+            )?;
+        }
+        result
+    }
 
+    fn check_canonical_sources<'arena>(
+        &'arena self,
+        context: &mut CanonicalCheckerContext<'arena>,
+        check_files: Vec<(FileId, String, bool, bool)>,
+    ) -> Result<Vec<CanonicalCheckedSource<'arena>>, CanonicalProgramCheckError> {
         let mut checked_sources = Vec::new();
         for (file, file_name, is_declaration_file, is_javascript_file) in check_files {
-            if is_declaration_file && self.options.skip_lib_check {
+            if self
+                .canonical_source_header_skip(false, is_declaration_file)
+                .is_some()
+            {
                 continue;
             }
             let source = self.source_file_by_id(file).ok_or_else(|| {
@@ -5163,75 +5689,123 @@ impl Program {
                     file,
                 }
             })?;
-            let check_directive = source_check_js_directive(&source.source_text);
-            if check_directive == Some(false)
-                || is_javascript_file && !check_directive.unwrap_or(self.options.check_js)
+            if self
+                .canonical_source_text_skip(is_javascript_file, &source.source_text)
+                .is_some()
             {
                 continue;
             }
-            let runtime_pragma = source_jsx_pragma_value(&source.source_text, "@jsxRuntime");
-            let runtime_module = self.options.jsx_runtime_module_specifier_for_source(
-                runtime_pragma,
-                source_jsx_pragma_value(&source.source_text, "@jsxImportSource"),
-            );
-            let runtime = if let Some(module_specifier) = runtime_module.as_deref() {
-                let containing = canonicalize(
-                    &source.file_name,
-                    &self.current_directory,
-                    self.case_sensitivity,
-                );
-                let resolved_module = self
-                    .resolved_modules
-                    .get(&ResolvedModuleKey::new(
-                        containing,
-                        module_specifier.to_owned(),
-                        CanonicalModuleResolutionMode::Esm,
-                    ))
-                    .and_then(|target| self.file_index.get(target))
-                    .and_then(|index| self.source_files.get(*index))
-                    .and_then(|target| context.file(target.id))
-                    .and_then(|(_, bound)| bound.symbol(bound.source_file()));
-                CanonicalJsxRuntimeEvidence::Automatic {
-                    module_specifier,
-                    resolved_module,
-                }
-            } else if runtime_pragma == Some("classic")
-                || self.options.jsx == ts_options::JsxEmit::React
-            {
-                let factory_pragma = source_jsx_pragma_value(&source.source_text, "@jsx ");
-                let fragment_factory_pragma =
-                    source_jsx_pragma_value(&source.source_text, "@jsxFrag")
-                        .or_else(|| source_jsx_pragma_value(&source.source_text, "@jsxfrag"));
-                CanonicalJsxRuntimeEvidence::Classic {
-                    factory_namespace: self.options.jsx_factory_namespace_for_source(
-                        factory_pragma,
-                        fragment_factory_pragma,
-                        false,
-                    ),
-                    fragment_factory_namespace: self.options.jsx_factory_namespace_for_source(
-                        factory_pragma,
-                        fragment_factory_pragma,
-                        true,
-                    ),
-                    fragment_factory_required: self.options.jsx_factory.is_some()
-                        && self.options.jsx_fragment_factory.is_none()
-                        && fragment_factory_pragma.is_none(),
-                    fragment_factory_pragma_required: factory_pragma.is_some()
-                        && self.options.jsx_fragment_factory.is_none()
-                        && fragment_factory_pragma.is_none(),
-                }
-            } else {
-                CanonicalJsxRuntimeEvidence::Preserve
-            };
-            context
-                .check_source_file_with_jsx_runtime(file, runtime)
-                .map_err(|error| CanonicalProgramCheckError::SourceCheck { file_name, error })?;
-            checked_sources.push(CanonicalCheckedSource {
-                source,
-                runtime: runtime.into(),
-            });
+            checked_sources.push(self.check_canonical_source(context, source)?);
         }
+        Ok(checked_sources)
+    }
 
+    fn canonical_source_header_skip(
+        &self,
+        is_default_library: bool,
+        is_declaration_file: bool,
+    ) -> Option<CanonicalCensusSkipReason> {
+        if is_default_library {
+            Some(CanonicalCensusSkipReason::DefaultLibrary)
+        } else if is_declaration_file && self.options.skip_lib_check {
+            Some(CanonicalCensusSkipReason::DeclarationFile)
+        } else {
+            None
+        }
+    }
+
+    fn canonical_source_text_skip(
+        &self,
+        is_javascript_file: bool,
+        source_text: &str,
+    ) -> Option<CanonicalCensusSkipReason> {
+        let check_directive = source_check_js_directive(source_text);
+        if check_directive == Some(false) {
+            Some(CanonicalCensusSkipReason::NoCheckDirective)
+        } else if is_javascript_file && !check_directive.unwrap_or(self.options.check_js) {
+            Some(CanonicalCensusSkipReason::UncheckedJavaScript)
+        } else {
+            None
+        }
+    }
+
+    fn check_canonical_source<'arena>(
+        &'arena self,
+        context: &mut CanonicalCheckerContext<'arena>,
+        source: &'arena SourceFile,
+    ) -> Result<CanonicalCheckedSource<'arena>, CanonicalProgramCheckError> {
+        let runtime_pragma = source_jsx_pragma_value(&source.source_text, "@jsxRuntime");
+        let runtime_module = self.options.jsx_runtime_module_specifier_for_source(
+            runtime_pragma,
+            source_jsx_pragma_value(&source.source_text, "@jsxImportSource"),
+        );
+        let runtime = if let Some(module_specifier) = runtime_module.as_deref() {
+            let containing = canonicalize(
+                &source.file_name,
+                &self.current_directory,
+                self.case_sensitivity,
+            );
+            let resolved_module = self
+                .resolved_modules
+                .get(&ResolvedModuleKey::new(
+                    containing,
+                    module_specifier.to_owned(),
+                    CanonicalModuleResolutionMode::Esm,
+                ))
+                .and_then(|target| self.file_index.get(target))
+                .and_then(|index| self.source_files.get(*index))
+                .and_then(|target| context.file(target.id))
+                .and_then(|(_, bound)| bound.symbol(bound.source_file()));
+            CanonicalJsxRuntimeEvidence::Automatic {
+                module_specifier,
+                resolved_module,
+            }
+        } else if runtime_pragma == Some("classic")
+            || self.options.jsx == ts_options::JsxEmit::React
+        {
+            let factory_pragma = source_jsx_pragma_value(&source.source_text, "@jsx ");
+            let fragment_factory_pragma = source_jsx_pragma_value(&source.source_text, "@jsxFrag")
+                .or_else(|| source_jsx_pragma_value(&source.source_text, "@jsxfrag"));
+            CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace: self.options.jsx_factory_namespace_for_source(
+                    factory_pragma,
+                    fragment_factory_pragma,
+                    false,
+                ),
+                fragment_factory_namespace: self.options.jsx_factory_namespace_for_source(
+                    factory_pragma,
+                    fragment_factory_pragma,
+                    true,
+                ),
+                fragment_factory_required: self.options.jsx_factory.is_some()
+                    && self.options.jsx_fragment_factory.is_none()
+                    && fragment_factory_pragma.is_none(),
+                fragment_factory_pragma_required: factory_pragma.is_some()
+                    && self.options.jsx_fragment_factory.is_none()
+                    && fragment_factory_pragma.is_none(),
+            }
+        } else {
+            CanonicalJsxRuntimeEvidence::Preserve
+        };
+        context
+            .check_source_file_with_jsx_runtime(source.id, runtime)
+            .map_err(|error| CanonicalProgramCheckError::SourceCheck {
+                file_name: source.file_name.clone(),
+                error,
+            })?;
+        Ok(CanonicalCheckedSource {
+            source,
+            runtime: runtime.into(),
+        })
+    }
+
+    fn finish_canonical_check<'arena, T>(
+        &'arena self,
+        mut context: CanonicalCheckerContext<'arena>,
+        bind_diagnostics: Vec<ProgramDiagnostic>,
+        checked_sources: Vec<CanonicalCheckedSource<'arena>>,
+        queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
+    ) -> Result<(Vec<ProgramDiagnostic>, T), CanonicalProgramCheckError> {
         let diagnostics =
             self.canonical_checker_diagnostics(&mut context, &bind_diagnostics, &checked_sources)?;
         let cold_diagnostics = self.canonical_diagnostic_snapshot(&diagnostics);
@@ -11892,6 +12466,547 @@ fn config_diagnostic(diagnostic: &ConfigDiagnostic) -> ProgramDiagnostic {
         category: diagnostic.diagnostic.category(),
         message: diagnostic.render(),
         related_information: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod census_tests {
+    use std::convert::Infallible;
+
+    use ts_checker::semantic::SourceCheckError;
+    use ts_vfs::{FileSystem, MemoryFileSystem};
+
+    use super::{
+        CanonicalCensusAttempt, CanonicalCensusCompletion, CanonicalCensusControl,
+        CanonicalCensusEvent, CanonicalCensusLoadDisposition, CanonicalCensusOutcome,
+        CanonicalCensusPhase, CanonicalCensusSkipReason, CanonicalPreparedChecker,
+        CanonicalProgramCheckError, CanonicalReplayJsxRuntime, Program, ProgramChecker,
+    };
+
+    fn project(config: &str, files: &[(&str, &str)]) -> MemoryFileSystem {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/tsconfig.json", config).unwrap();
+        for (name, source) in files {
+            fs.write_file(&format!("/project/{name}"), source).unwrap();
+        }
+        fs
+    }
+
+    fn collect(fs: &MemoryFileSystem) -> (CanonicalCensusCompletion, Vec<CanonicalCensusEvent>) {
+        let mut events = Vec::new();
+        let completion =
+            Program::run_canonical_root_census(fs, "/project/tsconfig.json", |_, event| {
+                events.push(event);
+                Ok::<_, Infallible>(CanonicalCensusControl::Continue)
+            })
+            .unwrap();
+        (completion, events)
+    }
+
+    fn outcome(
+        events: &[CanonicalCensusEvent],
+        selected: CanonicalCensusAttempt,
+    ) -> &CanonicalCensusOutcome {
+        events
+            .iter()
+            .find_map(|event| match event {
+                CanonicalCensusEvent::AttemptFinished {
+                    attempt, outcome, ..
+                } if *attempt == selected => Some(outcome),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn prepare(program: &Program) -> CanonicalPreparedChecker<'_> {
+        program
+            .prepare_canonical_checker_observed(CanonicalCensusAttempt::Ordinary, &mut |_, _| {
+                Ok::<_, Infallible>(CanonicalCensusControl::Continue)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn census_keeps_two_returned_root_failures_separate_from_normal_order() {
+        let fs = project(
+            r#"{"compilerOptions":{"noLib":true,"noEmit":true},"files":["first.ts","second.ts"]}"#,
+            &[
+                ("first.ts", "function* first() { yield 1; }"),
+                ("second.ts", "function* second() { yield 2; }"),
+            ],
+        );
+        let mut called = false;
+        let normal = Program::try_from_config_with_canonical_checker_and_queries(
+            &fs,
+            "/project/tsconfig.json",
+            |_, _| called = true,
+        )
+        .unwrap_err();
+        assert!(!called);
+        assert!(normal.is_unsupported_boundary());
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::Complete);
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Ordinary),
+            outcome(&events, CanonicalCensusAttempt::Root(0)),
+        );
+        for (index, name) in ["first.ts", "second.ts"].into_iter().enumerate() {
+            let CanonicalCensusOutcome::Failure {
+                phase: CanonicalCensusPhase::Source,
+                error:
+                    CanonicalProgramCheckError::SourceCheck {
+                        file_name,
+                        error: SourceCheckError::Unsupported(_),
+                    },
+            } = outcome(&events, CanonicalCensusAttempt::Root(index))
+            else {
+                panic!("the actual generator call must fail: {events:?}");
+            };
+            assert_eq!(file_name, &format!("/project/{name}"));
+        }
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            CanonicalCensusEvent::PhaseStarted {
+                attempt: CanonicalCensusAttempt::Root(_),
+                phase: CanonicalCensusPhase::PostSource
+            }
+        )));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the failed memo state and both fresh full-graph controls together.
+    fn census_rebinds_every_file_after_a_failed_source_with_memo_state() {
+        let fs = project(
+            r#"{"compilerOptions":{"noLib":true,"noEmit":true,"skipLibCheck":true},"files":["broken.ts","reader.ts","globals.d.ts"]}"#,
+            &[
+                (
+                    "broken.ts",
+                    concat!(
+                        "interface Matcher { m<T extends string>(value: T): T; ",
+                        "m<T extends number>(value: T): T; m(left: boolean, right: boolean): boolean; }\n",
+                        "declare const matcher: Matcher;\nconst wrong: string = 0;\nconst bad = matcher.m(true);\n",
+                    ),
+                ),
+                ("reader.ts", "const received: number = available; received;"),
+                ("globals.d.ts", "declare const available: number;"),
+            ],
+        );
+        let (program, disposition) =
+            Program::load_canonical_config_program(&fs, "/project/tsconfig.json").unwrap();
+        assert_eq!(disposition, CanonicalCensusLoadDisposition::Ready);
+        let broken = program.source_file("/project/broken.ts").unwrap();
+        let reader = program.source_file("/project/reader.ts").unwrap();
+        let globals = program.source_file("/project/globals.d.ts").unwrap();
+        let mut failed = prepare(&program);
+        let before = (
+            failed.context.store().type_len(),
+            failed.context.store().symbol_len(),
+            failed.context.store().signature_len(),
+            failed.context.store().mapper_len(),
+            failed.context.store().type_resolution_len(),
+        );
+        let error = program
+            .check_canonical_source(&mut failed.context, broken)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CanonicalProgramCheckError::SourceCheck {
+                    error: SourceCheckError::Call(_),
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_ne!(
+            before,
+            (
+                failed.context.store().type_len(),
+                failed.context.store().symbol_len(),
+                failed.context.store().signature_len(),
+                failed.context.store().mapper_len(),
+                failed.context.store().type_resolution_len(),
+            )
+        );
+        assert!(failed.context.diagnostics().is_empty());
+        let (_, failed_globals) = failed.context.file(globals.id).unwrap();
+        let available = failed
+            .context
+            .store()
+            .symbol_table(failed.context.globals())
+            .unwrap()
+            .get_source("available")
+            .unwrap();
+        assert!(failed_globals.declarations_complete());
+        drop(failed);
+
+        let mut counts = Vec::new();
+        for _ in 0..2 {
+            let mut fresh = prepare(&program);
+            assert_eq!(
+                fresh.context.file_order(),
+                program
+                    .canonical_semantic_sources()
+                    .iter()
+                    .map(|source| source.id)
+                    .collect::<Vec<_>>()
+            );
+            for source in program.source_files() {
+                let (arena, bound) = fresh.context.file(source.id).unwrap();
+                assert_eq!(arena.id(), source.parse.arena.id());
+                assert!(bound.declarations_complete());
+            }
+            // This checks the opaque store brand, not a numeric ID across runs.
+            assert!(fresh.context.store().symbol(available).is_none());
+            assert_eq!(
+                before,
+                (
+                    fresh.context.store().type_len(),
+                    fresh.context.store().symbol_len(),
+                    fresh.context.store().signature_len(),
+                    fresh.context.store().mapper_len(),
+                    fresh.context.store().type_resolution_len(),
+                )
+            );
+            program
+                .check_canonical_source(&mut fresh.context, reader)
+                .unwrap();
+            assert!(fresh.context.diagnostics().is_empty());
+            let broken_source = fresh.context.source_file(broken.id).unwrap();
+            assert!(
+                fresh
+                    .context
+                    .store()
+                    .source_file_links(broken_source)
+                    .is_none_or(|links| !links.type_checked)
+            );
+            counts.push((
+                fresh.context.store().type_len(),
+                fresh.context.store().signature_len(),
+                fresh.context.store().symbol_len(),
+                fresh.context.store().mapper_len(),
+                fresh.context.store().type_resolution_len(),
+            ));
+        }
+        assert_eq!(counts[0], counts[1]);
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::Complete);
+        assert!(matches!(
+            outcome(&events, CanonicalCensusAttempt::Root(0)),
+            CanonicalCensusOutcome::Failure { .. }
+        ));
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Root(1)),
+            &CanonicalCensusOutcome::Complete
+        );
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Root(2)),
+            &CanonicalCensusOutcome::Skipped(CanonicalCensusSkipReason::DeclarationFile)
+        );
+    }
+
+    #[test]
+    fn census_preserves_original_source_policy_and_no_check() {
+        let fs = project(
+            r#"{"compilerOptions":{"lib":["es5"],"noEmit":true,"skipLibCheck":true,"allowJs":true,"checkJs":false},"files":["good.ts","decl.d.ts","off.ts","off.js","/__typescript/lib/lib.es5.d.ts"]}"#,
+            &[
+                ("good.ts", "const good: number = 1;"),
+                ("decl.d.ts", "declare const declared: number;"),
+                ("off.ts", "// @ts-nocheck\nfunction* omitted() { yield 1; }"),
+                ("off.js", "function* ignored() { yield 1; }"),
+            ],
+        );
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::Complete);
+        for (index, reason) in [
+            (1, CanonicalCensusSkipReason::DeclarationFile),
+            (2, CanonicalCensusSkipReason::NoCheckDirective),
+            (3, CanonicalCensusSkipReason::UncheckedJavaScript),
+            (4, CanonicalCensusSkipReason::DefaultLibrary),
+        ] {
+            assert_eq!(
+                outcome(&events, CanonicalCensusAttempt::Root(index)),
+                &CanonicalCensusOutcome::Skipped(reason)
+            );
+            assert!(!events.iter().any(|event| matches!(event,
+                CanonicalCensusEvent::PhaseStarted { attempt: CanonicalCensusAttempt::Root(actual), .. } if *actual == index
+            )));
+        }
+        fs.write_file("/project/tsconfig.json",
+            r#"{"compilerOptions":{"noCheck":true,"noEmit":true,"allowJs":true},"files":["good.ts","off.js"]}"#).unwrap();
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::NoCheck);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, CanonicalCensusEvent::PhaseStarted { .. }))
+        );
+        for attempt in [
+            CanonicalCensusAttempt::Ordinary,
+            CanonicalCensusAttempt::Root(0),
+            CanonicalCensusAttempt::Root(1),
+        ] {
+            assert_eq!(
+                outcome(&events, attempt),
+                &CanonicalCensusOutcome::Skipped(CanonicalCensusSkipReason::NoCheck)
+            );
+        }
+    }
+
+    #[test]
+    fn census_preserves_duplicate_and_unloaded_program_roots() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/input.ts", "const value: number = 1;")
+            .unwrap();
+        let mut program = Program::new_unchecked_with_options_and_checker(
+            &fs,
+            "/project",
+            &[
+                "input.ts".to_owned(),
+                "input.ts".to_owned(),
+                "missing.ts".to_owned(),
+            ],
+            ts_options::CompilerOptions {
+                no_lib: true,
+                no_emit: true,
+                ..ts_options::CompilerOptions::default()
+            },
+            ProgramChecker::Canonical,
+        );
+        program.load_remaining_program_graph(&fs);
+        let roots = program.project_graph_snapshot().roots;
+        assert_eq!(roots.len(), 3);
+        assert_eq!(roots[0], roots[1]);
+        assert!(roots[2].file_id.is_none());
+        let mut events = Vec::new();
+        let completion = program
+            .run_canonical_census_attempts(roots, &mut |_, event| {
+                events.push(event);
+                Ok::<_, Infallible>(CanonicalCensusControl::Continue)
+            })
+            .unwrap();
+        assert_eq!(completion, CanonicalCensusCompletion::Complete);
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Root(0)),
+            &CanonicalCensusOutcome::Complete
+        );
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Root(1)),
+            &CanonicalCensusOutcome::Complete
+        );
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Root(2)),
+            &CanonicalCensusOutcome::Unloaded
+        );
+    }
+
+    #[test]
+    fn census_distinguishes_load_binding_and_context_failures() {
+        let fs = MemoryFileSystem::new(true);
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::LoadUnavailable);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                CanonicalCensusEvent::LoadStarted,
+                CanonicalCensusEvent::Loaded {
+                    disposition: CanonicalCensusLoadDisposition::ConfigUnavailable,
+                    roots: None,
+                    ..
+                }
+            ]
+        ));
+
+        let fs = project(r#"{"files":[],"references":[{"path":"./other"}]}"#, &[]);
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::LoadUnavailable);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                CanonicalCensusEvent::LoadStarted,
+                CanonicalCensusEvent::LoadFailed {
+                    error: CanonicalProgramCheckError::ProjectReferencesUnsupported { .. },
+                    ..
+                }
+            ]
+        ));
+
+        for (config, files, phase) in [
+            (
+                r#"{"compilerOptions":{"noLib":true,"noEmit":true,"resolveJsonModule":true,"module":"ESNext","moduleResolution":"Bundler"},"files":["input.json"]}"#,
+                vec![("input.json", "{\"value\":1}")],
+                CanonicalCensusPhase::Binding,
+            ),
+            (
+                r#"{"compilerOptions":{"noLib":true,"noEmit":true},"files":["input.ts"]}"#,
+                vec![("input.ts", "var undefined: number;")],
+                CanonicalCensusPhase::Context,
+            ),
+        ] {
+            let fs = project(config, &files);
+            let (completion, events) = collect(&fs);
+            assert_eq!(
+                completion,
+                CanonicalCensusCompletion::PreparationFailed,
+                "{events:?}"
+            );
+            assert!(matches!(outcome(&events, CanonicalCensusAttempt::Ordinary),
+                CanonicalCensusOutcome::Failure { phase: actual, .. } if *actual == phase));
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                CanonicalCensusEvent::AttemptStarted {
+                    attempt: CanonicalCensusAttempt::Root(_)
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn census_observer_error_and_stop_end_before_the_next_operation() {
+        let fs = project(
+            r#"{"compilerOptions":{"noLib":true,"noEmit":true},"files":["a.ts","b.ts"]}"#,
+            &[
+                ("a.ts", "const a: number = 1;"),
+                ("b.ts", "const b: number = 2;"),
+            ],
+        );
+        for fail in [false, true] {
+            let mut events = Vec::new();
+            let mut stopped = false;
+            let result =
+                Program::run_canonical_root_census(&fs, "/project/tsconfig.json", |_, event| {
+                    assert!(
+                        !stopped,
+                        "the observer must not be called after cancellation"
+                    );
+                    stopped = matches!(
+                        event,
+                        CanonicalCensusEvent::AttemptStarted {
+                            attempt: CanonicalCensusAttempt::Root(1)
+                        }
+                    );
+                    events.push(event);
+                    if stopped {
+                        if fail {
+                            Err("output failed")
+                        } else {
+                            Ok(CanonicalCensusControl::Stop)
+                        }
+                    } else {
+                        Ok(CanonicalCensusControl::Continue)
+                    }
+                });
+            assert!(stopped);
+            assert_eq!(
+                result,
+                if fail {
+                    Err("output failed")
+                } else {
+                    Ok(CanonicalCensusCompletion::Stopped)
+                }
+            );
+            assert_eq!(
+                outcome(&events, CanonicalCensusAttempt::Root(0)),
+                &CanonicalCensusOutcome::Complete
+            );
+            assert!(matches!(
+                events.last(),
+                Some(CanonicalCensusEvent::AttemptStarted {
+                    attempt: CanonicalCensusAttempt::Root(1)
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn census_uses_classic_and_automatic_jsx_from_each_fresh_context() {
+        let fs = project(
+            r#"{"compilerOptions":{"lib":["es5"],"noEmit":true,"skipLibCheck":true,"jsx":"react-jsx","module":"ESNext","moduleResolution":"Bundler"},"files":["classic.tsx","auto.tsx"]}"#,
+            &[
+                (
+                    "classic.tsx",
+                    "/** @jsxRuntime classic */\n/** @jsx Custom.h */\ndeclare const Custom: any;\nconst first = <div />;",
+                ),
+                ("auto.tsx", "const second = <div />;"),
+                ("node_modules/react/jsx-runtime.d.ts", "export {};"),
+            ],
+        );
+        let (program, _) =
+            Program::load_canonical_config_program(&fs, "/project/tsconfig.json").unwrap();
+        let classic = program.source_file("/project/classic.tsx").unwrap();
+        let automatic = program.source_file("/project/auto.tsx").unwrap();
+        let target = program
+            .source_file("/project/node_modules/react/jsx-runtime.d.ts")
+            .unwrap();
+        let mut previous_symbol = None;
+        for _ in 0..2 {
+            let mut prepared = prepare(&program);
+            let checked = program
+                .check_canonical_source(&mut prepared.context, classic)
+                .unwrap();
+            assert!(
+                matches!(checked.runtime, CanonicalReplayJsxRuntime::Classic { ref factory_namespace, .. } if factory_namespace == "Custom")
+            );
+            drop(prepared);
+            let mut fresh = prepare(&program);
+            if let Some(previous) = previous_symbol {
+                assert!(fresh.context.store().symbol(previous).is_none());
+            }
+            let expected = fresh.context.file(target.id).unwrap().1;
+            let expected = expected.symbol(expected.source_file()).unwrap();
+            let checked = program
+                .check_canonical_source(&mut fresh.context, automatic)
+                .unwrap();
+            assert!(
+                matches!(checked.runtime, CanonicalReplayJsxRuntime::Automatic { ref module_specifier, resolved_module: Some(symbol) }
+                if module_specifier == "react/jsx-runtime" && symbol == expected)
+            );
+            previous_symbol = Some(expected);
+        }
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::Complete);
+        for index in 0..2 {
+            assert_eq!(
+                outcome(&events, CanonicalCensusAttempt::Root(index)),
+                &CanonicalCensusOutcome::Complete
+            );
+        }
+    }
+
+    #[test]
+    fn census_completion_does_not_claim_zero_diagnostics_or_change_normal_callbacks() {
+        let fs = project(
+            r#"{"compilerOptions":{"noLib":true,"noEmit":true,"strict":true},"files":["input.ts"]}"#,
+            &[("input.ts", "const wrong: number = 'text';")],
+        );
+        let mut calls = 0;
+        let (program, snapshot) = Program::try_from_config_with_canonical_checker_and_queries(
+            &fs,
+            "/project/tsconfig.json",
+            |_, queries| {
+                calls += 1;
+                queries.cold_diagnostic_snapshot()
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(program.diagnostics(), snapshot.unwrap());
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2322))
+        );
+        let (completion, events) = collect(&fs);
+        assert_eq!(completion, CanonicalCensusCompletion::Complete);
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Ordinary),
+            &CanonicalCensusOutcome::Complete
+        );
+        assert_eq!(
+            outcome(&events, CanonicalCensusAttempt::Root(0)),
+            &CanonicalCensusOutcome::Complete
+        );
     }
 }
 
