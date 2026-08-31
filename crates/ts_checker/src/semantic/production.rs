@@ -1637,10 +1637,6 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         )
         .map_err(DeclaredTypeError::from)?
         .with_module_resolutions(module_resolutions);
-        if let Some(members) = super::classes::completed_source_class_members(store, &host, symbol)?
-        {
-            return Ok(members);
-        }
         let type_context = ClassTypeQueryContext::new(global_types, *options);
         super::classes::with_retained_source_class_annotation_scopes(
             store,
@@ -1648,6 +1644,11 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             &type_context,
             symbol,
             |store| {
+                if let Some(members) =
+                    super::classes::completed_source_class_members(store, &host, symbol)?
+                {
+                    return Ok(members);
+                }
                 let overload_plan = loop {
                     match super::classes::plan_source_constructor_overload_class(
                         store,
