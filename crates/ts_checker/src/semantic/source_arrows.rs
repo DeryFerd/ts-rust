@@ -1739,7 +1739,6 @@ fn plan_contextual_source_arrow_worker(
                 if statement_record.parent != Some(body.node)
                     || statement_record.flags.0 != 0
                     || data.flow_node.is_some()
-                    || data.facts != 0
                     || !range_contains(body_record.range, statement_record.range)
                     || expression_record.parent != Some(statement.node)
                     || expression_record.kind != SyntaxKind::CallExpression
