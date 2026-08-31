@@ -4,8 +4,10 @@ Updated 2026-08-31. The full port goal remains active.
 
 ## Decision
 
-Make Hono the next complete-project demo target. Keep TanStack Query core as
-the second target. Three unchanged Hono class-annotation tests now pass,
+Use Hono and TanStack Query core as the two complete-project demo targets.
+Keep Hono as the main integration target while the full Query census measures
+its remaining work. Choose the first demo from complete measured results.
+Three unchanged Hono class-annotation tests now pass,
 including rejected status codes and renamed imports. The full Hono run still
 stops on an unavailable interface declaration in `http-exception.ts`.
 The latest trace identifies the merged DOM and Node `Response` declarations.
@@ -40,12 +42,35 @@ and [independent review](../target/wave202-core-corpus-3-repair-corpus-4-prepara
 are closed. The corpus is still red, so this source is not accepted.
 
 The two remaining supported mismatches concern a namespace-qualified symbol
-name and an extra `undefined` in a printed optional parameter. Separate
-workers are checking their production causes. The original expected artifacts
-will not change. A first differing line does not prove that all later lines
-are correct.
+name and an extra `undefined` in a printed optional parameter. The optional
+parameter fix is committed at `da6d8be7`, with seven new tests that have not
+run. The namespace-symbol fix is under source review. Its review found a
+missing-link replay case that still needs correction. The original expected
+artifacts will not change. A first differing line does not prove that all
+later lines are correct.
 
-The latest Hono run on `33ebb2f0` built in 70 seconds, then failed construction
+The complete Hono census is now closed on `db8eda9a`. It checked all 188
+original roots in separate fresh checker contexts. It recorded 27 source-check
+completions, 158 unsupported results, two internal errors and one skip under
+the original declaration-file policy. No root was left unvisited. These are
+not 27 diagnostic-free files. Complete checker diagnostics remain unavailable
+for each isolated root. The ordinary-order control also failed.
+
+The load phase separately recorded 55 syntax diagnostics in ten original
+source and dependency files. Five parallel investigations traced them to
+parser rules, including arrow lookahead, type-argument lookahead, computed
+members, keyword-named members and conditional type starts. One parser writer
+and separate test owners are implementing the fixes on the tested core source.
+No repaired parser result is claimed yet. The [complete census](../target/wave202-demo-hono-first-failure-census-1-result.md),
+[independent review](../target/wave202-demo-hono-first-failure-census-1-result-review.md)
+and [all 188 root outcomes](../target/wave202-demo-hono-first-failure-census-1-root-ledger.md)
+retain the original inputs, separate diagnostics and closed cleanup.
+The source failures also show missing function-body, async, generic-class and
+callable support. Hono is not one library fix away from full checking.
+A matching census for Query core is in preparation to compare the remaining
+work on its complete 23-root production project.
+
+The earlier Hono run on `33ebb2f0` built in 70 seconds, then failed construction
 after 5 seconds. It does not return a diagnostic set. The trace identifies the
 Node `Response` variable inside `declare global` in `@types/node/globals.d.ts`.
 The merged-interface planner rejects that contribution because its source file
@@ -57,7 +82,10 @@ and [review](../target/wave202-demo-hono-isolated-probe-7-runtime-review.md)
 preserve the complete trace. The [library source comparison](../target/wave202-demo-hono-library-query-batch-handoff.md#probe-7-compatibility-with-the-fixed-b-planner)
 shows that the current batch already covers both guards through the real
 declaration-owner checks. It does not prove that the full `Response` query
-or Hono passes. The batch's final source review is still in progress.
+or Hono passes. The batch is now committed at `0508192a` with complete source
+and commit review. Its 94 added tests have not run. Build and test preparation
+is next. The [source review](../target/wave202-demo-hono-library-query-batch-review.md)
+keeps that distinction explicit.
 The original Hono configuration, 188 roots and dependencies remain unchanged.
 
 The latest alias repair run completed 5,094 tests, with 5,074 passes and 20
@@ -268,7 +296,7 @@ retains every failed test. No result from this run is added to another run.
 
 | Target | Complete upstream scope | Why use it | Last project-stage result |
 | --- | --- | --- | --- |
-| Hono | `tsconfig.build.json`, 188 roots | Strict library build with ES2022 target. Dependencies are prepared. Saved Go cold diagnostics are empty. | Three public class-annotation tests pass. Full project still stops on an unavailable interface declaration. |
+| Hono | `tsconfig.build.json`, 188 roots | Strict library build with ES2022 target. Dependencies are prepared. Saved Go cold diagnostics are empty. | Complete census: 27 source completions, 158 unsupported, two internal errors, one original-policy skip. Ordinary check still fails. |
 | TanStack Query core | `packages/query-core/tsconfig.prod.json`, 23 roots | Strict ESNext/Bundler package. Dependencies and declaration outputs are prepared. Saved Go cold and warm diagnostics are empty. | Unsupported arrow in `timeoutManager.ts`. |
 
 Roots are not the complete dependency graph. The saved Go runs load 186 files
@@ -348,8 +376,9 @@ are closed. Seven workers completed separate failure reports. The coordinator
 is checking their combined census.
 The current shared class-reference repair targets a reader that accepts an
 applied class reference, then incorrectly requires an interface payload.
-Twelve writers are completing a reviewed 24-file refactor of its read-only
-validation paths. Each writer owns separate files. Current entry points keep
+Twelve writers completed a 24-file refactor of its read-only validation paths.
+All component source reviews are closed. The combined review is in progress.
+Each writer owns separate files. Current entry points keep
 their existing behavior. This first phase passes one validation context through
 the existing readers. It does not yet admit applied class references.
 That second phase still needs a correct rule for recursive validation.
@@ -463,7 +492,8 @@ and [independent review](../target/wave202-alias-context-relations-focused-1-run
 are closed. The new relation control does not reach its assertions. Its
 original alias-wrapper query is unsupported. That source form needs a real
 repair, not a test route that avoids it. That bounded wrapper repair is now
-in progress. Two complete numeric and method backports are committed at
+committed at `d0bbe0c9` and independently reviewed. It has not run.
+Two complete numeric and method backports are committed at
 `3b8640ca` and independently reviewed, but not tested on this receiver yet.
 The remaining 19 older failures have a separate completed census.
 Executable class imports are committed and reviewed at `c295104c`, with eight
@@ -488,12 +518,13 @@ these reports to claim stable replay or complete artifact parity.
 
 The immediate demo sequence is:
 
-1. Run the validated root-failure reporter on the unchanged Hono project.
-   Keep its ordinary control separate from isolated-root results. The complete
-   313-test prerequisite and independent result review have passed.
-2. Finish and test the library batch that addresses the observed `Response`
-   declaration guard. Do not claim success from its source coverage alone.
-3. Group measured Hono failures by their first shared checker operation.
+1. Fix and test the parser rules behind Hono's 55 loaded syntax diagnostics.
+   Keep the complete original input as the acceptance check.
+2. Test the committed library batch that addresses the observed `Response`
+   declaration guard. Run the complete Query-core census in parallel so its
+   remaining work is measured before choosing the first finished demo.
+3. Use the completed Hono census to group failures by their first shared
+   checker operation.
    Give independent groups to separate writer and reviewer pairs. Combine
    the current class, alias and library patches only after their own tests.
 4. Run the complete ordinary Hono check after each integrated repair. Continue
@@ -532,11 +563,12 @@ including all 16 new controls, in a fresh target. Complete artifact checks,
 separate cleanup and independent review also passed. The [result](../target/wave202-project-first-failure-census-focused-2-runtime.md)
 and [review](../target/wave202-project-first-failure-census-focused-2-runtime-review.md)
 preserve all outcomes. The old failed result remains unchanged. This reporter
-test pass does not mean that Hono passes. Its original-project census packet
-has passed independent preparation review with all 188 roots. The fixed limits
-are 600 seconds for a fresh build and 1,800 seconds for the census. A soft stop
-at 1,500 seconds preserves completed events. These limits do not promise that
-every root will finish. Activation is in progress. No census result exists yet.
+test pass does not mean that Hono passes. The original-project census is now
+complete and independently reviewed. Its fresh build took 70 seconds and
+the census took 334 seconds. All 188 roots returned an outcome before either
+deadline. The ordinary invariant and all 55 load diagnostics remain separate.
+Main execution returned 2. Separate cleanup returned 0 and all 36 saved
+output hashes were verified. No complete Hono check or replay pass follows.
 
 The reporter loads the complete original Program, runs the ordinary-order
 control first, and checks each root in a fresh checker context. It records
