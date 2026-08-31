@@ -15538,6 +15538,11 @@ mod tests {
                     _ => unreachable!(),
                 }
                 let poisoned = snapshot(store);
+                let expected_error = if damage == 2 {
+                    RelationUnavailable::UnsupportedProperty(types.message)
+                } else {
+                    RelationUnavailable::InvalidStructuredMembers(types.instance)
+                };
                 for _ in 0..2 {
                     assert_eq!(
                         store.resolved_own_property_by_key_with_context(
@@ -15546,9 +15551,7 @@ mod tests {
                             Some(&globals),
                             &mut caller
                         ),
-                        Err(RelationUnavailable::InvalidStructuredMembers(
-                            types.instance
-                        ))
+                        Err(expected_error)
                     );
                     assert_eq!(
                         store.is_type_assignable_to_with_session(
@@ -15558,9 +15561,7 @@ mod tests {
                             Some(true),
                             &mut caller
                         ),
-                        Err(RelationUnavailable::InvalidStructuredMembers(
-                            types.instance
-                        ))
+                        Err(expected_error)
                     );
                     assert_eq!(snapshot(store), poisoned);
                 }
