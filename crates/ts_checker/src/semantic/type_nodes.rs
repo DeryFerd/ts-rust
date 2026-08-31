@@ -9629,7 +9629,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.plan_type_reference(node, alias_owner, union_constituent)
             }
             SyntaxKind::ImportType => {
-                if self.jsdoc_import_type_target.is_some() {
+                if self.jsdoc_import_type_target.is_some()
+                    || self.is_source_jsdoc_import_type(node)?
+                {
                     self.plan_jsdoc_import_type(node, alias_owner, union_constituent)
                 } else {
                     self.plan_ordinary_import_type(node)
@@ -9696,6 +9698,38 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.validate_replayed_annotation_cache(node)?;
         }
         Ok(())
+    }
+
+    // Source identity selects the missing-capability error, not permission to resolve an import.
+    fn is_source_jsdoc_import_type(&self, node: NodeRef) -> Result<bool, DeclaredTypeError> {
+        let Some(bound) = self.host.bound_file(node) else {
+            return Ok(false);
+        };
+        if !bound
+            .source_facts()
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
+        {
+            return Ok(false);
+        }
+        let Some(parent) = preflight_node(self.store, self.host, node)?.parent else {
+            return Ok(false);
+        };
+        let declaration = NodeRef::new(node.arena, node.file, parent);
+        if preflight_node(self.store, self.host, declaration)?.kind
+            != SyntaxKind::JsTypeAliasDeclaration
+        {
+            return Ok(false);
+        }
+        let Some(symbol) = bound
+            .symbol(declaration)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+        else {
+            return Ok(false);
+        };
+        Ok(
+            authenticated_type_alias_declaration(self.store, self.host, declaration, symbol)?
+                .is_some_and(|alias| alias.type_ == node.node),
+        )
     }
 
     fn plan_jsdoc_import_type(
@@ -62999,6 +63033,134 @@ export type Env = {
             file,
             files,
             store,
+        }
+    }
+
+    #[test]
+    fn jsdoc_import_dispatch_requires_the_real_reparsed_alias_without_a_capability() {
+        let mut fixture = javascript_typedef_fixture(
+            "/** @typedef {import('./target').C} C */\n/** @type {C} */\nvar c;",
+            CanonicalModuleState::Script,
+            |_| {},
+        );
+        let declaration = named_node(&fixture, SyntaxKind::JsTypeAliasDeclaration, "C");
+        let symbol = node_symbol(&fixture, declaration);
+        let record = fixture.parsed.arena.get(declaration.node).unwrap();
+        assert_eq!(record.flags, NodeFlags::REPARSED);
+        let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+            unreachable!()
+        };
+        let import = NodeRef::new(declaration.arena, declaration.file, alias.type_);
+        let name = NodeRef::new(declaration.arena, declaration.file, alias.name);
+        let import_record = fixture.parsed.arena.get(import.node).unwrap();
+        assert_eq!(import_record.kind, SyntaxKind::ImportType);
+        assert_eq!(import_record.flags, NodeFlags::default());
+        assert_eq!(import_record.parent, Some(declaration.node));
+        let source_role = |fixture: &Fixture, node| {
+            let bound = fixture.files.get(&fixture.file).unwrap();
+            assert!(bound.source_facts().unwrap().is_javascript_file());
+            let host = post_global_host(&fixture.parsed.arena, bound);
+            let capabilities = HashMap::new();
+            TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &capabilities)
+                .is_source_jsdoc_import_type(node)
+        };
+        let snapshot = |fixture: &Fixture| {
+            (
+                function_store_state(&fixture.store),
+                library_query_source_links(&fixture.parsed, fixture.file, &fixture.store),
+                fixture.store.type_alias_links(symbol).cloned(),
+            )
+        };
+        let before = snapshot(&fixture);
+        assert_eq!(source_role(&fixture, import), Ok(true));
+        assert_eq!(source_role(&fixture, name), Ok(false));
+        assert_eq!(snapshot(&fixture), before);
+        let expected = type_node_unavailable(
+            TypeNodeUnavailable::JsDocImportTypeCapabilityUnsupported(import),
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        for _ in 0..2 {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    symbol,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(expected),
+            );
+            assert_eq!(snapshot(&fixture), before);
+            assert!(diagnostics.is_empty());
+        }
+        let original = fixture.store.symbol(symbol).unwrap().clone();
+        assert!(fixture.store.set_symbol_declarations(symbol, None, None));
+        let damaged = snapshot(&fixture);
+        assert_eq!(source_role(&fixture, import), Ok(false));
+        assert_eq!(snapshot(&fixture), damaged);
+        assert!(fixture.store.set_symbol_declarations(
+            symbol,
+            original.declarations().map(<[_]>::to_vec),
+            original.value_declaration(),
+        ));
+        let restored = snapshot(&fixture);
+        assert_eq!(source_role(&fixture, import), Ok(true));
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                symbol,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(expected),
+        );
+        assert_eq!(snapshot(&fixture), restored);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn ordinary_typescript_import_dispatch_keeps_its_nonliteral_diagnostic() {
+        let mut fixture = fixture("type Use = import(123).C;");
+        let (_, _, import) = alias_parts(&fixture, "Use");
+        let NodeData::ImportTypeNode(data) = &fixture.parsed.arena.get(import.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let argument = NodeRef::new(import.arena, import.file, data.argument);
+        let bound = fixture.files.get(&fixture.file).unwrap();
+        assert!(!bound.source_facts().unwrap().is_javascript_file());
+        let host = post_global_host(&fixture.parsed.arena, bound);
+        let capabilities = HashMap::new();
+        let planner =
+            TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &capabilities);
+        assert_eq!(planner.is_source_jsdoc_import_type(import), Ok(false));
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_node(&mut fixture, import, &mut diagnostics),
+            Ok(error_type)
+        );
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("the ordinary import keeps its string-literal diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 1141);
+        assert_eq!(diagnostic.node, Some(argument));
+        assert!(diagnostic.diagnostic.arguments.is_empty());
+        assert!(diagnostic.range_override.is_none());
+        assert!(diagnostic.related_information.is_empty());
+        let snapshot = |fixture: &Fixture, diagnostics: &CanonicalCheckerDiagnostics| {
+            (
+                function_store_state(&fixture.store),
+                library_query_source_links(&fixture.parsed, fixture.file, &fixture.store),
+                diagnostics.clone(),
+            )
+        };
+        let warm = snapshot(&fixture, &diagnostics);
+        for _ in 0..2 {
+            assert_eq!(
+                query_node(&mut fixture, import, &mut diagnostics),
+                Ok(error_type)
+            );
+            assert_eq!(snapshot(&fixture, &diagnostics), warm);
         }
     }
 
