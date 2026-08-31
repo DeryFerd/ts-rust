@@ -3426,7 +3426,7 @@ fn class_context_member_for_symbol(
         .ok_or_else(invalid)?;
     if source.symbol != symbol
         || !class_context_has_member_owner(store, context, identities, source.declaring_class)
-        || property.parent() != Some(source.declaring_class)
+        || store.get_parent_of_symbol(symbol) != Some(source.declaring_class)
         || property.value_declaration() != Some(source.declaration)
         || store.get_merged_symbol(symbol) != Some(symbol)
         || structured
@@ -3526,14 +3526,21 @@ fn class_context_has_member_owner(
         return true;
     }
     let mut base = identities.base.map(|(instance, _)| instance);
+    let mut derived = identities.instance;
     let mut visited = std::collections::HashSet::new();
     while let Some(instance) = base {
         if !visited.insert(instance) {
             return false;
         }
+        if let Some(matches) =
+            classes::source_constructor_base_member_owner(store, derived, context.side, owner)
+        {
+            return matches;
+        }
         if store.type_payload(instance).and_then(TypeRecord::symbol) == Some(owner) {
             return true;
         }
+        derived = instance;
         base = store
             .direct_class_heritage_provenance(instance)
             .map(|base| base.base_instance_type);
@@ -3929,6 +3936,7 @@ pub(super) fn check_direct_source_property_with_class_context_and_session(
         if store
             .type_node_links(plan.node)
             .is_some_and(|links| links != &TypeNodeLinks::default())
+            && view.requires_member_instantiation()
             && store
                 .class_instance_super_member(view.receiver_type(), property.symbol)
                 .is_none()

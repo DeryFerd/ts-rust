@@ -31554,6 +31554,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 ));
             }
         }
+        if let Some(returned) = super::classes::source_constructor_signature_return_type(
+            self.store, self.host, signature,
+        )
+        .map_err(|_| invalid_method())?
+        {
+            self.reject_type_reference_alias_capabilities()?;
+            return Ok(returned);
+        }
         let declaration = self
             .store
             .signature(signature)

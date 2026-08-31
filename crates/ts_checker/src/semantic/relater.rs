@@ -43,7 +43,8 @@ use super::{
     classes::{
         ClassConstructorVisibility, ClassHeritageMembersValidation,
         authenticated_class_constructor_value, class_constructor_call_parameter_type,
-        class_member_visibility, validate_class_heritage_members, validated_class_derives_from,
+        class_member_visibility, source_constructor_base_property_is_exact,
+        validate_class_heritage_members, validated_class_derives_from,
     },
     declared::cached_ordinary_type_parameter_owner,
     derived_types::DerivedObjectLiteralValidation,
@@ -935,7 +936,7 @@ pub(super) fn validated_synthetic_structural_property(
 enum ObjectPropertyOrigin {
     Declared,
     InterfaceHeritage(TypeId),
-    ValidatedClass,
+    ValidatedClass(TypeId),
     SyntheticStructural(TypeId),
     FiniteMappedRecord(TypeId),
     Mapped(TypeId),
@@ -954,7 +955,7 @@ impl ObjectPropertyOrigin {
         matches!(
             self,
             Self::Declared
-                | Self::ValidatedClass
+                | Self::ValidatedClass(_)
                 | Self::InterfaceHeritage(_)
                 | Self::PropertyObjectAlias(_)
         )
@@ -3639,13 +3640,13 @@ impl<'store> RelaterSession<'store> {
         }
         self.observe_symbol_table(members);
         for property in &properties {
-            self.property_symbol(*property, ObjectPropertyOrigin::ValidatedClass)?;
+            self.property_symbol(*property, ObjectPropertyOrigin::ValidatedClass(type_))?;
         }
         Ok(ResolvedObjectMembers {
             members: Some(members),
             properties,
             index_infos: Vec::new(),
-            property_origin: ObjectPropertyOrigin::ValidatedClass,
+            property_origin: ObjectPropertyOrigin::ValidatedClass(type_),
             call_signatures: Vec::new(),
             exact_callable: false,
         })
@@ -4492,7 +4493,7 @@ impl<'store> RelaterSession<'store> {
                 )
             };
             let visibility = |origin, declaration: Option<NodeRef>| {
-                if matches!(origin, ObjectPropertyOrigin::ValidatedClass) {
+                if matches!(origin, ObjectPropertyOrigin::ValidatedClass(_)) {
                     declaration.map_or(ClassConstructorVisibility::Public, |declaration| {
                         class_member_visibility(self.store, declaration)
                     })
@@ -4542,7 +4543,7 @@ impl<'store> RelaterSession<'store> {
             RelationKind::Subtype | RelationKind::StrictSubtype
         ) && matches!(
             source_members.property_origin,
-            ObjectPropertyOrigin::ValidatedClass
+            ObjectPropertyOrigin::ValidatedClass(_)
         );
         // Preserve upstream's unmatched-property pass before comparing any
         // property types. This ordering is observable through relation caches.
@@ -6039,7 +6040,7 @@ impl<'store> RelaterSession<'store> {
             )
         };
         let visibility = |origin, declaration: Option<NodeRef>| {
-            if matches!(origin, ObjectPropertyOrigin::ValidatedClass) {
+            if matches!(origin, ObjectPropertyOrigin::ValidatedClass(_)) {
                 declaration.map_or(ClassConstructorVisibility::Public, |declaration| {
                     class_member_visibility(self.store, declaration)
                 })
@@ -6057,7 +6058,7 @@ impl<'store> RelaterSession<'store> {
             }
         } else if target_visibility == ClassConstructorVisibility::Protected {
             let Some(source_owner) = source_owner
-                .filter(|_| matches!(source_origin, ObjectPropertyOrigin::ValidatedClass))
+                .filter(|_| matches!(source_origin, ObjectPropertyOrigin::ValidatedClass(_)))
             else {
                 return Ok(Ternary::False);
             };
@@ -6886,10 +6887,10 @@ impl<'store> RelaterSession<'store> {
             }
             ObjectPropertyOrigin::Declared
             | ObjectPropertyOrigin::InterfaceHeritage(_)
-            | ObjectPropertyOrigin::ValidatedClass
+            | ObjectPropertyOrigin::ValidatedClass(_)
             | ObjectPropertyOrigin::GenericReference(_) => {}
         }
-        if matches!(origin, ObjectPropertyOrigin::ValidatedClass)
+        if matches!(origin, ObjectPropertyOrigin::ValidatedClass(_))
             && record.flags() == SymbolFlags::METHOD
         {
             self.validated_class_method_callable_set(symbol)?;
@@ -6927,7 +6928,15 @@ impl<'store> RelaterSession<'store> {
                 .symbol(parent)
                 .ok_or(RelationUnavailable::Symbol(parent))?;
             let allowed_parent_flags = match origin {
-                ObjectPropertyOrigin::ValidatedClass => SymbolFlags::CLASS,
+                ObjectPropertyOrigin::ValidatedClass(receiver)
+                    if parent.flags().contains(SymbolFlags::INTERFACE)
+                        && source_constructor_base_property_is_exact(
+                            self.store, receiver, symbol,
+                        ) =>
+                {
+                    SymbolFlags::INTERFACE
+                }
+                ObjectPropertyOrigin::ValidatedClass(_) => SymbolFlags::CLASS,
                 ObjectPropertyOrigin::GenericReference(reference)
                     if self.class_field_reference_target(reference)?.is_some() =>
                 {
@@ -8151,7 +8160,7 @@ impl<'store> RelaterSession<'store> {
             return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
         }
         if class_members == ClassHeritageMembersValidation::Valid {
-            property_origin = ObjectPropertyOrigin::ValidatedClass;
+            property_origin = ObjectPropertyOrigin::ValidatedClass(type_id);
         }
         let heritage_members = if property_origin.is_declared()
             && class_members == ClassHeritageMembersValidation::NotClass
@@ -8733,16 +8742,23 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     return None;
                 }
             }
-            let owner_type = self.declared_type_links(owner_symbol)?.declared_type?;
-            let TypeData::Interface(owner_type) = self.type_payload(owner_type)?.data() else {
+            let owner_type_id = self.declared_type_links(owner_symbol)?.declared_type?;
+            let TypeData::Interface(owner_type) = self.type_payload(owner_type_id)?.data() else {
                 return None;
             };
-            if owner_type
-                .all_type_parameters
-                .as_ref()
-                .is_some_and(|parameters| !parameters.is_empty())
-                || owner_type.outer_type_parameter_count != 0
-            {
+            let nongeneric_owner = if owner_kind == SymbolFlags::CLASS {
+                // The complete class proof separates its canonical synthetic this
+                // from the ordinary arguments. A nonempty written prefix stays out.
+                validate_class_heritage_members(self, owner_type_id)
+                    == ClassHeritageMembersValidation::Valid
+                    && owner_type.reference.resolved_type_arguments.as_deref() == Some(&[])
+            } else {
+                owner_type
+                    .all_type_parameters
+                    .as_ref()
+                    .is_none_or(Vec::is_empty)
+            };
+            if !nongeneric_owner || owner_type.outer_type_parameter_count != 0 {
                 return None;
             }
             let StoredCallableSetValidation::Valid {
@@ -14390,6 +14406,200 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One real method set retains its this and owner proofs through each restore.
+    fn method_overload_relations_recheck_synthetic_this_identity() {
+        #[derive(Clone, Copy)]
+        enum Damage {
+            MissingThisOwner,
+            ThisOwner,
+            ThisDefault,
+            OwnerType,
+        }
+        let library = parse_source_file("");
+        let source = parse_source_file(concat!(
+            "interface Contract { choose(value: string): string; choose(value: number): number; } ",
+            "class Choice { ",
+            "choose(value: string): string; choose(value: number): number; ",
+            "choose(value: any): any { return value; } } ",
+            "class Alternate {}",
+        ));
+        let file = FileId::new(97_041);
+        let mut context = source_relation_context(
+            &library,
+            &source,
+            file,
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let own = query_method_relation_member(&mut context, "Choice", "choose");
+        let target = query_method_relation_member(&mut context, "Contract", "choose");
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        let TypeData::Interface(owner) = store.type_payload(own.owner_type).unwrap().data() else {
+            panic!("the source class retains its real interface record")
+        };
+        let this_type = owner.this_type.unwrap();
+        assert_eq!(owner.all_type_parameters.as_deref(), Some(&[this_type][..]));
+        assert_eq!(
+            owner.reference.resolved_type_arguments.as_deref(),
+            Some(&[][..])
+        );
+        assert_eq!(owner.outer_type_parameter_count, 0);
+        let this_data = |store: &TestStore| {
+            let TypeData::TypeParameter(data) = store.type_payload(this_type).unwrap().data()
+            else {
+                panic!("the published suffix remains the real synthetic this parameter")
+            };
+            data.clone()
+        };
+        let original_this = this_data(store);
+        assert!(original_this.is_this_type);
+        assert_eq!(original_this.constraint, Some(own.owner_type));
+        assert_eq!(
+            store.type_payload(this_type).unwrap().symbol(),
+            Some(own.owner)
+        );
+        let alternate = store
+            .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+            .unwrap()
+            .get_source("Alternate")
+            .unwrap();
+        let alternate_type = store
+            .declared_type_links(alternate)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_eq!(
+            validate_class_heritage_members(store, alternate_type),
+            ClassHeritageMembersValidation::Valid
+        );
+        let owner_links = store.declared_type_links(own.owner).unwrap().clone();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let snapshot = |store: &TestStore| {
+            (
+                method_relation_counts(store),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+                store.type_payload(this_type).unwrap().symbol(),
+                this_data(store),
+                store.declared_type_links(own.owner).cloned(),
+                store.source_class_provenance(own.owner_type).cloned(),
+            )
+        };
+        let mut caller = crate::semantic::instantiate::InstantiationSession::new(
+            crate::semantic::instantiate::InstantiationLimits {
+                max_depth: 0,
+                max_count: 0,
+            },
+        );
+        let before = snapshot(store);
+        assert!(!store.set_type_parameter_resolution(this_type, None, None, None, None));
+        assert_eq!(snapshot(store), before);
+        for damage in [
+            Damage::MissingThisOwner,
+            Damage::ThisOwner,
+            Damage::ThisDefault,
+            Damage::OwnerType,
+        ] {
+            assert_eq!(
+                store
+                    .authenticated_method_overload_set(own.type_, None)
+                    .unwrap()
+                    .unwrap()
+                    .call_signatures
+                    .iter()
+                    .map(|signature| signature.signature)
+                    .collect::<Vec<_>>(),
+                own.signatures
+            );
+            assert_eq!(
+                store.is_type_assignable_to_with_session(
+                    own.type_,
+                    target.type_,
+                    Some(&globals),
+                    Some(true),
+                    &mut caller
+                ),
+                Ok(true)
+            );
+            match damage {
+                Damage::MissingThisOwner => assert!(store.set_type_symbol(this_type, None)),
+                Damage::ThisOwner => assert!(store.set_type_symbol(this_type, Some(alternate))),
+                Damage::ThisDefault => assert!(store.set_type_parameter_resolution(
+                    this_type,
+                    original_this.constraint,
+                    original_this.target,
+                    original_this.mapper,
+                    Some(number),
+                )),
+                Damage::OwnerType => assert!(store.set_declared_type_links(
+                    own.owner,
+                    DeclaredTypeLinks {
+                        declared_type: Some(alternate_type),
+                        ..owner_links.clone()
+                    }
+                )),
+            }
+            let poisoned = snapshot(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    store.authenticated_method_overload_set(own.type_, None),
+                    Ok(None)
+                );
+                assert_eq!(
+                    store.is_type_assignable_to_with_session(
+                        own.type_,
+                        target.type_,
+                        Some(&globals),
+                        Some(true),
+                        &mut caller
+                    ),
+                    Err(RelationUnavailable::MalformedFunctionType(own.type_))
+                );
+                assert_eq!(snapshot(store), poisoned);
+            }
+            match damage {
+                Damage::MissingThisOwner | Damage::ThisOwner => {
+                    assert!(store.set_type_symbol(this_type, Some(own.owner)));
+                }
+                Damage::ThisDefault => assert!(store.set_type_parameter_resolution(
+                    this_type,
+                    original_this.constraint,
+                    original_this.target,
+                    original_this.mapper,
+                    original_this.resolved_default_type,
+                )),
+                Damage::OwnerType => {
+                    assert!(store.set_declared_type_links(own.owner, owner_links.clone()));
+                }
+            }
+            assert_eq!(
+                store.is_type_assignable_to_with_session(
+                    own.type_,
+                    target.type_,
+                    Some(&globals),
+                    Some(true),
+                    &mut caller
+                ),
+                Ok(true)
+            );
+            assert_eq!(
+                (
+                    caller.query_count(),
+                    caller.total_count(),
+                    caller.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+        }
+        assert_eq!(this_data(store), original_this);
+    }
+
+    #[test]
     fn method_overload_relations_keep_array_authority_and_spent_caller() {
         let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
         let source = parse_source_file(concat!(
@@ -14922,6 +15132,500 @@ mod tests {
             Err(RelationUnavailable::InvalidStructuredMembers(indexed))
         );
         assert_eq!(fixture.store.relation_state_snapshot(), poisoned);
+    }
+
+    mod constructor_base_property_tests {
+        use super::*;
+        use crate::semantic::instantiate::{InstantiationLimits, InstantiationSession};
+
+        const FILE: FileId = FileId::new(97_040);
+        const LIBRARY: &str = concat!(
+            "interface Product { message: string; } ",
+            "interface ProductFactory { new(message: string, code: number): Product; ",
+            "readonly prototype: Product; readonly category: string; } ",
+            "declare var BuildProduct: ProductFactory;",
+        );
+        const SOURCE: &str = concat!(
+            "interface Product { code: number; } ",
+            "interface ProductFactory { readonly revision: number; } ",
+            "interface OtherProduct { message: string; category: string; } ",
+            "class CustomProduct extends BuildProduct { ",
+            "constructor(message: string, code: number) { super(message, code); } } ",
+            "class Shape { message = ''; code = 0; } ",
+            "class StaticShape { static category = ''; static revision = 0; }",
+        );
+
+        struct ConstructorBaseProperties {
+            instance: TypeId,
+            value: TypeId,
+            shape: TypeId,
+            static_shape: TypeId,
+            base_instance: TypeId,
+            base_value: TypeId,
+            message: SemanticSymbolId,
+            category: SemanticSymbolId,
+            other_message: SemanticSymbolId,
+            other_category: SemanticSymbolId,
+        }
+
+        fn context<'arena>(
+            library: &'arena ParseResult,
+            source: &'arena ParseResult,
+        ) -> CanonicalCheckerContext<'arena> {
+            assert!(library.diagnostics.is_empty());
+            assert!(source.diagnostics.is_empty());
+            let mut context = source_relation_context(
+                library,
+                source,
+                FILE,
+                CanonicalCheckerOptions {
+                    strict_function_types: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(FILE).unwrap();
+            assert!(context.diagnostics().is_empty());
+            context
+        }
+
+        fn identities(store: &TestStore) -> ConstructorBaseProperties {
+            let globals = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .unwrap();
+            let owner = |name| {
+                store
+                    .get_merged_symbol(globals.get_source(name).unwrap())
+                    .unwrap()
+            };
+            let instance = store
+                .declared_type_links(owner("CustomProduct"))
+                .unwrap()
+                .declared_type
+                .unwrap();
+            let edge = store.direct_class_heritage_provenance(instance).unwrap();
+            let property = |type_, name| {
+                store
+                    .type_payload(type_)
+                    .and_then(|record| record.data().structured())
+                    .and_then(|structured| structured.members)
+                    .and_then(|members| store.symbol_table(members))
+                    .and_then(|members| members.get_source(name))
+                    .unwrap()
+            };
+            let other = store
+                .symbol(owner("OtherProduct"))
+                .unwrap()
+                .members()
+                .and_then(|members| store.symbol_table(members))
+                .unwrap();
+            ConstructorBaseProperties {
+                instance,
+                value: edge.owner_value_type,
+                shape: store
+                    .declared_type_links(owner("Shape"))
+                    .unwrap()
+                    .declared_type
+                    .unwrap(),
+                static_shape: store
+                    .value_symbol_links(owner("StaticShape"))
+                    .unwrap()
+                    .resolved_type
+                    .unwrap(),
+                base_instance: edge.base_instance_type,
+                base_value: edge.base_value_type,
+                message: property(edge.base_instance_type, "message"),
+                category: property(edge.base_value_type, "category"),
+                other_message: other.get_source("message").unwrap(),
+                other_category: other.get_source("category").unwrap(),
+            }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Checks both member sides and source replay with one caller.
+        fn constructor_base_properties_keep_merged_owners_and_caller_session() {
+            let library = parse_source_file(LIBRARY);
+            let source = parse_source_file(SOURCE);
+            let mut context = context(&library, &source);
+            let globals = context.global_types().clone();
+            let types = identities(context.store());
+            let store = context.store_mut_for_test();
+            for (property, base) in [
+                (types.message, types.base_instance),
+                (types.category, types.base_value),
+            ] {
+                let raw_parent = store.symbol(property).unwrap().parent().unwrap();
+                let canonical_parent = store.get_parent_of_symbol(property).unwrap();
+                assert_ne!(raw_parent, canonical_parent);
+                assert_eq!(
+                    store.type_payload(base).unwrap().symbol(),
+                    Some(canonical_parent)
+                );
+                assert_eq!(
+                    store.symbol(raw_parent).unwrap().flags(),
+                    SymbolFlags::INTERFACE
+                );
+            }
+            let counts = method_relation_counts(store);
+            let links = store.checker_link_allocated_lengths();
+            let mut caller = InstantiationSession::new(InstantiationLimits {
+                max_depth: 0,
+                max_count: 0,
+            });
+            for _ in 0..2 {
+                assert_eq!(
+                    store.resolved_own_property_by_key_with_context(
+                        types.instance,
+                        EscapedName::source("message").as_ref(),
+                        Some(&globals),
+                        &mut caller,
+                    ),
+                    Ok(Some(ResolvedOwnProperty {
+                        symbol: types.message,
+                        type_: store.intrinsic_bootstrap().unwrap().string_type,
+                        optional: false,
+                        readonly: false,
+                    }))
+                );
+                assert_eq!(
+                    store.is_type_assignable_to_with_session(
+                        types.instance,
+                        types.shape,
+                        Some(&globals),
+                        Some(true),
+                        &mut caller,
+                    ),
+                    Ok(true)
+                );
+                let bootstrap = store.relation_bootstrap_facts().unwrap();
+                let mut relation =
+                    super::super::RelaterSession::new_with_global_types_options_and_session(
+                        store,
+                        RelationKind::Assignable,
+                        bootstrap,
+                        Some(RelationGlobalTypes::from_global_types(&globals)),
+                        Some(true),
+                        Some(&mut caller),
+                    );
+                let inherited = relation
+                    .class_constructor_static_members(types.value)
+                    .unwrap();
+                assert!(inherited.properties.contains(&types.category));
+                assert!(matches!(
+                    inherited.property_origin,
+                    super::super::ObjectPropertyOrigin::ValidatedClass(receiver)
+                        if receiver == types.value
+                ));
+                let expected = relation
+                    .class_constructor_static_members(types.static_shape)
+                    .unwrap();
+                assert_eq!(
+                    relation.properties_related_to(
+                        types.value,
+                        types.static_shape,
+                        &inherited,
+                        &expected,
+                    ),
+                    Ok(Ternary::True)
+                );
+            }
+            assert_eq!(
+                (
+                    caller.query_count(),
+                    caller.total_count(),
+                    caller.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+            assert_eq!(method_relation_counts(store), counts);
+            assert_eq!(store.checker_link_allocated_lengths(), links);
+            context.recheck_source_file(FILE).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let replay = identities(context.store());
+            assert_eq!(replay.instance, types.instance);
+            assert_eq!(replay.value, types.value);
+            assert_eq!(replay.message, types.message);
+            assert_eq!(replay.category, types.category);
+            assert_eq!(method_relation_counts(context.store()), counts);
+        }
+
+        #[test]
+        fn constructor_base_properties_reject_unrelated_receivers_and_wrong_sides() {
+            let library = parse_source_file(LIBRARY);
+            let source = parse_source_file(SOURCE);
+            let mut context = context(&library, &source);
+            let globals = context.global_types().clone();
+            let types = identities(context.store());
+            let store = context.store_mut_for_test();
+            let before = (
+                method_relation_counts(store),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            );
+            let mut caller = InstantiationSession::new(InstantiationLimits {
+                max_depth: 0,
+                max_count: 0,
+            });
+            for (receiver, property) in [
+                (types.shape, types.message),
+                (types.value, types.message),
+                (types.instance, types.category),
+                (types.base_instance, types.message),
+                (types.base_value, types.category),
+                (types.instance, types.other_message),
+            ] {
+                let bootstrap = store.relation_bootstrap_facts().unwrap();
+                let mut relation =
+                    super::super::RelaterSession::new_with_global_types_options_and_session(
+                        store,
+                        RelationKind::Assignable,
+                        bootstrap,
+                        Some(RelationGlobalTypes::from_global_types(&globals)),
+                        Some(true),
+                        Some(&mut caller),
+                    );
+                assert_eq!(
+                    relation
+                        .property_symbol(
+                            property,
+                            super::super::ObjectPropertyOrigin::ValidatedClass(receiver),
+                        )
+                        .map(|_| ()),
+                    Err(RelationUnavailable::UnsupportedProperty(property))
+                );
+            }
+            assert_eq!(
+                (
+                    method_relation_counts(store),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot()
+                ),
+                before
+            );
+            assert_eq!(
+                (
+                    caller.query_count(),
+                    caller.total_count(),
+                    caller.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Each damaged proof is restored before the same warm queries.
+        fn constructor_base_properties_recheck_warm_owner_tables_and_types() {
+            let library = parse_source_file(LIBRARY);
+            let source = parse_source_file(SOURCE);
+            let mut context = context(&library, &source);
+            let globals = context.global_types().clone();
+            let types = identities(context.store());
+            let store = context.store_mut_for_test();
+            let member_table = |type_| {
+                store
+                    .type_payload(type_)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap()
+                    .members
+                    .unwrap()
+            };
+            let instance_table = member_table(types.instance);
+            let base_table = member_table(types.base_instance);
+            let static_table = member_table(types.value);
+            let message = store.symbol(types.message).unwrap();
+            let relationships = (
+                message.members(),
+                message.exports(),
+                message.parent(),
+                message.export_symbol(),
+            );
+            let other_owner = store.get_parent_of_symbol(types.other_message).unwrap();
+            let value_links = store.value_symbol_links(types.message).unwrap().clone();
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            let key = store
+                .relation_key_if_available(
+                    types.instance,
+                    types.shape,
+                    super::super::IntersectionState::NONE,
+                    false,
+                    false,
+                )
+                .unwrap()
+                .key();
+            let mut caller = InstantiationSession::new(InstantiationLimits {
+                max_depth: 0,
+                max_count: 0,
+            });
+            let snapshot = |store: &TestStore| {
+                (
+                    (
+                        method_relation_counts(store),
+                        store.checker_link_allocated_lengths(),
+                        store.relation_state_snapshot(),
+                    ),
+                    store.symbol(types.message).unwrap().parent(),
+                    store.value_symbol_links(types.message).cloned(),
+                    [
+                        store
+                            .symbol_table(instance_table)
+                            .unwrap()
+                            .get_source("message"),
+                        store
+                            .symbol_table(base_table)
+                            .unwrap()
+                            .get_source("message"),
+                        store
+                            .symbol_table(static_table)
+                            .unwrap()
+                            .get_source("category"),
+                    ],
+                    store.source_class_provenance(types.instance).cloned(),
+                    store.direct_class_heritage_provenance(types.instance),
+                )
+            };
+            for damage in 0..5 {
+                assert_eq!(
+                    store.is_type_assignable_to_with_session(
+                        types.instance,
+                        types.shape,
+                        Some(&globals),
+                        Some(true),
+                        &mut caller
+                    ),
+                    Ok(true)
+                );
+                assert!(
+                    store
+                        .relation_cache_get(RelationKind::Assignable, key)
+                        .contains(RelationComparisonResult::SUCCEEDED)
+                );
+                match damage {
+                    0 => assert!(store.set_symbol_relationships(
+                        types.message,
+                        relationships.0,
+                        relationships.1,
+                        Some(other_owner),
+                        relationships.3
+                    )),
+                    1 | 2 => assert_eq!(
+                        store.insert_symbol(
+                            if damage == 1 {
+                                instance_table
+                            } else {
+                                base_table
+                            },
+                            EscapedName::source("message"),
+                            types.other_message,
+                        ),
+                        Some(Some(types.message))
+                    ),
+                    3 => assert_eq!(
+                        store.insert_symbol(
+                            static_table,
+                            EscapedName::source("category"),
+                            types.other_category
+                        ),
+                        Some(Some(types.category))
+                    ),
+                    4 => assert!(store.set_value_symbol_links(
+                        types.message,
+                        ValueSymbolLinks {
+                            resolved_type: Some(number),
+                            ..value_links.clone()
+                        }
+                    )),
+                    _ => unreachable!(),
+                }
+                let poisoned = snapshot(store);
+                for _ in 0..2 {
+                    assert_eq!(
+                        store.resolved_own_property_by_key_with_context(
+                            types.instance,
+                            EscapedName::source("message").as_ref(),
+                            Some(&globals),
+                            &mut caller
+                        ),
+                        Err(RelationUnavailable::InvalidStructuredMembers(
+                            types.instance
+                        ))
+                    );
+                    assert_eq!(
+                        store.is_type_assignable_to_with_session(
+                            types.instance,
+                            types.shape,
+                            Some(&globals),
+                            Some(true),
+                            &mut caller
+                        ),
+                        Err(RelationUnavailable::InvalidStructuredMembers(
+                            types.instance
+                        ))
+                    );
+                    assert_eq!(snapshot(store), poisoned);
+                }
+                match damage {
+                    0 => assert!(store.set_symbol_relationships(
+                        types.message,
+                        relationships.0,
+                        relationships.1,
+                        relationships.2,
+                        relationships.3
+                    )),
+                    1 | 2 => assert_eq!(
+                        store.insert_symbol(
+                            if damage == 1 {
+                                instance_table
+                            } else {
+                                base_table
+                            },
+                            EscapedName::source("message"),
+                            types.message,
+                        ),
+                        Some(Some(types.other_message))
+                    ),
+                    3 => assert_eq!(
+                        store.insert_symbol(
+                            static_table,
+                            EscapedName::source("category"),
+                            types.category
+                        ),
+                        Some(Some(types.other_category))
+                    ),
+                    4 => assert!(store.set_value_symbol_links(types.message, value_links.clone())),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    store
+                        .resolved_own_property_by_key_with_context(
+                            types.instance,
+                            EscapedName::source("message").as_ref(),
+                            Some(&globals),
+                            &mut caller
+                        )
+                        .map(|property| property.unwrap().symbol),
+                    Ok(types.message)
+                );
+                assert_eq!(
+                    store.is_type_assignable_to_with_session(
+                        types.instance,
+                        types.shape,
+                        Some(&globals),
+                        Some(true),
+                        &mut caller
+                    ),
+                    Ok(true)
+                );
+                assert_eq!(
+                    (
+                        caller.query_count(),
+                        caller.total_count(),
+                        caller.limit_event_count()
+                    ),
+                    (0, 0, 0)
+                );
+            }
+        }
     }
 
     #[test]

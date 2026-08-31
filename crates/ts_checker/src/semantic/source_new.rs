@@ -991,14 +991,14 @@ pub(super) fn plan_direct_default_new_with_type_context(
             symbol,
         }));
     }
-    let source_single = symbol_record.flags() == SymbolFlags::CLASS
+    let source_arguments = symbol_record.flags() == SymbolFlags::CLASS
         && prior_source_classes
             .get(&symbol)
-            .is_some_and(SourceClassPlan::has_public_single_constructor);
-    if has_expression_arguments && !source_single {
+            .is_some_and(SourceClassPlan::has_checked_constructor_arguments);
+    if has_expression_arguments && !source_arguments {
         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
     }
-    let expression_arguments = source_single.then(|| SourceNewExpressionArguments {
+    let expression_arguments = source_arguments.then(|| SourceNewExpressionArguments {
         nodes: new_expression
             .arguments
             .as_ref()
@@ -1011,14 +1011,14 @@ pub(super) fn plan_direct_default_new_with_type_context(
             }),
         expressions: None,
     });
-    if source_single {
+    if source_arguments {
         arguments.clear();
         executor = None;
         if new_expression.type_arguments.is_some() {
             return Err(unsupported(SourceNewUnsupported::TypeArguments(node)));
         }
     }
-    let global_wrapper = !source_single
+    let global_wrapper = !source_arguments
         && matches!(identifier.text.as_str(), "Object" | "Boolean")
         && store
             .intrinsic_bootstrap()
@@ -1026,7 +1026,7 @@ pub(super) fn plan_direct_default_new_with_type_context(
             .and_then(|globals| globals.get_source(&identifier.text))
             .and_then(|global| store.get_merged_symbol(global))
             == Some(symbol);
-    let global_array = !source_single
+    let global_array = !source_arguments
         && identifier.text == "Array"
         && store
             .intrinsic_bootstrap()
@@ -1034,7 +1034,7 @@ pub(super) fn plan_direct_default_new_with_type_context(
             .and_then(|globals| globals.get_source("Array"))
             .and_then(|global| store.get_merged_symbol(global))
             == Some(symbol);
-    let global_date = !source_single
+    let global_date = !source_arguments
         && identifier.text == "Date"
         && store
             .intrinsic_bootstrap()
@@ -1043,7 +1043,7 @@ pub(super) fn plan_direct_default_new_with_type_context(
             .and_then(|global| store.get_merged_symbol(global))
             == Some(symbol);
     let imported_class = import_bindings.contains_key(&resolved_symbol);
-    let global_promise = !source_single
+    let global_promise = !source_arguments
         && identifier.text == "Promise"
         && store
             .intrinsic_bootstrap()
@@ -1161,11 +1161,11 @@ pub(super) fn plan_direct_default_new_with_type_context(
             }));
         }
         (SourceNewTarget::ConstructorOverloads(Box::new(class)), None)
-    } else if let Some(class) = prior_source_classes
-        .get(&symbol)
-        .filter(|class| symbol_record.flags() == SymbolFlags::CLASS && !class.has_object_base())
-    {
-        if !(class.has_own_default_constructor() || source_single) || early_preparation {
+    } else if let Some(class) = prior_source_classes.get(&symbol).filter(|class| {
+        symbol_record.flags() == SymbolFlags::CLASS
+            && (!class.has_object_base() || class.has_constructor_value_base())
+    }) {
+        if !(class.has_own_default_constructor() || source_arguments) || early_preparation {
             return Err(unsupported(SourceNewUnsupported::Constructor(constructor)));
         }
         if argument.is_some() || !additional_arguments.is_empty() || !type_arguments.is_empty() {
@@ -3864,7 +3864,7 @@ pub(super) fn preflight_direct_default_new(
     plan: &SourceDefaultNewPlan,
 ) -> Result<(), SourceNewError> {
     if plan.expression_arguments.is_some()
-        && !matches!(&plan.target, SourceNewTarget::SourceClass(class) if class.has_public_single_constructor())
+        && !matches!(&plan.target, SourceNewTarget::SourceClass(class) if class.has_checked_constructor_arguments())
     {
         return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
             plan.node,
@@ -5559,10 +5559,10 @@ fn resolved_source_class_constructor(
     class: &SourceClassPlan,
 ) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
     let invalid = || invariant(SourceNewInvariant::InvalidClassPlan(class.declaration()));
-    let explicit = class.has_public_single_constructor();
+    let checked_arguments = class.has_checked_constructor_arguments();
     if class.symbol() != plan.resolved_symbol
-        || !(class.has_own_default_constructor() || explicit)
-        || explicit != plan.expression_arguments.is_some()
+        || !(class.has_own_default_constructor() || checked_arguments)
+        || checked_arguments != plan.expression_arguments.is_some()
         || plan.argument.is_some()
         || !plan.additional_arguments.is_empty()
         || !plan.type_arguments.is_empty()
@@ -5573,7 +5573,7 @@ fn resolved_source_class_constructor(
     {
         return Err(invalid());
     }
-    if explicit {
+    if checked_arguments {
         preflight_source_class_expression_arguments(host, plan)?;
     }
     let declaration = host.node(class.declaration()).ok_or_else(invalid)?;
@@ -5591,7 +5591,24 @@ fn resolved_source_class_constructor(
         instance_type: members.shells().instance_type(),
         signature: members.default_construct_signature(),
     };
-    if authenticated_class_constructor_value(store, class.symbol())
+    if class.has_public_inherited_constructor() {
+        let candidates = super::classes::source_class_expression_constructor_candidates(
+            store,
+            host,
+            class.symbol(),
+        )?
+        .ok_or_else(invalid)?;
+        if candidates
+            .first()
+            .is_none_or(|callable| callable.signature != selected.signature)
+            || candidates.iter().any(|callable| {
+                callable.owner != selected.value_type
+                    || callable.return_type != Some(selected.instance_type)
+            })
+        {
+            return Err(invalid());
+        }
+    } else if authenticated_class_constructor_value(store, class.symbol())
         != Some((selected.value_type, selected.signature))
     {
         return Err(invalid());
@@ -5677,25 +5694,49 @@ pub(super) fn source_class_constructor_argument_contextual_type(
                 plan.constructor,
             ))
         })?;
-    let constructor = super::classes::source_class_single_constructor(store, host, class.symbol())?
-        .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(class.declaration())))?;
-    if constructor.callable.signature != selected.signature
-        || constructor.callable.owner != selected.value_type
+    let candidates = super::classes::source_class_expression_constructor_candidates(
+        store,
+        host,
+        class.symbol(),
+    )?
+    .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(class.declaration())))?;
+    if candidates
+        .first()
+        .is_none_or(|callable| callable.signature != selected.signature)
+        || candidates
+            .iter()
+            .any(|callable| callable.owner != selected.value_type)
     {
         return Err(invariant(SourceNewInvariant::InvalidConstructSignature(
             selected.signature,
         )));
     }
-    super::calls::try_get_type_at_position(
-        store,
-        Some(globals),
-        &constructor.callable,
-        argument_index,
-    )
-    .map_err(|error| SourceNewError::Call {
-        node: plan.node,
-        error,
-    })
+    let arity = plan
+        .expression_arguments
+        .as_ref()
+        .map_or(0, |arguments| arguments.nodes.len());
+    let mut contextual = None;
+    for callable in &candidates {
+        if class.has_public_inherited_constructor()
+            && (arity < callable.min_argument_count || arity > callable.parameters.len())
+        {
+            continue;
+        }
+        let Some(candidate) =
+            super::calls::try_get_type_at_position(store, Some(globals), callable, argument_index)
+                .map_err(|error| SourceNewError::Call {
+                    node: plan.node,
+                    error,
+                })?
+        else {
+            return Ok(None);
+        };
+        if contextual.is_some_and(|previous| previous != candidate) {
+            return Ok(None);
+        }
+        contextual = Some(candidate);
+    }
+    Ok(contextual)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5728,11 +5769,19 @@ pub(super) fn check_source_class_expression_new(
                 plan.constructor,
             ))
         })?;
-    let constructor = super::classes::source_class_single_constructor(store, host, class.symbol())?
-        .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(class.declaration())))?;
-    if constructor.callable.signature != selected.signature
-        || constructor.callable.owner != selected.value_type
-        || constructor.callable.return_type != Some(selected.instance_type)
+    let candidates = super::classes::source_class_expression_constructor_candidates(
+        store,
+        host,
+        class.symbol(),
+    )?
+    .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(class.declaration())))?;
+    if candidates
+        .first()
+        .is_none_or(|callable| callable.signature != selected.signature)
+        || candidates.iter().any(|callable| {
+            callable.owner != selected.value_type
+                || callable.return_type != Some(selected.instance_type)
+        })
     {
         return Err(invariant(SourceNewInvariant::InvalidConstructSignature(
             selected.signature,
@@ -5752,7 +5801,7 @@ pub(super) fn check_source_class_expression_new(
             callee: selected.value_type,
             arguments: argument_types,
         },
-        &[constructor.callable],
+        &candidates,
         existing_signature,
         session,
     )
@@ -5768,13 +5817,19 @@ pub(super) fn check_source_class_expression_new(
             error: super::calls::DirectCallInvariant::InvalidSignature(existing).into(),
         });
     }
-    if resolution.projection.signature != selected.signature
+    if !candidates
+        .iter()
+        .any(|callable| callable.signature == resolution.projection.signature)
         || resolution.projection.return_type != selected.instance_type
     {
         return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
             plan.node,
         )));
     }
+    let selected = CheckedSourceDefaultNew {
+        signature: resolution.projection.signature,
+        ..selected
+    };
     let checked = publish_default_new_links(store, host, plan, selected, argument_types)?;
     Ok((checked, resolution))
 }
@@ -6958,12 +7013,28 @@ fn preflight_default_new_cache(
         }
         SourceNewTarget::SourceClass(class) => {
             let resolved = resolved_source_class_constructor(store, host, plan, class)?;
+            let candidates = if class.has_public_inherited_constructor() && resolved.is_some() {
+                super::classes::source_class_expression_constructor_candidates(
+                    store,
+                    host,
+                    class.symbol(),
+                )?
+            } else {
+                None
+            };
             if constructor_type.is_some_and(|constructor| {
                 resolved.is_none_or(|resolved| constructor != resolved.value_type)
             }) || result_type.is_some_and(|result| {
                 resolved.is_none_or(|resolved| result != resolved.instance_type)
             }) || signature.is_some_and(|signature| {
-                resolved.is_none_or(|resolved| signature != resolved.signature)
+                candidates.as_ref().map_or_else(
+                    || resolved.is_none_or(|resolved| signature != resolved.signature),
+                    |candidates| {
+                        !candidates
+                            .iter()
+                            .any(|callable| callable.signature == signature)
+                    },
+                )
             }) {
                 return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
                     plan.node,

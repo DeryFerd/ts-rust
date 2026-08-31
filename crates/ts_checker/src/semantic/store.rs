@@ -12434,7 +12434,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             .get(&instance_type)
             .copied()
     }
+}
 
+impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
     /// Publishes the exact instance/value split selected by one direct class
     /// heritage plan. All five identities must already be authoritative.
     pub(super) fn publish_direct_class_heritage_provenance(
@@ -12475,8 +12477,13 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if provenance.owner_symbol == provenance.base_symbol
             || !exact_class_instance(self, instance_type, provenance.owner_symbol)
             || !exact_class_value(self, provenance.owner_value_type, provenance.owner_symbol)
-            || !exact_class_instance(self, provenance.base_instance_type, provenance.base_symbol)
-            || !exact_class_value(self, provenance.base_value_type, provenance.base_symbol)
+            || !(exact_class_instance(self, provenance.base_instance_type, provenance.base_symbol)
+                && exact_class_value(self, provenance.base_value_type, provenance.base_symbol)
+                || super::classes::source_constructor_heritage_is_exact(
+                    self,
+                    instance_type,
+                    provenance,
+                ))
         {
             return false;
         }
