@@ -1,9 +1,9 @@
 //! Class value queries compose the existing annotation and expression kernels.
 
 use super::super::{
-    ClassPropertyPlan, completed_source_class_method_type, completed_source_class_property_type,
-    emit_standard_class_fields, plan_property_with_body_mode, preflight_source_class_annotation,
-    validate_index_type_cache,
+    ClassPropertyPlan, ClassTypeQueryContext, completed_source_class_method_type,
+    completed_source_class_property_type, emit_standard_class_fields, plan_property_with_body_mode,
+    preflight_source_class_annotation, validate_index_type_cache,
 };
 use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
@@ -610,7 +610,12 @@ impl ClassValueQuery<'_, '_, '_> {
         symbol: SemanticSymbolId,
         active: &mut HashSet<SemanticSymbolId>,
     ) -> Result<TypeId, ClassError> {
-        if let Some(type_) = completed_source_class_method_type(self.store, self.host, symbol)? {
+        if let Some(type_) = completed_source_class_method_type(
+            self.store,
+            self.host,
+            symbol,
+            &ClassTypeQueryContext::new(self.global_types, self.options),
+        )? {
             return Ok(type_);
         }
         match plan_selected_class_member(self.store, self.host, symbol) {

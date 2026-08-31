@@ -1,7 +1,8 @@
 //! Exact source integration for admitted class and declared constructions.
 //!
 //! This includes `new Model()`, `new Model`, literal overload arguments, and
-//! checked expression arguments for an explicit source constructor. It follows
+//! checked expression arguments for an explicit source constructor or an
+//! authenticated default-library TypeLiteral construct value. It follows
 //! pinned TypeScript-Go `checkCallExpression`,
 //! `getResolvedSignature`, `resolveNewExpression`, and `resolveCall`.
 //! An admitted constructor belongs to one preceding local class, an imported
@@ -12,8 +13,9 @@
 //! arguments and canonical generic instantiations. Global arrays retain their
 //! real length and generic-item overloads, including authenticated empty object
 //! literals. Planning proves syntax, resolver routes, provider provenance, and
-//! cold/warm caches before source execution may publish class or expression
-//! state.
+//! available cache facts before canonical declaration preparation. The source
+//! expression checker validates argument semantics before New selection and
+//! result publication.
 
 use std::collections::{HashMap, HashSet};
 
@@ -33,13 +35,17 @@ use super::{
     TypeNodeLinks, ValueSymbolLinks,
     bootstrap::LiteralTypeCacheError,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
-    callables::CallableFamily,
+    callables::{CallableFamily, ValidatedSingleCallable},
     classes::{
         ClassConstructorVisibility, ClassMemberPlan, ClassMemberQueryPlan, SourceClassPlan,
         authenticated_class_constructor_value, completed_source_class_members,
         execute_nongeneric_class_member_query, optional_constructor_parameter_type,
         plan_nongeneric_class_member_query, preflight_nongeneric_class_member_query,
         source_class_plan_is_current,
+    },
+    constructor_values::{
+        GlobalConstructorValuePlan, plan_global_constructor_value,
+        prepare_global_constructor_candidates, resolve_global_constructor_candidates,
     },
     declared::{execute_type_parameter, preflight_class_or_interface_reference},
     functions::plan_function_type,
@@ -51,7 +57,7 @@ use super::{
     },
     reference_types::{create_direct_generic_reference, validate_direct_generic_reference},
     signatures::{Signature, SignatureFlags},
-    source::{PlannedExpression, PlannedExpressionKind},
+    source::{CheckedExpressionTypes, PlannedExpression, PlannedExpressionKind},
     source_callables::{
         source_direct_call_argument_arrow_is_exact,
         source_promise_constructor_argument_arrow_is_exact,
@@ -202,6 +208,7 @@ enum SourceNewTarget {
     GlobalArray(SourceGlobalArrayConstructorPlan),
     GlobalDate(SourceGlobalDateConstructorPlan),
     DeclaredInterface(global_error::DeclaredConstructorPlan),
+    Library(Box<GlobalConstructorValuePlan>),
     GlobalPromise(SourceGlobalPromiseConstructorPlan),
 }
 
@@ -356,6 +363,10 @@ struct SourceNewParameter {
 }
 
 impl SourceDefaultNewPlan {
+    pub(super) fn is_library_constructor(&self) -> bool {
+        matches!(&self.target, SourceNewTarget::Library(_))
+    }
+
     pub(super) fn expression_argument_nodes(&self) -> Option<&[NodeRef]> {
         self.expression_arguments
             .as_ref()
@@ -787,6 +798,66 @@ pub(super) fn plan_direct_default_new_with_type_context(
     early_preparation: bool,
     type_context: Option<&super::classes::ClassTypeQueryContext>,
 ) -> Result<SourceDefaultNewPlan, SourceNewError> {
+    plan_direct_default_new_with_context(
+        arena,
+        bound,
+        store,
+        host,
+        prior_classes,
+        prior_source_classes,
+        import_bindings,
+        node,
+        early_preparation,
+        type_context,
+        None,
+    )
+}
+
+/// Uses the current source caller to admit a real default-library value.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_direct_default_new_with_source_context(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    prior_classes: &HashMap<SemanticSymbolId, ClassMemberPlan>,
+    prior_source_classes: &HashMap<SemanticSymbolId, SourceClassPlan>,
+    import_bindings: &HashMap<SemanticSymbolId, SourceImportBindingPlan>,
+    node: NodeRef,
+    early_preparation: bool,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+) -> Result<SourceDefaultNewPlan, SourceNewError> {
+    let type_context = super::classes::ClassTypeQueryContext::new(globals, options);
+    plan_direct_default_new_with_context(
+        arena,
+        bound,
+        store,
+        host,
+        prior_classes,
+        prior_source_classes,
+        import_bindings,
+        node,
+        early_preparation,
+        Some(&type_context),
+        Some((globals, options)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_direct_default_new_with_context(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    prior_classes: &HashMap<SemanticSymbolId, ClassMemberPlan>,
+    prior_source_classes: &HashMap<SemanticSymbolId, SourceClassPlan>,
+    import_bindings: &HashMap<SemanticSymbolId, SourceImportBindingPlan>,
+    node: NodeRef,
+    early_preparation: bool,
+    type_context: Option<&super::classes::ClassTypeQueryContext>,
+    source_context: Option<(&CanonicalGlobalTypes, CanonicalCheckerOptions)>,
+) -> Result<SourceDefaultNewPlan, SourceNewError> {
     let record = arena
         .get(node.node)
         .ok_or_else(|| invariant(SourceNewInvariant::MissingNode(node)))?;
@@ -988,27 +1059,38 @@ pub(super) fn plan_direct_default_new_with_type_context(
     let symbol_record = store
         .symbol(symbol)
         .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(symbol)))?;
+    let library = source_context
+        .map(|(globals, options)| {
+            plan_global_constructor_value(store, host, globals, options, symbol)
+                .map_err(|error| global_error::provider_error(constructor, symbol, error))
+        })
+        .transpose()?
+        .flatten();
     let source_arguments = symbol_record.flags() == SymbolFlags::CLASS
         && prior_source_classes
             .get(&symbol)
             .is_some_and(SourceClassPlan::has_checked_constructor_arguments);
-    if has_expression_arguments && !source_arguments {
+    if has_expression_arguments && !(source_arguments || library.is_some()) {
         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
     }
-    let expression_arguments = source_arguments.then(|| SourceNewExpressionArguments {
-        nodes: new_expression
-            .arguments
-            .as_ref()
-            .map_or_else(Vec::new, |arguments| {
-                arguments
-                    .nodes
-                    .iter()
-                    .map(|&argument| NodeRef::new(node.arena, node.file, argument))
-                    .collect()
-            }),
-        expressions: None,
-    });
-    if source_arguments {
+    let expression_arguments =
+        (source_arguments || library.is_some()).then(|| SourceNewExpressionArguments {
+            nodes: new_expression
+                .arguments
+                .as_ref()
+                .map_or_else(Vec::new, |arguments| {
+                    arguments
+                        .nodes
+                        .iter()
+                        .map(|&argument| NodeRef::new(node.arena, node.file, argument))
+                        .collect()
+                }),
+            expressions: None,
+        });
+    if source_arguments || library.is_some() {
+        if library.is_some() && executor.is_some() {
+            return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+        }
         arguments.clear();
         executor = None;
         if new_expression.type_arguments.is_some() {
@@ -1074,7 +1156,9 @@ pub(super) fn plan_direct_default_new_with_type_context(
     };
     let argument = arguments.first().cloned();
     let additional_arguments = arguments.into_iter().skip(1).collect::<Vec<_>>();
-    let (target, parameter) = if let Some(binding) = import_bindings.get(&resolved_symbol) {
+    let (target, parameter) = if let Some(library) = library {
+        (SourceNewTarget::Library(Box::new(library)), None)
+    } else if let Some(binding) = import_bindings.get(&resolved_symbol) {
         if symbol_record.flags() != SymbolFlags::ALIAS
             || binding.alias_symbol != resolved_symbol
             || binding.local_text != identifier.text
@@ -1319,7 +1403,7 @@ pub(super) fn plan_direct_default_new_with_type_context(
         executor: None,
         expression_arguments,
     };
-    preflight_default_new_cache(store, host, &plan)?;
+    preflight_default_new_cache_with_context(store, host, &plan, source_context)?;
     Ok(plan)
 }
 
@@ -3903,8 +3987,28 @@ pub(super) fn preflight_direct_default_new(
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
 ) -> Result<(), SourceNewError> {
+    preflight_direct_default_new_with_context(store, host, plan, None)
+}
+
+pub(super) fn preflight_direct_default_new_with_source_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+) -> Result<(), SourceNewError> {
+    preflight_direct_default_new_with_context(store, host, plan, Some((globals, options)))
+}
+
+fn preflight_direct_default_new_with_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    source_context: Option<(&CanonicalGlobalTypes, CanonicalCheckerOptions)>,
+) -> Result<(), SourceNewError> {
     if plan.expression_arguments.is_some()
         && !matches!(&plan.target, SourceNewTarget::SourceClass(class) if class.has_checked_constructor_arguments())
+        && !(plan.is_library_constructor() && source_context.is_some())
     {
         return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
             plan.node,
@@ -3926,6 +4030,14 @@ pub(super) fn preflight_direct_default_new(
         }
     }
     match &plan.target {
+        SourceNewTarget::Library(_) => {
+            let (globals, options) = source_context.ok_or_else(|| {
+                invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                ))
+            })?;
+            resolve_library_new_candidates(store, host, globals, options, plan)?;
+        }
         SourceNewTarget::ConstructorOverloads(class) => {
             if super::classes::plan_source_constructor_overload_class(
                 store,
@@ -4122,7 +4234,7 @@ pub(super) fn preflight_direct_default_new(
             }
         }
     }
-    preflight_default_new_cache(store, host, plan)
+    preflight_default_new_cache_with_context(store, host, plan, source_context)
 }
 
 /// Revalidates every construction, prepares required constructor signatures,
@@ -4148,7 +4260,7 @@ pub(super) fn prepare_direct_default_news(
         if !seen.insert(plan.node) {
             return Err(invariant(SourceNewInvariant::DuplicatePlan(plan.node)));
         }
-        preflight_direct_default_new(store, host, plan)?;
+        preflight_direct_default_new_with_source_context(store, host, global_types, options, plan)?;
     }
 
     for plan in plans {
@@ -4163,6 +4275,26 @@ pub(super) fn prepare_direct_default_news(
 
     for plan in plans {
         match &plan.target {
+            SourceNewTarget::Library(library) => {
+                prepare_global_constructor_candidates(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    library,
+                )
+                .map_err(|error| {
+                    global_error::provider_error(plan.constructor, plan.resolved_symbol, error)
+                })?;
+                resolve_library_new_candidates(store, host, global_types, options, plan)?
+                    .ok_or_else(|| {
+                        invariant(SourceNewInvariant::InvalidConstructorCache(
+                            plan.constructor,
+                        ))
+                    })?;
+            }
             SourceNewTarget::ConstructorOverloads(class) => {
                 super::classes::prepare_source_class_constructor_header(
                     store,
@@ -5281,6 +5413,11 @@ pub(super) fn check_direct_default_new(
     preflight_direct_default_new(store, host, plan)?;
     preflight_prepared_default_new_cache(store, host, plan)?;
     let selected = match &plan.target {
+        SourceNewTarget::Library(_) => {
+            return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                plan.node,
+            )));
+        }
         SourceNewTarget::ConstructorOverloads(_) => {
             return Err(unsupported(SourceNewUnsupported::Arguments(plan.node)));
         }
@@ -5532,12 +5669,23 @@ fn publish_default_new_links(
     selected: CheckedSourceDefaultNew,
     argument_types: &[TypeId],
 ) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    publish_default_new_links_with_context(store, host, plan, selected, argument_types, None)
+}
+
+fn publish_default_new_links_with_context(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    selected: CheckedSourceDefaultNew,
+    argument_types: &[TypeId],
+    source_context: Option<(&CanonicalGlobalTypes, CanonicalCheckerOptions)>,
+) -> Result<CheckedSourceDefaultNew, SourceNewError> {
     let CheckedSourceDefaultNew {
         value_type,
         instance_type,
         signature,
     } = selected;
-    preflight_publication_cache(
+    preflight_publication_cache_with_context(
         store,
         host,
         plan,
@@ -5545,6 +5693,7 @@ fn publish_default_new_links(
         instance_type,
         signature,
         argument_types,
+        source_context,
     )?;
 
     let symbol_links = SymbolNodeLinks {
@@ -5562,6 +5711,14 @@ fn publish_default_new_links(
         resolved_signature: ResolvedSignatureState::Resolved(signature),
         ..SignatureLinks::default()
     };
+    if plan.is_library_constructor()
+        && store.symbol_node_links(plan.constructor) == Some(&symbol_links)
+        && store.type_node_links(plan.constructor) == Some(&constructor_links)
+        && store.signature_links(plan.node) == Some(&signature_links)
+        && store.type_node_links(plan.node) == Some(&expression_links)
+    {
+        return Ok(selected);
+    }
     assert!(store.set_symbol_node_links(plan.constructor, symbol_links));
     assert!(store.set_type_node_links(plan.constructor, constructor_links));
     assert!(store.set_signature_links(plan.node, signature_links));
@@ -5718,6 +5875,409 @@ fn preflight_source_class_expression_arguments(
         previous_end = child.range.end;
     }
     Ok(())
+}
+
+/// A transient view of the complete, source-proven library construct suffix.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceLibraryConstructorCandidates {
+    pub(super) value_type: TypeId,
+    pub(super) callables: Vec<ValidatedSingleCallable>,
+}
+
+fn resolve_library_new_candidates(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+) -> Result<Option<SourceLibraryConstructorCandidates>, SourceNewError> {
+    let invalid = || {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    };
+    let SourceNewTarget::Library(library) = &plan.target else {
+        return Err(invalid());
+    };
+    if plan.argument.is_some()
+        || !plan.additional_arguments.is_empty()
+        || !plan.type_arguments.is_empty()
+        || plan.parameter.is_some()
+        || plan.executor.is_some()
+        || library.value_symbol() != plan.resolved_symbol
+        || constructor_value_symbol(store, plan.constructor, plan.resolved_symbol)?
+            != plan.resolved_symbol
+    {
+        return Err(invalid());
+    }
+    preflight_source_class_expression_arguments(host, plan)?;
+    let (arena, bound) = host.source(plan.constructor).ok_or_else(invalid)?;
+    let record = host.node(plan.constructor).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Err(invalid());
+    };
+    let expression = host.node(plan.node).ok_or_else(invalid)?;
+    let NodeData::NewExpression(new_expression) = &expression.data else {
+        return Err(invalid());
+    };
+    if !plan.constructor.is_for(plan.node.arena, plan.node.file)
+        || record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 0
+        || record.parent != Some(plan.node.node)
+        || record.range.start < expression.range.start
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || !bound.contains(plan.constructor)
+        || !bound.contains(plan.node)
+        || new_expression.arguments.as_ref().is_some_and(|arguments| {
+            arguments.has_trailing_comma
+                || record.range.end > arguments.range.start
+                || arguments.range.end != expression.range.end
+                || arguments.range.end.get() < arguments.range.start.get().saturating_add(2)
+                || arena.source_text().is_some_and(|source| {
+                    let open = usize::try_from(arguments.range.start.get()).ok();
+                    let close = usize::try_from(arguments.range.end.get().saturating_sub(1)).ok();
+                    open.is_none_or(|open| source.as_bytes().get(open) != Some(&b'('))
+                        || close.is_none_or(|close| source.as_bytes().get(close) != Some(&b')'))
+                })
+        })
+        || new_expression.arguments.is_none() && record.range.end != expression.range.end
+    {
+        return Err(invalid());
+    }
+    let mut callback_host = host.name_resolver_host(store)?;
+    let mut resolver =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(|error| {
+                invariant(SourceNewInvariant::NameResolution {
+                    node: plan.constructor,
+                    error,
+                })
+            })?;
+    if resolver
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(plan.constructor)),
+            &identifier.text,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(|error| {
+            invariant(SourceNewInvariant::NameResolution {
+                node: plan.constructor,
+                error,
+            })
+        })?
+        != Some(plan.resolved_symbol)
+    {
+        return Err(invalid());
+    }
+    let current =
+        plan_global_constructor_value(store, host, globals, options, plan.resolved_symbol)
+            .map_err(|error| {
+                global_error::provider_error(plan.constructor, plan.resolved_symbol, error)
+            })?;
+    if current.as_ref() != Some(library.as_ref()) {
+        return Err(invalid());
+    }
+    let Some(ready) = resolve_global_constructor_candidates(store, host, globals, options, library)
+        .map_err(|error| {
+            global_error::provider_error(plan.constructor, plan.resolved_symbol, error)
+        })?
+    else {
+        return Ok(None);
+    };
+    let value = ready.value();
+    let value_type = value.constructor_type();
+    let projection =
+        super::callable_sets::validate_stored_callable_set_projection(store, value_type, false)
+            .ok_or_else(invalid)?;
+    if value.value_symbol() != plan.resolved_symbol
+        || projection.owner != value_type
+        || ready.signatures().is_empty()
+        || projection.construct_signatures.len() != ready.signatures().len()
+        || library.construct_declarations().len() != ready.signatures().len()
+    {
+        return Err(invalid());
+    }
+    let mut callables = Vec::with_capacity(ready.signatures().len());
+    for ((signature, &projected), declaration) in ready
+        .signatures()
+        .iter()
+        .zip(projection.construct_signatures.iter())
+        .zip(library.construct_declarations())
+    {
+        let record = store.signature(projected).ok_or_else(invalid)?;
+        let mut parameters = store
+            .callable_signature_parameter_types(projected)
+            .ok_or_else(invalid)?
+            .to_vec();
+        if signature.value() != value
+            || signature.signature() != projected
+            || signature.declaration() != declaration
+            || record.declaration() != Some(declaration)
+            || !record.flags().contains(SignatureFlags::CONSTRUCT)
+            || record.flags().contains(SignatureFlags::ABSTRACT)
+            || !record.type_parameters().is_empty()
+            || record.target().is_some()
+            || record.mapper().is_some()
+            || record.resolved_return_type() != Some(signature.return_type())
+            || parameters.len() != record.parameters().len()
+        {
+            return Err(invalid());
+        }
+        let rest_parameter = if record.has_rest_parameter() {
+            Some(parameters.pop().ok_or_else(invalid)?)
+        } else {
+            None
+        };
+        let min_argument_count =
+            usize::try_from(record.min_argument_count()).map_err(|_| invalid())?;
+        if min_argument_count > parameters.len() {
+            return Err(invalid());
+        }
+        callables.push(ValidatedSingleCallable {
+            owner: value_type,
+            signature: projected,
+            parameters,
+            rest_parameter,
+            min_argument_count,
+            return_type: Some(signature.return_type()),
+            strict_variance_exempt: false,
+        });
+    }
+    Ok(Some(SourceLibraryConstructorCandidates {
+        value_type,
+        callables,
+    }))
+}
+
+/// Checks available producer facts. Flow-dependent types still need the executor.
+fn preflight_library_argument_caches(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+) -> Result<(), SourceNewError> {
+    let Some(arguments) = plan.checked_expression_arguments() else {
+        return Ok(());
+    };
+    let mut pending = arguments.iter().collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    while let Some(expression) = pending.pop() {
+        let node = expression.node;
+        let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(node));
+        if !seen.insert(node)
+            || host.node(node).is_none()
+            || host
+                .bound_file(node)
+                .is_none_or(|bound| !bound.contains(node))
+        {
+            return Err(invalid());
+        }
+        let cached = exact_type_cache(store, node).map_err(|()| invalid())?;
+        let symbol = exact_symbol_cache(store, node).map_err(|()| invalid())?;
+        match &expression.kind {
+            PlannedExpressionKind::Call(_) => {
+                super::source_calls::preflight_call_links(store, node).map_err(|_| invalid())?;
+            }
+            PlannedExpressionKind::SuperCall(_) => {
+                super::source_calls::preflight_super_call_links(store, node)
+                    .map_err(|_| invalid())?;
+            }
+            _ => {
+                exact_signature_cache(store, node).map_err(|()| invalid())?;
+            }
+        }
+        if let PlannedExpressionKind::Identifier(read) = &expression.kind
+            && symbol.is_some_and(|symbol| symbol != read.resolved_symbol)
+        {
+            return Err(invalid());
+        }
+        if let PlannedExpressionKind::Object { plan: object, .. } = &expression.kind {
+            let state = object_literal_state(store, object).map_err(|_| invalid())?;
+            if cached.is_some_and(|cached| {
+                state.is_none_or(|state| !state.is_resolved() || state.type_id() != cached)
+            }) {
+                return Err(invalid());
+            }
+        }
+        if let PlannedExpressionKind::New(nested) = &expression.kind {
+            preflight_direct_default_new_with_source_context(
+                store, host, globals, options, nested,
+            )?;
+        }
+        if let Some(cached) = cached {
+            let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+            let regular = match &expression.kind {
+                PlannedExpressionKind::String(value) => {
+                    Some(bootstrap.cached_string_literal_type(value))
+                }
+                PlannedExpressionKind::Number { value, .. } => {
+                    Some(bootstrap.cached_number_literal_type(*value))
+                }
+                PlannedExpressionKind::BigInt { value, .. } => {
+                    Some(bootstrap.cached_bigint_literal_type(value))
+                }
+                PlannedExpressionKind::Boolean(value) => Some(Some(if *value {
+                    bootstrap.regular_true_type
+                } else {
+                    bootstrap.regular_false_type
+                })),
+                _ => None,
+            };
+            if let Some(regular) = regular {
+                let regular = regular.ok_or_else(invalid)?;
+                store
+                    .validate_union_constituent(regular)
+                    .map_err(|_| invalid())?;
+                let Some(TypeData::Literal(literal)) =
+                    store.type_payload(regular).map(TypeRecord::data)
+                else {
+                    return Err(invalid());
+                };
+                if literal.regular_type != regular
+                    || cached != regular && literal.fresh_type != Some(cached)
+                {
+                    return Err(invalid());
+                }
+                store
+                    .validate_union_constituent(cached)
+                    .map_err(|_| invalid())?;
+            }
+            let known = match &expression.kind {
+                PlannedExpressionKind::Null => Some(bootstrap.null_widening_type),
+                PlannedExpressionKind::GlobalUndefined => Some(bootstrap.undefined_widening_type),
+                PlannedExpressionKind::RegularExpression(type_) => Some(*type_),
+                PlannedExpressionKind::Parenthesized(_)
+                    if expression.unparenthesized().node != node =>
+                {
+                    Some(
+                        exact_type_cache(store, expression.unparenthesized().node)
+                            .map_err(|()| invalid())?
+                            .ok_or_else(invalid)?,
+                    )
+                }
+                _ => None,
+            };
+            if known.is_some_and(|expected| expected != cached) {
+                return Err(invalid());
+            }
+        }
+        expression.new_argument_children(&mut pending);
+    }
+    Ok(())
+}
+
+/// Requires prepared use-site slots and validates every candidate before demand.
+pub(super) fn source_library_constructor_candidates(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+) -> Result<SourceLibraryConstructorCandidates, SourceNewError> {
+    preflight_direct_default_new_with_source_context(store, host, globals, options, plan)?;
+    preflight_prepared_default_new_cache_with_context(store, host, plan, Some((globals, options)))?;
+    if plan.checked_expression_arguments().is_none() {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    }
+    resolve_library_new_candidates(store, host, globals, options, plan)?.ok_or_else(|| {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    })
+}
+
+pub(super) fn source_constructor_argument_contextual_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+    argument_index: usize,
+) -> Result<Option<TypeId>, SourceNewError> {
+    if !plan.is_library_constructor() {
+        return source_class_constructor_argument_contextual_type(
+            store,
+            host,
+            globals,
+            plan,
+            argument_index,
+        );
+    }
+    let candidates = source_library_constructor_candidates(store, host, globals, options, plan)?;
+    let arguments = plan
+        .checked_expression_arguments()
+        .ok_or_else(|| invariant(SourceNewInvariant::InvalidExpressionCache(plan.node)))?;
+    if argument_index >= arguments.len() {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    }
+    let single = candidates.callables.len() == 1;
+    let candidates = candidates.callables.iter().filter(|candidate| {
+        single
+            || arguments.len() >= candidate.min_argument_count
+                && (candidate.rest_parameter.is_some()
+                    || arguments.len() <= candidate.parameters.len())
+    });
+    super::source_calls::common_fixed_argument_contextual_type(
+        store,
+        globals,
+        candidates,
+        argument_index,
+    )
+    .map_err(|error| SourceNewError::Call {
+        node: plan.node,
+        error,
+    })
+}
+
+/// Publishes only a selected original candidate after source diagnostics succeed.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn finish_source_library_expression_new(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+    candidates: &SourceLibraryConstructorCandidates,
+    checked_arguments: &[CheckedExpressionTypes],
+    resolution: &super::calls::DirectCallResolution,
+) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    let current = source_library_constructor_candidates(store, host, globals, options, plan)?;
+    if &current != candidates
+        || !current.callables.iter().any(|candidate| {
+            candidate.signature == resolution.projection.signature
+                && candidate.return_type == Some(resolution.projection.return_type)
+        })
+    {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    }
+    let selected = CheckedSourceDefaultNew {
+        value_type: current.value_type,
+        instance_type: resolution.projection.return_type,
+        signature: resolution.projection.signature,
+    };
+    let argument_cache_types = checked_arguments
+        .iter()
+        .map(CheckedExpressionTypes::raw)
+        .collect::<Vec<_>>();
+    publish_default_new_links_with_context(
+        store,
+        host,
+        plan,
+        selected,
+        &argument_cache_types,
+        Some((globals, options)),
+    )
 }
 
 pub(super) fn source_class_constructor_argument_contextual_type(
@@ -5883,6 +6443,15 @@ fn preflight_prepared_default_new_cache(
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
 ) -> Result<(), SourceNewError> {
+    preflight_prepared_default_new_cache_with_context(store, host, plan, None)
+}
+
+fn preflight_prepared_default_new_cache_with_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    source_context: Option<(&CanonicalGlobalTypes, CanonicalCheckerOptions)>,
+) -> Result<(), SourceNewError> {
     if store.symbol_node_links(plan.constructor).is_none()
         || store.type_node_links(plan.constructor).is_none()
         || store.signature_links(plan.node).is_none()
@@ -5899,7 +6468,7 @@ fn preflight_prepared_default_new_cache(
             plan.node,
         )));
     }
-    preflight_default_new_cache(store, host, plan)
+    preflight_default_new_cache_with_context(store, host, plan, source_context)
 }
 
 fn resolved_declared_constructor(
@@ -7027,10 +7596,20 @@ fn preflight_exported_constructor_binding(
     Ok(())
 }
 
+#[cfg(test)]
 fn preflight_default_new_cache(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
+) -> Result<(), SourceNewError> {
+    preflight_default_new_cache_with_context(store, host, plan, None)
+}
+
+fn preflight_default_new_cache_with_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    source_context: Option<(&CanonicalGlobalTypes, CanonicalCheckerOptions)>,
 ) -> Result<(), SourceNewError> {
     preflight_exported_constructor_binding(store, host, plan)?;
     let constructor_symbol = exact_symbol_cache(store, plan.constructor).map_err(|()| {
@@ -7079,6 +7658,32 @@ fn preflight_default_new_cache(
     }
 
     match &plan.target {
+        SourceNewTarget::Library(_) => {
+            let (globals, options) = source_context.ok_or_else(|| {
+                invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                ))
+            })?;
+            let candidates = resolve_library_new_candidates(store, host, globals, options, plan)?;
+            if constructor_type.is_some_and(|type_| {
+                candidates
+                    .as_ref()
+                    .is_none_or(|candidates| candidates.value_type != type_)
+            }) || signature.is_some_and(|signature| {
+                candidates.as_ref().is_none_or(|candidates| {
+                    !candidates.callables.iter().any(|candidate| {
+                        candidate.signature == signature && candidate.return_type == result_type
+                    })
+                })
+            }) || signature.is_some()
+                && (constructor_symbol != Some(plan.resolved_symbol) || constructor_type.is_none())
+            {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+            preflight_library_argument_caches(store, host, globals, options, plan)?;
+        }
         SourceNewTarget::ConstructorOverloads(class) => {
             let group =
                 super::classes::source_class_constructor_overloads(store, host, class.symbol())?;
@@ -7291,7 +7896,8 @@ fn preflight_default_new_cache(
     Ok(())
 }
 
-fn preflight_publication_cache(
+#[allow(clippy::too_many_arguments)]
+fn preflight_publication_cache_with_context(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
@@ -7299,8 +7905,9 @@ fn preflight_publication_cache(
     instance_type: TypeId,
     signature: SignatureId,
     argument_types: &[TypeId],
+    source_context: Option<(&CanonicalGlobalTypes, CanonicalCheckerOptions)>,
 ) -> Result<(), SourceNewError> {
-    preflight_prepared_default_new_cache(store, host, plan)?;
+    preflight_prepared_default_new_cache_with_context(store, host, plan, source_context)?;
     let constructor_symbol = exact_symbol_cache(store, plan.constructor).map_err(|()| {
         invariant(SourceNewInvariant::InvalidConstructorCache(
             plan.constructor,
@@ -7647,6 +8254,810 @@ mod tests {
         classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
         production::GlobalMergeCompletion,
     };
+
+    const LIBRARY_EXPRESSION_NEW_DECLARATIONS: &str = concat!(
+        "interface Array<T> {} interface ReadonlyArray<T> {} ",
+        "interface BuildResult { value: string; } ",
+        "interface OtherResult { value: number; } ",
+        "declare var BuildValue: { prototype: BuildResult; ",
+        "new(): BuildResult; new(value?: number): OtherResult; empty(): BuildResult; };",
+    );
+
+    #[allow(clippy::too_many_arguments)]
+    fn library_zero_argument_plan(
+        source: &ParseResult,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        globals: &CanonicalGlobalTypes,
+        options: CanonicalCheckerOptions,
+        node: NodeRef,
+    ) -> SourceDefaultNewPlan {
+        let mut plan = plan_direct_default_new_with_source_context(
+            &source.arena,
+            bound,
+            store,
+            host,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            node,
+            false,
+            globals,
+            options,
+        )
+        .unwrap();
+        assert!(plan.is_library_constructor());
+        assert_eq!(plan.expression_argument_nodes(), Some(&[][..]));
+        plan.set_expression_arguments(Vec::new()).unwrap();
+        plan
+    }
+
+    #[test]
+    fn library_expression_new_revalidates_complete_candidates_and_saved_pairs() {
+        let library = parse_source_file(LIBRARY_EXPRESSION_NEW_DECLARATIONS);
+        let source = parse_source_file("const value = new BuildValue();");
+        assert!(library.diagnostics.is_empty());
+        assert!(source.diagnostics.is_empty());
+        for damage in 0..9 {
+            let library_file = FileId::new(202_800);
+            let file = FileId::new(202_801);
+            let mut context =
+                global_object_constructor_context(&library, &source, library_file, file);
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let library_bound = context.file(library_file).unwrap().1.clone();
+            let source_bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&source.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let globals = context.global_types().clone();
+            let options = context.options();
+            let (node, constructor) = variable_new(&source, file, "value");
+            let plan = library_zero_argument_plan(
+                &source,
+                &source_bound,
+                context.store(),
+                &host,
+                &globals,
+                options,
+                node,
+            );
+            let candidates = source_library_constructor_candidates(
+                context.store(),
+                &host,
+                &globals,
+                options,
+                &plan,
+            )
+            .unwrap();
+            assert_eq!(candidates.callables.len(), 2);
+            assert_ne!(
+                candidates.callables[0].return_type,
+                candidates.callables[1].return_type
+            );
+            let selected = candidates.callables[0].signature;
+            let later = candidates.callables[1].signature;
+            let return_type = candidates.callables[0].return_type.unwrap();
+            let other_return = candidates.callables[1].return_type.unwrap();
+            assert_eq!(
+                exact_signature_cache(context.store(), node),
+                Ok(Some(selected))
+            );
+            assert_eq!(
+                exact_type_cache(context.store(), node),
+                Ok(Some(return_type))
+            );
+            let parameter = context.store().signature(later).unwrap().parameters()[0];
+            let original_parameter = context
+                .store()
+                .value_symbol_links(parameter)
+                .unwrap()
+                .clone();
+            let original_symbol = context
+                .store()
+                .symbol_node_links(constructor)
+                .unwrap()
+                .clone();
+            let original_constructor = context
+                .store()
+                .type_node_links(constructor)
+                .unwrap()
+                .clone();
+            let original_result = context.store().type_node_links(node).unwrap().clone();
+            let original_signature = context.store().signature_links(node).unwrap().clone();
+            let original_members = context
+                .store()
+                .type_payload(candidates.value_type)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .clone();
+            let owner = context
+                .store()
+                .type_payload(return_type)
+                .and_then(TypeRecord::symbol)
+                .unwrap();
+            let primitive = context.store().intrinsic_bootstrap().unwrap().string_type;
+            let before = format!("{:?}", context.store());
+            preflight_direct_default_new_with_source_context(
+                context.store(),
+                &host,
+                &globals,
+                options,
+                &plan,
+            )
+            .unwrap();
+            assert_eq!(format!("{:?}", context.store()), before);
+
+            let store = context.store_mut_for_test();
+            match damage {
+                0 => assert!(store.set_symbol_node_links(
+                    constructor,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(owner)
+                    }
+                )),
+                1 => assert!(store.set_type_node_links(
+                    constructor,
+                    TypeNodeLinks {
+                        resolved_type: Some(primitive),
+                        ..TypeNodeLinks::default()
+                    }
+                )),
+                2 => assert!(store.set_type_node_links(
+                    node,
+                    TypeNodeLinks {
+                        resolved_type: Some(other_return),
+                        ..TypeNodeLinks::default()
+                    }
+                )),
+                3 => assert!(store.set_signature_links(
+                    node,
+                    SignatureLinks {
+                        resolved_signature: ResolvedSignatureState::Resolved(later),
+                        ..SignatureLinks::default()
+                    }
+                )),
+                4 => assert!(store.set_type_node_links(node, TypeNodeLinks::default())),
+                5 => assert!(store.set_signature_links(node, SignatureLinks::default())),
+                6 => assert!(store.set_signature_resolved_return_type(later, Some(return_type))),
+                7 => assert!(store.set_value_symbol_links(
+                    parameter,
+                    ValueSymbolLinks {
+                        resolved_type: Some(primitive),
+                        ..original_parameter.clone()
+                    }
+                )),
+                8 => assert!(store.set_structured_type_members(
+                    candidates.value_type,
+                    original_members.members,
+                    original_members.properties.clone(),
+                    Some(Vec::new()),
+                    Some(vec![later, selected]),
+                    original_members.index_infos.clone(),
+                )),
+                _ => unreachable!(),
+            }
+            let damaged = format!("{store:?}");
+            let mut session = InstantiationSession::new(Default::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            for _ in 0..2 {
+                assert!(matches!(
+                    preflight_direct_default_new_with_source_context(
+                        store, &host, &globals, options, &plan
+                    ),
+                    Err(SourceNewError::Invariant(_)) | Err(SourceNewError::DeclaredType(_)),
+                ));
+                assert!(
+                    prepare_direct_default_news(
+                        store,
+                        &host,
+                        &globals,
+                        options,
+                        &mut session,
+                        &mut diagnostics,
+                        std::slice::from_ref(&plan),
+                    )
+                    .is_err()
+                );
+                assert_eq!(format!("{store:?}"), damaged);
+                assert_eq!(
+                    (
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_count()
+                    ),
+                    (0, 0, 0)
+                );
+                assert!(diagnostics.is_empty());
+            }
+            match damage {
+                0 => assert!(store.set_symbol_node_links(constructor, original_symbol)),
+                1 => assert!(store.set_type_node_links(constructor, original_constructor)),
+                2 | 4 => assert!(store.set_type_node_links(node, original_result)),
+                3 | 5 => assert!(store.set_signature_links(node, original_signature)),
+                6 => assert!(store.set_signature_resolved_return_type(later, Some(other_return))),
+                7 => assert!(store.set_value_symbol_links(parameter, original_parameter)),
+                8 => assert!(store.set_structured_type_members(
+                    candidates.value_type,
+                    original_members.members,
+                    original_members.properties.clone(),
+                    Some(Vec::new()),
+                    original_members.signatures.clone(),
+                    original_members.index_infos.clone(),
+                )),
+                _ => unreachable!(),
+            }
+            let restored = format!("{store:?}");
+            let checked = super::super::source_calls::check_source_library_expression_new(
+                store,
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                &plan,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(checked.signature, selected);
+            assert_eq!(checked.instance_type, return_type);
+            assert_eq!(checked.value_type, candidates.value_type);
+            assert_eq!(format!("{store:?}"), restored);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn library_expression_new_batch_preflights_later_nodes_before_preparation() {
+        let library = parse_source_file(LIBRARY_EXPRESSION_NEW_DECLARATIONS);
+        let source =
+            parse_source_file("const first = new BuildValue(); const second = new BuildValue();");
+        let library_file = FileId::new(202_802);
+        let file = FileId::new(202_803);
+        let mut context = global_object_constructor_context(&library, &source, library_file, file);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let first = variable_new(&source, file, "first").0;
+        let (second, constructor) = variable_new(&source, file, "second");
+        let plans = [first, second].map(|node| {
+            library_zero_argument_plan(
+                &source,
+                &source_bound,
+                context.store(),
+                &host,
+                &globals,
+                options,
+                node,
+            )
+        });
+        let value_symbol = plans[0].resolved_symbol();
+        let foreign = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .global_this_symbol;
+        let store = context.store_mut_for_test();
+        assert!(store.set_symbol_node_links(
+            constructor,
+            SymbolNodeLinks {
+                resolved_symbol: Some(foreign)
+            }
+        ));
+        let damaged = format!("{store:?}");
+        let mut session = InstantiationSession::new(Default::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        for _ in 0..2 {
+            assert_eq!(
+                prepare_direct_default_news(
+                    store,
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                    &plans,
+                ),
+                Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                    constructor
+                )))
+            );
+            assert_eq!(format!("{store:?}"), damaged);
+            assert!(
+                store
+                    .value_symbol_links(value_symbol)
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+            assert!(store.type_node_links(first).is_none());
+            assert!(store.signature_links(first).is_none());
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+            assert!(diagnostics.is_empty());
+        }
+        assert!(store.set_symbol_node_links(constructor, SymbolNodeLinks::default()));
+        prepare_direct_default_news(
+            store,
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            &plans,
+        )
+        .unwrap();
+        for plan in &plans {
+            let checked = super::super::source_calls::check_source_library_expression_new(
+                store,
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                plan,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                exact_signature_cache(store, plan.node),
+                Ok(Some(checked.signature))
+            );
+            assert_eq!(
+                exact_type_cache(store, plan.node),
+                Ok(Some(checked.instance_type))
+            );
+        }
+        let warm = format!("{store:?}");
+        prepare_direct_default_news(
+            store,
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            &plans,
+        )
+        .unwrap();
+        assert_eq!(format!("{store:?}"), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn library_expression_new_keeps_current_array_authority_on_warm_reads() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface BuildResult { value: string; } ",
+            "declare var BuildValue: { prototype: BuildResult; ",
+            "new(values?: string[]): BuildResult; };",
+        ));
+        let source = parse_source_file("const value = new BuildValue();");
+        let library_file = FileId::new(202_804);
+        let file = FileId::new(202_805);
+        let mut context = global_object_constructor_context(&library, &source, library_file, file);
+        context.check_source_file(file).unwrap();
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let (node, _) = variable_new(&source, file, "value");
+        let plan = library_zero_argument_plan(
+            &source,
+            &source_bound,
+            context.store(),
+            &host,
+            &globals,
+            options,
+            node,
+        );
+        let candidates =
+            source_library_constructor_candidates(context.store(), &host, &globals, options, &plan)
+                .unwrap();
+        let [callable] = candidates.callables.as_slice() else {
+            panic!("one real constructor")
+        };
+        let array = callable.parameters[0];
+        let reference = context
+            .store()
+            .canonical_array_reference(&globals, array)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reference.element_type,
+            context.store().intrinsic_bootstrap().unwrap().string_type
+        );
+        let TypeData::TypeReference(record) = context
+            .store()
+            .type_payload(reference.base_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("real canonical Array reference")
+        };
+        assert_eq!(record.object.target, Some(globals.array_type));
+        let other = global_object_constructor_context(
+            &library,
+            &source,
+            FileId::new(202_806),
+            FileId::new(202_807),
+        );
+        let mut missing = globals.clone();
+        missing.array_type = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .empty_generic_type;
+        let mut foreign = globals.clone();
+        foreign.array_type = other.global_types().array_type;
+        for invalid_globals in [&missing, &foreign] {
+            let before = format!("{:?}", context.store());
+            let mut session = InstantiationSession::new(Default::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            for _ in 0..2 {
+                assert!(
+                    preflight_direct_default_new_with_source_context(
+                        context.store(),
+                        &host,
+                        invalid_globals,
+                        options,
+                        &plan,
+                    )
+                    .is_err()
+                );
+                assert!(
+                    prepare_direct_default_news(
+                        context.store_mut_for_test(),
+                        &host,
+                        invalid_globals,
+                        options,
+                        &mut session,
+                        &mut diagnostics,
+                        std::slice::from_ref(&plan),
+                    )
+                    .is_err()
+                );
+                assert_eq!(format!("{:?}", context.store()), before);
+                assert_eq!(
+                    (
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_count()
+                    ),
+                    (0, 0, 0)
+                );
+                assert!(diagnostics.is_empty());
+            }
+        }
+        let before = format!("{:?}", context.store());
+        assert_eq!(
+            source_library_constructor_candidates(context.store(), &host, &globals, options, &plan),
+            Ok(candidates)
+        );
+        assert_eq!(format!("{:?}", context.store()), before);
+    }
+
+    #[test]
+    fn library_expression_new_preparation_uses_the_spent_source_caller() {
+        use crate::semantic::{
+            array_types::CanonicalArrayTargets,
+            instantiate::{InstantiationLimits, instantiate_type_with_vector_and_session},
+        };
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface BuildResult { value: string; } ",
+            "type Payload<T> = T[]; ",
+            "declare var BuildValue: { prototype: BuildResult; ",
+            "new(values?: Payload<string>): BuildResult; };",
+        ));
+        let source = parse_source_file("const value = new BuildValue();");
+        let library_file = FileId::new(202_808);
+        let file = FileId::new(202_809);
+        let mut context = global_object_constructor_context(&library, &source, library_file, file);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let (node, constructor) = variable_new(&source, file, "value");
+        let plan = library_zero_argument_plan(
+            &source,
+            &source_bound,
+            context.store(),
+            &host,
+            &globals,
+            options,
+            node,
+        );
+        let parameter_node = library
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &library.arena.get(alias.name)?.data else {
+                    return None;
+                };
+                (name.text == "Payload").then_some(NodeRef::new(
+                    library.arena.id(),
+                    library_file,
+                    alias.type_parameters.as_ref()?.nodes[0],
+                ))
+            })
+            .unwrap();
+        let parameter_symbol = library_bound.symbol(parameter_node).unwrap();
+        let store = context.store_mut_for_test();
+        let parameter = execute_type_parameter(store, parameter_symbol);
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let mut caller = InstantiationSession::new(InstantiationLimits {
+            max_count: 1,
+            ..InstantiationLimits::default()
+        });
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                store,
+                parameter,
+                &[parameter],
+                &[number],
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+                &mut caller,
+            ),
+            Ok(number)
+        );
+        assert_eq!(
+            (
+                caller.query_count(),
+                caller.total_count(),
+                caller.limit_event_count()
+            ),
+            (1, 1, 0)
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(
+            prepare_direct_default_news(
+                store,
+                &host,
+                &globals,
+                options,
+                &mut caller,
+                &mut diagnostics,
+                std::slice::from_ref(&plan),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            (
+                caller.query_count(),
+                caller.total_count(),
+                caller.limit_event_count()
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(exact_type_cache(store, constructor), Ok(None));
+        assert_eq!(exact_type_cache(store, node), Ok(None));
+        assert_eq!(exact_signature_cache(store, node), Ok(None));
+        assert!(
+            store
+                .value_symbol_links(plan.resolved_symbol())
+                .is_none_or(|links| links.resolved_type.is_none())
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn library_expression_new_preflights_nested_literal_facts_without_semantic_replay() {
+        use crate::semantic::source::PlannedObjectMember;
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface BuildResult { value: string; } interface Init { count: number; } ",
+            "declare var BuildValue: { prototype: BuildResult; new(value: string, init: Init): BuildResult; };",
+        ));
+        let source = parse_source_file("const value = new BuildValue('ready', { count: 1 });");
+        let library_file = FileId::new(202_810);
+        let file = FileId::new(202_811);
+        let mut context = global_object_constructor_context(&library, &source, library_file, file);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let (node, _) = variable_new(&source, file, "value");
+        let mut plan = plan_direct_default_new_with_source_context(
+            &source.arena,
+            &source_bound,
+            context.store(),
+            &host,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            node,
+            false,
+            &globals,
+            options,
+        )
+        .unwrap();
+        let [text, object] = plan.expression_argument_nodes().unwrap() else {
+            panic!("two actual arguments")
+        };
+        let (text, object) = (*text, *object);
+        let NodeData::StringLiteral(text_data) = &source.arena.get(text.node).unwrap().data else {
+            panic!("the original string argument")
+        };
+        let NodeData::ObjectLiteralExpression(object_data) =
+            &source.arena.get(object.node).unwrap().data
+        else {
+            panic!("the original object argument")
+        };
+        let [property] = object_data.properties.nodes.as_slice() else {
+            panic!("one real property")
+        };
+        let NodeData::PropertyAssignment(property) = &source.arena.get(*property).unwrap().data
+        else {
+            panic!("one assignment")
+        };
+        let value = NodeRef::new(source.arena.id(), file, property.initializer);
+        let NodeData::NumericLiteral(number) = &source.arena.get(value.node).unwrap().data else {
+            panic!("the actual numeric value")
+        };
+        let object_plan = plan_object_literal(context.store(), &host, object).unwrap();
+        plan.set_expression_arguments(vec![
+            PlannedExpression::new(text, PlannedExpressionKind::String(text_data.text.clone())),
+            PlannedExpression::new(
+                object,
+                PlannedExpressionKind::Object {
+                    plan: object_plan,
+                    properties: vec![PlannedObjectMember::Eager(PlannedExpression::new(
+                        value,
+                        PlannedExpressionKind::Number {
+                            value: ts_jsnum::from_string(&number.text),
+                            unary_operand: None,
+                        },
+                    ))],
+                },
+            ),
+        ])
+        .unwrap();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let store = context.store_mut_for_test();
+        assert!(store.set_type_node_links(
+            value,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        let before = format!("{store:?}");
+        let mut caller = InstantiationSession::new(Default::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        for _ in 0..2 {
+            assert_eq!(
+                prepare_direct_default_news(
+                    store,
+                    &host,
+                    &globals,
+                    options,
+                    &mut caller,
+                    &mut diagnostics,
+                    std::slice::from_ref(&plan),
+                ),
+                Err(invariant(SourceNewInvariant::InvalidExpressionCache(value)))
+            );
+            assert_eq!(format!("{store:?}"), before);
+            assert!(
+                store
+                    .value_symbol_links(plan.resolved_symbol())
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+            assert!(store.signature_links(node).is_none());
+            assert!(store.type_node_links(node).is_none());
+            assert_eq!(
+                (
+                    caller.query_count(),
+                    caller.total_count(),
+                    caller.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+        }
+        assert!(store.set_type_node_links(value, TypeNodeLinks::default()));
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let correct = context.store().type_node_links(value).unwrap().clone();
+        let original_pair = (
+            context.store().type_node_links(node).cloned(),
+            context.store().signature_links(node).cloned(),
+        );
+        assert!(context.store_mut_for_test().set_type_node_links(
+            value,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        let before = format!("{:?}", context.store());
+        assert_eq!(
+            preflight_direct_default_new_with_source_context(
+                context.store(),
+                &host,
+                &globals,
+                options,
+                &plan
+            ),
+            Err(invariant(SourceNewInvariant::InvalidExpressionCache(value)))
+        );
+        assert_eq!(format!("{:?}", context.store()), before);
+        assert_eq!(
+            (
+                context.store().type_node_links(node).cloned(),
+                context.store().signature_links(node).cloned()
+            ),
+            original_pair
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(value, correct)
+        );
+        preflight_direct_default_new_with_source_context(
+            context.store(),
+            &host,
+            &globals,
+            options,
+            &plan,
+        )
+        .unwrap();
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_node_links(node).cloned(),
+                context.store().signature_links(node).cloned()
+            ),
+            original_pair
+        );
+    }
 
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
         let mut binder = CanonicalBinder::new();

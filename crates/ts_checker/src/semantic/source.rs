@@ -58,6 +58,8 @@
 //! including writes through previously declared JavaScript function expandos.
 //! Own source-class fields accept direct top-level writes. Later direct reads
 //! use the source file's checked assignments without changing declared field types.
+//! Direct instance-field conditions use the current class body's checked flow.
+//! Proved library constructor values can be used in class locals and returns.
 //! Option-gated unused-local, unused-parameter, and unused-import diagnostics
 //! run after complete source value and reference publication.
 //! The complete source tree and complete supported-statement plan are validated
@@ -87,6 +89,8 @@ use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
 use super::classes::{plan_source_class_members, prepare_source_class_members};
+#[cfg(test)]
+use super::source_properties::check_class_property_write_target;
 
 use ts_ast::{
     FileId, ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind,
@@ -291,8 +295,8 @@ use super::{
         CheckedClassPropertyWriteTarget, ClassAccessContext, OwnClassPropertyWritePlan,
         SourceClassPropertyWritePlan, SourcePropertyDiagnostic, SourcePropertyError,
         SourcePropertyPlan, SourcePropertyQueryError, SourcePropertyUnsupported,
-        attach_class_access_context, check_class_property_write_target, check_class_receiver,
-        check_direct_source_property_with_class_context_and_session,
+        attach_class_access_context, check_class_property_write_target_with_session,
+        check_class_receiver, check_direct_source_property_with_class_context_and_session,
         check_direct_source_property_with_session, check_direct_source_property_with_source,
         check_own_class_property_flow_read, check_own_class_property_write_target,
         finish_direct_source_property_plan, plan_class_access_context, plan_class_property_write,
@@ -740,6 +744,25 @@ impl PlannedExpression {
         self.array_spreads
             .iter()
             .find_map(|(position, node)| (*position == index).then_some(*node))
+    }
+
+    /// Lists retained eager children for constructor cache preflight, without evaluating them.
+    pub(super) fn new_argument_children<'expression>(
+        &'expression self,
+        pending: &mut Vec<&'expression Self>,
+    ) {
+        match &self.kind {
+            PlannedExpressionKind::New(construction) => {
+                pending.extend(
+                    construction
+                        .checked_expression_arguments()
+                        .into_iter()
+                        .flatten(),
+                );
+            }
+            PlannedExpressionKind::SuperCall(call) => pending.extend(call.arguments()),
+            _ => self.eager_children(pending),
+        }
     }
 
     fn eager_children<'expression>(&'expression self, pending: &mut Vec<&'expression Self>) {
@@ -1375,7 +1398,7 @@ enum PlannedClassStatement {
 struct PlannedClassIf {
     condition: PlannedExpression,
     negations: Vec<NodeRef>,
-    flow: SourceTruthinessCondition,
+    flow: SourceFlowCondition,
     then_statement: Box<PlannedClassStatement>,
     else_statement: Option<Box<PlannedClassStatement>>,
 }
@@ -2621,6 +2644,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
         &'semantic CanonicalTypeMapperStore,
         &'semantic DeclaredTypeHost<'sources>,
     )>,
+    global_types: Option<&'semantic CanonicalGlobalTypes>,
     array_targets: Option<CanonicalArrayTargets>,
     meta_options: Option<CanonicalCheckerOptions>,
     class_type_context: Option<ClassTypeQueryContext>,
@@ -2674,6 +2698,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ambient_class_reads: Vec::new(),
             ambient_namespace_reads: Vec::new(),
             semantic: None,
+            global_types: None,
             array_targets: None,
             meta_options: None,
             class_type_context: None,
@@ -2731,6 +2756,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ambient_class_reads: Vec::new(),
             ambient_namespace_reads: Vec::new(),
             semantic: Some((store, host)),
+            global_types: None,
             array_targets: None,
             meta_options: None,
             class_type_context: None,
@@ -2760,10 +2786,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         source: SourceFileRef,
         store: &'semantic CanonicalTypeMapperStore,
         host: &'semantic DeclaredTypeHost<'sources>,
-        global_types: &CanonicalGlobalTypes,
+        global_types: &'semantic CanonicalGlobalTypes,
         options: CanonicalCheckerOptions,
     ) -> Self {
         let mut planner = Self::new_semantic(arena, bound, source, store, host);
+        planner.global_types = Some(global_types);
         planner.array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
         planner.meta_options = Some(options);
         planner.class_type_context = Some(ClassTypeQueryContext::new(global_types, options));
@@ -8702,6 +8729,181 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(Some(function.type_.is_some()))
     }
 
+    fn is_class_body_constructor_expression(
+        &self,
+        expression: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let Some(body) = self.class_body.as_ref().filter(|body| {
+            matches!(
+                body.kind,
+                ClassBodyKind::Constructor | ClassBodyKind::Method { .. }
+            )
+        }) else {
+            return Ok(false);
+        };
+        let Some((store, host)) = self.semantic else {
+            return Ok(false);
+        };
+        let Some(class) = self.source_body_classes.get(&body.class_symbol) else {
+            return Ok(false);
+        };
+        let NodeData::NewExpression(construction) = &self.node(expression)?.data else {
+            return Ok(false);
+        };
+        let constructor = self.reference(construction.expression);
+        if class.declaration() != body.class_declaration
+            || !class.bodies().contains(body)
+            || self.bound.container(expression) != Some(body.declaration)
+            || self.bound.flow_container(constructor) != Some(body.declaration)
+            || self.bound.flow_at(constructor).is_none()
+            || !super::classes::source_class_plan_is_current(store, host, class)
+                .map_err(|error| Self::class_plan_error(body.declaration, error))?
+        {
+            return Ok(false);
+        }
+        let mut current = expression;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Ok(false);
+            }
+            let child = self.node(current)?;
+            let Some(parent) = child.parent.map(|node| self.reference(node)) else {
+                return Ok(false);
+            };
+            let record = self.node(parent)?;
+            if record.flags.0 != 0
+                || record.range.start > child.range.start
+                || record.range.end < child.range.end
+                || self.bound.container(parent) != Some(body.declaration)
+            {
+                return Ok(false);
+            }
+            match (&record.data, record.kind) {
+                (
+                    NodeData::ParenthesizedExpression(wrapper),
+                    SyntaxKind::ParenthesizedExpression,
+                ) if wrapper.expression == current.node => {}
+                (NodeData::TypeAssertion(wrapper), SyntaxKind::TypeAssertionExpression)
+                    if wrapper.expression == current.node => {}
+                (NodeData::AsExpression(wrapper), SyntaxKind::AsExpression)
+                    if wrapper.expression == current.node => {}
+                (NodeData::SatisfiesExpression(wrapper), SyntaxKind::SatisfiesExpression)
+                    if wrapper.expression == current.node => {}
+                (NodeData::NonNullExpression(wrapper), SyntaxKind::NonNullExpression)
+                    if wrapper.expression == current.node => {}
+                (
+                    NodeData::PropertyAccessExpression(access),
+                    SyntaxKind::PropertyAccessExpression,
+                ) if access.expression == current.node => {}
+                (
+                    NodeData::ElementAccessExpression(access),
+                    SyntaxKind::ElementAccessExpression,
+                ) if access.expression == current.node => {}
+                (NodeData::CallExpression(call), SyntaxKind::CallExpression)
+                    if call.expression == current.node
+                        || call.arguments.nodes.contains(&current.node) => {}
+                (NodeData::BinaryExpression(binary), SyntaxKind::BinaryExpression)
+                    if binary.left == current.node || binary.right == current.node => {}
+                (NodeData::VariableDeclaration(variable), SyntaxKind::VariableDeclaration)
+                    if variable.initializer == Some(current.node) =>
+                {
+                    return match self.class_constructor_variable_statement(parent)? {
+                        Some(statement) => {
+                            self.class_constructor_statement_is_current(statement, body)
+                        }
+                        None => Ok(false),
+                    };
+                }
+                (NodeData::ReturnStatement(returned), SyntaxKind::ReturnStatement)
+                    if returned.expression == Some(current.node)
+                        && returned.flow_node.is_none() =>
+                {
+                    return self.class_constructor_statement_is_current(parent, body);
+                }
+                _ => return Ok(false),
+            }
+            current = parent;
+        }
+    }
+
+    fn class_constructor_variable_statement(
+        &self,
+        declaration: NodeRef,
+    ) -> Result<Option<NodeRef>, SourceCheckError> {
+        let Some(list) = self
+            .node(declaration)?
+            .parent
+            .map(|node| self.reference(node))
+        else {
+            return Ok(None);
+        };
+        let record = self.node(list)?;
+        let NodeData::VariableDeclarationList(declarations) = &record.data else {
+            return Ok(None);
+        };
+        let Some(statement) = record.parent.map(|node| self.reference(node)) else {
+            return Ok(None);
+        };
+        if record.kind != SyntaxKind::VariableDeclarationList
+            || !declarations.declarations.nodes.contains(&declaration.node)
+            || declarations.declarations.has_trailing_comma
+            || self.node(statement)?.kind != SyntaxKind::VariableStatement
+            || !matches!(&self.node(statement)?.data, NodeData::VariableStatement(variable)
+                if variable.declaration_list == list.node)
+        {
+            return Ok(None);
+        }
+        Ok(Some(statement))
+    }
+
+    fn class_constructor_statement_is_current(
+        &self,
+        mut statement: NodeRef,
+        body: &ClassBodyPlan,
+    ) -> Result<bool, SourceCheckError> {
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(statement)
+                || self.bound.container(statement) != Some(body.declaration)
+            {
+                return Ok(false);
+            }
+            let child = self.node(statement)?;
+            let Some(parent) = child.parent.map(|node| self.reference(node)) else {
+                return Ok(false);
+            };
+            let record = self.node(parent)?;
+            if child.flags.0 != 0
+                || record.flags.0 != 0
+                || record.range.start > child.range.start
+                || record.range.end < child.range.end
+                || self.bound.container(parent) != Some(body.declaration)
+            {
+                return Ok(false);
+            }
+            match (&record.data, record.kind) {
+                (NodeData::Block(block), SyntaxKind::Block)
+                    if block.statements.nodes.contains(&statement.node)
+                        && !block.statements.has_trailing_comma
+                        && block.flow_node.is_none()
+                        && block.facts == 0 =>
+                {
+                    if parent == body.body {
+                        return Ok(record.parent == Some(body.declaration.node));
+                    }
+                }
+                (NodeData::IfStatement(branch), SyntaxKind::IfStatement)
+                    if (branch.then_statement == statement.node
+                        || branch.else_statement == Some(statement.node))
+                        && branch.flow_node.is_none()
+                        && branch.facts == 0 => {}
+                _ => return Ok(false),
+            }
+            statement = parent;
+        }
+    }
+
     /// Proves that constructor evaluation remains inside an admitted source expression.
     fn is_top_level_constructor_expression(
         &self,
@@ -9392,6 +9594,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 &mut local_assignments,
                 &mut calls,
             )?;
+            if conditions.iter().any(|condition| {
+                matches!(condition, SourceFlowCondition::ClassPropertyTruthiness(_))
+            }) {
+                preflight_class_property_condition_reads(&statements)?;
+            }
             for (_, initializer) in &parameter_initializers {
                 collect_class_expression_flow(initializer, &mut points)?;
             }
@@ -9505,21 +9712,39 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 }
                 let condition = self.plan_expression(condition_node)?;
                 self.preflight_class_body_expression(&condition)?;
-                let PlannedExpressionKind::Identifier(read) = condition.unparenthesized().kind
-                else {
-                    return Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Class(root),
-                    ));
-                };
-                if read.kind != PlannedIdentifierReadKind::Variable {
-                    return Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Class(root),
-                    ));
-                }
-                let flow = SourceTruthinessCondition {
-                    expression: root,
-                    symbol: read.value_symbol,
-                    negated: negations.len() % 2 == 1,
+                let negated = negations.len() % 2 == 1;
+                let flow = match &condition.unparenthesized().kind {
+                    PlannedExpressionKind::Identifier(read)
+                        if read.kind == PlannedIdentifierReadKind::Variable =>
+                    {
+                        SourceFlowCondition::Truthiness(SourceTruthinessCondition {
+                            expression: root,
+                            symbol: read.value_symbol,
+                            negated,
+                        })
+                    }
+                    PlannedExpressionKind::Property(property) => {
+                        let (store, host) = self.semantic.ok_or(SourceCheckError::Class(root))?;
+                        super::source_properties::plan_class_property_truthiness(
+                            store,
+                            host,
+                            body,
+                            property.node,
+                        )
+                        .map_err(|error| Self::property_plan_error(property.node, error))?;
+                        SourceFlowCondition::ClassPropertyTruthiness(
+                            super::source_flow::SourceClassPropertyTruthinessCondition {
+                                expression: root,
+                                access: property.node,
+                                negated,
+                            },
+                        )
+                    }
+                    _ => {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Class(root),
+                        ));
+                    }
                 };
                 let then_statement =
                     Box::new(self.plan_class_statement(then_statement, statement, body)?);
@@ -23620,7 +23845,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ))
             }
             SyntaxKind::NewExpression => {
-                if !self.is_top_level_constructor_expression(expression)? {
+                let class_position = self.is_class_body_constructor_expression(expression)?;
+                if !class_position && !self.is_top_level_constructor_expression(expression)? {
                     return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
                         expression,
                     )));
@@ -23637,19 +23863,40 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             .is_some_and(|record| record.kind == SyntaxKind::ThrowStatement)
                     });
                 let mut construction =
-                    super::source_new::plan_direct_default_new_with_type_context(
-                        self.arena,
-                        self.bound,
-                        store,
-                        host,
-                        &self.prior_classes,
-                        &self.source_body_classes,
-                        &self.value_import_bindings,
-                        expression,
-                        early_preparation,
-                        self.class_type_context.as_ref(),
-                    )
+                    if let Some((globals, options)) = self.global_types.zip(self.meta_options) {
+                        super::source_new::plan_direct_default_new_with_source_context(
+                            self.arena,
+                            self.bound,
+                            store,
+                            host,
+                            &self.prior_classes,
+                            &self.source_body_classes,
+                            &self.value_import_bindings,
+                            expression,
+                            early_preparation,
+                            globals,
+                            options,
+                        )
+                    } else {
+                        super::source_new::plan_direct_default_new_with_type_context(
+                            self.arena,
+                            self.bound,
+                            store,
+                            host,
+                            &self.prior_classes,
+                            &self.source_body_classes,
+                            &self.value_import_bindings,
+                            expression,
+                            early_preparation,
+                            self.class_type_context.as_ref(),
+                        )
+                    }
                     .map_err(|error| Self::new_plan_error(expression, error))?;
+                if class_position && !construction.is_library_constructor() {
+                    return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+                        expression,
+                    )));
+                }
                 if let Some(binding) = self
                     .value_import_bindings
                     .get(&construction.resolved_symbol())
@@ -28052,6 +28299,10 @@ fn plan_default_library_source_callable(
     Ok(Some(callable))
 }
 
+pub(super) fn source_new_error(expression: NodeRef, error: SourceNewError) -> SourceCheckError {
+    SourcePlanner::new_plan_error(expression, error)
+}
+
 fn class_expression_nodes(
     expression: &PlannedExpression,
 ) -> Result<Vec<&PlannedExpression>, SourceCheckError> {
@@ -28090,6 +28341,12 @@ fn class_expression_nodes(
                 pending.push(&call.callee);
             }
             PlannedExpressionKind::SuperCall(call) => pending.extend(call.arguments().iter().rev()),
+            PlannedExpressionKind::New(construction) if construction.is_library_constructor() => {
+                let arguments = construction
+                    .checked_expression_arguments()
+                    .ok_or(SourceCheckError::Class(expression.node))?;
+                pending.extend(arguments.iter().rev());
+            }
             PlannedExpressionKind::Array(elements) => pending.extend(elements.iter().rev()),
             PlannedExpressionKind::Object { properties, .. } => {
                 pending.extend(
@@ -28230,7 +28487,7 @@ fn collect_class_statement_flow(
                 )?;
             }
             PlannedClassStatement::If(branch) => {
-                conditions.push(SourceFlowCondition::Truthiness(branch.flow));
+                conditions.push(branch.flow);
                 expressions.push(&branch.condition);
                 collect_class_statement_flow(
                     std::slice::from_ref(&branch.then_statement),
@@ -28329,6 +28586,33 @@ fn collect_class_statement_flow(
     Ok(())
 }
 
+fn preflight_class_property_condition_reads(
+    statements: &[PlannedClassStatement],
+) -> Result<(), SourceCheckError> {
+    let mut pending = statements.iter().rev().collect::<Vec<_>>();
+    while let Some(statement) = pending.pop() {
+        match statement {
+            PlannedClassStatement::Block(statements) => pending.extend(statements.iter().rev()),
+            PlannedClassStatement::If(branch) => {
+                pending.extend(branch.else_statement.as_deref());
+                pending.push(branch.then_statement.as_ref());
+            }
+            PlannedClassStatement::ObjectBinding(binding) => {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Class(binding.receiver.node),
+                ));
+            }
+            PlannedClassStatement::ObjectAssignment(assignment) => {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Class(assignment.receiver.node),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn collect_class_expression_flow(
     expression: &PlannedExpression,
     points: &mut Vec<NodeRef>,
@@ -28341,6 +28625,9 @@ fn collect_class_expression_flow(
                 | PlannedExpressionKind::Property(_)
         ) {
             points.push(expression.node);
+        }
+        if let PlannedExpressionKind::New(construction) = &expression.kind {
+            points.push(construction.constructor());
         }
     }
     Ok(())
@@ -29970,6 +30257,15 @@ pub(super) struct CheckedExpressionTypes {
 }
 
 impl CheckedExpressionTypes {
+    pub(super) const fn raw(&self) -> TypeId {
+        self.raw
+    }
+
+    #[cfg(test)]
+    pub(super) fn leaf_for_test(raw: TypeId, result: TypeId) -> Self {
+        Self::leaf(raw, result)
+    }
+
     fn leaf(raw: TypeId, result: TypeId) -> Self {
         Self {
             raw,
@@ -34252,10 +34548,19 @@ fn check_expression_type_with_capture_context(
             )
         }
         PlannedExpressionKind::New(construction) => {
-            preflight_direct_default_new(store, host, construction)
-                .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+            super::source_new::preflight_direct_default_new_with_source_context(
+                store,
+                host,
+                global_types,
+                options,
+                construction,
+            )
+            .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
             if let Some(arguments) = construction.checked_expression_arguments() {
                 let mut argument_types = Vec::with_capacity(arguments.len());
+                let mut library_arguments = construction
+                    .is_library_constructor()
+                    .then(|| Vec::with_capacity(arguments.len()));
                 for (index, argument) in arguments.iter().enumerate() {
                     let contextual = if matches!(
                         argument.unparenthesized().kind,
@@ -34264,10 +34569,11 @@ fn check_expression_type_with_capture_context(
                             | PlannedExpressionKind::Arrow(_)
                             | PlannedExpressionKind::Template(_)
                     ) {
-                        super::source_new::source_class_constructor_argument_contextual_type(
+                        super::source_new::source_constructor_argument_contextual_type(
                             store,
                             host,
                             global_types,
+                            options,
                             construction,
                             index,
                         )
@@ -34277,25 +34583,42 @@ fn check_expression_type_with_capture_context(
                     } else {
                         None
                     };
-                    argument_types.push(
-                        check_expression_type_with_capture_context(
-                            store,
-                            host,
-                            global_types,
-                            source,
-                            options,
-                            session,
-                            diagnostics,
-                            current_flow_types,
-                            type_import_execution,
-                            argument,
-                            contextual,
-                            deferred,
-                            class_flow.as_deref_mut(),
-                            arrow_capture,
-                        )?
-                        .result,
-                    );
+                    let checked = check_expression_type_with_capture_context(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        current_flow_types,
+                        type_import_execution,
+                        argument,
+                        contextual,
+                        deferred,
+                        class_flow.as_deref_mut(),
+                        arrow_capture,
+                    )?;
+                    argument_types.push(checked.result);
+                    if let Some(arguments) = &mut library_arguments {
+                        arguments.push(checked);
+                    }
+                }
+                if let Some(arguments) = library_arguments {
+                    let checked = super::source_calls::check_source_library_expression_new(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        construction,
+                        &arguments,
+                    )?;
+                    return Ok(CheckedExpressionTypes::leaf(
+                        checked.instance_type,
+                        checked.instance_type,
+                    ));
                 }
                 let (checked, resolution) = super::source_new::check_source_class_expression_new(
                     store,
@@ -34638,6 +34961,7 @@ fn check_expression_type_with_capture_context(
                         store,
                         host,
                         global_types,
+                        options,
                         call,
                         callee.result,
                         index,
@@ -34764,6 +35088,21 @@ fn check_expression_type_with_capture_context(
                     &argument_types,
                 )?
             };
+            if let Some(context) = class_flow.as_deref_mut()
+                && context.flow.has_property_conditions()
+            {
+                context
+                    .flow
+                    .complete_non_effecting_call(
+                        store,
+                        host,
+                        global_types,
+                        call,
+                        callee.result,
+                        &checked,
+                    )
+                    .map_err(|error| class_body_flow_error(call.node, error))?;
+            }
             Ok(CheckedExpressionTypes::leaf(
                 checked.return_type,
                 checked.return_type,
@@ -36369,7 +36708,7 @@ fn check_class_statements(
                 let snapshot = context
                     .flow
                     .snapshot_at(store, global_types, branch.condition.unparenthesized().node)
-                    .map_err(|error| class_body_flow_error(branch.flow.expression, error))?;
+                    .map_err(|error| class_body_flow_error(branch.flow.expression(), error))?;
                 let checked = check_expression_type_with_class_context(
                     store,
                     host,
@@ -36385,7 +36724,14 @@ fn check_class_statements(
                     deferred,
                     Some(&mut *context),
                 )?;
-                if snapshot.type_of(branch.flow.symbol) != Some(checked.raw)
+                let snapshot_matches = match branch.flow {
+                    SourceFlowCondition::Truthiness(condition) => {
+                        snapshot.type_of(condition.symbol) == Some(checked.raw)
+                    }
+                    SourceFlowCondition::ClassPropertyTruthiness(_) => true,
+                    _ => false,
+                };
+                if !snapshot_matches
                     || !source_truthiness_condition_type_is_supported(
                         store,
                         checked.result,
@@ -36394,8 +36740,20 @@ fn check_class_statements(
                     )?
                 {
                     return Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Class(branch.flow.expression),
+                        UnsupportedSourceSyntax::Class(branch.flow.expression()),
                     ));
+                }
+                if let SourceFlowCondition::ClassPropertyTruthiness(condition) = branch.flow {
+                    context
+                        .flow
+                        .complete_property_condition(
+                            store,
+                            host,
+                            condition,
+                            checked.raw,
+                            checked.result,
+                        )
+                        .map_err(|error| class_body_flow_error(condition.expression, error))?;
                 }
                 emit_truthiness_operand_diagnostics(
                     store,
@@ -36595,7 +36953,7 @@ fn check_class_statements(
                     deferred,
                     Some(&mut *context),
                 )?;
-                let target = check_class_property_write_target(
+                let target = check_class_property_write_target_with_session(
                     store,
                     host,
                     global_types,
@@ -36603,6 +36961,7 @@ fn check_class_statements(
                     plan,
                     receiver.result,
                     context.flow.access_token(),
+                    session,
                 )
                 .map_err(|error| SourcePlanner::property_plan_error(plan.target(), error))?;
                 for diagnostic in super::source_properties::class_property_write_diagnostics(
@@ -37093,7 +37452,7 @@ fn check_class_private_object_assignment(
             deferred,
             Some(&mut *context),
         )?;
-        let target = super::source_properties::check_class_property_write_target(
+        let target = super::source_properties::check_class_property_write_target_with_session(
             store,
             host,
             global_types,
@@ -37101,6 +37460,7 @@ fn check_class_private_object_assignment(
             plan,
             receiver.result,
             context.flow.access_token(),
+            session,
         )
         .map_err(|error| SourcePlanner::property_plan_error(plan.target(), error))?;
         for diagnostic in super::source_properties::class_property_write_diagnostics(
@@ -73127,6 +73487,190 @@ mod tests {
             options,
         )
         .unwrap()
+    }
+
+    mod library_constructor_position_tests {
+        use super::*;
+
+        fn class_plan(
+            context: &CanonicalCheckerContext<'_>,
+            host: &DeclaredTypeHost<'_>,
+            file: FileId,
+        ) -> SourceClassPlan {
+            let (arena, bound) = context.file(file).unwrap();
+            let declarations = arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                        arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let [declaration] = declarations.as_slice() else {
+                panic!("the fixture keeps one actual class")
+            };
+            plan_source_class_members(context.store(), host, bound.symbol(*declaration).unwrap())
+                .unwrap()
+        }
+
+        fn constructions(source: &ParseResult, file: FileId) -> Vec<NodeRef> {
+            let mut nodes = source
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            nodes.sort_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+            nodes
+        }
+
+        #[test]
+        fn class_library_new_positions_keep_actual_bodies_and_branch_edges() {
+            let source = parsed(concat!(
+                "class Placement { constructor() { const built = new Ctor(); } ",
+                "build(flag: boolean): number { if (flag) { ",
+                "const nested = (new Nested()); return new Returned(); } ",
+                "return new Last(); } static create(): number { return new Static(); } }",
+            ));
+            let file = FileId::new(202_560);
+            let context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let bound = context.file(file).unwrap().1;
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let class = class_plan(&context, &host, file);
+            let mut planner = SourcePlanner::new_semantic_with_global_types(
+                &source.arena,
+                bound,
+                context.source_file(file).unwrap(),
+                context.store(),
+                &host,
+                context.global_types(),
+                context.options(),
+            );
+            planner
+                .source_body_classes
+                .insert(class.symbol(), class.clone());
+            let nodes = constructions(&source, file);
+            assert_eq!(nodes.len(), 5);
+            let before = observable_state(&context, file);
+            for construction in nodes {
+                let owner = bound.container(construction).unwrap();
+                let body = class
+                    .bodies()
+                    .iter()
+                    .find(|body| body.declaration == owner)
+                    .unwrap();
+                planner.class_body = Some(body.clone());
+                let NodeData::NewExpression(data) =
+                    &source.arena.get(construction.node).unwrap().data
+                else {
+                    unreachable!()
+                };
+                let callee = NodeRef::new(source.arena.id(), file, data.expression);
+                assert_eq!(bound.flow_container(callee), Some(owner));
+                assert!(bound.flow_at(callee).is_some());
+                for _ in 0..2 {
+                    assert_eq!(
+                        planner.is_class_body_constructor_expression(construction),
+                        Ok(true)
+                    );
+                    assert_eq!(observable_state(&context, file), before);
+                    assert!(context.store().type_node_links(construction).is_none());
+                    assert!(context.store().signature_links(construction).is_none());
+                }
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+
+        #[test]
+        fn class_library_new_positions_reject_deferred_and_changed_body_proofs() {
+            let source = parsed(concat!(
+                "class Placement { build(): number { const deferred = () => new Deferred(); ",
+                "function nested() { return new Nested(); } return new Direct(); } ",
+                "other(): number { return new Other(); } }",
+            ));
+            let file = FileId::new(202_561);
+            let context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let bound = context.file(file).unwrap().1;
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let class = class_plan(&context, &host, file);
+            let nodes = constructions(&source, file);
+            assert_eq!(nodes.len(), 4);
+            let direct = nodes
+                .iter()
+                .copied()
+                .find(|node| node_text(&source, *node) == "new Direct()")
+                .unwrap();
+            let other = nodes
+                .iter()
+                .copied()
+                .find(|node| node_text(&source, *node) == "new Other()")
+                .unwrap();
+            let body = class
+                .bodies()
+                .iter()
+                .find(|body| Some(body.declaration) == bound.container(direct))
+                .unwrap();
+            let other_body = class
+                .bodies()
+                .iter()
+                .find(|body| Some(body.declaration) == bound.container(other))
+                .unwrap();
+            assert_ne!(body.declaration, other_body.declaration);
+            let mut planner = SourcePlanner::new_semantic_with_global_types(
+                &source.arena,
+                bound,
+                context.source_file(file).unwrap(),
+                context.store(),
+                &host,
+                context.global_types(),
+                context.options(),
+            );
+            planner
+                .source_body_classes
+                .insert(class.symbol(), class.clone());
+            planner.class_body = Some(body.clone());
+            let before = observable_state(&context, file);
+            for node in nodes {
+                assert_eq!(
+                    planner.is_class_body_constructor_expression(node),
+                    Ok(node == direct)
+                );
+            }
+            let mut wrong_block = body.clone();
+            wrong_block.body = other_body.body;
+            for changed in [None, Some(other_body.clone()), Some(wrong_block)] {
+                planner.class_body = changed;
+                for _ in 0..2 {
+                    assert_eq!(
+                        planner.is_class_body_constructor_expression(direct),
+                        Ok(false)
+                    );
+                    assert_eq!(observable_state(&context, file), before);
+                }
+            }
+            planner.class_body = Some(body.clone());
+            assert_eq!(
+                planner.is_class_body_constructor_expression(direct),
+                Ok(true)
+            );
+            assert_eq!(observable_state(&context, file), before);
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]

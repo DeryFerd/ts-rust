@@ -24,7 +24,7 @@ pub(super) struct DeclaredConstructorPlan {
     pub(super) parameter: Option<SourceNewParameter>,
 }
 
-fn provider_error(
+pub(super) fn provider_error(
     constructor: NodeRef,
     symbol: SemanticSymbolId,
     error: DeclaredConstructorValueError,

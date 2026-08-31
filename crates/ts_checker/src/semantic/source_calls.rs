@@ -42,7 +42,7 @@ use super::{
     },
     classes::{
         ClassBodyAccessToken, ClassBodyCallable, ClassBodyIdentities, ClassError,
-        ClassMemberOrigin, ClassPropertySide, class_body_identities, class_body_method_callable,
+        ClassMemberOrigin, ClassPropertySide, class_body_identities,
         class_body_super_constructor_callable, class_member_source,
         validate_class_instance_super_view,
     },
@@ -78,10 +78,11 @@ use super::{
     },
     signatures::{ElementFlags, SignatureFlags, SignatureKind, TypePredicateKind},
     source::{
-        PlannedExpression, PlannedExpressionKind, PlannedIdentifierReadKind, SourceCheckError,
-        UnsupportedSourceSyntax, logical_binary_operator_text, merge_retry_diagnostic,
-        merge_retry_diagnostics, primitive_binary_operator_text,
-        retry_source_generic_member_failure, source_call_effects_target_type,
+        CheckedExpressionTypes, PlannedExpression, PlannedExpressionKind,
+        PlannedIdentifierReadKind, SourceCheckError, UnsupportedSourceSyntax,
+        logical_binary_operator_text, merge_retry_diagnostic, merge_retry_diagnostics,
+        primitive_binary_operator_text, retry_source_generic_member_failure,
+        source_call_effects_target_type,
     },
     source_callables::{
         CallableTypePredicatePlan, StoredSourceCallableValidation,
@@ -5204,7 +5205,7 @@ fn preflight_call_cache_state(
     Ok(resolved_type.zip(resolved_signature))
 }
 
-fn preflight_call_links(
+pub(super) fn preflight_call_links(
     store: &CanonicalTypeMapperStore,
     node: NodeRef,
 ) -> Result<(), SourceCheckError> {
@@ -5219,7 +5220,7 @@ fn preflight_call_links(
     Ok(())
 }
 
-fn preflight_super_call_links(
+pub(super) fn preflight_super_call_links(
     store: &CanonicalTypeMapperStore,
     node: NodeRef,
 ) -> Result<(), SourceCheckError> {
@@ -7650,6 +7651,8 @@ fn class_method_receiver_types(
 fn source_class_method_target(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
     plan: &SourceCallPlan,
     callee_type: TypeId,
     access: &ClassBodyAccessToken,
@@ -7744,8 +7747,16 @@ fn source_class_method_target(
     {
         return Err(invalid());
     }
-    let target = class_body_method_callable(store, host, access, receiver_type, member)
-        .map_err(|error| class_call_error(plan.node, error))?;
+    let query_context = super::classes::ClassTypeQueryContext::new(globals, options);
+    let target = super::classes::class_body_method_callable_with_query_context(
+        store,
+        host,
+        access,
+        receiver_type,
+        member,
+        &query_context,
+    )
+    .map_err(|error| class_call_error(plan.node, error))?;
     if target.kind() != SignatureKind::Call
         || target.callable().owner != callee_type
         || target.class_symbol() != source.declaring_class
@@ -7770,6 +7781,25 @@ fn source_class_method_target(
         return Err(invalid());
     }
     Ok(target)
+}
+
+/// Keeps the fixed-candidate context shared by calls and library constructions.
+pub(super) fn common_fixed_argument_contextual_type<'a>(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    candidates: impl IntoIterator<Item = &'a ValidatedSingleCallable>,
+    argument_index: usize,
+) -> Result<Option<TypeId>, DirectCallError> {
+    let mut contextual_type = None;
+    for callable in candidates {
+        let type_ =
+            super::calls::try_get_type_at_position(store, Some(globals), callable, argument_index)?;
+        if contextual_type.is_some_and(|previous| type_ != Some(previous)) {
+            return Ok(None);
+        }
+        contextual_type = type_;
+    }
+    Ok(contextual_type)
 }
 
 fn class_call_argument_contextual_type(
@@ -7797,26 +7827,12 @@ fn class_call_argument_contextual_type(
         .map(|overloads| overloads.signatures.as_slice())
         .or_else(|| target.construct_signatures())
     {
-        let mut contextual_type = None;
-        for callable in signatures {
-            if arguments.len() < callable.min_argument_count
-                || arguments.len() > callable.parameters.len()
-            {
-                continue;
-            }
-            let type_ = super::calls::try_get_type_at_position(
-                store,
-                Some(globals),
-                callable,
-                argument_index,
-            )
-            .map_err(|error| direct_class_call_error(node, error))?;
-            if contextual_type.is_some_and(|previous| type_ != Some(previous)) {
-                return Ok(None);
-            }
-            contextual_type = type_;
-        }
-        return Ok(contextual_type);
+        let candidates = signatures.iter().filter(|callable| {
+            arguments.len() >= callable.min_argument_count
+                && arguments.len() <= callable.parameters.len()
+        });
+        return common_fixed_argument_contextual_type(store, globals, candidates, argument_index)
+            .map_err(|error| direct_class_call_error(node, error));
     }
     super::calls::try_get_type_at_position(store, Some(globals), target.callable(), argument_index)
         .map_err(|error| direct_class_call_error(node, error))
@@ -7846,12 +7862,14 @@ pub(super) fn source_class_method_argument_contextual_type(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
     plan: &SourceCallPlan,
     callee_type: TypeId,
     argument_index: usize,
     access: &ClassBodyAccessToken,
 ) -> Result<Option<TypeId>, SourceCheckError> {
-    let target = source_class_method_target(store, host, plan, callee_type, access)?;
+    let target =
+        source_class_method_target(store, host, globals, options, plan, callee_type, access)?;
     class_call_argument_contextual_type(
         store,
         globals,
@@ -8022,6 +8040,162 @@ pub(super) fn prepare_source_constructor_argument_diagnostics(
     )
 }
 
+/// Uses the fixed New selector and source demand retries before paired publication.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_source_library_expression_new(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    plan: &super::source_new::SourceDefaultNewPlan,
+    checked_arguments: &[CheckedExpressionTypes],
+) -> Result<super::source_new::CheckedSourceDefaultNew, SourceCheckError> {
+    use super::source_new::{
+        SourceNewError, finish_source_library_expression_new, source_library_constructor_candidates,
+    };
+
+    let node = plan.node();
+    let new_error = |error| super::source::source_new_error(node, error);
+    let arguments = plan
+        .checked_expression_arguments()
+        .ok_or(SourceCheckError::Call(node))?;
+    if arguments.len() != checked_arguments.len() {
+        return Err(SourceCheckError::Call(node));
+    }
+    let original = source_library_constructor_candidates(store, host, globals, options, plan)
+        .map_err(new_error)?;
+    for (argument, checked) in arguments.iter().zip(checked_arguments) {
+        if store.type_node_links(argument.node)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(checked.raw()),
+                ..TypeNodeLinks::default()
+            })
+        {
+            return Err(SourceCheckError::Call(argument.node));
+        }
+    }
+    // Node caches keep raw types. Applicability uses the contextual results.
+    let argument_types = checked_arguments
+        .iter()
+        .map(|checked| checked.result)
+        .collect::<Vec<_>>();
+    let existing_signature =
+        preflight_call_cache_state(store, node)?.map(|(_, signature)| signature);
+    let mut staged = CanonicalCheckerDiagnostics::default();
+    let mut retried_signatures = HashSet::new();
+    let mut retried_members = HashSet::new();
+    let mut retried_properties = HashSet::new();
+    let mut relation_candidates = argument_types.clone();
+    for candidate in &original.callables {
+        relation_candidates.extend_from_slice(&candidate.parameters);
+        relation_candidates.extend(candidate.rest_parameter);
+        relation_candidates.extend(candidate.return_type);
+    }
+    let resolution = loop {
+        let current = source_library_constructor_candidates(store, host, globals, options, plan)
+            .map_err(new_error)?;
+        if current != original
+            || preflight_call_cache_state(store, node)?.map(|(_, signature)| signature)
+                != existing_signature
+        {
+            return Err(SourceCheckError::Call(node));
+        }
+        let request = DirectCallRequest {
+            form: DirectCallForm::New,
+            optional_chain: false,
+            type_argument_count: 0,
+            has_spread_argument: false,
+            callee: current.value_type,
+            arguments: &argument_types,
+        };
+        match super::calls::resolve_direct_call_candidates_with_session(
+            store,
+            globals,
+            options.strict_function_types,
+            request,
+            &current.callables,
+            existing_signature,
+            session,
+        ) {
+            Ok(resolution) => break resolution,
+            Err(
+                DirectCallError::Unsupported(DirectCallUnsupported::UnresolvedReturnType(
+                    signature,
+                ))
+                | DirectCallError::Relation(RelationUnavailable::UnresolvedSignatureReturn(
+                    signature,
+                )),
+            ) if retried_signatures.insert(signature) => {
+                resolve_signature_return(
+                    store,
+                    host,
+                    globals,
+                    options,
+                    session,
+                    &mut staged,
+                    signature,
+                )?;
+            }
+            Err(DirectCallError::Relation(
+                error @ (RelationUnavailable::UnresolvedStructuredMembers(_)
+                | RelationUnavailable::UnresolvedPropertyType(_)),
+            )) => {
+                if let RelationUnavailable::UnresolvedStructuredMembers(type_) = error
+                    && !relation_candidates.contains(&type_)
+                {
+                    relation_candidates.push(type_);
+                }
+                retry_source_generic_member_failure(
+                    store,
+                    host,
+                    globals,
+                    options,
+                    session,
+                    &mut staged,
+                    error,
+                    &relation_candidates,
+                    &mut retried_members,
+                    &mut retried_properties,
+                )?;
+            }
+            Err(error) => return Err(new_error(SourceNewError::Call { node, error })),
+        }
+    };
+    if existing_signature.is_some_and(|signature| signature != resolution.projection.signature) {
+        return Err(SourceCheckError::Call(node));
+    }
+    let call_diagnostics = prepare_source_constructor_argument_diagnostics(
+        store,
+        host,
+        globals,
+        options,
+        session,
+        &mut staged,
+        node,
+        arguments,
+        &argument_types,
+        &resolution,
+    )?;
+    let checked = finish_source_library_expression_new(
+        store,
+        host,
+        globals,
+        options,
+        plan,
+        &original,
+        checked_arguments,
+        &resolution,
+    )
+    .map_err(new_error)?;
+    merge_retry_diagnostics(diagnostics, staged);
+    for diagnostic in call_diagnostics {
+        merge_retry_diagnostic(diagnostics, diagnostic);
+    }
+    Ok(checked)
+}
+
 /// Publishes the real base signature while only the super call expression is void.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_source_super_call(
@@ -8129,7 +8303,8 @@ pub(super) fn check_class_body_method_call(
     if plan.arguments.len() != argument_types.len() {
         return Err(SourceCheckError::Call(plan.node));
     }
-    let target = source_class_method_target(store, host, plan, callee_type, access)?;
+    let target =
+        source_class_method_target(store, host, globals, options, plan, callee_type, access)?;
     let mut staged = CanonicalCheckerDiagnostics::default();
     let Some(resolution) = resolve_source_class_call(
         store,
@@ -8194,7 +8369,8 @@ pub(super) fn check_class_body_method_call(
         argument_types,
         legacy_class_call_resolution(&resolution),
     )?;
-    let current = source_class_method_target(store, host, plan, callee_type, access)?;
+    let current =
+        source_class_method_target(store, host, globals, options, plan, callee_type, access)?;
     if !same_class_call_target(&target, &current)
         || !store.try_reserve_type_node_links(1)
         || !store.try_reserve_signature_links(1)
@@ -8866,6 +9042,176 @@ mod tests {
         type_nodes::TypeNodeUnavailable,
         type_records::{LiteralValue, TypeData},
     };
+
+    #[test]
+    fn library_new_uses_checked_argument_types_before_diagnostics_and_publication() {
+        use crate::semantic::source_new::plan_direct_default_new_with_source_context;
+        let library = parsed(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface BuildResult { value: string; } ",
+            "declare var BuildValue: { prototype: BuildResult; new(value: string): BuildResult; };",
+        ));
+        let source = parsed("const value = new BuildValue(1);");
+        let library_file = FileId::new(202_812);
+        let file = FileId::new(202_813);
+        let mut context = context_with_default_library(&library, library_file, &source, file);
+        context.check_source_file(file).unwrap();
+        let [original_diagnostic] = context.diagnostics().as_slice() else {
+            panic!("one ordinary constructor argument diagnostic")
+        };
+        assert_eq!(original_diagnostic.diagnostic.code(), 2345);
+        assert_eq!(
+            original_diagnostic.diagnostic.render().unwrap(),
+            "Argument of type 'number' is not assignable to parameter of type 'string'."
+        );
+        let original_diagnostic = original_diagnostic.clone();
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let node = source
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    id,
+                ))
+            })
+            .unwrap();
+        let mut plan = plan_direct_default_new_with_source_context(
+            &source.arena,
+            &source_bound,
+            context.store(),
+            &host,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            node,
+            false,
+            &globals,
+            options,
+        )
+        .unwrap();
+        let [argument] = plan.expression_argument_nodes().unwrap() else {
+            panic!("one actual argument")
+        };
+        let argument = *argument;
+        let NodeData::NumericLiteral(literal) = &source.arena.get(argument.node).unwrap().data
+        else {
+            panic!("the original number literal")
+        };
+        plan.set_expression_arguments(vec![PlannedExpression::new(
+            argument,
+            PlannedExpressionKind::Number {
+                value: ts_jsnum::from_string(&literal.text),
+                unary_operand: None,
+            },
+        )])
+        .unwrap();
+        assert_eq!(original_diagnostic.node, Some(argument));
+        let argument_type = context
+            .store()
+            .type_node_links(argument)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let result = context.store().type_node_links(node).unwrap().clone();
+        let signature = context.store().signature_links(node).unwrap().clone();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let wrong_argument = [CheckedExpressionTypes::leaf_for_test(wrong, wrong)];
+        let checked_argument = [CheckedExpressionTypes::leaf_for_test(
+            argument_type,
+            argument_type,
+        )];
+        let store = context.store_mut_for_test();
+        assert!(store.set_type_node_links(node, TypeNodeLinks::default()));
+        assert!(store.set_signature_links(node, SignatureLinks::default()));
+        let before = format!("{store:?}");
+        let mut caller = InstantiationSession::new(Default::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        for _ in 0..2 {
+            assert!(matches!(check_source_library_expression_new(
+                store, &host, &globals, options, &mut caller, &mut diagnostics, &plan, &wrong_argument,
+            ), Err(SourceCheckError::Call(error)) if error == argument));
+            assert_eq!(format!("{store:?}"), before);
+            assert!(diagnostics.is_empty());
+            assert_eq!(
+                (
+                    caller.query_count(),
+                    caller.total_count(),
+                    caller.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+            assert_eq!(store.type_node_links(node), Some(&TypeNodeLinks::default()));
+            assert_eq!(
+                store.signature_links(node),
+                Some(&SignatureLinks::default())
+            );
+        }
+        let checked = check_source_library_expression_new(
+            store,
+            &host,
+            &globals,
+            options,
+            &mut caller,
+            &mut diagnostics,
+            &plan,
+            &checked_argument,
+        )
+        .unwrap();
+        assert_eq!(store.type_node_links(node), Some(&result));
+        assert_eq!(store.signature_links(node), Some(&signature));
+        assert_eq!(
+            Some(checked.signature),
+            signature.resolved_signature.signature()
+        );
+        assert_eq!(Some(checked.instance_type), result.resolved_type);
+        assert_eq!(
+            diagnostics.as_slice(),
+            std::slice::from_ref(&original_diagnostic)
+        );
+        let warm = format!("{store:?}");
+        let counts = (
+            caller.query_count(),
+            caller.total_count(),
+            caller.limit_event_count(),
+        );
+        check_source_library_expression_new(
+            store,
+            &host,
+            &globals,
+            options,
+            &mut caller,
+            &mut diagnostics,
+            &plan,
+            &checked_argument,
+        )
+        .unwrap();
+        assert_eq!(format!("{store:?}"), warm);
+        assert_eq!(
+            (
+                caller.query_count(),
+                caller.total_count(),
+                caller.limit_event_count()
+            ),
+            counts
+        );
+        assert_eq!(
+            diagnostics.as_slice(),
+            std::slice::from_ref(&original_diagnostic)
+        );
+    }
 
     fn parsed(text: &str) -> ParseResult {
         let parsed = parse_source_file(text);

@@ -37974,6 +37974,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 return_type,
             });
         }
+        if !state.is_resolved() {
+            call_types = object_members::prepare_type_literal_construct_parameter_types(
+                self.store,
+                &literal,
+                state,
+                &call_types,
+                self.global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types),
+                self.instantiation_session.as_deref_mut(),
+            )
+            .map_err(property_object_error)?;
+        }
         let method_values = object_members::publish_interface_method_values_prepared(
             self.store,
             &literal,

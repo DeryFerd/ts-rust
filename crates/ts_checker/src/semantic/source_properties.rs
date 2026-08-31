@@ -262,6 +262,118 @@ impl ClassAccessContext {
     }
 }
 
+/// A direct own-field reference. This proof does not query the field's type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClassPropertyTruthinessSource {
+    property: DirectSourcePropertySyntax,
+    pub(super) context: ClassAccessContext,
+    pub(super) member: SemanticSymbolId,
+    pub(super) declaration: NodeRef,
+}
+
+impl ClassPropertyTruthinessSource {
+    pub(super) fn name(&self) -> &str {
+        &self.property.name
+    }
+}
+
+/// Proves the field and its actual class body before a condition is executed.
+pub(super) fn plan_class_property_truthiness(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    body: &classes::ClassBodyPlan,
+    access: NodeRef,
+) -> Result<ClassPropertyTruthinessSource, SourcePropertyError> {
+    let invalid = || SourcePropertyError::InvalidCache(access);
+    let (arena, bound) = host.source(access).ok_or_else(invalid)?;
+    class_access_node(store, host, access)?;
+    let property = plan_direct_source_property_syntax(arena, store, access)?;
+    let context = plan_class_access_context(store, host, property.receiver)?
+        .ok_or_else(|| unsupported_access(access))?;
+    if property.optional
+        || context.kind != ClassReceiverKind::This
+        || context.side != ClassPropertySide::Instance
+        || !matches!(
+            context.phase,
+            ClassAccessPhase::Constructor | ClassAccessPhase::Method
+        )
+        || !matches!(
+            body.kind,
+            classes::ClassBodyKind::Constructor | classes::ClassBodyKind::Method { .. }
+        )
+        || context.class_symbol != body.class_symbol
+        || context.class_declaration != body.class_declaration
+        || context.body_declaration != body.declaration
+        || bound.flow_container(access) != Some(body.declaration)
+    {
+        return Err(unsupported_access(access));
+    }
+    let members = store
+        .symbol(context.class_symbol)
+        .and_then(|owner| owner.members())
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(|| unsupported_access(access))?;
+    let member = match property.privacy {
+        SourcePropertyPrivacy::Identifier => members.get_source(&property.name),
+        SourcePropertyPrivacy::Private { enclosing_class }
+            if enclosing_class == Some(body.class_declaration) =>
+        {
+            members.iter().find_map(|(_, symbol)| {
+                (classes::authenticated_private_class_symbol_name(store, body.class_symbol, symbol)
+                    == Some(property.name.as_str()))
+                .then_some(symbol)
+            })
+        }
+        SourcePropertyPrivacy::Private { .. } => None,
+    }
+    .ok_or_else(|| unsupported_access(access))?;
+    let symbol = store.symbol(member).ok_or_else(invalid)?;
+    let declaration = symbol.value_declaration().ok_or_else(invalid)?;
+    let record = class_access_node(store, host, declaration)?;
+    let NodeData::PropertyDeclaration(field) = &record.data else {
+        return Err(unsupported_access(access));
+    };
+    let optional = field
+        .postfix_token
+        .map(|node| {
+            let token = NodeRef::new(declaration.arena, declaration.file, node);
+            let token = class_access_node(store, host, token)?;
+            if token.parent != Some(declaration.node)
+                || token.flags.0 != 0
+                || !matches!(token.data, NodeData::Token(_))
+            {
+                return Err(invalid());
+            }
+            Ok(token.kind == SyntaxKind::QuestionToken)
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if symbol.flags().contains(SymbolFlags::OPTIONAL) != optional {
+        return Err(invalid());
+    }
+    if !symbol.flags().contains(SymbolFlags::PROPERTY)
+        || symbol.parent() != Some(body.class_symbol)
+        || store.get_merged_symbol(member) != Some(member)
+        || bound.symbol(declaration) != Some(member)
+        || record.parent != Some(body.class_declaration.node)
+        || class_member_side(store, host, declaration, field.modifiers.as_ref())?
+            != ClassPropertySide::Instance
+        || ts_binder::canonical_has_syntactic_modifier(
+            arena,
+            declaration.node,
+            SyntaxKind::AccessorKeyword,
+        )
+    {
+        return Err(unsupported_access(access));
+    }
+    Ok(ClassPropertyTruthinessSource {
+        property,
+        context,
+        member,
+        declaration,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ClassBindingPropertyPlan {
     binding: NodeRef,
@@ -1554,6 +1666,7 @@ pub(super) fn class_property_write_diagnostics(
         .collect())
 }
 
+#[allow(dead_code)] // Keep the caller-free entry for existing private source checks.
 pub(super) fn check_class_property_write_target(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1562,6 +1675,50 @@ pub(super) fn check_class_property_write_target(
     plan: &SourceClassPropertyWritePlan,
     receiver_type: TypeId,
     access: &classes::ClassBodyAccessToken,
+) -> Result<CheckedClassPropertyWriteTarget, SourcePropertyError> {
+    check_class_property_write_target_worker(
+        store,
+        host,
+        globals,
+        options,
+        plan,
+        receiver_type,
+        access,
+        None,
+    )
+}
+
+pub(super) fn check_class_property_write_target_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceClassPropertyWritePlan,
+    receiver_type: TypeId,
+    access: &classes::ClassBodyAccessToken,
+    session: &mut InstantiationSession,
+) -> Result<CheckedClassPropertyWriteTarget, SourcePropertyError> {
+    check_class_property_write_target_worker(
+        store,
+        host,
+        globals,
+        options,
+        plan,
+        receiver_type,
+        access,
+        Some(session),
+    )
+}
+
+fn check_class_property_write_target_worker(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceClassPropertyWritePlan,
+    receiver_type: TypeId,
+    access: &classes::ClassBodyAccessToken,
+    session: Option<&mut InstantiationSession>,
 ) -> Result<CheckedClassPropertyWriteTarget, SourcePropertyError> {
     let invalid = || SourcePropertyError::InvalidCache(plan.target());
     let (identities, member) = validate_class_property_write_access(store, host, plan, access)?;
@@ -1628,12 +1785,13 @@ pub(super) fn check_class_property_write_target(
         }
     }
     let read_type = if strict && optional {
-        property_union_type(
+        property_union_type_with_session(
             store,
             Some(globals),
             plan.target(),
             &[declared, sentinel],
             Some(plan.member),
+            session,
         )?
     } else {
         declared
@@ -3969,26 +4127,29 @@ pub(super) fn check_direct_source_property_with_class_context_and_session(
             .ok_or(RelationUnavailable::MissingBootstrap)?;
         if bootstrap.options.strict_null_checks {
             let undefined = bootstrap.undefined_or_missing_type;
-            declared_type = property_union_type(
+            declared_type = property_union_type_with_session(
                 store,
                 globals,
                 plan.node,
                 &[declared_type, undefined],
                 Some(property.symbol),
+                Some(session),
             )?;
         }
     }
     let mut type_ = declared_type;
     if !private_error && !matches!(member.origin, ClassMemberOrigin::Method) {
         if let Some(flow) = flow.filter(|_| !context.is_deferred()) {
-            let read = flow.property_read(
+            let read = flow.property_read_with_session(
                 store,
                 host,
+                globals,
                 &context,
                 plan.node,
                 &member,
                 declared_type,
                 options,
+                session,
             )?;
             validate_class_property_flow_read(store, host, plan.node, &read)?;
             if read.used_before_assignment() {
@@ -5833,7 +5994,31 @@ fn property_union_type(
     types: &[TypeId],
     property: Option<SemanticSymbolId>,
 ) -> Result<TypeId, SourcePropertyError> {
+    property_union_type_with_session(store, global_types, node, types, property, None)
+}
+
+fn property_union_type_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    node: NodeRef,
+    types: &[TypeId],
+    property: Option<SemanticSymbolId>,
+    session: Option<&mut InstantiationSession>,
+) -> Result<TypeId, SourcePropertyError> {
     if let Some(global_types) = global_types {
+        if let Some(session) = session {
+            return store
+                .expression_union_type_with_global_types_and_session(
+                    global_types,
+                    types,
+                    UnionReduction::Literal,
+                    session,
+                )
+                .map_err(|error| SourcePropertyError::Union {
+                    node,
+                    error: UnionPropertyError::TypeCache(error),
+                });
+        }
         return store
             .expression_union_type_with_global_types(global_types, types, UnionReduction::Literal)
             .map_err(|error| SourcePropertyError::Union {
@@ -6733,6 +6918,20 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn class_property_optional_unions_keep_spent_and_active_caller_demand_errors() {
+        super::super::logical_operators::property_flow_test_support::assert_borrowed_union_preparation(
+            |store, globals, node, _, array, sentinel, caller| {
+                property_union_type_with_session(
+                    store, Some(globals), node, &[array, sentinel], None, Some(caller),
+                ).map_err(|error| match error {
+                    SourcePropertyError::Union { error: UnionPropertyError::TypeCache(error), .. } => error,
+                    other => panic!("expected the actual optional union preparation error: {other:?}"),
+                })
+            },
+        );
     }
 
     #[derive(Debug, Eq, PartialEq)]

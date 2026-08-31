@@ -92,7 +92,8 @@
 //! Their construct overloads and inherited members use the same source class worker.
 //! Optional named fields keep the written type in member storage and use the
 //! existing optional read and write rules.
-//! Other heritage expressions and non-primitive method annotations remain later stages.
+//! Written method returns use the class annotation query and keep their real signatures.
+//! Other heritage expressions and unsupported annotation shapes remain later stages.
 
 use std::collections::{HashMap, HashSet};
 
@@ -876,7 +877,17 @@ pub(super) fn source_class_constructor_overloads(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceClassMethodPlan {
     method: ClassMethodPlan,
-    return_type: Option<TypeId>,
+    return_type: Option<ClassBodyParameterType>,
+}
+
+fn source_class_method_return_type(
+    store: &CanonicalTypeMapperStore,
+    method: &SourceClassMethodPlan,
+) -> Result<Option<TypeId>, ClassError> {
+    method
+        .return_type
+        .map(|type_| type_.resolved(store))
+        .transpose()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1793,9 +1804,20 @@ pub(super) fn plan_source_class_members_with_context(
                     .return_type_node
                     .map(|annotation| {
                         let record = preflight_node(store, host, annotation)?;
-                        if record.flags.0 != 0
-                            || !matches!(record.data, NodeData::KeywordTypeNode(_))
-                        {
+                        if record.flags.0 != 0 {
+                            return Err(unsupported(ClassUnsupported::PropertyType {
+                                node: annotation,
+                                kind: record.kind,
+                            }));
+                        }
+                        if !matches!(record.data, NodeData::KeywordTypeNode(_)) {
+                            if type_context.is_some()
+                                && annotations::source_class_method_return_annotation_is_owned(
+                                    store, host, symbol, annotation,
+                                )
+                            {
+                                return Ok(ClassBodyParameterType::Annotation(annotation));
+                            }
                             return Err(unsupported(ClassUnsupported::PropertyType {
                                 node: annotation,
                                 kind: record.kind,
@@ -1803,7 +1825,7 @@ pub(super) fn plan_source_class_members_with_context(
                         }
                         let type_ = primitive_keyword_type(store, annotation, record.kind)?;
                         validate_index_type_cache(store, annotation, type_)?;
-                        Ok(type_)
+                        Ok(ClassBodyParameterType::Known(type_))
                     })
                     .transpose()?;
                 let (arena, _) = host
@@ -2055,6 +2077,14 @@ pub(super) fn plan_source_class_members_with_context(
                         _ => None,
                     })
             }))
+            .chain(
+                plan.methods
+                    .iter()
+                    .filter_map(|method| match method.return_type {
+                        Some(ClassBodyParameterType::Annotation(node)) => Some(node),
+                        _ => None,
+                    }),
+            )
             .collect();
         plan.annotations.sort_unstable();
         plan.annotations.dedup();
@@ -2957,10 +2987,9 @@ fn validate_source_class_stored_header(
         if store
             .signature(provenance.prepared.methods[index].1)
             .is_none_or(|signature| signature.resolved_return_type() != returned)
-            || method
-                .return_type
+            || source_class_method_return_type(store, method)?
                 .is_some_and(|annotation| returned != Some(annotation))
-            || method.return_type.is_none() && (returned.is_some() != body_complete)
+            || method.method.return_type_node.is_none() && (returned.is_some() != body_complete)
         {
             return Err(reject());
         }
@@ -3515,7 +3544,7 @@ fn validate_source_class_stored_layout(
             && store
                 .type_node_links(annotation)
                 .and_then(|links| links.resolved_type)
-                != method.return_type
+                != source_class_method_return_type(store, method)?
         {
             return Err(reject());
         }
@@ -3740,7 +3769,7 @@ pub(super) fn prepare_source_class_members(
                     ))
                 })?;
             methods.push((type_, signature));
-            returns.push(method.return_type);
+            returns.push(source_class_method_return_type(store, method)?);
         }
         let prepared = PreparedSourceClass {
             plan: plan.clone(),
@@ -3778,7 +3807,7 @@ pub(super) fn prepare_source_class_members(
             return Err(invariant(ClassInvariant::Publication(plan.declaration())));
         }
         for (index, method) in plan.methods.iter().enumerate() {
-            if method.return_type.is_none() {
+            if method.method.return_type_node.is_none() {
                 assert!(store.set_signature_resolved_return_type(prepared.methods[index].1, None));
             }
         }
@@ -3933,8 +3962,8 @@ pub(super) fn prepare_source_class_members(
     let method_returns = plan
         .methods
         .iter()
-        .map(|method| method.return_type)
-        .collect::<Vec<_>>();
+        .map(|method| source_class_method_return_type(store, method))
+        .collect::<Result<Vec<_>, ClassError>>()?;
     let completed_bodies = vec![false; plan.bodies.len()];
     let retained_plan = plan.clone();
     let mut numbers = Vec::new();
@@ -4213,7 +4242,7 @@ pub(super) fn prepare_source_class_members(
                 Vec::new(),
                 None,
                 parameters,
-                method.return_type,
+                source_class_method_return_type(store, method)?,
                 None,
                 class_method_minimum(&method.method).expect("method arity was bounded"),
             )
@@ -4238,9 +4267,10 @@ pub(super) fn prepare_source_class_members(
                 }
             ));
         }
-        if let (Some(annotation), Some(type_)) =
-            (method.method.return_type_node, method.return_type)
-        {
+        if let (Some(annotation), Some(type_)) = (
+            method.method.return_type_node,
+            source_class_method_return_type(store, method)?,
+        ) {
             assert!(store.set_type_node_links(
                 annotation,
                 TypeNodeLinks {
@@ -5807,6 +5837,7 @@ fn completed_source_class_method_type(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
+    context: &ClassTypeQueryContext,
 ) -> Result<Option<TypeId>, ClassError> {
     let Some(provenance) = store
         .symbol(symbol)
@@ -5815,18 +5846,38 @@ fn completed_source_class_method_type(
     else {
         return Ok(None);
     };
-    if !provenance
-        .prepared
-        .plan
-        .methods
-        .iter()
-        .any(|method| method.method.symbol == symbol && method.method.overload)
-    {
+    if !provenance.prepared.plan.methods.iter().any(|method| {
+        method.method.symbol == symbol
+            && (method.method.overload
+                || matches!(
+                    method.return_type,
+                    Some(ClassBodyParameterType::Annotation(_))
+                ))
+    }) {
         return Ok(None);
     }
     validate_source_class_header(store, host, provenance)?;
     if !provenance.complete {
         return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+    }
+    for (method, &(_, signature)) in provenance
+        .prepared
+        .plan
+        .methods
+        .iter()
+        .zip(&provenance.prepared.methods)
+        .filter(|(method, _)| method.method.symbol == symbol)
+    {
+        completed_source_class_method_signature_return_type(
+            store,
+            host,
+            method.method.declaration,
+            signature,
+            Some(CanonicalArrayTargets::from_global_types(
+                &context.global_types,
+            )),
+            context.options,
+        )?;
     }
     store
         .value_symbol_links(symbol)
@@ -7175,6 +7226,57 @@ pub(super) fn class_body_super_constructor_callable(
     })
 }
 
+/// A body token proves the target. Only the current caller grants Array access.
+pub(super) fn class_body_method_callable_with_query_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    access: &ClassBodyAccessToken,
+    receiver_type: TypeId,
+    member: SemanticSymbolId,
+    context: &ClassTypeQueryContext,
+) -> Result<ClassBodyCallable, ClassError> {
+    let target = class_body_method_callable(store, host, access, receiver_type, member)?;
+    let invalid = || invariant(ClassInvariant::InvalidPropertyValueCache(member));
+    if let Some(origin) = store.source_class_provenance_for_symbol(target.class_symbol) {
+        validate_source_class_header(store, host, origin)?;
+        if origin
+            .prepared
+            .plan
+            .type_query_context
+            .as_ref()
+            .is_some_and(|retained| retained.options != context.options)
+        {
+            return Err(invalid());
+        }
+    }
+    let targets = Some(CanonicalArrayTargets::from_global_types(
+        &context.global_types,
+    ));
+    let single = target.overloads.is_none().then_some(&target.callable);
+    for callable in single
+        .into_iter()
+        .chain(target.overloads.iter().flat_map(|overloads| {
+            overloads
+                .signatures
+                .iter()
+                .chain(std::iter::once(&overloads.implementation))
+        }))
+    {
+        for edge in callable
+            .parameters
+            .iter()
+            .copied()
+            .chain(callable.rest_parameter)
+            .chain(callable.return_type)
+        {
+            store
+                .validate_cached_array_capability_with_pending_functions(targets, edge, &[])
+                .map_err(|_| invalid())?;
+        }
+    }
+    Ok(target)
+}
+
 pub(super) fn class_body_method_callable(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -7289,7 +7391,8 @@ pub(super) fn class_body_method_callable(
             return Err(invariant(ClassInvariant::InvalidPropertyValueCache(member)));
         }
         if origin.prepared.plan.methods[method_index]
-            .return_type
+            .method
+            .return_type_node
             .is_none()
             && origin.method_returns[method_index].is_none()
         {
@@ -14341,6 +14444,7 @@ fn plan_direct_class_base(
             node,
             expression,
             symbol,
+            constructor_value: None,
             type_arguments: Vec::new(),
         });
     }
@@ -35689,6 +35793,141 @@ mod query_tests {
             context.get_return_type_of_signature(signature),
             Ok(returned)
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the spent caller across header publication and completed queries.
+    fn named_method_return_queries_keep_an_already_spent_caller() {
+        let parsed = parse_source_file(concat!(
+            "interface Seed<T> { value: T; } ",
+            "type Text = string; ",
+            "class Model { read(value: string): Text { return value; } }",
+        ));
+        let file = FileId::new(202_712);
+        let mut context = context(&parsed, file, CanonicalModuleState::Script);
+        let (_, owner) = class(&context, &parsed, file, "Model");
+        let bound = context.file(file).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let parameter = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(record.data, NodeData::TypeParameterDeclaration(_)).then(|| {
+                    bound
+                        .symbol(NodeRef::new(parsed.arena.id(), file, node))
+                        .unwrap()
+                })
+            })
+            .unwrap();
+        let parameter_type = context.get_declared_type_of_symbol(parameter).unwrap();
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(context.store(), parameter_type),
+            Some(parameter)
+        );
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let mut caller = InstantiationSession::new(InstantiationLimits {
+            max_depth: 100,
+            max_count: 1,
+        });
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                context.store_mut_for_test(),
+                parameter_type,
+                &[parameter_type],
+                &[string],
+                None,
+                &mut caller
+            ),
+            Ok(string)
+        );
+        let mark = caller.limit_event_mark();
+        assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+        let query_context = ClassTypeQueryContext::new(&globals, options);
+        let plan = plan_source_class_members_with_type_context(
+            context.store(),
+            &host,
+            owner,
+            Some(&query_context),
+        )
+        .unwrap();
+        let method = &plan.methods[0].method;
+        let annotation = method.return_type_node.unwrap();
+        assert!(context.store().type_node_links(annotation).is_none());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        prepare_source_class_constructor_header(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut caller,
+            &mut diagnostics,
+            &plan,
+        )
+        .unwrap();
+        assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+        assert_eq!(caller.limit_event_mark(), mark);
+        assert!(diagnostics.is_empty());
+        let prepared = context
+            .store()
+            .source_class_provenance_for_symbol(owner)
+            .unwrap()
+            .prepared
+            .clone();
+        assert!(prepared.annotation_types.contains(&(annotation, string)));
+        assert_eq!(
+            context
+                .store()
+                .signature(prepared.methods[0].1)
+                .unwrap()
+                .resolved_return_type(),
+            Some(string)
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                format!("{:?}", context.store()),
+                context.diagnostics().clone(),
+            )
+        };
+        let warm = snapshot(&context);
+        for _ in 0..2 {
+            assert_eq!(
+                ClassValueQuery {
+                    store: context.store_mut_for_test(),
+                    host: &host,
+                    global_types: &globals,
+                    options,
+                    session: &mut caller,
+                    diagnostics: &mut diagnostics,
+                }
+                .member_type(method.symbol),
+                Ok(prepared.methods[0].0)
+            );
+            assert_eq!(
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut caller,
+                    &mut diagnostics
+                )
+                .unwrap()
+                .get_type_from_source_class_annotation(annotation, owner),
+                Ok(string)
+            );
+            assert_eq!(snapshot(&context), warm);
+            assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+            assert_eq!(caller.limit_event_mark(), mark);
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]

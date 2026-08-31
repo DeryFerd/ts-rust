@@ -14,6 +14,7 @@ use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, TypeId,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     enums::canonical_enum_type_owner,
+    instantiate::InstantiationSession,
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::TypeFlags,
 };
@@ -205,6 +206,7 @@ pub(super) fn narrow_logical_right_operand(
                 left_type,
                 TruthinessAssumption::Truthy,
                 strict_null_checks,
+                None,
             )
         }
         SyntaxKind::BarBarToken | SyntaxKind::BarBarEqualsToken => {
@@ -214,6 +216,7 @@ pub(super) fn narrow_logical_right_operand(
                 left_type,
                 TruthinessAssumption::Falsy,
                 strict_null_checks,
+                None,
             )
         }
         SyntaxKind::QuestionQuestionToken | SyntaxKind::QuestionQuestionEqualsToken => {
@@ -243,6 +246,31 @@ pub(super) fn narrow_by_truthiness(
         type_,
         assumption,
         strict_null_checks,
+        None,
+    )
+}
+
+/// Keeps the complete input and both truthiness passes in the current caller.
+pub(super) fn narrow_by_truthiness_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    type_: TypeId,
+    assumption: TruthinessAssumption,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, LogicalBinaryError> {
+    store.validate_union_constituent_with_global_types(global_types, type_)?;
+    let strict_null_checks = store
+        .intrinsic_bootstrap()
+        .ok_or(LogicalBinaryInvariant::MissingBootstrap)?
+        .options
+        .strict_null_checks;
+    narrow_by_truthiness_with_strict_null_checks(
+        store,
+        Some(global_types),
+        type_,
+        assumption,
+        strict_null_checks,
+        Some(session),
     )
 }
 
@@ -252,19 +280,33 @@ fn narrow_by_truthiness_with_strict_null_checks(
     type_: TypeId,
     assumption: TruthinessAssumption,
     strict_null_checks: bool,
+    mut session: Option<&mut InstantiationSession>,
 ) -> Result<TypeId, LogicalBinaryError> {
     match assumption {
         TruthinessAssumption::Truthy => {
-            let truthy =
-                remove_definitely_falsy_types(store, global_types, type_, strict_null_checks)?;
-            get_non_nullable_type(store, global_types, truthy, strict_null_checks)
+            let truthy = filter_union_leaves_with_session(
+                store,
+                global_types,
+                type_,
+                UnionReduction::Literal,
+                |store, leaf| Ok(logical_type_facts(store, leaf, strict_null_checks)?.truthy),
+                session.as_deref_mut(),
+            )?;
+            get_non_nullable_type_with_session(
+                store,
+                global_types,
+                truthy,
+                strict_null_checks,
+                session,
+            )
         }
-        TruthinessAssumption::Falsy => filter_union_leaves(
+        TruthinessAssumption::Falsy => filter_union_leaves_with_session(
             store,
             global_types,
             type_,
             UnionReduction::Literal,
             |store, leaf| Ok(logical_type_facts(store, leaf, strict_null_checks)?.falsy),
+            session,
         ),
     }
 }
@@ -473,6 +515,16 @@ fn get_non_nullable_type(
     type_: TypeId,
     strict_null_checks: bool,
 ) -> Result<TypeId, LogicalBinaryError> {
+    get_non_nullable_type_with_session(store, global_types, type_, strict_null_checks, None)
+}
+
+fn get_non_nullable_type_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_: TypeId,
+    strict_null_checks: bool,
+    session: Option<&mut InstantiationSession>,
+) -> Result<TypeId, LogicalBinaryError> {
     if !strict_null_checks {
         return Ok(type_);
     }
@@ -488,7 +540,7 @@ fn get_non_nullable_type(
     if flags.intersects(TypeFlags::UNKNOWN) {
         return Ok(unknown_empty_object);
     }
-    filter_union_leaves(
+    filter_union_leaves_with_session(
         store,
         global_types,
         type_,
@@ -501,6 +553,7 @@ fn get_non_nullable_type(
             Ok(flags.intersects(TypeFlags::ANY)
                 || !flags.intersects(TypeFlags::VOID_LIKE | TypeFlags::NULL | TypeFlags::UNKNOWN))
         },
+        session,
     )
 }
 
@@ -544,7 +597,18 @@ fn filter_union_leaves(
     global_types: Option<&CanonicalGlobalTypes>,
     type_: TypeId,
     reduction: UnionReduction,
+    include: impl FnMut(&CanonicalTypeMapperStore, TypeId) -> Result<bool, LogicalBinaryError>,
+) -> Result<TypeId, LogicalBinaryError> {
+    filter_union_leaves_with_session(store, global_types, type_, reduction, include, None)
+}
+
+fn filter_union_leaves_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_: TypeId,
+    reduction: UnionReduction,
     mut include: impl FnMut(&CanonicalTypeMapperStore, TypeId) -> Result<bool, LogicalBinaryError>,
+    session: Option<&mut InstantiationSession>,
 ) -> Result<TypeId, LogicalBinaryError> {
     let leaves = union_leaves(store, type_)?;
     let mut retained = Vec::with_capacity(leaves.len());
@@ -553,7 +617,7 @@ fn filter_union_leaves(
             retained.push(leaf);
         }
     }
-    logical_union(store, global_types, &retained, reduction)
+    logical_union_with_session(store, global_types, &retained, reduction, session)
 }
 
 fn union_leaves(
@@ -652,7 +716,27 @@ fn logical_union(
     types: &[TypeId],
     reduction: UnionReduction,
 ) -> Result<TypeId, LogicalBinaryError> {
+    logical_union_with_session(store, global_types, types, reduction, None)
+}
+
+fn logical_union_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    types: &[TypeId],
+    reduction: UnionReduction,
+    session: Option<&mut InstantiationSession>,
+) -> Result<TypeId, LogicalBinaryError> {
     if let Some(global_types) = global_types {
+        if let Some(session) = session {
+            return store
+                .expression_union_type_with_global_types_and_session(
+                    global_types,
+                    types,
+                    reduction,
+                    session,
+                )
+                .map_err(Into::into);
+        }
         return store
             .expression_union_type_with_global_types(global_types, types, reduction)
             .map_err(Into::into);
@@ -669,6 +753,324 @@ fn logical_union(
         Err(LogicalBinaryError::Unsupported(
             LogicalBinaryUnsupported::MissingGlobalTypes,
         ))
+    }
+}
+
+#[cfg(test)]
+pub(super) mod property_flow_test_support {
+    use ts_ast::{FileId, FlowRef, NodeRef, SyntaxKind};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
+
+    use super::*;
+    use crate::semantic::{
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+        array_types::CanonicalArrayTargets,
+        instantiate::{
+            InstantiationLimits, MappedTemplateFrame, instantiate_type_with_session,
+            with_mapped_template_frame,
+        },
+        links::ValueSymbolLinks,
+        types::AccessFlags,
+    };
+
+    pub(super) const FILE: FileId = FileId::new(202_674);
+    pub(super) const LIBRARY: &str = concat!(
+        "interface Array<T> {} interface ReadonlyArray<T> {} ",
+        "interface Base<T> { value: T; [index: number]: number; }",
+    );
+    pub(super) const SOURCE: &str = concat!(
+        "interface Derived extends Base<number> {} ",
+        "interface Plain { value: number; } ",
+        "type Values = number[];",
+    );
+
+    pub(super) fn context<'a>(
+        library: &'a ParseResult,
+        parsed: &'a ParseResult,
+    ) -> CanonicalCheckerContext<'a> {
+        let mut binder = CanonicalBinder::new();
+        for (source, file, path, declaration) in [
+            (
+                library,
+                FileId::new(202_673),
+                "\"/project/flow-lib.d.ts\"",
+                true,
+            ),
+            (parsed, FILE, "\"/project/flow-types.ts\"", false),
+        ] {
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (FileId::new(202_673), &library.arena),
+                (FILE, &parsed.arena),
+            ],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    pub(super) fn array_node(parsed: &ParseResult) -> NodeRef {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrayType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    FILE,
+                    node,
+                ))
+            })
+            .unwrap()
+    }
+
+    fn counts(store: &CanonicalTypeMapperStore) -> (usize, usize, usize, usize, Vec<usize>) {
+        (
+            store.type_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths().to_vec(),
+        )
+    }
+
+    /// A dirty canonical union must demand its real inherited property in this caller.
+    pub(in crate::semantic) fn assert_borrowed_union_preparation(
+        mut query: impl FnMut(
+            &mut CanonicalTypeMapperStore,
+            &CanonicalGlobalTypes,
+            NodeRef,
+            FlowRef,
+            TypeId,
+            TypeId,
+            &mut InstantiationSession,
+        ) -> Result<TypeId, LiteralTypeCacheError>,
+    ) {
+        let library = parse_source_file(LIBRARY);
+        let parsed = parse_source_file(SOURCE);
+        for active in [false, true] {
+            let mut context = context(&library, &parsed);
+            context.check_source_file(FILE).unwrap();
+            assert!(
+                context.diagnostics().is_empty(),
+                "{:?}",
+                context.diagnostics()
+            );
+            let node = array_node(&parsed);
+            let array = context
+                .store()
+                .type_node_links(node)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let flow = context
+                .file(FILE)
+                .unwrap()
+                .1
+                .flow_graph()
+                .container_end(NodeRef::new(parsed.arena.id(), FILE, parsed.source_file))
+                .unwrap();
+            let globals = context.global_types().clone();
+            let arrays = CanonicalArrayTargets::from_global_types(&globals);
+            let named = |name| {
+                let owner = context
+                    .store()
+                    .symbol_table(context.globals())
+                    .unwrap()
+                    .get_source(name)
+                    .unwrap();
+                let owner = context.store().get_merged_symbol(owner).unwrap();
+                context
+                    .store()
+                    .declared_type_links(owner)
+                    .unwrap()
+                    .declared_type
+                    .unwrap()
+            };
+            let derived = named("Derived");
+            let plain = named("Plain");
+            let store = context.store_mut_for_test();
+            let TypeData::Interface(interface) = store.type_payload(derived).unwrap().data() else {
+                panic!("expected the real inherited interface")
+            };
+            let proxy = store
+                .symbol_table(interface.reference.object.structured.members.unwrap())
+                .unwrap()
+                .get_source("value")
+                .unwrap();
+            let (number, sentinel, empty) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.number_type,
+                    bootstrap.undefined_or_missing_type,
+                    bootstrap.empty_type_literal_type,
+                )
+            };
+            let mut setup = InstantiationSession::new(InstantiationLimits::default());
+            let input = store
+                .expression_union_type_with_global_types_and_session(
+                    &globals,
+                    &[number, derived],
+                    UnionReduction::Literal,
+                    &mut setup,
+                )
+                .unwrap();
+            let rows = store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .union_of_union_cache_len();
+            store
+                .expression_union_type_with_global_types_and_session(
+                    &globals,
+                    &[input, plain],
+                    UnionReduction::Subtype,
+                    &mut setup,
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_of_union_cache_len(),
+                rows + 1
+            );
+            let links = store.value_symbol_links(proxy).unwrap().clone();
+            assert_eq!(links.resolved_type, Some(number));
+            let mapper = links.mapper.unwrap();
+            let parameter = store
+                .value_symbol_links(links.target.unwrap())
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert!(matches!(
+                store.type_payload(parameter).unwrap().data(),
+                TypeData::TypeParameter(_)
+            ));
+            let template = store
+                .alloc_indexed_access_type(empty, parameter, AccessFlags::NONE)
+                .unwrap();
+            assert!(store.set_value_symbol_links(
+                proxy,
+                ValueSymbolLinks {
+                    resolved_type: None,
+                    ..links
+                }
+            ));
+            store.mark_union_cache_validation_dirty();
+            let mut caller = InstantiationSession::new(if active {
+                InstantiationLimits {
+                    max_depth: 1,
+                    ..InstantiationLimits::default()
+                }
+            } else {
+                InstantiationLimits {
+                    max_count: 1,
+                    ..InstantiationLimits::default()
+                }
+            });
+            assert_eq!(
+                instantiate_type_with_session(store, parameter, mapper, Some(arrays), &mut caller),
+                Ok(number)
+            );
+            assert_eq!(
+                (
+                    caller.query_count(),
+                    caller.total_count(),
+                    caller.limit_event_count()
+                ),
+                (1, 1, 0)
+            );
+            let before = counts(store);
+            let rejected = LiteralTypeCacheError::UnsupportedUnionConstituent(derived.max(plain));
+            for event in 1..=2 {
+                let result = if active {
+                    with_mapped_template_frame(
+                        store,
+                        MappedTemplateFrame::Indexed(template),
+                        &[parameter],
+                        &[number],
+                        &mut caller,
+                        |error| panic!("the outer caller frame must enter: {error:?}"),
+                        |store, caller| query(store, &globals, node, flow, array, sentinel, caller),
+                    )
+                } else {
+                    query(store, &globals, node, flow, array, sentinel, &mut caller)
+                };
+                assert_eq!(result, Err(rejected));
+                let count = if active { 1 + event } else { 1 };
+                assert_eq!(
+                    (
+                        caller.query_count(),
+                        caller.total_count(),
+                        caller.limit_event_count()
+                    ),
+                    (count, count, event as u64)
+                );
+                assert_eq!(store.value_symbol_links(proxy).unwrap().resolved_type, None);
+                assert!(store.instantiated_property_recovery(proxy).is_none());
+                assert_eq!(counts(store), before);
+                assert!(store.type_resolution_is_empty());
+            }
+            if active {
+                assert_eq!(
+                    instantiate_type_with_session(
+                        store,
+                        parameter,
+                        mapper,
+                        Some(arrays),
+                        &mut caller
+                    ),
+                    Ok(number)
+                );
+                assert_eq!(caller.query_count(), 4);
+            }
+            let mut adequate = InstantiationSession::new(InstantiationLimits::default());
+            let result =
+                query(store, &globals, node, flow, array, sentinel, &mut adequate).unwrap();
+            assert_eq!(
+                store.value_symbol_links(proxy).unwrap().resolved_type,
+                Some(number)
+            );
+            assert!(adequate.total_count() > 0);
+            assert_eq!(adequate.limit_event_count(), 0);
+            let warm = counts(store);
+            let caller_state = format!("{caller:?}");
+            for _ in 0..2 {
+                assert_eq!(
+                    query(store, &globals, node, flow, array, sentinel, &mut caller),
+                    Ok(result)
+                );
+                assert_eq!(counts(store), warm);
+                assert_eq!(format!("{caller:?}"), caller_state);
+            }
+        }
     }
 }
 
@@ -981,6 +1383,136 @@ mod tests {
             Err(LogicalBinaryError::Invariant(
                 LogicalBinaryInvariant::MissingBootstrap,
             )),
+        );
+    }
+
+    #[test]
+    fn borrowed_truthiness_keeps_spent_and_active_caller_demand_errors() {
+        property_flow_test_support::assert_borrowed_union_preparation(
+            |store, globals, _, _, array, _, caller| {
+                narrow_by_truthiness_with_session(
+                    store,
+                    globals,
+                    array,
+                    TruthinessAssumption::Falsy,
+                    caller,
+                )
+                .map_err(|error| match error {
+                    LogicalBinaryError::Literal(error) => error,
+                    other => panic!("expected the actual union preparation error: {other:?}"),
+                })
+            },
+        );
+    }
+
+    #[test]
+    fn borrowed_truthiness_validates_removed_array_constituents_and_authority() {
+        use crate::semantic::array_types::CanonicalArrayTargets;
+        use crate::semantic::instantiate::{
+            InstantiationLimits, instantiate_type_with_vector_and_session,
+        };
+        use ts_parser::parse_source_file;
+
+        let library = parse_source_file(property_flow_test_support::LIBRARY);
+        let parsed = parse_source_file(property_flow_test_support::SOURCE);
+        let mut context = property_flow_test_support::context(&library, &parsed);
+        let foreign = property_flow_test_support::context(&library, &parsed);
+        context
+            .check_source_file(property_flow_test_support::FILE)
+            .unwrap();
+        assert!(context.diagnostics().is_empty());
+        let array = context
+            .store()
+            .type_node_links(property_flow_test_support::array_node(&parsed))
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let globals = context.global_types().clone();
+        let foreign_globals = foreign.global_types().clone();
+        let store = context.store_mut_for_test();
+        let (number, never) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.never_type)
+        };
+        let TypeData::Interface(target) = store.type_payload(globals.array_type).unwrap().data()
+        else {
+            unreachable!()
+        };
+        let parameter = target.reference.resolved_type_arguments.as_ref().unwrap()[0];
+        let mut caller = InstantiationSession::new(InstantiationLimits {
+            max_count: 1,
+            ..InstantiationLimits::default()
+        });
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                store,
+                parameter,
+                &[parameter],
+                &[number],
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+                &mut caller
+            ),
+            Ok(number)
+        );
+        assert_eq!(
+            narrow_by_truthiness_with_session(
+                store,
+                &globals,
+                array,
+                TruthinessAssumption::Falsy,
+                &mut caller
+            ),
+            Ok(never)
+        );
+        for damage in [false, true] {
+            let authority = if damage { &globals } else { &foreign_globals };
+            if damage {
+                assert!(store.set_object_target_and_mapper(
+                    array,
+                    Some(globals.readonly_array_type),
+                    None
+                ));
+            }
+            let error = store
+                .validate_union_constituent_with_global_types(authority, array)
+                .unwrap_err();
+            let before = format!("{store:?}");
+            let caller_before = format!("{caller:?}");
+            for _ in 0..2 {
+                assert_eq!(
+                    narrow_by_truthiness_with_session(
+                        store,
+                        authority,
+                        array,
+                        TruthinessAssumption::Falsy,
+                        &mut caller
+                    ),
+                    Err(LogicalBinaryError::Literal(error))
+                );
+                assert_eq!(format!("{store:?}"), before);
+                assert_eq!(format!("{caller:?}"), caller_before);
+            }
+            if damage {
+                assert!(store.set_object_target_and_mapper(array, Some(globals.array_type), None));
+            }
+        }
+        assert_eq!(
+            narrow_by_truthiness_with_session(
+                store,
+                &globals,
+                array,
+                TruthinessAssumption::Truthy,
+                &mut caller
+            ),
+            Ok(array)
+        );
+        assert_eq!(
+            (
+                caller.query_count(),
+                caller.total_count(),
+                caller.limit_event_count()
+            ),
+            (1, 1, 0)
         );
     }
 }
