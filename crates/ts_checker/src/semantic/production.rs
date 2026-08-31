@@ -1503,6 +1503,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     ///
     /// This admits top-level nongeneric TypeScript declarations and named class expressions
     /// in top-level variable initializers. Heritage remains a separate query.
+    /// Empty nongeneric classes in unmerged ambient namespaces also retain
+    /// their exact source-owned instance and value shells.
     /// It does not mark a source checked or admit it to the class writers.
     ///
     /// # Errors

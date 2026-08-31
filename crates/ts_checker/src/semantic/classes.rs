@@ -6267,6 +6267,7 @@ pub(super) struct ClassQueryPlan {
     abstract_class: bool,
     expression: bool,
     export_local: Option<SemanticSymbolId>,
+    ambient_namespace: Option<super::source_namespaces::AmbientNamespaceClassQueryOwner>,
     members: Vec<ts_ast::NodeId>,
 }
 
@@ -24698,7 +24699,7 @@ fn shell_state(
     Ok(ClassShellState { instance, value })
 }
 
-/// Plans only the source binding needed by a lazy class identity query.
+/// Plans source bindings for top-level classes and empty ambient namespace classes.
 #[allow(clippy::too_many_lines)] // The declaration and expression bindings have different owners.
 pub(super) fn plan_class_query(
     store: &CanonicalTypeMapperStore,
@@ -24821,22 +24822,48 @@ pub(super) fn plan_class_query(
     } else {
         declaration
     };
-    if host
-        .node(statement)
-        .is_none_or(|statement| statement.parent != Some(source.node))
-        || source_data
-            .statements
-            .nodes
-            .iter()
-            .filter(|node| **node == statement.node)
-            .count()
-            != 1
+    let ambient_namespace = if !expression
+        && record.parent.is_some_and(|parent| {
+            host.node(NodeRef::new(declaration.arena, declaration.file, parent))
+                .is_some_and(|parent| parent.kind == SyntaxKind::ModuleBlock)
+        }) {
+        if !members.nodes.is_empty() || modifiers.is_some() {
+            return Err(unsupported(ClassUnsupported::NestedDeclaration(
+                declaration,
+            )));
+        }
+        Some(
+            super::source_namespaces::plan_ambient_namespace_class_query_owner(
+                store,
+                host,
+                symbol,
+                declaration,
+            )
+            .map_err(|_| invalid())?
+            .ok_or_else(|| unsupported(ClassUnsupported::NestedDeclaration(declaration)))?,
+        )
+    } else {
+        None
+    };
+    if ambient_namespace.is_none()
+        && (host
+            .node(statement)
+            .is_none_or(|statement| statement.parent != Some(source.node))
+            || source_data
+                .statements
+                .nodes
+                .iter()
+                .filter(|node| **node == statement.node)
+                .count()
+                != 1)
     {
         return Err(unsupported(ClassUnsupported::NestedDeclaration(
             declaration,
         )));
     }
-    let (ambient, abstract_class, export_local) = if expression {
+    let (ambient, abstract_class, export_local) = if let Some(namespace) = ambient_namespace {
+        (true, false, Some(namespace.export_local()))
+    } else if expression {
         (false, false, None)
     } else {
         let modifiers = plan_class_declaration_modifiers(
@@ -24872,6 +24899,7 @@ pub(super) fn plan_class_query(
         abstract_class,
         expression,
         export_local,
+        ambient_namespace,
         members: members.nodes.clone(),
     })
 }
@@ -24950,6 +24978,17 @@ fn class_query_shell_state(
     {
         return Err(invalid_instance());
     }
+    if plan.ambient_namespace.is_some()
+        && store.declared_type_links(plan.symbol).is_some_and(|links| {
+            links
+                != &(super::DeclaredTypeLinks {
+                    declared_type: instance,
+                    ..super::DeclaredTypeLinks::default()
+                })
+        })
+    {
+        return Err(invalid_instance());
+    }
     let value = match store.value_symbol_links(plan.symbol) {
         None => StaticShellState::Cold,
         Some(links) if links == &ValueSymbolLinks::default() => StaticShellState::Cold,
@@ -24965,10 +25004,12 @@ fn class_query_shell_state(
             }
             if exact_static_shell(store, plan.symbol, type_) {
                 StaticShellState::WarmShell(type_)
-            } else if instance.is_some_and(|instance| {
-                validate_class_heritage_members(store, instance)
-                    == ClassHeritageMembersValidation::Valid
-            }) {
+            } else if plan.ambient_namespace.is_none()
+                && instance.is_some_and(|instance| {
+                    validate_class_heritage_members(store, instance)
+                        == ClassHeritageMembersValidation::Valid
+                })
+            {
                 StaticShellState::WarmMembers(type_)
             } else {
                 return Err(invalid_value());
@@ -25002,6 +25043,20 @@ fn class_query_shell_state(
         return Err(invalid_value());
     }
     Ok(ClassShellState { instance, value })
+}
+
+/// Checks namespace query caches without calling the deferred namespace planner.
+pub(super) fn validate_ambient_namespace_class_query_shell(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<(), ClassError> {
+    let plan = plan_class_query(store, host, symbol)?;
+    if plan.ambient_namespace.is_none() {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+    }
+    class_query_shell_state(store, &plan)?;
+    Ok(())
 }
 
 /// Checks a cold class name without publishing member types or constructor state.
@@ -30827,6 +30882,301 @@ mod query_tests {
             })
             .unwrap();
         (owner, field, declaration, initializer, parameter)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Damage and restore each real owner and cache on its own graph.
+    fn ambient_namespace_class_query_shells_reject_changed_owner_and_cache_state() {
+        let parsed =
+            parse_source_file("declare namespace Library { class Entry {} class Other {} }");
+        let file = FileId::new(14_414);
+        for warm in [false, true] {
+            for poison in [
+                "export",
+                "local",
+                "declaration",
+                "prototype",
+                "instance",
+                "declared_flags",
+                "value",
+                "namespace_value",
+                "resolved_exports",
+                "namespace_exports_table",
+                "class_exports_table",
+                "base_constructor",
+            ] {
+                let mut context = context(&parsed, file, CanonicalModuleState::Script);
+                let (declaration, owner) = class(&context, &parsed, file, "Entry");
+                let (other_declaration, other) = class(&context, &parsed, file, "Other");
+                let instance = context.get_declared_type_of_symbol(owner).unwrap();
+                let prior = warm.then(|| context.get_class_query_shells(owner).unwrap());
+                let other_shells = context.get_class_query_shells(other).unwrap();
+                let owner_record = context.store().symbol(owner).unwrap().clone();
+                let namespace = owner_record.parent().unwrap();
+                let namespace_record = context.store().symbol(namespace).unwrap().clone();
+                let namespace_exports = namespace_record.exports().unwrap();
+                let local = context
+                    .file(file)
+                    .unwrap()
+                    .1
+                    .local_symbol(declaration)
+                    .unwrap();
+                let local_record = context.store().symbol(local).unwrap().clone();
+                let prototype = context
+                    .store()
+                    .symbol_table(owner_record.exports().unwrap())
+                    .unwrap()
+                    .get_source("prototype")
+                    .unwrap();
+                let prototype_record = context.store().symbol(prototype).unwrap().clone();
+                let declared = context.store().declared_type_links(owner).unwrap().clone();
+                let value = context
+                    .store()
+                    .value_symbol_links(owner)
+                    .cloned()
+                    .unwrap_or_default();
+                let namespace_value = context
+                    .store()
+                    .value_symbol_links(namespace)
+                    .cloned()
+                    .unwrap_or_default();
+                let namespace_links = context
+                    .store()
+                    .module_symbol_links(namespace)
+                    .cloned()
+                    .unwrap_or_default();
+                let TypeData::Interface(instance_data) =
+                    context.store().type_payload(instance).unwrap().data()
+                else {
+                    panic!("the class must retain its declared instance")
+                };
+                let base_constructor = instance_data.resolved_base_constructor_type;
+                let store = context.store_mut_for_test();
+                match poison {
+                    "export" => assert_eq!(
+                        store.insert_symbol(namespace_exports, EscapedName::source("Entry"), other),
+                        Some(Some(owner))
+                    ),
+                    "local" => assert!(store.set_symbol_relationships(
+                        local,
+                        local_record.members(),
+                        local_record.exports(),
+                        local_record.parent(),
+                        Some(other)
+                    )),
+                    "declaration" => assert!(store.set_symbol_declarations(
+                        owner,
+                        Some(vec![declaration]),
+                        Some(other_declaration)
+                    )),
+                    "prototype" => assert!(store.set_symbol_flags(
+                        prototype,
+                        SymbolFlags::PROPERTY,
+                        prototype_record.check_flags()
+                    )),
+                    "instance" => assert!(store.set_declared_type_links(
+                        owner,
+                        super::super::DeclaredTypeLinks {
+                            declared_type: Some(other_shells.instance_type()),
+                            ..declared.clone()
+                        }
+                    )),
+                    "declared_flags" => assert!(store.set_declared_type_links(
+                        owner,
+                        super::super::DeclaredTypeLinks {
+                            enum_checked: true,
+                            ..declared.clone()
+                        }
+                    )),
+                    "value" => assert!(store.set_value_symbol_links(
+                        owner,
+                        ValueSymbolLinks {
+                            resolved_type: Some(other_shells.value_type()),
+                            ..ValueSymbolLinks::default()
+                        }
+                    )),
+                    "namespace_value" => assert!(store.set_value_symbol_links(
+                        namespace,
+                        ValueSymbolLinks {
+                            resolved_type: Some(other_shells.value_type()),
+                            ..ValueSymbolLinks::default()
+                        }
+                    )),
+                    "resolved_exports" => {
+                        let foreign = store.clone_symbol_table(namespace_exports).unwrap();
+                        assert_ne!(foreign, namespace_exports);
+                        let mut links = namespace_links.clone();
+                        links.resolved_exports = Some(foreign);
+                        assert!(store.set_module_symbol_links(namespace, links));
+                    }
+                    "namespace_exports_table" => {
+                        let copied = store.clone_symbol_table(namespace_exports).unwrap();
+                        assert_ne!(copied, namespace_exports);
+                        assert!(store.set_symbol_relationships(
+                            namespace,
+                            namespace_record.members(),
+                            Some(copied),
+                            namespace_record.parent(),
+                            namespace_record.export_symbol()
+                        ));
+                    }
+                    "class_exports_table" => {
+                        let exports = owner_record.exports().unwrap();
+                        let copied = store.clone_symbol_table(exports).unwrap();
+                        assert_ne!(copied, exports);
+                        assert!(store.set_symbol_relationships(
+                            owner,
+                            owner_record.members(),
+                            Some(copied),
+                            owner_record.parent(),
+                            owner_record.export_symbol()
+                        ));
+                    }
+                    "base_constructor" => assert!(store.set_interface_base_resolution(
+                        instance,
+                        false,
+                        Some(other_shells.value_type()),
+                        None
+                    )),
+                    _ => unreachable!(),
+                }
+                let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                    (
+                        format!("{:?}", context.store()),
+                        context.diagnostics().clone(),
+                    )
+                };
+                let changed = snapshot(&context);
+                for _ in 0..2 {
+                    assert!(
+                        context.get_class_query_shells(owner).is_err(),
+                        "{warm}, {poison}"
+                    );
+                    assert_eq!(snapshot(&context), changed);
+                }
+                let store = context.store_mut_for_test();
+                assert!(
+                    store
+                        .insert_symbol(namespace_exports, EscapedName::source("Entry"), owner)
+                        .is_some()
+                );
+                assert!(store.set_symbol_relationships(
+                    local,
+                    local_record.members(),
+                    local_record.exports(),
+                    local_record.parent(),
+                    local_record.export_symbol()
+                ));
+                for (symbol, record) in [(owner, &owner_record), (namespace, &namespace_record)] {
+                    assert!(store.set_symbol_relationships(
+                        symbol,
+                        record.members(),
+                        record.exports(),
+                        record.parent(),
+                        record.export_symbol()
+                    ));
+                }
+                assert!(store.set_symbol_declarations(
+                    owner,
+                    owner_record.declarations().map(<[NodeRef]>::to_vec),
+                    owner_record.value_declaration()
+                ));
+                assert!(store.set_symbol_flags(
+                    prototype,
+                    prototype_record.flags(),
+                    prototype_record.check_flags()
+                ));
+                assert!(store.set_declared_type_links(owner, declared));
+                assert!(store.set_value_symbol_links(owner, value));
+                assert!(store.set_value_symbol_links(namespace, namespace_value));
+                assert!(store.set_module_symbol_links(namespace, namespace_links));
+                assert!(store.set_interface_base_resolution(
+                    instance,
+                    false,
+                    base_constructor,
+                    None
+                ));
+                let restored = context.get_class_query_shells(owner).unwrap();
+                assert_eq!(restored.instance_type(), instance);
+                if let Some(prior) = prior {
+                    assert_eq!(restored, prior);
+                }
+                let after = snapshot(&context);
+                assert_eq!(context.get_class_query_shells(owner), Ok(restored));
+                assert_eq!(snapshot(&context), after);
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ambient_namespace_class_queries_keep_runtime_generic_and_merged_boundaries() {
+        for source in [
+            "namespace Library { export class Entry {} }",
+            "declare namespace Library { class Entry<T> {} }",
+            "declare namespace Library { class Entry { value: string; } }",
+            "declare namespace Library { class Base {} class Entry extends Base {} }",
+            "declare namespace Library { interface Entry {} class Entry {} }",
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(14_415);
+            let mut context = context(&parsed, file, CanonicalModuleState::Script);
+            let (_, owner) = class(&context, &parsed, file, "Entry");
+            let before = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert!(context.get_class_query_shells(owner).is_err(), "{source}");
+                assert_eq!(format!("{:?}", context.store()), before);
+            }
+            assert!(context.store().declared_type_links(owner).is_none());
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert!(context.diagnostics().is_empty());
+        }
+
+        let parsed = parse_source_file(concat!(
+            "declare namespace Library { class Entry {} } ",
+            "declare namespace Library { class Other {} }",
+        ));
+        let file = FileId::new(14_416);
+        let mut context = context(&parsed, file, CanonicalModuleState::Script);
+        let (_, owner) = class(&context, &parsed, file, "Entry");
+        let instance = context.get_declared_type_of_symbol(owner).unwrap();
+        for resolved_exports in [false, true] {
+            if resolved_exports {
+                let namespace = context.store().symbol(owner).unwrap().parent().unwrap();
+                let exports = context
+                    .store()
+                    .symbol(namespace)
+                    .unwrap()
+                    .exports()
+                    .unwrap();
+                let copied = context
+                    .store_mut_for_test()
+                    .clone_symbol_table(exports)
+                    .unwrap();
+                let mut links = context
+                    .store()
+                    .module_symbol_links(namespace)
+                    .cloned()
+                    .unwrap_or_default();
+                links.resolved_exports = Some(copied);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_module_symbol_links(namespace, links)
+                );
+            }
+            let before = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert!(matches!(
+                    context.get_class_query_shells(owner),
+                    Err(ClassError::Unsupported(_))
+                ));
+                assert_eq!(context.type_to_string(instance).unwrap(), "Entry");
+                assert_eq!(format!("{:?}", context.store()), before);
+            }
+        }
+        assert!(context.store().value_symbol_links(owner).is_none());
+        assert!(context.diagnostics().is_empty());
     }
 
     fn standard_field_query_counts(
