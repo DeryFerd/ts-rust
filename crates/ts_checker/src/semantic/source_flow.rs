@@ -927,11 +927,19 @@ pub(super) fn plan_source_captured_local(
         return Ok(None);
     }
     let writer = host.node(writing_callable).ok_or_else(invalid)?;
-    let NodeData::ArrowFunction(arrow) = &writer.data else {
-        return Ok(None);
-    };
-    if arrow.modifiers.is_some() || arrow.asterisk_token.is_some() {
-        return Ok(None);
+    match &writer.data {
+        NodeData::ArrowFunction(arrow)
+            if arrow.modifiers.is_none() && arrow.asterisk_token.is_none() => {}
+        NodeData::MethodDeclaration(method)
+            if method.modifiers.is_none()
+                && method.asterisk_token.is_none()
+                && method.type_parameters.is_none()
+                && method.postfix_token.is_none()
+                && writer
+                    .parent
+                    .and_then(|parent| arena.get(parent))
+                    .is_some_and(|parent| parent.kind == SyntaxKind::ObjectLiteralExpression) => {}
+        _ => return Ok(None),
     }
     let owner = store.symbol(symbol).ok_or_else(invalid)?;
     if owner.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE {
@@ -973,10 +981,16 @@ pub(super) fn plan_source_captured_local(
     {
         return Ok(None);
     }
-    if !source_captured_arrow_is_stored(store, host, writing_callable)? {
-        return Ok(None);
+    if writer.kind == SyntaxKind::MethodDeclaration {
+        validate_source_object_method_owner(arena, bound, store, host, writing_callable)
+            .map_err(|_| invalid())?;
+    } else {
+        if !source_captured_arrow_is_stored(store, host, writing_callable)? {
+            return Ok(None);
+        }
+        validate_source_arrow_owner(arena, bound, store, writing_callable)
+            .map_err(|_| invalid())?;
     }
-    validate_source_arrow_owner(arena, bound, store, writing_callable).map_err(|_| invalid())?;
     validate_captured_declaring_owner(arena, bound, store, host, declaring_callable)
         .map_err(|_| invalid())?;
     let statement = NodeRef::new(
@@ -1387,6 +1401,65 @@ fn validate_source_arrow_owner(
     Ok(body)
 }
 
+/// Reuses the object's member proof and retains the method's actual body and flow start.
+fn validate_source_object_method_owner(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(container);
+    let owner =
+        super::source_callables::source_object_literal_method_symbol(store, host, container)
+            .ok_or_else(invalid)?;
+    let record = host.node(container).ok_or_else(invalid)?;
+    let NodeData::MethodDeclaration(method) = &record.data else {
+        return Err(invalid().into());
+    };
+    let body = NodeRef::new(
+        container.arena,
+        container.file,
+        method.body.ok_or_else(invalid)?,
+    );
+    let body_record = host.node(body).ok_or_else(invalid)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Err(invalid().into());
+    };
+    if !container.is_for(arena.id(), bound.file_id())
+        || !bound.contains(container)
+        || bound.node_arena_revision() != arena.revision()
+        || bound
+            .source_facts()
+            .is_none_or(|facts| facts.is_javascript_file() || facts.is_declaration_file())
+        || bound.symbol(container) != Some(owner)
+        || bound.local_symbol(container).is_some()
+        || record.flags.0 != 0
+        || method.modifiers.is_some()
+        || method.asterisk_token.is_some()
+        || method.type_parameters.is_some()
+        || method.postfix_token.is_some()
+        || body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(container.node)
+        || body_record.range.start < record.range.start
+        || body_record.range.end > record.range.end
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || block.facts != 0
+    {
+        return Err(invalid().into());
+    }
+    let start = bound
+        .flow_graph()
+        .container_start(container)
+        .ok_or_else(invalid)?;
+    if preflight_start_payload(bound.flow_graph(), container, start)? != Some(container) {
+        return Err(invalid().into());
+    }
+    Ok(body)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceFlowArrayMutation {
     pub(super) call: NodeRef,
@@ -1485,7 +1558,22 @@ fn validate_captured_flow_origin(
     match origin {
         SourceCapturedFlowOrigin::Assignment(assignment) => {
             let invalid = || SourceFlowInvariant::InvalidCapturedLocal(assignment.local.target);
-            validate_arrow_statement(arena, bound, store, container, assignment.statement)?;
+            if arena
+                .get(container.node)
+                .is_some_and(|record| record.kind == SyntaxKind::MethodDeclaration)
+            {
+                let body =
+                    validate_source_object_method_owner(arena, bound, store, host, container)?;
+                validate_callable_expression_statement(
+                    arena,
+                    bound,
+                    container,
+                    body,
+                    assignment.statement,
+                )?;
+            } else {
+                validate_arrow_statement(arena, bound, store, container, assignment.statement)?;
+            }
             let target = arena
                 .get(assignment.local.target.node)
                 .ok_or_else(invalid)?;
@@ -1527,6 +1615,12 @@ fn validate_captured_flow_origin(
         SourceCapturedFlowOrigin::ArrayMutation(captured) => {
             let mutation = captured.mutation;
             let invalid = || SourceFlowInvariant::InvalidArrayMutation(mutation.call);
+            if arena
+                .get(container.node)
+                .is_none_or(|record| record.kind != SyntaxKind::ArrowFunction)
+            {
+                return Err(invalid().into());
+            }
             validate_linear_direct_call(arena, bound, store, container, mutation.call)?;
             if mutation.receiver != captured.local.target
                 || mutation.declaration != captured.local.declaration
@@ -7015,8 +7109,18 @@ fn validate_arrow_statement(
     container: NodeRef,
     statement: NodeRef,
 ) -> Result<(), SourceFlowError> {
-    let invalid = || SourceFlowInvariant::InvalidCall(statement);
     let body = validate_source_arrow_owner(arena, bound, store, container)?;
+    validate_callable_expression_statement(arena, bound, container, body, statement)
+}
+
+fn validate_callable_expression_statement(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    container: NodeRef,
+    body: NodeRef,
+    statement: NodeRef,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(statement);
     if !statement.is_for(arena.id(), bound.file_id())
         || !bound.contains(statement)
         || bound.container(statement) != Some(container)
@@ -10097,6 +10201,239 @@ mod tests {
                 ),
                 before
             );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the method, capture, and retained flow damage checks together.
+    fn object_method_captured_write_rechecks_owner_binding_and_flow() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(concat!(
+            "function outer() { let value: string | number = 'old'; let other: number = 0; ",
+            "let values: number[] = []; ",
+            "const object = { write(): void { value = 1; value; }, ",
+            "append(): void { values.push(1); } }; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(202_940);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let declaration = captured_variable(&parsed, file, "value");
+        let symbol = bound.symbol(declaration).unwrap();
+        let other = bound
+            .symbol(captured_variable(&parsed, file, "other"))
+            .unwrap();
+        let syntax = captured_assignment_syntax(&parsed, file);
+        let [(statement, expression, target)] = syntax.as_slice() else {
+            panic!("expected one captured write");
+        };
+        let (statement, expression, target) = (*statement, *expression, *target);
+        let writer = bound.flow_container(target).unwrap();
+        let owner = bound.symbol(writer).unwrap();
+        let local = plan_source_captured_local(context.store(), &host, writer, target, symbol)
+            .unwrap()
+            .unwrap();
+        assert_eq!(local.declaration(), declaration);
+        assert_eq!(local.writing_callable(), writer);
+        assert_eq!(
+            local.declaring_callable(),
+            bound.container(declaration).unwrap()
+        );
+        let NodeData::MethodDeclaration(method) = &parsed.arena.get(writer.node).unwrap().data
+        else {
+            panic!("expected the real object method");
+        };
+        let NodeData::Block(block) = &parsed.arena.get(method.body.unwrap()).unwrap().data else {
+            panic!("expected the method block");
+        };
+        let points = block
+            .statements
+            .nodes
+            .iter()
+            .map(|node| NodeRef::new(writer.arena, file, *node))
+            .collect::<Vec<_>>();
+        let [before, after] = points.as_slice() else {
+            panic!("expected the write and following read");
+        };
+        assert_eq!(*before, statement);
+        let assignment = SourceFlowCapturedAssignment {
+            statement,
+            expression,
+            local,
+        };
+        let plan = SourceFlowPlan::preflight_linear_with_captured_effects(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            writer,
+            points.clone(),
+            [],
+            [],
+            [],
+            [],
+            [assignment],
+            [],
+        )
+        .unwrap();
+        assert_eq!(plan.start_payload, Some(writer));
+        assert_eq!(plan.end, bound.flow_graph().container_end(writer));
+        assert!(plan.assignment_declarations.is_empty());
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (input, number) = (bootstrap.string_or_number_type, bootstrap.number_type);
+        let outer = [(symbol, input), (other, number)]
+            .into_iter()
+            .collect::<SourceFlowTypes>();
+        for _ in 0..2 {
+            let mut frame = plan
+                .frame_with_captured_locals(context.store(), &host, &bound, outer.clone())
+                .unwrap();
+            assert_eq!(
+                frame
+                    .snapshot_at(context.store_mut_for_test(), &globals, statement)
+                    .unwrap()
+                    .types(),
+                &outer
+            );
+            assert_eq!(
+                frame.snapshot_at(context.store_mut_for_test(), &globals, *after),
+                Err(SourceFlowInvariant::PendingAssignment(target).into())
+            );
+            frame.complete_assignment(target, symbol, number).unwrap();
+            let result = frame
+                .snapshot_at(context.store_mut_for_test(), &globals, *after)
+                .unwrap();
+            assert_eq!(result.type_of(symbol), Some(number));
+            assert_eq!(result.type_of(other), Some(number));
+            assert_eq!(outer.get(&symbol), Some(&input));
+        }
+        let reject = |store: &CanonicalTypeMapperStore| {
+            let before = format!("{store:?}");
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_source_captured_local(store, &host, &local),
+                    Err(SourceFlowInvariant::InvalidCapturedLocal(target).into())
+                );
+                assert!(
+                    matches!(plan.frame_with_captured_locals(store, &host, &bound, outer.clone()),
+                    Err(SourceFlowError::Invariant(SourceFlowInvariant::InvalidCapturedLocal(node))) if node == target)
+                );
+                assert_eq!(format!("{store:?}"), before);
+            }
+        };
+        let store = context.store_mut_for_test();
+        let parent = store.symbol(owner).unwrap().parent().unwrap();
+        let name = store.symbol(owner).unwrap().name().to_owned();
+        let members = store.symbol(parent).unwrap().members().unwrap();
+        let flags = store.symbol(owner).unwrap().flags();
+        let checks = store.symbol(owner).unwrap().check_flags();
+        for warm in [false, true] {
+            if warm {
+                assert!(store.set_symbol_node_links(
+                    target,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(symbol)
+                    }
+                ));
+            }
+            assert_eq!(validate_source_captured_local(store, &host, &local), Ok(()));
+            assert!(store.set_symbol_relationships(owner, None, None, None, None));
+            reject(store);
+            assert!(store.set_symbol_relationships(owner, None, None, Some(parent), None));
+            assert_eq!(validate_source_captured_local(store, &host, &local), Ok(()));
+            assert!(store.set_symbol_flags(owner, SymbolFlags::PROPERTY, checks));
+            reject(store);
+            assert!(store.set_symbol_flags(owner, flags, checks));
+            assert_eq!(validate_source_captured_local(store, &host, &local), Ok(()));
+            assert_eq!(
+                store.insert_symbol(members, name.clone(), other),
+                Some(Some(owner))
+            );
+            reject(store);
+            assert_eq!(
+                store.insert_symbol(members, name.clone(), owner),
+                Some(Some(other))
+            );
+            assert_eq!(validate_source_captured_local(store, &host, &local), Ok(()));
+        }
+        assert!(store.set_symbol_node_links(
+            target,
+            SymbolNodeLinks {
+                resolved_symbol: Some(other)
+            }
+        ));
+        reject(store);
+        assert!(store.set_symbol_node_links(
+            target,
+            SymbolNodeLinks {
+                resolved_symbol: Some(symbol)
+            }
+        ));
+        assert_eq!(validate_source_captured_local(store, &host, &local), Ok(()));
+        assert!(
+            plan.frame_with_captured_locals(store, &host, &bound, outer.clone())
+                .is_ok()
+        );
+        for (index, mut changed) in [local; 3].into_iter().enumerate() {
+            match index {
+                0 => changed.annotation = declaration,
+                1 => changed.symbol = other,
+                2 => changed.writing_callable = local.declaring_callable,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                validate_source_captured_local(store, &host, &changed),
+                Err(SourceFlowInvariant::InvalidCapturedLocal(target).into())
+            );
+        }
+        let values = captured_variable(&parsed, file, "values");
+        let values_symbol = bound.symbol(values).unwrap();
+        let (call, receiver) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::CallExpression(call) = &record.data else {
+                    return None;
+                };
+                let NodeData::PropertyAccessExpression(property) =
+                    &parsed.arena.get(call.expression)?.data
+                else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(writer.arena, file, node),
+                    NodeRef::new(writer.arena, file, property.expression),
+                ))
+            })
+            .unwrap();
+        let append = bound.flow_container(receiver).unwrap();
+        assert_ne!(append, writer);
+        let captured = plan_source_captured_local(store, &host, append, receiver, values_symbol)
+            .unwrap()
+            .unwrap();
+        let origin = SourceCapturedFlowOrigin::ArrayMutation(SourceFlowCapturedArrayMutation {
+            mutation: SourceFlowArrayMutation {
+                call,
+                receiver,
+                declaration: values,
+                symbol: values_symbol,
+            },
+            local: captured,
+        });
+        let before = format!("{store:?}");
+        for _ in 0..2 {
+            assert_eq!(
+                validate_captured_flow_origin(&parsed.arena, &bound, store, &host, append, origin),
+                Err(SourceFlowInvariant::InvalidArrayMutation(call).into())
+            );
+            assert_eq!(format!("{store:?}"), before);
         }
     }
 

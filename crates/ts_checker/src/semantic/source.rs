@@ -15223,9 +15223,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         statement: NodeRef,
         expression: NodeRef,
     ) -> Result<Option<PlannedCapturedLocalAssignment>, SourceCheckError> {
-        if callable.family != SourceCallableFamily::ArrowFunction
-            || self.node(callable.declaration)?.kind != SyntaxKind::ArrowFunction
-        {
+        let expected_kind = match callable.family {
+            SourceCallableFamily::ArrowFunction => SyntaxKind::ArrowFunction,
+            SourceCallableFamily::ObjectLiteralMethod => SyntaxKind::MethodDeclaration,
+            _ => return Ok(None),
+        };
+        if self.node(callable.declaration)?.kind != expected_kind {
             return Ok(None);
         }
         let record = self.node(expression)?;
@@ -15270,6 +15273,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         .map_err(Self::variable_plan_error)?;
         if read.kind != PlannedIdentifierReadKind::Variable {
             return Err(Self::unsupported_function_body(callable));
+        }
+        if callable.family == SourceCallableFamily::ObjectLiteralMethod
+            && callable
+                .parameters
+                .iter()
+                .any(|parameter| parameter.symbol == read.value_symbol)
+        {
+            // The parameter assignment planner retains its own binding and flow proof.
+            return Ok(None);
         }
         let local = plan_source_captured_local(
             store,
