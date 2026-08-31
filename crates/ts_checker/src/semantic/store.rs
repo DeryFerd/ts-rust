@@ -23,7 +23,10 @@ use super::{
     alias_provider::{ProductionAliasSourceRegistry, SourceFileNamespaceWrapper},
     array_types::CanonicalArrayTargets,
     bootstrap::{CanonicalUnionCreationProof, IntrinsicBootstrap},
-    classes::{ClassInstanceSuperMember, ClassInstanceSuperView, SourceClassProvenance},
+    classes::{
+        ClassInstanceSuperMember, ClassInstanceSuperView, SourceClassAnnotationScope,
+        SourceClassProvenance,
+    },
     conditional_types::{
         ConditionalQueryKey, ConditionalQueryProduction, ConditionalTypeProduction,
     },
@@ -347,6 +350,7 @@ pub(super) enum UnresolvedTypeError {
 struct RelationReadObservations {
     types: HashSet<TypeId>,
     type_aliases: HashSet<TypeAliasId>,
+    type_alias_owners: HashSet<TypeId>,
     signatures: HashSet<SignatureId>,
     symbols: HashSet<SemanticSymbolId>,
     symbol_tables: HashSet<SymbolTableId>,
@@ -802,6 +806,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     mapped_index_recoveries: HashMap<IndexInfoId, MappedIndexRecovery>,
     source_mapped_lookup_requests: HashMap<TypeId, SourceMappedLookupRequest>,
     source_class_provenance: HashMap<TypeId, SourceClassProvenance>,
+    source_class_annotation_scopes: HashMap<TypeId, SourceClassAnnotationScope>,
     source_classes_by_symbol: HashMap<SemanticSymbolId, TypeId>,
     class_instance_super_views: HashMap<TypeId, ClassInstanceSuperView>,
     class_instance_super_views_by_instance: HashMap<TypeId, TypeId>,
@@ -865,6 +870,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     relation_cache_generation: u64,
     relation_observable_types: HashSet<TypeId>,
     relation_observable_type_aliases: HashSet<TypeAliasId>,
+    relation_observable_type_alias_owners: HashSet<TypeId>,
     relation_observable_signatures: HashSet<SignatureId>,
     relation_observable_symbols: HashSet<SemanticSymbolId>,
     relation_observable_symbol_tables: HashSet<SymbolTableId>,
@@ -987,6 +993,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             mapped_index_recoveries: HashMap::new(),
             source_mapped_lookup_requests: HashMap::new(),
             source_class_provenance: HashMap::new(),
+            source_class_annotation_scopes: HashMap::new(),
             source_classes_by_symbol: HashMap::new(),
             class_instance_super_views: HashMap::new(),
             class_instance_super_views_by_instance: HashMap::new(),
@@ -1035,6 +1042,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             relation_cache_generation: 0,
             relation_observable_types: HashSet::new(),
             relation_observable_type_aliases: HashSet::new(),
+            relation_observable_type_alias_owners: HashSet::new(),
             relation_observable_signatures: HashSet::new(),
             relation_observable_symbols: HashSet::new(),
             relation_observable_symbol_tables: HashSet::new(),
@@ -6833,7 +6841,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 && [previous, declared_type]
                     .into_iter()
                     .flatten()
-                    .any(|type_| self.relation_type_is_observable(type_)));
+                    .any(|type_| self.relation_observable_type_alias_owners.contains(&type_)));
         let dirty = self.type_alias_links(symbol).is_some_and(|current| {
             current != &TypeAliasLinks::default()
                 && current != &links
@@ -6876,12 +6884,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// at `type_`. This reverse edge is maintained atomically with
     /// [`Self::set_type_alias_links`] and is used to prove symmetric alias
     /// provenance for declared type-literal identities.
+    /// The owner set is observed separately from the unchanged type payload,
+    /// including when no alias owns the type yet.
     #[must_use]
     pub(super) fn type_alias_declared_type_owners(
         &self,
         type_: TypeId,
     ) -> Option<&HashSet<SemanticSymbolId>> {
-        self.observe_relation_type_read(type_);
+        self.observe_relation_type_alias_owners_read(type_);
         self.type_alias_declared_type_owners.get(&type_)
     }
 
@@ -7630,6 +7640,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     #[inline]
+    fn observe_relation_type_alias_owners_read(&self, type_: TypeId) {
+        self.with_relation_read_observations(|observed| {
+            observed.type_alias_owners.insert(type_);
+        });
+    }
+
+    #[inline]
     pub(super) fn observe_relation_signature_read(&self, signature: SignatureId) {
         self.with_relation_read_observations(|observed| {
             observed.signatures.insert(signature);
@@ -7751,6 +7768,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.relation_observable_types.extend(observed.types);
         self.relation_observable_type_aliases
             .extend(observed.type_aliases);
+        self.relation_observable_type_alias_owners
+            .extend(observed.type_alias_owners);
         self.relation_observable_signatures
             .extend(observed.signatures);
         self.relation_observable_symbols.extend(observed.symbols);
@@ -7772,6 +7791,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     fn clear_relation_observations(&mut self) {
         self.relation_observable_types.clear();
         self.relation_observable_type_aliases.clear();
+        self.relation_observable_type_alias_owners.clear();
         self.relation_observable_signatures.clear();
         self.relation_observable_symbols.clear();
         self.relation_observable_symbol_tables.clear();
@@ -12210,6 +12230,43 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .source_classes_by_symbol
                 .try_reserve(additional)
                 .is_ok()
+    }
+
+    pub(super) fn begin_source_class_annotation_scope(
+        &mut self,
+        instance: TypeId,
+        scope: SourceClassAnnotationScope,
+    ) -> bool {
+        if self.source_class_annotation_scopes.contains_key(&instance)
+            || self.source_class_annotation_scopes.try_reserve(1).is_err()
+        {
+            return false;
+        }
+        self.source_class_annotation_scopes.insert(instance, scope);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
+    pub(super) fn source_class_annotation_scope(
+        &self,
+        instance: TypeId,
+    ) -> Option<&SourceClassAnnotationScope> {
+        self.observe_relation_type_read(instance);
+        self.source_class_annotation_scopes.get(&instance)
+    }
+
+    pub(super) fn end_source_class_annotation_scope(&mut self, instance: TypeId) -> bool {
+        if self
+            .source_class_annotation_scopes
+            .remove(&instance)
+            .is_none()
+        {
+            return false;
+        }
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
     }
 
     pub(super) fn source_class_provenance(
@@ -17163,6 +17220,393 @@ mod tests {
                 .relation_cache_get(RelationKind::StrictSubtype, key),
             RelationComparisonResult::NONE
         );
+    }
+
+    const TUPLE_ALIAS_OBSERVATION_SOURCE: &str = concat!(
+        "interface Array<T> {} interface ReadonlyArray<T> {}\n",
+        "type Numeric = [number]; type Text = [string, boolean];\n",
+    );
+
+    struct TupleAliasObservationFixture<'arena> {
+        context: CanonicalCheckerContext<'arena>,
+        aliases: [crate::semantic::SemanticSymbolId; 2],
+        tuples: [crate::semantic::TypeId; 2],
+        key: CacheHashKey,
+    }
+
+    fn tuple_alias_observation_fixture(
+        parsed: &ts_parser::ParseResult,
+    ) -> TupleAliasObservationFixture<'_> {
+        use crate::semantic::relation::IntersectionState;
+
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_080);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/tuple-alias-observation.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let aliases: [(crate::semantic::SemanticSymbolId, NodeRef); 2] = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let declaration = NodeRef::new(parsed.arena.id(), file, node);
+                Some((
+                    binder.file(file).unwrap().symbol(declaration).unwrap(),
+                    NodeRef::new(parsed.arena.id(), file, alias.type_),
+                ))
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("the source has two tuple aliases");
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let tuples = aliases.map(|(_, node)| context.get_type_from_type_node(node).unwrap());
+        let aliases = aliases.map(|(symbol, _)| symbol);
+        for alias in aliases {
+            assert!(context.store().type_alias_links(alias).is_none());
+        }
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let expected = [
+            vec![bootstrap.number_type],
+            vec![bootstrap.string_type, bootstrap.boolean_type],
+        ];
+        for (tuple, arguments) in tuples.into_iter().zip(expected) {
+            let record = context.store().type_payload(tuple).unwrap();
+            let TypeData::TypeReference(reference) = record.data() else {
+                panic!("the tuple query must return a canonical reference")
+            };
+            assert_eq!(
+                reference.resolved_type_arguments.as_deref(),
+                Some(arguments.as_slice())
+            );
+            assert!(record.alias().is_none());
+        }
+        assert_eq!(
+            context.is_type_assignable_to(tuples[0], tuples[1]),
+            Ok(false)
+        );
+        let key = context
+            .store()
+            .relation_key_if_available(tuples[0], tuples[1], IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        assert_eq!(
+            context
+                .store()
+                .relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::FAILED
+        );
+        TupleAliasObservationFixture {
+            context,
+            aliases,
+            tuples,
+            key,
+        }
+    }
+
+    #[test]
+    fn source_tuple_alias_publication_preserves_payload_only_relations() {
+        let parsed = parse_source_file(TUPLE_ALIAS_OBSERVATION_SOURCE);
+        let TupleAliasObservationFixture {
+            mut context,
+            aliases,
+            tuples,
+            key,
+        } = tuple_alias_observation_fixture(&parsed);
+        let before = context.store().relation_state_snapshot();
+        let generation = context.store().relation_inputs_generation;
+        let type_count = context.store().type_len();
+        for tuple in tuples {
+            assert!(context.store().relation_type_is_observable(tuple));
+            assert!(
+                !context
+                    .store()
+                    .relation_observable_type_alias_owners
+                    .contains(&tuple)
+            );
+        }
+        for (alias, tuple) in aliases.into_iter().zip(tuples) {
+            assert!(context.store().type_alias_links(alias).is_none());
+            assert!(!context.store().relation_observable_symbols.contains(&alias));
+            assert_eq!(context.get_declared_type_of_symbol(alias), Ok(tuple));
+            assert_eq!(
+                context.store().type_alias_declared_type_owners(tuple),
+                Some(&HashSet::from([alias]))
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .relation_cache_get(RelationKind::Assignable, key),
+                RelationComparisonResult::FAILED
+            );
+            assert_eq!(context.store().relation_inputs_generation, generation);
+            assert_eq!(context.store().relation_cache_generation, generation);
+            assert_eq!(context.store().relation_state_snapshot(), before);
+            assert_eq!(context.store().type_len(), type_count);
+        }
+        let links = context.store().checker_link_allocated_lengths();
+        for _ in 0..2 {
+            for (alias, tuple) in aliases.into_iter().zip(tuples) {
+                assert_eq!(context.get_declared_type_of_symbol(alias), Ok(tuple));
+            }
+            assert_eq!(
+                context.is_type_assignable_to(tuples[0], tuples[1]),
+                Ok(false)
+            );
+            assert_eq!(context.store().relation_state_snapshot(), before);
+            assert_eq!(context.store().relation_inputs_generation, generation);
+            assert_eq!(context.store().relation_cache_generation, generation);
+            assert_eq!(context.store().type_len(), type_count);
+            assert_eq!(context.store().checker_link_allocated_lengths(), links);
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn source_alias_owner_misses_commit_and_clear_with_relation_replacement() {
+        let parsed = parse_source_file(TUPLE_ALIAS_OBSERVATION_SOURCE);
+        let TupleAliasObservationFixture {
+            mut context,
+            aliases,
+            tuples,
+            key,
+        } = tuple_alias_observation_fixture(&parsed);
+        let store = context.store_mut_for_test();
+        let observation = store.begin_relation_read_observation().unwrap();
+        assert!(store.type_alias_declared_type_owners(tuples[0]).is_none());
+        assert!(store.relation_observable_type_alias_owners.is_empty());
+        assert_eq!(
+            store
+                .active_relation_read_observations
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .observations
+                .type_alias_owners,
+            HashSet::from([tuples[0]])
+        );
+        assert!(store.commit_relation_cache_writes(
+            observation,
+            RelationKind::Assignable,
+            [(key, RelationComparisonResult::FAILED)],
+        ));
+        assert!(!store.relation_read_observation_is_active());
+        assert_eq!(
+            store.relation_observable_type_alias_owners,
+            HashSet::from([tuples[0]])
+        );
+        let before = store.relation_state_snapshot();
+        let generation = store.relation_inputs_generation;
+
+        assert_eq!(
+            context.get_declared_type_of_symbol(aliases[0]),
+            Ok(tuples[0])
+        );
+        let store = context.store();
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+        assert_eq!(store.relation_inputs_generation, generation + 1);
+        assert_eq!(store.relation_cache_generation, generation);
+        assert_eq!(
+            context.get_declared_type_of_symbol(aliases[0]),
+            Ok(tuples[0])
+        );
+        assert_eq!(context.store().relation_inputs_generation, generation + 1);
+
+        assert_eq!(
+            context.is_type_assignable_to(tuples[0], tuples[1]),
+            Ok(false)
+        );
+        let store = context.store_mut_for_test();
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::FAILED
+        );
+        assert_eq!(store.relation_cache_generation, generation + 1);
+        assert!(store.relation_observable_type_alias_owners.is_empty());
+        assert!(!store.relation_observable_symbols.contains(&aliases[0]));
+        let replaced = store.relation_state_snapshot();
+        assert!(store.set_type_alias_links(aliases[0], TypeAliasLinks::default()));
+        assert!(store.type_alias_declared_type_owners(tuples[0]).is_none());
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::FAILED
+        );
+        assert_eq!(store.relation_inputs_generation, generation + 1);
+        assert_eq!(store.relation_state_snapshot(), replaced);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn source_alias_owner_changes_invalidate_both_ends_and_reject_foreign_links() {
+        let parsed = parse_source_file(TUPLE_ALIAS_OBSERVATION_SOURCE);
+        let foreign = tuple_alias_observation_fixture(&parsed);
+        for observed in 0..2 {
+            let TupleAliasObservationFixture {
+                mut context,
+                aliases,
+                tuples,
+                key,
+            } = tuple_alias_observation_fixture(&parsed);
+            for (alias, tuple) in aliases.into_iter().zip(tuples) {
+                assert_eq!(context.get_declared_type_of_symbol(alias), Ok(tuple));
+            }
+            let store = context.store_mut_for_test();
+            let observation = store.begin_relation_read_observation().unwrap();
+            assert_eq!(
+                store.type_alias_declared_type_owners(tuples[observed]),
+                Some(&HashSet::from([aliases[observed]]))
+            );
+            assert!(store.commit_relation_cache_writes(
+                observation,
+                RelationKind::Assignable,
+                [(key, RelationComparisonResult::FAILED)],
+            ));
+            let before = store.relation_state_snapshot();
+            let generation = store.relation_inputs_generation;
+            let owners = store.type_alias_declared_type_owners.clone();
+            let links = store.type_alias_links(aliases[0]).unwrap().clone();
+            assert!(store.set_type_alias_links(aliases[0], links.clone()));
+            for (alias, candidate) in [
+                (foreign.aliases[0], links.clone()),
+                (
+                    aliases[0],
+                    TypeAliasLinks {
+                        declared_type: Some(foreign.tuples[0]),
+                        ..links.clone()
+                    },
+                ),
+            ] {
+                assert!(!store.set_type_alias_links(alias, candidate));
+                assert_eq!(store.type_alias_links(aliases[0]), Some(&links));
+                assert_eq!(store.type_alias_declared_type_owners, owners);
+                assert_eq!(store.relation_inputs_generation, generation);
+                assert_eq!(store.relation_cache_generation, generation);
+                assert_eq!(store.relation_state_snapshot(), before);
+                assert_eq!(
+                    store.relation_cache_get(RelationKind::Assignable, key),
+                    RelationComparisonResult::FAILED
+                );
+            }
+            assert!(!store.relation_observable_symbols.contains(&aliases[0]));
+            assert!(store.set_type_alias_links(
+                aliases[0],
+                TypeAliasLinks {
+                    declared_type: Some(tuples[1]),
+                    ..links
+                }
+            ));
+            assert!(store.type_alias_declared_type_owners(tuples[0]).is_none());
+            assert_eq!(
+                store.type_alias_declared_type_owners(tuples[1]),
+                Some(&HashSet::from(aliases))
+            );
+            assert_eq!(
+                store.relation_cache_get(RelationKind::Assignable, key),
+                RelationComparisonResult::NONE
+            );
+            assert_eq!(store.relation_inputs_generation, generation + 1);
+            assert_eq!(store.relation_cache_generation, generation);
+            assert_eq!(store.relation_state_snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn source_alias_discard_keeps_payload_cache_and_observed_symbol_invalidation() {
+        let parsed = parse_source_file(TUPLE_ALIAS_OBSERVATION_SOURCE);
+        let TupleAliasObservationFixture {
+            mut context,
+            aliases,
+            tuples,
+            key,
+        } = tuple_alias_observation_fixture(&parsed);
+        let store = context.store_mut_for_test();
+        let before = store.relation_state_snapshot();
+        let generation = store.relation_inputs_generation;
+        let observation = store.begin_relation_read_observation().unwrap();
+        assert!(store.type_alias_declared_type_owners(tuples[0]).is_none());
+        assert!(store.type_alias_links(aliases[0]).is_none());
+        assert!(!store.commit_relation_cache_writes(observation, RelationKind::Assignable, []));
+        assert!(store.relation_read_observation_is_active());
+        assert!(store.relation_observable_type_alias_owners.is_empty());
+        assert!(!store.relation_observable_symbols.contains(&aliases[0]));
+        assert!(store.discard_relation_read_observation(observation));
+        assert!(!store.relation_read_observation_is_active());
+        assert!(!store.discard_relation_read_observation(observation));
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        assert_eq!(
+            context.get_declared_type_of_symbol(aliases[0]),
+            Ok(tuples[0])
+        );
+        let store = context.store_mut_for_test();
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::FAILED
+        );
+        assert_eq!(store.relation_inputs_generation, generation);
+        assert_eq!(store.relation_cache_generation, generation);
+        assert_eq!(store.relation_state_snapshot(), before);
+        let observation = store.begin_relation_read_observation().unwrap();
+        let links = store.type_alias_links(aliases[0]).unwrap().clone();
+        assert!(store.commit_relation_cache_writes(
+            observation,
+            RelationKind::Assignable,
+            [(key, RelationComparisonResult::FAILED)],
+        ));
+        assert!(store.relation_observable_type_alias_owners.is_empty());
+        assert!(store.relation_observable_symbols.contains(&aliases[0]));
+        assert!(store.set_type_alias_links(aliases[0], links.clone()));
+        assert_eq!(store.relation_inputs_generation, generation);
+        assert!(store.set_type_alias_links(
+            aliases[0],
+            TypeAliasLinks {
+                type_parameters: Some(Vec::new()),
+                ..links
+            }
+        ));
+        assert_eq!(
+            store.type_alias_declared_type_owners(tuples[0]),
+            Some(&HashSet::from([aliases[0]]))
+        );
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE
+        );
+        assert_eq!(store.relation_inputs_generation, generation + 1);
+        assert_eq!(store.relation_cache_generation, generation);
+        assert_eq!(store.relation_state_snapshot(), before);
     }
 
     #[test]

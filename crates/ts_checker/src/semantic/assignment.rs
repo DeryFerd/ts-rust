@@ -16,6 +16,7 @@
 //! authenticate the source declaration before admission. Nested JavaScript
 //! function-expando writes reuse their previously declared outer property.
 //! JavaScript object expandos retain the initializer's real assignment exports.
+//! Same-file own class fields retain their source receiver and assignment position.
 //! Name lookup follows the pinned lexical resolver and checker export/merge routing.
 //! Valid syntax outside that closure is a typed unsupported result; malformed AST,
 //! binder, or semantic-store provenance is an invariant failure.
@@ -47,6 +48,20 @@ pub(super) struct SimpleAssignmentPlan {
     pub right: NodeRef,
     pub target_symbol: SemanticSymbolId,
     pub target_type_node: Option<NodeRef>,
+}
+
+/// A direct top-level write whose receiver names one same-file source class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct OwnClassPropertyAssignmentPlan {
+    pub(super) statement: NodeRef,
+    pub(super) expression: NodeRef,
+    pub(super) left: NodeRef,
+    pub(super) right: NodeRef,
+    pub(super) receiver: NodeRef,
+    pub(super) receiver_symbol: SemanticSymbolId,
+    pub(super) class_symbol: SemanticSymbolId,
+    pub(super) class_declaration: NodeRef,
+    pub(super) side: super::classes::ClassPropertySide,
 }
 
 /// One binder-authenticated `CommonJS` export assignment.
@@ -331,6 +346,26 @@ pub(super) fn plan_simple_assignment(
         &HashSet::new(),
         statement,
     )
+}
+
+/// Selects class writes before the ordinary identifier-assignment boundary.
+pub(super) fn plan_own_class_property_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    statement: NodeRef,
+) -> Result<Option<OwnClassPropertyAssignmentPlan>, AssignmentPlanError> {
+    AssignmentPlanner {
+        arena,
+        bound,
+        store,
+        host,
+        ambient_targets: &HashSet::new(),
+        uninitialized_targets: &HashSet::new(),
+        mutable_targets: &HashSet::new(),
+    }
+    .plan_own_class_property_assignment(statement)
 }
 
 /// Authenticates one direct `CommonJS` export alias without changing checker state.
@@ -3537,6 +3572,221 @@ impl CommonJsAssignmentPlanner<'_> {
 }
 
 impl AssignmentPlanner<'_, '_> {
+    #[allow(clippy::too_many_lines)] // Prove the statement, receiver declaration, and actual class together.
+    fn plan_own_class_property_assignment(
+        &self,
+        statement: NodeRef,
+    ) -> Result<Option<OwnClassPropertyAssignmentPlan>, AssignmentPlanError> {
+        self.preflight_program()?;
+        if self
+            .bound
+            .source_facts()
+            .is_none_or(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
+        {
+            return Ok(None);
+        }
+        let statement_node = self.node(statement)?;
+        let NodeData::ExpressionStatement(statement_data) = &statement_node.data else {
+            return Ok(None);
+        };
+        let expression = self.reference(statement_data.expression);
+        let expression_node = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &expression_node.data else {
+            return Ok(None);
+        };
+        let left = self.reference(binary.left);
+        let NodeData::PropertyAccessExpression(access) = &self.node(left)?.data else {
+            return Ok(None);
+        };
+        let receiver = self.reference(access.expression);
+        let receiver_node = self.node(receiver)?;
+        let NodeData::Identifier(identifier) = &receiver_node.data else {
+            return Ok(None);
+        };
+        let operator = self.reference(binary.operator_token);
+        let operator_node = self.node(operator)?;
+        if operator_node.kind != SyntaxKind::EqualsToken {
+            return Ok(None);
+        }
+        if statement_node.kind != SyntaxKind::ExpressionStatement
+            || statement_node.flags.0 != 0
+            || statement_data.flow_node.is_some()
+        {
+            return Err(AssignmentInvariant::InvalidStatementShape(statement).into());
+        }
+        if statement_node.parent != Some(self.bound.source_file().node) {
+            return Ok(None);
+        }
+        let NodeData::SourceFile(source) = &self.node(self.bound.source_file())?.data else {
+            return Err(AssignmentInvariant::InvalidStatementShape(statement).into());
+        };
+        if !source.statements.nodes.contains(&statement.node) {
+            return Err(AssignmentInvariant::InvalidStatementShape(statement).into());
+        }
+        if expression_node.flags.0 != 0
+            || binary.symbol.is_some()
+            || binary.type_.is_some()
+            || binary.facts != 0
+            || binary.modifiers.is_some()
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonOrdinaryAssignment(expression),
+            ));
+        }
+        if operator_node.flags.0 != 0 || !matches!(operator_node.data, NodeData::Token(_)) {
+            return Err(AssignmentInvariant::InvalidOperatorToken(operator).into());
+        }
+        if receiver_node.flags.0 != 0 || identifier.flow_node.is_some() {
+            return Err(AssignmentInvariant::InvalidIdentifierShape(receiver).into());
+        }
+        let right = self.reference(binary.right);
+        self.require_parent(expression, Some(statement.node))?;
+        self.require_parent(left, Some(expression.node))?;
+        self.require_parent(right, Some(expression.node))?;
+        self.require_parent(operator, Some(expression.node))?;
+        self.require_parent(receiver, Some(left.node))?;
+        if self.is_assignment_expression(right)? {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::ChainedAssignment(right),
+            ));
+        }
+        let resolved = self.resolve(receiver, &identifier.text)?;
+        let routed = self.route_value_symbol(resolved)?;
+        if routed.redirect.is_some() || routed.export_local.is_some() {
+            return Ok(None);
+        }
+        let receiver_symbol = routed.target;
+        if let Some(cached) = self
+            .store
+            .symbol_node_links(receiver)
+            .and_then(|links| links.resolved_symbol)
+            && cached != receiver_symbol
+        {
+            return Err(AssignmentInvariant::ResolvedSymbolMismatch {
+                node: receiver,
+                expected: receiver_symbol,
+                actual: cached,
+            }
+            .into());
+        }
+        let owner = self
+            .store
+            .symbol(receiver_symbol)
+            .ok_or(AssignmentInvariant::InvalidSymbol(receiver_symbol))?;
+        let (class_symbol, side) = if owner.flags() == SymbolFlags::CLASS {
+            (receiver_symbol, super::classes::ClassPropertySide::Static)
+        } else {
+            if !matches!(
+                owner.flags(),
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE
+            ) {
+                return Ok(None);
+            }
+            let Some([declaration]) = owner.declarations() else {
+                return Ok(None);
+            };
+            if !declaration.is_for(receiver.arena, receiver.file) {
+                return Ok(None);
+            }
+            if owner.value_declaration() != Some(*declaration) {
+                return Err(AssignmentInvariant::InvalidSymbolShape(receiver_symbol).into());
+            }
+            self.validate_declaration_symbol(
+                receiver,
+                *declaration,
+                receiver_symbol,
+                None,
+                &identifier.text,
+            )?;
+            let variable_node = self.node(*declaration)?;
+            let NodeData::VariableDeclaration(variable) = &variable_node.data else {
+                return Ok(None);
+            };
+            if variable_node.range.end > statement_node.range.start {
+                return Ok(None);
+            }
+            let (name, meaning) = if let Some(annotation) = variable.type_ {
+                let annotation = self.reference(annotation);
+                self.require_parent(annotation, Some(declaration.node))?;
+                let NodeData::TypeReferenceNode(reference) = &self.node(annotation)?.data else {
+                    return Ok(None);
+                };
+                if reference.type_arguments.is_some() {
+                    return Ok(None);
+                }
+                let name = self.reference(reference.type_name);
+                self.require_parent(name, Some(annotation.node))?;
+                (name, SymbolFlags::TYPE)
+            } else if let Some(initializer) = variable.initializer {
+                let initializer = self.reference(initializer);
+                self.require_parent(initializer, Some(declaration.node))?;
+                let NodeData::NewExpression(construction) = &self.node(initializer)?.data else {
+                    return Ok(None);
+                };
+                if construction.type_arguments.is_some() {
+                    return Ok(None);
+                }
+                let name = self.reference(construction.expression);
+                self.require_parent(name, Some(initializer.node))?;
+                (name, SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE)
+            } else {
+                return Ok(None);
+            };
+            let NodeData::Identifier(identifier) = &self.node(name)?.data else {
+                return Ok(None);
+            };
+            let resolved = self.resolve_with_meaning(name, &identifier.text, meaning)?;
+            let routed = self.route_value_symbol(resolved)?;
+            if routed.redirect.is_some() || routed.export_local.is_some() {
+                return Ok(None);
+            }
+            (routed.target, super::classes::ClassPropertySide::Instance)
+        };
+        let owner = self
+            .store
+            .symbol(class_symbol)
+            .ok_or(AssignmentInvariant::InvalidSymbol(class_symbol))?;
+        if owner.flags() != SymbolFlags::CLASS || owner.parent().is_some() {
+            return Ok(None);
+        }
+        let Some([class_declaration]) = owner.declarations() else {
+            return Ok(None);
+        };
+        if !class_declaration.is_for(receiver.arena, receiver.file) {
+            return Ok(None);
+        }
+        let class_node = self.node(*class_declaration)?;
+        let NodeData::ClassDeclaration(class) = &class_node.data else {
+            return Err(AssignmentInvariant::InvalidSymbolShape(class_symbol).into());
+        };
+        if owner.value_declaration() != Some(*class_declaration)
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.export_symbol().is_some()
+            || self.bound.symbol(*class_declaration) != Some(class_symbol)
+            || self.store.get_merged_symbol(class_symbol) != Some(class_symbol)
+        {
+            return Err(AssignmentInvariant::InvalidSymbolShape(class_symbol).into());
+        }
+        if class_node.parent != Some(self.bound.source_file().node)
+            || class_node.range.end > statement_node.range.start
+            || class.type_parameters.is_some()
+            || class.heritage_clauses.is_some()
+        {
+            return Ok(None);
+        }
+        Ok(Some(OwnClassPropertyAssignmentPlan {
+            statement,
+            expression,
+            left,
+            right,
+            receiver,
+            receiver_symbol,
+            class_symbol,
+            class_declaration: *class_declaration,
+            side,
+        }))
+    }
+
     fn plan(&self, statement: NodeRef) -> Result<SimpleAssignmentPlan, AssignmentPlanError> {
         self.preflight_program()?;
         let statement_node = self.node(statement)?;
@@ -3779,6 +4029,15 @@ impl AssignmentPlanner<'_, '_> {
     }
 
     fn resolve(&self, left: NodeRef, name: &str) -> Result<SemanticSymbolId, AssignmentPlanError> {
+        self.resolve_with_meaning(left, name, SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE)
+    }
+
+    fn resolve_with_meaning(
+        &self,
+        left: NodeRef,
+        name: &str,
+        meaning: SymbolFlags,
+    ) -> Result<SemanticSymbolId, AssignmentPlanError> {
         let mut callback_host = self
             .host
             .name_resolver_host(self.store)
@@ -3793,7 +4052,7 @@ impl AssignmentPlanner<'_, '_> {
         match resolver.resolve(
             Some(CanonicalResolutionLocation::Bound(left)),
             name,
-            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            meaning,
             None,
             false,
             false,

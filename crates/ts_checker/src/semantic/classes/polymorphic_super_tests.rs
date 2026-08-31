@@ -71,7 +71,14 @@ fn class_polymorphic_super_pending_header_and_completed_class_share_the_referenc
     let derived = symbol(&context, "Derived");
     let bound = context.file(FILE).unwrap().1.clone();
     let host = host(&parsed, &bound);
-    let base_plan = plan_source_class_members(context.store(), &host, base).unwrap();
+    let type_context = ClassTypeQueryContext::new(context.global_types(), context.options());
+    let base_plan = plan_source_class_members_with_type_context(
+        context.store(),
+        &host,
+        base,
+        Some(&type_context),
+    )
+    .unwrap();
     let prepared_base =
         prepare_source_class_members(context.store_mut_for_test(), &host, &base_plan).unwrap();
     finish_source_class_members(
@@ -81,7 +88,13 @@ fn class_polymorphic_super_pending_header_and_completed_class_share_the_referenc
         &prepared_base,
     )
     .unwrap();
-    let plan = plan_source_class_members(context.store(), &host, derived).unwrap();
+    let plan = plan_source_class_members_with_type_context(
+        context.store(),
+        &host,
+        derived,
+        Some(&type_context),
+    )
+    .unwrap();
     let prepared =
         prepare_source_class_members(context.store_mut_for_test(), &host, &plan).unwrap();
     let access = prepared

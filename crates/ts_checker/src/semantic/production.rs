@@ -1604,6 +1604,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     /// options and global types. The operation
     /// preflights and reserves the entire graph before publishing a cold
     /// dependency or derived shell.
+    /// Source-body constructors retain their real headers without checking
+    /// field initializers or bodies.
     ///
     /// # Errors
     ///
@@ -1634,62 +1636,82 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             return Ok(members);
         }
         let type_context = ClassTypeQueryContext::new(global_types, *options);
-        let overload_plan = loop {
-            match super::classes::plan_source_constructor_overload_class(
-                store,
-                &host,
-                symbol,
-                Some(&type_context),
-            ) {
-                Ok(plan) => break plan,
-                Err(error) => {
-                    if !super::classes::prepare_source_constructor_overload_annotation(
+        super::classes::with_retained_source_class_annotation_scopes(
+            store,
+            &host,
+            &type_context,
+            symbol,
+            |store| {
+                let overload_plan = loop {
+                    match super::classes::plan_source_constructor_overload_class(
+                        store,
+                        &host,
+                        symbol,
+                        Some(&type_context),
+                    ) {
+                        Ok(plan) => break plan,
+                        Err(error) => {
+                            if !super::classes::prepare_source_constructor_overload_annotation(
+                                store,
+                                &host,
+                                global_types,
+                                *options,
+                                instantiation_session,
+                                diagnostics,
+                                symbol,
+                                error,
+                            )? {
+                                return Err(error);
+                            }
+                        }
+                    }
+                };
+                if let Some(plan) = overload_plan {
+                    return super::classes::prepare_source_class_constructor_header(
                         store,
                         &host,
                         global_types,
                         *options,
                         instantiation_session,
                         diagnostics,
-                        symbol,
-                        error,
-                    )? {
-                        return Err(error);
-                    }
+                        &plan,
+                    );
                 }
-            }
-        };
-        if let Some(plan) = overload_plan {
-            super::classes::prepare_source_class_members_with_type_queries(
-                store,
-                &host,
-                global_types,
-                *options,
-                instantiation_session,
-                diagnostics,
-                &plan,
-            )?;
-            return super::classes::source_class_constructor_overloads(store, &host, symbol)?
-                .map(|overloads| overloads.members)
-                .ok_or(super::classes::ClassError::Invariant(
-                    super::classes::ClassInvariant::InvalidConstructSignature(symbol),
-                ));
-        }
-        if let Some(members) = super::classes::completed_source_class_members(store, &host, symbol)?
-        {
-            return Ok(members);
-        }
-        if store.source_class_provenance_for_symbol(symbol).is_some() {
-            return Err(super::classes::ClassError::Invariant(
-                super::classes::ClassInvariant::InvalidInstanceMembers(symbol),
-            ));
-        }
-        let plan = plan_nongeneric_class_member_query_with_type_context(
-            store,
-            &host,
-            symbol,
-            Some(&type_context),
-        )?;
-        execute_nongeneric_class_member_query(store, &host, &plan)
+                if let Some(plan) = super::classes::plan_source_single_constructor_class(
+                    store,
+                    &host,
+                    symbol,
+                    Some(&type_context),
+                )? {
+                    return super::classes::prepare_source_class_constructor_header(
+                        store,
+                        &host,
+                        global_types,
+                        *options,
+                        instantiation_session,
+                        diagnostics,
+                        &plan,
+                    );
+                }
+                if let Some(members) =
+                    super::classes::completed_source_class_members(store, &host, symbol)?
+                {
+                    return Ok(members);
+                }
+                if store.source_class_provenance_for_symbol(symbol).is_some() {
+                    return Err(super::classes::ClassError::Invariant(
+                        super::classes::ClassInvariant::InvalidInstanceMembers(symbol),
+                    ));
+                }
+                let plan = plan_nongeneric_class_member_query_with_type_context(
+                    store,
+                    &host,
+                    symbol,
+                    Some(&type_context),
+                )?;
+                execute_nongeneric_class_member_query(store, &host, &plan)
+            },
+        )
     }
 
     /// Publishes or validates the exact type/value/member identities for one

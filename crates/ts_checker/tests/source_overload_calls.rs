@@ -5,9 +5,25 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, SignatureId, TypeData,
-    signatures::SignatureFlags,
+    signatures::SignatureFlags, type_records::StructuredTypeData,
 };
 use ts_parser::{ParseResult, parse_source_file};
+
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
+}
 
 fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
@@ -110,11 +126,13 @@ fn assert_failure_signature(
             .collect::<Vec<_>>();
         types.sort_unstable();
         types.dedup();
-        let type_ = links.resolved_type.unwrap();
+        let parameter_type = links.resolved_type.unwrap();
         if let [only] = types.as_slice() {
-            assert_eq!(type_, *only);
+            assert_eq!(parameter_type, *only);
         } else {
-            let TypeData::Union(union) = context.store().type_payload(type_).unwrap().data() else {
+            let TypeData::Union(union) =
+                context.store().type_payload(parameter_type).unwrap().data()
+            else {
                 panic!("the failure parameter must retain the real parameter union")
             };
             assert_eq!(union.union.types, types);
@@ -137,8 +155,7 @@ fn assert_failure_signature(
     let callee = NodeRef::new(call.arena, call.file, syntax.expression);
     let callable = context.get_type_at_location(callee).unwrap();
     let members = match context.store().type_payload(callable).unwrap().data() {
-        TypeData::Object(data) => &data.structured,
-        TypeData::Interface(data) => &data.reference.object.structured,
+        data @ (TypeData::Object(_) | TypeData::Interface(_)) => structured_data(data).unwrap(),
         _ => panic!("expected the source callable's structured type"),
     };
     assert_eq!(members.signatures.as_deref(), Some(visible.as_slice()));

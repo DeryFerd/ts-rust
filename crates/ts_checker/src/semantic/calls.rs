@@ -1162,7 +1162,7 @@ fn get_fixed_overload_failure_signature(
             }
         }
         let source = source.ok_or(DirectCallInvariant::InvalidSignature(first.signature))?;
-        let type_ = store
+        let reduced = store
             .expression_union_type_with_global_types_and_session(
                 global_types,
                 &types,
@@ -1170,7 +1170,7 @@ fn get_fixed_overload_failure_signature(
                 session,
             )
             .map_err(|error| overload_failure_type_error(callee, first.signature, error))?;
-        parameter_types.push((source, type_));
+        parameter_types.push((source, reduced));
     }
     if !store.try_reserve_signatures(1)
         || !store.try_reserve_checker_symbol_allocations(maximum, 0)
@@ -4719,6 +4719,7 @@ mod tests {
         let mut context = array_context(&parsed);
         let globals = context.global_types().clone();
         let strict = context.options().strict_function_types;
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
         let store = context.store_mut_for_test();
         let bootstrap = store.intrinsic_bootstrap().unwrap();
         let number = bootstrap.number_type;
@@ -4757,6 +4758,7 @@ mod tests {
                 strict,
                 request(callable.owner, &arguments),
                 &callable,
+                &mut session,
             )
             .unwrap();
             assert_eq!(checked.signature(), callable.signature);
@@ -4778,6 +4780,7 @@ mod tests {
         let mut context = array_context(&parsed);
         let globals = context.global_types().clone();
         let strict = context.options().strict_function_types;
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
         let store = context.store_mut_for_test();
         let number = store.intrinsic_bootstrap().unwrap().number_type;
         let callable = callable(store, SignatureFlags::NONE, &[number], 1, None);
@@ -4791,6 +4794,7 @@ mod tests {
                 strict,
                 request(callable.owner, &[foreign_type]),
                 &callable,
+                &mut session,
             ),
             Err(DirectCallError::Invariant(
                 DirectCallInvariant::InvalidArgumentType {

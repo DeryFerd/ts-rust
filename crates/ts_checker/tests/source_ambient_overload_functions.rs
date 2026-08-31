@@ -6,9 +6,26 @@ use ts_binder::{
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SourceCheckError,
     SymbolNodeLinks, TypeData, UnsupportedSourceSyntax,
+    type_records::StructuredTypeData,
     types::{ObjectFlags, TypeFlags},
 };
 use ts_parser::{ParseResult, parse_source_file};
+
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
+}
 
 fn checker_options() -> CanonicalCheckerOptions {
     CanonicalCheckerOptions {
@@ -487,7 +504,7 @@ fn failed_multi_overloads_keep_marked_recovery_out_of_public_candidates() {
         .get_type_at_location(call_callee(&parsed, file, *bad))
         .unwrap();
     let members = match context.store().type_payload(callable).unwrap().data() {
-        TypeData::Object(data) => &data.structured,
+        data @ TypeData::Object(_) => structured_data(data).unwrap(),
         _ => panic!("expected the source callable's structured type"),
     };
     assert_eq!(members.signatures.as_deref(), Some(visible.as_slice()));

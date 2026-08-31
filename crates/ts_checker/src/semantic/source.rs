@@ -56,6 +56,8 @@
 //! binder-authenticated `CommonJS` exports, function or arrow expandos, and
 //! authenticated class or JavaScript function-alias prototype members,
 //! including writes through previously declared JavaScript function expandos.
+//! Own source-class fields accept direct top-level writes. Later direct reads
+//! use the source file's checked assignments without changing declared field types.
 //! Option-gated unused-local, unused-parameter, and unused-import diagnostics
 //! run after complete source value and reference publication.
 //! The complete source tree and complete supported-statement plan are validated
@@ -286,15 +288,17 @@ use super::{
         prepare_source_overload_publication, publish_source_overload_batch,
     },
     source_properties::{
-        CheckedClassPropertyWriteTarget, ClassAccessContext, SourceClassPropertyWritePlan,
-        SourcePropertyDiagnostic, SourcePropertyError, SourcePropertyPlan,
-        SourcePropertyQueryError, SourcePropertyUnsupported, attach_class_access_context,
-        check_class_property_write_target, check_class_receiver,
+        CheckedClassPropertyWriteTarget, ClassAccessContext, OwnClassPropertyWritePlan,
+        SourceClassPropertyWritePlan, SourcePropertyDiagnostic, SourcePropertyError,
+        SourcePropertyPlan, SourcePropertyQueryError, SourcePropertyUnsupported,
+        attach_class_access_context, check_class_property_write_target, check_class_receiver,
         check_direct_source_property_with_class_context_and_session,
         check_direct_source_property_with_session, check_direct_source_property_with_source,
+        check_own_class_property_flow_read, check_own_class_property_write_target,
         finish_direct_source_property_plan, plan_class_access_context, plan_class_property_write,
         plan_direct_source_property_call_syntax, plan_direct_source_property_syntax,
-        prepare_source_property_diagnostic, source_property_type_for_effects,
+        plan_own_class_property_write, prepare_source_property_diagnostic,
+        source_property_type_for_effects,
     },
     source_statements::{
         SourceCapturedBlockLoopSyntax, SourceCapturedIterationBodySyntax,
@@ -1032,6 +1036,7 @@ struct PreparedSourceTypeImportValueUse {
 struct SourceTypeImportExecution<'a> {
     value_uses: HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
     annotation_capabilities: &'a HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+    property_flow: super::source_flow::OwnClassPropertyFlow,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1362,6 +1367,7 @@ enum PlannedClassStatement {
     Variables(Vec<PlannedVariable>),
     ObjectBinding(Box<PlannedClassObjectBinding>),
     ObjectAssignment(Box<PlannedClassObjectAssignment>),
+    PrivateObjectAssignment(Box<PlannedClassPrivateObjectAssignment>),
     PropertyWrite(Box<PlannedClassPropertyWrite>),
 }
 
@@ -1404,12 +1410,22 @@ struct PlannedClassPropertyWrite {
     value: PlannedExpression,
 }
 
+#[derive(Clone, Debug)]
+struct PlannedClassPrivateObjectAssignment {
+    statement: NodeRef,
+    expression: NodeRef,
+    parentheses: Vec<NodeRef>,
+    source: PlannedExpression,
+    writes: Vec<(SourceClassPropertyWritePlan, PlannedExpression)>,
+}
+
 /// Only the source executor can produce an executed property assignment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CheckedClassPropertyAssignment {
     target: CheckedClassPropertyWriteTarget,
     assigned_type: TypeId,
     flow_type: TypeId,
+    source: Option<super::source_properties::CheckedClassDestructuringSource>,
 }
 
 impl CheckedClassPropertyAssignment {
@@ -1423,6 +1439,29 @@ impl CheckedClassPropertyAssignment {
 
     pub(super) const fn flow_type(&self) -> TypeId {
         self.flow_type
+    }
+
+    pub(super) fn source_is_exact(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        require_result: bool,
+    ) -> bool {
+        match &self.source {
+            Some(source) => {
+                source.assigned_type() == self.assigned_type
+                    && source
+                        .validate(store, host, self.target.plan(), require_result)
+                        .is_ok()
+            }
+            None => {
+                self.target.plan().destructuring().is_none()
+                    && store
+                        .type_node_links(self.target.plan().node())
+                        .and_then(|links| links.resolved_type)
+                        == Some(self.assigned_type)
+            }
+        }
     }
 }
 
@@ -2078,6 +2117,13 @@ struct PlannedAssignment {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedOwnClassPropertyAssignment {
+    target: OwnClassPropertyWritePlan,
+    receiver: PlannedExpression,
+    right: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
 struct PlannedEvolvingArrayAssignment {
     expression: NodeRef,
     element: SourceElementPlan,
@@ -2426,6 +2472,7 @@ enum PlannedStatement {
     ArrayVariable(Box<PlannedArrayVariable>),
     ObjectVariable(Box<PlannedObjectVariable>),
     Assignment(PlannedAssignment),
+    OwnClassPropertyAssignment(Box<PlannedOwnClassPropertyAssignment>),
     EvolvingArrayAssignment(Box<PlannedEvolvingArrayAssignment>),
     CommonJsAssignment(PlannedCommonJsAssignment),
     JavaScriptRequireAlias(PlannedJavaScriptRequireAlias),
@@ -4847,6 +4894,31 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 right,
                             },
                         ));
+                        continue;
+                    }
+                    if let Some(assignment) = super::assignment::plan_own_class_property_assignment(
+                        self.arena, self.bound, store, host, statement,
+                    )
+                    .map_err(Self::assignment_plan_error)?
+                    {
+                        let target = plan_own_class_property_write(store, host, &assignment)
+                            .map_err(|error| Self::property_plan_error(assignment.left, error))?;
+                        let receiver = self.plan_expression(assignment.receiver)?;
+                        if !matches!(&receiver.kind, PlannedExpressionKind::Identifier(read)
+                            if read.value_symbol == assignment.receiver_symbol)
+                        {
+                            return Err(SourceCheckError::Property(assignment.left));
+                        }
+                        self.primitive_binary_position_roots
+                            .insert(assignment.right);
+                        let right = self.plan_expression(assignment.right)?;
+                        statements.push(PlannedStatement::OwnClassPropertyAssignment(Box::new(
+                            PlannedOwnClassPropertyAssignment {
+                                target,
+                                receiver,
+                                right,
+                            },
+                        )));
                         continue;
                     }
                     let assignment = if self.assignable_ambient_variables.is_empty()
@@ -9209,39 +9281,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
-    // The legacy single-parameter constructor plan cannot own local declarations.
     fn needs_early_source_constructor_plan(&self, members: &[ts_ast::NodeId]) -> bool {
-        members
-            .iter()
-            .filter(|member| {
-                self.arena
-                    .get(**member)
-                    .is_some_and(|record| record.kind == SyntaxKind::Constructor)
-            })
-            .count()
-            > 1
-            || members.iter().any(|member| {
-                let Some(NodeData::ConstructorDeclaration(constructor)) =
-                    self.arena.get(*member).map(|record| &record.data)
-                else {
-                    return false;
-                };
-                if constructor.parameters.nodes.len() != 1 {
-                    return false;
-                }
-                constructor
-                    .body
-                    .and_then(|body| self.arena.get(body))
-                    .is_some_and(|record| {
-                        matches!(&record.data, NodeData::Block(block)
-                        if block.statements.nodes.iter().any(|statement| {
-                            self.arena.get(*statement).is_some_and(|record| {
-                                record.kind == SyntaxKind::VariableStatement
-                                    && matches!(record.data, NodeData::VariableStatement(_))
-                            })
-                        }))
-                    })
-            })
+        super::classes::source_class_needs_early_constructor_plan(self.arena, members)
     }
 
     fn try_plan_source_class(
@@ -9497,6 +9538,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 if record.kind == SyntaxKind::ExpressionStatement && data.flow_node.is_none() =>
             {
                 let expression = self.reference(data.expression);
+                if let Some(assignment) =
+                    self.try_plan_class_private_object_assignment(expression, body)?
+                {
+                    return Ok(PlannedClassStatement::PrivateObjectAssignment(Box::new(
+                        assignment,
+                    )));
+                }
                 if let Some(assignment) = self.try_plan_class_object_assignment(expression, body)? {
                     return Ok(PlannedClassStatement::ObjectAssignment(Box::new(
                         assignment,
@@ -9783,6 +9831,109 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             binding,
             elements,
         })
+    }
+
+    fn try_plan_class_private_object_assignment(
+        &mut self,
+        mut expression: NodeRef,
+        body: &ClassBodyPlan,
+    ) -> Result<Option<PlannedClassPrivateObjectAssignment>, SourceCheckError> {
+        let mut parentheses = Vec::new();
+        while let NodeData::ParenthesizedExpression(parenthesized) = &self.node(expression)?.data {
+            let inner = self.reference(parenthesized.expression);
+            if self.node(expression)?.flags.0 != 0
+                || self.node(inner)?.parent != Some(expression.node)
+            {
+                return Err(SourceCheckError::Class(expression));
+            }
+            parentheses.push(expression);
+            expression = inner;
+        }
+        let NodeData::BinaryExpression(binary) = &self.node(expression)?.data else {
+            return Ok(None);
+        };
+        if self.node(self.reference(binary.operator_token))?.kind != SyntaxKind::EqualsToken {
+            return Ok(None);
+        }
+        let NodeData::ObjectLiteralExpression(object) =
+            &self.node(self.reference(binary.left))?.data
+        else {
+            return Ok(None);
+        };
+        let properties = object.properties.nodes.clone();
+        let source_node = self.reference(binary.right);
+        let private_target = |property| {
+            let NodeData::PropertyAssignment(property) = &self.arena.get(property)?.data else {
+                return None;
+            };
+            let NodeData::PropertyAccessExpression(access) =
+                &self.arena.get(property.initializer)?.data
+            else {
+                return None;
+            };
+            (self.arena.get(access.name)?.kind == SyntaxKind::PrivateIdentifier)
+                .then_some(self.reference(property.initializer))
+        };
+        if !properties
+            .iter()
+            .any(|property| private_target(*property).is_some())
+        {
+            return Ok(None);
+        }
+        // Other RHS forms need the assignment pattern's contextual type.
+        if self.node(source_node)?.kind != SyntaxKind::Identifier {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Class(source_node),
+            ));
+        }
+        let targets = properties
+            .iter()
+            .map(|property| {
+                private_target(*property).ok_or(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Class(self.reference(*property)),
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (store, host) = self.semantic.ok_or(SourceCheckError::Class(expression))?;
+        let plans = targets
+            .into_iter()
+            .map(|target| {
+                let plan = super::source_properties::plan_class_destructuring_property_write(
+                    store, host, target,
+                )
+                .map_err(|error| Self::property_plan_error(target, error))?;
+                if plan.node() != expression
+                    || plan.value() != source_node
+                    || plan.context().body_declaration() != body.declaration
+                    || plan.context().class_symbol() != body.class_symbol
+                {
+                    return Err(SourceCheckError::Class(target));
+                }
+                Ok(plan)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let statement = plans
+            .first()
+            .ok_or(SourceCheckError::Class(expression))?
+            .statement();
+        if plans.iter().any(|plan| plan.statement() != statement) {
+            return Err(SourceCheckError::Class(expression));
+        }
+        let source = self.plan_expression(source_node)?;
+        self.preflight_class_body_expression(&source)?;
+        let mut writes = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let receiver = self.plan_expression(plan.receiver())?;
+            self.preflight_class_body_expression(&receiver)?;
+            writes.push((plan, receiver));
+        }
+        Ok(Some(PlannedClassPrivateObjectAssignment {
+            statement,
+            expression,
+            parentheses,
+            source,
+            writes,
+        }))
     }
 
     fn try_plan_class_object_assignment(
@@ -23522,6 +23673,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         .set_promise_executor(executor)
                         .map_err(|error| Self::new_plan_error(expression, error))?;
                 }
+                if let Some(nodes) = construction
+                    .expression_argument_nodes()
+                    .map(<[NodeRef]>::to_vec)
+                {
+                    let arguments = nodes
+                        .into_iter()
+                        .map(|argument| {
+                            self.primitive_binary_position_roots.insert(argument);
+                            self.plan_expression(argument)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    construction
+                        .set_expression_arguments(arguments)
+                        .map_err(|error| Self::new_plan_error(expression, error))?;
+                }
                 self.default_news.push(construction.clone());
                 Ok(PlannedExpression::new(
                     expression,
@@ -27960,7 +28126,7 @@ fn class_expression_nodes(
 fn class_source_annotation_nodes(
     class: &PlannedSourceClass,
 ) -> Result<Vec<NodeRef>, SourceCheckError> {
-    let mut annotations = Vec::new();
+    let mut annotations = class.source.annotation_nodes().to_vec();
     for body in class.source.bodies() {
         annotations.extend(body.return_annotation);
         annotations.extend(
@@ -28013,6 +28179,10 @@ fn class_source_annotation_nodes(
             PlannedClassStatement::ObjectAssignment(assignment) => {
                 expressions.push(&assignment.receiver);
                 expressions.extend(assignment.elements.iter().map(|(_, target, _)| target));
+            }
+            PlannedClassStatement::PrivateObjectAssignment(assignment) => {
+                expressions.push(&assignment.source);
+                expressions.extend(assignment.writes.iter().map(|(_, receiver)| receiver));
             }
             PlannedClassStatement::PropertyWrite(write) => {
                 expressions.extend([&write.receiver, &write.value]);
@@ -28138,6 +28308,14 @@ fn collect_class_statement_flow(
                 for (_, target, flow) in &assignment.elements {
                     expressions.push(target);
                     local_assignments.push(*flow);
+                }
+            }
+            PlannedClassStatement::PrivateObjectAssignment(assignment) => {
+                points.push(assignment.statement);
+                expressions.push(&assignment.source);
+                for (plan, receiver) in &assignment.writes {
+                    points.push(plan.target());
+                    expressions.push(receiver);
                 }
             }
         }
@@ -28363,6 +28541,14 @@ fn collect_eager_logical_truthiness_conditions(
                 pending.push(&conditional.condition);
             }
             PlannedExpressionKind::Template(template) => pending.extend(&template.substitutions),
+            PlannedExpressionKind::New(construction) => {
+                pending.extend(
+                    construction
+                        .checked_expression_arguments()
+                        .into_iter()
+                        .flatten(),
+                );
+            }
             PlannedExpressionKind::Null
             | PlannedExpressionKind::String(_)
             | PlannedExpressionKind::RegularExpression(_)
@@ -28374,14 +28560,18 @@ fn collect_eager_logical_truthiness_conditions(
             | PlannedExpressionKind::ClassReceiver(_)
             | PlannedExpressionKind::TypeImportValueUse(_)
             | PlannedExpressionKind::ImportMeta(_)
-            | PlannedExpressionKind::Arrow(_)
-            | PlannedExpressionKind::New(_) => {}
+            | PlannedExpressionKind::Arrow(_) => {}
         }
     }
 }
 
 fn expression_has_deferred_object_members(expression: &PlannedExpression) -> bool {
     match &expression.kind {
+        PlannedExpressionKind::New(construction) => construction
+            .checked_expression_arguments()
+            .into_iter()
+            .flatten()
+            .any(expression_has_deferred_object_members),
         PlannedExpressionKind::Object { plan, properties } => {
             !plan.object_literal_getters.is_empty()
                 || properties
@@ -28923,7 +29113,9 @@ fn preflight_inferred_function_return_dependencies(
             PlannedExpressionKind::TypeImportValueUse(_)
             | PlannedExpressionKind::ClassReceiver(_)
             | PlannedExpressionKind::SuperCall(_) => false,
-            PlannedExpressionKind::New(construction) => construction.requires_early_preparation(),
+            PlannedExpressionKind::New(construction) => construction.requires_early_preparation()
+                && construction.checked_expression_arguments().into_iter().flatten()
+                    .all(|argument| expression_is_closed(argument, parameters, locals, functions)),
             PlannedExpressionKind::Parenthesized(inner) if expression.awaited => {
                 match &inner.kind {
                     PlannedExpressionKind::Identifier(read)
@@ -31319,6 +31511,21 @@ fn emit_uninitialized_variable_read_diagnostics(
     expression: &PlannedExpression,
 ) -> Result<(), SourceCheckError> {
     match &expression.kind {
+        PlannedExpressionKind::New(construction) => {
+            for argument in construction
+                .checked_expression_arguments()
+                .into_iter()
+                .flatten()
+            {
+                emit_uninitialized_variable_read_diagnostics(
+                    store,
+                    host,
+                    current_flow_types,
+                    diagnostics,
+                    argument,
+                )?;
+            }
+        }
         PlannedExpressionKind::Identifier(read) if expression.used_before_assignment => {
             let type_ =
                 *current_flow_types
@@ -31520,8 +31727,7 @@ fn emit_uninitialized_variable_read_diagnostics(
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::ClassReceiver(_)
         | PlannedExpressionKind::TypeImportValueUse(_)
-        | PlannedExpressionKind::Arrow(_)
-        | PlannedExpressionKind::New(_) => {}
+        | PlannedExpressionKind::Arrow(_) => {}
     }
     Ok(())
 }
@@ -33327,22 +33533,35 @@ fn check_expression_type_with_capture_context(
                 class_flow.as_deref_mut(),
                 arrow_capture,
             )?;
-            let checked = check_direct_source_property_with_source(
+            let checked = if let Some(checked) = check_own_class_property_flow_read(
                 store,
                 host,
-                global_types,
                 options,
                 property,
                 receiver.result,
-                session,
-                diagnostics,
+                &type_import_execution.property_flow,
             )
-            .map_err(|error| match error {
-                SourcePropertyQueryError::Property(error) => {
-                    SourcePlanner::property_plan_error(expression.node, error)
-                }
-                SourcePropertyQueryError::Source(error) => error,
-            })?;
+            .map_err(|error| SourcePlanner::property_plan_error(expression.node, error))?
+            {
+                checked
+            } else {
+                check_direct_source_property_with_source(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    property,
+                    receiver.result,
+                    session,
+                    diagnostics,
+                )
+                .map_err(|error| match error {
+                    SourcePropertyQueryError::Property(error) => {
+                        SourcePlanner::property_plan_error(expression.node, error)
+                    }
+                    SourcePropertyQueryError::Source(error) => error,
+                })?
+            };
             for diagnostic in checked.diagnostics {
                 publish_or_defer_class_property_diagnostic(
                     store,
@@ -33391,6 +33610,15 @@ fn check_expression_type_with_capture_context(
                 class_flow.as_deref_mut(),
                 arrow_capture,
             )?;
+            if type_import_execution
+                .property_flow
+                .has_unproved_element_read(store, host, options, element)
+                .map_err(|error| class_body_flow_error(element.node, error))?
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Element(element.node),
+                ));
+            }
             let mut demanded = HashSet::new();
             let checked = loop {
                 match check_direct_source_element_with_source::<SourceElementReadError>(
@@ -34023,6 +34251,80 @@ fn check_expression_type_with_capture_context(
         PlannedExpressionKind::New(construction) => {
             preflight_direct_default_new(store, host, construction)
                 .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+            if let Some(arguments) = construction.checked_expression_arguments() {
+                let mut argument_types = Vec::with_capacity(arguments.len());
+                for (index, argument) in arguments.iter().enumerate() {
+                    let contextual = if matches!(
+                        argument.unparenthesized().kind,
+                        PlannedExpressionKind::Array(_)
+                            | PlannedExpressionKind::Object { .. }
+                            | PlannedExpressionKind::Arrow(_)
+                            | PlannedExpressionKind::Template(_)
+                    ) {
+                        super::source_new::source_class_constructor_argument_contextual_type(
+                            store,
+                            host,
+                            global_types,
+                            construction,
+                            index,
+                        )
+                        .map_err(|error| {
+                            SourcePlanner::new_plan_error(construction.node(), error)
+                        })?
+                    } else {
+                        None
+                    };
+                    argument_types.push(
+                        check_expression_type_with_capture_context(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            current_flow_types,
+                            type_import_execution,
+                            argument,
+                            contextual,
+                            deferred,
+                            class_flow.as_deref_mut(),
+                            arrow_capture,
+                        )?
+                        .result,
+                    );
+                }
+                let (checked, resolution) = super::source_new::check_source_class_expression_new(
+                    store,
+                    host,
+                    global_types,
+                    options.strict_function_types,
+                    session,
+                    construction,
+                    &argument_types,
+                )
+                .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+                let call_diagnostics =
+                    super::source_calls::prepare_source_constructor_argument_diagnostics(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        construction.node(),
+                        arguments,
+                        &argument_types,
+                        &resolution,
+                    )?;
+                for diagnostic in call_diagnostics {
+                    merge_retry_diagnostic(diagnostics, diagnostic);
+                }
+                return Ok(CheckedExpressionTypes::leaf(
+                    checked.instance_type,
+                    checked.instance_type,
+                ));
+            }
             if let Some(executor) = construction.promise_executor() {
                 let contextual = construction
                     .promise_executor_contextual_type(store)
@@ -35093,222 +35395,259 @@ fn check_planned_source_class(
     if class.bodies.len() != class.source.bodies().len() {
         return Err(SourceCheckError::Class(declaration));
     }
-    let prepared = prepare_source_class_members_with_type_queries(
-        store,
-        host,
-        global_types,
-        options,
-        session,
-        diagnostics,
-        &class.source,
-    )
-    .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
-    let value_type = store
-        .value_symbol_links(class.source.symbol())
-        .and_then(|links| links.resolved_type)
-        .ok_or(SourceCheckError::Class(declaration))?;
-    let mut base_flow_types = flow_types.clone();
-    if base_flow_types
-        .insert(class.source.symbol(), value_type)
-        .is_some()
-    {
-        return Err(SourceCheckError::Class(declaration));
-    }
-    let mut state = ClassBodyExecutionState {
-        class,
-        prepared: &prepared,
-        base_flow_types,
-        type_import_capabilities,
-        active: HashSet::new(),
-        checked: HashSet::new(),
-        body_diagnostics: HashMap::new(),
-        uninitialized_properties: None,
-        value_types: HashMap::new(),
-        value_order: Vec::new(),
-    };
-    let initializer_bodies =
-        (0..class.bodies.len()).filter(|index| class.bodies[*index].initializer.is_some());
-    let statement_bodies =
-        (0..class.bodies.len()).filter(|index| class.bodies[*index].initializer.is_none());
-    for index in initializer_bodies.chain(statement_bodies) {
-        check_planned_class_body(
+    let scope =
+        super::classes::begin_source_class_annotations(store, host, global_types, &class.source)
+            .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
+    let result = (|| {
+        for &annotation in class.source.annotation_nodes() {
+            session.reset_query();
+            let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .get_type_from_source_class_annotation(annotation, class.source.symbol())?;
+            publish_expression_type(store, annotation, type_)?;
+        }
+        let prepared = prepare_source_class_members_with_type_queries(
             store,
             host,
             global_types,
-            source,
             options,
             session,
-            type_import_execution,
-            deferred,
-            &mut state,
-            index,
-        )?;
-    }
-    let members = finish_source_class_members(store, host, &class.source, &prepared)
+            diagnostics,
+            &class.source,
+        )
         .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
-    let mut overload_diagnostics = super::classes::check_source_class_method_overloads(
-        store,
-        host,
-        global_types,
-        options,
-        session,
-        &prepared,
-    )?
-    .into_iter()
-    .collect::<HashMap<_, _>>();
-    if let Some(overloads) =
-        super::classes::source_class_constructor_overloads(store, host, class.source.symbol())
-            .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?
-        && let Some(incompatible) = super::source_overloads::first_incompatible_source_overload(
-            store,
-            global_types,
-            options.strict_function_types,
-            session,
-            &overloads.implementation,
-            &overloads.signatures,
-        )?
-    {
-        let overload = store
-            .signature(incompatible)
-            .and_then(super::signatures::Signature::declaration)
+        let value_type = store
+            .value_symbol_links(class.source.symbol())
+            .and_then(|links| links.resolved_type)
             .ok_or(SourceCheckError::Class(declaration))?;
-        let implementation = store
-            .signature(overloads.implementation.signature)
-            .and_then(super::signatures::Signature::declaration)
-            .ok_or(SourceCheckError::Class(declaration))?;
-        if !class.source.bodies().iter().any(|body| {
-            body.kind == ClassBodyKind::Constructor && body.declaration == implementation
-        }) {
-            return Err(SourceCheckError::Class(implementation));
-        }
-        if overload_diagnostics
-            .insert(
-                implementation,
-                CanonicalCheckerDiagnostic {
-                    node: Some(overload),
-                    range_override: None,
-                    diagnostic: Diagnostic::new(
-                        message_by_code(2394).ok_or(SourceCheckError::MissingDiagnostic(2394))?,
-                    ),
-                    related_information: vec![CanonicalCheckerRelatedInformation {
-                        node: Some(implementation),
-                        diagnostic: Diagnostic::new(
-                            message_by_code(2750)
-                                .ok_or(SourceCheckError::MissingDiagnostic(2750))?,
-                        ),
-                    }],
-                },
-            )
+        let mut base_flow_types = flow_types.clone();
+        if base_flow_types
+            .insert(class.source.symbol(), value_type)
             .is_some()
         {
-            return Err(SourceCheckError::Class(implementation));
+            return Err(SourceCheckError::Class(declaration));
         }
-    }
-    check_class_heritage_compatibility(
-        store,
-        host,
-        global_types,
-        options,
-        diagnostics,
-        declaration,
-        &members,
-    )?;
-    check_class_implementation_compatibility(
-        store,
-        host,
-        global_types,
-        options,
-        diagnostics,
-        session,
-        declaration,
-        &members,
-    )?;
-    for body in class.source.bodies() {
-        if let Some(diagnostic) = overload_diagnostics.remove(&body.declaration) {
-            merge_retry_diagnostic(diagnostics, diagnostic);
+        let mut state = ClassBodyExecutionState {
+            class,
+            prepared: &prepared,
+            base_flow_types,
+            type_import_capabilities,
+            active: HashSet::new(),
+            checked: HashSet::new(),
+            body_diagnostics: HashMap::new(),
+            uninitialized_properties: None,
+            value_types: HashMap::new(),
+            value_order: Vec::new(),
+        };
+        let initializer_bodies =
+            (0..class.bodies.len()).filter(|index| class.bodies[*index].initializer.is_some());
+        let statement_bodies =
+            (0..class.bodies.len()).filter(|index| class.bodies[*index].initializer.is_none());
+        for index in initializer_bodies.chain(statement_bodies) {
+            check_planned_class_body(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                type_import_execution,
+                deferred,
+                &mut state,
+                index,
+            )?;
         }
-        let checked = state
-            .body_diagnostics
-            .remove(&body.declaration)
-            .ok_or(SourceCheckError::Class(body.declaration))?;
-        // Property messages can name this class only after all bodies are complete.
-        let rendered_count = checked.rendered.len();
-        let mut rendered = checked.rendered.into_vec().into_iter();
-        let mut properties = checked.properties.into_iter().peekable();
-        for index in 0..=rendered_count {
-            while properties
-                .peek()
-                .is_some_and(|property| property.rendered_before == index)
-            {
-                let property = properties.next().expect("the next property was checked");
-                let diagnostic = prepare_source_property_diagnostic(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    &property.diagnostic,
+        let members = finish_source_class_members(store, host, &class.source, &prepared)
+            .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
+        let mut overload_diagnostics = super::classes::check_source_class_method_overloads(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            &prepared,
+        )?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        if let Some(overloads) =
+            super::classes::source_class_constructor_overloads(store, host, class.source.symbol())
+                .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?
+            && let Some(incompatible) = super::source_overloads::first_incompatible_source_overload(
+                store,
+                global_types,
+                options.strict_function_types,
+                session,
+                &overloads.implementation,
+                &overloads.signatures,
+            )?
+        {
+            let overload = store
+                .signature(incompatible)
+                .and_then(super::signatures::Signature::declaration)
+                .ok_or(SourceCheckError::Class(declaration))?;
+            let implementation = store
+                .signature(overloads.implementation.signature)
+                .and_then(super::signatures::Signature::declaration)
+                .ok_or(SourceCheckError::Class(declaration))?;
+            if !class.source.bodies().iter().any(|body| {
+                body.kind == ClassBodyKind::Constructor && body.declaration == implementation
+            }) {
+                return Err(SourceCheckError::Class(implementation));
+            }
+            if overload_diagnostics
+                .insert(
+                    implementation,
+                    CanonicalCheckerDiagnostic {
+                        node: Some(overload),
+                        range_override: None,
+                        diagnostic: Diagnostic::new(
+                            message_by_code(2394)
+                                .ok_or(SourceCheckError::MissingDiagnostic(2394))?,
+                        ),
+                        related_information: vec![CanonicalCheckerRelatedInformation {
+                            node: Some(implementation),
+                            diagnostic: Diagnostic::new(
+                                message_by_code(2750)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(2750))?,
+                            ),
+                        }],
+                    },
                 )
-                .map_err(|error| SourcePlanner::property_plan_error(property.node, error))?;
-                merge_retry_diagnostic(diagnostics, diagnostic);
-            }
-            if let Some(diagnostic) = rendered.next() {
-                merge_retry_diagnostic(diagnostics, diagnostic);
+                .is_some()
+            {
+                return Err(SourceCheckError::Class(implementation));
             }
         }
-        if properties.next().is_some() {
-            return Err(SourceCheckError::Class(body.declaration));
+        check_class_heritage_compatibility(
+            store,
+            host,
+            global_types,
+            options,
+            diagnostics,
+            declaration,
+            &members,
+        )?;
+        check_class_implementation_compatibility(
+            store,
+            host,
+            global_types,
+            options,
+            diagnostics,
+            session,
+            declaration,
+            &members,
+        )?;
+        for body in class.source.bodies() {
+            if let Some(diagnostic) = overload_diagnostics.remove(&body.declaration) {
+                merge_retry_diagnostic(diagnostics, diagnostic);
+            }
+            let checked = state
+                .body_diagnostics
+                .remove(&body.declaration)
+                .ok_or(SourceCheckError::Class(body.declaration))?;
+            // Property messages can name this class only after all bodies are complete.
+            let rendered_count = checked.rendered.len();
+            let mut rendered = checked.rendered.into_vec().into_iter();
+            let mut properties = checked.properties.into_iter().peekable();
+            for index in 0..=rendered_count {
+                while properties
+                    .peek()
+                    .is_some_and(|property| property.rendered_before == index)
+                {
+                    let property = properties.next().expect("the next property was checked");
+                    let diagnostic = prepare_source_property_diagnostic(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        &property.diagnostic,
+                    )
+                    .map_err(|error| SourcePlanner::property_plan_error(property.node, error))?;
+                    merge_retry_diagnostic(diagnostics, diagnostic);
+                }
+                if let Some(diagnostic) = rendered.next() {
+                    merge_retry_diagnostic(diagnostics, diagnostic);
+                }
+            }
+            if properties.next().is_some() {
+                return Err(SourceCheckError::Class(body.declaration));
+            }
         }
-    }
-    if !overload_diagnostics.is_empty() {
+        if !overload_diagnostics.is_empty() {
+            return Err(SourceCheckError::Class(declaration));
+        }
+        let uninitialized = match state.uninitialized_properties {
+            Some(properties) => properties,
+            None if !class
+                .source
+                .bodies()
+                .iter()
+                .any(|body| matches!(body.kind, ClassBodyKind::Constructor)) =>
+            {
+                class_uninitialized_properties(store, host, options, &class.source, None)?
+            }
+            None => return Err(SourceCheckError::Class(declaration)),
+        };
+        for name in uninitialized {
+            let name_text = match host.node(name).map(|record| &record.data) {
+                Some(NodeData::Identifier(name)) => &name.text,
+                Some(NodeData::PrivateIdentifier(name)) => &name.text,
+                _ => return Err(SourceCheckError::Class(name)),
+            };
+            merge_retry_diagnostic(
+                diagnostics,
+                CanonicalCheckerDiagnostic {
+                    node: Some(name),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(2564).ok_or(SourceCheckError::MissingDiagnostic(2564))?,
+                        [name_text.clone()],
+                    ),
+                    related_information: Vec::new(),
+                },
+            );
+        }
+        for symbol in &state.value_order {
+            let type_ = state
+                .value_types
+                .get(symbol)
+                .copied()
+                .ok_or(SourceCheckError::Class(declaration))?;
+            stage_value_type(store, staged_value_types, value_order, *symbol, type_)?;
+        }
+        super::classes::check_class_index_constraints(
+            store,
+            host,
+            global_types,
+            options,
+            &members,
+            diagnostics,
+        )?;
+        Ok(members)
+    })();
+    if let Some(scope) = scope
+        && !store.end_source_class_annotation_scope(scope)
+    {
         return Err(SourceCheckError::Class(declaration));
     }
-    let uninitialized = match state.uninitialized_properties {
-        Some(properties) => properties,
-        None if !class
-            .source
-            .bodies()
-            .iter()
-            .any(|body| matches!(body.kind, ClassBodyKind::Constructor)) =>
-        {
-            class_uninitialized_properties(store, host, options, &class.source, None)?
-        }
-        None => return Err(SourceCheckError::Class(declaration)),
-    };
-    for name in uninitialized {
-        let name_text = match host.node(name).map(|record| &record.data) {
-            Some(NodeData::Identifier(name)) => &name.text,
-            Some(NodeData::PrivateIdentifier(name)) => &name.text,
-            _ => return Err(SourceCheckError::Class(name)),
-        };
-        merge_retry_diagnostic(
-            diagnostics,
-            CanonicalCheckerDiagnostic {
-                node: Some(name),
-                range_override: None,
-                diagnostic: Diagnostic::with_arguments(
-                    message_by_code(2564).ok_or(SourceCheckError::MissingDiagnostic(2564))?,
-                    [name_text.clone()],
-                ),
-                related_information: Vec::new(),
-            },
-        );
+    let members = result?;
+    // A completed class must pass normal checks without the active owner scope.
+    for &annotation in class.source.annotation_nodes() {
+        super::type_nodes::preflight_source_class_annotation(
+            store,
+            host,
+            global_types,
+            options.into(),
+            annotation,
+            class.source.symbol(),
+        )?;
     }
-    for symbol in &state.value_order {
-        let type_ = state
-            .value_types
-            .get(symbol)
-            .copied()
-            .ok_or(SourceCheckError::Class(declaration))?;
-        stage_value_type(store, staged_value_types, value_order, *symbol, type_)?;
-    }
-    super::classes::check_class_index_constraints(
-        store,
-        host,
-        global_types,
-        options,
-        &members,
-        diagnostics,
-    )?;
     Ok(members)
 }
 
@@ -35443,15 +35782,19 @@ fn check_planned_class_body(
             .return_annotation
             .map(|annotation| {
                 session.reset_query();
-                CanonicalTypeQuery::new_with_global_types_and_session(
+                let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
                     store,
                     host,
                     global_types,
                     options,
                     session,
                     diagnostics,
-                )?
-                .get_type_from_type_node(annotation)
+                )?;
+                if class.source.annotation_nodes().contains(&annotation) {
+                    query.get_type_from_source_class_annotation(annotation, class.source.symbol())
+                } else {
+                    query.get_type_from_type_node(annotation)
+                }
                 .map_err(SourceCheckError::from)
             })
             .transpose()?;
@@ -35517,6 +35860,40 @@ fn check_planned_class_body(
                 } else {
                     widened_fresh_literal_union_type(store, global_types, type_)?
                 };
+                if options.no_implicit_any
+                    && store.type_payload(type_).is_some_and(|record| {
+                        record.flags().intersects(TypeFlags::NULLABLE)
+                            && record
+                                .object_flags()
+                                .contains(ObjectFlags::CONTAINS_WIDENING_TYPE)
+                    })
+                {
+                    let Some(NodeData::PropertyDeclaration(property)) =
+                        host.node(body.declaration).map(|record| &record.data)
+                    else {
+                        return Err(SourceCheckError::Class(body.declaration));
+                    };
+                    let name =
+                        NodeRef::new(body.declaration.arena, body.declaration.file, property.name);
+                    let name_text = match host.node(name).map(|record| &record.data) {
+                        Some(NodeData::Identifier(identifier)) => &identifier.text,
+                        Some(NodeData::PrivateIdentifier(identifier)) => &identifier.text,
+                        _ => return Err(SourceCheckError::Class(name)),
+                    };
+                    merge_retry_diagnostic(
+                        diagnostics,
+                        CanonicalCheckerDiagnostic {
+                            node: Some(name),
+                            range_override: None,
+                            diagnostic: Diagnostic::with_arguments(
+                                message_by_code(7008)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(7008))?,
+                                [name_text.as_str(), "any"],
+                            ),
+                            related_information: Vec::new(),
+                        },
+                    );
+                }
                 store.get_widened_type_with_global_types(type_, global_types)?
             };
             Some(type_)
@@ -35749,6 +36126,11 @@ fn class_statement_expressions(statement: &PlannedClassStatement) -> Vec<&Planne
         PlannedClassStatement::ObjectAssignment(assignment) => {
             std::iter::once(&assignment.receiver)
                 .chain(assignment.elements.iter().map(|(_, target, _)| target))
+                .collect()
+        }
+        PlannedClassStatement::PrivateObjectAssignment(assignment) => {
+            std::iter::once(&assignment.source)
+                .chain(assignment.writes.iter().map(|(_, receiver)| receiver))
                 .collect()
         }
         PlannedClassStatement::Block(statements) => statements
@@ -36282,6 +36664,7 @@ fn check_class_statements(
                     target,
                     assigned_type: assignment.assigned_type,
                     flow_type,
+                    source: None,
                 };
                 context
                     .flow
@@ -36490,6 +36873,21 @@ fn check_class_statements(
                     publish_expression_type(store, *parenthesis, receiver.result)?;
                 }
             }
+            PlannedClassStatement::PrivateObjectAssignment(assignment) => {
+                check_class_private_object_assignment(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    type_import_execution,
+                    deferred,
+                    context,
+                    assignment,
+                )?;
+            }
             PlannedClassStatement::Variables(variables) => {
                 for variable in variables {
                     let PlannedVariableInitializer::Expression(initializer) = &variable.initializer
@@ -36588,6 +36986,205 @@ fn check_class_statements(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_class_private_object_assignment(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    context: &mut ClassBodyExecutionContext<'_, '_, '_>,
+    assignment: &PlannedClassPrivateObjectAssignment,
+) -> Result<(), SourceCheckError> {
+    let snapshot = context
+        .flow
+        .snapshot_at(store, global_types, assignment.statement)
+        .map_err(|error| class_body_flow_error(assignment.statement, error))?;
+    let value = check_expression_type_with_class_context(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        snapshot.types(),
+        type_import_execution,
+        &assignment.source,
+        None,
+        deferred,
+        Some(&mut *context),
+    )?;
+    let arrays = CanonicalArrayTargets::from_global_types(global_types);
+    super::source_properties::validate_class_destructuring_source_type(
+        store,
+        assignment.source.node,
+        value.result,
+        arrays,
+    )
+    .map_err(|error| SourcePlanner::property_plan_error(assignment.source.node, error))?;
+    for (plan, receiver) in &assignment.writes {
+        context
+            .flow
+            .preflight_property_assignment(store, host, plan)
+            .map_err(|error| class_body_flow_error(plan.target(), error))?;
+        let projection = plan
+            .destructuring()
+            .ok_or(SourceCheckError::Class(plan.target()))?;
+        if projection.source() != assignment.source.node {
+            return Err(SourceCheckError::Class(plan.target()));
+        }
+        let property = super::object_members::resolve_object_property_by_key_with_source(
+            store,
+            host,
+            global_types,
+            options,
+            value.result,
+            ts_binder::EscapedNameRef::source(projection.name()),
+            session,
+            diagnostics,
+        )?
+        .ok_or_else(|| {
+            SourcePlanner::property_plan_error(
+                projection.property(),
+                SourcePropertyError::Unsupported(SourcePropertyUnsupported::MissingOwnProperty {
+                    node: projection.property(),
+                    receiver_type: value.result,
+                }),
+            )
+        })?;
+        let selected = super::source_properties::CheckedClassDestructuringSource::new(
+            store,
+            host,
+            plan,
+            value.result,
+            property,
+            arrays,
+        )
+        .map_err(|error| SourcePlanner::property_plan_error(plan.target(), error))?;
+        let assigned_type = selected.assigned_type();
+        let snapshot = context
+            .flow
+            .snapshot_at(store, global_types, receiver.node)
+            .map_err(|error| class_body_flow_error(receiver.node, error))?;
+        let receiver = check_expression_type_with_class_context(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            snapshot.types(),
+            type_import_execution,
+            receiver,
+            None,
+            deferred,
+            Some(&mut *context),
+        )?;
+        let target = super::source_properties::check_class_property_write_target(
+            store,
+            host,
+            global_types,
+            options,
+            plan,
+            receiver.result,
+            context.flow.access_token(),
+        )
+        .map_err(|error| SourcePlanner::property_plan_error(plan.target(), error))?;
+        for diagnostic in super::source_properties::class_property_write_diagnostics(
+            store,
+            host,
+            &target,
+            receiver.result,
+        )
+        .map_err(|error| SourcePlanner::property_plan_error(plan.target(), error))?
+        {
+            publish_or_defer_class_property_diagnostic(
+                store,
+                host,
+                global_types,
+                options,
+                diagnostics,
+                plan.target(),
+                diagnostic,
+                Some(&mut *context),
+            )?;
+        }
+        let diagnostic_start = diagnostics.len();
+        if !source_type_is_assignable_to(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            assigned_type,
+            target.write_type(),
+        )? {
+            let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                store,
+                host,
+                global_types,
+                assigned_type,
+                target.write_type(),
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            )?;
+            merge_retry_diagnostic(
+                diagnostics,
+                CanonicalCheckerDiagnostic {
+                    node: Some(plan.target()),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+                        [display.source, display.target],
+                    ),
+                    related_information: Vec::new(),
+                },
+            );
+        }
+        rewrite_exact_optional_class_write_diagnostic(
+            store,
+            options,
+            &target,
+            assigned_type,
+            diagnostic_start,
+            diagnostics,
+        )?;
+        let flow_type = current_flow_type_after_assignment(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            CheckedAssignment {
+                declared_type: target.read_type(),
+                assigned_type,
+            },
+        )?;
+        let checked = CheckedClassPropertyAssignment {
+            target,
+            assigned_type,
+            flow_type,
+            source: Some(selected),
+        };
+        context
+            .flow
+            .complete_property_assignment(store, host, &checked)
+            .map_err(|error| class_body_flow_error(plan.target(), error))?;
+    }
+    publish_expression_type(store, assignment.expression, value.result)?;
+    for parenthesis in assignment.parentheses.iter().rev() {
+        publish_expression_type(store, *parenthesis, value.result)?;
     }
     Ok(())
 }
@@ -48287,6 +48884,116 @@ fn check_planned_return_branch(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // Validate the original binding plan before its flow boundary.
+fn own_class_property_binding_is_unproved(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    options: CanonicalCheckerOptions,
+    flow: &super::source_flow::OwnClassPropertyFlow,
+    variable: &PlannedObjectVariable,
+) -> Result<bool, SourceCheckError> {
+    let Some(receiver) = flow
+        .matching_receiver_symbol(store, host, variable.initializer.node)
+        .map_err(|error| class_body_flow_error(variable.pattern, error))?
+    else {
+        return Ok(false);
+    };
+    let invalid =
+        || SourceCheckError::Variable(VariableInvariant::InvalidBindingPattern(variable.pattern));
+    let mut affected = Vec::new();
+    for element in &variable.elements {
+        let binding = &element.binding;
+        let name = if let Some(parent) = binding.parent_properties.first() {
+            Some(parent.property_name.as_str())
+        } else if binding.rest {
+            continue;
+        } else if let Some(key) = binding.computed_key {
+            match &host.node(key).ok_or_else(invalid)?.data {
+                NodeData::StringLiteral(literal) => Some(literal.text.as_str()),
+                NodeData::NoSubstitutionTemplateLiteral(literal) => Some(literal.text.as_str()),
+                _ => None,
+            }
+        } else {
+            Some(binding.property_name.as_str())
+        };
+        if flow
+            .has_checked_reference(store, host, options, receiver, name)
+            .map_err(|error| class_body_flow_error(variable.pattern, error))?
+        {
+            affected.push(binding);
+        }
+    }
+    if affected.is_empty() {
+        return Ok(false);
+    }
+    let (arena, bound) = host.source(variable.pattern).ok_or_else(invalid)?;
+    let declaration = host
+        .node(variable.pattern)
+        .and_then(|node| node.parent)
+        .map(|node| NodeRef::new(variable.pattern.arena, variable.pattern.file, node))
+        .ok_or_else(invalid)?;
+    let record = host.node(declaration).ok_or_else(invalid)?;
+    let NodeData::VariableDeclaration(source) = &record.data else {
+        return Err(invalid());
+    };
+    if source.name != variable.pattern.node
+        || source
+            .initializer
+            .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            != Some(variable.initializer.node)
+        || source
+            .type_
+            .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            != variable.type_node
+    {
+        return Err(invalid());
+    }
+    let list = record.parent.ok_or_else(invalid)?;
+    let statement = arena
+        .get(list)
+        .and_then(|record| record.parent)
+        .ok_or_else(invalid)?;
+    let exported =
+        ts_binder::canonical_has_syntactic_modifier(arena, statement, SyntaxKind::ExportKeyword);
+    let replay = plan_top_level_object_binding_elements(
+        arena,
+        bound,
+        store,
+        declaration,
+        variable.binding,
+        exported,
+    )
+    .map_err(|_| invalid())?;
+    if replay.len() != variable.elements.len()
+        || replay
+            .iter()
+            .zip(&variable.elements)
+            .any(|(actual, planned)| actual != &planned.binding)
+    {
+        return Err(invalid());
+    }
+    if store
+        .type_node_links(variable.pattern)
+        .is_some_and(|links| links != &TypeNodeLinks::default())
+    {
+        return Err(invalid());
+    }
+    for binding in affected {
+        if store
+            .value_symbol_links(binding.symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+            || [binding.element, binding.name].iter().any(|&node| {
+                store
+                    .type_node_links(node)
+                    .is_some_and(|links| links != &TypeNodeLinks::default())
+            })
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(true)
+}
+
 fn current_flow_type_after_assignment(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -53222,6 +53929,12 @@ fn validate_getter_capture_entries(
             PlannedExpressionKind::Template(template) => pending.extend(&template.substitutions),
             PlannedExpressionKind::New(construction) => {
                 pending.extend(construction.promise_executor());
+                pending.extend(
+                    construction
+                        .checked_expression_arguments()
+                        .into_iter()
+                        .flatten(),
+                );
             }
             PlannedExpressionKind::ImportCall(import) => {
                 pending.extend(import.specifier.as_ref());
@@ -57426,9 +58139,14 @@ fn recover_deferred_constructor_class_order(
     diagnostics: &CanonicalCheckerDiagnostics,
     error: SourceCheckError,
 ) -> bool {
-    let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(failure)) = error else {
+    if !matches!(
+        error,
+        SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Class(_) | UnsupportedSourceSyntax::New(_)
+        )
+    ) {
         return false;
-    };
+    }
     let Some(facts) = bound.source_facts() else {
         return false;
     };
@@ -57621,7 +58339,16 @@ fn recover_deferred_constructor_class_order(
     let Ok(last_plan) = plan_nongeneric_class_member_query(store, host, last.symbol) else {
         return false;
     };
-    [first.declaration, field, constructor, annotation].contains(&failure)
+    let expected_failure = match error {
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(failure)) => {
+            [first.declaration, field, constructor, annotation].contains(&failure)
+        }
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(failure)) => {
+            failure == construction
+        }
+        _ => false,
+    };
+    expected_failure
         && first.symbol != middle.symbol
         && first.symbol != last.symbol
         && middle.symbol != last.symbol
@@ -62753,6 +63480,54 @@ fn prepare_source_class_parameter(
     Ok(true)
 }
 
+// A header query can leave valid self annotations before source bodies are checked.
+// Reopen only those real same-source owners for the existing preparation query.
+// Every owned scope closes before execution or an error returns to the caller.
+#[allow(clippy::too_many_arguments)] // Retains the existing source and query context.
+fn with_retained_class_annotation_scopes<T>(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    source: SourceFileRef,
+    owners: impl IntoIterator<Item = (NodeRef, SemanticSymbolId)>,
+    query: impl FnOnce(&mut CanonicalTypeMapperStore) -> Result<T, SourceCheckError>,
+) -> Result<T, SourceCheckError> {
+    let context = ClassTypeQueryContext::new(global_types, options);
+    let mut scopes = Vec::new();
+    let result = (|| {
+        for (node, symbol) in owners {
+            let Some(declaration) = store
+                .symbol(symbol)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+            else {
+                continue;
+            };
+            if !declaration.is_for(source.node_ref().arena, source.file()) {
+                continue;
+            }
+            scopes
+                .try_reserve(1)
+                .map_err(|_| SourceCheckError::Class(node))?;
+            if let Some(instance) = super::classes::begin_retained_source_class_annotations(
+                store, host, &context, symbol,
+            )
+            .map_err(|error| SourcePlanner::class_plan_error(node, error))?
+            {
+                scopes.push((node, instance));
+            }
+        }
+        query(store)
+    })();
+    let mut cleanup_error = None;
+    for (node, instance) in scopes.into_iter().rev() {
+        if !store.end_source_class_annotation_scope(instance) {
+            cleanup_error.get_or_insert(SourceCheckError::Class(node));
+        }
+    }
+    cleanup_error.map_or(result, Err)
+}
+
 /// Checks one already-retained source into context-owned private staging.
 #[allow(clippy::too_many_arguments)] // Mirrors the context-owned source execution boundary.
 pub(super) fn check_source_file(
@@ -62781,41 +63556,64 @@ pub(super) fn check_source_file(
     }
 
     let mut prepared_class_parameters = HashSet::new();
-    let plan = loop {
-        match SourcePlanner::new_semantic_with_global_types(
-            arena,
-            bound,
-            source,
-            store,
-            host,
-            global_types,
-            options,
-        )
-        .finish()
-        {
-            Ok(plan) => break plan,
-            Err(error) => {
-                if let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(annotation)) =
-                    error
-                    && !prepared_class_parameters.insert(annotation)
-                {
-                    return Err(error);
-                }
-                if !prepare_source_class_parameter(
-                    store,
-                    host,
-                    global_types,
-                    source,
-                    options,
-                    session,
-                    diagnostics,
-                    error,
-                )? {
-                    return Err(error);
+    let class_header_owners = host
+        .node(source.node_ref())
+        .and_then(|record| match &record.data {
+            NodeData::SourceFile(data) => Some(&data.statements.nodes),
+            _ => None,
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(|&node| {
+            let declaration = NodeRef::new(source.node_ref().arena, source.file(), node);
+            host.node(declaration)
+                .filter(|record| record.kind == SyntaxKind::ClassDeclaration)
+                .and_then(|_| bound.symbol(declaration))
+                .map(|symbol| (declaration, symbol))
+        });
+    let plan = with_retained_class_annotation_scopes(
+        store,
+        host,
+        global_types,
+        options,
+        source,
+        class_header_owners,
+        |store| loop {
+            match SourcePlanner::new_semantic_with_global_types(
+                arena,
+                bound,
+                source,
+                store,
+                host,
+                global_types,
+                options,
+            )
+            .finish()
+            {
+                Ok(plan) => break Ok(plan),
+                Err(error) => {
+                    if let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(annotation)) =
+                        error
+                        && !prepared_class_parameters.insert(annotation)
+                    {
+                        return Err(error);
+                    }
+                    if !prepare_source_class_parameter(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        error,
+                    )? {
+                        return Err(error);
+                    }
                 }
             }
-        }
-    };
+        },
+    )?;
     let SourceCheckPlan {
         statements,
         value_imports,
@@ -63672,25 +64470,47 @@ pub(super) fn check_source_file(
                 }
             }
             PlannedStatement::SourceClass(class) => {
-                for annotation in class_source_annotation_nodes(class)? {
-                    session.reset_query();
-                    CanonicalTypeQuery::new_with_global_types_and_session(
-                        store,
-                        host,
-                        global_types,
-                        options,
-                        session,
-                        &mut type_import_preflight_diagnostics,
-                    )?
-                    .with_type_reference_alias_targets(
-                        type_import_capabilities
-                            .get(&annotation)
-                            .map_or([].as_slice(), Vec::as_slice)
-                            .iter()
-                            .copied(),
-                    )?
-                    .preflight_type_from_type_node(annotation)?;
-                }
+                with_retained_class_annotation_scopes(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    source,
+                    [(class.source.declaration(), class.source.symbol())],
+                    |store| {
+                        for annotation in class_source_annotation_nodes(class)? {
+                            if class.source.annotation_nodes().contains(&annotation) {
+                                super::type_nodes::preflight_source_class_annotation(
+                                    store,
+                                    host,
+                                    global_types,
+                                    options.into(),
+                                    annotation,
+                                    class.source.symbol(),
+                                )?;
+                                continue;
+                            }
+                            session.reset_query();
+                            CanonicalTypeQuery::new_with_global_types_and_session(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                session,
+                                &mut type_import_preflight_diagnostics,
+                            )?
+                            .with_type_reference_alias_targets(
+                                type_import_capabilities
+                                    .get(&annotation)
+                                    .map_or([].as_slice(), Vec::as_slice)
+                                    .iter()
+                                    .copied(),
+                            )?
+                            .preflight_type_from_type_node(annotation)?;
+                        }
+                        Ok(())
+                    },
+                )?;
             }
             PlannedStatement::GenericInterface(interface) => {
                 for annotation in interface.property_type_nodes().chain(
@@ -64078,6 +64898,7 @@ pub(super) fn check_source_file(
     let mut type_import_execution = SourceTypeImportExecution {
         value_uses: HashMap::new(),
         annotation_capabilities: &type_import_capabilities,
+        property_flow: super::source_flow::OwnClassPropertyFlow::default(),
     };
     for read in &type_import_value_uses {
         if type_import_execution.value_uses.contains_key(&read.node) {
@@ -64497,16 +65318,28 @@ pub(super) fn check_source_file(
         .filter(|construction| construction.requires_early_preparation())
         .cloned()
         .collect::<Vec<_>>();
-    prepare_direct_default_news(
+    with_retained_class_annotation_scopes(
         store,
         host,
         global_types,
         options,
-        session,
-        diagnostics,
-        &early_default_news,
-    )
-    .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))?;
+        source,
+        early_default_news
+            .iter()
+            .map(|construction| (construction.node(), construction.resolved_symbol())),
+        |store| {
+            prepare_direct_default_news(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                &early_default_news,
+            )
+            .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))
+        },
+    )?;
 
     let materialized_overloads = materialize_source_overloads(
         store,
@@ -65256,16 +66089,28 @@ pub(super) fn check_source_file(
         inferred_function_diagnostics[index] = Some(function_diagnostics);
     }
 
-    prepare_direct_default_news(
+    with_retained_class_annotation_scopes(
         store,
         host,
         global_types,
         options,
-        session,
-        diagnostics,
-        &default_news,
-    )
-    .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))?;
+        source,
+        default_news
+            .iter()
+            .map(|construction| (construction.node(), construction.resolved_symbol())),
+        |store| {
+            prepare_direct_default_news(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                &default_news,
+            )
+            .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))
+        },
+    )?;
     for statement in statements {
         session.reset_query();
         match statement {
@@ -68421,6 +69266,33 @@ pub(super) fn check_source_file(
                     .transpose()?;
                 let initializer_flow_types =
                     circular_flow_types.as_ref().unwrap_or(&current_flow_types);
+                if own_class_property_binding_is_unproved(
+                    store,
+                    host,
+                    options,
+                    &type_import_execution.property_flow,
+                    &variable,
+                )? {
+                    check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        initializer_flow_types,
+                        &type_import_execution,
+                        &variable.initializer,
+                        None,
+                        &mut deferred,
+                    )?;
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Variable(VariableUnsupported::BindingPattern(
+                            variable.pattern,
+                        )),
+                    ));
+                }
                 let initializer = if let Some(type_node) = variable.type_node {
                     check_planned_assignment(
                         store,
@@ -68867,6 +69739,75 @@ pub(super) fn check_source_file(
                         ));
                     }
                 }
+            }
+            PlannedStatement::OwnClassPropertyAssignment(write) => {
+                let assignment = write.target.assignment();
+                let receiver = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &type_import_execution,
+                    &write.receiver,
+                    None,
+                    &mut deferred,
+                )?;
+                let target = check_own_class_property_write_target(
+                    store,
+                    host,
+                    options,
+                    &write.target,
+                    receiver.result,
+                )
+                .map_err(|error| SourcePlanner::property_plan_error(assignment.left, error))?;
+                if let Some(diagnostic) = target.diagnostic {
+                    merge_retry_diagnostic(diagnostics, diagnostic);
+                }
+                let checked = check_assignment_to_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &type_import_execution,
+                    &mut deferred,
+                    target.type_,
+                    None,
+                    &write.right,
+                    assignment.left,
+                    Some(assignment.expression),
+                )?;
+                let flow_type = current_flow_type_after_assignment(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    CheckedAssignment {
+                        declared_type: target.declared_type,
+                        assigned_type: checked.assigned_type,
+                    },
+                )?;
+                type_import_execution
+                    .property_flow
+                    .complete_assignment(
+                        store,
+                        host,
+                        options,
+                        &write.target,
+                        receiver.result,
+                        checked.assigned_type,
+                        flow_type,
+                    )
+                    .map_err(|error| class_body_flow_error(assignment.left, error))?;
             }
             PlannedStatement::Assignment(assignment) => {
                 let staged_declared_type = *top_level_declared_types
@@ -71938,6 +72879,168 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn source_class_header_retry_closes_prior_scope_when_later_header_is_damaged() {
+        let source = parsed(concat!(
+            "class First { next: First | null = null; constructor(value: First | null) {} }\n",
+            "class Second { next: Second | null = null; constructor(value: Second | null) {} }\n",
+        ));
+        let file = FileId::new(202_482);
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            strict_property_initialization: true,
+            no_implicit_any: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = context(&[(file, &source)], options);
+        let bound = context.file(file).unwrap().1.clone();
+        let declarations = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let [first, second] = declarations.as_slice() else {
+            unreachable!()
+        };
+        let owners = [
+            bound.symbol(*first).unwrap(),
+            bound.symbol(*second).unwrap(),
+        ];
+        let first_members = context.get_nongeneric_class_members(owners[0]).unwrap();
+        let second_members = context.get_nongeneric_class_members(owners[1]).unwrap();
+        let instances = [
+            first_members.shells().instance_type(),
+            second_members.shells().instance_type(),
+        ];
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let source_file = context.source_file(file).unwrap();
+        let before = observable_state(&context, file);
+        let mut entered = false;
+        with_retained_class_annotation_scopes(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            source_file,
+            [(*first, owners[0])],
+            |store| {
+                entered = true;
+                assert_eq!(
+                    super::super::classes::source_class_annotation_scope_targets(
+                        store,
+                        instances[0]
+                    ),
+                    Some(CanonicalArrayTargets::from_global_types(&globals))
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(entered);
+        assert_eq!(observable_state(&context, file), before);
+        let property = context
+            .store()
+            .symbol_table(second_members.instance_members().unwrap())
+            .unwrap()
+            .get_source("next")
+            .unwrap();
+        let declaration = context
+            .store()
+            .symbol(property)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let NodeData::PropertyDeclaration(property) =
+            &source.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let annotation = NodeRef::new(source.arena.id(), file, property.type_.unwrap());
+        let original = context.store().type_node_links(annotation).unwrap().clone();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let damaged = TypeNodeLinks {
+            resolved_type: Some(wrong),
+            ..TypeNodeLinks::default()
+        };
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(annotation, damaged.clone())
+        );
+        let retained = owners.map(|owner| {
+            context
+                .store()
+                .source_class_provenance_for_symbol(owner)
+                .unwrap()
+                .clone()
+        });
+        let poisoned = observable_state(&context, file);
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Class(*second))
+            );
+            assert_eq!(observable_state(&context, file), poisoned);
+            assert_eq!(context.store().type_node_links(annotation), Some(&damaged));
+            for (owner, instance, provenance) in [
+                (owners[0], instances[0], &retained[0]),
+                (owners[1], instances[1], &retained[1]),
+            ] {
+                assert!(
+                    context
+                        .store()
+                        .source_class_annotation_scope(instance)
+                        .is_none()
+                );
+                assert_eq!(
+                    context.store().source_class_provenance_for_symbol(owner),
+                    Some(provenance)
+                );
+            }
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(annotation, original)
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+        assert_eq!(
+            context.get_nongeneric_class_members(owners[0]).unwrap(),
+            first_members
+        );
+        assert_eq!(
+            context.get_nongeneric_class_members(owners[1]).unwrap(),
+            second_members
+        );
+        let completed = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), completed);
+        for instance in instances {
+            assert!(
+                context
+                    .store()
+                    .source_class_annotation_scope(instance)
+                    .is_none()
+            );
+        }
+    }
+
     fn context_with_declaration_facts(
         file: FileId,
         source: &ParseResult,
@@ -73450,6 +74553,7 @@ mod tests {
         let imports = SourceTypeImportExecution {
             value_uses: HashMap::new(),
             annotation_capabilities: &capabilities,
+            property_flow: super::super::source_flow::OwnClassPropertyFlow::default(),
         };
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
         let mut check = |context: &mut CanonicalCheckerContext<'_>,
@@ -82636,6 +83740,165 @@ mod tests {
     }
 
     #[test]
+    fn deferred_constructor_order_recovery_matches_only_the_actual_failure_node() {
+        let source = parsed(DEFERRED_CLASS_ORDER_SOURCE);
+        let file = FileId::new(11_760);
+        let context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let declaration = context
+            .store()
+            .symbol(global_symbol(&context, "bar"))
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .unwrap();
+        let NodeData::ClassDeclaration(class) = &source.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the retained owner is the first class")
+        };
+        let [field, constructor] = class.members.nodes.as_slice() else {
+            panic!("the retained class has its original field and constructor")
+        };
+        let field = NodeRef::new(source.arena.id(), file, *field);
+        let constructor = NodeRef::new(source.arena.id(), file, *constructor);
+        let NodeData::PropertyDeclaration(property) = &source.arena.get(field.node).unwrap().data
+        else {
+            panic!("the first member is the original annotated field")
+        };
+        let annotation = NodeRef::new(source.arena.id(), file, property.type_.unwrap());
+        let construction = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::NewExpression(new_expression) =
+            &source.arena.get(construction.node).unwrap().data
+        else {
+            panic!("the actual construction retains its expression")
+        };
+        let callee = NodeRef::new(source.arena.id(), file, new_expression.expression);
+        let recovers = |failure| {
+            recover_deferred_constructor_class_order(
+                &source.arena,
+                &bound,
+                &host,
+                context.store(),
+                context.diagnostics(),
+                SourceCheckError::Unsupported(failure),
+            )
+        };
+        let cold = observable_state(&context, file);
+
+        for anchor in [declaration, field, constructor, annotation] {
+            assert!(recovers(UnsupportedSourceSyntax::Class(anchor)));
+            assert!(!recovers(UnsupportedSourceSyntax::New(anchor)));
+        }
+        assert!(recovers(UnsupportedSourceSyntax::New(construction)));
+        assert!(!recovers(UnsupportedSourceSyntax::Class(construction)));
+        for anchor in [bound.source_file(), callee] {
+            assert!(!recovers(UnsupportedSourceSyntax::Class(anchor)));
+            assert!(!recovers(UnsupportedSourceSyntax::New(anchor)));
+        }
+        assert!(!recovers(UnsupportedSourceSyntax::Property(construction)));
+        assert_eq!(observable_state(&context, file), cold);
+        assert!(!is_type_checked(&context, file));
+        for name in ["bar", "baz", "foo"] {
+            let symbol = global_symbol(&context, name);
+            assert!(context.store().declared_type_links(symbol).is_none());
+            assert!(context.store().value_symbol_links(symbol).is_none());
+        }
+    }
+
+    #[test]
+    fn deferred_constructor_order_recovery_keeps_new_expression_caches_cold() {
+        let source = parsed(DEFERRED_CLASS_ORDER_SOURCE);
+        let file = FileId::new(11_761);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let construction = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let recovers = |context: &CanonicalCheckerContext<'_>| {
+            recover_deferred_constructor_class_order(
+                &source.arena,
+                &bound,
+                &host,
+                context.store(),
+                context.diagnostics(),
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(construction)),
+            )
+        };
+        let cold = observable_state(&context, file);
+        assert!(context.store().type_node_links(construction).is_none());
+        assert!(context.store().symbol_node_links(construction).is_none());
+        assert!(recovers(&context));
+        assert_eq!(observable_state(&context, file), cold);
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            construction,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+        assert!(!recovers(&context));
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(construction, TypeNodeLinks::default())
+        );
+        let restored = observable_state(&context, file);
+        assert!(recovers(&context));
+        assert_eq!(observable_state(&context, file), restored);
+
+        let target = global_symbol(&context, "foo");
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            construction,
+            SymbolNodeLinks {
+                resolved_symbol: Some(target),
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+        assert!(!recovers(&context));
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_symbol_node_links(construction, SymbolNodeLinks::default())
+        );
+        let restored = observable_state(&context, file);
+        assert!(recovers(&context));
+        assert_eq!(observable_state(&context, file), restored);
+        assert!(!is_type_checked(&context, file));
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
     fn class_order_recovery_rejects_unrelated_inheritance_and_constructor_shapes() {
         for (index, text) in [
             String::from("class A extends B {} class B {}"),
@@ -83398,15 +84661,16 @@ mod tests {
             let base = global_symbol(&context, "Super");
             let interface = global_symbol(&context, "Options");
             let cold = observable_state(&context, file);
+            let result = context.check_source_file(file);
 
             assert!(
                 matches!(
-                    context.check_source_file(file),
+                    result,
                     Err(SourceCheckError::Unsupported(
                         UnsupportedSourceSyntax::Class(_)
                     ))
                 ),
-                "{text}",
+                "{text}: {result:?}",
             );
             assert_eq!(observable_state(&context, file), cold, "{text}");
             for symbol in [owner, base, interface] {
@@ -121730,6 +122994,314 @@ class Foo2 {
     }
 
     #[test]
+    fn private_destructuring_rhs_contexts_remain_explicit_boundaries() {
+        for right in [
+            "{ value: 1, extra: 2 }",
+            "({ value: 1, extra: 2 })",
+            "true && { value: 1, extra: 2 }",
+        ] {
+            let source = parsed(&format!(
+                "class Model {{ #state: number = 0; update(): void {{ ({{ value: this.#state }} = {right}); }} }}"
+            ));
+            let file = FileId::new(202_944);
+            let context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let bound = context.file(file).unwrap().1;
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let right_node = source
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::BinaryExpression(binary) = &record.data else {
+                        return None;
+                    };
+                    matches!(
+                        source.arena.get(binary.left).unwrap().data,
+                        NodeData::ObjectLiteralExpression(_)
+                    )
+                    .then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        binary.right,
+                    ))
+                })
+                .unwrap();
+            let before = observable_state(&context, file);
+            for _ in 0..2 {
+                let result = SourcePlanner::new_semantic_with_global_types(
+                    &source.arena,
+                    bound,
+                    context.source_file(file).unwrap(),
+                    context.store(),
+                    &host,
+                    context.global_types(),
+                    context.options(),
+                )
+                .finish();
+                assert!(matches!(
+                    result,
+                    Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(node)))
+                        if node == right_node
+                ));
+                assert_eq!(observable_state(&context, file), before);
+            }
+        }
+    }
+
+    #[test]
+    fn private_destructuring_flow_keeps_projection_completion_and_object_results() {
+        let source = parsed(concat!(
+            "class Model { #state: number; constructor(value: number) { ",
+            "const source = { value }; ({ value: this.#state } = source); } }",
+        ));
+        let file = FileId::new(202_943);
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+            strict_property_initialization: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = context(&[(file, &source)], options);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let target_node = source
+            .arena
+            .iter()
+            .find_map(|(node, _)| {
+                let node = NodeRef::new(source.arena.id(), file, node);
+                super::super::source_properties::class_destructuring_write_assignment(&host, node)
+                    .map(|_| node)
+            })
+            .unwrap();
+        let write = super::super::source_properties::plan_class_destructuring_property_write(
+            context.store(),
+            &host,
+            target_node,
+        )
+        .unwrap();
+        assert!(bound.flow_at(write.statement()).is_some());
+        assert_eq!(
+            bound.flow_at(write.value()),
+            bound.flow_at(write.statement())
+        );
+        let class = super::super::classes::plan_source_class_members(
+            context.store(),
+            &host,
+            write.context().class_symbol(),
+        )
+        .unwrap();
+        let body = class
+            .bodies()
+            .iter()
+            .find(|body| matches!(body.kind, ClassBodyKind::Constructor))
+            .unwrap();
+        let prepared = super::super::classes::prepare_source_class_members(
+            context.store_mut_for_test(),
+            &host,
+            &class,
+        )
+        .unwrap();
+        let access = prepared.body_access(context.store(), &host, body).unwrap();
+        let source_declaration = variable_declaration(&source, file, "source");
+        let source_symbol = variable_symbol(&context, &source, file, "source");
+        let source_type = variable_value_type(&context, &source, file, "source");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let [parameter] = body.parameters.as_slice() else {
+            panic!("the real constructor has one scalar parameter")
+        };
+        assert_eq!(parameter.type_.resolved(context.store()).unwrap(), number);
+        let flow = SourceFlowPlan::preflight_class_body(
+            &source.arena,
+            &bound,
+            context.store(),
+            &host,
+            body,
+            [
+                variable_name(&source, file, "source"),
+                write.statement(),
+                write.value(),
+                write.target(),
+                write.receiver(),
+            ],
+            [SourceFlowAssignment {
+                declaration: source_declaration,
+                symbol: source_symbol,
+            }],
+            [],
+        )
+        .unwrap();
+        let mut frame = ClassInitializationFrame::new(
+            body,
+            &flow,
+            &bound,
+            access.clone(),
+            HashMap::from([(parameter.symbol, number)]),
+        )
+        .unwrap();
+        frame
+            .complete_assignment(source_declaration, source_symbol, source_type)
+            .unwrap();
+        let globals = context.global_types().clone();
+        let arrays = CanonicalArrayTargets::from_global_types(&globals);
+        let identities =
+            super::super::classes::class_body_identities(context.store(), &host, &access).unwrap();
+        let mut caller = InstantiationSession::new(InstantiationLimits::default());
+        let target = super::super::source_properties::check_class_property_write_target(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &write,
+            identities.this_type,
+            &access,
+        )
+        .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(write.value())
+                .unwrap()
+                .resolved_type,
+            Some(source_type)
+        );
+        let property = super::super::object_members::resolve_object_property_by_key_with_source(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            source_type,
+            ts_binder::EscapedNameRef::source(write.destructuring().unwrap().name()),
+            &mut caller,
+            &mut CanonicalCheckerDiagnostics::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let selected = super::super::source_properties::CheckedClassDestructuringSource::new(
+            context.store(),
+            &host,
+            &write,
+            source_type,
+            property,
+            arrays,
+        )
+        .unwrap();
+        let assigned_type = selected.assigned_type();
+        let flow_type = current_flow_type_after_assignment(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut caller,
+            &mut CanonicalCheckerDiagnostics::default(),
+            CheckedAssignment {
+                declared_type: target.read_type(),
+                assigned_type,
+            },
+        )
+        .unwrap();
+        let checked = CheckedClassPropertyAssignment {
+            target,
+            assigned_type,
+            flow_type,
+            source: Some(selected),
+        };
+        let member = checked.target().member_source().clone();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_ne!(source_type, assigned_type);
+        assert_eq!(checked.target().write_type(), number);
+        let before = observable_state(&context, file);
+        assert_eq!(
+            frame.property_initialized_at_constructor_exit(context.store(), &host, &member),
+            Err(SourceFlowInvariant::PendingAssignment(write.target()).into())
+        );
+        for missing_receipt in [false, true] {
+            let mut changed = checked.clone();
+            if missing_receipt {
+                changed.source = None;
+            } else {
+                changed.assigned_type = string;
+            }
+            assert_eq!(
+                frame.complete_property_assignment(context.store(), &host, &changed),
+                Err(SourceFlowInvariant::InvalidClassProperty(write.target()).into())
+            );
+            assert_eq!(observable_state(&context, file), before);
+        }
+        let result_links = context
+            .store()
+            .type_node_links(write.node())
+            .unwrap()
+            .clone();
+        assert_eq!(result_links.resolved_type, Some(source_type));
+        // Recreate only the absent result cache from this fresh invocation phase.
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(write.node(), TypeNodeLinks::default())
+        );
+        frame
+            .complete_property_assignment(context.store(), &host, &checked)
+            .unwrap();
+        assert_eq!(
+            frame.property_initialized_at_constructor_exit(context.store(), &host, &member),
+            Err(SourceFlowInvariant::InvalidClassProperty(write.target()).into())
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(write.node(), result_links.clone())
+        );
+        assert_eq!(
+            frame.property_initialized_at_constructor_exit(context.store(), &host, &member),
+            Ok(true)
+        );
+        assert_eq!(
+            frame.complete_property_assignment(context.store(), &host, &checked),
+            Err(SourceFlowInvariant::AssignmentAlreadyCompleted(write.target()).into())
+        );
+        for node in [write.value(), write.node()] {
+            let original = context.store().type_node_links(node).unwrap().clone();
+            assert!(context.store_mut_for_test().set_type_node_links(
+                node,
+                TypeNodeLinks {
+                    resolved_type: Some(number),
+                    ..original.clone()
+                }
+            ));
+            let damaged = observable_state(&context, file);
+            for _ in 0..2 {
+                assert_eq!(
+                    frame.property_initialized_at_constructor_exit(context.store(), &host, &member),
+                    Err(SourceFlowInvariant::InvalidClassProperty(write.target()).into())
+                );
+                assert_eq!(observable_state(&context, file), damaged);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(node, original)
+            );
+            assert_eq!(
+                frame.property_initialized_at_constructor_exit(context.store(), &host, &member),
+                Ok(true)
+            );
+        }
+        assert_eq!(observable_state(&context, file), before);
+        assert_eq!(caller.limit_event_count(), 0);
+    }
+
+    #[test]
     fn source_abstract_properties_keep_deferred_and_destructured_access_rules() {
         let source = parsed(concat!(
             "abstract class Model {\n",
@@ -122349,6 +123921,7 @@ class Foo2 {
             &SourceTypeImportExecution {
                 value_uses: HashMap::new(),
                 annotation_capabilities: &capabilities,
+                property_flow: super::super::source_flow::OwnClassPropertyFlow::default(),
             },
             &mut Vec::new(),
             &mut execution,

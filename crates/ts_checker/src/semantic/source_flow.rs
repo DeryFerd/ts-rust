@@ -12,6 +12,9 @@
 //! Static blocks retain their outer start and receiver-specific property keys.
 //! Field initializers retain their own flow containers. Local destructuring
 //! assignments do not initialize class fields.
+//! Private destructuring leaves use the real field assignment and source property.
+//! Source-file field reads use checked own-field writes and real binder references.
+//! Unknown flow effects and affected computed or binding reads stay unsupported.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -44,8 +47,10 @@ use super::{
     signatures::TypePredicateKind,
     source::CheckedClassPropertyAssignment,
     source_properties::{
-        ClassAccessContext, SourceClassPropertyWritePlan, SourcePropertyError,
-        plan_class_property_write, validate_class_property_write_access,
+        ClassAccessContext, OwnClassPropertyWritePlan, SourceClassPropertyWritePlan,
+        SourcePropertyError, class_destructuring_write_assignment,
+        plan_class_destructuring_property_write, plan_class_property_write,
+        validate_class_property_write_access, validate_own_class_property_write_target,
     },
     source_statements::{
         SourceCapturedIterationStatementSyntax, SourceLinearLogicalStatementSyntax,
@@ -59,6 +64,512 @@ const FLOW_DEPTH_LIMIT: usize = 2_000;
 const FLOW_METADATA_BITS: u32 = FlowFlags::REFERENCED.bits() | FlowFlags::SHARED.bits();
 
 pub(super) type SourceFlowTypes = HashMap<SemanticSymbolId, TypeId>;
+
+/// Checked source writes for one source-check invocation, keyed by their real targets.
+#[derive(Default)]
+pub(super) struct OwnClassPropertyFlow {
+    assignments: HashMap<NodeRef, CompletedOwnClassPropertyWrite>,
+}
+
+struct CompletedOwnClassPropertyWrite {
+    plan: OwnClassPropertyWritePlan,
+    receiver_type: TypeId,
+    declared_type: TypeId,
+    assigned_type: TypeId,
+    flow_type: TypeId,
+}
+
+impl CompletedOwnClassPropertyWrite {
+    fn validate(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        options: CanonicalCheckerOptions,
+    ) -> Result<(), SourceFlowError> {
+        let assignment = self.plan.assignment();
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(assignment.left);
+        let checked = validate_own_class_property_write_target(
+            store,
+            host,
+            options,
+            &self.plan,
+            self.receiver_type,
+        )
+        .map_err(|_| invalid())?;
+        if checked.declared_type != self.declared_type
+            || store.type_node_links(assignment.expression)
+                != Some(&super::TypeNodeLinks {
+                    resolved_type: Some(self.assigned_type),
+                    ..super::TypeNodeLinks::default()
+                })
+            || store.type_payload(self.flow_type).is_none()
+        {
+            return Err(invalid().into());
+        }
+        Ok(())
+    }
+}
+
+impl OwnClassPropertyFlow {
+    pub(super) fn matching_receiver_symbol(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        receiver: NodeRef,
+    ) -> Result<Option<SemanticSymbolId>, SourceFlowError> {
+        if self.assignments.is_empty() {
+            return Ok(None);
+        }
+        let bound = host
+            .bound_file(receiver)
+            .ok_or(SourceFlowInvariant::ForeignNode(receiver))?;
+        let symbol = own_class_flow_reference_symbol(store, host, bound, receiver)?;
+        Ok(symbol.filter(|symbol| {
+            self.assignments
+                .values()
+                .any(|write| write.plan.assignment().receiver_symbol == *symbol)
+        }))
+    }
+
+    pub(super) fn has_reference(&self, receiver: SemanticSymbolId, name: &str) -> bool {
+        self.assignments.values().any(|write| {
+            write.plan.assignment().receiver_symbol == receiver && write.plan.name() == name
+        })
+    }
+
+    pub(super) fn has_checked_reference(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        options: CanonicalCheckerOptions,
+        receiver: SemanticSymbolId,
+        name: Option<&str>,
+    ) -> Result<bool, SourceFlowError> {
+        let mut affected = false;
+        for write in self.assignments.values().filter(|write| {
+            write.plan.assignment().receiver_symbol == receiver
+                && name.is_none_or(|name| write.plan.name() == name)
+        }) {
+            write.validate(store, host, options)?;
+            affected = true;
+        }
+        Ok(affected)
+    }
+
+    /// Computed reads need their own reference proof before they can use checked writes.
+    pub(super) fn has_unproved_element_read(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        options: CanonicalCheckerOptions,
+        plan: &super::source_elements::SourceElementPlan,
+    ) -> Result<bool, SourceFlowError> {
+        let Some(receiver_symbol) =
+            self.matching_receiver_symbol(store, host, plan.receiver.node)?
+        else {
+            return Ok(false);
+        };
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(plan.node);
+        let (arena, bound) = host.source(plan.node).ok_or_else(invalid)?;
+        own_class_flow_node(store, host, plan.node)?;
+        let syntax =
+            super::source_elements::plan_direct_source_element_syntax(arena, store, plan.node)
+                .map_err(|_| invalid())?;
+        if syntax.receiver() != plan.receiver.node
+            || syntax.index() != plan.index.node
+            || own_class_flow_symbol(store, host, bound, plan.receiver.node)? != receiver_symbol
+        {
+            return Err(invalid().into());
+        }
+        let name = match &own_class_flow_node(store, host, plan.index.node)?.data {
+            NodeData::StringLiteral(literal) => Some(literal.text.as_str()),
+            NodeData::NoSubstitutionTemplateLiteral(literal) => Some(literal.text.as_str()),
+            _ => None,
+        };
+        let affected = self.has_checked_reference(store, host, options, receiver_symbol, name)?;
+        if affected
+            && (store
+                .type_node_links(plan.node)
+                .is_some_and(|links| links != &super::TypeNodeLinks::default())
+                || store
+                    .symbol_node_links(plan.node)
+                    .is_some_and(|links| links != &super::SymbolNodeLinks::default()))
+        {
+            return Err(invalid().into());
+        }
+        Ok(affected)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Retain the result checked with the source caller's session.
+    pub(super) fn complete_assignment(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        options: CanonicalCheckerOptions,
+        plan: &OwnClassPropertyWritePlan,
+        receiver_type: TypeId,
+        assigned_type: TypeId,
+        flow_type: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        let assignment = plan.assignment();
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(assignment.left);
+        let checked =
+            validate_own_class_property_write_target(store, host, options, plan, receiver_type)
+                .map_err(|_| invalid())?;
+        let bound = host.bound_file(assignment.left).ok_or_else(invalid)?;
+        if bound.flow_container(assignment.left) != Some(bound.source_file())
+            || bound.flow_at(assignment.left).is_none()
+            || store.type_node_links(assignment.expression)
+                != Some(&super::TypeNodeLinks {
+                    resolved_type: Some(assigned_type),
+                    ..super::TypeNodeLinks::default()
+                })
+            || store.type_payload(flow_type).is_none()
+            || self.assignments.contains_key(&assignment.left)
+        {
+            return Err(invalid().into());
+        }
+        self.assignments.insert(
+            assignment.left,
+            CompletedOwnClassPropertyWrite {
+                plan: plan.clone(),
+                receiver_type,
+                declared_type: checked.declared_type,
+                assigned_type,
+                flow_type,
+            },
+        );
+        Ok(())
+    }
+
+    /// Uses the actual source flow chain. Other instances of the same class do not match.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(super) fn read_type(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        options: CanonicalCheckerOptions,
+        access: NodeRef,
+        receiver_symbol: SemanticSymbolId,
+        receiver_type: TypeId,
+        member: SemanticSymbolId,
+        declared_type: TypeId,
+    ) -> Result<Option<TypeId>, SourceFlowError> {
+        if !self.assignments.values().any(|write| {
+            write.plan.assignment().receiver_symbol == receiver_symbol
+                && write.plan.member_source().symbol == member
+        }) {
+            return Ok(None);
+        }
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(access);
+        let bound = host.bound_file(access).ok_or_else(invalid)?;
+        let container = bound.source_file();
+        if bound.flow_container(access) != Some(container) {
+            return Ok(None);
+        }
+        let graph = bound.flow_graph();
+        if graph.container_is_complete(container) != Some(true) {
+            return Err(SourceFlowUnsupported::IncompleteContainer(container).into());
+        }
+        let start = graph
+            .container_start(container)
+            .ok_or(SourceFlowInvariant::MissingStart(container))?;
+        preflight_start_payload(graph, container, start)?;
+        let record = own_class_flow_node(store, host, access)?;
+        if is_property_assignment_target(host, access) {
+            return Err(invalid().into());
+        }
+        let NodeData::PropertyAccessExpression(property) = &record.data else {
+            return Err(invalid().into());
+        };
+        let receiver = NodeRef::new(access.arena, access.file, property.expression);
+        let name = NodeRef::new(access.arena, access.file, property.name);
+        let NodeData::Identifier(name) = &own_class_flow_node(store, host, name)?.data else {
+            return Err(invalid().into());
+        };
+        if own_class_flow_symbol(store, host, bound, receiver)? != receiver_symbol {
+            return Err(invalid().into());
+        }
+        let mut current = bound
+            .flow_at(access)
+            .ok_or(SourceFlowInvariant::MissingFlowPoint(access))?;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Err(SourceFlowInvariant::Cycle(current).into());
+            }
+            if visited.len() > FLOW_DEPTH_LIMIT {
+                return Err(SourceFlowInvariant::DepthLimit(current).into());
+            }
+            let node = flow_node(graph, current)?;
+            match source_flow_kind(current, node.flags)? {
+                SourceFlowKind::Start => {
+                    if current != start {
+                        return Err(SourceFlowInvariant::InvalidStart(current).into());
+                    }
+                    preflight_start_payload(graph, container, current)?;
+                    return Ok(Some(declared_type));
+                }
+                SourceFlowKind::Assignment => {
+                    let antecedent = linear_antecedent(current, &node)?;
+                    flow_node(graph, antecedent)?;
+                    if antecedent == current {
+                        return Err(SourceFlowInvariant::Cycle(current).into());
+                    }
+                    let target = ast_payload(current, &node)?;
+                    validate_bound_node(bound, graph, target)?;
+                    let target_node = own_class_flow_node(store, host, target)?;
+                    if let Some(write) = self.assignments.get(&target) {
+                        let assignment = write.plan.assignment();
+                        if assignment.left != target
+                            || bound.flow_container(target) != Some(container)
+                        {
+                            return Err(SourceFlowInvariant::InvalidClassProperty(target).into());
+                        }
+                        write.validate(store, host, options)?;
+                        if assignment.receiver_symbol == receiver_symbol
+                            && write.plan.member_source().symbol == member
+                        {
+                            if write.receiver_type != receiver_type
+                                || write.declared_type != declared_type
+                            {
+                                return Err(invalid().into());
+                            }
+                            return Ok(Some(write.flow_type));
+                        }
+                    } else {
+                        match &target_node.data {
+                            NodeData::VariableDeclaration(_) => {
+                                let symbol = bound
+                                    .symbol(target)
+                                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                                    .ok_or_else(invalid)?;
+                                if symbol == receiver_symbol {
+                                    return Ok(Some(declared_type));
+                                }
+                            }
+                            NodeData::Identifier(_) => {
+                                if own_class_flow_symbol(store, host, bound, target)?
+                                    == receiver_symbol
+                                {
+                                    return Ok(Some(declared_type));
+                                }
+                            }
+                            NodeData::PropertyAccessExpression(property) => {
+                                let receiver =
+                                    NodeRef::new(target.arena, target.file, property.expression);
+                                let property_name =
+                                    NodeRef::new(target.arena, target.file, property.name);
+                                let NodeData::Identifier(property_name) =
+                                    &own_class_flow_node(store, host, property_name)?.data
+                                else {
+                                    return Err(SourceFlowUnsupported::PropertyWrite(target).into());
+                                };
+                                if own_class_flow_symbol(store, host, bound, receiver)?
+                                    == receiver_symbol
+                                    && property_name.text == name.text
+                                {
+                                    return Err(SourceFlowUnsupported::PropertyWrite(target).into());
+                                }
+                            }
+                            _ => return Err(SourceFlowUnsupported::PropertyWrite(target).into()),
+                        }
+                    }
+                    current = antecedent;
+                }
+                SourceFlowKind::Unreachable => {
+                    validate_unreachable_node(graph, current, &node)?;
+                    return Err(SourceFlowUnsupported::FlowKind {
+                        flow: current,
+                        flags: node.flags,
+                    }
+                    .into());
+                }
+                SourceFlowKind::BranchLabel | SourceFlowKind::LoopLabel => {
+                    for &antecedent in label_antecedents(current, &node)? {
+                        flow_node(graph, antecedent)?;
+                    }
+                    return Err(SourceFlowUnsupported::FlowKind {
+                        flow: current,
+                        flags: node.flags,
+                    }
+                    .into());
+                }
+                SourceFlowKind::Call
+                | SourceFlowKind::ArrayMutation
+                | SourceFlowKind::TrueCondition
+                | SourceFlowKind::FalseCondition => {
+                    let payload = ast_payload(current, &node)?;
+                    validate_bound_node(bound, graph, payload)?;
+                    own_class_flow_node(store, host, payload)?;
+                    flow_node(graph, linear_antecedent(current, &node)?)?;
+                    return Err(SourceFlowUnsupported::FlowKind {
+                        flow: current,
+                        flags: node.flags,
+                    }
+                    .into());
+                }
+            }
+        }
+    }
+}
+
+fn own_class_flow_node<'host>(
+    store: &CanonicalTypeMapperStore,
+    host: &'host DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<&'host ts_ast::Node, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::ForeignNode(node);
+    let record = super::declared::preflight_node(store, host, node).map_err(|_| invalid())?;
+    let parent = record
+        .parent
+        .map_or(super::store::SourceNodeParent::Root, |parent| {
+            super::store::SourceNodeParent::Parent(NodeRef::new(node.arena, node.file, parent))
+        });
+    if store.source_node_kind(node) != Some(record.kind)
+        || store.source_node_parent(node) != Some(parent)
+    {
+        return Err(invalid().into());
+    }
+    Ok(record)
+}
+
+fn own_class_flow_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &BoundFile,
+    node: NodeRef,
+) -> Result<SemanticSymbolId, SourceFlowError> {
+    own_class_flow_reference_symbol(store, host, bound, node)?
+        .ok_or_else(|| SourceFlowUnsupported::PropertyWrite(node).into())
+}
+
+/// Match the reference wrappers used by Go without reading any annotation type.
+#[allow(clippy::too_many_lines)] // Keep each source edge and the final symbol proof in one walk.
+fn own_class_flow_reference_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &BoundFile,
+    mut node: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceFlowError> {
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(node) || visited.len() > FLOW_DEPTH_LIMIT {
+            return Err(SourceFlowInvariant::InvalidClassProperty(node).into());
+        }
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(node);
+        let record = own_class_flow_node(store, host, node)?;
+        let child = match &record.data {
+            NodeData::Identifier(_) => break,
+            NodeData::ParenthesizedExpression(wrapper)
+                if record.kind == SyntaxKind::ParenthesizedExpression =>
+            {
+                wrapper.expression
+            }
+            NodeData::NonNullExpression(wrapper)
+                if record.kind == SyntaxKind::NonNullExpression =>
+            {
+                wrapper.expression
+            }
+            NodeData::SatisfiesExpression(wrapper)
+                if record.kind == SyntaxKind::SatisfiesExpression =>
+            {
+                let annotation = NodeRef::new(node.arena, node.file, wrapper.type_);
+                if own_class_flow_node(store, host, annotation)?.parent != Some(node.node) {
+                    return Err(invalid().into());
+                }
+                wrapper.expression
+            }
+            NodeData::BinaryExpression(binary) if record.kind == SyntaxKind::BinaryExpression => {
+                let operator = NodeRef::new(node.arena, node.file, binary.operator_token);
+                let operator = own_class_flow_node(store, host, operator)?;
+                if operator.kind != SyntaxKind::CommaToken {
+                    return Ok(None);
+                }
+                let left = NodeRef::new(node.arena, node.file, binary.left);
+                if operator.parent != Some(node.node)
+                    || operator.flags.0 != 0
+                    || !matches!(operator.data, NodeData::Token(_))
+                    || binary.facts != 0
+                    || binary.symbol.is_some()
+                    || binary.type_.is_some()
+                    || binary.modifiers.is_some()
+                    || own_class_flow_node(store, host, left)?.parent != Some(node.node)
+                {
+                    return Err(invalid().into());
+                }
+                binary.right
+            }
+            _ => return Ok(None),
+        };
+        let child = NodeRef::new(node.arena, node.file, child);
+        let child_record = own_class_flow_node(store, host, child)?;
+        if record.flags.0 != 0
+            || child_record.parent != Some(node.node)
+            || child_record.range.start < record.range.start
+            || child_record.range.end > record.range.end
+        {
+            return Err(invalid().into());
+        }
+        node = child;
+    }
+    let invalid = || SourceFlowInvariant::InvalidClassProperty(node);
+    let record = own_class_flow_node(store, host, node)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Err(SourceFlowUnsupported::PropertyWrite(node).into());
+    };
+    let (arena, actual_bound) = host.source(node).ok_or_else(invalid)?;
+    if actual_bound.source_file() != bound.source_file()
+        || record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 0
+        || identifier.flow_node.is_some()
+    {
+        return Err(invalid().into());
+    }
+    let mut callback = host.name_resolver_host(store).map_err(|_| invalid())?;
+    let mut resolver =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback)
+            .map_err(|_| invalid())?;
+    let symbol = resolver
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(node)),
+            &identifier.text,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(|_| invalid())?;
+    let Some(symbol) = symbol else {
+        if store
+            .symbol_node_links(node)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|cached| {
+                store
+                    .intrinsic_bootstrap()
+                    .is_none_or(|bootstrap| cached != bootstrap.unknown_symbol)
+            })
+        {
+            return Err(invalid().into());
+        }
+        return Ok(None);
+    };
+    if store
+        .symbol_node_links(node)
+        .and_then(|links| links.resolved_symbol)
+        .is_some_and(|cached| cached != symbol)
+    {
+        return Err(invalid().into());
+    }
+    let symbol = store
+        .symbol(symbol)
+        .and_then(ts_binder::semantic::Symbol::export_symbol)
+        .unwrap_or(symbol);
+    store
+        .get_merged_symbol(symbol)
+        .map(Some)
+        .ok_or_else(|| invalid().into())
+}
 
 /// One immutable map of current invocation-local symbol types.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3059,10 +3570,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         if target.access_token() != &self.access
             || store.type_payload(assignment.assigned_type()).is_none()
             || store.type_payload(assignment.flow_type()).is_none()
-            || store
-                .type_node_links(plan.node())
-                .and_then(|links| links.resolved_type)
-                != Some(assignment.assigned_type())
+            || !assignment.source_is_exact(store, host, false)
             || class_member_source(store, host, plan.member()).map_err(|_| invalid())?
                 != *target.member_source()
         {
@@ -3389,10 +3897,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                                 .initial
                                 .type_
                                 .is_some_and(|declared| declared != checked.target().read_type())
-                            || store
-                                .type_node_links(assignment.expression)
-                                .and_then(|links| links.resolved_type)
-                                != Some(checked.assigned_type())
+                            || !checked.source_is_exact(store, host, true)
                             || store.type_payload(checked.flow_type()).is_none()
                         {
                             return Err(SourceFlowInvariant::InvalidClassProperty(target).into());
@@ -6478,6 +6983,9 @@ fn plan_outer_class_property_assignment(
 }
 
 fn is_property_assignment_target(host: &DeclaredTypeHost<'_>, target: NodeRef) -> bool {
+    if class_destructuring_write_assignment(host, target).is_some() {
+        return true;
+    }
     let Some(record) = host.node(target) else {
         return false;
     };
@@ -6516,19 +7024,25 @@ fn plan_constructor_property_assignment(
     {
         return Err(invalid().into());
     }
-    let expression = NodeRef::new(
-        target.arena,
-        target.file,
-        host.node(target)
-            .and_then(|record| record.parent)
-            .ok_or_else(invalid)?,
-    );
-    let plan = plan_class_property_write(store, host, expression).map_err(|error| match error {
+    let plan = if class_destructuring_write_assignment(host, target).is_some() {
+        plan_class_destructuring_property_write(store, host, target)
+    } else {
+        let expression = NodeRef::new(
+            target.arena,
+            target.file,
+            host.node(target)
+                .and_then(|record| record.parent)
+                .ok_or_else(invalid)?,
+        );
+        plan_class_property_write(store, host, expression)
+    }
+    .map_err(|error| match error {
         SourcePropertyError::Unsupported(_) => {
             SourceFlowError::Unsupported(SourceFlowUnsupported::PropertyWrite(target))
         }
         _ => invalid().into(),
     })?;
+    let expression = plan.node();
     let node = flow_node(bound.flow_graph(), flow)?;
     if plan.target() != target
         || plan.context().class_symbol() != body.class_symbol
@@ -7875,6 +8389,543 @@ mod tests {
             ),
             before
         );
+    }
+
+    #[test]
+    fn own_class_property_flow_keeps_receiver_identity_and_invalidation() {
+        let parsed = parse_source_file(concat!(
+            "declare const text: string; ",
+            "class Model { value: string | null = null; static value: string | null = null; } ",
+            "let model = new Model(); const other = new Model(); ",
+            "model.value = text; const narrowed: string = model.value; ",
+            "const wrapped: string = (model).value; const separate: string | null = other.value; ",
+            "Model.value = text; const staticRead: string = Model.value; ",
+            "model.value = null; const secondWrite: null = model.value; ",
+            "model = other; const reset: string | null = model.value;",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_615);
+        let mut context = loop_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let null = bootstrap.null_type;
+        let declared = context
+            .store()
+            .symbol_table(context.globals())
+            .unwrap()
+            .get_source("Model")
+            .unwrap();
+        let field = context
+            .store()
+            .symbol(declared)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let union = context
+            .store()
+            .value_symbol_links(field)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        for (name, expected) in [
+            ("narrowed", string),
+            ("wrapped", string),
+            ("separate", union),
+            ("staticRead", string),
+            ("secondWrite", null),
+            ("reset", union),
+        ] {
+            let declaration = captured_variable(&parsed, file, name);
+            let NodeData::VariableDeclaration(variable) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!();
+            };
+            let read = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+            assert_eq!(
+                context.get_type_at_location(read).unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(field)
+                .unwrap()
+                .resolved_type,
+            Some(union)
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().mapper_len(),
+            context.store().relation_state_snapshot(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().relation_state_snapshot()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the actual checked write and both cache restore paths.
+    fn own_class_property_flow_rechecks_written_expression_caches() {
+        use crate::semantic::source_properties::plan_own_class_property_write;
+        use crate::semantic::{SymbolNodeLinks, TypeNodeLinks, production::GlobalMergeCompletion};
+
+        let parsed = parse_source_file(concat!(
+            "declare const text: string; class Model { value: string | null = null; } ",
+            "const model = new Model(); model.value = text; const after: string = model.value;",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_616);
+        let mut context = loop_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let assignments = captured_assignment_syntax(&parsed, file);
+        let [(statement, expression, _)] = assignments.as_slice() else {
+            panic!("one actual assignment")
+        };
+        let statement = *statement;
+        let expression = *expression;
+        let assignment = super::super::assignment::plan_own_class_property_assignment(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            statement,
+        )
+        .unwrap()
+        .unwrap();
+        let plan = plan_own_class_property_write(context.store(), &host, &assignment).unwrap();
+        let declaration = captured_variable(&parsed, file, "after");
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!();
+        };
+        let access = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+        let receiver = context
+            .store()
+            .type_node_links(assignment.receiver)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let assigned = context.store().type_node_links(expression).unwrap().clone();
+        let flow_type = context
+            .store()
+            .type_node_links(access)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            flow_type,
+            context.store().intrinsic_bootstrap().unwrap().string_type
+        );
+        let declared = context
+            .store()
+            .value_symbol_links(plan.member_source().symbol)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let options = context.options();
+        let mut flow = OwnClassPropertyFlow::default();
+        flow.complete_assignment(
+            context.store(),
+            &host,
+            options,
+            &plan,
+            receiver,
+            assigned.resolved_type.unwrap(),
+            flow_type,
+        )
+        .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let symbols = context
+            .store()
+            .symbol_node_links(assignment.receiver)
+            .unwrap()
+            .clone();
+        for corrupt_symbol in [false, true] {
+            if corrupt_symbol {
+                assert!(context.store_mut_for_test().set_symbol_node_links(
+                    assignment.receiver,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(assignment.class_symbol)
+                    }
+                ));
+            } else {
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    expression,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..assigned.clone()
+                    }
+                ));
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot(),
+            );
+            for _ in 0..2 {
+                assert!(
+                    matches!(flow.read_type(context.store(), &host, options, access, assignment.receiver_symbol, receiver, plan.member_source().symbol, declared),
+                    Err(SourceFlowError::Invariant(SourceFlowInvariant::InvalidClassProperty(node))) if node == assignment.left)
+                );
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.store().relation_state_snapshot()
+                    ),
+                    before
+                );
+                assert!(context.diagnostics().is_empty());
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(expression, assigned.clone())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(assignment.receiver, symbols.clone())
+            );
+            assert_eq!(
+                flow.read_type(
+                    context.store(),
+                    &host,
+                    options,
+                    access,
+                    assignment.receiver_symbol,
+                    receiver,
+                    plan.member_source().symbol,
+                    declared
+                ),
+                Ok(Some(flow_type))
+            );
+        }
+    }
+
+    #[test]
+    fn own_class_property_flow_matches_real_reference_wrappers() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(concat!(
+            "declare const text: string; ",
+            "class Model { value: string | null = null; static value: string | null = null; } ",
+            "const model = new Model(); model.value = text; Model.value = text; ",
+            "const nonNull: string = model!.value; ",
+            "const satisfied: string = (model satisfies Model).value; ",
+            "const staticRead: string = Model!.value; ",
+            "const comma = (model.value, model);",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_619);
+        let mut context = loop_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for name in ["nonNull", "satisfied", "staticRead"] {
+            let declaration = captured_variable(&parsed, file, name);
+            let NodeData::VariableDeclaration(variable) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!();
+            };
+            let read = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+            assert_eq!(
+                context.get_type_at_location(read).unwrap(),
+                string,
+                "{name}"
+            );
+        }
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let comma = captured_variable(&parsed, file, "comma");
+        let NodeData::VariableDeclaration(variable) = &parsed.arena.get(comma.node).unwrap().data
+        else {
+            unreachable!();
+        };
+        let receiver = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+        let model = bound
+            .symbol(captured_variable(&parsed, file, "model"))
+            .unwrap();
+        assert_eq!(
+            own_class_flow_reference_symbol(context.store(), &host, &bound, receiver),
+            Ok(Some(model))
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.store().relation_state_snapshot(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn own_class_property_flow_keeps_affected_object_bindings_unavailable() {
+        use crate::semantic::source::{SourceCheckError, UnsupportedSourceSyntax};
+        use crate::semantic::variables::VariableUnsupported;
+
+        let parsed = parse_source_file(
+            "declare const text: string; class Model { value: string | null = null; } const model = new Model(); model.value = text; const { value } = model; const after: string = value;",
+        );
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_620);
+        let mut context = loop_context(&parsed, file);
+        let (element, name, pattern) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::BindingElement(binding) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, binding.name?),
+                    NodeRef::new(parsed.arena.id(), file, record.parent?),
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(element).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Variable(VariableUnsupported::BindingPattern(pattern))
+                ))
+            );
+            assert!(context.diagnostics().is_empty());
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .is_none_or(|links| { links == &crate::semantic::ValueSymbolLinks::default() })
+            );
+            for node in [element, name] {
+                assert!(
+                    context
+                        .store()
+                        .type_node_links(node)
+                        .is_none_or(|links| { links == &TypeNodeLinks::default() })
+                );
+            }
+            assert!(
+                context
+                    .store()
+                    .source_file_links(context.source_file(file).unwrap())
+                    .is_none_or(|links| !links.type_checked)
+            );
+        }
+    }
+
+    #[test]
+    fn own_class_property_flow_preserves_unaffected_object_bindings() {
+        let parsed = parse_source_file(concat!(
+            "declare const text: string; ",
+            "class Model { value: string | null = null; other = 0; } ",
+            "const model = new Model(); const second = new Model(); model.value = text; ",
+            "const { other } = model; const numeric: number = other; ",
+            "const { value: separate } = second; const nullable: string | null = separate;",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_621);
+        let mut context = loop_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        for (name, expected) in [("numeric", "number"), ("nullable", "string | null")] {
+            let declaration = captured_variable(&parsed, file, name);
+            let NodeData::VariableDeclaration(variable) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!();
+            };
+            let read = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+            let type_ = context.get_type_at_location(read).unwrap();
+            assert_eq!(context.type_to_string(type_).unwrap(), expected);
+        }
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.store().relation_state_snapshot(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn own_class_property_flow_keeps_unknown_calls_unavailable() {
+        use crate::semantic::source::{SourceCheckError, UnsupportedSourceSyntax};
+
+        let parsed = parse_source_file(concat!(
+            "declare function visit(): void; declare const text: string; ",
+            "class Model { value: string | null = null; } ",
+            "const model = new Model(); model.value = text; visit(); ",
+            "const after: string = model.value;",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_617);
+        let mut context = loop_context(&parsed, file);
+        let declaration = captured_variable(&parsed, file, "after");
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!();
+        };
+        let access = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Class(access)
+                ))
+            );
+            assert!(context.diagnostics().is_empty());
+            assert!(
+                context
+                    .store()
+                    .type_node_links(access)
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+            assert!(
+                context
+                    .store()
+                    .source_file_links(context.source_file(file).unwrap())
+                    .is_none_or(|links| !links.type_checked)
+            );
+        }
+    }
+
+    #[test]
+    fn own_class_property_flow_keeps_computed_reads_unavailable() {
+        use crate::semantic::source::{SourceCheckError, UnsupportedSourceSyntax};
+
+        let parsed = parse_source_file(concat!(
+            "declare const text: string; class Model { value: string | null = null; } ",
+            "const model = new Model(); model.value = text; ",
+            "const after: string = model['value'];",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_618);
+        let mut context = loop_context(&parsed, file);
+        let declaration = captured_variable(&parsed, file, "after");
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!();
+        };
+        let access = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+        let unsupported = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Element(access));
+        for _ in 0..2 {
+            assert_eq!(context.check_source_file(file), Err(unsupported));
+            assert!(context.diagnostics().is_empty());
+            assert!(
+                context
+                    .store()
+                    .type_node_links(access)
+                    .is_none_or(|links| { links == &TypeNodeLinks::default() })
+            );
+            assert!(
+                context
+                    .store()
+                    .symbol_node_links(access)
+                    .is_none_or(|links| { links == &crate::semantic::SymbolNodeLinks::default() })
+            );
+            assert!(
+                context
+                    .store()
+                    .source_file_links(context.source_file(file).unwrap())
+                    .is_none_or(|links| !links.type_checked)
+            );
+        }
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            access,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Class(access))
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(access, TypeNodeLinks::default())
+        );
+        assert_eq!(context.check_source_file(file), Err(unsupported));
+        assert!(context.diagnostics().is_empty());
     }
 
     fn captured_assignment_syntax(

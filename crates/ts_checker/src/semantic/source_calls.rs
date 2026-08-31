@@ -7958,6 +7958,55 @@ fn legacy_class_call_resolution(resolution: &DirectCallResolution) -> ResolvedLe
     }
 }
 
+/// Uses normal argument diagnostics for checked source constructor expressions.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_source_constructor_argument_diagnostics(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    node: NodeRef,
+    arguments: &[PlannedExpression],
+    argument_types: &[TypeId],
+    resolution: &DirectCallResolution,
+) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    let Some(NodeData::NewExpression(expression)) = host.node(node).map(|record| &record.data)
+    else {
+        return Err(SourceCheckError::Call(node));
+    };
+    let nodes = expression
+        .arguments
+        .as_ref()
+        .map_or(&[][..], |arguments| arguments.nodes.as_slice());
+    if arguments.len() != nodes.len()
+        || argument_types.len() != nodes.len()
+        || arguments.iter().zip(nodes).any(|(argument, &expected)| {
+            argument.node != NodeRef::new(node.arena, node.file, expected)
+        })
+    {
+        return Err(SourceCheckError::Call(node));
+    }
+    prepare_fixed_source_call_diagnostic(
+        store,
+        host,
+        globals,
+        options,
+        session,
+        diagnostics,
+        SourceCallDiagnosticSite {
+            node,
+            callee_diagnostic_node: node,
+            form: DirectCallForm::New,
+            arguments,
+            receiver: None,
+        },
+        argument_types,
+        legacy_class_call_resolution(resolution),
+    )
+}
+
 /// Publishes the real base signature while only the super call expression is void.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_source_super_call(

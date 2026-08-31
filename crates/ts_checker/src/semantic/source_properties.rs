@@ -18,6 +18,7 @@
 //! token for pending class headers. Initialization reads retain their binder
 //! flow evidence separately from accessibility diagnostics.
 //! Constructor writes use a separate target plan and keep read and write types distinct.
+//! Top-level own-field writes validate the completed class without a body token.
 //! Keyword-private and protected reads retain their declared types after an access error.
 //! Exact
 //! two-constituent
@@ -553,6 +554,10 @@ enum SourcePropertyPosition {
     Read,
     CallCallee(NodeRef),
     WriteTarget(NodeRef),
+    DestructuringWrite {
+        assignment: NodeRef,
+        binding: NodeRef,
+    },
 }
 
 /// Property-access syntax proven before recursive source planning starts.
@@ -577,6 +582,403 @@ impl DirectSourcePropertySyntax {
     }
 }
 
+/// An own-field write outside class bodies. It cannot authorize `this` access.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct OwnClassPropertyWritePlan {
+    assignment: super::assignment::OwnClassPropertyAssignmentPlan,
+    property: DirectSourcePropertySyntax,
+    member: ClassMemberSource,
+}
+
+impl OwnClassPropertyWritePlan {
+    pub(super) const fn assignment(&self) -> &super::assignment::OwnClassPropertyAssignmentPlan {
+        &self.assignment
+    }
+
+    pub(super) const fn member_source(&self) -> &ClassMemberSource {
+        &self.member
+    }
+
+    pub(super) fn name(&self) -> &str {
+        &self.property.name
+    }
+}
+
+pub(super) struct CheckedOwnClassPropertyWrite {
+    pub(super) type_: TypeId,
+    pub(super) declared_type: TypeId,
+    pub(super) diagnostic: Option<CanonicalCheckerDiagnostic>,
+}
+
+/// Retains the binder's own field and rejects unsupported members before execution.
+#[allow(clippy::too_many_lines)] // The source member, side, and receiver form one write proof.
+pub(super) fn plan_own_class_property_write(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    assignment: &super::assignment::OwnClassPropertyAssignmentPlan,
+) -> Result<OwnClassPropertyWritePlan, SourcePropertyError> {
+    let invalid = || SourcePropertyError::InvalidCache(assignment.left);
+    let (arena, bound) = host.source(assignment.statement).ok_or_else(invalid)?;
+    if super::assignment::plan_own_class_property_assignment(
+        arena,
+        bound,
+        store,
+        host,
+        assignment.statement,
+    )
+    .map_err(|_| invalid())?
+        != Some(*assignment)
+    {
+        return Err(invalid());
+    }
+    for node in [
+        assignment.statement,
+        assignment.expression,
+        assignment.left,
+        assignment.right,
+        assignment.receiver,
+        assignment.class_declaration,
+    ] {
+        class_access_node(store, host, node)?;
+    }
+    let property = plan_direct_source_property_syntax_at(
+        arena,
+        store,
+        assignment.left,
+        SourcePropertyPosition::WriteTarget(assignment.expression),
+    )?;
+    if property.receiver != assignment.receiver
+        || property.privacy != SourcePropertyPrivacy::Identifier
+        || property.optional
+    {
+        return Err(unsupported_access(assignment.left));
+    }
+    class_access_node(store, host, property.name_node)?;
+    if let Some(instance) = store
+        .declared_type_links(assignment.class_symbol)
+        .and_then(|links| links.declared_type)
+        && store.type_payload(instance).is_some_and(|record| {
+            record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        })
+        && classes::validate_class_heritage_members(store, instance)
+            != ClassHeritageMembersValidation::Valid
+    {
+        return Err(invalid());
+    }
+    let owner = store.symbol(assignment.class_symbol).ok_or_else(invalid)?;
+    let table = match assignment.side {
+        ClassPropertySide::Instance => owner.members(),
+        ClassPropertySide::Static => owner.exports(),
+    }
+    .and_then(|table| store.symbol_table(table))
+    .ok_or_else(invalid)?;
+    let symbol = table
+        .get_source(&property.name)
+        .ok_or_else(|| unsupported_access(assignment.left))?;
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
+    if record.flags() != SymbolFlags::PROPERTY {
+        return Err(unsupported_access(assignment.left));
+    }
+    let declaration = record.value_declaration().ok_or_else(invalid)?;
+    let declaration_record = class_access_node(store, host, declaration)?;
+    let NodeData::PropertyDeclaration(field) = &declaration_record.data else {
+        return Err(unsupported_access(assignment.left));
+    };
+    if classes::class_member_visibility(store, declaration) != ClassConstructorVisibility::Public
+        || ts_binder::canonical_has_syntactic_modifier(
+            arena,
+            declaration.node,
+            SyntaxKind::AccessorKeyword,
+        )
+        || ts_binder::canonical_has_syntactic_modifier(
+            arena,
+            declaration.node,
+            SyntaxKind::AbstractKeyword,
+        )
+    {
+        return Err(unsupported_access(assignment.left));
+    }
+    let NodeData::ClassDeclaration(class) =
+        &class_access_node(store, host, assignment.class_declaration)?.data
+    else {
+        return Err(invalid());
+    };
+    let readonly = ts_binder::canonical_has_syntactic_modifier(
+        arena,
+        declaration.node,
+        SyntaxKind::ReadonlyKeyword,
+    );
+    if record.parent() != Some(assignment.class_symbol)
+        || record.declarations() != Some(&[declaration])
+        || record.name().as_utf8() != Some(property.name.as_str())
+        || record.check_flags() != CheckFlags::NONE
+            && (!readonly || record.check_flags() != CheckFlags::READONLY)
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || bound.symbol(declaration) != Some(symbol)
+        || declaration_record.parent != Some(assignment.class_declaration.node)
+        || !class.members.nodes.contains(&declaration.node)
+        || class_member_side(store, host, declaration, field.modifiers.as_ref())? != assignment.side
+    {
+        return Err(invalid());
+    }
+    Ok(OwnClassPropertyWritePlan {
+        assignment: *assignment,
+        property,
+        member: ClassMemberSource {
+            symbol,
+            declaring_class: assignment.class_symbol,
+            declaration,
+            origin: ClassMemberOrigin::Field {
+                initializer: field
+                    .initializer
+                    .map(|node| NodeRef::new(declaration.arena, declaration.file, node)),
+            },
+            side: assignment.side,
+            visibility: ClassConstructorVisibility::Public,
+            readonly,
+            abstract_: false,
+        },
+    })
+}
+
+/// Checks a completed class and publishes the exact write target, without a body token.
+pub(super) fn check_own_class_property_write_target(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    options: CanonicalCheckerOptions,
+    plan: &OwnClassPropertyWritePlan,
+    receiver_type: TypeId,
+) -> Result<CheckedOwnClassPropertyWrite, SourcePropertyError> {
+    let checked =
+        validate_own_class_property_write_target(store, host, options, plan, receiver_type)?;
+    publish_property_links(
+        store,
+        plan.assignment.left,
+        Some(plan.member.symbol),
+        checked.type_,
+    )?;
+    Ok(checked)
+}
+
+#[allow(clippy::too_many_lines)] // Validate the completed class and both sides of the write together.
+pub(super) fn validate_own_class_property_write_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    options: CanonicalCheckerOptions,
+    plan: &OwnClassPropertyWritePlan,
+    receiver_type: TypeId,
+) -> Result<CheckedOwnClassPropertyWrite, SourcePropertyError> {
+    let assignment = plan.assignment();
+    let invalid = || SourcePropertyError::InvalidCache(assignment.left);
+    let replay =
+        plan_own_class_property_write(store, host, assignment).map_err(|error| match error {
+            SourcePropertyError::Unsupported(_) => invalid(),
+            error => error,
+        })?;
+    if replay != *plan {
+        return Err(invalid());
+    }
+    let instance = store
+        .declared_type_links(assignment.class_symbol)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(|| unsupported_access(assignment.left))?;
+    if classes::validate_class_heritage_members(store, instance)
+        != ClassHeritageMembersValidation::Valid
+    {
+        return Err(invalid());
+    }
+    let expected_receiver = match assignment.side {
+        ClassPropertySide::Instance => instance,
+        ClassPropertySide::Static => store
+            .value_symbol_links(assignment.class_symbol)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(invalid)?,
+    };
+    if receiver_type != expected_receiver {
+        return Err(SourcePropertyError::Unsupported(
+            SourcePropertyUnsupported::Receiver(assignment.receiver),
+        ));
+    }
+    if store.type_node_links(assignment.receiver)
+        != Some(&TypeNodeLinks {
+            resolved_type: Some(receiver_type),
+            ..TypeNodeLinks::default()
+        })
+        || store
+            .symbol_node_links(assignment.receiver)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|symbol| symbol != assignment.receiver_symbol)
+        || classes::class_member_source(store, host, plan.member.symbol).map_err(|_| invalid())?
+            != plan.member
+    {
+        return Err(invalid());
+    }
+    let structured = store
+        .type_payload(receiver_type)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(invalid)?;
+    if structured
+        .members
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source(&plan.property.name))
+        != Some(plan.member.symbol)
+        || structured
+            .properties
+            .as_deref()
+            .is_none_or(|properties| !properties.contains(&plan.member.symbol))
+    {
+        return Err(invalid());
+    }
+    let links = store
+        .value_symbol_links(plan.member.symbol)
+        .ok_or_else(invalid)?;
+    let declared = links.resolved_type.ok_or_else(invalid)?;
+    if links
+        != &(ValueSymbolLinks {
+            resolved_type: Some(declared),
+            ..ValueSymbolLinks::default()
+        })
+    {
+        return Err(invalid());
+    }
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    if bootstrap.options != options.intrinsic {
+        return Err(invalid());
+    }
+    let type_ = if plan.member.readonly {
+        bootstrap.error_type
+    } else {
+        declared
+    };
+    let diagnostic = plan
+        .member
+        .readonly
+        .then(|| {
+            Ok::<_, SourcePropertyError>(CanonicalCheckerDiagnostic {
+                node: Some(plan.property.name_node),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2540).ok_or(SourcePropertyError::MissingDiagnostic(2540))?,
+                    [plan.property.name.clone()],
+                ),
+                related_information: Vec::new(),
+            })
+        })
+        .transpose()?;
+    validate_property_link_targets(store, assignment.left, Some(plan.member.symbol), type_)?;
+    Ok(CheckedOwnClassPropertyWrite {
+        type_,
+        declared_type: declared,
+        diagnostic,
+    })
+}
+
+/// Applies checked source-file writes before publishing a later own-field read.
+#[allow(clippy::too_many_lines)] // Keep class ownership, read position, and flow publication together.
+pub(super) fn check_own_class_property_flow_read(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    options: CanonicalCheckerOptions,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+    flow: &super::source_flow::OwnClassPropertyFlow,
+) -> Result<Option<CheckedSourceProperty>, SourcePropertyError> {
+    let Some(receiver_symbol) = flow.matching_receiver_symbol(store, host, plan.receiver.node)?
+    else {
+        return Ok(None);
+    };
+    if !flow.has_reference(receiver_symbol, &plan.name) {
+        return Ok(None);
+    }
+    let invalid = || SourcePropertyError::InvalidCache(plan.node);
+    let (arena, _) = host.source(plan.node).ok_or_else(invalid)?;
+    class_access_node(store, host, plan.node)?;
+    let syntax = plan_direct_source_property_syntax_at(arena, store, plan.node, plan.position)?;
+    if syntax.receiver != plan.receiver.node
+        || syntax.name_node != plan.name_node
+        || syntax.name != plan.name
+        || syntax.privacy != plan.privacy
+        || syntax.optional != plan.optional
+    {
+        return Err(invalid());
+    }
+    if !plan.is_read() || plan.optional || plan.privacy != SourcePropertyPrivacy::Identifier {
+        return Err(unsupported_access(plan.node));
+    }
+    let receiver = store.type_payload(receiver_type).ok_or_else(invalid)?;
+    let owner = receiver
+        .symbol()
+        .ok_or_else(|| unsupported_access(plan.node))?;
+    let instance = store
+        .declared_type_links(owner)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(|| unsupported_access(plan.node))?;
+    if classes::validate_class_heritage_members(store, instance)
+        != ClassHeritageMembersValidation::Valid
+    {
+        return Err(invalid());
+    }
+    let side = if receiver_type == instance {
+        ClassPropertySide::Instance
+    } else if store
+        .value_symbol_links(owner)
+        .and_then(|links| links.resolved_type)
+        == Some(receiver_type)
+    {
+        ClassPropertySide::Static
+    } else {
+        return Err(unsupported_access(plan.node));
+    };
+    let structured = receiver.data().structured().ok_or_else(invalid)?;
+    let member = structured
+        .members
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source(&plan.name))
+        .ok_or_else(|| unsupported_access(plan.node))?;
+    if structured
+        .properties
+        .as_deref()
+        .is_none_or(|properties| !properties.contains(&member))
+    {
+        return Err(invalid());
+    }
+    let source = classes::class_member_source(store, host, member).map_err(|_| invalid())?;
+    if source.declaring_class != owner
+        || source.side != side
+        || source.visibility != ClassConstructorVisibility::Public
+        || !matches!(source.origin, ClassMemberOrigin::Field { .. })
+        || store
+            .symbol(member)
+            .is_none_or(|symbol| symbol.flags() != SymbolFlags::PROPERTY)
+    {
+        return Err(unsupported_access(plan.node));
+    }
+    let declared = store
+        .value_symbol_links(member)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    let Some(type_) = flow.read_type(
+        store,
+        host,
+        options,
+        plan.node,
+        receiver_symbol,
+        receiver_type,
+        member,
+        declared,
+    )?
+    else {
+        return Ok(None);
+    };
+    publish_property_links(store, plan.node, Some(member), type_)?;
+    Ok(Some(CheckedSourceProperty {
+        type_,
+        diagnostics: Vec::new(),
+    }))
+}
+
 /// A class field assignment with a separate left-hand-side position proof.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceClassPropertyWritePlan {
@@ -589,6 +991,7 @@ pub(super) struct SourceClassPropertyWritePlan {
     declaration: NodeRef,
     origin: ClassMemberOrigin,
     readonly: bool,
+    destructuring: Option<ClassDestructuringPropertyPlan>,
 }
 
 impl SourceClassPropertyWritePlan {
@@ -623,6 +1026,157 @@ impl SourceClassPropertyWritePlan {
     pub(super) fn name(&self) -> &str {
         &self.property.name
     }
+
+    pub(super) const fn destructuring(&self) -> Option<&ClassDestructuringPropertyPlan> {
+        self.destructuring.as_ref()
+    }
+}
+
+/// The real source key and private target of one object assignment property.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClassDestructuringPropertyPlan {
+    binding: NodeRef,
+    property: NodeRef,
+    target: NodeRef,
+    source: NodeRef,
+    name: String,
+}
+
+impl ClassDestructuringPropertyPlan {
+    pub(super) const fn property(&self) -> NodeRef {
+        self.property
+    }
+
+    pub(super) const fn source(&self) -> NodeRef {
+        self.source
+    }
+
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Recognizes an assignment leaf, not a property value in an ordinary object.
+/// The full planner checks source facts, ranges, class authority, and caches.
+pub(super) fn class_destructuring_write_assignment(
+    host: &DeclaredTypeHost<'_>,
+    target: NodeRef,
+) -> Option<NodeRef> {
+    let record = host.node(target)?;
+    if record.kind != SyntaxKind::PropertyAccessExpression {
+        return None;
+    }
+    let binding = NodeRef::new(target.arena, target.file, record.parent?);
+    let binding_record = host.node(binding)?;
+    let NodeData::PropertyAssignment(property) = &binding_record.data else {
+        return None;
+    };
+    let pattern = NodeRef::new(target.arena, target.file, binding_record.parent?);
+    let pattern_record = host.node(pattern)?;
+    let NodeData::ObjectLiteralExpression(object) = &pattern_record.data else {
+        return None;
+    };
+    let assignment = NodeRef::new(target.arena, target.file, pattern_record.parent?);
+    let NodeData::BinaryExpression(binary) = &host.node(assignment)?.data else {
+        return None;
+    };
+    (property.initializer == target.node
+        && object.properties.nodes.contains(&binding.node)
+        && binary.left == pattern.node
+        && host
+            .node(NodeRef::new(
+                target.arena,
+                target.file,
+                binary.operator_token,
+            ))?
+            .kind
+            == SyntaxKind::EqualsToken)
+        .then_some(assignment)
+}
+
+fn plan_class_destructuring_property(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    assignment: NodeRef,
+    target: NodeRef,
+) -> Result<ClassDestructuringPropertyPlan, SourcePropertyError> {
+    let invalid = || SourcePropertyError::InvalidCache(target);
+    if class_destructuring_write_assignment(host, target) != Some(assignment) {
+        return Err(unsupported_access(target));
+    }
+    let target_record = class_access_node(store, host, target)?;
+    let binding = NodeRef::new(
+        target.arena,
+        target.file,
+        target_record.parent.ok_or_else(invalid)?,
+    );
+    let binding_record = class_access_node(store, host, binding)?;
+    let NodeData::PropertyAssignment(property) = &binding_record.data else {
+        return Err(invalid());
+    };
+    let pattern = NodeRef::new(
+        target.arena,
+        target.file,
+        binding_record.parent.ok_or_else(invalid)?,
+    );
+    let pattern_record = class_access_node(store, host, pattern)?;
+    let NodeData::ObjectLiteralExpression(object) = &pattern_record.data else {
+        return Err(invalid());
+    };
+    let assignment_record = class_access_node(store, host, assignment)?;
+    let NodeData::BinaryExpression(binary) = &assignment_record.data else {
+        return Err(invalid());
+    };
+    let name_node = NodeRef::new(target.arena, target.file, property.name);
+    let name_record = class_access_node(store, host, name_node)?;
+    let name = match &name_record.data {
+        NodeData::Identifier(identifier)
+            if name_record.kind == SyntaxKind::Identifier && identifier.flow_node.is_none() =>
+        {
+            identifier.text.clone()
+        }
+        NodeData::StringLiteral(literal)
+            if name_record.kind == SyntaxKind::StringLiteral && literal.token_flags.0 == 0 =>
+        {
+            literal.text.clone()
+        }
+        _ => return Err(unsupported_access(name_node)),
+    };
+    if binding_record.kind != SyntaxKind::PropertyAssignment
+        || binding_record.flags.0 != 0
+        || property.facts != 0
+        || property.symbol.is_some()
+        || property.type_.is_some()
+        || property.modifiers.is_some()
+        || property.postfix_token.is_some()
+        || pattern_record.kind != SyntaxKind::ObjectLiteralExpression
+        || pattern_record.flags.0 != 0
+        || object.facts != 0
+        || object
+            .properties
+            .nodes
+            .iter()
+            .filter(|node| **node == binding.node)
+            .count()
+            != 1
+        || name_record.parent != Some(binding.node)
+        || name_record.flags.0 != 0
+        || name.is_empty()
+        || binding_record.range.start < pattern_record.range.start
+        || binding_record.range.end > pattern_record.range.end
+        || name_record.range.start < binding_record.range.start
+        || name_record.range.end > target_record.range.start
+        || target_record.range.end > binding_record.range.end
+    {
+        return Err(invalid());
+    }
+    Ok(ClassDestructuringPropertyPlan {
+        binding,
+        property: name_node,
+        target,
+        source: NodeRef::new(target.arena, target.file, binary.right),
+        name,
+    })
 }
 
 /// The real class body token and field types used for one assignment check.
@@ -662,12 +1216,32 @@ pub(super) fn plan_class_property_write(
     host: &DeclaredTypeHost<'_>,
     assignment: NodeRef,
 ) -> Result<SourceClassPropertyWritePlan, SourcePropertyError> {
+    plan_class_property_write_at(store, host, assignment, None)
+}
+
+pub(super) fn plan_class_destructuring_property_write(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    target: NodeRef,
+) -> Result<SourceClassPropertyWritePlan, SourcePropertyError> {
+    let assignment = class_destructuring_write_assignment(host, target)
+        .ok_or_else(|| unsupported_access(target))?;
+    plan_class_property_write_at(store, host, assignment, Some(target))
+}
+
+fn plan_class_property_write_at(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    assignment: NodeRef,
+    destructuring_target: Option<NodeRef>,
+) -> Result<SourceClassPropertyWritePlan, SourcePropertyError> {
     let invalid = || SourcePropertyError::InvalidCache(assignment);
     let record = class_access_node(store, host, assignment)?;
     let NodeData::BinaryExpression(binary) = &record.data else {
         return Err(unsupported_access(assignment));
     };
-    let target = NodeRef::new(assignment.arena, assignment.file, binary.left);
+    let target = destructuring_target
+        .unwrap_or_else(|| NodeRef::new(assignment.arena, assignment.file, binary.left));
     let value = NodeRef::new(assignment.arena, assignment.file, binary.right);
     let operator = NodeRef::new(assignment.arena, assignment.file, binary.operator_token);
     let operator_record = class_access_node(store, host, operator)?;
@@ -690,13 +1264,27 @@ pub(super) fn plan_class_property_write(
     {
         return Err(invalid());
     }
+    let destructuring = destructuring_target
+        .map(|target| plan_class_destructuring_property(store, host, assignment, target))
+        .transpose()?;
     let (arena, bound) = host.source(assignment).ok_or_else(invalid)?;
     let property = plan_direct_source_property_syntax_at(
         arena,
         store,
         target,
-        SourcePropertyPosition::WriteTarget(assignment),
+        destructuring
+            .as_ref()
+            .map_or(SourcePropertyPosition::WriteTarget(assignment), |plan| {
+                SourcePropertyPosition::DestructuringWrite {
+                    assignment,
+                    binding: plan.binding,
+                }
+            }),
     )?;
+    if destructuring.is_some() && !matches!(property.privacy, SourcePropertyPrivacy::Private { .. })
+    {
+        return Err(unsupported_access(target));
+    }
     let target_record = class_access_node(store, host, target)?;
     if target_record.range.end > operator_record.range.start
         || operator_record.range.end > value_record.range.start
@@ -722,14 +1310,34 @@ pub(super) fn plan_class_property_write(
         _ => return Err(invalid()),
     };
     let body = body.ok_or_else(invalid)?;
+    let mut statement_expression = assignment;
+    if destructuring.is_some() {
+        let mut seen = std::collections::HashSet::new();
+        while let Some(parent) = class_access_node(store, host, statement_expression)?.parent {
+            if !seen.insert(statement_expression) {
+                return Err(invalid());
+            }
+            let parent = NodeRef::new(assignment.arena, assignment.file, parent);
+            let parent_record = class_access_node(store, host, parent)?;
+            let NodeData::ParenthesizedExpression(parenthesized) = &parent_record.data else {
+                break;
+            };
+            if parent_record.flags.0 != 0 || parenthesized.expression != statement_expression.node {
+                return Err(invalid());
+            }
+            statement_expression = parent;
+        }
+    }
     let statement = NodeRef::new(
         assignment.arena,
         assignment.file,
-        record.parent.ok_or_else(invalid)?,
+        class_access_node(store, host, statement_expression)?
+            .parent
+            .ok_or_else(invalid)?,
     );
     let statement_record = class_access_node(store, host, statement)?;
     if !matches!(&statement_record.data, NodeData::ExpressionStatement(data)
-        if data.expression == assignment.node && data.flow_node.is_none())
+        if data.expression == statement_expression.node && data.flow_node.is_none())
         || statement_record.flags.0 != 0
     {
         return Err(unsupported_access(assignment));
@@ -826,6 +1434,37 @@ pub(super) fn plan_class_property_write(
         }
         _ => return Err(unsupported_access(target)),
     };
+    if destructuring.is_some() {
+        let source_optional = match &declaration_record.data {
+            NodeData::PropertyDeclaration(field) => field
+                .postfix_token
+                .map(|token| {
+                    let token = NodeRef::new(declaration.arena, declaration.file, token);
+                    let record = class_access_node(store, host, token)?;
+                    if record.parent != Some(declaration.node)
+                        || record.flags.0 != 0
+                        || !matches!(record.data, NodeData::Token(_))
+                    {
+                        return Err(invalid());
+                    }
+                    Ok(record.kind == SyntaxKind::QuestionToken)
+                })
+                .transpose()?
+                .unwrap_or(false),
+            _ => false,
+        };
+        if member_record.flags().contains(SymbolFlags::OPTIONAL) != source_optional {
+            return Err(invalid());
+        }
+        if source_optional {
+            return Err(SourcePropertyError::Unsupported(
+                SourcePropertyUnsupported::OptionalProperty {
+                    node: target,
+                    property: member,
+                },
+            ));
+        }
+    }
     let readonly = ts_binder::canonical_has_syntactic_modifier(
         arena,
         declaration.node,
@@ -844,6 +1483,7 @@ pub(super) fn plan_class_property_write(
         declaration,
         origin,
         readonly,
+        destructuring,
     })
 }
 
@@ -854,7 +1494,12 @@ pub(super) fn validate_class_property_write_access(
     access: &classes::ClassBodyAccessToken,
 ) -> Result<(classes::ClassBodyIdentities, ClassMemberSource), SourcePropertyError> {
     let invalid = || SourcePropertyError::InvalidCache(plan.target());
-    if plan_class_property_write(store, host, plan.node())? != *plan {
+    let actual = if plan.destructuring.is_some() {
+        plan_class_destructuring_property_write(store, host, plan.target())?
+    } else {
+        plan_class_property_write(store, host, plan.node())?
+    };
+    if actual != *plan {
         return Err(invalid());
     }
     let identities = classes::class_body_identities(store, host, access).map_err(|_| invalid())?;
@@ -1006,6 +1651,162 @@ pub(super) fn check_class_property_write_target(
         read_type,
         write_type,
     })
+}
+
+/// A checked property projection keeps the RHS object and assigned value separate.
+/// This receipt is local to the class-body invocation. It is not a type cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CheckedClassDestructuringSource {
+    plan: ClassDestructuringPropertyPlan,
+    source_type: TypeId,
+    property: ResolvedOwnProperty,
+    arrays: CanonicalArrayTargets,
+}
+
+pub(super) fn validate_class_destructuring_source_type(
+    store: &CanonicalTypeMapperStore,
+    source: NodeRef,
+    type_: TypeId,
+    arrays: CanonicalArrayTargets,
+) -> Result<(), SourcePropertyError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(SourcePropertyError::InvalidCache(source))?;
+    let TypeData::Object(object) = record.data() else {
+        return Err(unsupported_access(source));
+    };
+    if record.alias().is_some()
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object
+            .structured
+            .signatures
+            .as_ref()
+            .is_some_and(|signatures| !signatures.is_empty())
+        || object
+            .structured
+            .index_infos
+            .as_ref()
+            .is_some_and(|indexes| !indexes.is_empty())
+        || record
+            .symbol()
+            .and_then(|owner| store.symbol(owner))
+            .is_some_and(|owner| {
+                owner
+                    .flags()
+                    .intersects(SymbolFlags::CLASS | SymbolFlags::FUNCTION)
+            })
+    {
+        return Err(unsupported_access(source));
+    }
+    store
+        .validate_union_constituent_with_array_targets(arrays, type_)
+        .map_err(|error| SourcePropertyError::Union {
+            node: source,
+            error: UnionPropertyError::TypeCache(error),
+        })
+}
+
+impl CheckedClassDestructuringSource {
+    pub(super) fn new(
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        plan: &SourceClassPropertyWritePlan,
+        source_type: TypeId,
+        property: ResolvedOwnProperty,
+        arrays: CanonicalArrayTargets,
+    ) -> Result<Self, SourcePropertyError> {
+        let projection = plan
+            .destructuring
+            .clone()
+            .ok_or(SourcePropertyError::InvalidCache(plan.target()))?;
+        if property.optional {
+            return Err(SourcePropertyError::Unsupported(
+                SourcePropertyUnsupported::OptionalProperty {
+                    node: projection.property,
+                    property: property.symbol,
+                },
+            ));
+        }
+        if store.symbol(property.symbol).is_none_or(|symbol| {
+            !symbol.flags().contains(SymbolFlags::PROPERTY)
+                || symbol
+                    .flags()
+                    .intersects(SymbolFlags::METHOD | SymbolFlags::ACCESSOR)
+        }) {
+            return Err(unsupported_access(projection.property));
+        }
+        let result = Self {
+            plan: projection,
+            source_type,
+            property,
+            arrays,
+        };
+        result.validate(store, host, plan, false)?;
+        Ok(result)
+    }
+
+    pub(super) const fn assigned_type(&self) -> TypeId {
+        self.property.type_
+    }
+
+    pub(super) fn validate(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        write: &SourceClassPropertyWritePlan,
+        require_result: bool,
+    ) -> Result<(), SourcePropertyError> {
+        let invalid = || SourcePropertyError::InvalidCache(write.target());
+        if self.plan.target != write.target()
+            || write.destructuring() != Some(&self.plan)
+            || plan_class_destructuring_property_write(store, host, write.target())? != *write
+        {
+            return Err(invalid());
+        }
+        let result = store
+            .type_node_links(write.node())
+            .and_then(|links| links.resolved_type);
+        if store.type_node_links(self.plan.source)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(self.source_type),
+                ..TypeNodeLinks::default()
+            })
+            || result.is_some_and(|result| result != self.source_type)
+            || require_result && result != Some(self.source_type)
+        {
+            return Err(invalid());
+        }
+        let structured = store
+            .type_payload(self.source_type)
+            .and_then(|record| record.data().structured())
+            .ok_or_else(invalid)?;
+        let symbol = structured
+            .members
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get_source(&self.plan.name));
+        let property = store.symbol(self.property.symbol).ok_or_else(invalid)?;
+        if symbol != Some(self.property.symbol)
+            || !structured
+                .properties
+                .as_ref()
+                .is_some_and(|properties| properties.contains(&self.property.symbol))
+            || property.flags().contains(SymbolFlags::OPTIONAL)
+            || property.check_flags().contains(CheckFlags::READONLY) != self.property.readonly
+            || store
+                .value_symbol_links(self.property.symbol)
+                .and_then(|links| links.resolved_type)
+                != Some(self.property.type_)
+        {
+            return Err(invalid());
+        }
+        validate_class_destructuring_source_type(
+            store,
+            self.plan.source,
+            self.source_type,
+            self.arrays,
+        )
+    }
 }
 
 fn class_access_node<'host>(
@@ -1591,6 +2392,33 @@ fn plan_direct_source_property_syntax_at(
                 return Err(unsupported_access(node));
             }
         }
+        SourcePropertyPosition::DestructuringWrite {
+            assignment,
+            binding,
+        } => {
+            let exact = assignment.is_for(node.arena, node.file)
+                && binding.is_for(node.arena, node.file)
+                && record.parent == Some(binding.node)
+                && arena.get(binding.node).is_some_and(|record| {
+                    matches!(&record.data, NodeData::PropertyAssignment(property)
+                        if property.initializer == node.node)
+                        && record.parent.and_then(|pattern| arena.get(pattern).map(|record| (pattern, record)))
+                            .is_some_and(|(pattern, record)| {
+                                matches!(&record.data, NodeData::ObjectLiteralExpression(object)
+                                    if object.properties.nodes.contains(&binding.node))
+                                    && record.parent == Some(assignment.node)
+                                    && arena.get(assignment.node).is_some_and(|record| {
+                                        matches!(&record.data, NodeData::BinaryExpression(binary)
+                                            if binary.left == pattern
+                                                && arena.get(binary.operator_token).is_some_and(|token|
+                                                    token.kind == SyntaxKind::EqualsToken))
+                                    })
+                            })
+                });
+            if !exact || access.question_dot_token.is_some() {
+                return Err(unsupported_access(node));
+            }
+        }
     }
 
     let receiver = NodeRef::new(node.arena, node.file, access.expression);
@@ -1835,7 +2663,10 @@ fn check_direct_source_property_with_source_mode(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     publish: bool,
 ) -> Result<(CheckedSourceProperty, Option<SemanticSymbolId>), SourcePropertyQueryError> {
-    if matches!(plan.position, SourcePropertyPosition::WriteTarget(_)) {
+    if matches!(
+        plan.position,
+        SourcePropertyPosition::WriteTarget(_) | SourcePropertyPosition::DestructuringWrite { .. }
+    ) {
         if !publish {
             return Err(unsupported_access(plan.node).into());
         }
@@ -5931,6 +6762,509 @@ mod tests {
         }
     }
 
+    fn own_class_write_plans(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        host: &DeclaredTypeHost<'_>,
+        file: FileId,
+    ) -> Vec<OwnClassPropertyWritePlan> {
+        let bound = context.file(file).unwrap().1;
+        let mut statements = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ExpressionStatement).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        statements.sort_by_key(|node| parsed.arena.get(node.node).unwrap().range.start);
+        statements
+            .into_iter()
+            .map(|statement| {
+                let assignment = super::super::assignment::plan_own_class_property_assignment(
+                    &parsed.arena,
+                    bound,
+                    context.store(),
+                    host,
+                    statement,
+                )
+                .unwrap()
+                .unwrap();
+                plan_own_class_property_write(context.store(), host, &assignment).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep source admission, cold-cache replay, and damage restoration together.
+    fn own_class_property_writes_resolve_unpublished_receiver_symbols_and_reject_foreign_caches() {
+        let parsed = parsed(concat!(
+            "class Model { value = 0; } ",
+            "const model = new Model(); const other = new Model(); ",
+            "model.value = 1; other.value = 2;",
+        ));
+        let file = FileId::new(202_622);
+        let mut context = class_body_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let cold = class_property_cache_state(&context, &parsed, file);
+        let plans = own_class_write_plans(&context, &parsed, &host, file);
+        assert_eq!(plans.len(), 2);
+        assert_ne!(
+            plans[0].assignment().receiver_symbol,
+            plans[1].assignment().receiver_symbol
+        );
+        for plan in &plans {
+            assert!(
+                context
+                    .store()
+                    .symbol_node_links(plan.assignment().receiver)
+                    .is_none()
+            );
+        }
+        assert_eq!(class_property_cache_state(&context, &parsed, file), cold);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let options = context.options();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for (index, plan) in plans.iter().enumerate() {
+            let assignment = plan.assignment();
+            let original = context
+                .store()
+                .symbol_node_links(assignment.receiver)
+                .unwrap()
+                .clone();
+            assert_eq!(original.resolved_symbol, Some(assignment.receiver_symbol));
+            let receiver_type = context
+                .store()
+                .type_node_links(assignment.receiver)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(assignment.receiver, SymbolNodeLinks::default(),)
+            );
+            let unpublished = class_property_cache_state(&context, &parsed, file);
+            let relations = context.store().relation_state_snapshot();
+            for _ in 0..2 {
+                let checked = validate_own_class_property_write_target(
+                    context.store(),
+                    &host,
+                    options,
+                    plan,
+                    receiver_type,
+                )
+                .unwrap();
+                assert_eq!(checked.type_, number);
+                assert!(checked.diagnostic.is_none());
+                assert_eq!(
+                    class_property_cache_state(&context, &parsed, file),
+                    unpublished
+                );
+                assert_eq!(context.store().relation_state_snapshot(), relations);
+            }
+            assert!(context.store_mut_for_test().set_symbol_node_links(
+                assignment.receiver,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(plans[1 - index].assignment().receiver_symbol)
+                },
+            ));
+            let poisoned = class_property_cache_state(&context, &parsed, file);
+            for _ in 0..2 {
+                assert!(matches!(
+                    validate_own_class_property_write_target(context.store(), &host, options, plan, receiver_type),
+                    Err(SourcePropertyError::InvalidCache(node)) if node == assignment.left
+                ));
+                assert_eq!(
+                    class_property_cache_state(&context, &parsed, file),
+                    poisoned
+                );
+                assert_eq!(context.store().relation_state_snapshot(), relations);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(assignment.receiver, original)
+            );
+            let restored = class_property_cache_state(&context, &parsed, file);
+            assert_eq!(
+                validate_own_class_property_write_target(
+                    context.store(),
+                    &host,
+                    options,
+                    plan,
+                    receiver_type,
+                )
+                .unwrap()
+                .type_,
+                number
+            );
+            assert_eq!(
+                class_property_cache_state(&context, &parsed, file),
+                restored
+            );
+        }
+        let warm = class_property_cache_state(&context, &parsed, file);
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(class_property_cache_state(&context, &parsed, file), warm);
+    }
+
+    #[test]
+    fn own_class_property_writes_plan_readonly_fields_before_class_publication() {
+        let parsed = parsed(concat!(
+            "class Model { readonly value: string = ''; static readonly value: string = ''; } ",
+            "const model = new Model(); model.value = 1; Model.value = 1;",
+        ));
+        let file = FileId::new(202_611);
+        let mut context = class_body_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let cold = class_property_cache_state(&context, &parsed, file);
+        let plans = own_class_write_plans(&context, &parsed, &host, file);
+        assert_eq!(plans.len(), 2);
+        for plan in &plans {
+            assert!(plan.member.readonly);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol(plan.member.symbol)
+                    .unwrap()
+                    .check_flags(),
+                CheckFlags::NONE,
+            );
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(plan.member.symbol)
+                    .is_none()
+            );
+        }
+        assert_eq!(class_property_cache_state(&context, &parsed, file), cold);
+        context.check_source_file(file).unwrap();
+        assert_eq!(context.diagnostics().len(), 2);
+        for (diagnostic, plan) in context.diagnostics().as_slice().iter().zip(&plans) {
+            assert_eq!(diagnostic.node, Some(plan.property.name_node));
+            assert_eq!(diagnostic.diagnostic.code(), 2540);
+        }
+        assert_eq!(own_class_write_plans(&context, &parsed, &host, file), plans);
+        let warm = class_property_cache_state(&context, &parsed, file);
+        let diagnostics = context.diagnostics().clone();
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(class_property_cache_state(&context, &parsed, file), warm);
+        assert_eq!(context.diagnostics(), &diagnostics);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Poison each actual published cache, then restore the same source.
+    fn own_class_property_writes_reject_changed_target_and_receiver_caches() {
+        let parsed = parsed(concat!(
+            "class Model { value = 0; static value = 0; } ",
+            "const model = new Model(); model.value = 1; Model.value = 1;",
+        ));
+        let file = FileId::new(202_612);
+        let mut context = class_body_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let plans = own_class_write_plans(&context, &parsed, &host, file);
+        assert_eq!(plans.len(), 2);
+        let options = context.options();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for (index, plan) in plans.iter().enumerate() {
+            let assignment = plan.assignment();
+            let left_type = context
+                .store()
+                .type_node_links(assignment.left)
+                .unwrap()
+                .clone();
+            let left_symbol = context
+                .store()
+                .symbol_node_links(assignment.left)
+                .unwrap()
+                .clone();
+            let receiver = context
+                .store()
+                .type_node_links(assignment.receiver)
+                .unwrap()
+                .clone();
+            let receiver_type = receiver.resolved_type.unwrap();
+            let field = context
+                .store()
+                .value_symbol_links(plan.member.symbol)
+                .unwrap()
+                .clone();
+            for corruption in 0..4 {
+                match corruption {
+                    0 => assert!(context.store_mut_for_test().set_type_node_links(
+                        assignment.left,
+                        TypeNodeLinks {
+                            resolved_type: Some(string),
+                            ..left_type.clone()
+                        },
+                    )),
+                    1 => assert!(context.store_mut_for_test().set_type_node_links(
+                        assignment.receiver,
+                        TypeNodeLinks {
+                            resolved_type: Some(string),
+                            ..receiver.clone()
+                        },
+                    )),
+                    2 => assert!(context.store_mut_for_test().set_symbol_node_links(
+                        assignment.left,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(plans[1 - index].member.symbol)
+                        },
+                    )),
+                    3 => assert!(context.store_mut_for_test().set_value_symbol_links(
+                        plan.member.symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(string),
+                            ..field.clone()
+                        },
+                    )),
+                    _ => unreachable!(),
+                }
+                let before = class_property_cache_state(&context, &parsed, file);
+                let field_before = context
+                    .store()
+                    .value_symbol_links(plan.member.symbol)
+                    .cloned();
+                let relations = context.store().relation_state_snapshot();
+                for _ in 0..2 {
+                    assert!(matches!(
+                        check_own_class_property_write_target(
+                            context.store_mut_for_test(), &host, options, plan, receiver_type,
+                        ),
+                        Err(SourcePropertyError::InvalidCache(node)) if node == assignment.left
+                    ));
+                    assert_eq!(class_property_cache_state(&context, &parsed, file), before);
+                    assert_eq!(
+                        context.store().value_symbol_links(plan.member.symbol),
+                        field_before.as_ref()
+                    );
+                    assert_eq!(context.store().relation_state_snapshot(), relations);
+                    assert!(context.diagnostics().is_empty());
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(assignment.left, left_type.clone())
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(assignment.left, left_symbol.clone())
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(assignment.receiver, receiver.clone())
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(plan.member.symbol, field.clone())
+                );
+                let restored = class_property_cache_state(&context, &parsed, file);
+                let checked = check_own_class_property_write_target(
+                    context.store_mut_for_test(),
+                    &host,
+                    options,
+                    plan,
+                    receiver_type,
+                )
+                .unwrap();
+                assert_eq!(checked.type_, number);
+                assert!(checked.diagnostic.is_none());
+                assert_eq!(
+                    class_property_cache_state(&context, &parsed, file),
+                    restored
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn own_class_property_writes_keep_source_owner_and_side_proofs() {
+        let parsed = parsed(concat!(
+            "class First { value = 0; static value = 0; } ",
+            "class Second { value = 0; static value = 0; } ",
+            "declare const first: First; declare const second: Second; ",
+            "first.value = 1; First.value = 1; second.value = 1;",
+        ));
+        let file = FileId::new(202_613);
+        let mut context = class_body_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let plans = own_class_write_plans(&context, &parsed, &host, file);
+        assert_eq!(plans.len(), 3);
+        let options = context.options();
+        let original = &plans[0];
+        let receiver = context
+            .store()
+            .type_node_links(original.assignment.receiver)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        for corruption in 0..3 {
+            let mut forged = original.clone();
+            match corruption {
+                0 => forged.assignment.class_symbol = plans[2].assignment.class_symbol,
+                1 => forged.member = plans[2].member.clone(),
+                2 => forged.assignment.side = ClassPropertySide::Static,
+                _ => unreachable!(),
+            }
+            let before = class_property_cache_state(&context, &parsed, file);
+            for _ in 0..2 {
+                assert!(matches!(
+                    check_own_class_property_write_target(context.store_mut_for_test(), &host, options, &forged, receiver),
+                    Err(SourcePropertyError::InvalidCache(node)) if node == original.assignment.left
+                ));
+                assert_eq!(class_property_cache_state(&context, &parsed, file), before);
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+        let before = class_property_cache_state(&context, &parsed, file);
+        check_own_class_property_write_target(
+            context.store_mut_for_test(),
+            &host,
+            options,
+            original,
+            receiver,
+        )
+        .unwrap();
+        assert_eq!(class_property_cache_state(&context, &parsed, file), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep all damaged owner states beside their restore checks.
+    fn own_class_property_writes_reject_changed_field_kind_and_member_table() {
+        let parsed =
+            parsed("class Model { value = 0; } const model = new Model(); model.value = 1;");
+        let file = FileId::new(202_614);
+        let mut context = class_body_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let plans = own_class_write_plans(&context, &parsed, &host, file);
+        let [plan] = plans.as_slice() else {
+            panic!("one actual write")
+        };
+        let owner = context
+            .store()
+            .symbol(plan.assignment.class_symbol)
+            .unwrap();
+        let relationships = (
+            owner.members(),
+            owner.exports(),
+            owner.parent(),
+            owner.export_symbol(),
+        );
+        let empty = context.store_mut_for_test().alloc_symbol_table();
+        let receiver = context
+            .store()
+            .type_node_links(plan.assignment.receiver)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let options = context.options();
+        for corruption in 0..3 {
+            match corruption {
+                0 | 1 => assert!(context.store_mut_for_test().set_symbol_flags(
+                    plan.member.symbol,
+                    if corruption == 0 {
+                        SymbolFlags::METHOD
+                    } else {
+                        SymbolFlags::GET_ACCESSOR
+                    },
+                    CheckFlags::NONE,
+                )),
+                2 => assert!(context.store_mut_for_test().set_symbol_relationships(
+                    plan.assignment.class_symbol,
+                    Some(empty),
+                    relationships.1,
+                    relationships.2,
+                    relationships.3,
+                )),
+                _ => unreachable!(),
+            }
+            let before = class_property_cache_state(&context, &parsed, file);
+            for _ in 0..2 {
+                assert!(matches!(
+                    check_own_class_property_write_target(context.store_mut_for_test(), &host, options, plan, receiver),
+                    Err(SourcePropertyError::InvalidCache(node)) if node == plan.assignment.left
+                ));
+                assert_eq!(class_property_cache_state(&context, &parsed, file), before);
+                assert!(context.diagnostics().is_empty());
+            }
+            assert!(context.store_mut_for_test().set_symbol_flags(
+                plan.member.symbol,
+                SymbolFlags::PROPERTY,
+                CheckFlags::NONE
+            ));
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                plan.assignment.class_symbol,
+                relationships.0,
+                relationships.1,
+                relationships.2,
+                relationships.3,
+            ));
+            let restored = class_property_cache_state(&context, &parsed, file);
+            check_own_class_property_write_target(
+                context.store_mut_for_test(),
+                &host,
+                options,
+                plan,
+                receiver,
+            )
+            .unwrap();
+            assert_eq!(
+                class_property_cache_state(&context, &parsed, file),
+                restored
+            );
+        }
+    }
+
     fn source_property_context<'arena>(
         files: &[(FileId, &'arena ParseResult)],
         declaration_count: usize,
@@ -7594,6 +8928,508 @@ mod tests {
             context.recheck_source_file(file).unwrap();
             assert_eq!(context.diagnostics(), &diagnostics);
             assert_eq!(class_property_cache_state(&context, &parsed, file), before);
+        }
+    }
+
+    fn private_destructuring_test_plans(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        host: &DeclaredTypeHost<'_>,
+        file: FileId,
+    ) -> Vec<SourceClassPropertyWritePlan> {
+        let mut targets = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let target = NodeRef::new(parsed.arena.id(), file, node);
+                class_destructuring_write_assignment(host, target)
+                    .map(|_| (record.range.start, target))
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by_key(|(start, _)| *start);
+        targets
+            .into_iter()
+            .map(|(_, target)| {
+                plan_class_destructuring_property_write(context.store(), host, target).unwrap()
+            })
+            .collect()
+    }
+
+    fn private_destructuring_test_state(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (ClassPropertyCacheState, [usize; 6]) {
+        let store = context.store();
+        (
+            class_property_cache_state(context, parsed, file),
+            [
+                store.mapper_len(),
+                store.index_info_len(),
+                store.type_alias_len(),
+                store.symbol_store().symbol_table_len(),
+                store.type_resolution_len(),
+                store.type_resolution_start(),
+            ],
+        )
+    }
+
+    #[test]
+    fn private_destructuring_projection_rechecks_source_and_result_caches() {
+        use crate::semantic::instantiate::InstantiationLimits;
+
+        let parsed = parsed(concat!(
+            "class Model { #state: number = 0; update(value: number): void { ",
+            "const source = { value }; ({ value: this.#state } = source); ",
+            "const after: number = this.#state; } }",
+        ));
+        let file = FileId::new(202_940);
+        let mut context = class_body_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let plan = private_destructuring_test_plans(&context, &parsed, &host, file).remove(0);
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let arrays = CanonicalArrayTargets::from_global_types(&globals);
+        let source_type = context
+            .store()
+            .type_node_links(plan.value())
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let mut caller = InstantiationSession::new(InstantiationLimits::default());
+        let property = super::super::object_members::resolve_object_property_by_key_with_source(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            source_type,
+            EscapedNameRef::source(plan.destructuring().unwrap().name()),
+            &mut caller,
+            &mut CanonicalCheckerDiagnostics::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let receipt = CheckedClassDestructuringSource::new(
+            context.store(),
+            &host,
+            &plan,
+            source_type,
+            property,
+            arrays,
+        )
+        .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(receipt.assigned_type(), number);
+        assert_ne!(source_type, number);
+        assert_ne!(property.symbol, plan.member());
+        let before = private_destructuring_test_state(&context, &parsed, file);
+        for node in [plan.value(), plan.node()] {
+            let original = context.store().type_node_links(node).unwrap().clone();
+            assert!(context.store_mut_for_test().set_type_node_links(
+                node,
+                TypeNodeLinks {
+                    resolved_type: Some(number),
+                    ..original.clone()
+                }
+            ));
+            let damaged = private_destructuring_test_state(&context, &parsed, file);
+            for _ in 0..2 {
+                assert_eq!(
+                    receipt.validate(context.store(), &host, &plan, true),
+                    Err(SourcePropertyError::InvalidCache(plan.target()))
+                );
+                assert_eq!(
+                    private_destructuring_test_state(&context, &parsed, file),
+                    damaged
+                );
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(node, original)
+            );
+            assert_eq!(
+                receipt.validate(context.store(), &host, &plan, true),
+                Ok(())
+            );
+            assert_eq!(
+                private_destructuring_test_state(&context, &parsed, file),
+                before
+            );
+        }
+        let original = context
+            .store()
+            .value_symbol_links(property.symbol)
+            .unwrap()
+            .clone();
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            property.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..original.clone()
+            }
+        ));
+        let damaged = private_destructuring_test_state(&context, &parsed, file);
+        for _ in 0..2 {
+            assert_eq!(
+                receipt.validate(context.store(), &host, &plan, true),
+                Err(SourcePropertyError::InvalidCache(plan.target()))
+            );
+            assert_eq!(
+                private_destructuring_test_state(&context, &parsed, file),
+                damaged
+            );
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(property.symbol, original)
+        );
+        assert_eq!(
+            receipt.validate(context.store(), &host, &plan, true),
+            Ok(())
+        );
+        assert_eq!(
+            private_destructuring_test_state(&context, &parsed, file),
+            before
+        );
+        assert_eq!((caller.query_count(), caller.limit_event_count()), (0, 0));
+    }
+
+    #[test]
+    fn private_destructuring_targets_keep_owners_tokens_and_the_spent_caller() {
+        use crate::semantic::instantiate::{
+            InstantiationError, InstantiationLimits, instantiate_type_with_session,
+        };
+
+        let parsed = parsed(concat!(
+            "class First { #state: number = 0; update(value: number): void { ",
+            "const source = { value }; ({ value: this.#state } = source); } } ",
+            "class Second { #state: number = 0; update(value: number): void { ",
+            "const source = { value }; ({ value: this.#state } = source); } }",
+        ));
+        let file = FileId::new(202_941);
+        let mut context = class_body_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let plans = private_destructuring_test_plans(&context, &parsed, &host, file);
+        let [plan, other] = plans.as_slice() else {
+            panic!("expected two real private writes")
+        };
+        assert_ne!(plan.member(), other.member());
+        assert!(
+            context
+                .store()
+                .symbol(plan.member())
+                .unwrap()
+                .name()
+                .is_private_identifier()
+        );
+        assert_ne!(
+            context.store().symbol(plan.member()).unwrap().name(),
+            context.store().symbol(other.member()).unwrap().name()
+        );
+        let mut tokens = Vec::new();
+        for plan in &plans {
+            let class = classes::plan_source_class_members(
+                context.store(),
+                &host,
+                plan.context().class_symbol(),
+            )
+            .unwrap();
+            let body = class
+                .bodies()
+                .iter()
+                .find(|body| body.declaration == plan.context().body_declaration())
+                .unwrap();
+            let prepared =
+                classes::prepare_source_class_members(context.store_mut_for_test(), &host, &class)
+                    .unwrap();
+            tokens.push(prepared.body_access(context.store(), &host, body).unwrap());
+        }
+        let identities =
+            classes::class_body_identities(context.store(), &host, &tokens[0]).unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let arrays = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let mapper = context
+            .store_mut_for_test()
+            .new_simple_type_mapper(identities.this_type, identities.instance_type)
+            .unwrap();
+        let mut caller = InstantiationSession::new(InstantiationLimits {
+            max_count: 1,
+            max_depth: 1,
+        });
+        assert_eq!(
+            instantiate_type_with_session(
+                context.store_mut_for_test(),
+                identities.this_type,
+                mapper,
+                arrays,
+                &mut caller
+            ),
+            Ok(identities.instance_type)
+        );
+        assert_eq!(caller.query_count(), 1);
+        let checked = check_class_property_write_target(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            plan,
+            identities.this_type,
+            &tokens[0],
+        )
+        .unwrap();
+        let source_type = context
+            .store()
+            .type_node_links(plan.value())
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let property = super::super::object_members::resolve_object_property_by_key_with_source(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            source_type,
+            EscapedNameRef::source(plan.destructuring().unwrap().name()),
+            &mut caller,
+            &mut CanonicalCheckerDiagnostics::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(property.type_, checked.write_type());
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .is_type_assignable_to_with_session(
+                    property.type_,
+                    checked.write_type(),
+                    Some(&globals),
+                    Some(options.strict_function_types),
+                    &mut caller,
+                ),
+            Ok(true)
+        );
+        assert_eq!((caller.query_count(), caller.limit_event_count()), (1, 0));
+        let before = private_destructuring_test_state(&context, &parsed, file);
+        let mut forged = plan.clone();
+        forged.member = other.member();
+        assert!(
+            matches!(validate_class_property_write_access(context.store(), &host, &forged, &tokens[0]),
+            Err(SourcePropertyError::InvalidCache(node)) if node == plan.target())
+        );
+        assert!(
+            matches!(validate_class_property_write_access(context.store(), &host, plan, &tokens[1]),
+            Err(SourcePropertyError::InvalidCache(node)) if node == plan.target())
+        );
+        assert_eq!(
+            private_destructuring_test_state(&context, &parsed, file),
+            before
+        );
+        let node_links = context
+            .store()
+            .type_node_links(plan.target())
+            .unwrap()
+            .clone();
+        let symbol_links = context
+            .store()
+            .symbol_node_links(plan.target())
+            .unwrap()
+            .clone();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for damage in [false, true] {
+            if damage {
+                assert!(context.store_mut_for_test().set_symbol_node_links(
+                    plan.target(),
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(other.member()),
+                        ..symbol_links.clone()
+                    }
+                ));
+            } else {
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    plan.target(),
+                    TypeNodeLinks {
+                        resolved_type: Some(string),
+                        ..node_links.clone()
+                    }
+                ));
+            }
+            let damaged = private_destructuring_test_state(&context, &parsed, file);
+            for _ in 0..2 {
+                assert_eq!(
+                    check_class_property_write_target(
+                        context.store_mut_for_test(),
+                        &host,
+                        &globals,
+                        options,
+                        plan,
+                        identities.this_type,
+                        &tokens[0],
+                    ),
+                    Err(SourcePropertyError::InvalidCache(plan.target()))
+                );
+                assert_eq!(
+                    private_destructuring_test_state(&context, &parsed, file),
+                    damaged
+                );
+                assert_eq!((caller.query_count(), caller.limit_event_count()), (1, 0));
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(plan.target(), node_links.clone())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(plan.target(), symbol_links.clone())
+            );
+            assert_eq!(
+                check_class_property_write_target(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    plan,
+                    identities.this_type,
+                    &tokens[0],
+                ),
+                Ok(checked.clone())
+            );
+            assert_eq!(
+                private_destructuring_test_state(&context, &parsed, file),
+                before
+            );
+        }
+        assert_eq!(
+            instantiate_type_with_session(
+                context.store_mut_for_test(),
+                identities.this_type,
+                mapper,
+                arrays,
+                &mut caller
+            ),
+            Err(InstantiationError::CountLimit { count: 1, limit: 1 })
+        );
+        assert_eq!((caller.query_count(), caller.limit_event_count()), (1, 1));
+    }
+
+    #[test]
+    fn private_destructuring_writes_preserve_readonly_constructor_authority() {
+        for constructor in [false, true] {
+            let parsed = parsed(if constructor {
+                "class Model { readonly #state: number; constructor(value: number) { const source = { value }; ({ value: this.#state } = source); } }"
+            } else {
+                "class Model { readonly #state: number = 0; update(value: number): void { const source = { value }; ({ value: this.#state } = source); } }"
+            });
+            let file = FileId::new(202_942);
+            let context = class_body_context(&parsed, file);
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                crate::semantic::production::GlobalMergeCompletion::for_test(
+                    context.options().name_resolution,
+                ),
+            )
+            .unwrap();
+            let target = parsed
+                .arena
+                .iter()
+                .find_map(|(node, _)| {
+                    let node = NodeRef::new(parsed.arena.id(), file, node);
+                    class_destructuring_write_assignment(&host, node).map(|_| node)
+                })
+                .unwrap();
+            let before = private_destructuring_test_state(&context, &parsed, file);
+            let result = plan_class_destructuring_property_write(context.store(), &host, target);
+            if constructor {
+                let plan = result.unwrap();
+                assert!(plan.readonly);
+                assert!(plan.destructuring().is_some());
+                assert_eq!(plan.context.phase, ClassAccessPhase::Constructor);
+            } else {
+                assert_eq!(result, Err(unsupported_access(target)));
+            }
+            assert_eq!(
+                private_destructuring_test_state(&context, &parsed, file),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn private_destructuring_optional_targets_remain_explicit_boundaries() {
+        let parsed = parsed(concat!(
+            "class Model { #state?: number; update(value: number): void { ",
+            "const source = { value }; ({ value: this.#state } = source); } }",
+        ));
+        let file = FileId::new(202_945);
+        let context = class_body_context(&parsed, file);
+        let bound = context.file(file).unwrap().1;
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let target = parsed
+            .arena
+            .iter()
+            .find_map(|(node, _)| {
+                let node = NodeRef::new(parsed.arena.id(), file, node);
+                class_destructuring_write_assignment(&host, node).map(|_| node)
+            })
+            .unwrap();
+        let property = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(record.data, NodeData::PropertyDeclaration(_)).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .and_then(|node| bound.symbol(node))
+            .unwrap();
+        assert!(context.store().value_symbol_links(property).is_none());
+        let before = private_destructuring_test_state(&context, &parsed, file);
+        for _ in 0..2 {
+            assert_eq!(
+                plan_class_destructuring_property_write(context.store(), &host, target),
+                Err(SourcePropertyError::Unsupported(
+                    SourcePropertyUnsupported::OptionalProperty {
+                        node: target,
+                        property,
+                    }
+                ))
+            );
+            assert_eq!(
+                private_destructuring_test_state(&context, &parsed, file),
+                before
+            );
         }
     }
 

@@ -5,13 +5,29 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeFormatFlags, SignatureId,
-    TypeData, TypeId, signatures::ElementFlags,
+    TypeData, TypeId, signatures::ElementFlags, type_records::StructuredTypeData,
 };
 use ts_options::ScriptTarget;
 use ts_parser::{ParseResult, parse_source_file};
 
 const FILE: FileId = FileId::new(62_202);
 const LIBRARY_FILE: FileId = FileId::new(62_201);
+
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
+}
 
 fn context<'a>(
     parsed: &'a ParseResult,
@@ -442,7 +458,7 @@ fn a_broad_method_implementation_does_not_accept_bad_overload_arguments() {
     assert_eq!(parameter_types, ["string | number", "number"]);
     let callable = context.get_type_at_location(callee(&parsed, call)).unwrap();
     let members = match context.store().type_payload(callable).unwrap().data() {
-        TypeData::Object(data) => &data.structured,
+        data @ TypeData::Object(_) => structured_data(data).unwrap(),
         _ => panic!("expected the source callable's structured type"),
     };
     assert_eq!(members.signatures.as_deref(), Some(&original[..2]));
