@@ -118,6 +118,7 @@ struct SourceNodeFacts {
     default_function_name: Option<NodeId>,
     prefix_unary_operator: Option<SyntaxKind>,
     type_operator: Option<SyntaxKind>,
+    class_annotation_role: Option<NodeId>,
     type_parameter_annotations: Option<Box<TypeParameterAnnotationFacts>>,
     alias_type_parameter: Option<Box<AliasTypeParameterSyntaxFacts>>,
     mapped_type: Option<Box<MappedTypeSyntaxFacts>>,
@@ -9507,6 +9508,36 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         })
     }
 
+    /// Reads the written parameter or field annotation from registered source.
+    /// Initializers can be allocated between the annotation and its holder.
+    #[must_use]
+    pub(super) fn source_class_annotation_role(&self, holder: NodeRef) -> Option<NodeRef> {
+        let facts = self.source_node_fact(holder)?;
+        if !matches!(
+            facts.kind,
+            SyntaxKind::Parameter | SyntaxKind::PropertyDeclaration
+        ) {
+            return None;
+        }
+        let annotation = NodeRef::new(holder.arena, holder.file, facts.class_annotation_role?);
+        let annotation_facts = self.source_node_fact(annotation)?;
+        let is_type = annotation_facts.kind.is_keyword_type()
+            || (SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
+                .contains(&(annotation_facts.kind as u16));
+        if !is_type
+            || annotation_facts.parent != Some(holder.node)
+            || self
+                .source_direct_children(holder)?
+                .iter()
+                .filter(|child| **child == annotation)
+                .count()
+                != 1
+        {
+            return None;
+        }
+        Some(annotation)
+    }
+
     /// Returns the final direct type annotation on a registered declaration.
     #[must_use]
     pub(super) fn source_direct_type_annotation(&self, declaration: NodeRef) -> Option<NodeRef> {
@@ -9660,6 +9691,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 },
                 type_operator: match &node.data {
                     NodeData::TypeOperatorNode(operator) => Some(operator.operator),
+                    _ => None,
+                },
+                class_annotation_role: match &node.data {
+                    NodeData::ParameterDeclaration(parameter) => parameter.type_,
+                    NodeData::PropertyDeclaration(property) => property.type_,
                     _ => None,
                 },
                 type_parameter_annotations: match &node.data {
@@ -14555,6 +14591,9 @@ fn canonical_type_resolution_property(
         | TypeSystemPropertyName::AliasTarget => None,
     }
 }
+
+#[cfg(test)]
+mod class_annotation_role_tests;
 
 #[cfg(test)]
 mod tests {
