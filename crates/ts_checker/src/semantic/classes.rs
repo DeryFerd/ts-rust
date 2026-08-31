@@ -10629,7 +10629,7 @@ fn class_property_modifiers(
                     declaration,
                 )));
             };
-            let abstract_class = class.modifiers.as_ref().is_some_and(|modifiers| {
+            let mut abstract_class = class.modifiers.as_ref().is_some_and(|modifiers| {
                 matches!(
                     modifiers.list.nodes.as_slice(),
                     [modifier]
@@ -10638,6 +10638,33 @@ fn class_property_modifiers(
                             .is_some_and(|modifier| modifier.kind == SyntaxKind::AbstractKeyword)
                 )
             });
+            if !abstract_class
+                && class.modifiers.as_ref().is_some_and(|modifiers| {
+                    matches!(modifiers.list.nodes.as_slice(), [_, modifier]
+                        if host.node(NodeRef::new(owner.arena, owner.file, *modifier))
+                            .is_some_and(|modifier| modifier.kind == SyntaxKind::AbstractKeyword))
+                })
+            {
+                let symbol = bound_symbol(store, host, owner)
+                    .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(owner)))?;
+                let symbol_record = store
+                    .symbol(symbol)
+                    .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))?;
+                let name = class
+                    .name
+                    .map(|node| NodeRef::new(owner.arena, owner.file, node))
+                    .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(owner)))?;
+                let (ambient, is_abstract, export_local) = plan_class_declaration_modifiers(
+                    store,
+                    host,
+                    owner,
+                    symbol,
+                    symbol_record,
+                    name,
+                    class.modifiers.as_ref(),
+                )?;
+                abstract_class = !ambient && is_abstract && export_local.is_some();
+            }
             if !abstract_class {
                 return Err(unsupported(ClassUnsupported::PropertyModifiers(
                     declaration,
@@ -18199,6 +18226,20 @@ fn plan_class_declaration_modifiers(
                     )));
                 }
             }
+        }
+        [_, modifier]
+            if host
+                .node(NodeRef::new(declaration.arena, declaration.file, *modifier))
+                .is_some_and(|modifier| modifier.kind == SyntaxKind::AbstractKeyword)
+                && bound.source_facts().is_some_and(|facts| {
+                    !facts.is_declaration_file() && !facts.is_javascript_file()
+                }) =>
+        {
+            (
+                &[SyntaxKind::ExportKeyword, SyntaxKind::AbstractKeyword][..],
+                false,
+                true,
+            )
         }
         [_, modifier]
             if host
@@ -48559,6 +48600,88 @@ export function systemSetTimeoutZero(callback: TimeoutCallback): void {
             ),
             warm,
         );
+    }
+
+    #[test]
+    fn exported_abstract_class_reads_recheck_local_owner_and_constructor_flags() {
+        let parsed = parse_source_file(concat!(
+            "export abstract class Model { abstract value: string; abstract read(): string; } ",
+            "export class Other {}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut fixture =
+            fixture_from_parsed_with_module_state(parsed, CanonicalModuleState::External);
+        let owner = class_symbol(&fixture, "Model");
+        let other = class_symbol(&fixture, "Other");
+        let declaration = class_node(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let local = bound.local_symbol(declaration).unwrap();
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        assert!(plan.is_abstract());
+        assert_eq!(plan.export_local(), Some(local));
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("the exported abstract class has no base")
+        };
+        assert!(!class.class.ambient);
+        assert!(class.class.instance_properties[0].abstract_property);
+        assert!(class.uninitialized_instance_properties().is_empty());
+        let property = &class.class.instance_properties[0];
+        let property_record = host.node(property.declaration).unwrap();
+        let NodeData::PropertyDeclaration(data) = &property_record.data else {
+            unreachable!()
+        };
+
+        assert!(
+            fixture
+                .store
+                .set_symbol_relationships(local, None, None, None, Some(other),)
+        );
+        let damaged = format!("{:?}", fixture.store);
+        assert!(plan_nongeneric_class_member_query(&fixture.store, &host, owner).is_err());
+        assert!(
+            class_property_modifiers(
+                &fixture.store,
+                &host,
+                property.declaration,
+                property.name_node,
+                data.modifiers.as_ref(),
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(format!("{:?}", fixture.store), damaged);
+        assert!(
+            fixture
+                .store
+                .set_symbol_relationships(local, None, None, None, Some(owner),)
+        );
+        assert_eq!(
+            plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+            Ok(plan.clone()),
+        );
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+        let signature = members.default_construct_signature();
+        let flags = SignatureFlags::CONSTRUCT | SignatureFlags::ABSTRACT;
+        assert_eq!(fixture.store.signature(signature).unwrap().flags(), flags);
+        let warm = format!("{:?}", fixture.store);
+        assert!(
+            fixture
+                .store
+                .set_signature_flags(signature, SignatureFlags::CONSTRUCT)
+        );
+        let damaged = format!("{:?}", fixture.store);
+        assert!(execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).is_err());
+        assert_eq!(format!("{:?}", fixture.store), damaged);
+        assert!(fixture.store.set_signature_flags(signature, flags));
+        assert_eq!(format!("{:?}", fixture.store), warm);
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members),
+        );
+        assert_eq!(format!("{:?}", fixture.store), warm);
     }
 
     #[test]

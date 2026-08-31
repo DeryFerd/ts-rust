@@ -12268,17 +12268,23 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Ok(None);
         };
         let name_start = self.node(self.reference(name))?.range.start.get();
-        if let [export, default] = modifiers.list.nodes.as_slice()
-            && self
-                .bound
-                .source_facts()
-                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
-            && self.node(self.reference(*default))?.kind == SyntaxKind::DefaultKeyword
+        if let [export, modifier] = modifiers.list.nodes.as_slice()
+            && let Some(facts) = self.bound.source_facts()
+            && (facts.is_declaration_file()
+                && self.node(self.reference(*modifier))?.kind == SyntaxKind::DefaultKeyword
+                || !facts.is_declaration_file()
+                    && !facts.is_javascript_file()
+                    && self.node(self.reference(*modifier))?.kind == SyntaxKind::AbstractKeyword)
         {
             let export = self.reference(*export);
-            let default = self.reference(*default);
+            let modifier = self.reference(*modifier);
             let export_node = self.node(export)?;
-            let default_node = self.node(default)?;
+            let modifier_node = self.node(modifier)?;
+            let spelling = if modifier_node.kind == SyntaxKind::AbstractKeyword {
+                "abstract"
+            } else {
+                "default"
+            };
             if !is_external_module
                 || modifiers.flags.0 != 0
                 || modifiers.list.has_trailing_comma
@@ -12288,14 +12294,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 || export_node.flags.0 != 0
                 || export_node.parent != Some(declaration.node)
                 || export_node.range.start != declaration_range.start
-                || export_node.range.end > default_node.range.start
+                || export_node.range.end > modifier_node.range.start
                 || !matches!(export_node.data, NodeData::Token(_))
                 || !self.source_spelling_matches(export, "export")
-                || default_node.flags.0 != 0
-                || default_node.parent != Some(declaration.node)
-                || default_node.range.end.get() > modifiers.list.range.end.get()
-                || !matches!(default_node.data, NodeData::Token(_))
-                || !self.source_spelling_matches(default, "default")
+                || modifier_node.flags.0 != 0
+                || modifier_node.parent != Some(declaration.node)
+                || modifier_node.range.end.get() > modifiers.list.range.end.get()
+                || !matches!(modifier_node.data, NodeData::Token(_))
+                || !self.source_spelling_matches(modifier, spelling)
             {
                 return Err(SourceCheckError::Unsupported(
                     UnsupportedSourceSyntax::Class(declaration),
