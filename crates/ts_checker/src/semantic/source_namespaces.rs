@@ -472,6 +472,78 @@ pub(super) fn validate_module_export_table(
     module_value_exports(store, host, owner, declarations, exports).map(|_| ())
 }
 
+/// Proves the source parent of an alias replaced by a native ambient export merge.
+pub(super) fn native_ambient_losing_export_parent_is_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    parent: SemanticSymbolId,
+) -> Result<bool, SourceCheckError> {
+    let Some(saved) = store.native_ambient_module_exports(parent) else {
+        return Ok(false);
+    };
+    let invalid = || SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(parent));
+    let owner = store.symbol(parent).ok_or_else(invalid)?;
+    let declarations = owner.declarations().ok_or_else(invalid)?;
+    validate_module_export_table(store, host, parent, declarations, owner.exports())?;
+
+    let Some(record) = store.symbol(symbol) else {
+        return Ok(false);
+    };
+    let Some([declaration]) = record.declarations() else {
+        return Ok(false);
+    };
+    let Some((_, bound)) = host.source(*declaration) else {
+        return Ok(false);
+    };
+    if record.flags() != SymbolFlags::ALIAS
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || store.get_parent_of_symbol(symbol) != Some(parent)
+        || host.node(*declaration).is_none_or(|node| {
+            node.kind != SyntaxKind::ExportSpecifier
+                || !matches!(node.data, NodeData::ExportSpecifier(_))
+        })
+        || bound.symbol(*declaration) != Some(symbol)
+    {
+        return Ok(false);
+    }
+    let Some(source_owner) = bound
+        .container(*declaration)
+        .and_then(|container| bound.symbol(container))
+    else {
+        return Ok(false);
+    };
+    let Some(source) = saved
+        .sources
+        .iter()
+        .find(|source| source.symbol == source_owner)
+    else {
+        return Ok(false);
+    };
+    let selected = owner
+        .exports()
+        .and_then(|table| store.symbol_table(table))
+        .and_then(|table| table.get(record.name()))
+        .and_then(|selected| store.get_merged_symbol(selected));
+    Ok(store.get_merged_symbol(source_owner) == Some(parent)
+        && source.exports.entries.iter().any(|entry| {
+            entry.name.as_ref() == record.name()
+                && entry.symbol == symbol
+                && entry.canonical == symbol
+        })
+        && saved.losing.iter().any(|losing| {
+            losing.source_owner == source_owner
+                && losing.name.as_ref() == record.name()
+                && losing.symbol == symbol
+                && losing.selected != symbol
+                && selected == Some(losing.selected)
+                && losing
+                    .aliases
+                    .first()
+                    .is_some_and(|edge| edge.alias == symbol && edge.declaration == *declaration)
+        }))
+}
+
 fn module_value_exports(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -12579,7 +12651,7 @@ pub(super) fn merge_source_ambient_module_exports(
     let NodeData::StringLiteral(name) = &name_record.data else {
         return Ok(());
     };
-    let Some((_, bound)) = host.source(plan.declaration) else {
+    let Some((arena, bound)) = host.source(plan.declaration) else {
         return Err(missing_node(plan.declaration));
     };
     if !plan.ambient
@@ -12588,6 +12660,17 @@ pub(super) fn merge_source_ambient_module_exports(
             .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
         || name.text.contains('*')
     {
+        return Ok(());
+    }
+    // External augmentations keep their resolved target, not a new global module entry.
+    if bound
+        .module_augmentations()
+        .iter()
+        .any(|augmentation| augmentation.name() == plan.name)
+    {
+        if plan_source_namespace(arena, bound, store, plan.declaration)? != *plan {
+            return Err(SourceCheckError::Import(plan.declaration));
+        }
         return Ok(());
     }
     let owner = store
@@ -14955,6 +15038,216 @@ mod tests {
     ) -> Result<(), SourceCheckError> {
         let host = fixture.context.declared_type_host().unwrap();
         validate_ambient_module_merge_dependencies(fixture.context.store(), &host, &fixture.plan)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check the same source-owned losing alias through damage and restoration.
+    fn native_losing_export_parent_requires_the_complete_current_source_proof() {
+        let proof = |context: &CanonicalCheckerContext<'_>, symbol, parent| {
+            let host = context.declared_type_host().unwrap();
+            native_ambient_losing_export_parent_is_exact(context.store(), &host, symbol, parent)
+        };
+        for warm in [false, true] {
+            let mut fixture = native_ambient_value_fixture();
+            let owner = fixture.plan.symbol;
+            let alias = fixture.aliases[0];
+            if warm {
+                fixture.context.get_type_of_module_value(owner).unwrap();
+            }
+            let before = native_ambient_value_snapshot(&fixture.context);
+            for _ in 0..2 {
+                assert_eq!(proof(&fixture.context, alias, owner), Ok(true));
+                for symbol in [fixture.selected, fixture.aliases[1], fixture.other] {
+                    assert_eq!(proof(&fixture.context, symbol, owner), Ok(false));
+                }
+                assert_eq!(proof(&fixture.context, alias, fixture.other), Ok(false));
+                assert_eq!(native_ambient_value_snapshot(&fixture.context), before);
+            }
+
+            let saved = fixture.context.store().symbol(alias).unwrap().clone();
+            let links = fixture
+                .context
+                .store()
+                .alias_symbol_links(alias)
+                .unwrap()
+                .clone();
+            let selected_table = fixture
+                .context
+                .store()
+                .symbol(owner)
+                .unwrap()
+                .exports()
+                .unwrap();
+            let raw_table = fixture
+                .context
+                .store()
+                .symbol(fixture.raw[0])
+                .unwrap()
+                .exports()
+                .unwrap();
+            for damage in 0..4 {
+                let store = fixture.context.store_mut_for_test();
+                match damage {
+                    0 => assert_eq!(
+                        store.insert_symbol(selected_table, EscapedName::source("foo"), alias),
+                        Some(Some(fixture.selected))
+                    ),
+                    1 => assert_eq!(
+                        store.insert_symbol(
+                            raw_table,
+                            EscapedName::source("foo"),
+                            fixture.selected
+                        ),
+                        Some(Some(alias))
+                    ),
+                    2 => {
+                        let mut changed = links.clone();
+                        changed.immediate_target = Some(fixture.aliases[2]);
+                        assert!(store.set_alias_symbol_links(alias, changed));
+                    }
+                    3 => assert!(store.set_symbol_relationships(
+                        alias,
+                        saved.members(),
+                        saved.exports(),
+                        Some(fixture.other),
+                        saved.export_symbol()
+                    )),
+                    _ => unreachable!(),
+                }
+                let changed = native_ambient_value_snapshot(&fixture.context);
+                for _ in 0..2 {
+                    assert_eq!(
+                        proof(&fixture.context, alias, owner),
+                        Err(SourceCheckError::Variable(
+                            VariableInvariant::InvalidSymbolShape(owner)
+                        ))
+                    );
+                    assert_eq!(native_ambient_value_snapshot(&fixture.context), changed);
+                }
+                let store = fixture.context.store_mut_for_test();
+                assert!(
+                    store
+                        .insert_symbol(selected_table, EscapedName::source("foo"), fixture.selected)
+                        .is_some()
+                );
+                assert!(
+                    store
+                        .insert_symbol(raw_table, EscapedName::source("foo"), alias)
+                        .is_some()
+                );
+                assert!(store.set_alias_symbol_links(alias, links.clone()));
+                assert!(store.set_symbol_relationships(
+                    alias,
+                    saved.members(),
+                    saved.exports(),
+                    saved.parent(),
+                    saved.export_symbol()
+                ));
+                assert_eq!(store.symbol(alias), Some(&saved));
+                assert_eq!(store.alias_symbol_links(alias), Some(&links));
+                assert_eq!(
+                    store
+                        .symbol_table(selected_table)
+                        .unwrap()
+                        .get_source("foo"),
+                    Some(fixture.selected)
+                );
+                assert_eq!(
+                    store.symbol_table(raw_table).unwrap().get_source("foo"),
+                    Some(alias)
+                );
+                let restored = native_ambient_value_snapshot(&fixture.context);
+                assert_eq!(proof(&fixture.context, alias, owner), Ok(true));
+                assert_eq!(native_ambient_value_snapshot(&fixture.context), restored);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Compare script and external ownership without changing either source.
+    fn external_augmentation_registration_keeps_the_original_global_capture() {
+        for state in [CanonicalModuleState::Script, CanonicalModuleState::External] {
+            let mut fixture = declaration_fixture(
+                "declare module 'extension' { export const value: number; }",
+                state,
+            );
+            let namespace = plan(&fixture, 0);
+            let bound = fixture.context.file(fixture.file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(fixture.context.options().name_resolution),
+            )
+            .unwrap();
+            let external = state == CanonicalModuleState::External;
+            assert_eq!(
+                bound
+                    .module_augmentations()
+                    .iter()
+                    .any(|item| item.name() == namespace.name),
+                external
+            );
+            let globals = fixture.context.globals();
+            let original_table = fixture
+                .context
+                .store()
+                .symbol_table(globals)
+                .unwrap()
+                .clone();
+            let original_capture =
+                format!("{:?}", fixture.context.store().source_global_bindings());
+            let name = fixture
+                .context
+                .store()
+                .symbol(namespace.symbol)
+                .unwrap()
+                .name()
+                .to_owned();
+            assert_eq!(original_table.get(name.as_ref()).is_none(), external);
+            let before = native_ambient_value_snapshot(&fixture.context);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            for _ in 0..2 {
+                assert_eq!(
+                    merge_source_ambient_module_exports(
+                        fixture.context.store_mut_for_test(),
+                        &host,
+                        &mut diagnostics,
+                        &namespace
+                    ),
+                    Ok(())
+                );
+                assert!(diagnostics.is_empty());
+                assert_eq!(native_ambient_value_snapshot(&fixture.context), before);
+            }
+            if external {
+                let mut changed = namespace.clone();
+                changed.members.clear();
+                assert_ne!(changed, namespace);
+                assert_eq!(
+                    merge_source_ambient_module_exports(
+                        fixture.context.store_mut_for_test(),
+                        &host,
+                        &mut diagnostics,
+                        &changed
+                    ),
+                    Err(SourceCheckError::Import(namespace.declaration))
+                );
+                assert!(diagnostics.is_empty());
+                assert_eq!(native_ambient_value_snapshot(&fixture.context), before);
+            }
+            fixture.context.check_source_file(fixture.file).unwrap();
+            for _ in 0..2 {
+                fixture.context.recheck_source_file(fixture.file).unwrap();
+                assert_eq!(
+                    fixture.context.store().symbol_table(globals),
+                    Some(&original_table)
+                );
+                assert_eq!(
+                    format!("{:?}", fixture.context.store().source_global_bindings()),
+                    original_capture
+                );
+                assert!(fixture.context.diagnostics().is_empty());
+            }
+        }
     }
 
     fn assert_native_ambient_value_failure(

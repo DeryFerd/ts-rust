@@ -1387,7 +1387,12 @@ fn validated_parent(
                 .and_then(|table| table.get(record.name()))
                 .is_some_and(|candidate| same_reference(store, candidate, source).unwrap_or(false))
         });
-    if !member {
+    if !member
+        && !super::source_namespaces::native_ambient_losing_export_parent_is_exact(
+            store, host, symbol, parent,
+        )
+        .map_err(|_| SymbolDisplayError::InvalidSymbol(symbol))?
+    {
         return Err(SymbolDisplayError::InvalidSymbol(symbol));
     }
     Ok(Some(parent))
@@ -3825,6 +3830,397 @@ mod tests {
             context.store().symbol(make).unwrap().name(),
             InternalSymbolName::Default.as_ref()
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the original files, both source aliases, and damage restoration together.
+    fn native_ambient_losing_export_display_keeps_source_identity_and_parent_proofs() {
+        use crate::semantic::artifact_queries::CanonicalArtifactQueryError;
+
+        let inputs = [
+            (
+                include_str!("../../../ts_bundled/libs/lib.es5.d.ts"),
+                "/lib.es5.d.ts",
+                true,
+                true,
+                CanonicalModuleState::Script,
+            ),
+            (
+                include_str!("../../../ts_bundled/libs/lib.decorators.d.ts"),
+                "/lib.decorators.d.ts",
+                true,
+                true,
+                CanonicalModuleState::Script,
+            ),
+            (
+                include_str!("../../../ts_bundled/libs/lib.decorators.legacy.d.ts"),
+                "/lib.decorators.legacy.d.ts",
+                true,
+                true,
+                CanonicalModuleState::Script,
+            ),
+            (
+                concat!(
+                    "declare function foo(): void;\n",
+                    "declare namespace foo { export const items: string[]; }\n",
+                    "export = foo;\n",
+                ),
+                "/node_modules/foo/index.d.ts",
+                true,
+                false,
+                CanonicalModuleState::External,
+            ),
+            (
+                "declare module 'mymod' { import * as foo from 'foo'; export { foo }; }\n",
+                "/a.d.ts",
+                true,
+                false,
+                CanonicalModuleState::Script,
+            ),
+            (
+                "declare module 'mymod' { export const foo: number; }\n",
+                "/b.d.ts",
+                true,
+                false,
+                CanonicalModuleState::Script,
+            ),
+            (
+                concat!(
+                    "declare global { interface Array<T> { customMethod(): T; } }\n",
+                    "export {};\n",
+                ),
+                "/augment.ts",
+                false,
+                false,
+                CanonicalModuleState::External,
+            ),
+            (
+                concat!(
+                    "import * as foo from 'foo';\n",
+                    "const items = foo.items;\n",
+                    "const result: string = items.customMethod();\n",
+                    "const fresh: string[] = [];\n",
+                    "const result2: string = fresh.customMethod();\n",
+                ),
+                "/index.ts",
+                false,
+                false,
+                CanonicalModuleState::External,
+            ),
+        ];
+        let parsed = inputs.map(|(text, _, _, _, _)| parse_source_file(text));
+        let files = [
+            41_051, 41_052, 41_053, 41_054, 41_055, 41_056, 41_057, 41_058,
+        ]
+        .map(FileId::new);
+        let node = |index: usize, kind: SyntaxKind| {
+            parsed[index]
+                .arena
+                .iter()
+                .find_map(|(id, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(
+                        parsed[index].arena.id(),
+                        files[index],
+                        id,
+                    ))
+                })
+                .unwrap()
+        };
+        let export = node(4, SyntaxKind::ExportSpecifier);
+        let constant = node(5, SyntaxKind::VariableDeclaration);
+        let NodeData::ExportSpecifier(export_data) =
+            &parsed[4].arena.get(export.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let NodeData::VariableDeclaration(constant_data) =
+            &parsed[5].arena.get(constant.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let names = [
+            NodeRef::new(export.arena, export.file, export_data.name),
+            NodeRef::new(constant.arena, constant.file, constant_data.name),
+        ];
+        let modules = [4, 5].map(|index| node(index, SyntaxKind::ModuleDeclaration));
+        let namespace_import = node(4, SyntaxKind::NamespaceImport);
+        let provider = node(3, SyntaxKind::FunctionDeclaration);
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                format!("{:?}", context.store()),
+                context.diagnostics().clone(),
+            )
+        };
+        let assert_diagnostics = |context: &CanonicalCheckerContext<'_>| {
+            let diagnostics = context.diagnostics().as_slice();
+            assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+            for (diagnostic, (name, related)) in diagnostics
+                .iter()
+                .zip([(names[0], names[1]), (names[1], names[0])])
+            {
+                assert_eq!(diagnostic.node, Some(name));
+                assert!(diagnostic.range_override.is_none());
+                assert_eq!(diagnostic.diagnostic.code(), 2451);
+                assert_eq!(diagnostic.diagnostic.arguments, ["foo"]);
+                assert_eq!(
+                    diagnostic.diagnostic.render().unwrap(),
+                    "Cannot redeclare block-scoped variable 'foo'."
+                );
+                let [other] = diagnostic.related_information.as_slice() else {
+                    panic!("each duplicate keeps its other source declaration")
+                };
+                assert_eq!(other.node, Some(related));
+                assert_eq!(other.diagnostic.code(), 6203);
+                assert_eq!(other.diagnostic.arguments, ["foo"]);
+                assert_eq!(
+                    other.diagnostic.render().unwrap(),
+                    "'foo' was also declared here."
+                );
+            }
+        };
+
+        for query_first in [false, true] {
+            let mut binder = CanonicalBinder::new();
+            for (index, (_, path, declaration, library, module)) in inputs.iter().enumerate() {
+                assert!(parsed[index].diagnostics.is_empty());
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed[index].arena,
+                        parsed[index].source_file,
+                        files[index],
+                        CanonicalSourceFileFacts::new_with_default_library(
+                            EscapedName::source(format!("\"{path}\"")),
+                            CanonicalSourceLanguage::TypeScript,
+                            *declaration,
+                            *library,
+                            *module,
+                        ),
+                    )
+                    .unwrap();
+            }
+            for (index, source) in parsed.iter().enumerate() {
+                binder
+                    .bind_typescript_declaration_slice(&source.arena, files[index])
+                    .unwrap();
+            }
+            let entries = [4, 7].map(|index| {
+                let import = node(index, SyntaxKind::ImportDeclaration);
+                let NodeData::ImportDeclaration(data) =
+                    &parsed[index].arena.get(import.node).unwrap().data
+                else {
+                    unreachable!()
+                };
+                CanonicalModuleResolutionEntry::resolved(
+                    NodeRef::new(import.arena, import.file, data.module_specifier),
+                    CanonicalResolvedModuleInput::new(
+                        files[3],
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::Esm,
+                    ),
+                )
+            });
+            let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+                binder.finish(),
+                parsed
+                    .iter()
+                    .enumerate()
+                    .map(|(index, source)| (files[index], &source.arena))
+                    .collect(),
+                CanonicalCheckerOptions {
+                    no_emit: true,
+                    name_resolution: ts_binder::CanonicalNameResolverOptions {
+                        emit_target: ts_options::ScriptTarget::Es2015,
+                        ..ts_binder::CanonicalNameResolverOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+                CanonicalModuleResolutionManifestInput::new(entries),
+            )
+            .unwrap();
+            assert!(context.global_type_diagnostics().next().is_none());
+            let raw = |declaration: NodeRef| {
+                context
+                    .file(declaration.file)
+                    .unwrap()
+                    .1
+                    .symbol(declaration)
+                    .unwrap()
+            };
+            let raw_modules = modules.map(raw);
+            let losing = raw(export);
+            let selected = raw(constant);
+            let imported = raw(namespace_import);
+            let original = raw(provider);
+            let parent = context.store().get_merged_symbol(raw_modules[0]).unwrap();
+            assert_ne!(raw_modules[0], raw_modules[1]);
+            assert_eq!(
+                context.store().get_merged_symbol(raw_modules[1]),
+                Some(parent)
+            );
+            assert_ne!(losing, selected);
+            assert_eq!(context.store().get_merged_symbol(losing), Some(losing));
+            assert_eq!(context.store().get_merged_symbol(selected), Some(selected));
+            assert_eq!(
+                context.store().symbol(losing).unwrap().flags(),
+                SymbolFlags::ALIAS
+            );
+            assert_eq!(
+                context.store().symbol(selected).unwrap().flags(),
+                SymbolFlags::BLOCK_SCOPED_VARIABLE
+            );
+            let saved = context
+                .store()
+                .native_ambient_module_exports(parent)
+                .unwrap()
+                .clone();
+            let [lost] = saved.losing.as_ref() else {
+                panic!("the native merge retains the one losing export")
+            };
+            assert_eq!(saved.owner, parent);
+            assert_eq!(saved.sources.len(), 2);
+            assert_eq!(lost.source_owner, raw_modules[0]);
+            assert_eq!(lost.name.as_utf8(), Some("foo"));
+            assert_eq!(lost.symbol, losing);
+            assert_eq!(lost.selected, selected);
+            assert_eq!(lost.aliases[0].alias, losing);
+            assert_eq!(lost.aliases[0].declaration, export);
+            assert_eq!(lost.aliases[1].alias, imported);
+            assert_eq!(lost.aliases[1].declaration, namespace_import);
+            let raw_exports = context
+                .store()
+                .symbol(raw_modules[0])
+                .unwrap()
+                .exports()
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_table(raw_exports)
+                    .unwrap()
+                    .get_source("foo"),
+                Some(losing)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_table(saved.selected.table)
+                    .unwrap()
+                    .get_source("foo"),
+                Some(selected)
+            );
+            assert_eq!(context.store().get_parent_of_symbol(losing), Some(parent));
+            let globals = context.global_types().clone();
+            assert_diagnostics(&context);
+            let diagnostics = context.diagnostics().clone();
+            let assert_display = |context: &mut CanonicalCheckerContext<'_>| {
+                let before = snapshot(context);
+                for (name, owner, declaration) in
+                    [(names[0], losing, export), (names[1], selected, constant)]
+                {
+                    assert_eq!(context.get_symbol_at_location(name), Ok(Some(owner)));
+                    assert_eq!(
+                        context.get_symbol_declarations(owner).unwrap(),
+                        [declaration]
+                    );
+                    for location in [name, declaration] {
+                        assert_eq!(
+                            context.symbol_to_string_at_location(owner, location),
+                            Ok("foo".to_owned())
+                        );
+                    }
+                }
+                assert_eq!(snapshot(context), before);
+                assert_diagnostics(context);
+            };
+
+            if query_first {
+                assert!(context.store().value_symbol_links(original).is_none());
+                assert_display(&mut context);
+                assert!(context.store().value_symbol_links(original).is_none());
+                for &file in &files[3..] {
+                    assert!(
+                        context
+                            .store()
+                            .source_file_links(context.source_file(file).unwrap())
+                            .is_none_or(|links| !links.type_checked)
+                    );
+                }
+            }
+            for &file in &files[3..] {
+                context.check_source_file(file).unwrap();
+            }
+            assert_display(&mut context);
+            assert_eq!(context.diagnostics(), &diagnostics);
+            assert_eq!(context.global_types(), &globals);
+            let warm = snapshot(&context);
+            for forced in [false, true] {
+                for &file in files[3..].iter().rev() {
+                    if forced {
+                        context.recheck_source_file(file).unwrap();
+                    } else {
+                        context.check_source_file(file).unwrap();
+                    }
+                }
+                assert_display(&mut context);
+                assert_eq!(snapshot(&context), warm);
+            }
+
+            let record = context.store().symbol(losing).unwrap().clone();
+            let links = context.store().alias_symbol_links(losing).unwrap().clone();
+            assert_eq!(record.parent(), Some(raw_modules[0]));
+            assert_ne!(links.alias_target, AliasTargetState::Resolved(selected));
+            for damage in ["losing row", "alias edge", "parent"] {
+                let store = context.store_mut_for_test();
+                match damage {
+                    "losing row" => assert_eq!(
+                        store.insert_symbol(raw_exports, EscapedName::source("foo"), selected),
+                        Some(Some(losing))
+                    ),
+                    "alias edge" => {
+                        let mut changed = links.clone();
+                        changed.alias_target = AliasTargetState::Resolved(selected);
+                        assert!(store.set_alias_symbol_links(losing, changed));
+                    }
+                    "parent" => assert!(store.set_symbol_relationships(
+                        losing,
+                        record.members(),
+                        record.exports(),
+                        Some(raw_modules[1]),
+                        record.export_symbol(),
+                    )),
+                    _ => unreachable!(),
+                }
+                let damaged = snapshot(&context);
+                for _ in 0..2 {
+                    assert_eq!(
+                        context.symbol_to_string_at_location(losing, export),
+                        Err(CanonicalArtifactQueryError::SymbolDisplay(
+                            SymbolDisplayError::InvalidSymbol(losing)
+                        )),
+                        "{damage}"
+                    );
+                    assert_eq!(snapshot(&context), damaged, "{damage}");
+                }
+                let store = context.store_mut_for_test();
+                match damage {
+                    "losing row" => assert_eq!(
+                        store.insert_symbol(raw_exports, EscapedName::source("foo"), losing),
+                        Some(Some(selected))
+                    ),
+                    "alias edge" => assert!(store.set_alias_symbol_links(losing, links.clone())),
+                    "parent" => assert!(store.set_symbol_relationships(
+                        losing,
+                        record.members(),
+                        record.exports(),
+                        record.parent(),
+                        record.export_symbol(),
+                    )),
+                    _ => unreachable!(),
+                }
+                assert_display(&mut context);
+                assert_eq!(context.diagnostics(), &diagnostics);
+            }
+        }
     }
 
     #[test]

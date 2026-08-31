@@ -2240,7 +2240,16 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         assignment: SemanticSymbolId,
         publish: bool,
     ) -> Result<Option<DisplayAliasTarget>, CanonicalAliasTargetUnavailable> {
-        if resolved.is_ambient_module() || resolved.usage_mode() != resolved.target_mode() {
+        if resolved.is_ambient_module()
+            || resolved.usage_mode() != resolved.target_mode()
+                && !matches!(
+                    (resolved.usage_mode(), resolved.target_mode()),
+                    (
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::CommonJs
+                    )
+                )
+        {
             return Ok(None);
         }
 
@@ -6529,6 +6538,122 @@ mod tests {
             (store.symbol_len(), store.symbol_store().symbol_table_len()),
             allocations
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each mode pair uses the same real import and provider proof.
+    fn declaration_namespace_import_modes_keep_exact_export_equals_owners() {
+        let modes = [
+            CanonicalModuleResolutionMode::CommonJs,
+            CanonicalModuleResolutionMode::Esm,
+        ];
+        for usage in modes {
+            for target in modes {
+                let importer = parsed("import * as renamed from './foo';");
+                let provider = parsed(concat!(
+                    "declare function foo(): void; ",
+                    "declare namespace foo {} ",
+                    "export = foo;",
+                ));
+                let importer_file = FileId::new(14_120);
+                let provider_file = FileId::new(14_121);
+                let files = [
+                    (importer_file, &importer, CanonicalModuleState::External),
+                    (provider_file, &provider, CanonicalModuleState::External),
+                ];
+                let specifier = node_ref(&importer, importer_file, module_specifiers(&importer)[0]);
+                let (mut store, bound_files, manifest) = fixture_with_declaration_files(
+                    &files,
+                    CanonicalModuleResolutionManifestInput::new([
+                        CanonicalModuleResolutionEntry::resolved(
+                            specifier,
+                            CanonicalResolvedModuleInput::new(provider_file, usage, target),
+                        ),
+                    ]),
+                    &[provider_file],
+                );
+                let binding = alias_declaration_named(&importer, importer_file, "renamed");
+                let import_alias = alias(&bound_files, binding);
+                let provider_bound = bound_files.get(&provider_file).unwrap();
+                let original = store
+                    .symbol_table(provider_bound.locals(provider_bound.source_file()).unwrap())
+                    .unwrap()
+                    .get_source("foo")
+                    .unwrap();
+                let module = source_module(&bound_files, provider_file);
+                let original_record = store.symbol(original).unwrap().clone();
+                let clause = importer.arena.get(binding.node).unwrap().parent.unwrap();
+                let import = importer.arena.get(clause).unwrap().parent.unwrap();
+                let origin = node_ref(&importer, importer_file, import);
+                let mut host = ProductionAliasTargetHost::new(
+                    &store,
+                    sources(&files, &bound_files),
+                    &manifest,
+                )
+                .unwrap();
+                let result = CanonicalAliasResolver::new(&mut store, &mut host)
+                    .resolve_alias(import_alias)
+                    .unwrap()
+                    .target
+                    .symbol()
+                    .unwrap();
+                let wraps = usage == target
+                    || (usage == CanonicalModuleResolutionMode::Esm
+                        && target == CanonicalModuleResolutionMode::CommonJs);
+                if wraps {
+                    assert_ne!(result, original);
+                    assert_ne!(result, import_alias);
+                    assert_eq!(
+                        store.export_type_links(result),
+                        Some(&ExportTypeLinks {
+                            target: Some(original),
+                            originating_import: Some(origin),
+                        })
+                    );
+                    let wrapper = store.symbol(result).unwrap();
+                    assert_eq!(wrapper.declarations(), original_record.declarations());
+                    let exports = store.symbol_table(wrapper.exports().unwrap()).unwrap();
+                    assert_eq!(exports.len(), 1);
+                    let default = exports.get(InternalSymbolName::Default.as_ref()).unwrap();
+                    assert_eq!(store.symbol(default).unwrap().parent(), Some(module));
+                    assert_eq!(
+                        store.alias_symbol_links(default),
+                        Some(&AliasSymbolLinks {
+                            immediate_target: Some(original),
+                            alias_target: AliasTargetState::Resolved(original),
+                            ..AliasSymbolLinks::default()
+                        })
+                    );
+                } else {
+                    assert_eq!(result, original);
+                    assert!(store.export_type_links(result).is_none());
+                }
+                assert_eq!(store.symbol(original), Some(&original_record));
+                let before = (
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.checker_link_allocated_lengths(),
+                );
+                for _ in 0..2 {
+                    assert_eq!(
+                        CanonicalAliasResolver::new(&mut store, &mut host)
+                            .resolve_alias(import_alias)
+                            .unwrap()
+                            .target,
+                        AliasTargetState::Resolved(result)
+                    );
+                    assert_eq!(
+                        (
+                            store.symbol_len(),
+                            store.symbol_store().symbol_table_len(),
+                            store.checker_link_allocated_lengths(),
+                        ),
+                        before
+                    );
+                    assert_eq!(store.symbol(original), Some(&original_record));
+                }
+            }
+        }
     }
 
     #[test]
