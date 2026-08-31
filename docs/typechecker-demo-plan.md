@@ -74,13 +74,22 @@ and dependency records remained in the shared target. That run does not verify
 the new class-body code. The [full result](../target/wave202-demo-generic-class-bodies-focused-1-report.md)
 keeps the failed validation and all original evidence.
 
-The next Hono build will use a new, empty source-specific target. It will check
-the actual Cargo artifact records before the project run. We will not copy or
+Hono builds now use new, empty source-specific targets. Each build checks
+the actual Cargo artifact records before the project run. We do not copy or
 delete old build caches. Cargo uses relative source paths and modification
 times for freshness. Those rules make cross-worktree cache reuse unsafe for
-this workflow. The exact local cache decision remains under review.
+this workflow. The exact local cache decision remains an inference.
 [Cargo's fingerprint documentation](https://doc.rust-lang.org/stable/nightly-rustc/cargo/core/compiler/fingerprint/index.html)
 describes these rules. This finding does not prove that every older run is wrong.
+
+The first isolated Hono build failed after 37 seconds with Rust E0063.
+One qualified class-base initializer lacked its required `constructor_value`
+field. The reporter was not built, so no Hono project stage ran. Both runtime
+and separate cleanup checks closed. The one-line fix is committed and reviewed
+at `9c26f3bbd72bf5cf19ba3c0f73046092131f557b`. All tests and original inputs
+remain unchanged. The next full-project attempt is being prepared with a new
+empty target. The [repair receipt](../target/wave202-demo-hono-qualified-base-build-repair-commit.md)
+keeps its exact source and review evidence. It is not a successful rebuild.
 
 The Query contextual-arrow candidate ran all 5,114 selected checker and public
 tests. It passed 5,064 and failed 50. Five failures are in the new controls.
@@ -93,7 +102,7 @@ retains every failed test. No result from this run is added to another run.
 
 ## Selected projects
 
-| Target | Complete upstream scope | Why use it | Fresh Rust construction result |
+| Target | Complete upstream scope | Why use it | Last project-stage result |
 | --- | --- | --- | --- |
 | Hono | `tsconfig.build.json`, 188 roots | Strict library build with ES2022 target. Dependencies are prepared. Saved Go cold diagnostics are empty. | Unsupported class in `http-exception.ts`. |
 | TanStack Query core | `packages/query-core/tsconfig.prod.json`, 23 roots | Strict ESNext/Bundler package. Dependencies and declaration outputs are prepared. Saved Go cold and warm diagnostics are empty. | Unsupported arrow in `timeoutManager.ts`. |
@@ -145,14 +154,19 @@ library run passed 5,115 of 5,143 tests. The remaining 28 library failures stay
 visible. This result is not a Hono project pass.
 
 The eight reviewed Hono dependencies are combined at `27347713`. The complete
-source integration is reviewed, but it has not run. A separate worker prepares
-the isolated reporter build and full original-project check. Further source
+source integration is reviewed. Its isolated build failed as recorded above.
+The corrected candidate is `9c26f3bb`. A separate worker prepares its next
+isolated reporter build and full original-project check. Further source
 audits found named method return annotations, property truthiness flow and
 ambient `Response` construction restrictions in the original `getResponse`
-method. Five independent pairs now implement the reviewed changes in one new
-tree, with one owner for each source file. Separate pairs plan six missing
-global and library queries, generic class methods, class-field initializers,
-and the remaining condition check.
+method. Five independent pairs have prepared those changes in one new tree.
+The complete combined source still needs final review and runtime checks.
+The next parallel batch addresses the shared DOM/Node owner, alias heritage,
+globalThis, conditional, import, defaulted-union and condition queries.
+Another batch combines the committed generic class bodies, construction,
+methods and executable imports. Each batch has one writer per source file
+and one owner for Git changes. Generic class method combinations, field
+initializers and named/indexed alias bounds also have reviewed plans.
 These are source findings, not the next measured project error.
 
 The Query source audit identifies missing contextual typing for the first
@@ -173,7 +187,11 @@ Their runtime checks are not complete. The generic-class-body run above is
 invalid. The first two generic function-alias runs stopped on missing Rust
 imports. Both import-only corrections are committed. The third run executed
 all 5,080 selected tests and failed 70, including all 17 new controls. A pair
-is tracing those failures before any repair or integration claim.
+proved two first-stop defects: copied signatures use a declaration-owned
+parameter publisher, and alias-owned union references lack their owner proof.
+The exact three-file repair is released. All 17 controls stay intact, and
+aliases remain outside the class integration until the repair is reviewed.
+The other 53 failures are not assigned to this feature without a matched run.
 Executable class imports are committed and reviewed at `c295104c`, with eight
 new private and eight new public tests. Generic construction is committed and
 reviewed at `d2a6a8a3`, with 16 new private and four new public tests. Neither
