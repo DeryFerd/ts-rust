@@ -90,6 +90,8 @@
 //! can reference its own declared class identity before its bodies are complete.
 //! Declared constructor values retain their real constructor and instance interfaces.
 //! Their construct overloads and inherited members use the same source class worker.
+//! Optional named fields keep the written type in member storage and use the
+//! existing optional read and write rules.
 //! Other heritage expressions and non-primitive method annotations remain later stages.
 
 use std::collections::{HashMap, HashSet};
@@ -1953,7 +1955,12 @@ pub(super) fn plan_source_class_members_with_context(
                         NodeData::KeywordTypeNode(_)
                     )
                 {
-                    if property.optional {
+                    if property.optional
+                        && !matches!(
+                            preflight_node(store, host, property.type_node)?.data,
+                            NodeData::TypeReferenceNode(_)
+                        )
+                    {
                         return Err(unsupported(ClassUnsupported::PropertyType {
                             node: property.type_node,
                             kind: preflight_node(store, host, property.type_node)?.kind,
@@ -2062,14 +2069,27 @@ pub(super) fn plan_source_class_members_with_context(
             )?;
         }
         for property in &plan.annotated_properties {
-            annotations::validate_source_annotation_value_cache(
-                store,
-                host,
-                context,
-                symbol,
-                property.type_node,
-                property.symbol,
-            )?;
+            if property.optional && !property.parameter_property {
+                let expected = preflight_source_class_annotation(
+                    store,
+                    host,
+                    &context.global_types,
+                    context.options,
+                    property.type_node,
+                    symbol,
+                )?
+                .cached_type(store, host, Some(&context.global_types))?;
+                validate_property_value_cache_state(store, property, expected)?;
+            } else {
+                annotations::validate_source_annotation_value_cache(
+                    store,
+                    host,
+                    context,
+                    symbol,
+                    property.type_node,
+                    property.symbol,
+                )?;
+            }
         }
     }
     plan.bindings = capture_source_class_bindings(store, &plan)?;
@@ -19181,8 +19201,15 @@ fn validate_property_cache_state_with_types(
         validate_node(assertion.annotation, Some(bootstrap.any_type))?;
     }
 
+    validate_property_value_cache_state(store, property, expected_value_type?)
+}
+
+fn validate_property_value_cache_state(
+    store: &CanonicalTypeMapperStore,
+    property: &ClassPropertyPlan,
+    expected_value_type: Option<TypeId>,
+) -> Result<(), ClassError> {
     let expected_check_flags = expected_property_check_flags(property);
-    let expected_value_type = expected_value_type?;
     let check_flags = store
         .symbol(property.symbol)
         .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(property.declaration)))?
@@ -34396,6 +34423,610 @@ mod query_tests {
                 ));
                 assert!(store.declared_type_links(raw_parent).is_none());
                 assert_eq!(snapshot(store), restored);
+            }
+        }
+    }
+
+    const OPTIONAL_NAMED_PROPERTY_SOURCE: &str = concat!(
+        "type Value = number | string; type Seed<T> = T; ",
+        "class Holder { readonly value?: Value; static cache?: Value; }",
+    );
+
+    fn optional_named_alias_symbol(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        name: &str,
+    ) -> SemanticSymbolId {
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                matches!(&parsed.arena.get(alias.name)?.data,
+                    NodeData::Identifier(identifier) if identifier.text == name)
+                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        context.file(file).unwrap().1.symbol(declaration).unwrap()
+    }
+
+    fn optional_named_query_counts(
+        context: &CanonicalCheckerContext<'_>,
+    ) -> (([usize; 4], [usize; 26]), [usize; 5]) {
+        let store = context.store();
+        (
+            standard_field_query_counts(context),
+            [
+                store.type_alias_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                store.type_resolution_len(),
+                store.type_resolution_start(),
+                store.index_info_len(),
+            ],
+        )
+    }
+
+    #[test]
+    fn optional_named_class_member_queries_keep_the_written_type_and_spent_caller() {
+        let parsed = parse_source_file(OPTIONAL_NAMED_PROPERTY_SOURCE);
+        let file = FileId::new(14_460);
+        let mut context = context(&parsed, file, CanonicalModuleState::Script);
+        let (_, owner) = class(&context, &parsed, file, "Holder");
+        let alias = optional_named_alias_symbol(&context, &parsed, file, "Value");
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let type_context = ClassTypeQueryContext::new(&globals, options);
+        let before = optional_named_query_counts(&context);
+        let plan = plan_source_class_members_with_type_context(
+            context.store(),
+            &host,
+            owner,
+            Some(&type_context),
+        )
+        .unwrap();
+        assert_eq!(optional_named_query_counts(&context), before);
+        assert!(plan.properties.is_empty());
+        assert_eq!(plan.annotated_properties.len(), 2);
+        assert_eq!(plan.annotation_nodes().len(), 2);
+        let field = &plan.annotated_properties[0];
+        let cache = &plan.annotated_properties[1];
+        assert_eq!(
+            (field.name.as_str(), field.side),
+            ("value", ClassPropertySide::Instance)
+        );
+        assert_eq!(
+            (cache.name.as_str(), cache.side),
+            ("cache", ClassPropertySide::Static)
+        );
+        assert!(field.readonly);
+        assert!(!cache.readonly);
+        for property in &plan.annotated_properties {
+            assert!(property.optional);
+            assert!(property.initializer_node.is_none());
+            assert_eq!(
+                context.store().symbol(property.symbol).unwrap().flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL
+            );
+            assert_eq!(
+                preflight_source_class_annotation(
+                    context.store(),
+                    &host,
+                    &globals,
+                    options.into(),
+                    property.type_node,
+                    owner,
+                )
+                .unwrap()
+                .cached_type(context.store(), &host, Some(&globals)),
+                Ok(None)
+            );
+        }
+
+        let parameter = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(record.data, NodeData::TypeParameterDeclaration(_)).then(|| {
+                    bound
+                        .symbol(NodeRef::new(parsed.arena.id(), file, node))
+                        .unwrap()
+                })
+            })
+            .unwrap();
+        let parameter_type = context.get_declared_type_of_symbol(parameter).unwrap();
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(context.store(), parameter_type),
+            Some(parameter)
+        );
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (number, string) = (bootstrap.number_type, bootstrap.string_type);
+        let mut caller = InstantiationSession::new(InstantiationLimits {
+            max_depth: 100,
+            max_count: 1,
+        });
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                context.store_mut_for_test(),
+                parameter_type,
+                &[parameter_type],
+                &[number],
+                None,
+                &mut caller,
+            ),
+            Ok(number)
+        );
+        let mark = caller.limit_event_mark();
+        assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+        let source = context.source_file(file).unwrap();
+        let source_links = context.store().source_file_links(source).cloned();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let value = ClassValueQuery {
+            store: context.store_mut_for_test(),
+            host: &host,
+            global_types: &globals,
+            options,
+            session: &mut caller,
+            diagnostics: &mut diagnostics,
+        }
+        .member_type(field.symbol)
+        .unwrap();
+        let TypeData::Union(union) = context.store().type_payload(value).unwrap().data() else {
+            panic!("the field keeps the real named union")
+        };
+        assert_eq!(union.union.types.len(), 2);
+        assert!(union.union.types.contains(&number));
+        assert!(union.union.types.contains(&string));
+        assert_eq!(
+            context
+                .store()
+                .type_alias_links(alias)
+                .unwrap()
+                .declared_type,
+            Some(value)
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_payload(value)
+                .and_then(TypeRecord::alias)
+                .and_then(|alias| context.store().type_alias(alias))
+                .and_then(super::super::type_records::TypeAlias::symbol),
+            Some(alias)
+        );
+        assert_eq!(
+            ClassValueQuery {
+                store: context.store_mut_for_test(),
+                host: &host,
+                global_types: &globals,
+                options,
+                session: &mut caller,
+                diagnostics: &mut diagnostics,
+            }
+            .member_type(cache.symbol),
+            Ok(value)
+        );
+        let warm = optional_named_query_counts(&context);
+        for _ in 0..2 {
+            for property in &plan.annotated_properties {
+                assert_eq!(
+                    ClassValueQuery {
+                        store: context.store_mut_for_test(),
+                        host: &host,
+                        global_types: &globals,
+                        options,
+                        session: &mut caller,
+                        diagnostics: &mut diagnostics,
+                    }
+                    .member_type(property.symbol),
+                    Ok(value)
+                );
+                assert_eq!(
+                    context.store().type_node_links(property.type_node),
+                    Some(&TypeNodeLinks {
+                        resolved_type: Some(value),
+                        ..TypeNodeLinks::default()
+                    })
+                );
+                assert_eq!(
+                    context.store().value_symbol_links(property.symbol),
+                    Some(&ValueSymbolLinks {
+                        resolved_type: Some(value),
+                        ..ValueSymbolLinks::default()
+                    })
+                );
+            }
+            assert_eq!(optional_named_query_counts(&context), warm);
+            assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+            assert_eq!(caller.limit_event_mark(), mark);
+            assert_eq!(
+                context.store().source_file_links(source),
+                source_links.as_ref()
+            );
+            assert!(context.store().declared_type_links(owner).is_none());
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert!(
+                context
+                    .store()
+                    .source_class_provenance_for_symbol(owner)
+                    .is_none()
+            );
+        }
+        let mut wrong_options = options;
+        wrong_options.strict_builtin_iterator_return = !options.strict_builtin_iterator_return;
+        assert_eq!(
+            ClassValueQuery {
+                store: context.store_mut_for_test(),
+                host: &host,
+                global_types: &globals,
+                options: wrong_options,
+                session: &mut caller,
+                diagnostics: &mut diagnostics,
+            }
+            .member_type(field.symbol),
+            Err(ClassError::DeclaredType(
+                DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::CheckerOptionMismatch {
+                        established_strict_builtin_iterator_return: options
+                            .strict_builtin_iterator_return,
+                        requested_strict_builtin_iterator_return: wrong_options
+                            .strict_builtin_iterator_return,
+                    }
+                )
+            ))
+        );
+        assert_eq!(optional_named_query_counts(&context), warm);
+        assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+        assert_eq!(caller.limit_event_mark(), mark);
+        assert!(diagnostics.is_empty());
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let provenance = context
+            .store()
+            .source_class_provenance_for_symbol(owner)
+            .unwrap();
+        assert!(provenance.complete);
+        assert_eq!(
+            provenance.prepared.plan.annotated_properties,
+            plan.annotated_properties
+        );
+        assert_eq!(provenance.prepared.annotation_types.len(), 2);
+        assert!(
+            provenance
+                .prepared
+                .annotation_types
+                .iter()
+                .all(|(_, type_)| *type_ == value)
+        );
+        let warm = optional_named_query_counts(&context);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            for property in &plan.annotated_properties {
+                assert_eq!(
+                    context.get_class_query_member_type(property.symbol),
+                    Ok(value)
+                );
+            }
+            assert_eq!(optional_named_query_counts(&context), warm);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn optional_named_class_members_reject_changed_bindings_and_warm_caches() {
+        let parsed = parse_source_file(OPTIONAL_NAMED_PROPERTY_SOURCE);
+        let file = FileId::new(14_461);
+        for source_checked in [false, true] {
+            let mut context = context(&parsed, file, CanonicalModuleState::Script);
+            let (_, owner) = class(&context, &parsed, file, "Holder");
+            let other = optional_named_alias_symbol(&context, &parsed, file, "Seed");
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                crate::semantic::production::GlobalMergeCompletion::for_test(
+                    context.options().name_resolution,
+                ),
+            )
+            .unwrap();
+            let query = ClassTypeQueryContext::new(context.global_types(), context.options());
+            let plan = plan_source_class_members_with_type_context(
+                context.store(),
+                &host,
+                owner,
+                Some(&query),
+            )
+            .unwrap();
+            let property = &plan.annotated_properties[0];
+            let value = context
+                .get_class_query_member_type(property.symbol)
+                .unwrap();
+            if source_checked {
+                context.check_source_file(file).unwrap();
+            }
+            let symbol = context.store().symbol(property.symbol).unwrap().clone();
+            let annotation = context
+                .store()
+                .type_node_links(property.type_node)
+                .unwrap()
+                .clone();
+            let reference = context
+                .store()
+                .symbol_node_links(property.type_node)
+                .unwrap()
+                .clone();
+            let links = context
+                .store()
+                .value_symbol_links(property.symbol)
+                .unwrap()
+                .clone();
+            let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert_ne!(value, wrong);
+            let source = context.source_file(file).unwrap();
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                (
+                    optional_named_query_counts(context),
+                    context.store().type_node_links(property.type_node).cloned(),
+                    context
+                        .store()
+                        .symbol_node_links(property.type_node)
+                        .cloned(),
+                    context.store().value_symbol_links(property.symbol).cloned(),
+                    context
+                        .store()
+                        .source_class_provenance_for_symbol(owner)
+                        .cloned(),
+                    context
+                        .store()
+                        .symbol(property.symbol)
+                        .map(|symbol| (symbol.flags(), symbol.check_flags(), symbol.parent())),
+                    context.diagnostics().clone(),
+                )
+            };
+            for poison in [
+                "value",
+                "value-target",
+                "annotation",
+                "coherent",
+                "reference",
+                "optional",
+                "readonly",
+                "owner",
+            ] {
+                match poison {
+                    "value" => assert!(context.store_mut_for_test().set_value_symbol_links(
+                        property.symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(wrong),
+                            ..links.clone()
+                        }
+                    )),
+                    "value-target" => assert!(context.store_mut_for_test().set_value_symbol_links(
+                        property.symbol,
+                        ValueSymbolLinks {
+                            target: Some(plan.annotated_properties[1].symbol),
+                            ..links.clone()
+                        }
+                    )),
+                    "annotation" => assert!(context.store_mut_for_test().set_type_node_links(
+                        property.type_node,
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            ..annotation.clone()
+                        }
+                    )),
+                    "coherent" => {
+                        assert!(context.store_mut_for_test().set_type_node_links(
+                            property.type_node,
+                            TypeNodeLinks {
+                                resolved_type: Some(wrong),
+                                ..annotation.clone()
+                            }
+                        ));
+                        assert!(context.store_mut_for_test().set_value_symbol_links(
+                            property.symbol,
+                            ValueSymbolLinks {
+                                resolved_type: Some(wrong),
+                                ..links.clone()
+                            }
+                        ));
+                    }
+                    "reference" => assert!(context.store_mut_for_test().set_symbol_node_links(
+                        property.type_node,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(other),
+                        }
+                    )),
+                    "optional" => assert!(context.store_mut_for_test().set_symbol_flags(
+                        property.symbol,
+                        SymbolFlags::PROPERTY,
+                        symbol.check_flags()
+                    )),
+                    "readonly" => assert!(context.store_mut_for_test().set_symbol_flags(
+                        property.symbol,
+                        symbol.flags(),
+                        CheckFlags::NONE
+                    )),
+                    "owner" => assert!(context.store_mut_for_test().set_symbol_relationships(
+                        property.symbol,
+                        symbol.members(),
+                        symbol.exports(),
+                        None,
+                        symbol.export_symbol()
+                    )),
+                    _ => unreachable!(),
+                }
+                let damaged = snapshot(&context);
+                let source_links = context.store().source_file_links(source).unwrap().clone();
+                for _ in 0..2 {
+                    let error = context
+                        .get_class_query_member_type(property.symbol)
+                        .unwrap_err();
+                    assert!(
+                        matches!(
+                            error,
+                            ClassError::Invariant(_) | ClassError::DeclaredType(_)
+                        ),
+                        "{poison}: {error:?}"
+                    );
+                    let error = plan_source_class_members_with_type_context(
+                        context.store(),
+                        &host,
+                        owner,
+                        Some(&query),
+                    )
+                    .unwrap_err();
+                    assert!(
+                        matches!(
+                            error,
+                            ClassError::Invariant(_) | ClassError::DeclaredType(_)
+                        ),
+                        "{poison}: {error:?}"
+                    );
+                    assert_eq!(snapshot(&context), damaged, "{poison}");
+                    assert_eq!(
+                        context.store().source_file_links(source),
+                        Some(&source_links)
+                    );
+                }
+                if source_checked {
+                    assert!(
+                        matches!(
+                            context.recheck_source_file(file),
+                            Err(SourceCheckError::Class(_) | SourceCheckError::DeclaredType(_))
+                        ),
+                        "{poison}"
+                    );
+                    assert_eq!(snapshot(&context), damaged, "{poison}");
+                    let mut incomplete = source_links;
+                    incomplete.type_checked = false;
+                    assert_eq!(context.store().source_file_links(source), Some(&incomplete));
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(property.symbol, links.clone())
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(property.type_node, annotation.clone())
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(property.type_node, reference.clone())
+                );
+                assert!(context.store_mut_for_test().set_symbol_flags(
+                    property.symbol,
+                    symbol.flags(),
+                    symbol.check_flags()
+                ));
+                assert!(context.store_mut_for_test().set_symbol_relationships(
+                    property.symbol,
+                    symbol.members(),
+                    symbol.exports(),
+                    symbol.parent(),
+                    symbol.export_symbol()
+                ));
+                let restored = optional_named_query_counts(&context);
+                assert_eq!(
+                    context.get_class_query_member_type(property.symbol),
+                    Ok(value)
+                );
+                if source_checked {
+                    context.recheck_source_file(file).unwrap();
+                    assert!(
+                        context
+                            .store()
+                            .source_file_links(source)
+                            .unwrap()
+                            .type_checked
+                    );
+                }
+                assert_eq!(optional_named_query_counts(&context), restored);
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn optional_named_class_annotations_keep_other_optional_forms_unsupported() {
+        for (source, kind) in [
+            ("class Holder { value?: number[]; }", SyntaxKind::ArrayType),
+            (
+                "class Holder { value?: number | string; }",
+                SyntaxKind::UnionType,
+            ),
+            (
+                "type Value = number | string; class Holder { value?: Value = 1; }",
+                SyntaxKind::TypeReference,
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(14_462);
+            let context = context(&parsed, file, CanonicalModuleState::Script);
+            let (_, owner) = class(&context, &parsed, file, "Holder");
+            let symbol = context
+                .store()
+                .symbol_table(context.store().symbol(owner).unwrap().members().unwrap())
+                .unwrap()
+                .get_source("value")
+                .unwrap();
+            let declaration = context
+                .store()
+                .symbol(symbol)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            let NodeData::PropertyDeclaration(property) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let annotation = NodeRef::new(parsed.arena.id(), file, property.type_.unwrap());
+            let expected = if property.initializer.is_some() {
+                ClassUnsupported::PropertyInitializer(declaration)
+            } else {
+                ClassUnsupported::PropertyType {
+                    node: annotation,
+                    kind,
+                }
+            };
+            let host = context.declared_type_host().unwrap();
+            let query = ClassTypeQueryContext::new(context.global_types(), context.options());
+            let before = optional_named_query_counts(&context);
+            for _ in 0..2 {
+                assert_eq!(
+                    plan_source_class_members_with_type_context(
+                        context.store(),
+                        &host,
+                        owner,
+                        Some(&query)
+                    ),
+                    Err(ClassError::Unsupported(expected))
+                );
+                assert_eq!(optional_named_query_counts(&context), before);
+                assert!(context.store().value_symbol_links(symbol).is_none());
+                assert!(context.store().type_node_links(annotation).is_none());
+                assert!(context.store().declared_type_links(owner).is_none());
+                assert!(
+                    context
+                        .store()
+                        .source_class_provenance_for_symbol(owner)
+                        .is_none()
+                );
+                assert!(context.diagnostics().is_empty());
             }
         }
     }
