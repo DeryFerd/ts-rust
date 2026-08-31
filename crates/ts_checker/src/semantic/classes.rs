@@ -92,6 +92,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::source_imports::SourceClassImportPlan;
+
 mod annotations;
 mod query;
 pub(super) use annotations::{
@@ -457,6 +459,13 @@ impl SourceClassPlan {
 
     pub(super) fn type_query_context(&self) -> Option<&ClassTypeQueryContext> {
         self.type_query_context.as_ref()
+    }
+
+    pub(super) fn imported_base(&self) -> Option<&SourceClassImportPlan> {
+        self.header
+            .base
+            .as_ref()
+            .and_then(|base| base.imported.as_deref())
     }
 
     /// Written field, constructor, and method types checked by the source type query.
@@ -953,6 +962,214 @@ impl SourceClassProvenance {
     }
 }
 
+/// The real exported and source-local identities of an executable class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassImportOwner {
+    pub(super) declaration: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) export_local: SemanticSymbolId,
+    pub(super) source: super::SourceFileRef,
+    pub(super) module: SemanticSymbolId,
+}
+
+/// A completed class value keeps the caller authority used to read its graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassImportValue {
+    pub(super) owner: SourceClassImportOwner,
+    pub(super) members: ClassMembers,
+    array_targets: CanonicalArrayTargets,
+    type_context: ClassTypeQueryContext,
+}
+
+/// Proves the exported declaration without treating its header as a checked body.
+pub(super) fn source_class_import_owner(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Option<SourceClassImportOwner>, ClassError> {
+    let invalid = || invariant(ClassInvariant::InvalidOwnerSymbol(symbol));
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    if owner.flags() != SymbolFlags::CLASS {
+        return Ok(None);
+    }
+    let [declaration] = owner.declarations().unwrap_or_default() else {
+        return Err(invalid());
+    };
+    let declaration = *declaration;
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    let facts = bound.source_facts().ok_or_else(invalid)?;
+    if facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || facts.is_common_js_module()
+        || !facts.is_external_module()
+    {
+        return Ok(None);
+    }
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return Ok(None);
+    };
+    let source = bound.source_file();
+    let source_record = preflight_node(store, host, source)?;
+    let NodeData::SourceFile(source_data) = &source_record.data else {
+        return Err(invalid());
+    };
+    if owner.check_flags() != CheckFlags::NONE
+        || owner.value_declaration() != Some(declaration)
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || !store.source_symbol_declarations_match(symbol)
+        || !store.source_declaration_belongs_to_symbol(declaration, symbol)
+        || bound.symbol(declaration) != Some(symbol)
+        || record.kind != SyntaxKind::ClassDeclaration
+        || record.flags.0 & (NODE_FLAG_JSDOC | NODE_FLAG_HAS_ERROR) != 0
+        || record.parent != Some(source.node)
+        || record.range.start < source_record.range.start
+        || record.range.end > source_record.range.end
+        || source_record.kind != SyntaxKind::SourceFile
+        || source_record.parent.is_some()
+        || source_data
+            .statements
+            .nodes
+            .iter()
+            .filter(|node| **node == declaration.node)
+            .count()
+            != 1
+        || class.flow_node.is_some()
+        || class.local_symbol.is_some()
+        || class.symbol.is_some()
+        || class.next_container.is_some()
+        || class.facts != 0
+        || class.members.has_trailing_comma
+        || class.members.range.start < record.range.start
+        || class.members.range.end != record.range.end
+    {
+        return Err(invalid());
+    }
+    let name = class
+        .name
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(invalid)?;
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid());
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || name_record.range.start < record.range.start
+        || name_record.range.end > record.range.end
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || owner.name().as_utf8() != Some(identifier.text.as_str())
+    {
+        return Err(invalid());
+    }
+    let (ambient, _, local) = plan_class_declaration_modifiers(
+        store,
+        host,
+        declaration,
+        symbol,
+        owner,
+        name,
+        class.modifiers.as_ref(),
+    )?;
+    let Some(export_local) = local.filter(|_| !ambient) else {
+        return Ok(None);
+    };
+    let source = super::SourceFileRef::new(store.id(), source);
+    if !store.contains_source_file(source) {
+        return Err(invalid());
+    }
+    Ok(Some(SourceClassImportOwner {
+        declaration,
+        symbol,
+        export_local,
+        source,
+        module: owner.parent().ok_or_else(invalid)?,
+    }))
+}
+
+/// An external value needs both the checked class graph and its completed source.
+pub(super) fn completed_source_class_import_value(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    owner: SourceClassImportOwner,
+) -> Result<Option<SourceClassImportValue>, ClassError> {
+    completed_source_class_import_value_in_context(
+        store,
+        host,
+        global_types,
+        &ClassTypeQueryContext::new(global_types, options),
+        owner,
+    )
+}
+
+fn completed_source_class_import_value_in_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    type_context: &ClassTypeQueryContext,
+    owner: SourceClassImportOwner,
+) -> Result<Option<SourceClassImportValue>, ClassError> {
+    let invalid = || invariant(ClassInvariant::InvalidOwnerSymbol(owner.symbol));
+    if source_class_import_owner(store, host, owner.symbol)? != Some(owner) {
+        return Err(invalid());
+    }
+    let Some(provenance) = store.source_class_provenance_for_symbol(owner.symbol) else {
+        return Ok(None);
+    };
+    let array_targets = CanonicalArrayTargets::from_global_types(global_types);
+    if provenance.prepared.plan.array_targets != Some(array_targets)
+        || provenance.prepared.plan.type_query_context.as_ref() != Some(type_context)
+        || provenance.prepared.plan.header.export_local != Some(owner.export_local)
+    {
+        return Err(invalid());
+    }
+    validate_source_class_header(store, host, provenance)?;
+    if !provenance.complete
+        || !store
+            .source_file_links(owner.source)
+            .is_some_and(|links| links.type_checked)
+    {
+        return Ok(None);
+    }
+    if store.value_symbol_links(owner.export_local)
+        != Some(&ValueSymbolLinks {
+            resolved_type: Some(provenance.prepared.value_type),
+            ..ValueSymbolLinks::default()
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(Some(SourceClassImportValue {
+        owner,
+        members: provenance.members.clone(),
+        array_targets,
+        type_context: type_context.clone(),
+    }))
+}
+
+pub(super) fn validate_source_class_import_value(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    value: &SourceClassImportValue,
+) -> Result<(), ClassError> {
+    if completed_source_class_import_value(store, host, global_types, options, value.owner)?
+        .as_ref()
+        != Some(value)
+    {
+        return Err(invariant(ClassInvariant::InvalidValueCache(
+            value.owner.symbol,
+        )));
+    }
+    Ok(())
+}
+
 fn source_class_body(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1433,7 +1650,37 @@ pub(super) fn plan_source_class_members_with_context(
     array_targets: Option<CanonicalArrayTargets>,
     type_context: Option<&ClassTypeQueryContext>,
 ) -> Result<SourceClassPlan, ClassError> {
-    let header = plan_class_declaration_header(store, host, symbol, true)?;
+    let imports = store
+        .source_class_provenance_for_symbol(symbol)
+        .and_then(|provenance| provenance.prepared.plan.header.base.as_ref())
+        .and_then(|base| base.imported.as_deref())
+        .map_or(&[][..], std::slice::from_ref);
+    plan_source_class_members_with_imports(
+        store,
+        host,
+        symbol,
+        array_targets,
+        type_context,
+        imports,
+    )
+}
+
+pub(super) fn plan_source_class_members_with_imports(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    array_targets: Option<CanonicalArrayTargets>,
+    type_context: Option<&ClassTypeQueryContext>,
+    imports: &[SourceClassImportPlan],
+) -> Result<SourceClassPlan, ClassError> {
+    let header = plan_class_declaration_header_with_imports(
+        store,
+        host,
+        symbol,
+        true,
+        type_context,
+        imports,
+    )?;
     let record = preflight_node(store, host, header.declaration)?;
     let NodeData::ClassDeclaration(class) = &record.data else {
         return Err(invariant(ClassInvariant::InvalidDeclaration(
@@ -1870,6 +2117,27 @@ fn source_class_base_members(
     let Some(base) = &plan.header.base else {
         return Ok(None);
     };
+    if let Some(imported) = &base.imported {
+        let context = plan
+            .type_query_context
+            .as_ref()
+            .ok_or_else(|| invariant(ClassInvariant::InvalidHeritageCache(plan.symbol())))?;
+        imported
+            .validate(store, host)
+            .map_err(|_| invariant(ClassInvariant::InvalidHeritageCache(plan.symbol())))?;
+        let value = completed_source_class_import_value_in_context(
+            store,
+            host,
+            &context.global_types,
+            context,
+            imported.owner,
+        )?
+        .ok_or_else(|| unsupported(ClassUnsupported::Heritage(base.expression)))?;
+        imported
+            .validate_constructor_value_links(store, &value)
+            .map_err(|_| invariant(ClassInvariant::InvalidHeritageCache(plan.symbol())))?;
+        return Ok(Some(value.members));
+    }
     let instance = store
         .declared_type_links(base.symbol)
         .and_then(|links| links.declared_type)
@@ -2187,12 +2455,19 @@ pub(super) fn source_class_plan_is_current(
     host: &DeclaredTypeHost<'_>,
     plan: &SourceClassPlan,
 ) -> Result<bool, ClassError> {
-    Ok(plan_source_class_members_with_context(
+    let imports = plan
+        .header
+        .base
+        .as_ref()
+        .and_then(|base| base.imported.as_deref())
+        .map_or(&[][..], std::slice::from_ref);
+    Ok(plan_source_class_members_with_imports(
         store,
         host,
         plan.symbol(),
         plan.array_targets,
         plan.type_query_context.as_ref(),
+        imports,
     )? == *plan)
 }
 
@@ -3534,10 +3809,16 @@ pub(super) fn prepare_source_class_members(
                 base_value_type: base.shells.value_type,
             }
         ));
+        let resolved_symbol = edge
+            .imported
+            .as_ref()
+            .map_or(base.shells.symbol, |imported| {
+                imported.demand.read.resolved_symbol
+            });
         assert!(store.set_symbol_node_links(
             edge.expression,
             SymbolNodeLinks {
-                resolved_symbol: Some(base.shells.symbol)
+                resolved_symbol: Some(resolved_symbol)
             }
         ));
         assert!(store.set_type_node_links(
@@ -6895,6 +7176,7 @@ pub(super) struct DirectClassBasePlan {
     expression: NodeRef,
     symbol: SemanticSymbolId,
     type_arguments: Vec<DirectClassBaseTypeArgument>,
+    imported: Option<Box<SourceClassImportPlan>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13219,6 +13501,8 @@ fn plan_direct_class_base(
     declaration: NodeRef,
     owner: SemanticSymbolId,
     clauses: &ts_ast::NodeList,
+    type_context: Option<&ClassTypeQueryContext>,
+    imports: &[SourceClassImportPlan],
 ) -> Result<DirectClassBasePlan, ClassError> {
     let clause = if let [clause_id] = clauses.nodes.as_slice() {
         NodeRef::new(declaration.arena, declaration.file, *clause_id)
@@ -13285,6 +13569,7 @@ fn plan_direct_class_base(
             expression,
             symbol,
             type_arguments: Vec::new(),
+            imported: None,
         });
     }
     let NodeData::Identifier(identifier) = &expression_record.data else {
@@ -13316,9 +13601,55 @@ fn plan_direct_class_base(
         )
         .map_err(|_| unsupported(ClassUnsupported::Heritage(expression)))?
         .ok_or_else(|| unsupported(ClassUnsupported::Heritage(expression)))?;
-    let symbol = store
+    let raw_symbol = store
         .get_merged_symbol(raw)
         .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(expression)))?;
+    let mut matching = imports
+        .iter()
+        .filter(|imported| imported.demand.read.node == expression);
+    let imported = matching.next();
+    if matching.next().is_some() {
+        return Err(invariant(ClassInvariant::InvalidHeritage(expression)));
+    }
+    let symbol = if let Some(imported) = imported {
+        if raw_symbol != imported.demand.binding.alias_symbol {
+            return Err(invariant(ClassInvariant::InvalidHeritage(expression)));
+        }
+        imported
+            .validate(store, host)
+            .map_err(|_| invariant(ClassInvariant::InvalidHeritage(expression)))?;
+        let context =
+            type_context.ok_or_else(|| unsupported(ClassUnsupported::Heritage(expression)))?;
+        let value = completed_source_class_import_value_in_context(
+            store,
+            host,
+            &context.global_types,
+            context,
+            imported.owner,
+        )?
+        .ok_or_else(|| unsupported(ClassUnsupported::Heritage(expression)))?;
+        imported
+            .validate_constructor_value_links(store, &value)
+            .map_err(|_| invariant(ClassInvariant::InvalidHeritage(expression)))?;
+        for (reference, expected) in [
+            (expression, value.members.shells().value_type()),
+            (node, value.members.shells().instance_type()),
+        ] {
+            if store.type_node_links(reference).is_some_and(|links| {
+                links != &TypeNodeLinks::default()
+                    && links
+                        != &TypeNodeLinks {
+                            resolved_type: Some(expected),
+                            ..TypeNodeLinks::default()
+                        }
+            }) {
+                return Err(invariant(ClassInvariant::InvalidHeritage(expression)));
+            }
+        }
+        imported.owner.symbol
+    } else {
+        raw_symbol
+    };
     if symbol == owner
         || store
             .symbol(symbol)
@@ -13429,6 +13760,7 @@ fn plan_direct_class_base(
         expression,
         symbol,
         type_arguments,
+        imported: imported.cloned().map(Box::new),
     })
 }
 
@@ -15372,6 +15704,30 @@ fn plan_class_declaration_header(
     symbol: SemanticSymbolId,
     allow_direct_base: bool,
 ) -> Result<ClassDeclarationHeader, ClassError> {
+    let plan = store
+        .source_class_provenance_for_symbol(symbol)
+        .map(|provenance| &provenance.prepared.plan);
+    let imports = plan
+        .and_then(SourceClassPlan::imported_base)
+        .map_or(&[][..], std::slice::from_ref);
+    plan_class_declaration_header_with_imports(
+        store,
+        host,
+        symbol,
+        allow_direct_base,
+        plan.and_then(SourceClassPlan::type_query_context),
+        imports,
+    )
+}
+
+fn plan_class_declaration_header_with_imports(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    allow_direct_base: bool,
+    type_context: Option<&ClassTypeQueryContext>,
+    imports: &[SourceClassImportPlan],
+) -> Result<ClassDeclarationHeader, ClassError> {
     let merged = store
         .get_merged_symbol(symbol)
         .ok_or_else(|| invariant(ClassInvariant::SymbolNotOwned(symbol)))?;
@@ -15499,6 +15855,8 @@ fn plan_class_declaration_header(
                         declaration,
                         symbol,
                         clauses,
+                        type_context,
+                        imports,
                     )?),
                     None,
                     if combined_class_heritage_clauses(store, host, declaration, clauses)?.is_some()
@@ -32295,6 +32653,297 @@ mod query_tests {
             .unwrap();
         let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
         (declaration, symbol)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep header, body token, file completion, and current authority distinct.
+    fn source_class_import_values_require_completed_files_and_current_authority() {
+        let parsed = parse_source_file(concat!(
+            "export class Base { value = 1; constructor() {} read() { return this.value; } } ",
+            "export class Other { value = 2; constructor() {} read() { return this.value; } }",
+        ));
+        let file = FileId::new(202_970);
+        let mut context = context(&parsed, file, CanonicalModuleState::External);
+        let (_, symbol) = class(&context, &parsed, file, "Base");
+        let (_, other_symbol) = class(&context, &parsed, file, "Other");
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let owner = source_class_import_owner(context.store(), &host, symbol)
+            .unwrap()
+            .unwrap();
+        let other = source_class_import_owner(context.store(), &host, other_symbol)
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.source, context.source_file(file).unwrap());
+        assert_ne!(owner.symbol, owner.export_local);
+        let read = |context: &CanonicalCheckerContext<'_>| {
+            completed_source_class_import_value(context.store(), &host, &globals, options, owner)
+        };
+        let cold = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(read(&context), Ok(None));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            cold
+        );
+
+        let header = context.get_nongeneric_class_members(symbol).unwrap();
+        let provenance = context
+            .store()
+            .source_class_provenance_for_symbol(symbol)
+            .unwrap()
+            .clone();
+        let body = provenance
+            .prepared
+            .plan
+            .bodies()
+            .iter()
+            .find(|body| matches!(body.kind, ClassBodyKind::Method { .. }))
+            .unwrap();
+        let token = provenance
+            .prepared
+            .body_access(context.store(), &host, body)
+            .unwrap();
+        assert_eq!(
+            class_body_identities(context.store(), &host, &token)
+                .unwrap()
+                .instance_type,
+            header.shells().instance_type()
+        );
+        assert!(!provenance.complete);
+        assert_eq!(read(&context), Ok(None));
+        assert!(
+            context
+                .store()
+                .value_symbol_links(owner.export_local)
+                .is_none()
+        );
+
+        context.check_source_file(file).unwrap();
+        let completed = read(&context).unwrap().unwrap();
+        assert_eq!(completed.members.shells(), header.shells());
+        let source_links = context
+            .store()
+            .source_file_links(owner.source)
+            .unwrap()
+            .clone();
+        let mut pending = source_links.clone();
+        pending.type_checked = false;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_source_file_links(owner.source, pending.clone())
+        );
+        for _ in 0..2 {
+            assert_eq!(read(&context), Ok(None));
+            assert_eq!(
+                context.store().source_file_links(owner.source),
+                Some(&pending)
+            );
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_source_file_links(owner.source, source_links)
+        );
+
+        let invalid = ClassError::Invariant(ClassInvariant::InvalidOwnerSymbol(symbol));
+        let mut wrong_options = options;
+        wrong_options.strict_function_types = !options.strict_function_types;
+        assert_eq!(
+            completed_source_class_import_value(
+                context.store(),
+                &host,
+                &globals,
+                wrong_options,
+                owner
+            ),
+            Err(invalid)
+        );
+        let mut wrong_globals = globals.clone();
+        wrong_globals.array_type = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_ne!(
+            CanonicalArrayTargets::from_global_types(&wrong_globals),
+            CanonicalArrayTargets::from_global_types(&globals)
+        );
+        assert_eq!(
+            completed_source_class_import_value(
+                context.store(),
+                &host,
+                &wrong_globals,
+                options,
+                owner
+            ),
+            Err(invalid)
+        );
+        assert_eq!(
+            completed_source_class_import_value(
+                context.store(),
+                &host,
+                &globals,
+                options,
+                SourceClassImportOwner {
+                    export_local: other.export_local,
+                    ..owner
+                },
+            ),
+            Err(invalid)
+        );
+        assert_eq!(read(&context), Ok(Some(completed.clone())));
+        assert_eq!(
+            context.get_nongeneric_class_members(symbol),
+            Ok(completed.members)
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each changed real cache is rejected before the same graph is restored.
+    fn source_class_import_values_reject_changed_local_and_body_caches() {
+        let parsed = parse_source_file(concat!(
+            "export class Base { value = 1; constructor() {} read() { return this.value; } } ",
+            "export class Other { value = 2; constructor() {} read() { return this.value; } }",
+        ));
+        let file = FileId::new(202_971);
+        let mut context = context(&parsed, file, CanonicalModuleState::External);
+        let (_, symbol) = class(&context, &parsed, file, "Base");
+        let (_, other) = class(&context, &parsed, file, "Other");
+        context.check_source_file(file).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let owner = source_class_import_owner(context.store(), &host, symbol)
+            .unwrap()
+            .unwrap();
+        let read = |context: &CanonicalCheckerContext<'_>| {
+            completed_source_class_import_value(context.store(), &host, &globals, options, owner)
+        };
+        let value = read(&context).unwrap().unwrap();
+        let instance = value.members.shells().instance_type();
+        let constructor_value = value.members.shells().value_type();
+        let saved = context
+            .store()
+            .source_class_provenance(instance)
+            .unwrap()
+            .clone();
+        let local_links = context
+            .store()
+            .value_symbol_links(owner.export_local)
+            .unwrap()
+            .clone();
+        let property = saved.prepared.plan.initialized_properties[0].symbol;
+        let property_links = context
+            .store()
+            .value_symbol_links(property)
+            .unwrap()
+            .clone();
+        let signature = saved.prepared.methods[0].1;
+        let returned = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .resolved_return_type();
+        let other_value = context
+            .store()
+            .value_symbol_links(other)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().source_class_provenance(instance).cloned(),
+                context
+                    .store()
+                    .value_symbol_links(owner.export_local)
+                    .cloned(),
+                context.store().value_symbol_links(property).cloned(),
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                context
+                    .store()
+                    .type_payload(constructor_value)
+                    .unwrap()
+                    .symbol(),
+                context.diagnostics().clone(),
+            )
+        };
+        let warm = snapshot(&context);
+        for change in 0..6 {
+            let store = context.store_mut_for_test();
+            match change {
+                0 => assert!(
+                    store.set_value_symbol_links(owner.export_local, ValueSymbolLinks::default())
+                ),
+                1 => assert!(store.set_value_symbol_links(
+                    owner.export_local,
+                    ValueSymbolLinks {
+                        resolved_type: Some(other_value),
+                        ..local_links.clone()
+                    }
+                )),
+                2 => assert!(store.set_signature_resolved_return_type(signature, Some(string))),
+                3 => assert!(store.set_value_symbol_links(
+                    property,
+                    ValueSymbolLinks {
+                        resolved_type: Some(string),
+                        ..property_links.clone()
+                    }
+                )),
+                4 => {
+                    store
+                        .source_class_provenance_mut(instance)
+                        .unwrap()
+                        .completed_bodies[0] = false
+                }
+                5 => assert!(store.set_type_symbol(constructor_value, Some(other))),
+                _ => unreachable!(),
+            }
+            let poisoned = snapshot(&context);
+            for _ in 0..2 {
+                assert!(
+                    matches!(read(&context), Err(ClassError::Invariant(_))),
+                    "change {change}"
+                );
+                assert_eq!(snapshot(&context), poisoned);
+            }
+            let store = context.store_mut_for_test();
+            assert!(store.set_value_symbol_links(owner.export_local, local_links.clone()));
+            assert!(store.set_value_symbol_links(property, property_links.clone()));
+            assert!(store.set_signature_resolved_return_type(signature, returned));
+            assert!(store.set_type_symbol(constructor_value, Some(symbol)));
+            *store.source_class_provenance_mut(instance).unwrap() = saved.clone();
+            assert_eq!(read(&context), Ok(Some(value.clone())));
+            assert_eq!(snapshot(&context), warm);
+        }
     }
 
     #[test]
