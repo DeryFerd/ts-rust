@@ -405,6 +405,17 @@ impl SourceDefaultNewPlan {
         self.resolved_symbol
     }
 
+    /// Class preparation uses the exported owner, while source reads keep the local symbol.
+    pub(super) fn provider_symbol(&self) -> SemanticSymbolId {
+        match &self.target {
+            SourceNewTarget::Class(class) => class.symbol(),
+            SourceNewTarget::SourceClass(class) | SourceNewTarget::ConstructorOverloads(class) => {
+                class.symbol()
+            }
+            _ => self.resolved_symbol,
+        }
+    }
+
     pub(super) const fn requires_early_preparation(&self) -> bool {
         self.early_preparation
     }
@@ -973,24 +984,10 @@ pub(super) fn plan_direct_default_new_with_type_context(
             }));
         }
     };
-    let symbol = store
-        .get_merged_symbol(resolved_symbol)
-        .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(resolved_symbol)))?;
-    if symbol != resolved_symbol {
-        return Err(invariant(SourceNewInvariant::MergedSymbol {
-            source: resolved_symbol,
-            target: symbol,
-        }));
-    }
+    let symbol = constructor_value_symbol(store, constructor, resolved_symbol)?;
     let symbol_record = store
         .symbol(symbol)
         .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(symbol)))?;
-    if symbol_record.check_flags() != CheckFlags::NONE {
-        return Err(unsupported(SourceNewUnsupported::ConstructorClass {
-            node: constructor,
-            symbol,
-        }));
-    }
     let source_single = symbol_record.flags() == SymbolFlags::CLASS
         && prior_source_classes
             .get(&symbol)
@@ -1324,6 +1321,49 @@ pub(super) fn plan_direct_default_new_with_type_context(
     };
     preflight_default_new_cache(store, host, &plan)?;
     Ok(plan)
+}
+
+/// Follows an exported local value without changing its lexical symbol identity.
+fn constructor_value_symbol(
+    store: &CanonicalTypeMapperStore,
+    constructor: NodeRef,
+    resolved_symbol: SemanticSymbolId,
+) -> Result<SemanticSymbolId, SourceNewError> {
+    let symbol = store
+        .get_merged_symbol(resolved_symbol)
+        .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(resolved_symbol)))?;
+    if symbol != resolved_symbol {
+        return Err(invariant(SourceNewInvariant::MergedSymbol {
+            source: resolved_symbol,
+            target: symbol,
+        }));
+    }
+    let record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(symbol)))?;
+    let reject = || {
+        unsupported(SourceNewUnsupported::ConstructorClass {
+            node: constructor,
+            symbol,
+        })
+    };
+    if record.check_flags() != CheckFlags::NONE {
+        return Err(reject());
+    }
+    if record.flags() != SymbolFlags::EXPORT_VALUE {
+        return Ok(symbol);
+    }
+    let target = record.export_symbol().ok_or_else(reject)?;
+    let exported = store
+        .symbol(target)
+        .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(target)))?;
+    if exported.flags() != SymbolFlags::CLASS
+        || exported.check_flags() != CheckFlags::NONE
+        || store.get_merged_symbol(target) != Some(target)
+    {
+        return Err(reject());
+    }
+    Ok(target)
 }
 
 /// Retains the normal global Date constructor proof without publishing its cold type.
@@ -5559,8 +5599,9 @@ fn resolved_source_class_constructor(
     class: &SourceClassPlan,
 ) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
     let invalid = || invariant(SourceNewInvariant::InvalidClassPlan(class.declaration()));
+    preflight_exported_constructor_binding(store, host, plan)?;
     let explicit = class.has_public_single_constructor();
-    if class.symbol() != plan.resolved_symbol
+    if class.symbol() != plan.provider_symbol()
         || !(class.has_own_default_constructor() || explicit)
         || explicit != plan.expression_arguments.is_some()
         || plan.argument.is_some()
@@ -5591,8 +5632,11 @@ fn resolved_source_class_constructor(
         instance_type: members.shells().instance_type(),
         signature: members.default_construct_signature(),
     };
-    if authenticated_class_constructor_value(store, class.symbol())
-        != Some((selected.value_type, selected.signature))
+    // Completed source members also prove module-owned exported classes.
+    // The legacy constructor reader remains restricted to unexported owners.
+    if plan.resolved_symbol == class.symbol()
+        && authenticated_class_constructor_value(store, class.symbol())
+            != Some((selected.value_type, selected.signature))
     {
         return Err(invalid());
     }
@@ -6881,11 +6925,59 @@ fn resolved_global_array_constructor(
     }))
 }
 
+/// Rechecks the local/export attachment before a class construction can use cached results.
+fn preflight_exported_constructor_binding(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+) -> Result<(), SourceNewError> {
+    let (symbol, declaration) = match &plan.target {
+        SourceNewTarget::Class(class) => (class.symbol(), class.declaration()),
+        SourceNewTarget::SourceClass(class) | SourceNewTarget::ConstructorOverloads(class) => {
+            (class.symbol(), class.declaration())
+        }
+        _ => return Ok(()),
+    };
+    if plan.resolved_symbol == symbol {
+        return Ok(());
+    }
+    let invalid = || invariant(SourceNewInvariant::InvalidClassPlan(declaration));
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    if constructor_value_symbol(store, plan.constructor, plan.resolved_symbol)? != symbol
+        || bound.local_symbol(declaration) != Some(plan.resolved_symbol)
+        || bound.symbol(declaration) != Some(symbol)
+    {
+        return Err(invalid());
+    }
+    let NodeData::ClassDeclaration(class) = &host.node(declaration).ok_or_else(invalid)?.data
+    else {
+        return Err(invalid());
+    };
+    if class.type_parameters.is_some() {
+        return Err(unsupported(SourceNewUnsupported::Constructor(
+            plan.constructor,
+        )));
+    }
+    match &plan.target {
+        SourceNewTarget::Class(class) => {
+            preflight_nongeneric_class_member_query(store, host, class)?;
+        }
+        SourceNewTarget::SourceClass(class) | SourceNewTarget::ConstructorOverloads(class) => {
+            if !source_class_plan_is_current(store, host, class)? {
+                return Err(invalid());
+            }
+        }
+        _ => unreachable!("only local class targets have an exported constructor binding"),
+    }
+    Ok(())
+}
+
 fn preflight_default_new_cache(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
 ) -> Result<(), SourceNewError> {
+    preflight_exported_constructor_binding(store, host, plan)?;
     let constructor_symbol = exact_symbol_cache(store, plan.constructor).map_err(|()| {
         invariant(SourceNewInvariant::InvalidConstructorCache(
             plan.constructor,
@@ -7537,6 +7629,32 @@ mod tests {
         .unwrap()
     }
 
+    fn exported_class_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/exported-construction.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
     fn class_symbol(
         parsed: &ParseResult,
         file: FileId,
@@ -7942,6 +8060,311 @@ mod tests {
             None,
         ));
         (context, object, owner, value_type, object_type, signature)
+    }
+
+    #[test]
+    fn exported_class_new_plans_revalidate_the_actual_local_edge_without_publication() {
+        enum Family {
+            Class,
+            Source,
+            Overloads,
+        }
+        for (source, family) in [
+            (
+                "export class Model { value!: string; } export class Other {} const model = new Model();",
+                Family::Class,
+            ),
+            (
+                "export class Model { read() { return 1; } } export class Other {} const model = new Model();",
+                Family::Source,
+            ),
+            (
+                "export class Model { constructor(); constructor(value: string); constructor(value?: string) {} } export class Other {} const model = new Model();",
+                Family::Overloads,
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(202_422);
+            let mut context = exported_class_context(&parsed, file);
+            let owner = class_symbol(&parsed, file, &context, "Model");
+            let other = class_symbol(&parsed, file, &context, "Other");
+            let declaration = context
+                .store()
+                .symbol(owner)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            let bound = context.file(file).unwrap().1.clone();
+            let local = bound.local_symbol(declaration).unwrap();
+            let local_record = context.store().symbol(local).unwrap().clone();
+            assert_ne!(local, owner);
+            assert_eq!(local_record.flags(), SymbolFlags::EXPORT_VALUE);
+            assert_eq!(local_record.export_symbol(), Some(owner));
+            let (construction, constructor) = variable_new(&parsed, file, "model");
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let cold = format!("{:?}", context.store());
+            let mut classes = HashMap::new();
+            let mut source_classes = HashMap::new();
+            match family {
+                Family::Class => {
+                    classes.insert(
+                        owner,
+                        super::super::classes::plan_nongeneric_class_members(
+                            context.store(),
+                            &host,
+                            owner,
+                        )
+                        .unwrap(),
+                    );
+                }
+                Family::Source => {
+                    source_classes.insert(
+                        owner,
+                        super::super::classes::plan_source_class_members(
+                            context.store(),
+                            &host,
+                            owner,
+                        )
+                        .unwrap(),
+                    );
+                }
+                Family::Overloads => {}
+            }
+            let plan = plan_direct_default_new(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                &host,
+                &classes,
+                &source_classes,
+                &HashMap::new(),
+                construction,
+                false,
+            )
+            .unwrap();
+            assert!(match family {
+                Family::Class => matches!(plan.target, SourceNewTarget::Class(_)),
+                Family::Source => matches!(plan.target, SourceNewTarget::SourceClass(_)),
+                Family::Overloads =>
+                    matches!(plan.target, SourceNewTarget::ConstructorOverloads(_)),
+            });
+            assert_eq!(plan.resolved_symbol(), local);
+            assert_eq!(plan.provider_symbol(), owner);
+            assert_eq!(format!("{:?}", context.store()), cold);
+            assert!(context.store().symbol_node_links(constructor).is_none());
+            assert!(context.store().type_node_links(construction).is_none());
+            assert!(context.store().signature_links(construction).is_none());
+
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                local,
+                local_record.members(),
+                local_record.exports(),
+                local_record.parent(),
+                Some(other),
+            ));
+            let damaged = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    preflight_default_new_cache(context.store(), &host, &plan),
+                    Err(invariant(SourceNewInvariant::InvalidClassPlan(declaration))),
+                );
+                assert_eq!(format!("{:?}", context.store()), damaged);
+            }
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                local,
+                local_record.members(),
+                local_record.exports(),
+                local_record.parent(),
+                local_record.export_symbol(),
+            ));
+            let restored = format!("{:?}", context.store());
+            assert_eq!(
+                preflight_default_new_cache(context.store(), &host, &plan),
+                Ok(())
+            );
+            assert_eq!(format!("{:?}", context.store()), restored);
+            assert!(context.diagnostics().is_empty());
+        }
+
+        let parsed = parse_source_file(
+            "export class Model<T> { value!: string; } const model = new Model();",
+        );
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_423);
+        let context = exported_class_context(&parsed, file);
+        let owner = class_symbol(&parsed, file, &context, "Model");
+        let (_, bound) = context.file(file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let (construction, constructor) = variable_new(&parsed, file, "model");
+        let cold = format!("{:?}", context.store());
+        let class =
+            super::super::classes::plan_nongeneric_class_members(context.store(), &host, owner)
+                .unwrap();
+        assert_eq!(
+            plan_direct_default_new(
+                &parsed.arena,
+                bound,
+                context.store(),
+                &host,
+                &HashMap::from([(owner, class)]),
+                &HashMap::new(),
+                &HashMap::new(),
+                construction,
+                false,
+            )
+            .unwrap_err(),
+            unsupported(SourceNewUnsupported::Constructor(constructor)),
+        );
+        assert_eq!(format!("{:?}", context.store()), cold);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn exported_class_new_keeps_lexical_links_and_rejects_a_class_symbol_in_the_cache() {
+        let parsed = parse_source_file(
+            "export class Model { read() { return 1; } } const model = new Model();",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(202_424);
+        let mut context = exported_class_context(&parsed, file);
+        let owner = class_symbol(&parsed, file, &context, "Model");
+        let declaration = context
+            .store()
+            .symbol(owner)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let local = bound.local_symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let (construction, constructor) = variable_new(&parsed, file, "model");
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let members = completed_source_class_members(context.store(), &host, owner)
+            .unwrap()
+            .unwrap();
+        let value = members.shells().value_type();
+        let instance = members.shells().instance_type();
+        let signature = members.default_construct_signature();
+        assert!(authenticated_class_constructor_value(context.store(), owner).is_none());
+        assert_eq!(
+            context.store().type_payload(value).unwrap().symbol(),
+            Some(owner)
+        );
+        assert_eq!(
+            context
+                .store()
+                .declared_type_links(owner)
+                .unwrap()
+                .declared_type,
+            Some(instance)
+        );
+        assert_ne!(local, owner);
+        assert_eq!(
+            context.store().symbol_node_links(constructor),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(local)
+            })
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(constructor)
+                .unwrap()
+                .resolved_type,
+            Some(value)
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(construction)
+                .unwrap()
+                .resolved_type,
+            Some(instance)
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature_links(construction)
+                .unwrap()
+                .resolved_signature,
+            ResolvedSignatureState::Resolved(signature)
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(instance)
+        );
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().clone(),
+                context.store().type_node_links(constructor).cloned(),
+                context.store().type_node_links(construction).cloned(),
+                context.store().signature_links(construction).cloned(),
+            )
+        };
+        let warm = snapshot(&context);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(snapshot(&context), warm);
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            constructor,
+            SymbolNodeLinks {
+                resolved_symbol: Some(owner)
+            }
+        ));
+        let damaged = snapshot(&context);
+        for _ in 0..2 {
+            assert_eq!(
+                context.recheck_source_file(file),
+                Err(SourceCheckError::Call(constructor))
+            );
+            assert_eq!(snapshot(&context), damaged);
+            assert_eq!(
+                context.store().symbol_node_links(constructor),
+                Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(owner)
+                })
+            );
+        }
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            constructor,
+            SymbolNodeLinks {
+                resolved_symbol: Some(local)
+            }
+        ));
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(snapshot(&context), warm);
+        let restored = completed_source_class_members(context.store(), &host, owner)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                restored.shells().value_type(),
+                restored.shells().instance_type(),
+                restored.default_construct_signature()
+            ),
+            (value, instance, signature),
+        );
     }
 
     #[test]
