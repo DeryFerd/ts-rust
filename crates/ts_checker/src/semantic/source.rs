@@ -194,9 +194,9 @@ use super::{
         SourceContextualArrowUnsupported, SourceContextualParameterOrigin,
         SourceContextualReturnOrigin, SourceContextualSignatureShape, SourceDefaultArrowExportPlan,
         plan_array_arrow_identifier_statement, plan_async_arrow_await_statement,
-        plan_contextual_source_arrow, plan_jsdoc_contextual_source_arrow, plan_source_arrow,
-        plan_source_arrow_value, plan_source_default_arrow_export,
-        resolve_contextual_arrow_parameter_origins,
+        plan_contextual_source_arrow, plan_jsdoc_contextual_source_arrow,
+        plan_local_contextual_source_arrow, plan_source_arrow, plan_source_arrow_value,
+        plan_source_default_arrow_export, resolve_contextual_arrow_parameter_origins,
     },
     source_callables::{
         ContextualSourceCallableParameter, PreparedContextualDirectCallSourceCallable,
@@ -1285,6 +1285,7 @@ struct PlannedObjectVariableElement {
 #[allow(clippy::large_enum_variant)] // Keeps ordinary variable expressions inline.
 enum PlannedVariableInitializer {
     Expression(PlannedExpression),
+    ContextualArrow(Box<PlannedContextualArrow>),
     Jsx {
         expression: NodeRef,
         element: NodeRef,
@@ -1582,6 +1583,7 @@ struct PlannedContextualArrow {
     source: SourceContextualArrowPlan,
     computed_keys: Vec<PlannedContextualComputedKey>,
     computed_key_flow: Option<SourceFlowPlan>,
+    call_body: Option<Box<(SourceCallablePlan, PlannedLinearFunctionStatements)>>,
     body: PlannedArrowBody,
 }
 
@@ -12600,8 +12602,40 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     .map_err(|error| contextual_arrow_flow_error(arrow.declaration, error))?,
                 )
             };
+            let mut call_body = None;
             let body = match arrow.return_origin {
                 SourceContextualReturnOrigin::InferredEmptyBody { .. } => PlannedArrowBody::Empty,
+                SourceContextualReturnOrigin::InferredCallStatement {
+                    statement,
+                    expression,
+                    ..
+                } => {
+                    let (store, host) = self
+                        .semantic
+                        .ok_or(SourceCheckError::Arrow(arrow.declaration))?;
+                    let callable =
+                        super::source_callables::plan_checked_local_contextual_arrow_body(
+                            store,
+                            host,
+                            &arrow,
+                            self.array_targets,
+                        )
+                        .map_err(Self::callable_plan_error)?;
+                    let syntax = plan_source_linear_function_statements_syntax(
+                        self.arena, self.bound, store, &callable,
+                    )
+                    .map_err(|error| Self::function_statements_plan_error(&callable, error))?;
+                    let planned = self.finish_linear_function_statements(&callable, syntax)?;
+                    if !planned.locals.is_empty()
+                        || !matches!(planned.statements.as_slice(),
+                            [PlannedLinearFunctionStatement::Expression { statement: actual, expression: value }]
+                                if *actual == statement && value.node == expression)
+                    {
+                        return Err(SourceCheckError::Arrow(arrow.declaration));
+                    }
+                    call_body = Some(Box::new((callable, planned)));
+                    PlannedArrowBody::Empty
+                }
                 SourceContextualReturnOrigin::InferredConciseExpression { expression } => {
                     self.plan_arrow_return_expression(expression, expression)?
                 }
@@ -12615,6 +12649,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 source: arrow,
                 computed_keys,
                 computed_key_flow,
+                call_body,
                 body,
             })
         })();
@@ -16707,6 +16742,36 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         let mut evolving_array = false;
         let initializer = match syntax.initializer {
+            Some(initializer)
+                if syntax.type_node.is_some()
+                    && matches!(
+                        syntax.binding,
+                        VariableBindingKind::Let | VariableBindingKind::Const
+                    )
+                    && matches!(&self.node(initializer)?.data, NodeData::ArrowFunction(arrow)
+                    if arrow.type_.is_none()
+                        && arrow.parameters.nodes.iter().any(|parameter| {
+                            self.node(self.reference(*parameter)).is_ok_and(|record| {
+                                matches!(&record.data, NodeData::ParameterDeclaration(data) if data.type_.is_none())
+                            })
+                        })) =>
+            {
+                let (store, host) = self.semantic.ok_or(SourceCheckError::Arrow(initializer))?;
+                let arrow =
+                    plan_local_contextual_source_arrow(store, host, &syntax, self.array_targets)
+                        .map_err(Self::contextual_arrow_plan_error)?;
+                preflight_contextual_source_publication(store, &arrow, None)?;
+                for annotation in arrow
+                    .parameters
+                    .iter()
+                    .filter_map(|parameter| parameter.annotation)
+                {
+                    self.plan_type_import_annotation_root(annotation)?;
+                }
+                PlannedVariableInitializer::ContextualArrow(Box::new(
+                    self.plan_contextual_arrow(arrow)?,
+                ))
+            }
             Some(initializer) => {
                 let initializer = self.plan_expression(initializer)?;
                 evolving_array = syntax.type_node.is_none()
@@ -29607,7 +29672,8 @@ fn preflight_inferred_function_return_dependencies(
                 PlannedVariableInitializer::Expression(_)
                 | PlannedVariableInitializer::AbsentAnnotated
                 | PlannedVariableInitializer::AbsentImplicitAny => {}
-                PlannedVariableInitializer::Jsx { .. }
+                PlannedVariableInitializer::ContextualArrow(_)
+                | PlannedVariableInitializer::Jsx { .. }
                 | PlannedVariableInitializer::AbsentJavaScript => return false,
             }
             locals.insert(local.symbol);
@@ -46694,6 +46760,35 @@ fn check_planned_loop_local_with_capture_context(
 ) -> Result<(), SourceCheckError> {
     session.reset_query();
     let (declared_type, current_type) = match (&local.initializer, local.type_node) {
+        (PlannedVariableInitializer::ContextualArrow(arrow), Some(type_node)) => {
+            if arrow.source.variable_symbol != local.symbol
+                || arrow.source.variable_declaration != local.declaration
+                || arrow.source.contextual_type.type_node != type_node
+            {
+                return Err(SourceCheckError::Arrow(arrow.source.declaration));
+            }
+            let captured = arrow_capture
+                .map(|capture| {
+                    capture.flow_types(store, host, arrow.source.declaration, flow_types)
+                })
+                .transpose()?;
+            issue_arrow_line_terminator_diagnostic(host, diagnostics, arrow.source.declaration)?;
+            let (target, _) = materialize_contextual_source_arrow(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                captured.as_ref().unwrap_or(flow_types),
+                type_import_execution,
+                type_import_capabilities,
+                deferred,
+                arrow,
+            )?;
+            (target, target)
+        }
         (PlannedVariableInitializer::Expression(initializer), Some(type_node)) => {
             let assignment = check_planned_assignment_with_capture_context(
                 store,
@@ -55725,6 +55820,49 @@ fn materialize_contextual_source_arrow(
 
     let return_type = match (&plan.return_origin, &arrow.body) {
         (SourceContextualReturnOrigin::InferredEmptyBody { .. }, PlannedArrowBody::Empty) => void,
+        (
+            SourceContextualReturnOrigin::InferredCallStatement { block, .. },
+            PlannedArrowBody::Empty,
+        ) => {
+            let (callable, statements) = arrow
+                .call_body
+                .as_deref()
+                .ok_or(SourceCheckError::Arrow(plan.declaration))?;
+            if callable.declaration != plan.declaration || callable.body != *block {
+                return Err(SourceCheckError::Arrow(plan.declaration));
+            }
+            let bound = host
+                .bound_file(plan.declaration)
+                .ok_or(SourceCheckError::Arrow(plan.declaration))?;
+            let mut entries = flow_types.clone();
+            let mut staged = HashMap::new();
+            let mut order = Vec::new();
+            check_planned_linear_function_statements_with_capture_entries(
+                bound,
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                flow_types.clone(),
+                type_import_execution,
+                type_import_capabilities,
+                deferred,
+                callable,
+                None,
+                statements,
+                &mut staged,
+                &mut order,
+                &mut entries,
+                None,
+            )?;
+            if !staged.is_empty() || !order.is_empty() {
+                return Err(SourceCheckError::Arrow(plan.declaration));
+            }
+            void
+        }
         (
             SourceContextualReturnOrigin::InferredConciseExpression { expression }
             | SourceContextualReturnOrigin::InferredReturnExpression { expression, .. },
@@ -69850,7 +69988,8 @@ pub(super) fn check_source_file(
                             };
                             (declared_type, declared_type)
                         }
-                        (PlannedVariableInitializer::AbsentAnnotated, None)
+                        (PlannedVariableInitializer::ContextualArrow(_), _)
+                        | (PlannedVariableInitializer::AbsentAnnotated, None)
                         | (
                             PlannedVariableInitializer::AbsentImplicitAny
                             | PlannedVariableInitializer::AbsentJavaScript,
