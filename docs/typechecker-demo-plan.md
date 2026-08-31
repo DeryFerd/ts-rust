@@ -4,8 +4,11 @@ Updated 2026-08-30. The full port goal remains active.
 
 ## Decision
 
-Make TanStack Query core the first complete-project demo target. Make Hono the
-second. Use their existing production typecheck configurations, not a new app
+Make Hono the next complete-project demo target. Keep TanStack Query core as
+the second target. Hono's immediate class repairs are committed and reviewed.
+Query still needs more source-language features before its next complete check.
+This changes the work order, not the acceptance criteria.
+Use their existing production typecheck configurations, not a new app
 or a reduced source list. These are selected targets, not projects proved close
 to passing. No complete real-world project has passed in Rust yet.
 
@@ -23,42 +26,38 @@ The measured compiler source is `5c7c7bd20cb45ebc8f2171eed8478fa2797e8343`.
 New source candidates remain in separate worktrees. They have not replaced
 that accepted compiler on the primary branch.
 
-Newer branches have useful results but are not accepted whole-project builds.
-The latest interface run passed 5,177 of 5,202 test executions. It cleared 28
-old failures and retained 25 failures, including one regression. One of those
-28 improvements includes an approved test setup correction. The JSDoc run
-passed all 88 selected public tests, but seven checker tests still failed.
-The latest combined run disagrees with that JSDoc run on unchanged parsing
-controls. The cause is under review.
-These runs overlap and must not be added together as unique passing tests.
+The full core check is green at
+`4f7397046c08de663fede5e5281884bbbc092092`. All 6,399 tests passed in 133
+harnesses. All eleven stages passed, including formatting, strict Clippy,
+4,886 checker units, parser and compiler tests, fixture tests, and both tool
+builds. All 201 required test names ran. The complete original
+`ambiguousCallsWhereReturnTypesAgree.ts` fixture passed diagnostics, types and
+symbols. The [complete result](../target/wave202-next-full-core-gate-7-report.md)
+does not replace the accepted original test subset. Its complete corpus
+comparison is being prepared separately.
 
-A newer full core check passed 6,398 of 6,399 tests in 133 harnesses at
-`5b0127b6e5613f5161dda18cddee644c6be5ea41`. All eleven stages ran. Formatting,
-strict Clippy, all 4,886 checker units, parser and compiler tests, fixture
-tests, and both tool builds passed. One public class-method test failed its
-full-store snapshot after a repeated source check. Independent review found
-two expected bookkeeping changes. The semantic and display assertions before
-that snapshot passed. The exact test-only correction is committed at
-`4f7397046c08de663fede5e5281884bbbc092092`. Its next full run is being prepared.
-The
-[complete result](../target/wave202-next-full-core-gate-6-report.md) does not
-replace the accepted original test subset.
+The newer combined core/class source is
+`aea8d39c730a2db79e4d2fae965f5b164d1240bf`. Its full checker run passed 5,981
+of 6,041 tests in 171 harnesses. The library harness passed 5,113 and failed
+28. Public tests passed 868 and failed 32. No test was ignored or filtered.
+All runtime services closed and the source stayed unchanged. The
+[complete result](../target/wave202-demo-core-class-focused-2-result.md) records
+all 60 failures. The previous run had 114 failures. The closed logs show 54
+recovered old failures and no newly failed names.
 
-The combined core/class source `ad8e06a85d01631c027d25a1e4c0cef776b34798`
-passes the complete workspace all-target compile check with no errors or
-warnings. Its separate full checker run is complete. It passed 5,926 of 6,040
-tests in 171 harnesses. The library harness passed 5,081 and failed 59. Public
-tests passed 845 and failed 55. No tests were ignored or filtered. All runtime
-services closed and the source stayed unchanged. The
-[complete result](../target/wave202-demo-core-class-focused-1-result.md) records
-all 114 failures. Forty-five match previously diagnosed private cases. Thirteen
-separate review groups cover the other 69 cases.
+That source combines two shared replay repairs. One keeps saved generic call
+signatures on the existing generic validation path. The other completes the
+operand plan for warm numeric-intersection queries. The new replay control
+and all three private numeric controls passed. All old test inputs remain
+unchanged. The two public numeric controls still fail and have a separate
+committed repair awaiting runtime checks.
 
-Two shared repairs are committed and being combined for the next run. One
-keeps saved generic call signatures on the existing generic validation path
-during replay. The other makes warm numeric-intersection queries build their
-complete operand plan. All old tests remain unchanged. Neither repair has a
-runtime result yet.
+All 16 tests in four JSDoc overload harnesses also passed in the newer run.
+They had failed in the previous run with unchanged parser and test source.
+The latest run records actual executable hashes and Cargo dependency metadata.
+The historical cause remains unproved. Do not assign every recovered test to
+the two source repairs. These runs overlap and must not be added together as
+unique passing tests.
 
 The Query contextual-arrow candidate ran all 5,114 selected checker and public
 tests. It passed 5,064 and failed 50. Five failures are in the new controls.
@@ -73,12 +72,12 @@ retains every failed test. No result from this run is added to another run.
 
 | Target | Complete upstream scope | Why use it | Fresh Rust construction result |
 | --- | --- | --- | --- |
-| TanStack Query core | `packages/query-core/tsconfig.prod.json`, 23 roots | Strict ESNext/Bundler package. Dependencies and declaration outputs are prepared. Saved Go cold and warm diagnostics are empty. | Unsupported arrow in `timeoutManager.ts`. |
 | Hono | `tsconfig.build.json`, 188 roots | Strict library build with ES2022 target. Dependencies are prepared. Saved Go cold diagnostics are empty. | Unsupported class in `http-exception.ts`. |
+| TanStack Query core | `packages/query-core/tsconfig.prod.json`, 23 roots | Strict ESNext/Bundler package. Dependencies and declaration outputs are prepared. Saved Go cold and warm diagnostics are empty. | Unsupported arrow in `timeoutManager.ts`. |
 
 Roots are not the complete dependency graph. The saved Go runs load 186 files
-for Query core and 352 for Hono. The first target does not include React Query
-or the entire TanStack repository. The second does not include every Hono
+for Query core and 352 for Hono. The Query target does not include React Query
+or the entire TanStack repository. The Hono target does not include every Hono
 test, example, or project reference.
 
 Both fresh checks ran once on clean compiler `db4988b261625c67d770f9d6290b9684d6395680`.
@@ -102,7 +101,13 @@ heritage controls passed, but four old checker controls and all four public
 controls failed. The repair is committed at
 `2ea6843ab6a5169dfe7344528d90f6e2aa22fc99`. It fixes inherited member ownership,
 keeps the actual caller for property diagnostic details, and corrects proved
-test setup errors. The next focused run is being prepared. Optional named fields
+test setup errors. Its next run stopped on a wrong Rust import path before
+either test harness started. All 4,904 tests were unrun. The import-only fix
+is committed at `01ac9bb590bfbf03f2f2def53a38974804960b49`. The corrected
+focused run completed all 4,904 tests, with 4,900 passes and four failures.
+The library passed 4,899 of 4,900. The public harness passed its complete Hono
+negative control. Its three positive controls stop in a test helper. Those
+failures still need diagnosis and are not passes. Optional named fields
 and imported conditional class annotations are also committed and reviewed,
 but not runtime-verified.
 One first project failure does not tell us how many remain.
@@ -119,11 +124,12 @@ A wider source audit covers all 23 Query roots. It finds more missing behavior,
 including generic class bodies, optional calls, generic function-type aliases,
 and branching callback bodies. Query is not one or two fixes from a proved
 complete pass. Separate workers now implement the shared source features.
-Generic class methods, optional calls and branching arrow bodies are committed
-and source-reviewed. Their runtime checks remain pending. Generic class bodies
-and generic function-type aliases are still in progress. Executable class
-imports and generic construction have separate reviewed designs. These audit
-findings do not predict the next runtime failure.
+Generic class methods, generic class bodies, optional calls, branching arrow
+bodies and generic function-type aliases are committed and source-reviewed.
+Their runtime checks remain pending. Executable class
+imports now have a separate implementation team. Generic construction has a
+reviewed design and waits for the class-body provider. These audit findings do
+not predict the next runtime failure.
 
 Pinned project commits:
 
