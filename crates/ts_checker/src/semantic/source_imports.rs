@@ -7558,6 +7558,22 @@ fn plan_direct_exported_type_target(
     let target_record = store
         .symbol(target)
         .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(target)))?;
+    if target_record.flags() == SymbolFlags::CLASS {
+        let Some([declaration]) = target_record.declarations() else {
+            return Err(unsupported(SourceImportUnsupported::TargetSymbol {
+                alias,
+                target,
+                flags: target_record.flags(),
+            }));
+        };
+        // Type-only binding needs the exported declaration, not its constructor value.
+        return source_class_import_owner(store, host, target)
+            .map_err(|error| imported_ambient_class_error(target, *declaration, error))?
+            .map(|owner| owner.declaration)
+            .ok_or_else(|| {
+                unsupported(SourceImportUnsupported::TargetTypeDeclaration(*declaration))
+            });
+    }
     if target_record.flags() != SymbolFlags::TYPE_ALIAS
         && target_record.flags() != SymbolFlags::INTERFACE
     {
@@ -30210,4 +30226,6 @@ export default <T>(): Subject<T> => {
         assert!(specifier_only.plan_import(0, 0).bindings.is_empty());
         assert_eq!(specifier_only.plan_type_import(0, 0).bindings.len(), 1);
     }
+
+    include!("source_imports_type_only_class_tests.rs");
 }
