@@ -87,9 +87,19 @@ One qualified class-base initializer lacked its required `constructor_value`
 field. The reporter was not built, so no Hono project stage ran. Both runtime
 and separate cleanup checks closed. The one-line fix is committed and reviewed
 at `9c26f3bbd72bf5cf19ba3c0f73046092131f557b`. All tests and original inputs
-remain unchanged. The next full-project attempt is being prepared with a new
-empty target. The [repair receipt](../target/wave202-demo-hono-qualified-base-build-repair-commit.md)
-keeps its exact source and review evidence. It is not a successful rebuild.
+remain unchanged. The [repair receipt](../target/wave202-demo-hono-qualified-base-build-repair-commit.md)
+keeps its exact source and review evidence.
+
+The second isolated build passed in 69 seconds. Its Cargo records confirm a
+fresh reporter, checker and compiler in the new empty target. The full original
+Hono command then ran for 5 seconds and stopped with `INV.SOURCE.DECLARED_TYPE`
+in `src/http-exception.ts`. The detail is `InvalidTypeReference`. No Program
+graph, complete diagnostic set, type or symbol artifact, or replay result was
+returned. Both runtime stages and the separate cleanup check closed. The
+[complete result](../target/wave202-demo-hono-isolated-probe-2-report.md)
+retains all raw output and executable evidence. The 188-root input and all
+dependencies remain unchanged. A separate worker is tracing the failing
+reference. This clears the build failure, not the project check.
 
 The Query contextual-arrow candidate ran all 5,114 selected checker and public
 tests. It passed 5,064 and failed 50. Five failures are in the new controls.
@@ -104,7 +114,7 @@ retains every failed test. No result from this run is added to another run.
 
 | Target | Complete upstream scope | Why use it | Last project-stage result |
 | --- | --- | --- | --- |
-| Hono | `tsconfig.build.json`, 188 roots | Strict library build with ES2022 target. Dependencies are prepared. Saved Go cold diagnostics are empty. | Unsupported class in `http-exception.ts`. |
+| Hono | `tsconfig.build.json`, 188 roots | Strict library build with ES2022 target. Dependencies are prepared. Saved Go cold diagnostics are empty. | Type-reference construction invariant in `http-exception.ts`. |
 | TanStack Query core | `packages/query-core/tsconfig.prod.json`, 23 roots | Strict ESNext/Bundler package. Dependencies and declaration outputs are prepared. Saved Go cold and warm diagnostics are empty. | Unsupported arrow in `timeoutManager.ts`. |
 
 Roots are not the complete dependency graph. The saved Go runs load 186 files
@@ -112,7 +122,7 @@ for Query core and 352 for Hono. The Query target does not include React Query
 or the entire TanStack repository. The Hono target does not include every Hono
 test, example, or project reference.
 
-Both fresh checks ran once on clean compiler `db4988b261625c67d770f9d6290b9684d6395680`.
+The first two project checks ran once on clean compiler `db4988b261625c67d770f9d6290b9684d6395680`.
 Its project reporter was already built. This is a diagnostic candidate with
 known component-test failures, not the accepted compiler source.
 
@@ -155,8 +165,8 @@ visible. This result is not a Hono project pass.
 
 The eight reviewed Hono dependencies are combined at `27347713`. The complete
 source integration is reviewed. Its isolated build failed as recorded above.
-The corrected candidate is `9c26f3bb`. A separate worker prepares its next
-isolated reporter build and full original-project check. Further source
+The corrected candidate `9c26f3bb` built and reached the type-reference failure
+recorded above. Further source
 audits found named method return annotations, property truthiness flow and
 ambient `Response` construction restrictions in the original `getResponse`
 method. Five independent pairs have prepared those changes in one new tree.
@@ -165,8 +175,10 @@ The next parallel batch addresses the shared DOM/Node owner, alias heritage,
 globalThis, conditional, import, defaulted-union and condition queries.
 Another batch combines the committed generic class bodies, construction,
 methods and executable imports. Each batch has one writer per source file
-and one owner for Git changes. Generic class method combinations, field
-initializers and named/indexed alias bounds also have reviewed plans.
+and one owner for Git changes. Separate workers now implement annotated
+array/object field initializers and named/indexed alias bounds. The latter
+covers the real `Env`, `Schema` and `Input` bound declarations. Generic methods
+on generic classes and imported generic class heritage have reviewed plans.
 These are source findings, not the next measured project error.
 
 The Query source audit identifies missing contextual typing for the first
@@ -189,8 +201,8 @@ imports. Both import-only corrections are committed. The third run executed
 all 5,080 selected tests and failed 70, including all 17 new controls. A pair
 proved two first-stop defects: copied signatures use a declaration-owned
 parameter publisher, and alias-owned union references lack their owner proof.
-The exact three-file repair is released. All 17 controls stay intact, and
-aliases remain outside the class integration until the repair is reviewed.
+The exact three-file repair is source-reviewed. All 17 controls stay intact, and
+aliases remain outside the current class-only integration.
 The other 53 failures are not assigned to this feature without a matched run.
 Executable class imports are committed and reviewed at `c295104c`, with eight
 new private and eight new public tests. Generic construction is committed and
