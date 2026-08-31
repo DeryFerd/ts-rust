@@ -4,10 +4,11 @@ use ts_binder::{
     CanonicalSourceLanguage, EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalModuleResolutionEntry,
-    CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
-    CanonicalResolvedModuleInput, ClassMembers, IntrinsicBootstrapOptions, SignatureId,
-    SourceCheckError, TypeData, TypeId, UnsupportedSourceSyntax, signatures::SignatureFlags,
+    CanonicalArtifactQueryError, CanonicalCheckerContext, CanonicalCheckerOptions,
+    CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+    CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, ClassMembers,
+    IntrinsicBootstrapOptions, SignatureId, SourceCheckError, TypeData, TypeId,
+    UnsupportedSourceSyntax, signatures::SignatureFlags,
 };
 use ts_options::{ModuleKind, ScriptTarget};
 use ts_parser::{ParseResult, parse_source_file};
@@ -1339,7 +1340,18 @@ fn complete_hono_class_keeps_original_inputs_and_an_explicit_unsupported_result(
     let (heritage, _, _) = class_nodes(&context, class);
     let error = global(&context, "Error");
     assert_eq!(
-        context.get_symbol_at_location(heritage).unwrap(),
+        context.get_symbol_at_location(heritage),
+        Err(CanonicalArtifactQueryError::SourceCheck(
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(class))
+        ))
+    );
+    let mut resolver = context
+        .name_resolver_host(context.options().name_resolution)
+        .unwrap();
+    assert_eq!(
+        resolver
+            .resolve_entity_name(heritage, SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE)
+            .unwrap(),
         Some(error)
     );
     let variable = context

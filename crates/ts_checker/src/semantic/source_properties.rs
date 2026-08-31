@@ -2842,7 +2842,7 @@ fn class_context_member_for_symbol(
         .ok_or_else(invalid)?;
     if source.symbol != symbol
         || !class_context_has_member_owner(store, context, identities, source.declaring_class)
-        || property.parent() != Some(source.declaring_class)
+        || store.get_parent_of_symbol(symbol) != Some(source.declaring_class)
         || property.value_declaration() != Some(source.declaration)
         || store.get_merged_symbol(symbol) != Some(symbol)
         || structured

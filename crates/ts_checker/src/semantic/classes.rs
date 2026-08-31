@@ -2400,6 +2400,73 @@ pub(super) fn source_constructor_base_member_owner(
     )
 }
 
+/// Proves an inherited interface property on the receiver's actual class side.
+pub(super) fn source_constructor_base_property_is_exact(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+    property: SemanticSymbolId,
+) -> bool {
+    let Some(provenance) = store
+        .type_payload(receiver)
+        .and_then(TypeRecord::symbol)
+        .and_then(|owner| store.source_class_provenance_for_symbol(owner))
+    else {
+        return false;
+    };
+    let side = if receiver == provenance.prepared.instance_type {
+        ClassPropertySide::Instance
+    } else if receiver == provenance.prepared.value_type {
+        ClassPropertySide::Static
+    } else {
+        return false;
+    };
+    let Some(SourceClassBaseMembers::Constructor(base)) = &provenance.base_members else {
+        return false;
+    };
+    let Some(edge) = store.direct_class_heritage_provenance(provenance.prepared.instance_type)
+    else {
+        return false;
+    };
+    if validate_source_class_stored_header(store, provenance).is_err()
+        || !source_constructor_heritage_is_exact(store, provenance.prepared.instance_type, edge)
+    {
+        return false;
+    }
+    let (base_type, owner, properties) = match side {
+        ClassPropertySide::Instance => (
+            base.identities.instance_type,
+            base.instance.symbol,
+            &base.instance_properties,
+        ),
+        ClassPropertySide::Static => (
+            base.identities.value_type,
+            base.constructor.symbol,
+            &base.static_properties,
+        ),
+    };
+    let Some(member) = store.symbol(property) else {
+        return false;
+    };
+    store.get_parent_of_symbol(property) == Some(owner)
+        && store.get_merged_symbol(property) == Some(property)
+        && properties.contains(&property)
+        && [receiver, base_type].into_iter().all(|type_| {
+            store
+                .type_payload(type_)
+                .and_then(|record| record.data().structured())
+                .filter(|structured| {
+                    structured
+                        .properties
+                        .as_deref()
+                        .is_some_and(|properties| properties.contains(&property))
+                })
+                .and_then(|structured| structured.members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get(member.name()))
+                == Some(property)
+        })
+}
+
 fn source_class_base_members(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -6549,8 +6616,8 @@ pub(super) fn class_member_source(
     let record = store
         .symbol(member)
         .ok_or_else(|| invariant(ClassInvariant::SymbolNotOwned(member)))?;
-    let class = record
-        .parent()
+    let class = store
+        .get_parent_of_symbol(member)
         .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(member)))?;
     let instance = store
         .declared_type_links(class)
@@ -33281,6 +33348,326 @@ mod query_tests {
                     .flags()
                     .contains(SymbolFlags::CLASS)
             );
+        }
+    }
+
+    const MERGED_CONSTRUCTOR_FILES: [FileId; 3] = [
+        FileId::new(260_140),
+        FileId::new(260_141),
+        FileId::new(260_142),
+    ];
+
+    fn merged_constructor_sources() -> [ParseResult; 3] {
+        [
+            parse_source_file(concat!(
+                "interface Item { label: string; }\n",
+                "interface Factory { new(label?: string): Item; readonly prototype: Item; readonly kind: string; }\n",
+                "declare var MakeItem: Factory;\n",
+            )),
+            parse_source_file(concat!(
+                "interface Item { serial: number; }\n",
+                "interface Factory { new(label?: string, serial?: number): Item; }\n",
+            )),
+            parse_source_file(concat!(
+                "class ItemDerived extends MakeItem {\n",
+                "  constructor(label: string, serial: number) { super(label, serial); }\n",
+                "  read(): string { return this.label; }\n",
+                "  baseRead(): string { return super.label; }\n",
+                "  static kindRead(): string { return this.kind; }\n",
+                "  static baseKindRead(): string { return super.kind; }\n",
+                "}\n",
+            )),
+        ]
+    }
+
+    fn merged_constructor_context(parsed: &[ParseResult; 3]) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        for ((parsed, file), (name, declaration)) in
+            parsed.iter().zip(MERGED_CONSTRUCTOR_FILES).zip([
+                ("\"/base.d.ts\"", true),
+                ("\"/addition.d.ts\"", true),
+                ("\"/derived.ts\"", false),
+            ])
+        {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(name),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            parsed
+                .iter()
+                .zip(MERGED_CONSTRUCTOR_FILES)
+                .map(|(parsed, file)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions {
+                intrinsic: crate::semantic::IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn merged_constructor_properties(
+        store: &CanonicalTypeMapperStore,
+        provenance: &SourceClassProvenance,
+    ) -> [(SemanticSymbolId, ClassPropertySide, TypeId); 2] {
+        let Some(SourceClassBaseMembers::Constructor(base)) = &provenance.base_members else {
+            panic!("the class retains its actual constructor value")
+        };
+        let property = |properties: &[SemanticSymbolId], name: &str| {
+            properties
+                .iter()
+                .copied()
+                .find(|&symbol| store.symbol(symbol).unwrap().name().as_utf8() == Some(name))
+                .unwrap()
+        };
+        [
+            (
+                property(&base.instance_properties, "label"),
+                ClassPropertySide::Instance,
+                provenance.prepared.instance_type,
+            ),
+            (
+                property(&base.static_properties, "kind"),
+                ClassPropertySide::Static,
+                provenance.prepared.value_type,
+            ),
+        ]
+    }
+
+    fn assert_merged_constructor_member_sources(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &[ParseResult; 3],
+        provenance: &SourceClassProvenance,
+    ) {
+        let bounds = MERGED_CONSTRUCTOR_FILES.map(|file| context.file(file).unwrap().1.clone());
+        let host = DeclaredTypeHost::new_after_global_merge(
+            parsed
+                .iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (&parsed.arena, bound)),
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let store = context.store();
+        let Some(SourceClassBaseMembers::Constructor(base)) = &provenance.base_members else {
+            panic!("the base keeps its actual two interface owners")
+        };
+        for (member, side, receiver) in merged_constructor_properties(store, provenance) {
+            let source = class_member_source(store, &host, member).unwrap();
+            let record = store.symbol(member).unwrap();
+            let raw_parent = record.parent().unwrap();
+            let owner = match side {
+                ClassPropertySide::Instance => base.instance.symbol,
+                ClassPropertySide::Static => base.constructor.symbol,
+            };
+            assert_ne!(raw_parent, owner);
+            assert_eq!(store.get_merged_symbol(raw_parent), Some(owner));
+            assert_eq!(source.symbol, member);
+            assert_eq!(source.declaring_class, owner);
+            assert_eq!(source.declaration, record.value_declaration().unwrap());
+            assert_eq!(source.side, side);
+            assert_eq!(source.origin, ClassMemberOrigin::DeclaredProperty);
+            assert_eq!(source.visibility, ClassConstructorVisibility::Public);
+            assert!(
+                store
+                    .declared_type_links(owner)
+                    .unwrap()
+                    .declared_type
+                    .is_some()
+            );
+            assert!(store.declared_type_links(raw_parent).is_none());
+            assert!(source_constructor_base_property_is_exact(
+                store, receiver, member
+            ));
+            assert!(!source_constructor_base_property_is_exact(
+                store,
+                if side == ClassPropertySide::Instance {
+                    provenance.prepared.value_type
+                } else {
+                    provenance.prepared.instance_type
+                },
+                member,
+            ));
+        }
+    }
+
+    #[test]
+    fn constructor_value_member_sources_keep_canonical_merged_owners_and_replay() {
+        for query_first in [false, true] {
+            let parsed = merged_constructor_sources();
+            let mut context = merged_constructor_context(&parsed);
+            let file = MERGED_CONSTRUCTOR_FILES[2];
+            let (_, owner) = class(&context, &parsed[2], file, "ItemDerived");
+            let reads =
+                parsed[2]
+                    .arena
+                    .iter()
+                    .filter_map(|(node, record)| {
+                        (record.kind == SyntaxKind::PropertyAccessExpression)
+                            .then_some(NodeRef::new(parsed[2].arena.id(), file, node))
+                    })
+                    .collect::<Vec<_>>();
+            assert_eq!(reads.len(), 4);
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            if query_first {
+                assert_eq!(context.get_type_at_location(reads[0]), Ok(string));
+            }
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            for &read in &reads {
+                assert_eq!(context.get_type_at_location(read), Ok(string));
+            }
+            let provenance = context
+                .store()
+                .source_class_provenance_for_symbol(owner)
+                .cloned()
+                .unwrap();
+            assert_merged_constructor_member_sources(&context, &parsed, &provenance);
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                (
+                    constructor_heritage_counts(context.store()),
+                    context.store().relation_state_snapshot(),
+                    context.diagnostics().clone(),
+                    context
+                        .store()
+                        .source_class_provenance_for_symbol(owner)
+                        .cloned(),
+                    reads
+                        .iter()
+                        .map(|&read| {
+                            (
+                                context.store().type_node_links(read).cloned(),
+                                context.store().symbol_node_links(read).cloned(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let healthy = snapshot(&context);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                for &read in &reads {
+                    assert_eq!(context.get_type_at_location(read), Ok(string));
+                }
+                assert_merged_constructor_member_sources(&context, &parsed, &provenance);
+                assert_eq!(snapshot(&context), healthy);
+            }
+        }
+    }
+
+    #[test]
+    fn constructor_value_member_sources_reject_changed_canonical_owners_without_writes() {
+        let parsed = merged_constructor_sources();
+        let mut context = merged_constructor_context(&parsed);
+        let file = MERGED_CONSTRUCTOR_FILES[2];
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (_, class_owner) = class(&context, &parsed[2], file, "ItemDerived");
+        let provenance = context
+            .store()
+            .source_class_provenance_for_symbol(class_owner)
+            .cloned()
+            .unwrap();
+        let bounds = MERGED_CONSTRUCTOR_FILES.map(|file| context.file(file).unwrap().1.clone());
+        let host = DeclaredTypeHost::new_after_global_merge(
+            parsed
+                .iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (&parsed.arena, bound)),
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        for (member, _, receiver) in merged_constructor_properties(store, &provenance) {
+            let source = class_member_source(store, &host, member).unwrap();
+            let owner = source.declaring_class;
+            let record = store.symbol(member).unwrap();
+            let relationships = (
+                record.members(),
+                record.exports(),
+                record.parent(),
+                record.export_symbol(),
+            );
+            let raw_parent = record.parent().unwrap();
+            let links = store.declared_type_links(owner).unwrap().clone();
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                (
+                    constructor_heritage_counts(store),
+                    store.relation_state_snapshot(),
+                    store.declared_type_links(owner).cloned(),
+                    store.declared_type_links(raw_parent).cloned(),
+                    store.value_symbol_links(member).cloned(),
+                    store.symbol(member).unwrap().parent(),
+                    store
+                        .source_class_provenance_for_symbol(class_owner)
+                        .cloned(),
+                )
+            };
+            for poison in 0..2 {
+                if poison == 0 {
+                    let mut wrong = links.clone();
+                    wrong.declared_type = Some(number);
+                    assert!(store.set_declared_type_links(owner, wrong));
+                } else {
+                    assert!(store.set_symbol_relationships(
+                        member,
+                        relationships.0,
+                        relationships.1,
+                        Some(class_owner),
+                        relationships.3,
+                    ));
+                }
+                let poisoned = snapshot(store);
+                for _ in 0..2 {
+                    assert!(class_member_source(store, &host, member).is_err());
+                    assert!(!source_constructor_base_property_is_exact(
+                        store, receiver, member
+                    ));
+                    assert_eq!(snapshot(store), poisoned);
+                }
+                assert!(store.set_declared_type_links(owner, links.clone()));
+                assert!(store.set_symbol_relationships(
+                    member,
+                    relationships.0,
+                    relationships.1,
+                    relationships.2,
+                    relationships.3,
+                ));
+                let restored = snapshot(store);
+                assert_eq!(
+                    class_member_source(store, &host, member),
+                    Ok(source.clone())
+                );
+                assert!(source_constructor_base_property_is_exact(
+                    store, receiver, member
+                ));
+                assert!(store.declared_type_links(raw_parent).is_none());
+                assert_eq!(snapshot(store), restored);
+            }
         }
     }
 

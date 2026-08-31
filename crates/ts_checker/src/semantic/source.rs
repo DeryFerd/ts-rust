@@ -38345,6 +38345,7 @@ fn check_assignment_with_expression_type(
             source_type,
             target,
             options,
+            session,
         )?;
         let unconstrained_jsdoc_type_parameter =
             is_unconstrained_jsdoc_arrow_type_parameter(store, host, target);
@@ -38744,6 +38745,7 @@ fn check_compound_assignment(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // Keep constituent checks in the caller's relation session.
 fn union_assignment_detail(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -38752,10 +38754,13 @@ fn union_assignment_detail(
     source_type: TypeId,
     target: TypeId,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
 ) -> Result<Option<String>, SourceCheckError> {
     if !matches!(
         expression.unparenthesized().kind,
-        PlannedExpressionKind::Conditional(_) | PlannedExpressionKind::Element(_)
+        PlannedExpressionKind::Conditional(_)
+            | PlannedExpressionKind::Element(_)
+            | PlannedExpressionKind::Property(_)
     ) {
         return Ok(None);
     }
@@ -38765,7 +38770,13 @@ fn union_assignment_detail(
         None => return Err(RelationUnavailable::Type(source_type).into()),
     };
     for constituent in constituents {
-        if store.is_type_assignable_to_with_global_types(constituent, target, global_types)? {
+        if store.is_type_assignable_to_with_session(
+            constituent,
+            target,
+            Some(global_types),
+            Some(options.strict_function_types),
+            session,
+        )? {
             continue;
         }
         let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
@@ -79755,7 +79766,8 @@ mod tests {
     }
 
     #[test]
-    fn invalid_derived_constructor_parameter_property_leaves_every_declaration_cold() {
+    #[allow(clippy::too_many_lines)] // Keep all three original inputs and their source identity checks together.
+    fn derived_constructor_parameter_properties_keep_recovered_diagnostics_and_source_identity() {
         for (index, text) in [
             concat!(
                 "interface Options { value: number; } ",
@@ -79786,25 +79798,523 @@ mod tests {
             let owner = global_symbol(&context, "Sub");
             let base = global_symbol(&context, "Super");
             let interface = global_symbol(&context, "Options");
-            let cold = observable_state(&context, file);
-            let result = context.check_source_file(file);
-
-            assert!(
-                matches!(
-                    result,
-                    Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Class(_)
-                    ))
-                ),
-                "{text}: {result:?}",
-            );
-            assert_eq!(observable_state(&context, file), cold, "{text}");
             for symbol in [owner, base, interface] {
                 assert!(context.store().declared_type_links(symbol).is_none());
             }
             assert!(context.store().value_symbol_links(owner).is_none());
             assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+
+            assert_eq!(context.check_source_file(file), Ok(()), "{text}");
+            let [declaration] = context
+                .store()
+                .symbol(owner)
+                .unwrap()
+                .declarations()
+                .unwrap()
+            else {
+                panic!("Sub must keep its one real class declaration")
+            };
+            let NodeData::ClassDeclaration(class) =
+                &source.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let constructor = class
+                .members
+                .nodes
+                .iter()
+                .copied()
+                .find(|node| source.arena.get(*node).unwrap().kind == SyntaxKind::Constructor)
+                .map(|node| NodeRef::new(source.arena.id(), file, node))
+                .unwrap();
+            let NodeData::ConstructorDeclaration(constructor_data) =
+                &source.arena.get(constructor.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let [parameter] = constructor_data.parameters.nodes.as_slice() else {
+                panic!("the constructor must keep its one parameter property")
+            };
+            let parameter = NodeRef::new(source.arena.id(), file, *parameter);
+            let NodeData::ParameterDeclaration(parameter_data) =
+                &source.arena.get(parameter.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let bound = context.file(file).unwrap().1;
+            let property = bound.symbol(parameter).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .symbol(owner)
+                    .unwrap()
+                    .members()
+                    .and_then(|members| context.store().symbol_table(members))
+                    .and_then(|members| members.get_source("options")),
+                Some(property),
+            );
+            let local = bound
+                .locals(constructor)
+                .and_then(|locals| context.store().symbol_table(locals))
+                .and_then(|locals| locals.get_source("options"))
+                .unwrap();
+            assert_ne!(property, local);
+            assert_eq!(
+                context.store().symbol(property).unwrap().parent(),
+                Some(owner)
+            );
+            assert_eq!(
+                context.store().symbol(property).unwrap().flags(),
+                SymbolFlags::PROPERTY
+            );
+            assert_eq!(
+                context.store().symbol(local).unwrap().flags(),
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            );
+            assert_eq!(
+                parameter_data
+                    .modifiers
+                    .as_ref()
+                    .unwrap()
+                    .list
+                    .nodes
+                    .iter()
+                    .map(|node| source.arena.get(*node).unwrap().kind)
+                    .collect::<Vec<_>>(),
+                [if index == 2 {
+                    SyntaxKind::PrivateKeyword
+                } else {
+                    SyntaxKind::PublicKeyword
+                }],
+            );
+            let interface_type = context
+                .store()
+                .declared_type_links(interface)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let instance_type = context
+                .store()
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            for symbol in [property, local] {
+                let record = context.store().symbol(symbol).unwrap();
+                assert_eq!(record.declarations(), Some(&[parameter][..]));
+                assert_eq!(record.value_declaration(), Some(parameter));
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(symbol)
+                        .unwrap()
+                        .resolved_type,
+                    Some(interface_type),
+                );
+            }
+            let annotation = NodeRef::new(source.arena.id(), file, parameter_data.type_.unwrap());
+            assert_eq!(resolved_node_type(&context, annotation), interface_type);
+            let signature = context
+                .store()
+                .signature_links(constructor)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let signature = context.store().signature(signature).unwrap();
+            assert_eq!(signature.parameters(), &[local]);
+            assert_eq!(signature.min_argument_count(), 1);
+            assert_eq!(signature.resolved_return_type(), Some(instance_type));
+
+            let mut expected = Vec::new();
+            if index == 0 {
+                let record = source.arena.get(constructor.node).unwrap();
+                let start = usize::try_from(record.range.start.get()).unwrap();
+                let end = usize::try_from(record.range.end.get()).unwrap();
+                let token = Scanner::new(&text[start..end]).scan();
+                assert_eq!(token.kind, SyntaxKind::ConstructorKeyword);
+                let range = TextRange::new(
+                    ts_core::TextPos::new(record.range.start.get() + token.range.start.get()),
+                    ts_core::TextPos::new(record.range.start.get() + token.range.end.get()),
+                );
+                assert_eq!(
+                    &text[usize::try_from(range.start.get()).unwrap()
+                        ..usize::try_from(range.end.get()).unwrap()],
+                    "constructor"
+                );
+                let diagnostic = CanonicalCheckerDiagnostic {
+                    node: Some(constructor),
+                    range_override: Some(CanonicalCheckerDiagnosticRange::new(constructor, range)),
+                    diagnostic: Diagnostic::new(message_by_code(2377).unwrap()),
+                    related_information: Vec::new(),
+                };
+                assert_eq!(
+                    diagnostic.diagnostic.render().unwrap(),
+                    "Constructors for derived classes must contain a 'super' call."
+                );
+                expected.push(diagnostic);
+            } else {
+                let call = source
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        let NodeData::CallExpression(call) = &record.data else {
+                            return None;
+                        };
+                        (source.arena.get(call.expression).unwrap().kind
+                            == SyntaxKind::SuperKeyword)
+                            .then_some(NodeRef::new(source.arena.id(), file, node))
+                    })
+                    .unwrap();
+                let NodeData::CallExpression(call_data) =
+                    &source.arena.get(call.node).unwrap().data
+                else {
+                    unreachable!()
+                };
+                let [argument] = call_data.arguments.nodes.as_slice() else {
+                    panic!("super must keep its one source argument")
+                };
+                let argument = NodeRef::new(source.arena.id(), file, *argument);
+                let NodeData::PropertyAccessExpression(access) =
+                    &source.arena.get(argument.node).unwrap().data
+                else {
+                    unreachable!()
+                };
+                let receiver = NodeRef::new(source.arena.id(), file, access.expression);
+                let name = NodeRef::new(source.arena.id(), file, access.name);
+                assert_eq!(node_text(&source, receiver), "options");
+                assert_eq!(resolved_node_type(&context, receiver), interface_type);
+                assert_eq!(
+                    context
+                        .store()
+                        .symbol_node_links(receiver)
+                        .unwrap()
+                        .resolved_symbol,
+                    Some(local)
+                );
+                if index == 1 {
+                    assert_eq!(node_text(&source, name), "missing");
+                    let diagnostic = CanonicalCheckerDiagnostic {
+                        node: Some(name),
+                        range_override: None,
+                        diagnostic: Diagnostic::with_arguments(
+                            message_by_code(2339).unwrap(),
+                            ["missing", "Options"],
+                        ),
+                        related_information: Vec::new(),
+                    };
+                    assert_eq!(
+                        diagnostic.diagnostic.render().unwrap(),
+                        "Property 'missing' does not exist on type 'Options'."
+                    );
+                    expected.push(diagnostic);
+                    assert_eq!(
+                        resolved_node_type(&context, argument),
+                        context.store().intrinsic_bootstrap().unwrap().error_type
+                    );
+                } else {
+                    assert_eq!(node_text(&source, name), "value");
+                    let interface_property = context
+                        .store()
+                        .symbol(interface)
+                        .unwrap()
+                        .members()
+                        .and_then(|members| context.store().symbol_table(members))
+                        .and_then(|members| members.get_source("value"))
+                        .unwrap();
+                    assert_eq!(
+                        context.store().symbol(interface_property).unwrap().parent(),
+                        Some(interface)
+                    );
+                    assert_eq!(
+                        context
+                            .store()
+                            .symbol_node_links(argument)
+                            .unwrap()
+                            .resolved_symbol,
+                        Some(interface_property)
+                    );
+                    assert_eq!(
+                        resolved_node_type(&context, argument),
+                        context.store().intrinsic_bootstrap().unwrap().number_type
+                    );
+                }
+                let base_value = context
+                    .store()
+                    .value_symbol_links(base)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                let TypeData::Object(base_value) =
+                    context.store().type_payload(base_value).unwrap().data()
+                else {
+                    unreachable!()
+                };
+                assert_eq!(base_value.structured.call_signature_count, 0);
+                let [base_signature] = base_value.structured.signatures.as_deref().unwrap() else {
+                    panic!("Super must keep its one construct signature")
+                };
+                assert_eq!(
+                    context
+                        .store()
+                        .signature_links(call)
+                        .unwrap()
+                        .resolved_signature
+                        .signature(),
+                    Some(*base_signature)
+                );
+                assert_eq!(
+                    resolved_node_type(&context, call),
+                    context.store().intrinsic_bootstrap().unwrap().void_type
+                );
+            }
+            assert_eq!(
+                context.diagnostics().as_slice(),
+                expected.as_slice(),
+                "{text}"
+            );
+            assert!(is_type_checked(&context, file));
+            for symbol in [owner, base, interface] {
+                assert!(
+                    context
+                        .store()
+                        .declared_type_links(symbol)
+                        .unwrap()
+                        .declared_type
+                        .is_some()
+                );
+            }
+            for symbol in [owner, base] {
+                assert!(
+                    context
+                        .store()
+                        .value_symbol_links(symbol)
+                        .unwrap()
+                        .resolved_type
+                        .is_some()
+                );
+            }
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                (
+                    observable_state(context, file),
+                    [owner, base, interface, property, local].map(|symbol| {
+                        (
+                            context.store().declared_type_links(symbol).cloned(),
+                            context.store().value_symbol_links(symbol).cloned(),
+                        )
+                    }),
+                    source
+                        .arena
+                        .iter()
+                        .map(|(node, _)| {
+                            let node = NodeRef::new(source.arena.id(), file, node);
+                            (
+                                context.store().type_node_links(node).cloned(),
+                                context.store().symbol_node_links(node).cloned(),
+                                context.store().signature_links(node).cloned(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let warm = snapshot(&context);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                context.diagnostics().as_slice(),
+                expected.as_slice(),
+                "{text}"
+            );
+            assert!(is_type_checked(&context, file));
+            assert_eq!(snapshot(&context), warm, "{text}");
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check one real property plan with a spent caller and its exact options.
+    fn property_union_assignment_detail_preserves_caller_state_and_strict_options() {
+        use crate::semantic::instantiate::instantiate_type_with_vector_and_session;
+
+        let source = parsed(concat!(
+            "function keep<T>(value: T): T { return value; } ",
+            "class Model { value: string | null = null; } ",
+            "const model = new Model(); const current = model.value;",
+        ));
+        let file = FileId::new(8_518);
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            strict_function_types: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = context(&[(file, &source)], options);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let read = variable_initializer(&source, file, "current");
+        let source_type = resolved_node_type(&context, read);
+        assert!(matches!(
+            context.store().type_payload(source_type).unwrap().data(),
+            TypeData::Union(_)
+        ));
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let plan = SourcePlanner::new_semantic_with_global_types(
+            &source.arena,
+            &bound,
+            context.source_file(file).unwrap(),
+            context.store(),
+            &host,
+            &globals,
+            options,
+        )
+        .finish()
+        .unwrap();
+        let expression = plan
+            .statements
+            .iter()
+            .find_map(|statement| {
+                let PlannedStatement::Variables(variables) = statement else {
+                    return None;
+                };
+                variables.iter().find_map(|variable| {
+                    let PlannedVariableInitializer::Expression(expression) = &variable.initializer
+                    else {
+                        return None;
+                    };
+                    (expression.node == read).then_some(expression)
+                })
+            })
+            .unwrap();
+        assert!(matches!(
+            expression.kind,
+            PlannedExpressionKind::Property(_)
+        ));
+        let keep = function_symbol(&context, &source, file, "keep");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(keep)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let parameter = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .type_parameters()[0];
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+        let mut session = InstantiationSession::new_recovering(
+            context.store(),
+            InstantiationLimits {
+                max_count: 1,
+                ..InstantiationLimits::default()
+            },
+            error,
+        )
+        .unwrap();
+        let arrays = Some(CanonicalArrayTargets::from_global_types(&globals));
+        for expected in [string, error] {
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    context.store_mut_for_test(),
+                    parameter,
+                    &[parameter],
+                    &[string],
+                    arrays,
+                    &mut session,
+                ),
+                Ok(expected),
+            );
+        }
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(session.total_count(), 1);
+        assert_eq!(session.limit_event_count(), 1);
+        let caller_state = |session: &InstantiationSession| {
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_mark(),
+                session.recovery_error_type(),
+            )
+        };
+        let spent = caller_state(&session);
+        let before = observable_state(&context, file);
+        assert_eq!(
+            union_assignment_detail(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                expression,
+                source_type,
+                string,
+                CanonicalCheckerOptions {
+                    strict_function_types: false,
+                    ..options
+                },
+                &mut session,
+            ),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                    established: true,
+                    requested: false
+                },
+            )),
+        );
+        assert_eq!(observable_state(&context, file), before);
+        assert_eq!(caller_state(&session), spent);
+        let detail = "Type 'null' is not assignable to type 'string'.";
+        assert_eq!(
+            union_assignment_detail(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                expression,
+                source_type,
+                string,
+                options,
+                &mut session,
+            ),
+            Ok(Some(detail.to_owned())),
+        );
+        assert_eq!(caller_state(&session), spent);
+        let warm = observable_state(&context, file);
+        assert_eq!(
+            union_assignment_detail(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                expression,
+                source_type,
+                string,
+                options,
+                &mut session,
+            ),
+            Ok(Some(detail.to_owned())),
+        );
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(caller_state(&session), spent);
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                context.store_mut_for_test(),
+                parameter,
+                &[parameter],
+                &[string],
+                arrays,
+                &mut session,
+            ),
+            Ok(error),
+        );
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(session.total_count(), 1);
+        assert_eq!(session.limit_event_count(), 2);
+        assert_eq!(session.recovery_error_type(), Some(error));
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

@@ -6675,8 +6675,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep each wrapper's source type, exact diagnostic, and replay together.
     fn own_class_property_flow_matches_real_reference_wrappers() {
-        use crate::semantic::production::GlobalMergeCompletion;
+        use crate::semantic::{CanonicalCheckerDiagnostic, production::GlobalMergeCompletion};
+        use ts_diagnostics::{Diagnostic, message_by_code};
 
         let parsed = parse_source_file(concat!(
             "declare const text: string; ",
@@ -6691,8 +6693,96 @@ mod tests {
         let file = FileId::new(202_619);
         let mut context = loop_context(&parsed, file);
         context.check_source_file(file).unwrap();
-        assert!(context.diagnostics().is_empty());
+        let satisfied = captured_variable(&parsed, file, "satisfied");
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(satisfied.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let name = NodeRef::new(parsed.arena.id(), file, variable.name);
+        let range = parsed.arena.get(name.node).unwrap().range;
+        assert_eq!(
+            &parsed.arena.source_text().unwrap()[usize::try_from(range.start.get()).unwrap()
+                ..usize::try_from(range.end.get()).unwrap()],
+            "satisfied"
+        );
+        let mut diagnostic =
+            Diagnostic::with_arguments(message_by_code(2322).unwrap(), ["string | null", "string"]);
+        diagnostic
+            .details
+            .push("  Type 'null' is not assignable to type 'string'.".to_owned());
+        let expected_diagnostic = CanonicalCheckerDiagnostic {
+            node: Some(name),
+            range_override: None,
+            diagnostic,
+            related_information: Vec::new(),
+        };
+        assert_eq!(
+            expected_diagnostic.diagnostic.render().unwrap(),
+            concat!(
+                "Type 'string | null' is not assignable to type 'string'.\n",
+                "  Type 'null' is not assignable to type 'string'."
+            )
+        );
+        assert_eq!(
+            context.diagnostics().as_slice(),
+            std::slice::from_ref(&expected_diagnostic)
+        );
         let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let null = context.store().intrinsic_bootstrap().unwrap().null_type;
+        let class = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(record.data, NodeData::ClassDeclaration(_)).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let class = context.file(file).unwrap().1.symbol(class).unwrap();
+        let property = context
+            .store()
+            .symbol(class)
+            .unwrap()
+            .members()
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let declaration = context
+            .store()
+            .symbol(property)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let NodeData::PropertyDeclaration(property_node) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let annotation = NodeRef::new(parsed.arena.id(), file, property_node.type_.unwrap());
+        let declared = context
+            .store()
+            .value_symbol_links(property)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(annotation)
+                .unwrap()
+                .resolved_type,
+            Some(declared)
+        );
+        let TypeData::Union(union) = context.store().type_payload(declared).unwrap().data() else {
+            panic!("the instance field must keep its canonical nullable union")
+        };
+        assert_eq!(union.union.types.len(), 2);
+        assert!(union.union.types.contains(&string));
+        assert!(union.union.types.contains(&null));
+        let mut reads = Vec::new();
         for name in ["nonNull", "satisfied", "staticRead"] {
             let declaration = captured_variable(&parsed, file, name);
             let NodeData::VariableDeclaration(variable) =
@@ -6701,11 +6791,17 @@ mod tests {
                 unreachable!();
             };
             let read = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+            let expected = if name == "satisfied" {
+                declared
+            } else {
+                string
+            };
             assert_eq!(
                 context.get_type_at_location(read).unwrap(),
-                string,
+                expected,
                 "{name}"
             );
+            reads.push((read, expected));
         }
         let bound = context.file(file).unwrap().1.clone();
         let host = DeclaredTypeHost::new_after_global_merge(
@@ -6734,7 +6830,13 @@ mod tests {
             context.store().relation_state_snapshot(),
         );
         context.recheck_source_file(file).unwrap();
-        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            context.diagnostics().as_slice(),
+            std::slice::from_ref(&expected_diagnostic)
+        );
+        for (read, expected) in reads {
+            assert_eq!(context.get_type_at_location(read).unwrap(), expected);
+        }
         assert_eq!(
             (
                 context.store().type_len(),
