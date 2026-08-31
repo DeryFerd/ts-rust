@@ -5475,6 +5475,99 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         else {
             return None;
         };
+        if self.source_is_typescript_external_module(owner_declaration)
+            && self.source_node_kind(owner_declaration) == Some(SyntaxKind::InterfaceDeclaration)
+            && let Some(SourceNodeParent::Parent(source)) =
+                self.source_node_parent(owner_declaration)
+            && self.source_node_kind(source) == Some(SyntaxKind::SourceFile)
+        {
+            // Exported interfaces have separate local and export symbols.
+            // Read their original binder slots before accepting current table entries.
+            let [Some(owner), Some(local)] =
+                self.symbols.source_binding_symbols(owner_declaration)?
+            else {
+                return None;
+            };
+            let [Some(module), None] = self.symbols.source_binding_symbols(source)? else {
+                return None;
+            };
+            let [Some(method), None] = self.symbols.source_binding_symbols(declaration)? else {
+                return None;
+            };
+            let interface = self.symbol(owner)?;
+            let local_record = self.symbol(local)?;
+            let module_record = self.symbol(module)?;
+            let method_record = self.symbol(method)?;
+            let owner_type = self.declared_type_links(owner)?.declared_type?;
+            let declarations = interface.declarations()?;
+            let name = self.source_child_with_kind(owner_declaration, SyntaxKind::Identifier)?;
+            if self.source_node_parent(source) != Some(SourceNodeParent::Root)
+                || self
+                    .source_files
+                    .get(&source.file)
+                    .map(|file| file.node_ref())
+                    != Some(source)
+                || self
+                    .source_file_facts
+                    .get(&source.file)?
+                    .is_common_js_module()
+                || self.source_identifier_text(name) != interface.name().as_utf8()
+                || declarations.is_empty()
+                || !declarations.contains(&owner_declaration)
+                || declarations.iter().any(|&declaration| {
+                    self.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration)
+                        || self.source_node_parent(declaration)
+                            != Some(SourceNodeParent::Parent(source))
+                        || self.source_node_is_exported(declaration) != Some(true)
+                        || self.symbols.source_binding_symbols(declaration)
+                            != Some([Some(owner), Some(local)])
+                })
+                || interface.flags() != SymbolFlags::INTERFACE
+                || interface.parent() != Some(module)
+                || interface.value_declaration().is_some()
+                || interface.exports().is_some()
+                || interface.export_symbol().is_some()
+                || !self.source_raw_symbol_declarations_match(owner)
+                || self.get_merged_symbol(owner) != Some(owner)
+                || local == owner
+                || self.get_merged_symbol(local) != Some(local)
+                || local_record.flags() != SymbolFlags::NONE
+                || local_record.check_flags() != CheckFlags::NONE
+                || local_record.name() != interface.name()
+                || local_record.declarations() != Some(declarations)
+                || local_record.value_declaration().is_some()
+                || local_record.members().is_some()
+                || local_record.exports().is_some()
+                || local_record.parent().is_some()
+                || local_record.export_symbol() != Some(owner)
+                || !self.source_raw_symbol_declarations_match(local)
+                || module_record.flags() != SymbolFlags::VALUE_MODULE
+                || module_record.check_flags() != CheckFlags::NONE
+                || module_record.declarations() != Some(&[source])
+                || module_record.members().is_some()
+                || module_record.parent().is_some()
+                || module_record.export_symbol().is_some()
+                || self.get_merged_symbol(module) != Some(module)
+                || !self.source_raw_symbol_declarations_match(module)
+                || !self.source_symbol_export_table_matches(module)
+                || module_record
+                    .exports()
+                    .and_then(|exports| self.symbol_table(exports))
+                    .and_then(|exports| exports.get(interface.name()))
+                    != Some(owner)
+                || method_record.parent() != Some(owner)
+                || !self.source_raw_symbol_declarations_match(method)
+                || interface
+                    .members()
+                    .and_then(|members| self.symbol_table(members))
+                    .and_then(|members| members.get(method_record.name()))
+                    != Some(method)
+                || self.authenticated_interface_method_owner(method) != Some((owner, owner_type))
+            {
+                return None;
+            }
+            return Some(method);
+        }
         let globals = self.symbol_table(self.intrinsic_bootstrap.as_ref()?.globals)?;
         for (_, global) in globals.iter() {
             let Some(owner) = self.get_merged_symbol(global) else {
@@ -15104,6 +15197,10 @@ fn canonical_type_resolution_property(
         | TypeSystemPropertyName::AliasTarget => None,
     }
 }
+
+#[cfg(test)]
+#[path = "store_exported_interface_method_tests.rs"]
+mod exported_interface_method_tests;
 
 #[cfg(test)]
 mod source_global_owner_tests {
