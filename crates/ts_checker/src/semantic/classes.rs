@@ -38118,7 +38118,10 @@ mod query_tests {
                                 record.object_flags(),
                                 record.symbol(),
                                 record.alias(),
-                                record.data().clone(),
+                                match record.data() {
+                                    TypeData::Interface(data) => data.clone(),
+                                    _ => panic!("expected the class instance interface"),
+                                },
                             )
                         }),
                     [original, selected].map(|id| {
@@ -38499,7 +38502,10 @@ mod query_tests {
                                 record.object_flags(),
                                 record.symbol(),
                                 record.alias(),
-                                record.data().clone(),
+                                match record.data() {
+                                    TypeData::TypeParameter(data) => data.clone(),
+                                    _ => panic!("expected the class type parameter"),
+                                },
                             )
                         })
                     })
@@ -38510,7 +38516,10 @@ mod query_tests {
                         record.object_flags(),
                         record.symbol(),
                         record.alias(),
-                        record.data().clone(),
+                        match record.data() {
+                            TypeData::Object(data) => data.clone(),
+                            _ => panic!("expected the class constructor object"),
+                        },
                     )
                 }),
                 [original, selected].map(|id| {
