@@ -30,9 +30,9 @@ use super::{
     links::ValueSymbolLinks,
     mapper::TypeMapperApplication,
     object_members::{
-        StoredDeclaredCallSetValidation, declared_method_type_parameter_view,
-        declared_method_value_links, declared_method_value_types,
-        validate_stored_declared_call_set,
+        StoredDeclaredCallSetValidation, declared_class_method_type_parameter_view,
+        declared_method_type_parameter_view, declared_method_value_links,
+        declared_method_value_types, validate_stored_declared_call_set,
     },
     reference_types::validate_direct_generic_reference,
     signatures::SignatureFlags,
@@ -253,7 +253,8 @@ pub(super) fn validate_stored_callable_set_with_array_targets(
         return validation;
     }
 
-    if let Some(validation) = validate_stored_class_method_callable_set(store, type_) {
+    if let Some(validation) = validate_stored_class_method_callable_set(store, type_, array_targets)
+    {
         return validation;
     }
 
@@ -2306,6 +2307,7 @@ pub(super) fn validated_method_annotation_type(
 fn validate_stored_class_method_callable_set(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<StoredCallableSetValidation> {
     let method_symbol = store.type_payload(type_)?.symbol()?;
     let method = store.symbol(method_symbol)?;
@@ -2393,7 +2395,8 @@ fn validate_stored_class_method_callable_set(
         for (callable, declaration) in projection.call_signatures.iter().zip(visible) {
             let signature = callable.signature;
             let return_type = callable.return_type?;
-            if store.signature(signature)?.declaration() != Some(*declaration)
+            let record = store.signature(signature)?;
+            if record.declaration() != Some(*declaration)
                 || store.signature_links(*declaration)
                     != Some(&SignatureLinks {
                         resolved_signature: ResolvedSignatureState::Resolved(signature),
@@ -2401,6 +2404,29 @@ fn validate_stored_class_method_callable_set(
                     })
             {
                 return None;
+            }
+            let source_has_type_parameters = store
+                .source_direct_children(*declaration)?
+                .into_iter()
+                .any(|child| store.source_node_kind(child) == Some(SyntaxKind::TypeParameter));
+            if source_has_type_parameters || !record.type_parameters().is_empty() {
+                if super::classes::source_class_generic_method_callee(
+                    store,
+                    signature,
+                    array_targets,
+                )
+                .ok()?
+                    != Some(type_)
+                {
+                    return None;
+                }
+                let parameters =
+                    declared_class_method_type_parameter_view(store, record, *declaration)?;
+                for parameter in parameters {
+                    edges.push(parameter.type_parameter);
+                    edges.extend(parameter.constraint);
+                    edges.extend(parameter.default_type);
+                }
             }
             edges.extend(&callable.parameters);
             edges.extend(callable.rest_parameter);

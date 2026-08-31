@@ -65,8 +65,241 @@ pub(in crate::semantic) fn source_class_annotation_is_owned(
     })
 }
 
-/// A method parameter uses its own literal, local symbol, and actual class member.
 pub(in crate::semantic) fn source_class_method_annotation_is_owned(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    annotation: NodeRef,
+) -> bool {
+    source_nongeneric_class_method_annotation_is_owned(store, host, owner, annotation)
+        || source_class_method_type_parameter_plan(store, host, owner, annotation)
+            .ok()
+            .flatten()
+            .is_some()
+}
+
+/// Method annotations retain the actual class, local formals, and written operand roles.
+pub(in crate::semantic) fn source_class_method_type_parameter_plan(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    annotation: NodeRef,
+) -> Result<
+    Option<Vec<super::super::object_members::PlannedInterfaceMethodTypeParameter>>,
+    ClassError,
+> {
+    source_class_method_type_parameter_plan_worker(store, host, owner, annotation, false)
+}
+
+/// Prepares the same method formals even when it has no written value annotation.
+pub(in crate::semantic) fn source_class_method_type_parameters(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    method: NodeRef,
+) -> Result<
+    Option<Vec<super::super::object_members::PlannedInterfaceMethodTypeParameter>>,
+    ClassError,
+> {
+    source_class_method_type_parameter_plan_worker(store, host, owner, method, true)
+}
+
+#[allow(clippy::too_many_lines)] // One read-only proof keeps source roles, member ownership, and formals together.
+fn source_class_method_type_parameter_plan_worker(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    annotation: NodeRef,
+    method_root: bool,
+) -> Result<
+    Option<Vec<super::super::object_members::PlannedInterfaceMethodTypeParameter>>,
+    ClassError,
+> {
+    let selected = (|| {
+        let (method, parameter) = if method_root {
+            (annotation, None)
+        } else {
+            let annotation_record = host.node(annotation)?;
+            let parent = NodeRef::new(annotation.arena, annotation.file, annotation_record.parent?);
+            let parent_record = host.node(parent)?;
+            match &parent_record.data {
+                NodeData::ParameterDeclaration(data)
+                    if data.type_ == Some(annotation.node)
+                        && data.dot_dot_dot_token.is_none()
+                        && data.question_token.is_none()
+                        && data.initializer.is_none()
+                        && data.modifiers.is_none() =>
+                {
+                    (
+                        NodeRef::new(parent.arena, parent.file, parent_record.parent?),
+                        Some(parent),
+                    )
+                }
+                NodeData::MethodDeclaration(data) if data.type_ == Some(annotation.node) => {
+                    (parent, None)
+                }
+                NodeData::TypeParameterDeclaration(data)
+                    if data.constraint == Some(annotation.node)
+                        || data.default_type == Some(annotation.node) =>
+                {
+                    (
+                        NodeRef::new(parent.arena, parent.file, parent_record.parent?),
+                        None,
+                    )
+                }
+                _ => return None,
+            }
+        };
+        let method_record = host.node(method)?;
+        let NodeData::MethodDeclaration(data) = &method_record.data else {
+            return None;
+        };
+        let declaration = NodeRef::new(method.arena, method.file, method_record.parent?);
+        let class_record = host.node(declaration)?;
+        let NodeData::ClassDeclaration(class) = &class_record.data else {
+            return None;
+        };
+        if method_record.kind != SyntaxKind::MethodDeclaration
+            || method_record.flags.0 != 0
+            || data
+                .type_parameters
+                .as_ref()
+                .is_none_or(|parameters| parameters.nodes.is_empty())
+            || data.body.is_none()
+            || data.asterisk_token.is_some()
+            || data.postfix_token.is_some()
+            || data.full_signature.is_some()
+            || data.symbol.is_some()
+            || data.flow_node.is_some()
+            || data.end_flow_node.is_some()
+            || data.next_container.is_some()
+            || data.facts != 0
+            || data.parameters.nodes.iter().any(|&node| {
+                let parameter = NodeRef::new(method.arena, method.file, node);
+                host.node(parameter).is_none_or(|record| {
+                    let NodeData::ParameterDeclaration(parameter) = &record.data else {
+                        return true;
+                    };
+                    record.kind != SyntaxKind::Parameter
+                        || record.flags.0 != 0
+                        || record.parent != Some(method.node)
+                        || parameter.type_.is_none()
+                        || parameter.dot_dot_dot_token.is_some()
+                        || parameter.question_token.is_some()
+                        || parameter.initializer.is_some()
+                        || parameter.modifiers.is_some()
+                        || parameter.symbol.is_some()
+                        || parameter.facts != 0
+                        || host
+                            .node(NodeRef::new(method.arena, method.file, parameter.name))
+                            .is_none_or(|name| name.kind != SyntaxKind::Identifier)
+                })
+            })
+            || class_record.kind != SyntaxKind::ClassDeclaration
+            || class.type_parameters.is_some()
+            || class
+                .members
+                .nodes
+                .iter()
+                .filter(|&&node| node == method.node)
+                .count()
+                != 1
+            || bound_symbol(store, host, declaration) != Some(owner)
+            || preflight_class_or_interface_reference(store, host, owner, SymbolFlags::CLASS)
+                != Ok(0)
+        {
+            return None;
+        }
+        let method_symbol = bound_symbol(store, host, method)?;
+        let method_owner = store.symbol(method_symbol)?;
+        let (side, readonly) = class_property_modifiers(
+            store,
+            host,
+            method,
+            NodeRef::new(method.arena, method.file, data.name),
+            data.modifiers.as_ref(),
+            None,
+        )
+        .ok()?;
+        if readonly
+            || side != ClassPropertySide::Instance
+            || method_owner.flags() != SymbolFlags::METHOD
+            || method_owner.parent() != Some(owner)
+            || method_owner.declarations() != Some(&[method])
+            || method_owner.value_declaration() != Some(method)
+            || method_owner.name().is_private_identifier()
+            || store.get_merged_symbol(method_symbol) != Some(method_symbol)
+            || store
+                .symbol(owner)?
+                .members()
+                .and_then(|table| store.symbol_table(table))?
+                .get(method_owner.name())
+                != Some(method_symbol)
+        {
+            return None;
+        }
+        if let Some(parameter) = parameter {
+            let symbol = bound_symbol(store, host, parameter)?;
+            let record = store.symbol(symbol)?;
+            if data
+                .parameters
+                .nodes
+                .iter()
+                .filter(|&&node| node == parameter.node)
+                .count()
+                != 1
+                || record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                || record.declarations() != Some(&[parameter])
+                || record.value_declaration() != Some(parameter)
+                || record.parent().is_some()
+                || store.get_merged_symbol(symbol) != Some(symbol)
+                || host
+                    .bound_file(method)?
+                    .locals(method)
+                    .and_then(|table| store.symbol_table(table))?
+                    .get(record.name())
+                    != Some(symbol)
+            {
+                return None;
+            }
+        }
+        Some(method)
+    })();
+    let Some(method) = selected else {
+        return Ok(None);
+    };
+    let NodeData::MethodDeclaration(data) = &super::preflight_node(store, host, method)?.data
+    else {
+        return Ok(None);
+    };
+    let planned = super::super::object_members::plan_declared_signature_type_parameters(
+        store,
+        host,
+        method,
+        data.type_parameters.as_ref(),
+        &data.parameters,
+        host.bound_file(method)
+            .and_then(|bound| bound.locals(method))
+            .and_then(|table| store.symbol_table(table)),
+        SyntaxKind::MethodDeclaration,
+    )
+    .map_err(|_| invariant(ClassInvariant::InvalidProperty(method)))?;
+    if !method_root
+        && let Some(parent) = host.node(annotation).and_then(|record| record.parent)
+        && host
+            .node(NodeRef::new(annotation.arena, annotation.file, parent))
+            .is_some_and(|record| record.kind == SyntaxKind::TypeParameter)
+        && !planned
+            .iter()
+            .any(|parameter| parameter.declaration.node == parent)
+    {
+        return Ok(None);
+    }
+    Ok(Some(planned))
+}
+
+/// A nongeneric method parameter keeps its original inline-literal proof.
+fn source_nongeneric_class_method_annotation_is_owned(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     owner: SemanticSymbolId,

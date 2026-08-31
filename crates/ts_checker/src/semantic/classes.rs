@@ -83,12 +83,14 @@
 //! fixed keyword tuple and required property-only type literal method parameters,
 //! and function-typed fields.
 //! Tuple annotations use the ordinary type-node query before method publication.
+//! Source-owned generic instance methods retain their own formals and query
+//! dependent annotations before the ordinary body checker uses their signatures.
 //! The source executor checks field initializers before publishing their inferred types.
 //! Direct null fields use the same executor and retain strict-null widening and diagnostics.
 //! With the caller's type-query context, fields and required constructor
 //! parameters retain canonical array and union annotations. A source annotation
 //! can reference its own declared class identity before its bodies are complete.
-//! General heritage and non-primitive method annotations remain later stages.
+//! Other heritage and nongeneric method annotation forms remain later stages.
 
 use std::collections::{HashMap, HashSet};
 
@@ -98,7 +100,8 @@ pub(super) use annotations::{
     SourceClassAnnotationScope, begin_retained_source_class_annotations,
     begin_source_class_annotations, class_instance_type_edges, completed_class_symbol,
     source_class_annotation_is_owned, source_class_annotation_scope_targets,
-    source_class_method_annotation_is_owned, with_retained_source_class_annotation_scopes,
+    source_class_method_annotation_is_owned, source_class_method_type_parameter_plan,
+    source_class_method_type_parameters, with_retained_source_class_annotation_scopes,
 };
 pub(super) use query::{
     ClassValueQuery, class_query_reference_symbol, selected_class_method_return_type,
@@ -144,8 +147,10 @@ use super::{
         missing_property_diagnostic, property_visibility_mismatch_detail,
     },
     object_members::{
-        DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation, plan_interface,
-        plan_type_literal, validate_resolved_declared_property_object,
+        DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
+        PlannedInterfaceMethodTypeParameter, declared_class_method_type_parameter_view,
+        plan_interface, plan_type_literal, resolved_declared_signature_type_parameters,
+        validate_resolved_declared_property_object,
     },
     reference_types::validate_direct_generic_reference,
     relater::ResolvedDeclaredProperty,
@@ -418,6 +423,13 @@ fn capture_source_class_bindings(
         method
             .method
             .parameters
+            .iter()
+            .map(|parameter| parameter.symbol)
+    }));
+    symbols.extend(plan.methods.iter().flat_map(|method| {
+        method
+            .method
+            .type_parameters
             .iter()
             .map(|parameter| parameter.symbol)
     }));
@@ -734,7 +746,7 @@ pub(super) fn source_class_constructor_overloads(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceClassMethodPlan {
     method: ClassMethodPlan,
-    return_type: Option<TypeId>,
+    return_type: Option<ClassBodyParameterType>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1559,6 +1571,15 @@ pub(super) fn plan_source_class_members_with_context(
                     .return_type_node
                     .map(|annotation| {
                         let record = preflight_node(store, host, annotation)?;
+                        if !method.type_parameters.is_empty()
+                            && type_context.is_some()
+                            && !matches!(record.data, NodeData::KeywordTypeNode(_))
+                            && source_class_method_annotation_is_owned(
+                                store, host, symbol, annotation,
+                            )
+                        {
+                            return Ok(ClassBodyParameterType::Annotation(annotation));
+                        }
                         if record.flags.0 != 0
                             || !matches!(record.data, NodeData::KeywordTypeNode(_))
                         {
@@ -1569,7 +1590,7 @@ pub(super) fn plan_source_class_members_with_context(
                         }
                         let type_ = primitive_keyword_type(store, annotation, record.kind)?;
                         validate_index_type_cache(store, annotation, type_)?;
-                        Ok(type_)
+                        Ok(ClassBodyParameterType::Known(type_))
                     })
                     .transpose()?;
                 let (arena, _) = host
@@ -1816,6 +1837,14 @@ pub(super) fn plan_source_class_members_with_context(
                         _ => None,
                     })
             }))
+            .chain(
+                plan.methods
+                    .iter()
+                    .filter_map(|method| match method.return_type {
+                        Some(ClassBodyParameterType::Annotation(node)) => Some(node),
+                        _ => None,
+                    }),
+            )
             .collect();
         plan.annotations.sort_unstable();
         plan.annotations.dedup();
@@ -2067,11 +2096,13 @@ fn source_class_minimum<T>(
         })
 }
 
+#[allow(clippy::too_many_arguments)] // Class and method signatures keep their distinct formal lists.
 fn source_class_signature_valid(
     store: &CanonicalTypeMapperStore,
     signature: SignatureId,
     declaration: Option<NodeRef>,
     flags: SignatureFlags,
+    type_parameters: &[TypeId],
     parameters: &[SemanticSymbolId],
     return_type: Option<TypeId>,
     minimum: i32,
@@ -2088,7 +2119,7 @@ fn source_class_signature_valid(
         record.declaration() == declaration
             && record.flags() == flags
             && record.parameters() == parameters
-            && record.type_parameters().is_empty()
+            && record.type_parameters() == type_parameters
             && record.this_parameter().is_none()
             && record.min_argument_count() == minimum
             && (record.resolved_min_argument_count() == -1
@@ -2165,6 +2196,27 @@ fn class_method_minimum(method: &ClassMethodPlan) -> Result<i32, ClassError> {
     i32::try_from(count).map_err(|_| invariant(ClassInvariant::Capacity(method.declaration)))
 }
 
+fn resolved_source_class_method_type_parameters(
+    store: &CanonicalTypeMapperStore,
+    method: &ClassMethodPlan,
+) -> Result<Vec<TypeId>, ClassError> {
+    if method.type_parameters.is_empty() {
+        return Ok(Vec::new());
+    }
+    resolved_declared_signature_type_parameters(store, method.declaration, &method.type_parameters)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyTypeCache(method.declaration)))
+}
+
+fn source_class_method_return_type(
+    store: &CanonicalTypeMapperStore,
+    method: &SourceClassMethodPlan,
+) -> Result<Option<TypeId>, ClassError> {
+    method
+        .return_type
+        .map(|annotation| annotation.resolved(store))
+        .transpose()
+}
+
 fn source_table_matches(
     store: &CanonicalTypeMapperStore,
     table: Option<SymbolTableId>,
@@ -2223,6 +2275,7 @@ fn validate_source_class_stored_header(
     let reject = || invariant(ClassInvariant::InvalidInstanceMembers(plan.symbol()));
     for (index, method) in plan.methods.iter().enumerate() {
         let returned = provenance.method_returns[index];
+        let annotated_return = source_class_method_return_type(store, method)?;
         let body_complete = plan
             .bodies
             .iter()
@@ -2231,9 +2284,7 @@ fn validate_source_class_stored_header(
         if store
             .signature(provenance.prepared.methods[index].1)
             .is_none_or(|signature| signature.resolved_return_type() != returned)
-            || method
-                .return_type
-                .is_some_and(|annotation| returned != Some(annotation))
+            || annotated_return.is_some_and(|annotation| returned != Some(annotation))
             || method.return_type.is_none() && (returned.is_some() != body_complete)
         {
             return Err(reject());
@@ -2469,6 +2520,7 @@ fn validate_source_class_stored_layout(
                 } else {
                     SignatureFlags::NONE
                 },
+            &[],
             &provenance.constructor_parameters,
             Some(prepared.instance_type),
             provenance.constructor_minimum,
@@ -2497,6 +2549,7 @@ fn validate_source_class_stored_layout(
                 } else {
                     SignatureFlags::NONE
                 },
+            &[],
             &constructor
                 .parameters
                 .iter()
@@ -2706,6 +2759,7 @@ fn validate_source_class_stored_layout(
                 signature,
                 Some(method.method.declaration),
                 SignatureFlags::NONE,
+                &resolved_source_class_method_type_parameters(store, &method.method)?,
                 &parameters,
                 returned,
                 class_method_minimum(&method.method)?,
@@ -2763,7 +2817,7 @@ fn validate_source_class_stored_layout(
             && store
                 .type_node_links(annotation)
                 .and_then(|links| links.resolved_type)
-                != method.return_type
+                != source_class_method_return_type(store, method)?
         {
             return Err(reject());
         }
@@ -2779,7 +2833,7 @@ fn validate_source_class_stored_layout(
     Ok(())
 }
 
-/// Resolves retained tuple parameters in the caller's query session before publication.
+/// Resolves method formals and dependent annotations in the caller's query session.
 pub(super) fn prepare_source_class_members_with_type_queries(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2792,6 +2846,80 @@ pub(super) fn prepare_source_class_members_with_type_queries(
     if !source_class_plan_is_current(store, host, plan)? {
         return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
     }
+    if plan
+        .methods
+        .iter()
+        .any(|method| !method.method.type_parameters.is_empty())
+    {
+        let scope = begin_source_class_annotations(store, host, global_types, plan)?;
+        let result = (|| {
+            for method in &plan.methods {
+                if !method.method.type_parameters.is_empty() {
+                    CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                    )?
+                    .prepare_source_class_method_type_parameters(
+                        method.method.declaration,
+                        plan.symbol(),
+                    )?;
+                }
+            }
+            for &annotation in plan.annotation_nodes() {
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                )?
+                .get_type_from_source_class_annotation(annotation, plan.symbol())?;
+            }
+            prepare_source_class_tuple_parameters(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                plan,
+            )?;
+            prepare_source_class_members(store, host, plan)
+        })();
+        if let Some(instance) = scope
+            && !store.end_source_class_annotation_scope(instance)
+        {
+            return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
+        }
+        return result;
+    }
+    prepare_source_class_tuple_parameters(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        plan,
+    )?;
+    prepare_source_class_members(store, host, plan)
+}
+
+#[allow(clippy::too_many_arguments)] // The caller owns query options, diagnostics, and session.
+fn prepare_source_class_tuple_parameters(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    plan: &SourceClassPlan,
+) -> Result<(), ClassError> {
     for annotation in plan.tuple_parameter_annotations() {
         CanonicalTypeQuery::new_with_global_types_and_session(
             store,
@@ -2803,7 +2931,7 @@ pub(super) fn prepare_source_class_members_with_type_queries(
         )?
         .get_type_from_type_node(annotation)?;
     }
-    prepare_source_class_members(store, host, plan)
+    Ok(())
 }
 
 /// Publishes a header with real signatures. Inferred method returns stay absent.
@@ -2819,16 +2947,22 @@ pub(super) fn prepare_source_class_constructor_header(
 ) -> Result<ClassMembers, ClassError> {
     let scope = begin_source_class_annotations(store, host, globals, plan)?;
     let result = (|| {
-        for &annotation in plan.annotation_nodes() {
-            CanonicalTypeQuery::new_with_global_types_and_session(
-                store,
-                host,
-                globals,
-                options,
-                session,
-                diagnostics,
-            )?
-            .get_type_from_source_class_annotation(annotation, plan.symbol())?;
+        if plan
+            .methods
+            .iter()
+            .all(|method| method.method.type_parameters.is_empty())
+        {
+            for &annotation in plan.annotation_nodes() {
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    globals,
+                    options,
+                    session,
+                    diagnostics,
+                )?
+                .get_type_from_source_class_annotation(annotation, plan.symbol())?;
+            }
         }
         prepare_source_class_members_with_type_queries(
             store,
@@ -2929,7 +3063,7 @@ pub(super) fn prepare_source_class_members(
                     ))
                 })?;
             methods.push((type_, signature));
-            returns.push(method.return_type);
+            returns.push(source_class_method_return_type(store, method)?);
         }
         let prepared = PreparedSourceClass {
             plan: plan.clone(),
@@ -3122,8 +3256,8 @@ pub(super) fn prepare_source_class_members(
     let method_returns = plan
         .methods
         .iter()
-        .map(|method| method.return_type)
-        .collect::<Vec<_>>();
+        .map(|method| source_class_method_return_type(store, method))
+        .collect::<Result<Vec<_>, _>>()?;
     let completed_bodies = vec![false; plan.bodies.len()];
     let retained_plan = plan.clone();
     let mut numbers = Vec::new();
@@ -3349,6 +3483,8 @@ pub(super) fn prepare_source_class_members(
     }
     let mut method_types = HashMap::new();
     for method in &plan.methods {
+        let type_parameters = resolved_source_class_method_type_parameters(store, &method.method)?;
+        let return_type = source_class_method_return_type(store, method)?;
         let type_ = *method_types.entry(method.method.symbol).or_insert_with(|| {
             store
                 .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method.method.symbol))
@@ -3364,10 +3500,10 @@ pub(super) fn prepare_source_class_members(
             .alloc_signature(
                 SignatureFlags::NONE,
                 Some(method.method.declaration),
-                Vec::new(),
+                type_parameters,
                 None,
                 parameters,
-                method.return_type,
+                return_type,
                 None,
                 class_method_minimum(&method.method).expect("method arity was bounded"),
             )
@@ -3392,9 +3528,7 @@ pub(super) fn prepare_source_class_members(
                 }
             ));
         }
-        if let (Some(annotation), Some(type_)) =
-            (method.method.return_type_node, method.return_type)
-        {
+        if let (Some(annotation), Some(type_)) = (method.method.return_type_node, return_type) {
             assert!(store.set_type_node_links(
                 annotation,
                 TypeNodeLinks {
@@ -5908,6 +6042,65 @@ fn source_class_callable_projection(
     })
 }
 
+/// Finds a generic class method through its real source owner, before trusting caches.
+pub(super) fn source_class_generic_method_callee(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, ClassError> {
+    let Some(record) = store.signature(signature) else {
+        return Ok(None);
+    };
+    let Some(declaration) = record.declaration() else {
+        return Ok(None);
+    };
+    if store.source_node_kind(declaration) != Some(SyntaxKind::MethodDeclaration) {
+        return Ok(None);
+    }
+    let Some(SourceNodeParent::Parent(class)) = store.source_node_parent(declaration) else {
+        return Ok(None);
+    };
+    if store.source_node_kind(class) != Some(SyntaxKind::ClassDeclaration) {
+        return Ok(None);
+    }
+    let Some(owner) = store.source_declaration_symbol(class) else {
+        return Ok(None);
+    };
+    let Some(provenance) = store.source_class_provenance_for_symbol(owner) else {
+        return Ok(None);
+    };
+    let plan = &provenance.prepared.plan;
+    let Some((index, method)) = plan
+        .methods
+        .iter()
+        .enumerate()
+        .find(|(_, method)| method.method.declaration == declaration)
+    else {
+        return Ok(None);
+    };
+    if method.method.type_parameters.is_empty() {
+        return Ok(None);
+    }
+    let invalid = || {
+        invariant(ClassInvariant::InvalidPropertyValueCache(
+            method.method.symbol,
+        ))
+    };
+    validate_source_class_stored_header(store, provenance)?;
+    let (callee, expected_signature) = provenance.prepared.methods[index];
+    if expected_signature != signature
+        || method.method.side != ClassPropertySide::Instance
+        || method.method.overload
+        || record.type_parameters()
+            != resolved_source_class_method_type_parameters(store, &method.method)?
+        || array_targets.is_some_and(|targets| plan.array_targets != Some(targets))
+        || declared_class_method_type_parameter_view(store, record, declaration).is_none()
+    {
+        return Err(invalid());
+    }
+    Ok(Some(callee))
+}
+
 /// Reads the separate overload and implementation signatures from the class receipt.
 pub(super) fn source_class_method_overloads(
     store: &CanonicalTypeMapperStore,
@@ -6607,6 +6800,7 @@ struct ClassMethodPlan {
     return_type_node: Option<NodeRef>,
     private_return: Option<ClassMethodPrivateReturnPlan>,
     private_tagged_call: Option<ClassMethodPrivateTaggedCallPlan>,
+    type_parameters: Vec<PlannedInterfaceMethodTypeParameter>,
     parameters: Vec<ClassMethodParameterPlan>,
     rest_parameter: Option<ClassMethodRestParameterPlan>,
 }
@@ -10640,7 +10834,28 @@ fn plan_class_method_parameter_with_body_mode(
         {
             return Err(reject());
         }
-        if let NodeData::ArrayTypeNode(array) = &type_record.data {
+        if source_body
+            && type_context.is_some()
+            && data.question_token.is_none()
+            && !matches!(type_record.data, NodeData::KeywordTypeNode(_))
+            && host
+                .node(method)
+                .and_then(|record| record.parent)
+                .map(|node| NodeRef::new(method.arena, method.file, node))
+                .and_then(|class| bound_symbol(store, host, class))
+                .is_some_and(|owner| {
+                    source_class_method_type_parameter_plan(store, host, owner, type_node)
+                        .is_ok_and(|formals| formals.is_some())
+                })
+        {
+            (
+                Some(type_node),
+                ClassBodyParameterType::Annotation(type_node),
+                store
+                    .type_node_links(type_node)
+                    .and_then(|links| links.resolved_type),
+            )
+        } else if let NodeData::ArrayTypeNode(array) = &type_record.data {
             if !source_body || data.question_token.is_some() {
                 return Err(reject());
             }
@@ -11376,7 +11591,6 @@ fn plan_method_with_body_mode(
         || method.next_container.is_some()
         || method.postfix_token.is_some()
         || method.symbol.is_some()
-        || method.type_parameters.is_some()
         || method.facts != 0
     {
         return Err(unsupported(ClassUnsupported::Member {
@@ -11384,8 +11598,20 @@ fn plan_method_with_body_mode(
             kind: SyntaxKind::MethodDeclaration,
         }));
     }
+    let type_parameters = if method.type_parameters.is_some() {
+        if !source_body || ambient || type_context.is_none() {
+            return Err(accessor_member_error(
+                declaration,
+                SyntaxKind::MethodDeclaration,
+            ));
+        }
+        source_class_method_type_parameters(store, host, owner, declaration)?
+            .ok_or_else(|| accessor_member_error(declaration, SyntaxKind::MethodDeclaration))?
+    } else {
+        Vec::new()
+    };
     if !ambient && !source_body && method.parameters.nodes.len() > 1
-        || method.parameters.has_trailing_comma
+        || method.parameters.has_trailing_comma && type_parameters.is_empty()
     {
         return Err(unsupported(ClassUnsupported::Member {
             node: declaration,
@@ -11437,6 +11663,12 @@ fn plan_method_with_body_mode(
                 ));
             }
             optional_seen |= planned.optional;
+            if planned.optional && !type_parameters.is_empty() {
+                return Err(accessor_member_error(
+                    declaration,
+                    SyntaxKind::MethodDeclaration,
+                ));
+            }
             previous_end = preflight_node(store, host, parameter)?.range.end;
             parameters.push(planned);
         }
@@ -11660,6 +11892,7 @@ fn plan_method_with_body_mode(
         return_type_node,
         private_return,
         private_tagged_call,
+        type_parameters,
         parameters,
         rest_parameter,
     })
@@ -35697,6 +35930,282 @@ mod tests {
             source_class_snapshot!(fixture.store, prepared.instance_type),
             before
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the original Query source and its method plan in one control.
+    fn generic_method_plan_keeps_the_original_timeout_provider_source() {
+        // Query 44645e9 keeps its source intact. This control checks the method plan,
+        // not the earlier object-arrow query or the whole project.
+        const SOURCE: &str = r###"/**
+ * {@link TimeoutManager} does not support passing arguments to the callback.
+ *
+ * `(_: void)` is the argument type inferred by TypeScript's default typings for
+ * `setTimeout(cb, number)`.
+ * If we don't accept a single void argument, then
+ * `new Promise(resolve => timeoutManager.setTimeout(resolve, N))` is a type error.
+ */
+export type TimeoutCallback = (_: void) => void
+
+/**
+ * Wrapping `setTimeout` is awkward from a typing perspective because platform
+ * typings may extend the return type of `setTimeout`. For example, NodeJS
+ * typings add `NodeJS.Timeout`; but a non-default `timeoutManager` may not be
+ * able to return such a type.
+ */
+export type ManagedTimerId = number | { [Symbol.toPrimitive]: () => number }
+
+/**
+ * Backend for timer functions.
+ */
+export type TimeoutProvider<TTimerId extends ManagedTimerId = ManagedTimerId> =
+  {
+    readonly setTimeout: (callback: TimeoutCallback, delay: number) => TTimerId
+    readonly clearTimeout: (timeoutId: TTimerId | undefined) => void
+
+    readonly setInterval: (callback: TimeoutCallback, delay: number) => TTimerId
+    readonly clearInterval: (intervalId: TTimerId | undefined) => void
+  }
+
+type SystemTimerId = ReturnType<typeof setTimeout>
+
+export const defaultTimeoutProvider: TimeoutProvider = {
+  // We need the wrapper function syntax below instead of direct references to
+  // global setTimeout etc.
+  //
+  // BAD: `setTimeout: setTimeout`
+  // GOOD: `setTimeout: (cb, delay) => setTimeout(cb, delay)`
+  //
+  // If we use direct references here, then anything that wants to spy on or
+  // replace the global setTimeout (like tests) won't work since we'll already
+  // have a hard reference to the original implementation at the time when this
+  // file was imported.
+  setTimeout: (callback, delay) => setTimeout(callback, delay),
+  clearTimeout: (timeoutId) =>
+    clearTimeout(timeoutId as SystemTimerId | undefined),
+
+  setInterval: (callback, delay) => setInterval(callback, delay),
+  clearInterval: (intervalId) =>
+    clearInterval(intervalId as SystemTimerId | undefined),
+}
+
+/**
+ * Allows customization of how timeouts are created.
+ *
+ * @tanstack/query-core makes liberal use of timeouts to implement `staleTime`
+ * and `gcTime`. The default TimeoutManager provider uses the platform's global
+ * `setTimeout` implementation, which is known to have scalability issues with
+ * thousands of timeouts on the event loop.
+ *
+ * If you hit this limitation, consider providing a custom TimeoutProvider that
+ * coalesces timeouts.
+ */
+export class TimeoutManager implements Omit<TimeoutProvider, 'name'> {
+  // We cannot have TimeoutManager<T> as we must instantiate it with a concrete
+  // type at app boot; and if we leave that type, then any new timer provider
+  // would need to support the default provider's concrete timer ID, which is
+  // infeasible across environments.
+  //
+  // We settle for type safety for the TimeoutProvider type, and accept that
+  // this class is unsafe internally to allow for extension.
+  #provider: TimeoutProvider<any> = defaultTimeoutProvider
+  #providerCalled = false
+
+  setTimeoutProvider<TTimerId extends ManagedTimerId>(
+    provider: TimeoutProvider<TTimerId>,
+  ): void {
+    if (process.env.NODE_ENV !== 'production') {
+      if (this.#providerCalled && provider !== this.#provider) {
+        // After changing providers, `clearTimeout` will not work as expected for
+        // timeouts from the previous provider.
+        //
+        // Since they may allocate the same timeout ID, clearTimeout may cancel an
+        // arbitrary different timeout, or unexpected no-op.
+        //
+        // We could protect against this by mixing the timeout ID bits
+        // deterministically with some per-provider bits.
+        //
+        // We could internally queue `setTimeout` calls to `TimeoutManager` until
+        // some API call to set the initial provider.
+        console.error(
+          `[timeoutManager]: Switching provider after calls to previous provider might result in unexpected behavior.`,
+          { previous: this.#provider, provider },
+        )
+      }
+    }
+
+    this.#provider = provider
+    if (process.env.NODE_ENV !== 'production') {
+      this.#providerCalled = false
+    }
+  }
+
+  setTimeout(callback: TimeoutCallback, delay: number): ManagedTimerId {
+    if (process.env.NODE_ENV !== 'production') {
+      this.#providerCalled = true
+    }
+    return this.#provider.setTimeout(callback, delay)
+  }
+
+  clearTimeout(timeoutId: ManagedTimerId | undefined): void {
+    this.#provider.clearTimeout(timeoutId)
+  }
+
+  setInterval(callback: TimeoutCallback, delay: number): ManagedTimerId {
+    if (process.env.NODE_ENV !== 'production') {
+      this.#providerCalled = true
+    }
+    return this.#provider.setInterval(callback, delay)
+  }
+
+  clearInterval(intervalId: ManagedTimerId | undefined): void {
+    this.#provider.clearInterval(intervalId)
+  }
+}
+
+export const timeoutManager = new TimeoutManager()
+
+/**
+ * In many cases code wants to delay to the next event loop tick; this is not
+ * mediated by {@link timeoutManager}.
+ *
+ * This function is provided to make auditing the `tanstack/query-core` for
+ * incorrect use of system `setTimeout` easier.
+ */
+export function systemSetTimeoutZero(callback: TimeoutCallback): void {
+  setTimeout(callback, 0)
+}
+"###;
+        let parsed = parse_source_file(SOURCE);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut fixture =
+            fixture_from_parsed_with_module_state(parsed, CanonicalModuleState::External);
+        let owner = class_symbol(&fixture, "TimeoutManager");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let globals_table = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let globals = crate::semantic::global_types::initialize_global_library_types(
+            &mut fixture.store,
+            &host,
+            globals_table,
+            false,
+        )
+        .unwrap();
+        let context = ClassTypeQueryContext::new(&globals, CanonicalCheckerOptions::default());
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        let method = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::MethodDeclaration(data) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &fixture.parsed.arena.get(data.name)?.data else {
+                    return None;
+                };
+                (name.text == "setTimeoutProvider").then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::MethodDeclaration(data) =
+            &fixture.parsed.arena.get(method.node).unwrap().data
+        else {
+            unreachable!();
+        };
+        assert!(data.parameters.has_trailing_comma);
+        let [parameter] = data.parameters.nodes.as_slice() else {
+            panic!("one original provider parameter");
+        };
+        let NodeData::ParameterDeclaration(parameter) =
+            &fixture.parsed.arena.get(*parameter).unwrap().data
+        else {
+            unreachable!();
+        };
+        let annotation = NodeRef::new(method.arena, method.file, parameter.type_.unwrap());
+        let body = NodeRef::new(method.arena, method.file, data.body.unwrap());
+        let NodeData::Block(block) = &fixture.parsed.arena.get(body.node).unwrap().data else {
+            unreachable!();
+        };
+        assert_eq!(block.statements.nodes.len(), 3);
+        let formals = source_class_method_type_parameters(&fixture.store, &host, owner, method)
+            .unwrap()
+            .unwrap();
+        assert_eq!(formals.len(), 1);
+        assert!(formals[0].constraint.is_some());
+        assert_eq!(formals[0].default_type, None);
+        assert!(
+            fixture
+                .store
+                .declared_type_links(formals[0].symbol)
+                .is_none()
+        );
+        let class = fixture.store.symbol(owner).unwrap();
+        let tables = (class.members(), class.exports().unwrap());
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.mapper_len(),
+        );
+        let planned = plan_method_with_body_mode(
+            &fixture.store,
+            &host,
+            owner,
+            method,
+            tables,
+            false,
+            true,
+            Some(targets),
+            Some(&context),
+        )
+        .unwrap();
+        assert_eq!(planned.type_parameters, formals);
+        assert_eq!(planned.parameters.len(), 1);
+        assert_eq!(
+            planned.parameters[0].type_,
+            ClassBodyParameterType::Annotation(annotation)
+        );
+        assert_eq!(planned.body, Some(body));
+        assert_eq!(
+            planned
+                .return_type_node
+                .map(|node| fixture.parsed.arena.get(node.node).unwrap().kind),
+            Some(SyntaxKind::VoidKeyword)
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                plan_method_with_body_mode(
+                    &fixture.store,
+                    &host,
+                    owner,
+                    method,
+                    tables,
+                    false,
+                    true,
+                    Some(targets),
+                    Some(&context),
+                ),
+                Ok(planned.clone()),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.mapper_len()
+                ),
+                before
+            );
+            assert!(
+                fixture
+                    .store
+                    .declared_type_links(formals[0].symbol)
+                    .is_none()
+            );
+            assert!(fixture.store.signature_links(method).is_none());
+        }
     }
 
     #[test]

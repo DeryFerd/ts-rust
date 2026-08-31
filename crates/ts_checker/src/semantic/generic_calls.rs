@@ -58,7 +58,10 @@ use super::{
     },
     mapped_types::{MappedTypeError, supported_mapped_alias_projection},
     object_aliases::property_object_alias_nonempty_projection,
-    object_members::{DeclaredMethodTypeParameterView, declared_method_type_parameter_view},
+    object_members::{
+        DeclaredMethodTypeParameterView, declared_class_method_type_parameter_view,
+        declared_method_type_parameter_view,
+    },
     reference_types::{DirectGenericReference, validate_direct_generic_reference},
     relation::RelationKind,
     signatures::{ElementFlags, IndexFlags, SignatureFlags},
@@ -669,6 +672,12 @@ pub(super) fn generic_method_signature_callee(
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<TypeId>, GenericCallVectorError> {
     if let Some(callee) = declared_method_signature_callee(store, signature) {
+        return Ok(Some(callee));
+    }
+    if let Some(callee) =
+        super::classes::source_class_generic_method_callee(store, signature, array_targets)
+            .map_err(|_| GenericCallVectorInvariant::CallableSignatureMismatch(signature))?
+    {
         return Ok(Some(callee));
     }
     instantiated_interface_method_signature_return(store, signature, array_targets)
@@ -1961,11 +1970,27 @@ fn validate_generic_method_type_parameter_view(
 ) -> Result<Option<GenericCallMethodTypeParameters>, GenericCallVectorError> {
     let instantiated =
         validate_generic_call_instantiated_method(store, callee, signature, array_targets)?;
+    let invalid = || GenericCallVectorInvariant::CallableSignatureMismatch(signature);
     if instantiated.is_none() && declared_method_signature_callee(store, signature) != Some(callee)
     {
-        return Ok(None);
+        if super::classes::source_class_generic_method_callee(store, signature, array_targets)
+            .map_err(|_| invalid())?
+            != Some(callee)
+        {
+            return Ok(None);
+        }
+        let original = store.signature(signature).ok_or_else(invalid)?;
+        let parameters = declared_class_method_type_parameter_view(
+            store,
+            original,
+            original.declaration().ok_or_else(invalid)?,
+        )
+        .ok_or_else(invalid)?;
+        return Ok(Some(GenericCallMethodTypeParameters {
+            instantiated: None,
+            parameters,
+        }));
     }
-    let invalid = || GenericCallVectorInvariant::CallableSignatureMismatch(signature);
     let original = instantiated.map_or(signature, |method| method.source);
     let original = store.signature(original).ok_or_else(invalid)?;
     let mut parameters = declared_method_type_parameter_view(
@@ -8600,6 +8625,215 @@ mod tests {
             Ok(result)
         );
         assert_eq!(vector_cache_graph_counts(store), warm);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source-owned method checks each damaged cache and its restoration.
+    fn generic_class_method_consumers_reject_changed_source_and_cache_proofs() {
+        let parsed = parse_source_file(concat!(
+            "type Bound = number; ",
+            "class Service { keep<T extends Bound>(value: T,): T { return value; } } ",
+            "declare const service: Service; const kept = service.keep<number>(1);",
+        ));
+        let file = FileId::new(96_545);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let targets = Some(CanonicalArrayTargets::from_global_types(
+            context.global_types(),
+        ));
+        let (callee, signature) = checked_method_signature(&context, &parsed, file, "kept");
+        let call = property_alias_variable_nodes(&parsed, file, "kept")
+            .1
+            .unwrap();
+        let store = context.store_mut_for_test();
+        let state = property_alias_call_state(store, call);
+        let mapper = store.signature(state.0).unwrap().mapper().unwrap();
+        let declaration = store.signature(signature).unwrap().declaration().unwrap();
+        let signature_links = store.signature_links(declaration).unwrap().clone();
+        let parameters = store
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        let [parameter] = parameters.as_slice() else {
+            panic!("expected the method's one type parameter")
+        };
+        let parameter = *parameter;
+        let parameter_symbol = store.type_payload(parameter).unwrap().symbol().unwrap();
+        let parameter_declaration = store
+            .symbol(parameter_symbol)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        let annotation = store
+            .source_type_parameter_annotations(parameter_declaration)
+            .unwrap()
+            .constraint
+            .unwrap();
+        let annotation_links = store.type_node_links(annotation).unwrap().clone();
+        let method_symbol = store.source_declaration_symbol(declaration).unwrap();
+        let method = store.symbol(method_symbol).unwrap();
+        let relationships = (
+            method.members(),
+            method.exports(),
+            method.parent(),
+            method.export_symbol(),
+        );
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (number, string) = (bootstrap.number_type, bootstrap.string_type);
+        assert_eq!(state.1, number);
+        let view = vec![DeclaredMethodTypeParameterView {
+            type_parameter: parameter,
+            constraint: Some(number),
+            default_type: None,
+        }];
+        assert_eq!(
+            declared_class_method_type_parameter_view(
+                store,
+                store.signature(signature).unwrap(),
+                declaration,
+            ),
+            Some(view.clone())
+        );
+        assert_eq!(
+            declared_method_type_parameter_view(
+                store,
+                store.signature(signature).unwrap(),
+                declaration,
+            ),
+            None
+        );
+        let valid = validate_stored_callable_set_with_array_targets(store, callee, targets);
+        let StoredCallableSetValidation::Valid {
+            edges, projection, ..
+        } = &valid
+        else {
+            panic!("expected the source-owned class method")
+        };
+        assert_eq!(edges.as_slice(), &[parameter, number, parameter, parameter]);
+        assert_eq!(projection.call_signatures.len(), 1);
+        let callable = generic_call_signature_candidate(store, callee, signature, targets).unwrap();
+        assert_eq!(
+            generic_method_type_argument_bounds(store, &callable, targets),
+            Ok((1, 1))
+        );
+        assert!(validate_generic_call_signature_shape(store, callee, &callable, targets).is_ok());
+        let warm = vector_cache_graph_counts(store);
+        for _ in 0..2 {
+            assert_eq!(
+                generic_method_signature_callee(store, signature, targets),
+                Ok(Some(callee))
+            );
+            assert_eq!(
+                validate_stored_callable_set_with_array_targets(store, callee, targets),
+                valid
+            );
+            assert_eq!(vector_cache_graph_counts(store), warm);
+        }
+
+        for mutation in 0..8 {
+            match mutation {
+                0 => {
+                    assert!(store.set_type_parameter_resolution(parameter, None, None, None, None))
+                }
+                1 => assert!(store.set_type_parameter_resolution(
+                    parameter,
+                    None,
+                    None,
+                    None,
+                    Some(number),
+                )),
+                2 => assert!(store.set_type_parameter_resolution(
+                    parameter,
+                    Some(number),
+                    None,
+                    None,
+                    Some(number),
+                )),
+                3 => {
+                    assert!(store.set_type_node_links(
+                        annotation,
+                        crate::semantic::TypeNodeLinks {
+                            resolved_type: Some(string),
+                            ..crate::semantic::TypeNodeLinks::default()
+                        },
+                    ));
+                    assert!(store.set_type_parameter_resolution(
+                        parameter,
+                        Some(string),
+                        None,
+                        None,
+                        None,
+                    ));
+                }
+                4 => assert!(store.set_signature_type_parameters(signature, Vec::new())),
+                5 => {
+                    assert!(store.set_signature_links(
+                        declaration,
+                        crate::semantic::SignatureLinks::default()
+                    ))
+                }
+                6 => assert!(store.set_symbol_relationships(method_symbol, None, None, None, None)),
+                7 => assert!(store.set_signature_target_and_mapper(signature, None, Some(mapper))),
+                _ => unreachable!(),
+            }
+            let before = vector_cache_graph_counts(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    generic_call_signature_candidate(store, callee, signature, targets),
+                    Err(GenericCallVectorError::Invariant(
+                        GenericCallVectorInvariant::MalformedCallable(callee)
+                    )),
+                    "mutation {mutation}",
+                );
+                assert_eq!(
+                    generic_method_signature_callee(store, signature, targets),
+                    Err(GenericCallVectorError::Invariant(
+                        GenericCallVectorInvariant::CallableSignatureMismatch(signature)
+                    )),
+                    "mutation {mutation}",
+                );
+                assert!(
+                    validate_generic_method_type_parameter_view(store, callee, signature, targets)
+                        .is_err()
+                );
+                assert_eq!(vector_cache_graph_counts(store), before);
+            }
+            assert!(store.set_type_parameter_resolution(parameter, Some(number), None, None, None));
+            assert!(store.set_type_node_links(annotation, annotation_links.clone()));
+            assert!(store.set_signature_type_parameters(signature, parameters.clone()));
+            assert!(store.set_signature_links(declaration, signature_links.clone()));
+            assert!(store.set_symbol_relationships(
+                method_symbol,
+                relationships.0,
+                relationships.1,
+                relationships.2,
+                relationships.3,
+            ));
+            assert!(store.set_signature_target_and_mapper(signature, None, None));
+            assert_eq!(
+                declared_class_method_type_parameter_view(
+                    store,
+                    store.signature(signature).unwrap(),
+                    declaration,
+                ),
+                Some(view.clone())
+            );
+            assert_eq!(
+                validate_stored_callable_set_with_array_targets(store, callee, targets),
+                valid
+            );
+            assert_eq!(
+                generic_method_signature_callee(store, signature, targets),
+                Ok(Some(callee))
+            );
+            assert_eq!(property_alias_call_state(store, call), state);
+            assert_eq!(vector_cache_graph_counts(store), warm);
+        }
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(property_alias_call_state(context.store(), call), state);
     }
 
     #[test]

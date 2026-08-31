@@ -12690,7 +12690,7 @@ pub(super) fn plan_interface_method(
 }
 
 #[allow(clippy::too_many_lines)] // Binder, syntax, constraints, and defaults share one proof.
-fn plan_declared_signature_type_parameters(
+pub(super) fn plan_declared_signature_type_parameters(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
@@ -20306,6 +20306,77 @@ pub(super) fn declared_method_type_parameter_view(
     if store.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature) {
         return None;
     }
+    declared_method_type_parameter_view_worker(store, signature, declaration)
+}
+
+/// Reads an original instance method's formals without validating its callable graph.
+pub(super) fn declared_class_method_type_parameter_view(
+    store: &CanonicalTypeMapperStore,
+    signature: &super::signatures::Signature,
+    declaration: NodeRef,
+) -> Option<Vec<DeclaredMethodTypeParameterView>> {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::MethodDeclaration)
+        || signature.declaration() != Some(declaration)
+        || signature.target().is_some()
+        || signature.mapper().is_some()
+    {
+        return None;
+    }
+    let SourceNodeParent::Parent(class_declaration) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    if store.source_node_kind(class_declaration) != Some(SyntaxKind::ClassDeclaration)
+        || store
+            .source_direct_children(class_declaration)?
+            .into_iter()
+            .any(|child| store.source_node_kind(child) == Some(SyntaxKind::TypeParameter))
+    {
+        return None;
+    }
+    let owner = store.source_declaration_symbol(class_declaration)?;
+    let class = store.symbol(owner)?;
+    let symbol = store.source_declaration_symbol(declaration)?;
+    let method = store.symbol(symbol)?;
+    if !class.flags().contains(SymbolFlags::CLASS)
+        || class.check_flags() != CheckFlags::NONE
+        || class.declarations() != Some(&[class_declaration])
+        || class.value_declaration() != Some(class_declaration)
+        || !store.source_symbol_declarations_match(owner)
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store.symbol_table(class.members()?)?.get(method.name()) != Some(symbol)
+        || method.flags() != SymbolFlags::METHOD
+        || method.check_flags() != CheckFlags::NONE
+        || method.declarations() != Some(&[declaration])
+        || method.value_declaration() != Some(declaration)
+        || method.parent() != Some(owner)
+        || method.members().is_some()
+        || method.exports().is_some()
+        || method.export_symbol().is_some()
+        || !store.source_symbol_declarations_match(symbol)
+        || store.get_merged_symbol(symbol) != Some(symbol)
+    {
+        return None;
+    }
+    let parameters = declared_method_type_parameter_view_worker(store, signature, declaration)?;
+    for parameter in &parameters {
+        let symbol = cached_ordinary_type_parameter_owner(store, parameter.type_parameter)?;
+        let [declaration] = store.symbol(symbol)?.declarations()? else {
+            return None;
+        };
+        if store.source_declaration_symbol(*declaration) != Some(symbol)
+            || !store.source_symbol_declarations_match(symbol)
+        {
+            return None;
+        }
+    }
+    Some(parameters)
+}
+
+fn declared_method_type_parameter_view_worker(
+    store: &CanonicalTypeMapperStore,
+    signature: &super::signatures::Signature,
+    declaration: NodeRef,
+) -> Option<Vec<DeclaredMethodTypeParameterView>> {
     let mut declarations = store.source_direct_children(declaration)?;
     declarations.retain(|parameter| {
         parameter.node < declaration.node
