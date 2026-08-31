@@ -21260,16 +21260,40 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         let (arena, bound) = self.host.source(receiver).ok_or_else(invalid)?;
         let mut callback = self.host.name_resolver_host(self.store)?;
-        let symbol =
-            CanonicalNameResolver::new(arena, bound, self.store.symbol_store(), &mut callback)?
-                .resolve(
+        let mut name_lookup =
+            CanonicalNameResolver::new(arena, bound, self.store.symbol_store(), &mut callback)?;
+        let value_meaning = SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE;
+        // Namespace handlers prove their own targets, including cold alias links.
+        let mut symbol = name_lookup.resolve(
+            Some(CanonicalResolutionLocation::Bound(receiver)),
+            &identifier.text,
+            value_meaning | SymbolFlags::ALIAS,
+            None,
+            false,
+            false,
+        )?;
+        if let Some(candidate) = symbol {
+            let candidate = self
+                .store
+                .get_merged_symbol(candidate)
+                .ok_or_else(invalid)?;
+            let candidate_record = self.store.symbol(candidate).ok_or_else(invalid)?;
+            let namespace_import = candidate_record.declarations().is_some_and(|declarations| {
+                declarations.iter().any(|declaration| {
+                    self.store.source_node_kind(*declaration) == Some(SyntaxKind::NamespaceImport)
+                })
+            });
+            if candidate_record.flags().intersects(SymbolFlags::ALIAS) && !namespace_import {
+                symbol = name_lookup.resolve(
                     Some(CanonicalResolutionLocation::Bound(receiver)),
                     &identifier.text,
-                    SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+                    value_meaning,
                     None,
                     false,
                     false,
                 )?;
+            }
+        }
         let Some(symbol) = symbol else {
             return Ok(false);
         };
