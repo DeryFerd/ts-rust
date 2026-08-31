@@ -1535,7 +1535,7 @@ impl SourceClassAnnotationTypeImportPlan {
             || !store.source_symbol_declarations_match(self.owner)
             || !store.source_declaration_belongs_to_symbol(self.declaration, self.owner)
             || store.source_node_kind(self.declaration) != Some(SyntaxKind::ClassDeclaration)
-            || store.source_direct_type_annotation(self.holder) != Some(self.root())
+            || store.source_class_annotation_role(self.holder) != Some(self.root())
             || store
                 .source_direct_children(self.declaration)
                 .is_none_or(|children| {
