@@ -205,6 +205,16 @@ struct ArtifactTypeNamePart {
     text: EscapedName,
 }
 
+struct AmbientClassHeritageArtifact {
+    expression: NodeRef,
+    reference: NodeRef,
+    qualifier: NodeRef,
+    leaf: NodeRef,
+    namespace: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    side: super::classes::ClassQueryTypeSide,
+}
+
 impl CanonicalCheckerContext<'_> {
     /// Returns the canonical semantic type for one exact Program node.
     ///
@@ -316,6 +326,14 @@ impl CanonicalCheckerContext<'_> {
         }
 
         if let Some(type_) = self.export_equals_declared_artifact_type(node)? {
+            return Ok(type_);
+        }
+
+        if let Some(type_) = self.ambient_class_type_name_artifact_type(node)? {
+            return Ok(type_);
+        }
+
+        if let Some(type_) = self.ambient_class_heritage_artifact_type(node)? {
             return Ok(type_);
         }
 
@@ -3497,6 +3515,401 @@ impl CanonicalCheckerContext<'_> {
         Ok(Some(owner))
     }
 
+    /// A warm constructor must not change a genuine type-reference name to a value.
+    #[allow(clippy::too_many_lines)] // Authenticate the same namespace class before the existing type query.
+    fn ambient_class_type_name_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let name = match &self.validated_artifact_node(node)?.2.data {
+            NodeData::TypeReferenceNode(reference) => {
+                NodeRef::new(node.arena, node.file, reference.type_name)
+            }
+            _ => node,
+        };
+        let Some(path) = self.type_name_artifact_path(name)? else {
+            return Ok(None);
+        };
+        let [qualifier, leaf] = path.parts.as_slice() else {
+            return Ok(None);
+        };
+        if ![path.reference, path.full_name, leaf.identifier].contains(&node)
+            || !matches!(&self.validated_artifact_node(path.reference)?.2.data,
+                NodeData::TypeReferenceNode(reference) if reference.type_arguments.is_none())
+        {
+            return Ok(None);
+        }
+        let Some(namespace) = self.lexical_artifact_symbol(
+            qualifier.identifier,
+            SymbolFlags::NAMESPACE | SymbolFlags::ALIAS,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(namespace_record) = self.store().symbol(namespace) else {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                node,
+                symbol: namespace,
+            });
+        };
+        if namespace_record.flags() != SymbolFlags::VALUE_MODULE {
+            return Ok(None);
+        }
+        let Some(symbol) = namespace_record
+            .exports()
+            .and_then(|exports| self.store().symbol_table(exports))
+            .and_then(|exports| exports.get(leaf.text.as_ref()))
+        else {
+            return Ok(None);
+        };
+        if self
+            .store()
+            .symbol(symbol)
+            .is_none_or(|owner| owner.flags() != SymbolFlags::CLASS)
+            || self
+                .store()
+                .value_symbol_links(symbol)
+                .is_none_or(|links| links == &super::ValueSymbolLinks::default())
+        {
+            return Ok(None);
+        }
+        let host = self.declared_type_host()?;
+        match super::classes::validate_ambient_namespace_class_query_shell(
+            self.store(),
+            &host,
+            symbol,
+        ) {
+            Ok(()) => {}
+            Err(super::ClassError::Unsupported(_)) => return Ok(None),
+            Err(error) => return Err(CanonicalArtifactQueryError::Class { node, error }),
+        }
+        let instance = self
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .ok_or(CanonicalArtifactQueryError::MissingType {
+                node,
+                kind: SyntaxKind::TypeReference,
+            })?;
+        for location in [path.reference, path.full_name, leaf.identifier] {
+            if let Some(links) = self.store().type_node_links(location) {
+                if links.outer_type_parameters.is_some() {
+                    return Err(CanonicalArtifactQueryError::ForeignNode(location));
+                }
+                if let Some(cached) = links.resolved_type
+                    && cached != instance
+                {
+                    return Err(CanonicalArtifactQueryError::InvalidType {
+                        node: location,
+                        type_: cached,
+                    });
+                }
+            }
+        }
+        if self.type_name_artifact_symbol(path.full_name)? != Some(Some(symbol)) {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+        }
+        let type_ = self.type_node_artifact_type(path.reference)?;
+        if type_ != instance {
+            return Err(CanonicalArtifactQueryError::InvalidType { node, type_ });
+        }
+        self.validate_artifact_type(node, type_).map(Some)
+    }
+
+    /// Grammar-only JavaScript heritage has no completed source-class base graph.
+    /// Prove the actual namespace class and query role before reading any cache.
+    #[allow(clippy::too_many_lines)] // Keep every source parent and list edge in one proof.
+    fn ambient_class_heritage_artifact(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<AmbientClassHeritageArtifact>, CanonicalArtifactQueryError> {
+        let (arena, bound, record) = self.validated_artifact_node(node)?;
+        if bound
+            .source_facts()
+            .is_none_or(|facts| !facts.is_javascript_file() || facts.is_external_module())
+        {
+            return Ok(None);
+        }
+        let (expression, side) = match &record.data {
+            NodeData::QualifiedName(_) => (node, super::classes::ClassQueryTypeSide::Instance),
+            NodeData::Identifier(_) => {
+                let Some(parent) = record.parent else {
+                    return Ok(None);
+                };
+                let parent = NodeRef::new(node.arena, node.file, parent);
+                let (_, _, parent_record) = self.validated_artifact_node(parent)?;
+                if !matches!(&parent_record.data,
+                    NodeData::QualifiedName(name) if name.right == node.node)
+                {
+                    return Ok(None);
+                }
+                (parent, super::classes::ClassQueryTypeSide::Value)
+            }
+            _ => return Ok(None),
+        };
+        let (_, _, expression_record) = self.validated_artifact_node(expression)?;
+        let NodeData::QualifiedName(name) = &expression_record.data else {
+            return Ok(None);
+        };
+        let Some(reference) = expression_record.parent else {
+            return Ok(None);
+        };
+        let reference = NodeRef::new(node.arena, node.file, reference);
+        let (_, _, reference_record) = self.validated_artifact_node(reference)?;
+        let NodeData::ExpressionWithTypeArguments(base) = &reference_record.data else {
+            return Ok(None);
+        };
+        let Some(clause) = reference_record.parent else {
+            return Ok(None);
+        };
+        let clause = NodeRef::new(node.arena, node.file, clause);
+        let (_, _, clause_record) = self.validated_artifact_node(clause)?;
+        let NodeData::HeritageClause(heritage) = &clause_record.data else {
+            return Ok(None);
+        };
+        let Some(declaration) = clause_record.parent else {
+            return Ok(None);
+        };
+        let declaration = NodeRef::new(node.arena, node.file, declaration);
+        let (_, _, declaration_record) = self.validated_artifact_node(declaration)?;
+        let NodeData::ClassDeclaration(class) = &declaration_record.data else {
+            return Ok(None);
+        };
+        if heritage.token != SyntaxKind::ExtendsKeyword
+            || class.type_parameters.is_some()
+            || class.modifiers.is_some()
+            || !class.members.nodes.is_empty()
+            || base.type_arguments.is_some()
+        {
+            return Ok(None);
+        }
+        let qualifier = NodeRef::new(node.arena, node.file, name.left);
+        let leaf = NodeRef::new(node.arena, node.file, name.right);
+        let (_, _, qualifier_record) = self.validated_artifact_node(qualifier)?;
+        let (_, _, leaf_record) = self.validated_artifact_node(leaf)?;
+        let (NodeData::Identifier(qualifier_name), NodeData::Identifier(member_name)) =
+            (&qualifier_record.data, &leaf_record.data)
+        else {
+            return Ok(None);
+        };
+        let source = bound.source_file();
+        let source_record = arena
+            .get(source.node)
+            .ok_or(CanonicalArtifactQueryError::ForeignNode(source))?;
+        let NodeData::SourceFile(source_data) = &source_record.data else {
+            return Err(CanonicalArtifactQueryError::ForeignNode(source));
+        };
+        if expression_record.kind != SyntaxKind::QualifiedName
+            || name.flow_node.is_some()
+            || name.facts != 0
+            || reference_record.kind != SyntaxKind::ExpressionWithTypeArguments
+            || base.expression != expression.node
+            || base.facts != 0
+            || clause_record.kind != SyntaxKind::HeritageClause
+            || heritage.facts != 0
+            || heritage.types.has_trailing_comma
+            || heritage.types.nodes.as_slice() != [reference.node]
+            || reference_record.range.start < heritage.types.range.start
+            || reference_record.range.end > heritage.types.range.end
+            || declaration_record.kind != SyntaxKind::ClassDeclaration
+            || declaration_record.parent != Some(source.node)
+            || class.flow_node.is_some()
+            || class.local_symbol.is_some()
+            || class.symbol.is_some()
+            || class.next_container.is_some()
+            || class.facts != 0
+            || class.members.has_trailing_comma
+            || class.members.range.end != declaration_record.range.end
+            || class.heritage_clauses.as_ref().is_none_or(|clauses| {
+                clauses.has_trailing_comma || clauses.nodes.as_slice() != [clause.node]
+            })
+            || source_record.kind != SyntaxKind::SourceFile
+            || source_record.parent.is_some()
+            || source_data
+                .statements
+                .nodes
+                .iter()
+                .filter(|statement| **statement == declaration.node)
+                .count()
+                != 1
+            || qualifier_record.kind != SyntaxKind::Identifier
+            || qualifier_name.flow_node.is_some()
+            || qualifier_name.text.is_empty()
+            || leaf_record.kind != SyntaxKind::Identifier
+            || member_name.flow_node.is_some()
+            || member_name.text.is_empty()
+        {
+            return Err(CanonicalArtifactQueryError::ForeignNode(node));
+        }
+        for (child, parent) in [
+            (qualifier, expression),
+            (leaf, expression),
+            (expression, reference),
+            (reference, clause),
+            (clause, declaration),
+            (declaration, source),
+        ] {
+            let (_, _, child_record) = self.validated_artifact_node(child)?;
+            let (_, _, parent_record) = self.validated_artifact_node(parent)?;
+            if child_record.flags.0 != 0
+                || child_record.parent != Some(parent.node)
+                || child_record.range.start < parent_record.range.start
+                || child_record.range.end > parent_record.range.end
+            {
+                return Err(CanonicalArtifactQueryError::ForeignNode(child));
+            }
+        }
+        let source_symbol = bound
+            .symbol(declaration)
+            .ok_or(CanonicalArtifactQueryError::ForeignNode(declaration))?;
+        let source_owner = self.store().symbol(source_symbol).ok_or(
+            CanonicalArtifactQueryError::InvalidSymbol {
+                node: declaration,
+                symbol: source_symbol,
+            },
+        )?;
+        if source_owner.flags() != SymbolFlags::CLASS
+            || source_owner.check_flags() != ts_binder::CheckFlags::NONE
+            || source_owner.declarations() != Some(&[declaration])
+            || source_owner.value_declaration() != Some(declaration)
+            || source_owner.parent().is_some()
+            || source_owner.export_symbol().is_some()
+            || self.store().get_merged_symbol(source_symbol) != Some(source_symbol)
+            || !self.store().source_symbol_declarations_match(source_symbol)
+            || !self
+                .store()
+                .source_declaration_belongs_to_symbol(declaration, source_symbol)
+        {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                node: declaration,
+                symbol: source_symbol,
+            });
+        }
+        let namespace = self
+            .lexical_artifact_symbol(qualifier, SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE)?
+            .ok_or(CanonicalArtifactQueryError::UnsupportedNode {
+                node: qualifier,
+                kind: SyntaxKind::Identifier,
+            })?;
+        let namespace_record =
+            self.store()
+                .symbol(namespace)
+                .ok_or(CanonicalArtifactQueryError::InvalidSymbol {
+                    node: qualifier,
+                    symbol: namespace,
+                })?;
+        if namespace_record.flags() != SymbolFlags::VALUE_MODULE
+            || self
+                .store()
+                .module_symbol_links(namespace)
+                .and_then(|links| links.resolved_exports)
+                .is_some_and(|exports| Some(exports) != namespace_record.exports())
+        {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                node: qualifier,
+                symbol: namespace,
+            });
+        }
+        let symbol = namespace_record
+            .exports()
+            .and_then(|exports| self.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source(&member_name.text))
+            .ok_or(CanonicalArtifactQueryError::InvalidSymbol {
+                node: expression,
+                symbol: namespace,
+            })?;
+        if self.store().get_parent_of_symbol(symbol) != Some(namespace) {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+        }
+        Ok(Some(AmbientClassHeritageArtifact {
+            expression,
+            reference,
+            qualifier,
+            leaf,
+            namespace,
+            symbol,
+            side,
+        }))
+    }
+
+    fn ambient_class_heritage_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let Some(query) = self.ambient_class_heritage_artifact(node)? else {
+            return Ok(None);
+        };
+        let host = self.declared_type_host()?;
+        super::classes::validate_ambient_namespace_class_query_shell(
+            self.store(),
+            &host,
+            query.symbol,
+        )
+        .map_err(|error| CanonicalArtifactQueryError::Class { node, error })?;
+        let instance = self
+            .store()
+            .declared_type_links(query.symbol)
+            .and_then(|links| links.declared_type);
+        let value = self
+            .store()
+            .value_symbol_links(query.symbol)
+            .and_then(|links| links.resolved_type);
+        let namespace_value = self
+            .store()
+            .value_symbol_links(query.namespace)
+            .and_then(|links| links.resolved_type);
+        for (location, expected) in [
+            (query.expression, value),
+            (query.leaf, value),
+            (query.reference, instance),
+            (query.qualifier, namespace_value),
+        ] {
+            if let Some(links) = self.store().type_node_links(location) {
+                if links.outer_type_parameters.is_some() {
+                    return Err(CanonicalArtifactQueryError::ForeignNode(location));
+                }
+                if let Some(cached) = links.resolved_type
+                    && Some(cached) != expected
+                {
+                    return Err(CanonicalArtifactQueryError::InvalidType {
+                        node: location,
+                        type_: cached,
+                    });
+                }
+            }
+        }
+        for (location, expected) in [
+            (query.expression, query.symbol),
+            (query.leaf, query.symbol),
+            (query.reference, query.symbol),
+            (query.qualifier, query.namespace),
+        ] {
+            if let Some(cached) = self
+                .store()
+                .symbol_node_links(location)
+                .and_then(|links| links.resolved_symbol)
+                && cached != expected
+            {
+                return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                    node: location,
+                    symbol: cached,
+                });
+            }
+        }
+        // The baseline asks the whole heritage row for the base instance. Do not
+        // publish that override as the ordinary constructor-expression cache.
+        let type_ = match query.side {
+            super::classes::ClassQueryTypeSide::Instance => {
+                self.get_declared_type_of_symbol(query.symbol)?
+            }
+            super::classes::ClassQueryTypeSide::Value => self
+                .get_class_query_shells(query.symbol)
+                .map_err(|error| CanonicalArtifactQueryError::Class { node, error })?
+                .value_type(),
+        };
+        self.validate_artifact_type(node, type_).map(Some)
+    }
+
     /// A class base name denotes its instance here, even when checking the
     /// extends expression retained the constructor value at that same node.
     fn class_heritage_artifact_target(
@@ -4637,6 +5050,322 @@ mod tests {
 
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
         context_with_options(parsed, file, CanonicalCheckerOptions::default())
+    }
+
+    fn ambient_class_heritage_context<'a>(
+        declarations: &'a ParseResult,
+        main: &'a ParseResult,
+    ) -> CanonicalCheckerContext<'a> {
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, name, language, declaration_file) in [
+            (
+                declarations,
+                FileId::new(6_185),
+                "\"/library.d.ts\"",
+                CanonicalSourceLanguage::TypeScript,
+                true,
+            ),
+            (
+                main,
+                FileId::new(6_186),
+                "\"/consumer.js\"",
+                CanonicalSourceLanguage::JavaScript,
+                false,
+            ),
+        ] {
+            assert!(parsed.diagnostics.is_empty());
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(name),
+                        language,
+                        declaration_file,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+        }
+        binder
+            .bind_typescript_declaration_slice(&declarations.arena, FileId::new(6_185))
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&main.arena, FileId::new(6_186))
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (FileId::new(6_185), &declarations.arena),
+                (FileId::new(6_186), &main.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn ambient_class_heritage_expression(parsed: &ParseResult) -> NodeRef {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ExpressionWithTypeArguments(base) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(
+                    parsed.arena.id(),
+                    FileId::new(6_186),
+                    base.expression,
+                ))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each wrong role cache is checked before any class-value publication.
+    fn ambient_class_heritage_queries_reject_wrong_role_caches_without_repair() {
+        let declarations =
+            parse_source_file("declare namespace Library { class Entry {} class Other {} }");
+        let main = ts_parser::parse_javascript_source_file(
+            "/** @extends {Library.Entry} */\nclass Use extends Library.Entry {}",
+        );
+        let expression = ambient_class_heritage_expression(&main);
+        for warm in [false, true] {
+            for poison in [
+                "leaf_type",
+                "whole_type",
+                "reference_type",
+                "qualifier_type",
+                "leaf_symbol",
+                "whole_symbol",
+                "reference_symbol",
+                "qualifier_symbol",
+                "leaf_outer_parameters",
+                "whole_outer_parameters",
+            ] {
+                let mut context = ambient_class_heritage_context(&declarations, &main);
+                context.check_source_file(FileId::new(6_185)).unwrap();
+                context.check_source_file(FileId::new(6_186)).unwrap();
+                let query = context
+                    .ambient_class_heritage_artifact(expression)
+                    .unwrap()
+                    .unwrap();
+                let other = context
+                    .store()
+                    .symbol(query.namespace)
+                    .unwrap()
+                    .exports()
+                    .and_then(|exports| context.store().symbol_table(exports))
+                    .and_then(|exports| exports.get_source("Other"))
+                    .unwrap();
+                let other_shells = context.get_class_query_shells(other).unwrap();
+                let instance = context.get_type_at_location(expression).unwrap();
+                assert!(context.store().value_symbol_links(query.symbol).is_none());
+                let prior = warm.then(|| context.get_type_at_location(query.leaf).unwrap());
+                let location = match poison {
+                    "leaf_type" | "leaf_symbol" | "leaf_outer_parameters" => query.leaf,
+                    "whole_type" | "whole_symbol" | "whole_outer_parameters" => query.expression,
+                    "reference_type" | "reference_symbol" => query.reference,
+                    "qualifier_type" | "qualifier_symbol" => query.qualifier,
+                    _ => unreachable!(),
+                };
+                let original_type = context
+                    .store()
+                    .type_node_links(location)
+                    .cloned()
+                    .unwrap_or_default();
+                let original_symbol = context
+                    .store()
+                    .symbol_node_links(location)
+                    .cloned()
+                    .unwrap_or_default();
+                let store = context.store_mut_for_test();
+                if poison.ends_with("symbol") {
+                    assert!(store.set_symbol_node_links(
+                        location,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(other)
+                        }
+                    ));
+                } else if poison.ends_with("outer_parameters") {
+                    assert!(store.set_type_node_links(
+                        location,
+                        TypeNodeLinks {
+                            outer_type_parameters: Some(Vec::new()),
+                            ..TypeNodeLinks::default()
+                        }
+                    ));
+                } else {
+                    let wrong = if matches!(poison, "leaf_type" | "whole_type") {
+                        instance
+                    } else {
+                        other_shells.value_type()
+                    };
+                    assert!(store.set_type_node_links(
+                        location,
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            ..TypeNodeLinks::default()
+                        }
+                    ));
+                }
+                let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                    (
+                        format!("{:?}", context.store()),
+                        context.diagnostics().clone(),
+                    )
+                };
+                let changed = snapshot(&context);
+                for node in [query.expression, query.leaf, query.leaf, query.expression] {
+                    assert!(
+                        context.get_type_at_location(node).is_err(),
+                        "{warm}, {poison}"
+                    );
+                    assert_eq!(snapshot(&context), changed);
+                }
+                let store = context.store_mut_for_test();
+                assert!(store.set_type_node_links(location, original_type));
+                assert!(store.set_symbol_node_links(location, original_symbol));
+                assert_eq!(context.get_type_at_location(query.expression), Ok(instance));
+                let value = context.get_type_at_location(query.leaf).unwrap();
+                assert_ne!(value, instance);
+                if let Some(prior) = prior {
+                    assert_eq!(value, prior);
+                }
+                let after = snapshot(&context);
+                for _ in 0..2 {
+                    assert_eq!(context.get_type_at_location(query.leaf), Ok(value));
+                    assert_eq!(context.get_type_at_location(query.expression), Ok(instance));
+                    assert_eq!(snapshot(&context), after);
+                }
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ambient_class_heritage_query_proof_rejects_wrong_lists_and_ranges() {
+        let declarations = parse_source_file("declare namespace Library { class Entry {} }");
+        for poison in ["class_list", "base_list", "base_range"] {
+            let mut main = ts_parser::parse_javascript_source_file(
+                "/** @extends {Library.Entry} */\nclass Use extends Library.Entry {}",
+            );
+            let expression = ambient_class_heritage_expression(&main);
+            let reference = main.arena.get(expression.node).unwrap().parent.unwrap();
+            let clause = main.arena.get(reference).unwrap().parent.unwrap();
+            let declaration = main.arena.get(clause).unwrap().parent.unwrap();
+            if poison == "class_list" {
+                let NodeData::ClassDeclaration(class) =
+                    &mut main.arena.get_mut(declaration).unwrap().data
+                else {
+                    unreachable!()
+                };
+                class.heritage_clauses.as_mut().unwrap().has_trailing_comma = true;
+            } else {
+                let NodeData::HeritageClause(heritage) =
+                    &mut main.arena.get_mut(clause).unwrap().data
+                else {
+                    unreachable!()
+                };
+                if poison == "base_list" {
+                    heritage.types.has_trailing_comma = true;
+                } else {
+                    heritage.types.range.end = heritage.types.range.start;
+                }
+            }
+            // Bind the changed source graph, so this is not a stale-arena rejection.
+            let context = ambient_class_heritage_context(&declarations, &main);
+            let before = format!("{:?}", context.store());
+            assert!(matches!(
+                context.ambient_class_heritage_artifact(expression),
+                Err(CanonicalArtifactQueryError::ForeignNode(_))
+            ));
+            assert_eq!(format!("{:?}", context.store()), before);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn ambient_class_type_reference_names_keep_instances_after_value_queries() {
+        let declarations = parse_source_file(concat!(
+            "declare namespace Library { class Entry {} }\n",
+            "type Ref = Library.Entry;\n",
+        ));
+        let main = ts_parser::parse_javascript_source_file(
+            "/** @extends {Library.Entry} */\nclass Use extends Library.Entry {}",
+        );
+        let expression = ambient_class_heritage_expression(&main);
+        let (reference, name, leaf) = declarations
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                let NodeData::TypeReferenceNode(reference) = &record.data else {
+                    return None;
+                };
+                let NodeData::QualifiedName(name) =
+                    &declarations.arena.get(reference.type_name)?.data
+                else {
+                    return None;
+                };
+                let node = |id| NodeRef::new(declarations.arena.id(), FileId::new(6_185), id);
+                Some((node(id), node(reference.type_name), node(name.right)))
+            })
+            .unwrap();
+        for type_first in [false, true] {
+            let mut context = ambient_class_heritage_context(&declarations, &main);
+            let query = context
+                .ambient_class_heritage_artifact(expression)
+                .unwrap()
+                .unwrap();
+            let instance = context.get_declared_type_of_symbol(query.symbol).unwrap();
+            if type_first {
+                for node in [leaf, name, reference] {
+                    assert_eq!(context.get_type_at_location(node), Ok(instance));
+                }
+                assert!(context.store().value_symbol_links(query.symbol).is_none());
+            }
+            let value = context.get_type_at_location(query.leaf).unwrap();
+            assert_ne!(value, instance);
+            for node in [leaf, name, reference, leaf] {
+                assert_eq!(context.get_type_at_location(node), Ok(instance));
+                assert_eq!(context.get_symbol_at_location(node), Ok(Some(query.symbol)));
+            }
+            for poisoned in [reference, name, leaf] {
+                let original = context
+                    .store()
+                    .type_node_links(poisoned)
+                    .cloned()
+                    .unwrap_or_default();
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    poisoned,
+                    TypeNodeLinks {
+                        resolved_type: Some(value),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+                let changed = format!("{:?}", context.store());
+                for node in [leaf, name, reference] {
+                    assert!(context.get_type_at_location(node).is_err());
+                    assert_eq!(format!("{:?}", context.store()), changed);
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(poisoned, original)
+                );
+            }
+            assert_eq!(context.get_type_at_location(query.leaf), Ok(value));
+            assert_eq!(context.get_type_at_location(query.expression), Ok(instance));
+            let before = format!("{:?}", context.store());
+            for _ in 0..2 {
+                for node in [leaf, name, reference] {
+                    assert_eq!(context.get_type_at_location(node), Ok(instance));
+                    assert_eq!(format!("{:?}", context.store()), before);
+                }
+            }
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
