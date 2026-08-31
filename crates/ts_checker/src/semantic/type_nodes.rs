@@ -45520,7 +45520,9 @@ export type Env = {
                     .find_map(|(_, record)| {
                         let annotation = match &record.data {
                             NodeData::PropertyDeclaration(property) => property.type_,
-                            NodeData::PropertySignatureDeclaration(property) => property.type_,
+                            NodeData::PropertySignatureDeclaration(property) => {
+                                Some(property.type_)
+                            }
                             _ => None,
                         };
                         (record.parent == Some(env_literal.node))
