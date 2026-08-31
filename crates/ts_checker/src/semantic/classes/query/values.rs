@@ -1,8 +1,8 @@
 //! Class value queries compose the existing annotation and expression kernels.
 
 use super::super::{
-    completed_source_class_method_type, completed_source_class_property_type,
-    emit_standard_class_fields,
+    ClassPropertyPlan, completed_source_class_method_type, completed_source_class_property_type,
+    emit_standard_class_fields, plan_property_with_body_mode, preflight_source_class_annotation,
 };
 use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
@@ -40,6 +40,7 @@ struct AnnotatedMemberPlan {
     annotation: NodeRef,
     method: bool,
     readonly: bool,
+    source_property: Option<ClassPropertyPlan>,
 }
 
 fn annotation_type_if_ready(
@@ -171,12 +172,39 @@ fn plan_annotated_member(
             kind: record.kind,
         })
     };
+    let source_property = match &record.data {
+        NodeData::PropertyDeclaration(property) if property.postfix_token.is_some() => {
+            let owner = store
+                .symbol(class.symbol)
+                .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(class.symbol)))?;
+            let property = plan_property_with_body_mode(
+                store,
+                host,
+                class.symbol,
+                declaration,
+                owner.members(),
+                owner.exports().ok_or_else(reject)?,
+                true,
+            )?;
+            if !property.optional
+                || property.initializer_node.is_some()
+                || !matches!(
+                    preflight_node(store, host, property.type_node)?.data,
+                    NodeData::TypeReferenceNode(_)
+                )
+            {
+                return Err(reject());
+            }
+            Some(property)
+        }
+        _ => None,
+    };
     let (name, annotation, modifiers, method) = match &record.data {
         NodeData::PropertyDeclaration(property)
             if record.kind == SyntaxKind::PropertyDeclaration
                 && property.symbol.is_none()
                 && property.facts == 0
-                && property.postfix_token.is_none() =>
+                && (property.postfix_token.is_none() || source_property.is_some()) =>
         {
             (
                 property.name,
@@ -244,7 +272,9 @@ fn plan_annotated_member(
             annotation,
         )));
     }
-    annotation_type_if_ready(store, host, annotation)?;
+    if source_property.is_none() {
+        annotation_type_if_ready(store, host, annotation)?;
+    }
     Ok(AnnotatedMemberPlan {
         class,
         declaration,
@@ -252,6 +282,7 @@ fn plan_annotated_member(
         annotation,
         method,
         readonly,
+        source_property,
     })
 }
 
@@ -433,6 +464,24 @@ impl ClassValueQuery<'_, '_, '_> {
         .get_type_from_type_node(node)?)
     }
 
+    fn member_annotation_type_if_ready(
+        &self,
+        plan: &AnnotatedMemberPlan,
+    ) -> Result<Option<TypeId>, ClassError> {
+        if plan.source_property.is_some() {
+            return Ok(preflight_source_class_annotation(
+                self.store,
+                self.host,
+                self.global_types,
+                self.options.into(),
+                plan.annotation,
+                plan.class.symbol,
+            )?
+            .cached_type(self.store, self.host, Some(self.global_types))?);
+        }
+        annotation_type_if_ready(self.store, self.host, plan.annotation)
+    }
+
     fn value_type(
         &mut self,
         symbol: SemanticSymbolId,
@@ -581,7 +630,7 @@ impl ClassValueQuery<'_, '_, '_> {
         if plan_annotated_member(self.store, self.host, plan.symbol)? != *plan {
             return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration)));
         }
-        let ready = annotation_type_if_ready(self.store, self.host, plan.annotation)?;
+        let ready = self.member_annotation_type_if_ready(plan)?;
         if let Some(links) = self.store.value_symbol_links(plan.symbol)
             && links != &ValueSymbolLinks::default()
         {
@@ -638,8 +687,20 @@ impl ClassValueQuery<'_, '_, '_> {
         {
             return Err(invalid());
         }
-        let type_ = self.annotation_type(plan.annotation)?;
-        if annotation_type_if_ready(self.store, self.host, plan.annotation)? != Some(type_) {
+        let type_ = if plan.source_property.is_some() {
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                self.store,
+                self.host,
+                self.global_types,
+                self.options,
+                self.session,
+                self.diagnostics,
+            )?
+            .get_type_from_source_class_annotation(plan.annotation, plan.class.symbol)?
+        } else {
+            self.annotation_type(plan.annotation)?
+        };
+        if self.member_annotation_type_if_ready(plan)? != Some(type_) {
             return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
                 plan.annotation,
             )));
