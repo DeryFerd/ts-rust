@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{
-    CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolData, SymbolFlags,
-    SymbolTableId,
+    CheckFlags, EscapedName, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolData,
+    SymbolFlags, SymbolTableId,
 };
 
 use super::{
@@ -972,6 +972,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 {
                     return Err(DerivedTypeError::UnsupportedWideningType(property.type_));
                 }
+                if self
+                    .contextual_property_order_key(property.symbol)
+                    .is_none()
+                {
+                    return Err(DerivedTypeError::MalformedObjectLiteral(*member));
+                }
                 if let Some(index) = context_names.get(&property.name).copied() {
                     context_properties[index] = property.clone();
                 } else {
@@ -1081,7 +1087,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     .undefined_properties
                     .get(&property.name)
                     .copied()
-                    && !self.valid_cached_undefined_property(&property.name, cached)
+                    && (!self.valid_cached_undefined_property(&property.name, cached)
+                        || self.contextual_property_order_key(cached).is_none())
                 {
                     return Err(DerivedTypeError::MalformedObjectLiteral(*member));
                 }
@@ -1107,6 +1114,50 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             constituents,
         });
         Ok(WidenTransform::Cached(union))
+    }
+
+    fn contextual_property_order_key(
+        &self,
+        property: SemanticSymbolId,
+    ) -> Option<(usize, u32, EscapedNameRef<'_>)> {
+        let record = self.symbol(property)?;
+        let declaration = *record.declarations()?.first()?;
+        let bound = self.source_declaration_symbol(declaration)?;
+        let source = self.symbol(bound)?;
+        let owner = record.parent()?;
+        let SourceNodeParent::Parent(owner_declaration) = self.source_node_parent(declaration)?
+        else {
+            return None;
+        };
+        if !self.source_symbol_declarations_match(bound)
+            || !self.source_symbol_declarations_match(owner)
+            || source.name() != record.name()
+            || source.declarations() != record.declarations()
+            || source.value_declaration() != record.value_declaration()
+            || source.parent() != Some(owner)
+            || self.source_declaration_symbol(owner_declaration) != Some(owner)
+        {
+            return None;
+        }
+        Some((
+            self.source_file_rank(declaration.file)?,
+            self.source_node_start(declaration)?,
+            record.name(),
+        ))
+    }
+
+    /// Pinned `compareSymbols` orders each selected symbol by its retained declaration.
+    fn sort_contextual_properties(&self, properties: &mut [SemanticSymbolId]) -> Option<()> {
+        let mut ordered = properties
+            .iter()
+            .map(|property| Some((self.contextual_property_order_key(*property)?, *property)))
+            .collect::<Option<Vec<_>>>()?;
+        // Member names are unique, so declaration and name order resolve every tie.
+        ordered.sort_unstable_by_key(|(key, _)| *key);
+        for (property, (_, symbol)) in properties.iter_mut().zip(ordered) {
+            *property = symbol;
+        }
+        Some(())
     }
 
     fn publish_regular_object(&mut self, plan: RegularObjectPlan) {
@@ -1299,6 +1350,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     );
                     properties.push(property_symbol);
                 }
+                self.sort_contextual_properties(&mut properties)
+                    .expect("the contextual plan checked every own, donor, and cached declaration");
 
                 let retained = shape.object_flags
                     & (ObjectFlags::JS_LITERAL | ObjectFlags::NON_INFERRABLE_TYPE);
@@ -2423,9 +2476,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return false;
         }
 
-        for (source_property, target_property) in
-            source_shape.properties.iter().zip(&target_shape.properties)
-        {
+        let mut expected_properties = Vec::with_capacity(target_shape.properties.len());
+        for source_property in &source_shape.properties {
+            let Some(target_property) = target_shape
+                .properties
+                .iter()
+                .find(|property| property.name == source_property.name)
+            else {
+                return false;
+            };
             let Some(property_record) = self.type_payload(source_property.type_) else {
                 return false;
             };
@@ -2488,15 +2547,28 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             {
                 return false;
             }
+            expected_properties.push(target_property.symbol);
         }
 
-        target_shape.properties[source_shape.properties.len()..]
-            .iter()
-            .zip(missing_properties)
-            .all(|(property, donor)| {
-                property.name == donor.name
-                    && self.validate_contextual_widened_object_property(target, property.symbol)
-            })
+        for donor in missing_properties {
+            let Some(property) = target_shape
+                .properties
+                .iter()
+                .find(|property| property.name == donor.name)
+            else {
+                return false;
+            };
+            if !self.validate_contextual_widened_object_property(target, property.symbol) {
+                return false;
+            }
+            expected_properties.push(property.symbol);
+        }
+        self.sort_contextual_properties(&mut expected_properties)
+            .is_some()
+            && expected_properties.iter().copied().eq(target_shape
+                .properties
+                .iter()
+                .map(|property| property.symbol))
     }
 
     fn widened_object_cache_entry_is_valid(
@@ -3889,6 +3961,435 @@ mod tests {
         }
     }
 
+    fn assert_contextual_property_order(
+        store: &CanonicalTypeMapperStore,
+        union: TypeId,
+        source: TypeId,
+        names: &[&str],
+    ) -> (TypeId, ObjectShape) {
+        let target = store.derived_types.contextual_widened_types[&(union, source)];
+        assert!(store.contextual_object_cache_entry_is_valid(union, source, target, None));
+        let source_shape = store
+            .validated_widening_object_shape(source, &mut HashSet::new())
+            .unwrap();
+        let shape = store.resolved_object_shape(target).unwrap();
+        assert_eq!(shape.symbol, source_shape.symbol);
+        assert_eq!(
+            shape
+                .properties
+                .iter()
+                .map(|property| property.name.as_utf8().unwrap())
+                .collect::<Vec<_>>(),
+            names,
+        );
+        let table = store.symbol_table(shape.members).unwrap();
+        assert_eq!(table.len(), names.len());
+        for source_property in &source_shape.properties {
+            let own = property(&shape, source_property.name.as_utf8().unwrap());
+            assert_eq!(own.symbol, source_property.symbol);
+            assert_eq!(own.type_, source_property.type_);
+        }
+        for property in &shape.properties {
+            assert_eq!(table.get(property.name.as_ref()), Some(property.symbol));
+            if store
+                .symbol(property.symbol)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::OPTIONAL)
+            {
+                assert_eq!(
+                    property.type_,
+                    store
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .undefined_or_missing_type
+                );
+                assert!(store.validate_contextual_widened_object_property(target, property.symbol));
+            }
+        }
+        (target, shape)
+    }
+
+    fn assert_contextual_order_rejection(
+        store: &mut CanonicalTypeMapperStore,
+        union: TypeId,
+        members: [TypeId; 2],
+        invalid: TypeId,
+        widened: Option<TypeId>,
+    ) {
+        let error = if let Some(cached) = widened {
+            assert_eq!(store.derived_types.widened_types.get(&union), Some(&cached));
+            DerivedTypeError::InvalidWidenedTypeCache {
+                source: union,
+                cached,
+            }
+        } else {
+            assert!(!store.derived_types.widened_types.contains_key(&union));
+            for source in members {
+                assert!(
+                    !store
+                        .derived_types
+                        .contextual_widened_types
+                        .contains_key(&(union, source))
+                );
+            }
+            DerivedTypeError::MalformedObjectLiteral(invalid)
+        };
+        for _ in 0..2 {
+            assert_widening_query_preserves_store(store, union, Err(error));
+        }
+    }
+
+    fn assert_coherent_contextual_donor_rejection(
+        store: &mut CanonicalTypeMapperStore,
+        cached: SemanticSymbolId,
+        union: TypeId,
+        original: TypeId,
+        replacement: TypeId,
+        receiver: TypeId,
+        widened: Option<TypeId>,
+    ) {
+        let original_shape = store.fresh_object_shape(original).unwrap();
+        let replacement_shape = store.fresh_object_shape(replacement).unwrap();
+        let donor = property(&original_shape, "zeta");
+        let foreign = property(&replacement_shape, "zeta");
+        assert_eq!(donor.type_, foreign.type_);
+        assert_ne!(original_shape.symbol, replacement_shape.symbol);
+        let raw = store
+            .value_symbol_links(donor.symbol)
+            .unwrap()
+            .target
+            .unwrap();
+        let foreign_raw = store
+            .value_symbol_links(foreign.symbol)
+            .unwrap()
+            .target
+            .unwrap();
+        let declaration = store.symbol(raw).unwrap().value_declaration().unwrap();
+        let foreign_declaration = store
+            .symbol(foreign_raw)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        assert_eq!(store.source_declaration_symbol(declaration), Some(raw));
+        assert_eq!(
+            store.source_declaration_symbol(foreign_declaration),
+            Some(foreign_raw)
+        );
+        let originals = [raw, donor.symbol, cached].map(|symbol| {
+            let record = store.symbol(symbol).unwrap();
+            (
+                symbol,
+                record.declarations().unwrap().to_vec(),
+                record.value_declaration(),
+            )
+        });
+        for (symbol, _, _) in &originals {
+            assert!(store.set_symbol_declarations(
+                *symbol,
+                Some(vec![foreign_declaration]),
+                Some(foreign_declaration),
+            ));
+        }
+        assert!(store.valid_cached_undefined_property(&EscapedName::source("zeta"), cached));
+        assert!(store.contextual_property_order_key(cached).is_none());
+        assert_contextual_order_rejection(store, union, [replacement, receiver], receiver, widened);
+        for (symbol, declarations, value_declaration) in originals {
+            assert!(store.set_symbol_declarations(symbol, Some(declarations), value_declaration));
+        }
+        assert!(store.contextual_property_order_key(cached).is_some());
+
+        for symbol in [foreign_raw, foreign.symbol] {
+            let record = store.symbol(symbol).unwrap();
+            assert_eq!(
+                record.declarations(),
+                Some([foreign_declaration].as_slice())
+            );
+            assert_eq!(record.value_declaration(), Some(foreign_declaration));
+            assert!(store.set_symbol_declarations(
+                symbol,
+                Some(vec![declaration]),
+                Some(declaration),
+            ));
+        }
+        assert!(store.fresh_object_shape(replacement).is_some());
+        assert!(
+            store
+                .contextual_property_order_key(foreign.symbol)
+                .is_none()
+        );
+        assert!(store.contextual_property_order_key(cached).is_some());
+        assert_contextual_order_rejection(
+            store,
+            union,
+            [replacement, receiver],
+            replacement,
+            widened,
+        );
+        for symbol in [foreign_raw, foreign.symbol] {
+            assert!(store.set_symbol_declarations(
+                symbol,
+                Some(vec![foreign_declaration]),
+                Some(foreign_declaration),
+            ));
+        }
+        assert!(
+            store
+                .contextual_property_order_key(foreign.symbol)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn contextual_object_order_keeps_source_members_and_rejects_warm_vector_swaps() {
+        let source = parsed(concat!(
+            "declare const log: string; declare const highlighted: boolean; ",
+            "const first: any = { log, highlighted }; const second: any = { log };",
+        ));
+        let file = FileId::new(202_380);
+        let mut context = checker_context(&[(file, &source)]);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let [first, second] = ["first", "second"].map(|name| {
+            resolved_expression_type(&context, variable_initializer(&source, file, name))
+        });
+        let store = context.store_mut_for_test();
+        let union = store
+            .expression_union_type(&[first, second], UnionReduction::None)
+            .unwrap();
+        assert!(!store.derived_types.widened_types.contains_key(&union));
+        let widened = store.get_widened_type(union).unwrap();
+        let (first_target, _) =
+            assert_contextual_property_order(store, union, first, &["log", "highlighted"]);
+        let (second_target, shape) =
+            assert_contextual_property_order(store, union, second, &["highlighted", "log"]);
+        assert_eq!(
+            crate::semantic::formatter::type_to_string(store, first_target).unwrap(),
+            "{ log: string; highlighted: boolean; }",
+        );
+        assert_eq!(
+            crate::semantic::formatter::type_to_string(store, second_target).unwrap(),
+            "{ highlighted?: undefined; log: string; }",
+        );
+        let properties = shape
+            .properties
+            .iter()
+            .map(|property| property.symbol)
+            .collect::<Vec<_>>();
+        let mut swapped = properties.clone();
+        swapped.swap(0, 1);
+        for _ in 0..2 {
+            assert_widening_query_preserves_store(store, union, Ok(widened));
+            assert!(store.set_structured_type_members(
+                second_target,
+                Some(shape.members),
+                Some(swapped.clone()),
+                None,
+                None,
+                None,
+            ));
+            let table = store.symbol_table(shape.members).unwrap();
+            assert_eq!(table.len(), 2);
+            for property in &shape.properties {
+                assert_eq!(table.get(property.name.as_ref()), Some(property.symbol));
+            }
+            assert!(store.resolved_object_shape(second_target).is_some());
+            assert_widening_query_preserves_store(
+                store,
+                union,
+                Err(DerivedTypeError::InvalidWidenedTypeCache {
+                    source: union,
+                    cached: widened,
+                }),
+            );
+            assert!(store.set_structured_type_members(
+                second_target,
+                Some(shape.members),
+                Some(properties.clone()),
+                None,
+                None,
+                None,
+            ));
+            assert_widening_query_preserves_store(store, union, Ok(widened));
+            assert_eq!(
+                assert_contextual_property_order(store, union, second, &["highlighted", "log"]).0,
+                second_target,
+            );
+        }
+    }
+
+    #[test]
+    fn contextual_object_order_uses_cached_donors_and_program_file_rank() {
+        let earlier = parsed("const original: any = { zeta: 1 };");
+        let later = parsed(concat!(
+            "const seed: any = { seed: 2 }; ",
+            "const receiver: any = { beta: 3 }; const replacement: any = { zeta: 4 };",
+        ));
+        let earlier_file = FileId::new(202_382);
+        let later_file = FileId::new(202_381);
+        let mut context = checker_context(&[(earlier_file, &earlier), (later_file, &later)]);
+        for file in [later_file, earlier_file] {
+            context.check_source_file(file).unwrap();
+        }
+        assert!(context.diagnostics().is_empty());
+        let original = resolved_expression_type(
+            &context,
+            variable_initializer(&earlier, earlier_file, "original"),
+        );
+        let [seed, receiver, replacement] = ["seed", "receiver", "replacement"].map(|name| {
+            resolved_expression_type(&context, variable_initializer(&later, later_file, name))
+        });
+        let store = context.store_mut_for_test();
+        assert_eq!(store.source_file_rank(earlier_file), Some(0));
+        assert_eq!(store.source_file_rank(later_file), Some(1));
+        assert!(earlier_file.index() > later_file.index());
+        let original_shape = store.fresh_object_shape(original).unwrap();
+        let receiver_shape = store.fresh_object_shape(receiver).unwrap();
+        let replacement_shape = store.fresh_object_shape(replacement).unwrap();
+        let donor = property(&original_shape, "zeta");
+        let current_donor = property(&replacement_shape, "zeta");
+        let own = property(&receiver_shape, "beta");
+        let seed_union = store
+            .expression_union_type(&[original, seed], UnionReduction::None)
+            .unwrap();
+        let seed_widened = store.get_widened_type(seed_union).unwrap();
+        assert_contextual_property_order(store, seed_union, original, &["zeta", "seed"]);
+        let (_, seeded) =
+            assert_contextual_property_order(store, seed_union, seed, &["zeta", "seed"]);
+        let cached = property(&seeded, "zeta").symbol;
+        assert_eq!(
+            store.value_symbol_links(cached).unwrap().target,
+            Some(donor.symbol)
+        );
+        assert_eq!(
+            store.symbol(cached).unwrap().parent(),
+            Some(original_shape.symbol)
+        );
+        assert_eq!(
+            store.symbol(cached).unwrap().declarations(),
+            store.symbol(donor.symbol).unwrap().declarations(),
+        );
+        assert!(
+            store.contextual_property_order_key(cached).unwrap()
+                < store.contextual_property_order_key(own.symbol).unwrap()
+        );
+        assert!(
+            store.contextual_property_order_key(own.symbol).unwrap()
+                < store
+                    .contextual_property_order_key(current_donor.symbol)
+                    .unwrap()
+        );
+        let union = store
+            .expression_union_type(&[receiver, replacement], UnionReduction::None)
+            .unwrap();
+        assert!(!store.derived_types.widened_types.contains_key(&union));
+        let widened = store.get_widened_type(union).unwrap();
+        let (_, actual) =
+            assert_contextual_property_order(store, union, receiver, &["zeta", "beta"]);
+        assert_eq!(property(&actual, "zeta").symbol, cached);
+        assert_contextual_property_order(store, union, replacement, &["beta", "zeta"]);
+        for _ in 0..2 {
+            assert_widening_query_preserves_store(store, seed_union, Ok(seed_widened));
+            assert_widening_query_preserves_store(store, union, Ok(widened));
+            assert_eq!(
+                store.derived_types.undefined_properties[&EscapedName::source("zeta")],
+                cached
+            );
+        }
+    }
+
+    #[test]
+    fn contextual_object_order_rejects_coherent_donor_damage_cold_and_warm() {
+        let source = parsed(concat!(
+            "const original: any = { zeta: 1 }; const seed: any = { alpha: 2 }; ",
+            "const replacement: any = { zeta: 3 }; const receiver: any = { beta: 4 };",
+        ));
+        let file = FileId::new(202_383);
+        let mut context = checker_context(&[(file, &source)]);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let [original, seed, replacement, receiver] =
+            ["original", "seed", "replacement", "receiver"].map(|name| {
+                resolved_expression_type(&context, variable_initializer(&source, file, name))
+            });
+        let store = context.store_mut_for_test();
+        let seed_union = store
+            .expression_union_type(&[original, seed], UnionReduction::None)
+            .unwrap();
+        let seed_widened = store.get_widened_type(seed_union).unwrap();
+        let cached = store.derived_types.undefined_properties[&EscapedName::source("zeta")];
+        let record = store.symbol(cached).unwrap();
+        let declarations = record.declarations().unwrap().to_vec();
+        let value_declaration = record.value_declaration();
+        let parent = record.parent();
+        let receiver_shape = store.fresh_object_shape(receiver).unwrap();
+        let foreign_declaration = store
+            .symbol(property(&receiver_shape, "beta").symbol)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let union = store
+            .expression_union_type(&[replacement, receiver], UnionReduction::None)
+            .unwrap();
+        for damage in 0..2 {
+            if damage == 0 {
+                assert!(store.set_symbol_declarations(
+                    cached,
+                    Some(vec![foreign_declaration]),
+                    Some(foreign_declaration),
+                ));
+            } else {
+                assert!(store.set_symbol_relationships(
+                    cached,
+                    None,
+                    None,
+                    Some(receiver_shape.symbol),
+                    None
+                ));
+            }
+            assert_contextual_order_rejection(
+                store,
+                union,
+                [replacement, receiver],
+                receiver,
+                None,
+            );
+            assert!(store.set_symbol_declarations(
+                cached,
+                Some(declarations.clone()),
+                value_declaration
+            ));
+            assert!(store.set_symbol_relationships(cached, None, None, parent, None));
+            assert_widening_query_preserves_store(store, seed_union, Ok(seed_widened));
+        }
+        assert_coherent_contextual_donor_rejection(
+            store,
+            cached,
+            union,
+            original,
+            replacement,
+            receiver,
+            None,
+        );
+        assert_widening_query_preserves_store(store, seed_union, Ok(seed_widened));
+        let widened = store.get_widened_type(union).unwrap();
+        let (_, actual) =
+            assert_contextual_property_order(store, union, receiver, &["zeta", "beta"]);
+        assert_eq!(property(&actual, "zeta").symbol, cached);
+        assert_coherent_contextual_donor_rejection(
+            store,
+            cached,
+            union,
+            original,
+            replacement,
+            receiver,
+            Some(widened),
+        );
+        for _ in 0..2 {
+            assert_widening_query_preserves_store(store, union, Ok(widened));
+        }
+    }
+
     #[test]
     fn contextual_object_unions_preserve_optional_identity_and_option_sentinels() {
         for (strict_null_checks, exact_optional_property_types) in
@@ -3952,13 +4453,40 @@ mod tests {
             for member in members {
                 let shape = context.store().resolved_object_shape(member).unwrap();
                 assert_eq!(shape.properties.len(), 3);
+                assert_eq!(
+                    shape
+                        .properties
+                        .iter()
+                        .map(|property| property.name.as_utf8().unwrap())
+                        .collect::<Vec<_>>(),
+                    ["first", "second", "third"],
+                );
+                let (context_union, source) =
+                    context.store().contextual_widened_source(member).unwrap();
+                assert_eq!(context_union, source_union);
+                assert!(source_members.contains(&source));
+                let source_shape = context
+                    .store()
+                    .validated_widening_object_shape(source, &mut HashSet::new())
+                    .unwrap();
+                let [source_property] = source_shape.properties.as_slice() else {
+                    panic!("each source object has one real required property");
+                };
+                assert_eq!(shape.symbol, source_shape.symbol);
+                let required = property(&shape, source_property.name.as_utf8().unwrap());
+                assert_eq!(required.symbol, source_property.symbol);
+                assert_eq!(required.type_, source_property.type_);
                 assert!(
                     context
                         .store()
-                        .symbol(shape.properties[0].symbol)
+                        .symbol(required.symbol)
                         .is_some_and(|record| !record.flags().contains(SymbolFlags::OPTIONAL))
                 );
-                for property in &shape.properties[1..] {
+                for property in shape
+                    .properties
+                    .iter()
+                    .filter(|property| property.symbol != required.symbol)
+                {
                     let record = context.store().symbol(property.symbol).unwrap();
                     let links = context.store().value_symbol_links(property.symbol).unwrap();
                     let donor = context.store().symbol(links.target.unwrap()).unwrap();
