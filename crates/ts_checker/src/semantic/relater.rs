@@ -6710,25 +6710,28 @@ impl<'store> RelaterSession<'store> {
         &self,
         type_id: TypeId,
     ) -> Result<Option<TypeId>, RelationUnavailable> {
-        class_reference_field_target(self.store, type_id, self.array_targets).map_err(|error| {
-            match error {
-                GenericInterfaceMemberError::UnsupportedTarget(_)
-                | GenericInterfaceMemberError::UnsupportedPropertyType(_) => {
-                    RelationUnavailable::UnsupportedStructuredType(type_id)
-                }
-                GenericInterfaceMemberError::UnsupportedMember(symbol) => {
-                    RelationUnavailable::UnsupportedProperty(symbol)
-                }
-                GenericInterfaceMemberError::Capacity(_) => {
-                    RelationUnavailable::UnionValidationCapacity(type_id)
-                }
-                GenericInterfaceMemberError::Reference(_)
-                | GenericInterfaceMemberError::InvalidTarget(_)
-                | GenericInterfaceMemberError::InvalidMember(_)
-                | GenericInterfaceMemberError::InvalidCachedMembers(_)
-                | GenericInterfaceMemberError::InvalidCachedProperty(_) => {
-                    RelationUnavailable::InvalidStructuredMembers(type_id)
-                }
+        class_reference_field_target(
+            self.store,
+            type_id,
+            self.global_types.map(|globals| globals.array_targets),
+        )
+        .map_err(|error| match error {
+            GenericInterfaceMemberError::UnsupportedTarget(_)
+            | GenericInterfaceMemberError::UnsupportedPropertyType(_) => {
+                RelationUnavailable::UnsupportedStructuredType(type_id)
+            }
+            GenericInterfaceMemberError::UnsupportedMember(symbol) => {
+                RelationUnavailable::UnsupportedProperty(symbol)
+            }
+            GenericInterfaceMemberError::Capacity(_) => {
+                RelationUnavailable::UnionValidationCapacity(type_id)
+            }
+            GenericInterfaceMemberError::Reference(_)
+            | GenericInterfaceMemberError::InvalidTarget(_)
+            | GenericInterfaceMemberError::InvalidMember(_)
+            | GenericInterfaceMemberError::InvalidCachedMembers(_)
+            | GenericInterfaceMemberError::InvalidCachedProperty(_) => {
+                RelationUnavailable::InvalidStructuredMembers(type_id)
             }
         })
     }
