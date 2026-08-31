@@ -34,8 +34,9 @@ Its first full check stopped at a parser function-length lint. The correction
 at `3b45a90d` passed formatting in the second check, then stopped on three
 Clippy findings. All 6,550 tests remain unrun on that source. The
 [latest core/parser result](../target/wave202-core-parser-combined-full-2-quality-report.md)
-retains every compiler error and the nine unattempted stages. A separate pair
-is reviewing the three small lint fixes. The artifact fixes still need
+retains every compiler error and the nine unattempted stages. The three small
+lint fixes are committed and independently reviewed at `4a09da42`. A fresh
+check of the same 6,550 tests is being prepared. The artifact fixes still need
 execution. The primary branch uses the previously accepted compiler source.
 
 The five parser repairs are committed at `b1746a95`, with 28 new tests.
@@ -69,9 +70,12 @@ Independent review and cleanup are closed. The
 [alias result](../target/wave202-alias-wrapper-numeric-method-focused-1-runtime.md)
 retains every failure. The next repair batch stopped at a test import error
 before listing any of its 5,104 tests. That one-line import fix is committed
-and independently reviewed at `bc967441`. A fresh retry is being prepared.
-The 5,082 passes and 17 failures remain the last complete alias measurement.
-This batch is not accepted yet.
+and independently reviewed at `bc967441`. Its fresh retry completed all 5,104
+tests with 5,094 passes and 10 failures. Eight old failures now pass. Nine old
+failures remain, and one new control fails. No old passing test regressed.
+Separate cleanup is closed. The
+[new alias result](../target/wave202-alias-five-repair-focused-3-runtime.md)
+has independent review. This batch is not accepted yet.
 
 The first shared project compiler is committed and independently verified at
 `b71b4158`. It combines the repaired library, class work, core, parser and
@@ -84,21 +88,30 @@ failed on an access to a nonexistent AST field. Neither project ran. The
 [failed build result](../target/wave202-demo-shared-project-census-2-result.md)
 has an independent review and closed cleanup. The exact one-line correction
 is committed and independently reviewed at `3b293b28`. All tests stay unchanged.
-The next run will build that source once and check both original projects.
+Its retry compiled the checker library, then failed on three incomplete error
+matches in the compiler driver. Neither project ran. The
+[latest build result](../target/wave202-demo-shared-project-census-3-result.md)
+has independent review and closed cleanup. The one-file driver repair is
+committed and independently reviewed at `069ebad6`. It keeps internal errors
+separate from unsupported language features and adds two classification tests.
+The next run will build that repair once and check both original projects.
 
 Separate repair pairs committed fixes for three causes linked to 35 measured
 library failures: conditional alias publication, warm union preparation and
 property-kind checks. The last group includes one test setup correction.
 These are source fixes, not 35 new passing tests. Later assertions still need
 execution. These fixes stay outside the immediate project retry.
+The separate namespace query selection repair is also committed and reviewed
+at `b879db17`. Its first failing operation is shared by 20 measured tests.
+Those tests have not run on the repair. It also stays outside this retry.
 
 ## Next work
 
-1. Build `3b293b28` once and measure both unchanged projects with that same
+1. Build `069ebad6` once and measure both unchanged projects with that same
    binary. Keep this source fixed. Do not wait for later feature patches or
    unrelated test repairs.
-2. Finish the small core/parser and alias build fixes. Run their unchanged
-   test selections in parallel with the project measurement. Report every failure.
+2. Run the repaired core/parser tests in parallel with the project measurement.
+   Review the complete alias result and repair its remaining failures.
 3. Fix the measured library and class failures in separate worktrees. Combine
    those repairs after the first project measurement.
 4. Prioritize the next actual project failure and any shared dependency. Repeat until
