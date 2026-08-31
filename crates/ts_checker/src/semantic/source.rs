@@ -9331,6 +9331,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Err(SourceCheckError::Class(declaration));
         }
         self.source_body_classes.insert(symbol, source.clone());
+        for &annotation in source.annotation_nodes() {
+            self.plan_type_import_annotation_root(annotation)?;
+        }
         let mut bodies = Vec::with_capacity(source.bodies().len());
         for body in source.bodies() {
             if body.class_declaration != declaration || body.class_symbol != symbol {

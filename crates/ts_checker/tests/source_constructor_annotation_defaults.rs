@@ -7,11 +7,10 @@ use ts_checker::semantic::{
     AliasSymbolLinks, CanonicalCheckerContext, CanonicalCheckerDiagnostics,
     CanonicalCheckerOptions, CanonicalModuleResolutionEntry,
     CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
-    CanonicalResolvedModuleInput, ClassError, ClassMembers, DeclaredTypeError, DeclaredTypeLinks,
-    IntrinsicBootstrapOptions, SignatureId, SignatureLinks, SourceCheckError, SourceFileLinks,
-    SymbolNodeLinks, TypeAliasLinks, TypeData, TypeId, TypeNodeLinks, TypeNodeUnavailable,
-    ValueSymbolLinks, artifact_queries::CanonicalArtifactQueryError, signatures::SignatureFlags,
-    type_records::LiteralValue, types::TypeFlags,
+    CanonicalResolvedModuleInput, ClassMembers, DeclaredTypeError, DeclaredTypeLinks,
+    IntrinsicBootstrapOptions, SignatureId, SignatureLinks, SourceFileLinks, SymbolNodeLinks,
+    TypeAliasLinks, TypeData, TypeId, TypeNodeLinks, TypeNodeUnavailable, ValueSymbolLinks,
+    signatures::SignatureFlags, type_records::LiteralValue, types::TypeFlags,
 };
 use ts_jsnum::Number;
 use ts_options::{ModuleKind, ScriptTarget};
@@ -721,8 +720,8 @@ fn invalid_named_constructor_defaults_report_the_real_assignment_without_changin
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // Keep the unchanged provider, real import owner, and unreached Exclude dependency together.
-fn hono_contentful_status_default_keeps_the_import_alias_dependency_visible() {
+#[allow(clippy::too_many_lines)] // Keep the unchanged provider, real import owner, conditional result, and default together.
+fn hono_contentful_status_default_keeps_the_imported_conditional_result() {
     let library = parse_source_file(ES5);
     let provider = parse_source_file(HONO_STATUS);
     let source = parse_source_file(HONO_CONSUMER);
@@ -775,35 +774,148 @@ fn hono_contentful_status_default_keeps_the_import_alias_dependency_visible() {
                 .declarations(),
             Some(&[exclude][..])
         );
-        let declared_error =
-            DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::ImportAliasTypeReference {
-                node: parts.annotation,
-                alias: imported_owner,
-            });
-        let source_error = SourceCheckError::DeclaredType(declared_error);
-        let cold = snapshot(&context);
-        if query_first {
-            assert_eq!(
-                context.get_nongeneric_class_members(class),
-                Err(ClassError::DeclaredType(declared_error))
-            );
-        }
-        for _ in 0..2 {
-            assert_eq!(context.check_source_file(SOURCE), Err(source_error));
-            assert_eq!(
-                context.get_type_at_location(parts.initializer),
-                Err(CanonicalArtifactQueryError::SourceCheck(source_error))
-            );
-            assert_eq!(
-                context.get_nongeneric_class_members(class),
-                Err(ClassError::DeclaredType(declared_error))
-            );
-            assert_eq!(context.recheck_source_file(SOURCE), Err(source_error));
-            assert_eq!(snapshot(&context), cold);
+        let header = if query_first {
+            let header = context.get_nongeneric_class_members(class).unwrap();
             assert!(!is_checked(&context, SOURCE));
             assert!(!is_checked(&context, STATUS));
             assert!(context.store().type_node_links(parts.initializer).is_none());
-            assert!(context.store().type_node_links(parts.annotation).is_none());
+            Some(header)
+        } else {
+            None
+        };
+        context.check_source_file(SOURCE).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let members = context.get_nongeneric_class_members(class).unwrap();
+        if let Some(header) = header {
+            assert_eq!(members, header);
+        }
+        let parameter = symbol(&context, parts.parameter);
+        let declared = value_type(&context, parameter);
+        assert_eq!(cached_type(&context, parts.annotation), declared);
+        assert_eq!(cached_type(&context, body), declared);
+        let owner = symbol(&context, contentful);
+        assert_eq!(
+            context
+                .store()
+                .type_alias_links(owner)
+                .unwrap()
+                .declared_type,
+            Some(declared)
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(parts.annotation)
+                .unwrap()
+                .resolved_symbol,
+            Some(owner)
+        );
+        let record = context.store().type_payload(declared).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .type_alias(record.alias().unwrap())
+                .unwrap()
+                .symbol(),
+            Some(owner)
+        );
+        let TypeData::Union(union) = record.data() else {
+            panic!("the real imported conditional must keep its numeric union");
+        };
+        assert_eq!(union.union.types.len(), 60);
+        for (value, retained) in [
+            (500, true),
+            (-1, true),
+            (101, false),
+            (204, false),
+            (205, false),
+            (304, false),
+        ] {
+            let literal = context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .cached_number_literal_type(Number::new(f64::from(value)))
+                .unwrap();
+            assert_eq!(union.union.types.contains(&literal), retained);
+        }
+        for &type_ in &union.union.types {
+            assert_eq!(
+                context.store().type_payload(type_).unwrap().flags(),
+                TypeFlags::NUMBER_LITERAL
+            );
+            let TypeData::Literal(literal) = context.store().type_payload(type_).unwrap().data()
+            else {
+                unreachable!()
+            };
+            assert_eq!(literal.regular_type, type_);
+        }
+        let initializer = cached_type(&context, parts.initializer);
+        let regular = assert_number(&context, initializer, 500);
+        assert_ne!(initializer, regular);
+        assert_ne!(initializer, declared);
+        let TypeData::Literal(literal) = context.store().type_payload(regular).unwrap().data()
+        else {
+            unreachable!()
+        };
+        assert_eq!(literal.fresh_type, Some(initializer));
+        let signature = members.default_construct_signature();
+        let record = context.store().signature(signature).unwrap();
+        assert_eq!(record.declaration(), Some(parts.constructor));
+        assert_eq!(record.parameters(), &[parameter]);
+        assert_eq!(record.min_argument_count(), 0);
+        assert_eq!(
+            record.resolved_return_type(),
+            Some(members.shells().instance_type())
+        );
+        let construction = only_node(&source, SOURCE, SyntaxKind::NewExpression);
+        assert_eq!(
+            cached_type(&context, construction),
+            members.shells().instance_type()
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature_links(construction)
+                .unwrap()
+                .resolved_signature
+                .signature(),
+            Some(signature)
+        );
+        assert_eq!(
+            context.get_type_at_location(parts.initializer),
+            Ok(initializer)
+        );
+        assert_eq!(
+            context.get_type_from_type_node(parts.annotation),
+            Ok(declared)
+        );
+        let warm = snapshot(&context);
+        for _ in 0..2 {
+            context.check_source_file(SOURCE).unwrap();
+            assert_eq!(
+                context.get_type_at_location(parts.initializer),
+                Ok(initializer)
+            );
+            assert_eq!(
+                context.get_nongeneric_class_members(class),
+                Ok(members.clone())
+            );
+            assert_eq!(
+                context.get_type_from_type_node(parts.annotation),
+                Ok(declared)
+            );
+            assert_eq!(context.get_type_at_location(parts.name), Ok(declared));
+            assert_eq!(
+                context.get_type_at_location(construction),
+                Ok(members.shells().instance_type())
+            );
+            context.recheck_source_file(SOURCE).unwrap();
+            assert_eq!(snapshot(&context), warm);
+            assert!(is_checked(&context, SOURCE));
+            assert!(!is_checked(&context, STATUS));
+            assert_eq!(cached_type(&context, parts.initializer), initializer);
+            assert_eq!(cached_type(&context, parts.annotation), declared);
         }
     }
 }

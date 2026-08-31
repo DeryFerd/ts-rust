@@ -1544,6 +1544,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             global_types,
             instantiation_session,
             diagnostics,
+            module_resolutions,
             ..
         } = self;
         instantiation_session.reset_query();
@@ -1552,7 +1553,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             files,
             GlobalMergeCompletion::new(options.name_resolution),
         )
-        .map_err(DeclaredTypeError::from)?;
+        .map_err(DeclaredTypeError::from)?
+        .with_module_resolutions(module_resolutions);
         super::classes::ClassValueQuery {
             store,
             host: &host,
@@ -1575,6 +1577,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             global_types,
             instantiation_session,
             diagnostics,
+            module_resolutions,
             ..
         } = self;
         instantiation_session.reset_query();
@@ -1583,7 +1586,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             files,
             GlobalMergeCompletion::new(options.name_resolution),
         )
-        .map_err(DeclaredTypeError::from)?;
+        .map_err(DeclaredTypeError::from)?
+        .with_module_resolutions(module_resolutions);
         super::classes::ClassValueQuery {
             store,
             host: &host,
@@ -1622,6 +1626,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             global_types,
             instantiation_session,
             diagnostics,
+            module_resolutions,
             ..
         } = self;
         instantiation_session.reset_query();
@@ -1630,7 +1635,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             files,
             GlobalMergeCompletion::new(options.name_resolution),
         )
-        .map_err(DeclaredTypeError::from)?;
+        .map_err(DeclaredTypeError::from)?
+        .with_module_resolutions(module_resolutions);
         if let Some(members) = super::classes::completed_source_class_members(store, &host, symbol)?
         {
             return Ok(members);
