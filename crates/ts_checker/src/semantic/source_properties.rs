@@ -581,6 +581,7 @@ pub(super) fn check_class_binding_property(
     plan: &ClassBindingPropertyPlan,
     receiver_type: TypeId,
     flow: &mut ClassInitializationFrame<'_, '_>,
+    session: &mut InstantiationSession,
 ) -> Result<CheckedSourceProperty, SourcePropertyError> {
     let invalid = || SourcePropertyError::InvalidCache(plan.property);
     if plan_class_binding_property(store, host, plan.binding, plan.receiver())? != *plan {
@@ -631,6 +632,25 @@ pub(super) fn check_class_binding_property(
             }),
         })
         .collect();
+    let declared_type = match inherited_class_instance_member_view(
+        store,
+        host,
+        plan.property,
+        &plan.context,
+        &member,
+        Some(flow.access_token()),
+    )? {
+        Some(view) => classes::prepare_class_instance_super_member_type_with_session(
+            store,
+            host,
+            Some(globals),
+            view,
+            symbol,
+            session,
+        )
+        .map_err(|error| class_member_query_error(plan.property, error))?,
+        None => property.type_,
+    };
     let type_ = if property.optional && options.intrinsic.strict_null_checks {
         let undefined = store
             .intrinsic_bootstrap()
@@ -640,11 +660,11 @@ pub(super) fn check_class_binding_property(
             store,
             Some(globals),
             plan.property,
-            &[property.type_, undefined],
+            &[declared_type, undefined],
             Some(symbol),
         )?
     } else {
-        property.type_
+        declared_type
     };
     Ok(CheckedSourceProperty { type_, diagnostics })
 }
@@ -3008,6 +3028,38 @@ fn check_direct_source_property_with_source_mode(
                             .and_then(|method| store.symbol(method))
                             .is_some_and(|method| method.flags().contains(SymbolFlags::METHOD))
                 });
+            // Completed class receivers need the same source-aware member mapper.
+            // This only selects that provider. It still proves completion, the
+            // reference arguments, and the original member before making a copy.
+            let source_class_reference = target.is_some_and(|target| {
+                receiver != target
+                    && store.type_payload(target).is_some_and(|record| {
+                        record.object_flags().contains(ObjectFlags::CLASS)
+                            && record.symbol().is_some_and(|symbol| {
+                                store.source_class_provenance_for_symbol(symbol).is_some()
+                            })
+                    })
+            });
+            let completed_applied_class_origin = match store.type_payload(receiver) {
+                Some(record)
+                    if target == Some(receiver)
+                        && record.object_flags().contains(ObjectFlags::CLASS)
+                        && matches!(record.data(), TypeData::Interface(_)) =>
+                {
+                    let owner = record
+                        .symbol()
+                        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+                    classes::completed_source_class_members(store, host, owner)
+                        .map_err(|error| class_member_query_error(plan.node, error))?
+                        .is_some_and(|members| {
+                            members.shells().instance_type() == receiver
+                                && members.base().is_some_and(|base| {
+                                    base.applied_instance_type() != base.instance_type()
+                                })
+                        })
+                }
+                _ => false,
+            };
             let conditional_mapped = store.type_payload(receiver).is_some_and(|record| {
                 matches!(record.data(), TypeData::Mapped(mapped)
                 if mapped.template_type.is_some_and(|template| {
@@ -3018,6 +3070,8 @@ fn check_direct_source_property_with_source_mode(
             if !property_alias
                 && !cold_interface
                 && !warm_generic_method
+                && !source_class_reference
+                && !completed_applied_class_origin
                 && !conditional_mapped
                 && !is_cold_direct_nongeneric_interface(store, receiver)
             {
@@ -3238,6 +3292,32 @@ fn resolve_direct_source_own_property(
             EscapedNameRef::source(name),
             session,
         )
+    } else if store.type_payload(receiver).is_some_and(|record| {
+        matches!(record.data(), TypeData::Interface(_))
+            && record.object_flags().contains(ObjectFlags::CLASS)
+    }) && store.source_class_provenance(receiver).is_some()
+    {
+        let property = super::object_members::resolve_object_property_by_key(
+            store,
+            global_types,
+            receiver,
+            EscapedNameRef::source(name),
+            session,
+        )?;
+        if property.is_none()
+            && store
+                .type_payload(receiver)
+                .and_then(|record| record.data().structured())
+                .is_some_and(|structured| {
+                    structured
+                        .signatures
+                        .as_ref()
+                        .is_some_and(|signatures| !signatures.is_empty())
+                })
+        {
+            return Err(RelationUnavailable::StructuredSignatures(receiver).into());
+        }
+        Ok(property)
     } else {
         store.resolved_own_property(receiver, name)
     }
@@ -3498,16 +3578,21 @@ where
             },
         },
     } {
-        let diagnostic =
-            class_property_accessibility(store, plan.name_node, receiver_type, property.symbol)?
-                .map(|accessibility| SourcePropertyDiagnostic {
-                    name_node: plan.name_node,
-                    receiver_type,
-                    missing_type: None,
-                    suggestion: None,
-                    private_owner: None,
-                    accessibility: Some(accessibility),
-                });
+        let diagnostic = class_property_accessibility(
+            store,
+            global_types,
+            plan.name_node,
+            receiver_type,
+            property.symbol,
+        )?
+        .map(|accessibility| SourcePropertyDiagnostic {
+            name_node: plan.name_node,
+            receiver_type,
+            missing_type: None,
+            suggestion: None,
+            private_owner: None,
+            accessibility: Some(accessibility),
+        });
         if property.optional {
             if !plan.is_read() {
                 return Err(SourcePropertyError::Unsupported(
@@ -3822,6 +3907,71 @@ fn class_context_has_member_owner(
             .map(|base| base.base_instance_type);
     }
     false
+}
+
+fn class_member_query_error(node: NodeRef, error: classes::ClassError) -> SourcePropertyError {
+    match error {
+        classes::ClassError::Unsupported(_) => unsupported_access(node),
+        _ => SourcePropertyError::InvalidCache(node),
+    }
+}
+
+/// Inherited reads keep the lexical this token and map only the base member.
+fn inherited_class_instance_member_view(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    context: &ClassAccessContext,
+    member: &ClassMemberSource,
+    access: Option<&classes::ClassBodyAccessToken>,
+) -> Result<Option<classes::ClassInstanceSuperView>, SourcePropertyError> {
+    if context.kind != ClassReceiverKind::This
+        || context.side != ClassPropertySide::Instance
+        || member.declaring_class == context.class_symbol
+    {
+        return Ok(None);
+    }
+    let (instance, base) = match access {
+        Some(access) => {
+            let identities = classes::class_body_identities(store, host, access)
+                .map_err(|error| class_member_query_error(context.receiver, error))?;
+            (identities.instance_type, identities.base)
+        }
+        None => {
+            let Some(members) =
+                classes::completed_source_class_members(store, host, context.class_symbol)
+                    .map_err(|error| class_member_query_error(context.receiver, error))?
+            else {
+                return Ok(None);
+            };
+            (members.shells().instance_type(), members.base())
+        }
+    };
+    let Some(base) = base else {
+        return Ok(None);
+    };
+    let has_type_parameters = store.type_payload(instance).is_some_and(|record| {
+        matches!(record.data(), TypeData::Interface(interface)
+            if interface.reference.resolved_type_arguments.as_ref()
+                .is_some_and(|parameters| !parameters.is_empty()))
+    });
+    if base.applied_instance_type() == base.instance_type() && !has_type_parameters {
+        return Ok(None);
+    }
+    if store
+        .type_node_links(node)
+        .is_some_and(|links| links != &TypeNodeLinks::default())
+        && store
+            .declared_type_links(context.class_symbol)
+            .and_then(|links| links.declared_type)
+            .and_then(|instance| store.class_instance_super_view_for_instance(instance))
+            .is_none()
+    {
+        return Err(SourcePropertyError::InvalidCache(node));
+    }
+    classes::prepare_class_instance_super_view(store, host, context.class_symbol, access)
+        .map(Some)
+        .map_err(|error| class_member_query_error(context.receiver, error))
 }
 
 fn class_access_diagnostic(
@@ -4208,7 +4358,21 @@ pub(super) fn check_direct_source_property_with_class_context_and_session(
         return Err(SourcePropertyError::InvalidCache(plan.node));
     }
     let mut declared_type = property.type_;
-    if !private_error && let Some(view) = identities.instance_super {
+    let member_view = if private_error {
+        None
+    } else if let Some(view) = identities.instance_super {
+        Some(view)
+    } else {
+        inherited_class_instance_member_view(
+            store,
+            host,
+            plan.node,
+            &context,
+            &member,
+            flow.as_deref().map(ClassInitializationFrame::access_token),
+        )?
+    };
+    if let Some(view) = member_view {
         if store
             .type_node_links(plan.node)
             .is_some_and(|links| links != &TypeNodeLinks::default())
@@ -4219,17 +4383,15 @@ pub(super) fn check_direct_source_property_with_class_context_and_session(
         {
             return Err(SourcePropertyError::InvalidCache(plan.node));
         }
-        declared_type = classes::prepare_class_instance_super_member_type(
+        declared_type = classes::prepare_class_instance_super_member_type_with_session(
             store,
             host,
             globals,
             view,
             property.symbol,
+            session,
         )
-        .map_err(|error| match error {
-            classes::ClassError::Unsupported(_) => unsupported_access(plan.node),
-            _ => SourcePropertyError::InvalidCache(plan.node),
-        })?;
+        .map_err(|error| class_member_query_error(plan.node, error))?;
     }
     if property.optional && !private_error {
         if !plan.is_read() {
@@ -4411,6 +4573,7 @@ fn validate_class_property_flow_identity(
 
 fn class_property_accessibility(
     store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
     name_node: NodeRef,
     receiver_type: TypeId,
     property: SemanticSymbolId,
@@ -4446,8 +4609,53 @@ fn class_property_accessibility(
         .value_symbol_links(receiver_owner)
         .and_then(|links| links.resolved_type)
         == Some(receiver_type);
+    if !static_side && receiver_type != receiver_class {
+        if super::instantiated_members::class_reference_field_target(
+            store,
+            receiver_type,
+            global_types.map(CanonicalArrayTargets::from_global_types),
+        )
+        .map_err(|_| invalid())?
+            != Some(receiver_class)
+        {
+            return Err(invalid());
+        }
+        let source_members =
+            classes::completed_source_class_receiver_members(store, receiver_class)
+                .map_err(|_| invalid())?
+                .ok_or_else(invalid)?;
+        let members = super::instantiated_members::validate_generic_interface_members(
+            store,
+            receiver_type,
+            global_types.map(CanonicalArrayTargets::from_global_types),
+        )
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+        let original = store
+            .value_symbol_links(property)
+            .ok_or_else(invalid)?
+            .target
+            .unwrap_or(property);
+        let original_record = store.symbol(original).ok_or_else(invalid)?;
+        if members.reference() != receiver_type
+            || members.target() != receiver_class
+            || !members.properties().contains(&property)
+            || members
+                .members()
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get(original_record.name()))
+                != Some(property)
+            || source_members.shells().instance_type() != receiver_class
+            || source_members.shells().symbol() != receiver_owner
+            || !source_members.instance_properties().contains(&original)
+            || original_record.parent() != Some(owner)
+            || original_record.value_declaration() != Some(declaration)
+            || original_record.name() != property_record.name()
+        {
+            return Err(invalid());
+        }
+    }
     if store.source_node_kind(name_node) != Some(SyntaxKind::Identifier)
-        || !static_side && receiver_type != receiver_class
         || classes::validated_class_derives_from(store, receiver_class, declaring_class)
             != Some(true)
         || receiver
@@ -6572,6 +6780,7 @@ pub(super) fn prepare_source_property_diagnostic(
                 != Some(name)
             || class_property_accessibility(
                 store,
+                Some(global_types),
                 deferred.name_node,
                 deferred.receiver_type,
                 property,
@@ -10919,6 +11128,369 @@ mod tests {
                 );
                 assert_eq!(class_property_cache_state(&context, &parsed, file), before);
             }
+        }
+    }
+
+    #[test]
+    fn applied_base_reads_keep_origin_symbols_and_lexical_this() {
+        let parsed = parsed(concat!(
+            "class Base<T> { protected value: T; ",
+            "constructor(value: T) { this.value = value; } ",
+            "read(): T { return this.value; } } ",
+            "class Child extends Base<string> { ",
+            "constructor(value: string) { super(value); } ",
+            "field(): string { return this.value; } ",
+            "direct(): string { return this.read(); } ",
+            "parent(): string { return super.read(); } ",
+            "binding(): string { const { value } = this; return value; } }",
+        ));
+        let file = FileId::new(202_1803);
+        let mut context = class_body_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let globals = context.store().symbol_table(context.globals()).unwrap();
+        let base = globals.get_source("Base").unwrap();
+        let child = globals.get_source("Child").unwrap();
+        let base_instance = context
+            .store()
+            .declared_type_links(base)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let child_instance = context
+            .store()
+            .declared_type_links(child)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Interface(origin) =
+            context.store().type_payload(base_instance).unwrap().data()
+        else {
+            panic!("the base must retain its declaration origin")
+        };
+        let [formal] = origin.reference.resolved_type_arguments.as_deref().unwrap() else {
+            panic!("the base must retain one type parameter")
+        };
+        let formal = *formal;
+        let members = context.store().symbol(base).unwrap().members().unwrap();
+        let members = context.store().symbol_table(members).unwrap();
+        let field = members.get_source("value").unwrap();
+        let method = members.get_source("read").unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(field)
+                .unwrap()
+                .resolved_type,
+            Some(formal)
+        );
+        let view = context
+            .store()
+            .class_instance_super_view_for_instance(child_instance)
+            .unwrap();
+        assert_eq!(view.lookup_type(), base_instance);
+        assert_eq!(view.instance_type(), child_instance);
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let copied_field = context
+            .store()
+            .class_instance_super_member(view.receiver_type(), field)
+            .unwrap();
+        assert_eq!(copied_field.type_(), string);
+        let copied_method = context
+            .store()
+            .class_instance_super_member(view.receiver_type(), method)
+            .unwrap();
+        let callable = copied_method.type_();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            super::super::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let mut inherited_reads = Vec::new();
+        for (node, record) in parsed.arena.iter() {
+            let NodeData::PropertyAccessExpression(property) = &record.data else {
+                continue;
+            };
+            let receiver = NodeRef::new(parsed.arena.id(), file, property.expression);
+            let Some(access) = plan_class_access_context(context.store(), &host, receiver).unwrap()
+            else {
+                continue;
+            };
+            if access.class_symbol() != child {
+                continue;
+            }
+            let node = NodeRef::new(parsed.arena.id(), file, node);
+            let symbol = context
+                .store()
+                .symbol_node_links(node)
+                .unwrap()
+                .resolved_symbol
+                .unwrap();
+            let type_ = context
+                .store()
+                .type_node_links(node)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            if symbol == field {
+                assert_eq!(type_, string);
+            } else {
+                assert_eq!(symbol, method);
+                assert_eq!(type_, callable);
+                let call = NodeRef::new(parsed.arena.id(), file, record.parent.unwrap());
+                assert_eq!(
+                    context.store().type_node_links(call).unwrap().resolved_type,
+                    Some(string)
+                );
+            }
+            let receiver_type = context
+                .store()
+                .type_node_links(receiver)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            if access.kind == ClassReceiverKind::This {
+                let TypeData::Interface(child_type) =
+                    context.store().type_payload(child_instance).unwrap().data()
+                else {
+                    unreachable!()
+                };
+                assert_eq!(Some(receiver_type), child_type.this_type);
+                assert_ne!(receiver_type, view.receiver_type());
+            } else {
+                assert_eq!(access.kind, ClassReceiverKind::SuperProperty);
+                assert_eq!(receiver_type, view.receiver_type());
+            }
+            inherited_reads.push(node);
+        }
+        assert_eq!(inherited_reads.len(), 3);
+        let binding = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::BindingElement).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let local = bound.symbol(binding).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(local)
+                .unwrap()
+                .resolved_type,
+            Some(string)
+        );
+        let warm = class_property_cache_state(&context, &parsed, file);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(class_property_cache_state(&context, &parsed, file), warm);
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(field)
+                    .unwrap()
+                    .resolved_type,
+                Some(formal)
+            );
+        }
+    }
+
+    #[test]
+    fn generic_class_visibility_revalidates_copied_members_before_diagnostics() {
+        let parsed = parsed(concat!(
+            "class Box<T> { private hidden: T; protected saved: T; ",
+            "constructor(value: T) { this.hidden = value; this.saved = value; } } ",
+            "declare const numeric: Box<number>; ",
+            "const hidden: number = numeric.hidden; ",
+            "const saved: number = numeric.saved;",
+        ));
+        let file = FileId::new(202_1804);
+        let mut context = class_body_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            vec![2341, 2445]
+        );
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            super::super::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let accesses = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::PropertyAccessExpression(property) = &record.data else {
+                    return None;
+                };
+                if !matches!(
+                    &parsed.arena.get(property.expression)?.data,
+                    NodeData::Identifier(identifier) if identifier.text == "numeric"
+                ) {
+                    return None;
+                }
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, property.expression),
+                    NodeRef::new(parsed.arena.id(), file, property.name),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(accesses.len(), 2);
+        for (access, receiver, name) in accesses {
+            let store = context.store();
+            let receiver_type = store
+                .type_node_links(receiver)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let proxy = store
+                .symbol_node_links(access)
+                .unwrap()
+                .resolved_symbol
+                .unwrap();
+            let links = store.value_symbol_links(proxy).unwrap().clone();
+            let original = links.target.unwrap();
+            assert_ne!(proxy, original);
+            assert!(links.mapper.is_some());
+            assert_eq!(links.resolved_type, Some(number));
+            assert_eq!(
+                store.type_node_links(access).unwrap().resolved_type,
+                Some(number)
+            );
+            let owner = store.symbol(original).unwrap().parent().unwrap();
+            let class = store
+                .declared_type_links(owner)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            assert_ne!(receiver_type, class);
+            let spelling = store.symbol(original).unwrap().name().as_utf8().unwrap();
+            let (accessibility, other) = if spelling == "hidden" {
+                (
+                    ClassPropertyAccessDiagnostic::Private {
+                        property: proxy,
+                        owner,
+                    },
+                    "saved",
+                )
+            } else {
+                assert_eq!(spelling, "saved");
+                (
+                    ClassPropertyAccessDiagnostic::Protected {
+                        property: proxy,
+                        owner,
+                    },
+                    "hidden",
+                )
+            };
+            let other = store
+                .symbol(owner)
+                .unwrap()
+                .members()
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source(other))
+                .unwrap();
+            let deferred = SourcePropertyDiagnostic {
+                name_node: name,
+                receiver_type,
+                missing_type: None,
+                suggestion: None,
+                private_owner: None,
+                accessibility: Some(accessibility),
+            };
+            assert_eq!(
+                class_property_accessibility(store, Some(&globals), name, receiver_type, proxy),
+                Ok(Some(accessibility))
+            );
+            let expected =
+                prepare_source_property_diagnostic(store, &host, &globals, options, &deferred)
+                    .unwrap();
+            assert_eq!(
+                expected.diagnostic.render().unwrap(),
+                if spelling == "hidden" {
+                    "Property 'hidden' is private and only accessible within class 'Box<T>'."
+                } else {
+                    "Property 'saved' is protected and only accessible within class 'Box<T>' and its subclasses."
+                }
+            );
+            let warm = class_property_cache_state(&context, &parsed, file);
+            for damage_target in [true, false] {
+                let mut damaged = links.clone();
+                if damage_target {
+                    damaged.target = Some(other);
+                } else {
+                    damaged.mapper = None;
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(proxy, damaged.clone())
+                );
+                for _ in 0..2 {
+                    assert_eq!(
+                        class_property_accessibility(
+                            context.store(),
+                            Some(&globals),
+                            name,
+                            receiver_type,
+                            proxy,
+                        ),
+                        Err(SourcePropertyError::InvalidCache(name))
+                    );
+                    assert_eq!(
+                        prepare_source_property_diagnostic(
+                            context.store(),
+                            &host,
+                            &globals,
+                            options,
+                            &deferred,
+                        ),
+                        Err(SourcePropertyError::InvalidCache(name))
+                    );
+                    assert_eq!(class_property_cache_state(&context, &parsed, file), warm);
+                    assert_eq!(context.store().value_symbol_links(proxy), Some(&damaged));
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(proxy, links.clone())
+                );
+                assert_eq!(
+                    prepare_source_property_diagnostic(
+                        context.store(),
+                        &host,
+                        &globals,
+                        options,
+                        &deferred,
+                    ),
+                    Ok(expected.clone())
+                );
+                assert_eq!(class_property_cache_state(&context, &parsed, file), warm);
+            }
+        }
+        let diagnostics = context.diagnostics().clone();
+        let warm = class_property_cache_state(&context, &parsed, file);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(context.diagnostics(), &diagnostics);
+            assert_eq!(class_property_cache_state(&context, &parsed, file), warm);
         }
     }
 

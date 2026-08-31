@@ -1,8 +1,8 @@
 //! Atomic canonical checking for the first source-statement slice.
 //!
 //! This module deliberately supports only unmodified type aliases and simple
-//! interfaces, top-level nongeneric classes with primitive annotated fields
-//! and at most one exact direct preceding local nongeneric base, exported
+//! interfaces, top-level classes checked under their declaration type parameters
+//! and at most one completed direct preceding local base, exported
 //! generic ambient declaration-file classes, empty exported classes,
 //! exact construction of preceding admitted classes, imported ambient classes,
 //! and declared constructors inside top-level values, assignments, property
@@ -70,11 +70,15 @@
 //! synthesize `any`. Canonical memo caches are not rolled back after a later
 //! semantic failure; diagnostics coupled to those caches remain in private
 //! source staging until a retry completes and publishes them atomically.
+//! A used executable class import can suspend planning while the same context
+//! checks its provider. The importer still publishes values only after its own
+//! complete plan and execution succeed.
 //! Strict `arguments` collisions retain a bounded binder-authenticated recovery
 //! that preserves the real `IArguments` assignment diagnostic.
 //! Static class elements retain their exact class and lexical `this` captures.
 //! Source class bodies use checked receiver tokens and binder flow. Inferred
 //! member types finish only after their expressions or bodies have been checked.
+//! Class formals belong to constructor signatures, not ordinary method signatures.
 //! Class bodies retain local truthiness branches and plain object destructuring.
 //! Deferred arrows keep lexical class receivers without constructor flow.
 //! Exported namespace classes retain lexical `this` in async static arrows.
@@ -85,10 +89,15 @@
 //! Malformed namespace arrows and unclosed JSX retain separate, fully
 //! authenticated parser-recovery paths without admitting unrelated source.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 #[cfg(test)]
 use super::classes::{plan_source_class_members, prepare_source_class_members};
+#[cfg(test)]
+use super::source_imports::preflight_prepared_source_import_publications_with_host;
 #[cfg(test)]
 use super::source_properties::check_class_property_write_target;
 
@@ -126,12 +135,12 @@ use super::{
         ClassGrammarDiagnostic, ClassGrammarDiagnosticPlan, ClassHeritageMembersValidation,
         ClassMemberPlan, ClassMemberQueryPlan, ClassTypeQueryContext, ExportedJsxArrowClassPlan,
         PreparedSourceClass, SourceClassPlan, check_class_heritage_compatibility,
-        check_class_implementation_compatibility, complete_source_class_body,
-        execute_exported_jsx_arrow_class, execute_nongeneric_class_member_query,
-        finish_source_class_members, plan_anonymous_abstract_class_expression_grammar,
-        plan_class_grammar_diagnostics, plan_exported_jsx_arrow_class,
-        plan_exported_static_member_name_grammar_diagnostics, plan_nongeneric_class_member_query,
-        plan_nongeneric_class_member_query_with_type_context,
+        check_class_heritage_compatibility_with_session, check_class_implementation_compatibility,
+        complete_source_class_body, execute_exported_jsx_arrow_class,
+        execute_nongeneric_class_member_query, finish_source_class_members,
+        plan_anonymous_abstract_class_expression_grammar, plan_class_grammar_diagnostics,
+        plan_exported_jsx_arrow_class, plan_exported_static_member_name_grammar_diagnostics,
+        plan_nongeneric_class_member_query, plan_nongeneric_class_member_query_with_type_context,
         preflight_nongeneric_class_member_query, prepare_source_class_members_with_type_queries,
         validate_class_heritage_members,
     },
@@ -261,15 +270,16 @@ use super::{
     source_imports::{
         PlannedSourceImportRead, PreparedSourceImportPublication, PreparedSourceImportValue,
         ResolvedSourceImportBinding, ResolvedSourceJsDocTypedefImport,
-        ResolvedSourceTypeImportBinding, SourceImportBindingPlan, SourceImportError,
-        SourceImportPlan, SourceImportUnsupported, SourceNamedReexportBindingPlan,
-        SourceNamedReexportPlan, plan_source_import_default_arrow_export,
-        plan_source_import_identifier_read, plan_source_jsdoc_typedef_import,
-        plan_source_property_type_import, plan_source_type_import_reference,
-        plan_top_level_import_equals, plan_top_level_javascript_require,
-        plan_top_level_named_reexport, plan_top_level_named_specifier_type_import,
-        plan_top_level_named_type_import, plan_top_level_named_value_import,
-        preflight_prepared_source_import_publications_with_host,
+        ResolvedSourceTypeImportBinding, SourceClassImportDemand, SourceClassImportPlan,
+        SourceImportBindingPlan, SourceImportError, SourceImportPlan, SourceImportUnsupported,
+        SourceNamedReexportBindingPlan, SourceNamedReexportPlan, plan_source_class_import_read,
+        plan_source_import_default_arrow_export, plan_source_import_identifier_read,
+        plan_source_jsdoc_typedef_import, plan_source_property_type_import,
+        plan_source_type_import_reference, plan_top_level_import_equals,
+        plan_top_level_javascript_require, plan_top_level_named_reexport,
+        plan_top_level_named_specifier_type_import, plan_top_level_named_type_import,
+        plan_top_level_named_value_import,
+        preflight_prepared_source_import_publications_with_context,
         preflight_source_default_arrow_export_value,
         prepare_source_import_value_with_type_import_capabilities,
         reject_source_type_import_value_use, resolve_source_import_binding,
@@ -2650,6 +2660,8 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     array_targets: Option<CanonicalArrayTargets>,
     meta_options: Option<CanonicalCheckerOptions>,
     class_type_context: Option<ClassTypeQueryContext>,
+    source_class_imports: &'semantic [SourceClassImportPlan],
+    source_class_import_demand: Option<&'semantic RefCell<Option<SourceClassImportDemand>>>,
     hoisted_functions: HashSet<SemanticSymbolId>,
     prior_variables: HashSet<SemanticSymbolId>,
     readable_variables: HashSet<SemanticSymbolId>,
@@ -2704,6 +2716,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             array_targets: None,
             meta_options: None,
             class_type_context: None,
+            source_class_imports: &[],
+            source_class_import_demand: None,
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
@@ -2762,6 +2776,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             array_targets: None,
             meta_options: None,
             class_type_context: None,
+            source_class_imports: &[],
+            source_class_import_demand: None,
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
@@ -2800,6 +2816,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         planner.no_implicit_any = options.no_implicit_any;
         planner.no_unused_locals = options.no_unused_locals;
         planner
+    }
+
+    fn with_source_class_imports(
+        mut self,
+        imports: &'semantic [SourceClassImportPlan],
+        demand: &'semantic RefCell<Option<SourceClassImportDemand>>,
+    ) -> Self {
+        self.source_class_imports = imports;
+        self.source_class_import_demand = Some(demand);
+        self
     }
 
     fn finish(mut self) -> Result<SourceCheckPlan, SourceCheckError> {
@@ -3875,7 +3901,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             statements.push(PlannedStatement::ClassGrammar(grammar));
                             continue;
                         }
-                        if self.needs_early_source_constructor_plan(&class.members.nodes)
+                        if (self.needs_early_source_constructor_plan(&class.members.nodes)
+                            || store.source_class_provenance_for_symbol(symbol).is_some())
                             && let Some(source) = self.try_plan_source_class(statement, symbol)?
                         {
                             statements.push(PlannedStatement::SourceClass(Box::new(source)));
@@ -4023,7 +4050,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         statements.push(PlannedStatement::ClassGrammar(grammar));
                         continue;
                     }
-                    if self.needs_early_source_constructor_plan(&class.members.nodes)
+                    if (self.needs_early_source_constructor_plan(&class.members.nodes)
+                        || store.source_class_provenance_for_symbol(symbol).is_some())
                         && let Some(source) = self.try_plan_source_class(statement, symbol)?
                     {
                         statements.push(PlannedStatement::SourceClass(Box::new(source)));
@@ -9073,6 +9101,85 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
+    fn is_direct_class_method_constructor_return(
+        &self,
+        expression: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let Some(body) = &self.class_body else {
+            return Ok(false);
+        };
+        let Some((store, host)) = self.semantic else {
+            return Ok(false);
+        };
+        if !matches!(body.kind, ClassBodyKind::Method { .. }) {
+            return Ok(false);
+        }
+        let Some(class) = self.source_body_classes.get(&body.class_symbol) else {
+            return Ok(false);
+        };
+        if class.declaration() != body.class_declaration
+            || class.symbol() != body.class_symbol
+            || !class.bodies().contains(body)
+            || !super::classes::source_class_plan_is_current(store, host, class)
+                .map_err(|error| Self::class_plan_error(body.class_declaration, error))?
+        {
+            return Ok(false);
+        }
+        let Some(statement) = self
+            .node(expression)?
+            .parent
+            .map(|node| self.reference(node))
+        else {
+            return Ok(false);
+        };
+        let record = self.node(statement)?;
+        let NodeData::ReturnStatement(returned) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::ReturnStatement
+            || record.flags.0 != 0
+            || record.parent != Some(body.body.node)
+            || returned.expression != Some(expression.node)
+            || returned.flow_node.is_some()
+            || returned.facts != 0
+            || self.bound.container(expression) != Some(body.declaration)
+            || self.bound.container(statement) != Some(body.declaration)
+            || self.bound.flow_container(statement) != Some(body.declaration)
+            || self.bound.flow_at(statement).is_none()
+        {
+            return Ok(false);
+        }
+        let record = self.node(body.body)?;
+        let NodeData::Block(block) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::Block
+            || record.flags.0 != 0
+            || record.parent != Some(body.declaration.node)
+            || block.flow_node.is_some()
+            || block.next_container.is_some()
+            || block.facts != 0
+            || block.statements.has_trailing_comma
+            || block
+                .statements
+                .nodes
+                .iter()
+                .filter(|&&node| node == statement.node)
+                .count()
+                != 1
+        {
+            return Ok(false);
+        }
+        let record = self.node(body.declaration)?;
+        let NodeData::MethodDeclaration(method) = &record.data else {
+            return Ok(false);
+        };
+        Ok(record.kind == SyntaxKind::MethodDeclaration
+            && record.parent == Some(body.class_declaration.node)
+            && method.body == Some(body.body.node)
+            && method.type_parameters.is_none())
+    }
+
     fn is_recovered_missing_arrow_body(
         &self,
         expression: NodeRef,
@@ -9532,13 +9639,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         {
             return Ok(None);
         }
-        let source = match super::classes::plan_source_class_members_with_context(
-            store,
-            host,
-            symbol,
-            self.array_targets,
-            self.class_type_context.as_ref(),
-        ) {
+        let source = if store.source_class_provenance_for_symbol(symbol).is_some() {
+            super::classes::plan_source_class_members_with_context(
+                store,
+                host,
+                symbol,
+                self.array_targets,
+                self.class_type_context.as_ref(),
+            )
+        } else {
+            super::classes::plan_source_class_members_with_imports(
+                store,
+                host,
+                symbol,
+                self.array_targets,
+                self.class_type_context.as_ref(),
+                self.source_class_imports,
+            )
+        };
+        let source = match source {
             Ok(source) => source,
             Err(
                 error @ super::classes::ClassError::Unsupported(
@@ -9548,9 +9667,37 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     },
                 ),
             ) => return Err(Self::class_plan_error(declaration, error)),
+            Err(
+                error @ super::classes::ClassError::Unsupported(
+                    super::classes::ClassUnsupported::Heritage(node),
+                ),
+            ) => {
+                if let Some(request) = self.source_class_import_demand
+                    && let Some(demand) = plan_source_class_import_read(
+                        store,
+                        host,
+                        &self.value_import_bindings,
+                        node,
+                    )
+                    .map_err(|error| Self::import_plan_error(node, &error))?
+                {
+                    if request.replace(Some(demand)).is_some() {
+                        return Err(SourceCheckError::Import(node));
+                    }
+                    return Err(Self::class_plan_error(declaration, error));
+                }
+                return Ok(None);
+            }
             Err(super::classes::ClassError::Unsupported(_)) => return Ok(None),
             Err(error) => return Err(Self::class_plan_error(declaration, error)),
         };
+        if let Some(imported) = source.imported_base() {
+            self.import_reads.push(imported.demand.read);
+            self.identifier_reads.push((
+                imported.demand.read.node,
+                imported.demand.read.resolved_symbol,
+            ));
+        }
         if source.declaration() != declaration
             || source.symbol() != symbol
             || !self.planned_classes.insert(symbol)
@@ -12371,17 +12518,23 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Ok(None);
         };
         let name_start = self.node(self.reference(name))?.range.start.get();
-        if let [export, default] = modifiers.list.nodes.as_slice()
-            && self
-                .bound
-                .source_facts()
-                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
-            && self.node(self.reference(*default))?.kind == SyntaxKind::DefaultKeyword
+        if let [export, modifier] = modifiers.list.nodes.as_slice()
+            && let Some(facts) = self.bound.source_facts()
+            && (facts.is_declaration_file()
+                && self.node(self.reference(*modifier))?.kind == SyntaxKind::DefaultKeyword
+                || !facts.is_declaration_file()
+                    && !facts.is_javascript_file()
+                    && self.node(self.reference(*modifier))?.kind == SyntaxKind::AbstractKeyword)
         {
             let export = self.reference(*export);
-            let default = self.reference(*default);
+            let modifier = self.reference(*modifier);
             let export_node = self.node(export)?;
-            let default_node = self.node(default)?;
+            let modifier_node = self.node(modifier)?;
+            let spelling = if modifier_node.kind == SyntaxKind::AbstractKeyword {
+                "abstract"
+            } else {
+                "default"
+            };
             if !is_external_module
                 || modifiers.flags.0 != 0
                 || modifiers.list.has_trailing_comma
@@ -12391,14 +12544,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 || export_node.flags.0 != 0
                 || export_node.parent != Some(declaration.node)
                 || export_node.range.start != declaration_range.start
-                || export_node.range.end > default_node.range.start
+                || export_node.range.end > modifier_node.range.start
                 || !matches!(export_node.data, NodeData::Token(_))
                 || !self.source_spelling_matches(export, "export")
-                || default_node.flags.0 != 0
-                || default_node.parent != Some(declaration.node)
-                || default_node.range.end.get() > modifiers.list.range.end.get()
-                || !matches!(default_node.data, NodeData::Token(_))
-                || !self.source_spelling_matches(default, "default")
+                || modifier_node.flags.0 != 0
+                || modifier_node.parent != Some(declaration.node)
+                || modifier_node.range.end.get() > modifiers.list.range.end.get()
+                || !matches!(modifier_node.data, NodeData::Token(_))
+                || !self.source_spelling_matches(modifier, spelling)
             {
                 return Err(SourceCheckError::Unsupported(
                     UnsupportedSourceSyntax::Class(declaration),
@@ -23988,7 +24141,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             SyntaxKind::NewExpression => {
                 let class_position = self.is_class_body_constructor_expression(expression)?;
-                if !class_position && !self.is_top_level_constructor_expression(expression)? {
+                let method_return = self.is_direct_class_method_constructor_return(expression)?;
+                if !class_position
+                    && !method_return
+                    && !self.is_top_level_constructor_expression(expression)?
+                {
                     return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
                         expression,
                     )));
@@ -24034,7 +24191,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         )
                     }
                     .map_err(|error| Self::new_plan_error(expression, error))?;
-                if class_position && !construction.is_library_constructor() {
+                if (class_position || method_return)
+                    && !(class_position && construction.is_library_constructor()
+                        || method_return && construction.is_generic_source_class())
+                {
                     return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
                         expression,
                     )));
@@ -28514,6 +28674,12 @@ fn class_expression_nodes(
                 let arguments = construction
                     .checked_expression_arguments()
                     .ok_or(SourceCheckError::Class(expression.node))?;
+                pending.extend(arguments.iter().rev());
+            }
+            PlannedExpressionKind::New(construction) if construction.is_generic_source_class() => {
+                let arguments = construction
+                    .checked_expression_arguments()
+                    .ok_or(SourceCheckError::Call(construction.node()))?;
                 pending.extend(arguments.iter().rev());
             }
             PlannedExpressionKind::Array(elements) => pending.extend(elements.iter().rev()),
@@ -34794,19 +34960,53 @@ fn check_expression_type_with_capture_context(
                 construction,
             )
             .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+            let generic = construction.is_generic_source_class();
+            let access = if generic {
+                class_flow
+                    .as_ref()
+                    .map(|context| context.flow.access_token().clone())
+            } else {
+                None
+            };
+            if generic {
+                super::source_new::preflight_source_generic_class_new_with_context(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    construction,
+                    access.as_ref(),
+                )
+                .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+                super::source_calls::emit_source_new_type_argument_grammar_diagnostics(
+                    host,
+                    diagnostics,
+                    construction,
+                )?;
+                if contextual_type.is_some()
+                    && construction
+                        .written_type_argument_nodes()
+                        .is_none_or(<[NodeRef]>::is_empty)
+                {
+                    return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+                        construction.node(),
+                    )));
+                }
+            }
             if let Some(arguments) = construction.checked_expression_arguments() {
                 let mut argument_types = Vec::with_capacity(arguments.len());
                 let mut library_arguments = construction
                     .is_library_constructor()
                     .then(|| Vec::with_capacity(arguments.len()));
                 for (index, argument) in arguments.iter().enumerate() {
-                    let contextual = if matches!(
-                        argument.unparenthesized().kind,
-                        PlannedExpressionKind::Array(_)
-                            | PlannedExpressionKind::Object { .. }
-                            | PlannedExpressionKind::Arrow(_)
-                            | PlannedExpressionKind::Template(_)
-                    ) {
+                    let contextual = if !generic
+                        && matches!(
+                            argument.unparenthesized().kind,
+                            PlannedExpressionKind::Array(_)
+                                | PlannedExpressionKind::Object { .. }
+                                | PlannedExpressionKind::Arrow(_)
+                                | PlannedExpressionKind::Template(_)
+                        ) {
                         super::source_new::source_constructor_argument_contextual_type(
                             store,
                             host,
@@ -34853,6 +35053,99 @@ fn check_expression_type_with_capture_context(
                         construction,
                         &arguments,
                     )?;
+                    return Ok(CheckedExpressionTypes::leaf(
+                        checked.instance_type,
+                        checked.instance_type,
+                    ));
+                }
+                if generic {
+                    let explicit_type_arguments =
+                        super::source_calls::resolve_explicit_source_type_arguments(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            diagnostics,
+                            construction.written_type_argument_nodes(),
+                        )?;
+                    let prepared = super::source_new::check_source_generic_class_new(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        construction,
+                        access.as_ref(),
+                        &argument_types,
+                        explicit_type_arguments.as_deref(),
+                    )
+                    .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+                    let mut staged = CanonicalCheckerDiagnostics::default();
+                    let call_diagnostics =
+                        match (prepared.resolution(), prepared.access_diagnostic()) {
+                            (Some(resolution), None) => {
+                                super::source_calls::prepare_source_generic_constructor_diagnostics(
+                                    store,
+                                    host,
+                                    global_types,
+                                    options,
+                                    session,
+                                    &mut staged,
+                                    construction,
+                                    &argument_types,
+                                    explicit_type_arguments.as_deref(),
+                                    resolution,
+                                )?
+                            }
+                            (None, Some((code, declaring_type))) => {
+                                let message = message_by_code(code)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(code))?;
+                                let diagnostic = match code {
+                                    2511 => Diagnostic::new(message),
+                                    2673 | 2674 => {
+                                        let mut flags =
+                                            CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+                                        if options.no_error_truncation {
+                                            flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+                                        }
+                                        let name = type_to_string_with_host_global_types_and_flags(
+                                            store,
+                                            host,
+                                            global_types,
+                                            declaring_type,
+                                            flags,
+                                        )?;
+                                        Diagnostic::with_arguments(message, [name])
+                                    }
+                                    _ => return Err(SourceCheckError::Call(construction.node())),
+                                };
+                                vec![CanonicalCheckerDiagnostic {
+                                    node: Some(construction.node()),
+                                    range_override: None,
+                                    diagnostic,
+                                    related_information: Vec::new(),
+                                }]
+                            }
+                            _ => return Err(SourceCheckError::Call(construction.node())),
+                        };
+                    let checked = super::source_new::publish_source_generic_class_new(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        construction,
+                        access.as_ref(),
+                        &argument_types,
+                        explicit_type_arguments.as_deref(),
+                        prepared,
+                    )
+                    .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+                    merge_retry_diagnostics(diagnostics, staged);
+                    for diagnostic in call_diagnostics {
+                        merge_retry_diagnostic(diagnostics, diagnostic);
+                    }
                     return Ok(CheckedExpressionTypes::leaf(
                         checked.instance_type,
                         checked.instance_type,
@@ -34999,6 +35292,7 @@ fn check_expression_type_with_capture_context(
                     call,
                     index,
                     &access,
+                    session,
                 )?;
                 arguments.push(
                     check_expression_type_with_capture_context(
@@ -35979,6 +36273,17 @@ fn check_planned_source_class(
         super::classes::begin_source_class_annotations(store, host, global_types, &class.source)
             .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
     let result = (|| {
+        if !class.source.type_parameters().is_empty() {
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .resolve_source_class_type_parameters(class.source.symbol())?;
+        }
         for &annotation in class.source.annotation_nodes() {
             session.reset_query();
             let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
@@ -36104,12 +36409,13 @@ fn check_planned_source_class(
                 return Err(SourceCheckError::Class(implementation));
             }
         }
-        check_class_heritage_compatibility(
+        check_class_heritage_compatibility_with_session(
             store,
             host,
             global_types,
             options,
             diagnostics,
+            session,
             declaration,
             &members,
         )?;
@@ -37318,6 +37624,7 @@ fn check_class_statements(
                         property,
                         receiver.result,
                         &mut context.flow,
+                        session,
                     )
                     .map_err(|error| {
                         SourcePlanner::property_plan_error(property.property(), error)
@@ -37402,6 +37709,7 @@ fn check_class_statements(
                         property,
                         receiver.result,
                         &mut context.flow,
+                        session,
                     )
                     .map_err(|error| {
                         SourcePlanner::property_plan_error(property.property(), error)
@@ -64619,6 +64927,14 @@ fn with_retained_class_annotation_scopes<T>(
     cleanup_error.map_or(result, Err)
 }
 
+/// Keeps dependency errors in the existing source import error families.
+pub(super) fn source_class_import_error(
+    node: NodeRef,
+    error: &SourceImportError,
+) -> SourceCheckError {
+    SourcePlanner::import_plan_error(node, error)
+}
+
 /// Checks one already-retained source into context-owned private staging.
 #[allow(clippy::too_many_arguments)] // Mirrors the context-owned source execution boundary.
 pub(super) fn check_source_file(
@@ -64633,6 +64949,8 @@ pub(super) fn check_source_file(
     classic_jsx_factories: Option<(&str, &str)>,
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
+    source_class_imports: &[SourceClassImportPlan],
+    source_class_import_demand: &RefCell<Option<SourceClassImportDemand>>,
 ) -> Result<(), SourceCheckError> {
     if !store.contains_source_file(source) {
         return Err(SourceCheckError::Provenance(
@@ -64679,10 +64997,14 @@ pub(super) fn check_source_file(
                 global_types,
                 options,
             )
+            .with_source_class_imports(source_class_imports, source_class_import_demand)
             .finish()
             {
                 Ok(plan) => break Ok(plan),
                 Err(error) => {
+                    if source_class_import_demand.borrow().is_some() {
+                        return Err(error);
+                    }
                     if let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(annotation)) =
                         error
                         && !prepared_class_parameters.insert(annotation)
@@ -66361,6 +66683,32 @@ pub(super) fn check_source_file(
                 return Err(SourceCheckError::Import(read.node));
             }
             continue;
+        }
+        if let Some(owner) =
+            super::classes::source_class_import_owner(store, host, resolved.target_symbol)
+                .map_err(|error| SourcePlanner::class_plan_error(read.node, error))?
+            && super::classes::completed_source_class_import_value(
+                store,
+                host,
+                global_types,
+                options,
+                owner,
+            )
+            .map_err(|error| SourcePlanner::class_plan_error(read.node, error))?
+            .is_none()
+        {
+            if source_class_import_demand
+                .replace(Some(SourceClassImportDemand {
+                    binding: resolved.binding.clone(),
+                    read: *read,
+                }))
+                .is_some()
+            {
+                return Err(SourceCheckError::Import(read.node));
+            }
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Import(read.node),
+            ));
         }
         resolve_source_import_namespace_exports(store, alias_host, host, resolved)
             .map_err(|error| SourcePlanner::import_plan_error(read.node, &error))?;
@@ -73256,10 +73604,11 @@ pub(super) fn check_source_file(
         diagnostics,
         &deferred,
     )?;
-    let import_publications = preflight_prepared_source_import_publications_with_host(
+    let import_publications = preflight_prepared_source_import_publications_with_context(
         store,
         host,
         global_types,
+        options,
         &prepared_imports,
     )
     .map_err(|error| SourcePlanner::import_plan_error(source.node_ref(), &error))?;
@@ -125240,6 +125589,395 @@ class Foo2 {
     }
 
     #[test]
+    fn generic_class_bodies_keep_origin_formals_and_signature_roles() {
+        let source = parsed(concat!(
+            "class Box<T> { value: T; ",
+            "constructor(value: T) { this.value = value; } ",
+            "read(): T { return this.value; } ",
+            "replace(value: T): T { const next: T = value; ",
+            "this.value = next; return this.read(); } }",
+        ));
+        let file = FileId::new(202_1801);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                strict_property_initialization: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let class_symbol = global_symbol(&context, "Box");
+        let declaration = context
+            .store()
+            .symbol(class_symbol)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let NodeData::ClassDeclaration(class) = &source.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("Box must retain its real class declaration")
+        };
+        let [parameter] = class.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+            panic!("Box has one written type parameter")
+        };
+        let parameter = NodeRef::new(source.arena.id(), file, *parameter);
+        let parameter_symbol = context.file(file).unwrap().1.symbol(parameter).unwrap();
+        let formal = context
+            .store()
+            .declared_type_links(parameter_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let instance = context
+            .store()
+            .declared_type_links(class_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Interface(origin) = context.store().type_payload(instance).unwrap().data()
+        else {
+            panic!("the source body must retain the class origin")
+        };
+        assert_eq!(
+            origin.reference.resolved_type_arguments.as_deref(),
+            Some([formal].as_slice())
+        );
+        assert_ne!(origin.this_type, Some(formal));
+        let field = declared_object_property_symbol(&context, instance, "value");
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(field)
+                .unwrap()
+                .resolved_type,
+            Some(formal)
+        );
+        for member in &class.members.nodes {
+            let declaration = NodeRef::new(source.arena.id(), file, *member);
+            let record = source.arena.get(*member).unwrap();
+            if !matches!(
+                record.kind,
+                SyntaxKind::Constructor | SyntaxKind::MethodDeclaration
+            ) {
+                continue;
+            }
+            let signature = context
+                .store()
+                .signature_links(declaration)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            let signature = context.store().signature(signature).unwrap();
+            if record.kind == SyntaxKind::Constructor {
+                assert_eq!(signature.type_parameters(), [formal]);
+                assert_eq!(signature.resolved_return_type(), Some(instance));
+            } else {
+                assert!(signature.type_parameters().is_empty());
+                assert_eq!(signature.resolved_return_type(), Some(formal));
+            }
+            for &parameter in signature.parameters() {
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(parameter)
+                        .unwrap()
+                        .resolved_type,
+                    Some(formal)
+                );
+            }
+        }
+        assert_eq!(variable_value_type(&context, &source, file, "next"), formal);
+        let call = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(resolved_node_type(&context, call), formal);
+        let warm = observable_state(&context, file);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+            assert_eq!(resolved_node_type(&context, call), formal);
+        }
+    }
+
+    #[test]
+    fn generic_new_keeps_contextual_inference_out_of_the_concrete_argument_route() {
+        for (construction, explicit, grammar_error) in [
+            ("new Box<number>()", true, false),
+            ("new Box()", false, false),
+            ("new Box<>()", false, true),
+        ] {
+            let source = parsed(&format!(
+                "class Box<T = string> {{}} const model: Box<number> = {construction};"
+            ));
+            let file = FileId::new(203_1802);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let node = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let NodeData::NewExpression(expression) = &source.arena.get(node.node).unwrap().data
+            else {
+                panic!("the fixture must retain its real New expression")
+            };
+            let constructor = NodeRef::new(source.arena.id(), file, expression.expression);
+            let checked = context.check_source_file(file);
+            if explicit {
+                checked.unwrap();
+                assert!(context.diagnostics().is_empty());
+                let instance = resolved_node_type(&context, node);
+                let reference = super::super::reference_types::validate_direct_generic_reference(
+                    context.store(),
+                    instance,
+                )
+                .unwrap();
+                assert_eq!(
+                    reference.type_arguments,
+                    [context.store().intrinsic_bootstrap().unwrap().number_type]
+                );
+                let owner = global_symbol(&context, "Box");
+                assert_eq!(
+                    context
+                        .store()
+                        .declared_type_links(owner)
+                        .unwrap()
+                        .declared_type,
+                    Some(reference.target),
+                );
+                let warm = observable_state(&context, file);
+                for _ in 0..2 {
+                    context.recheck_source_file(file).unwrap();
+                    assert_eq!(observable_state(&context, file), warm);
+                }
+            } else {
+                let expected = SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(node));
+                assert_eq!(checked, Err(expected));
+                assert!(!is_type_checked(&context, file));
+                assert!(
+                    context
+                        .store()
+                        .type_node_links(node)
+                        .and_then(|links| links.resolved_type)
+                        .is_none()
+                );
+                assert!(
+                    context
+                        .store()
+                        .signature_links(node)
+                        .and_then(|links| links.resolved_signature.signature())
+                        .is_none()
+                );
+                assert!(
+                    context
+                        .store()
+                        .symbol_node_links(constructor)
+                        .and_then(|links| links.resolved_symbol)
+                        .is_none()
+                );
+                assert!(
+                    context
+                        .store()
+                        .type_node_links(constructor)
+                        .and_then(|links| links.resolved_type)
+                        .is_none()
+                );
+                assert_eq!(
+                    context
+                        .diagnostics()
+                        .as_slice()
+                        .iter()
+                        .map(|diagnostic| diagnostic.diagnostic.code())
+                        .collect::<Vec<_>>(),
+                    if grammar_error {
+                        vec![1099]
+                    } else {
+                        Vec::new()
+                    },
+                );
+                let warm = observable_state(&context, file);
+                for _ in 0..2 {
+                    assert_eq!(context.check_source_file(file), Err(expected));
+                    assert_eq!(observable_state(&context, file), warm);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generic_new_method_return_requires_the_saved_class_body() {
+        let source = parsed(concat!(
+            "class Base<T> { protected constructor(value: T) {} } ",
+            "class Child extends Base<string> { constructor() { super('seed'); } ",
+            "make(): Base<number> { return new Base<number>(1); } }",
+        ));
+        let file = FileId::new(203_1803);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let node = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let instance = resolved_node_type(&context, node);
+        let reference = super::super::reference_types::validate_direct_generic_reference(
+            context.store(),
+            instance,
+        )
+        .unwrap();
+        assert_eq!(
+            reference.type_arguments,
+            [context.store().intrinsic_bootstrap().unwrap().number_type]
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_payload(reference.target)
+                .unwrap()
+                .symbol(),
+            Some(global_symbol(&context, "Base")),
+        );
+        let warm = observable_state(&context, file);
+        {
+            let bound = context.file(file).unwrap().1;
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let make_planner = || {
+                SourcePlanner::new_semantic_with_global_types(
+                    &source.arena,
+                    bound,
+                    context.source_file(file).unwrap(),
+                    context.store(),
+                    &host,
+                    context.global_types(),
+                    context.options(),
+                )
+            };
+            let plan = make_planner().finish().unwrap();
+            let [
+                PlannedStatement::SourceClass(base),
+                PlannedStatement::SourceClass(child),
+            ] = plan.statements.as_slice()
+            else {
+                panic!("the fixture must retain both actual class plans")
+            };
+            let (index, body) = child
+                .source
+                .bodies()
+                .iter()
+                .enumerate()
+                .find(|(_, body)| matches!(body.kind, ClassBodyKind::Method { .. }))
+                .unwrap();
+            let [
+                PlannedClassStatement::Return {
+                    expression: Some(expression),
+                    ..
+                },
+            ] = child.bodies[index].statements.as_slice()
+            else {
+                panic!("the method must retain its actual return expression")
+            };
+            assert_eq!(expression.node, node);
+            let nodes = class_expression_nodes(expression).unwrap();
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(nodes[0].node, node);
+            assert_eq!(node_text(&source, nodes[1].node), "1");
+            let PlannedExpressionKind::New(construction) = &expression.kind else {
+                panic!("the return must retain a real New plan")
+            };
+            assert!(construction.is_generic_source_class());
+            assert!(
+                super::super::source_new::preflight_source_generic_class_new_with_context(
+                    context.store(),
+                    &host,
+                    context.global_types(),
+                    context.options(),
+                    construction,
+                    None,
+                )
+                .is_err()
+            );
+            let mut planner = make_planner();
+            planner
+                .source_body_classes
+                .insert(base.source.symbol(), base.source.clone());
+            planner
+                .source_body_classes
+                .insert(child.source.symbol(), child.source.clone());
+            planner.class_body = Some(body.clone());
+            assert!(
+                planner
+                    .is_direct_class_method_constructor_return(node)
+                    .unwrap()
+            );
+            planner.class_body.as_mut().unwrap().declaration = body.class_declaration;
+            assert!(
+                !planner
+                    .is_direct_class_method_constructor_return(node)
+                    .unwrap()
+            );
+            planner.class_body = Some(body.clone());
+            planner.source_body_classes.remove(&child.source.symbol());
+            assert!(
+                !planner
+                    .is_direct_class_method_constructor_return(node)
+                    .unwrap()
+            );
+            planner
+                .source_body_classes
+                .insert(child.source.symbol(), child.source.clone());
+            assert!(
+                planner
+                    .is_direct_class_method_constructor_return(node)
+                    .unwrap()
+            );
+            planner.class_body = None;
+            assert!(
+                !planner
+                    .is_direct_class_method_constructor_return(node)
+                    .unwrap()
+            );
+        }
+        assert_eq!(observable_state(&context, file), warm);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(resolved_node_type(&context, node), instance);
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
     fn source_class_methods_check_reachable_ends_after_branch_returns() {
         let source = parsed(concat!(
             "class Conditional {\n",
@@ -126073,4 +126811,6 @@ class Foo2 {
         );
         assert!(diagnostics.is_empty());
     }
+
+    include!("source_class_warm_replay_tests.rs");
 }

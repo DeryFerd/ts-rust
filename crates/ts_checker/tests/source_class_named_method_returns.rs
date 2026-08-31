@@ -579,7 +579,7 @@ fn named_method_array_alias_returns_keep_the_real_array_target() {
             array.resolved_type_arguments.as_deref(),
             Some(&[string][..])
         );
-        let target = array.target;
+        let target = array.object.target.unwrap();
         let owner = context
             .store()
             .type_payload(target)
@@ -620,7 +620,7 @@ fn named_method_array_alias_returns_keep_the_real_array_target() {
             else {
                 panic!("the method parameter must retain its written array")
             };
-            assert_eq!(parameter.target, target);
+            assert_eq!(parameter.object.target, Some(target));
             assert_eq!(
                 parameter.resolved_type_arguments.as_deref(),
                 Some(&[string][..])

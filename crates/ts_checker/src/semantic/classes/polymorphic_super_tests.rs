@@ -548,7 +548,7 @@ fn class_polymorphic_super_does_not_preserve_an_object_with_mapped_this() {
     assert!(!class_super_member_type_is_unchanged(
         store,
         returned,
-        base_this,
+        &[base_this],
         Some(CanonicalArrayTargets::from_global_types(&globals)),
     ));
     let snapshot = |store: &CanonicalTypeMapperStore| {

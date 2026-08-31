@@ -68,9 +68,10 @@ use super::{
         ValueSymbolLinks,
     },
     object_aliases::{
-        PropertyObjectAliasProjection, inline_property_object_source_header,
-        property_object_alias_has_enclosing_type_parameters, property_object_alias_projection,
-        property_object_alias_source_parameters, source_property_object_projection,
+        PropertyObjectAliasProjection, SourceAliasOperandGraph,
+        inline_property_object_source_header, property_object_alias_has_enclosing_type_parameters,
+        property_object_alias_projection, property_object_alias_source_parameters,
+        source_property_object_projection,
     },
     reference_types::{
         validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
@@ -105,6 +106,35 @@ pub(super) fn resolve_object_property_by_key(
     name: EscapedNameRef<'_>,
     session: &mut InstantiationSession,
 ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+    resolve_object_property_by_key_with_alias_operand(
+        store,
+        global_types,
+        receiver,
+        name,
+        session,
+        None,
+    )
+}
+
+/// The optional input proves a closed source object before the ordinary table read.
+pub(super) fn resolve_object_property_by_key_with_alias_operand(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    receiver: TypeId,
+    name: EscapedNameRef<'_>,
+    session: &mut InstantiationSession,
+    operand: Option<(&SourceAliasOperandGraph, NodeRef)>,
+) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+    if let Some((graph, node)) = operand {
+        return property_from_source_alias_members(
+            store,
+            graph,
+            node,
+            receiver,
+            name,
+            global_types.map(CanonicalArrayTargets::from_global_types),
+        );
+    }
     if source_property_object_projection(store, receiver)?.is_some() {
         let members = match validate_property_object_alias_members_with_array_targets(
             store,
@@ -283,6 +313,18 @@ pub(super) fn resolve_object_property_by_key(
             store.resolved_own_property_by_key_with_context(receiver, name, global_types, session)
         }
     }
+}
+
+pub(super) fn property_from_source_alias_members(
+    store: &CanonicalTypeMapperStore,
+    graph: &SourceAliasOperandGraph,
+    node: NodeRef,
+    receiver: TypeId,
+    name: EscapedNameRef<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+    graph.validate_closed_object(store, node, receiver, array_targets)?;
+    property_from_validated_members(store, receiver, name)
 }
 
 fn property_from_validated_members(
@@ -499,6 +541,42 @@ pub(super) fn resolve_object_property_by_key_with_source(
     let record = store
         .type_payload(receiver)
         .ok_or(RelationUnavailable::Type(receiver))?;
+    let source_class_target = match record.data() {
+        TypeData::TypeReference(reference) => reference.object.target.filter(|target| {
+            store.source_class_provenance(*target).is_some()
+                && store
+                    .type_payload(*target)
+                    .is_some_and(|record| record.object_flags().contains(ObjectFlags::CLASS))
+        }),
+        _ => None,
+    };
+    if source_class_target.is_some() {
+        return resolve_instantiated_object_property_by_key_with_source(
+            store,
+            host,
+            global_types,
+            options,
+            receiver,
+            name,
+            session,
+            diagnostics,
+        );
+    }
+    if store.source_class_provenance(receiver).is_some()
+        && matches!(record.data(), TypeData::Interface(class)
+            if class.reference.resolved_type_arguments.as_deref() == Some(&[]))
+    {
+        return resolve_completed_class_origin_property_by_key_with_source(
+            store,
+            host,
+            global_types,
+            options,
+            receiver,
+            name,
+            session,
+            diagnostics,
+        );
+    }
     let nongeneric_origin = matches!(record.data(), TypeData::Interface(_))
         && validate_nongeneric_interface_argument_origin(store, receiver).is_ok();
     let generic = match record.data() {
@@ -741,6 +819,62 @@ pub(super) fn resolve_object_property_by_key_with_source(
 }
 
 #[allow(clippy::too_many_arguments)] // Keep the source host and limits with the selected proxy.
+fn resolve_completed_class_origin_property_by_key_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    receiver: TypeId,
+    name: EscapedNameRef<'_>,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
+    let members = super::classes::completed_source_class_receiver_members(store, receiver)
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+    let Some(table) = members.instance_members() else {
+        return Ok(None);
+    };
+    let Some(symbol) = store.symbol_table(table).ok_or_else(invalid)?.get(name) else {
+        return Ok(None);
+    };
+    if !members.instance_properties().contains(&symbol) {
+        return Err(invalid().into());
+    }
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
+    let optional = record.flags().contains(SymbolFlags::OPTIONAL);
+    let readonly = record.check_flags().contains(CheckFlags::READONLY);
+    if super::instantiated_members::completed_source_class_origin_member_mapping(
+        store,
+        receiver,
+        symbol,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+    )
+    .map_err(|error| source_generic_member_error(receiver, &error))?
+    .is_none()
+    {
+        return resolve_object_property_by_key(store, Some(global_types), receiver, name, session)
+            .map_err(Into::into);
+    }
+    let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+    )?
+    .get_type_of_instantiated_interface_property(receiver, symbol)?;
+    Ok(Some(ResolvedOwnProperty {
+        symbol,
+        type_,
+        optional,
+        readonly,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)] // Keep the source host and limits with the selected proxy.
 fn resolve_instantiated_object_property_by_key_with_source(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -779,7 +913,13 @@ fn resolve_instantiated_object_property_by_key_with_source(
         .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
     let optional = record.flags().contains(SymbolFlags::OPTIONAL);
     let readonly = record.check_flags().contains(CheckFlags::READONLY);
-    let type_ = if record.flags().contains(SymbolFlags::METHOD) {
+    let source_class = store.type_payload(receiver).is_some_and(|record| {
+        matches!(record.data(), TypeData::TypeReference(reference)
+        if reference.object.target.is_some_and(|target| {
+            store.source_class_provenance(target).is_some()
+        }))
+    });
+    let type_ = if record.flags().contains(SymbolFlags::METHOD) || source_class {
         CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,
@@ -13795,7 +13935,7 @@ pub(super) fn plan_interface_method(
 }
 
 #[allow(clippy::too_many_lines)] // Binder, syntax, constraints, and defaults share one proof.
-fn plan_declared_signature_type_parameters(
+pub(super) fn plan_declared_signature_type_parameters(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
@@ -16345,6 +16485,185 @@ pub(super) fn type_literal_state(
     validate_object_record(store, plan, type_)
         .map(Some)
         .ok_or_else(|| invalid_cache(plan, type_))
+}
+
+/// A source query has resolved every child of this closed property or index object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceAliasClosedObject {
+    plan: PropertyObjectPlan,
+    type_: TypeId,
+    property_types: Vec<TypeId>,
+    index_types: Vec<(TypeId, TypeId)>,
+    index_infos: Vec<super::IndexInfoId>,
+    index_parameters: Vec<(NodeRef, SemanticSymbolId)>,
+}
+
+impl SourceAliasClosedObject {
+    pub(super) fn validate_retained(
+        &self,
+        store: &CanonicalTypeMapperStore,
+    ) -> Result<(), PropertyObjectError> {
+        let plan = &self.plan;
+        let invalid = || invalid_cache(plan, self.type_);
+        if plan.kind != PropertyObjectKind::TypeLiteral
+            || plan.const_context
+            || plan.declarations.as_slice() != [plan.node]
+            || !plan.methods.is_empty()
+            || !plan.accessors.is_empty()
+            || !plan.object_literal_getters.is_empty()
+            || plan.class_assignment_properties.is_some()
+            || !plan.spreads.is_empty()
+            || !plan.call_signatures.is_empty()
+            || plan.heritage.is_some()
+            || plan.indexes.len() > 1
+            || self.index_parameters.len() != plan.indexes.len()
+            || store.source_node_kind(plan.node) != Some(SyntaxKind::TypeLiteral)
+            || store.source_declaration_symbol(plan.node) != Some(plan.symbol)
+            || !store.source_symbol_declarations_match(plan.symbol)
+            || store
+                .type_node_links(plan.node)
+                .is_none_or(|links| links.outer_type_parameters.is_some())
+        {
+            return Err(invalid());
+        }
+        let mut declarations = plan
+            .properties
+            .iter()
+            .map(|property| property.declaration)
+            .chain(plan.indexes.iter().map(|index| index.declaration))
+            .collect::<Vec<_>>();
+        declarations.sort_unstable();
+        if store.source_direct_children(plan.node).as_deref() != Some(declarations.as_slice())
+            || declarations.iter().any(|&node| {
+                store.source_node_parent(node) != Some(SourceNodeParent::Parent(plan.node))
+            })
+        {
+            return Err(invalid());
+        }
+        for property in &plan.properties {
+            if !matches!(
+                store.source_node_kind(property.declaration),
+                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+            ) || store.source_declaration_symbol(property.declaration) != Some(property.symbol)
+                || !store.source_symbol_declarations_match(property.symbol)
+                || store.source_direct_type_annotation(property.declaration)
+                    != Some(property.type_node)
+                || store.source_node_parent(property.name_node)
+                    != Some(SourceNodeParent::Parent(property.declaration))
+            {
+                return Err(invalid());
+            }
+        }
+        for (index, &(parameter, parameter_symbol)) in
+            plan.indexes.iter().zip(&self.index_parameters)
+        {
+            let symbol = store.symbol(index.symbol).ok_or_else(invalid)?;
+            let parameter_record = store.symbol(parameter_symbol).ok_or_else(invalid)?;
+            let name = store
+                .source_child_with_kind(parameter, SyntaxKind::Identifier)
+                .ok_or_else(invalid)?;
+            if index.value_type_parameter.is_some()
+                || store.source_node_kind(index.declaration) != Some(SyntaxKind::IndexSignature)
+                || store.source_declaration_symbol(index.declaration) != Some(index.symbol)
+                || !store.source_symbol_declarations_match(index.symbol)
+                || symbol.flags() != SymbolFlags::SIGNATURE
+                || symbol.check_flags() != CheckFlags::NONE
+                || symbol.name() != InternalSymbolName::Index.as_ref()
+                || symbol.parent() != Some(plan.symbol)
+                || symbol.declarations() != Some(&[index.declaration])
+                || symbol.value_declaration().is_some()
+                || symbol.members().is_some()
+                || symbol.exports().is_some()
+                || symbol.export_symbol().is_some()
+                || store.source_node_kind(parameter) != Some(SyntaxKind::Parameter)
+                || store.source_node_parent(parameter)
+                    != Some(SourceNodeParent::Parent(index.declaration))
+                || store.source_declaration_symbol(parameter) != Some(parameter_symbol)
+                || !store.source_symbol_declarations_match(parameter_symbol)
+                || parameter_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                || parameter_record.check_flags() != CheckFlags::NONE
+                || parameter_record.declarations() != Some(&[parameter])
+                || parameter_record.value_declaration() != Some(parameter)
+                || parameter_record.parent().is_some()
+                || parameter_record.members().is_some()
+                || parameter_record.exports().is_some()
+                || parameter_record.export_symbol().is_some()
+                || parameter_record.name().as_utf8() != store.source_identifier_text(name)
+                || store.source_direct_type_annotation(parameter) != Some(index.key_type_node)
+                || store.source_direct_type_annotation(index.declaration)
+                    != Some(index.value_type_node)
+            {
+                return Err(invalid());
+            }
+        }
+        match type_literal_state(store, plan)? {
+            Some(PropertyObjectState::Resolved(type_)) if type_ == self.type_ => {}
+            Some(PropertyObjectState::EmptyBootstrap(type_)) if type_ == self.type_ => {
+                let record = store.type_payload(type_).ok_or_else(invalid)?;
+                if !validate_empty_type_literal_identity(store, type_, record) {
+                    return Err(invalid());
+                }
+            }
+            _ => return Err(invalid()),
+        }
+        let indexes = store
+            .type_payload(self.type_)
+            .and_then(|record| record.data().structured())
+            .and_then(|members| members.index_infos.as_deref())
+            .unwrap_or_default();
+        if indexes != self.index_infos {
+            return Err(invalid());
+        }
+        validate_resolved_declared_member_types(
+            store,
+            plan,
+            &self.property_types,
+            &self.index_types,
+            &[],
+        )
+    }
+}
+
+/// Reuses the normal source planner and ready member checks. It does not query children.
+pub(super) fn source_alias_closed_object(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &PropertyObjectPlan,
+    type_: TypeId,
+    property_types: Vec<TypeId>,
+    index_types: Vec<(TypeId, TypeId)>,
+) -> Result<SourceAliasClosedObject, PropertyObjectError> {
+    let invalid = || invalid_cache(plan, type_);
+    if plan_type_literal(store, host, plan.node, plan.alias_symbol)? != *plan {
+        return Err(invalid());
+    }
+    let index_parameters = plan
+        .indexes
+        .iter()
+        .map(|index| {
+            let parameter = store
+                .source_child_with_kind(index.declaration, SyntaxKind::Parameter)
+                .ok_or_else(invalid)?;
+            let symbol = store
+                .source_declaration_symbol(parameter)
+                .ok_or_else(invalid)?;
+            Ok((parameter, symbol))
+        })
+        .collect::<Result<Vec<_>, PropertyObjectError>>()?;
+    let object = SourceAliasClosedObject {
+        plan: plan.clone(),
+        type_,
+        property_types,
+        index_types,
+        index_infos: store
+            .type_payload(type_)
+            .and_then(|record| record.data().structured())
+            .and_then(|members| members.index_infos.clone())
+            .unwrap_or_default(),
+        index_parameters,
+    };
+    object.validate_retained(store)?;
+    Ok(object)
 }
 
 pub(super) fn object_literal_state(
@@ -21679,6 +21998,77 @@ pub(super) fn declared_method_type_parameter_view(
     if store.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature) {
         return None;
     }
+    declared_method_type_parameter_view_worker(store, signature, declaration)
+}
+
+/// Reads an original instance method's formals without validating its callable graph.
+pub(super) fn declared_class_method_type_parameter_view(
+    store: &CanonicalTypeMapperStore,
+    signature: &super::signatures::Signature,
+    declaration: NodeRef,
+) -> Option<Vec<DeclaredMethodTypeParameterView>> {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::MethodDeclaration)
+        || signature.declaration() != Some(declaration)
+        || signature.target().is_some()
+        || signature.mapper().is_some()
+    {
+        return None;
+    }
+    let SourceNodeParent::Parent(class_declaration) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    if store.source_node_kind(class_declaration) != Some(SyntaxKind::ClassDeclaration)
+        || store
+            .source_direct_children(class_declaration)?
+            .into_iter()
+            .any(|child| store.source_node_kind(child) == Some(SyntaxKind::TypeParameter))
+    {
+        return None;
+    }
+    let owner = store.source_declaration_symbol(class_declaration)?;
+    let class = store.symbol(owner)?;
+    let symbol = store.source_declaration_symbol(declaration)?;
+    let method = store.symbol(symbol)?;
+    if !class.flags().contains(SymbolFlags::CLASS)
+        || class.check_flags() != CheckFlags::NONE
+        || class.declarations() != Some(&[class_declaration])
+        || class.value_declaration() != Some(class_declaration)
+        || !store.source_symbol_declarations_match(owner)
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store.symbol_table(class.members()?)?.get(method.name()) != Some(symbol)
+        || method.flags() != SymbolFlags::METHOD
+        || method.check_flags() != CheckFlags::NONE
+        || method.declarations() != Some(&[declaration])
+        || method.value_declaration() != Some(declaration)
+        || method.parent() != Some(owner)
+        || method.members().is_some()
+        || method.exports().is_some()
+        || method.export_symbol().is_some()
+        || !store.source_symbol_declarations_match(symbol)
+        || store.get_merged_symbol(symbol) != Some(symbol)
+    {
+        return None;
+    }
+    let parameters = declared_method_type_parameter_view_worker(store, signature, declaration)?;
+    for parameter in &parameters {
+        let symbol = cached_ordinary_type_parameter_owner(store, parameter.type_parameter)?;
+        let [declaration] = store.symbol(symbol)?.declarations()? else {
+            return None;
+        };
+        if store.source_declaration_symbol(*declaration) != Some(symbol)
+            || !store.source_symbol_declarations_match(symbol)
+        {
+            return None;
+        }
+    }
+    Some(parameters)
+}
+
+fn declared_method_type_parameter_view_worker(
+    store: &CanonicalTypeMapperStore,
+    signature: &super::signatures::Signature,
+    declaration: NodeRef,
+) -> Option<Vec<DeclaredMethodTypeParameterView>> {
     let mut declarations = store.source_direct_children(declaration)?;
     declarations.retain(|parameter| {
         parameter.node < declaration.node
@@ -31956,6 +32346,138 @@ mod generic_publication_tests {
             }),
         );
         assert_eq!(state(&fixture.store), poisoned);
+    }
+
+    fn closed_property_declaration_fixture() -> (Fixture, SourceAliasClosedObject, NodeRef) {
+        let mut fixture = interface_fixture(
+            "interface Owner {} type Shape = { item?: string }; class Other { item?: string; }",
+            48_936,
+        );
+        let node = |kind| {
+            fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap()
+        };
+        let literal = node(SyntaxKind::TypeLiteral);
+        let alias = fixture
+            .bound
+            .symbol(node(SyntaxKind::TypeAliasDeclaration))
+            .unwrap();
+        let class = node(SyntaxKind::ClassDeclaration);
+        let foreign = fixture
+            .store
+            .source_child_with_kind(class, SyntaxKind::PropertyDeclaration)
+            .unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_type_literal(&fixture.store, &host, literal, Some(alias)).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(alias)
+        .unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let proof = source_alias_closed_object(
+            &fixture.store,
+            &host,
+            &plan,
+            type_,
+            vec![string],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(diagnostics.is_empty());
+        (fixture, proof, foreign)
+    }
+
+    #[test]
+    fn source_alias_closed_objects_keep_property_declarations_and_reject_foreign_rows() {
+        let (mut fixture, proof, foreign) = closed_property_declaration_fixture();
+        let property = &proof.plan.properties[0];
+        assert!(property.optional);
+        assert_eq!(
+            fixture.store.source_node_kind(property.declaration),
+            Some(SyntaxKind::PropertyDeclaration)
+        );
+        assert_eq!(
+            fixture.store.source_node_kind(foreign),
+            Some(SyntaxKind::PropertyDeclaration)
+        );
+        let expected = Err(invalid_cache(&proof.plan, proof.type_));
+        let snapshot = format!("{:?}", fixture.store);
+        for damage in 0..4 {
+            let mut changed = proof.clone();
+            match damage {
+                0 => changed.plan.kind = PropertyObjectKind::ObjectLiteral,
+                1 => changed.plan.properties[0].declaration = foreign,
+                2 => changed.plan.properties[0].symbol = fixture.bound.symbol(foreign).unwrap(),
+                3 => {
+                    changed.plan.properties[0].type_node = fixture
+                        .store
+                        .source_direct_type_annotation(foreign)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    changed.validate_retained(&fixture.store),
+                    Err(invalid_cache(&changed.plan, changed.type_))
+                );
+                assert_eq!(format!("{:?}", fixture.store), snapshot);
+                assert_eq!(proof.validate_retained(&fixture.store), Ok(()));
+            }
+        }
+        let original = fixture
+            .store
+            .value_symbol_links(property.symbol)
+            .unwrap()
+            .clone();
+        let mut changed = original.clone();
+        changed.resolved_type = Some(fixture.store.intrinsic_bootstrap().unwrap().number_type);
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(property.symbol, changed)
+        );
+        let poisoned = format!("{:?}", fixture.store);
+        for _ in 0..2 {
+            assert_eq!(proof.validate_retained(&fixture.store), expected);
+            assert_eq!(format!("{:?}", fixture.store), poisoned);
+        }
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(property.symbol, original)
+        );
+        let restored = format!("{:?}", fixture.store);
+        let host = host(&fixture.parsed, &fixture.bound);
+        assert_eq!(proof.validate_retained(&fixture.store), Ok(()));
+        assert_eq!(
+            source_alias_closed_object(
+                &fixture.store,
+                &host,
+                &proof.plan,
+                proof.type_,
+                proof.property_types.clone(),
+                Vec::new()
+            ),
+            Ok(proof)
+        );
+        assert_eq!(format!("{:?}", fixture.store), restored);
     }
 
     #[test]
