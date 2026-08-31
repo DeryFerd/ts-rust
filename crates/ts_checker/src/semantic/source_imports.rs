@@ -16186,12 +16186,16 @@ mod tests {
                 .unwrap();
                 let declaration = NodeRef::new(source.arena.id(), file, declaration);
                 let owner = bound.symbol(declaration).unwrap();
-                assert!(!super::super::classes::source_class_annotation_is_owned(
-                    context.store(),
-                    &host,
-                    owner,
-                    NodeRef::new(source.arena.id(), file, annotation),
-                ));
+                assert_eq!(
+                    super::super::classes::source_class_annotation_is_owned(
+                        context.store(),
+                        &host,
+                        owner,
+                        NodeRef::new(source.arena.id(), file, annotation),
+                    ),
+                    !matches!(damage, Damage::Holder),
+                    "constructor={constructor}, damage={damage:?}",
+                );
                 let reference = NodeRef::new(source.arena.id(), file, reference);
                 let before = format!("{:?}", context.store());
                 for _ in 0..2 {
