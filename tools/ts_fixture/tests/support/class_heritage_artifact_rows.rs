@@ -351,3 +351,150 @@ fn heritage_row_selection_keeps_type_query_jsx_and_type_only_names_unchanged() {
     }
     assert_repeated_walk(&case, &program, &walk);
 }
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep all three complete pinned baselines with the original fixture.
+fn original_jsdoc_extends_artifacts_keep_instance_and_value_rows() {
+    // Exact Go baselines at dc37b5249ab60e2bbce936f71b883e6c8136167e.
+    const EXPECTED_TYPES: &str = concat!(
+        "//// [tests/cases/compiler/jsdocExtendsClauseMismatch.ts] ////\r\n",
+        "\r\n",
+        "=== react.d.ts ===\r\n",
+        "declare namespace React {\r\n",
+        ">React : typeof React\r\n",
+        "\r\n",
+        "    class Component {}\r\n",
+        ">Component : Component\r\n",
+        "\r\n",
+        "    class PureComponent {}\r\n",
+        ">PureComponent : PureComponent\r\n",
+        "}\r\n",
+        "\r\n",
+        "=== main.js ===\r\n",
+        "/**\r\n",
+        " * @extends {React.Component}\r\n",
+        " */\r\n",
+        "class C extends React.PureComponent {}\r\n",
+        ">C : C\r\n",
+        ">React.PureComponent : React.PureComponent\r\n",
+        ">React : typeof React\r\n",
+        ">PureComponent : typeof React.PureComponent\r\n",
+        "\r\n",
+        "/**\r\n",
+        " * @extends {React.Component}\r\n",
+        " */\r\n",
+        "class D extends React.Component {}\r\n",
+        ">D : D\r\n",
+        ">React.Component : React.Component\r\n",
+        ">React : typeof React\r\n",
+        ">Component : typeof React.Component\r\n",
+        "\r\n",
+    );
+    const EXPECTED_SYMBOLS: &str = concat!(
+        "//// [tests/cases/compiler/jsdocExtendsClauseMismatch.ts] ////\r\n",
+        "\r\n",
+        "=== react.d.ts ===\r\n",
+        "declare namespace React {\r\n",
+        ">React : Symbol(React, Decl(react.d.ts, 0, 0))\r\n",
+        "\r\n",
+        "    class Component {}\r\n",
+        ">Component : Symbol(Component, Decl(react.d.ts, 0, 25))\r\n",
+        "\r\n",
+        "    class PureComponent {}\r\n",
+        ">PureComponent : Symbol(PureComponent, Decl(react.d.ts, 1, 22))\r\n",
+        "}\r\n",
+        "\r\n",
+        "=== main.js ===\r\n",
+        "/**\r\n",
+        " * @extends {React.Component}\r\n",
+        " */\r\n",
+        "class C extends React.PureComponent {}\r\n",
+        ">C : Symbol(C, Decl(main.js, 0, 0))\r\n",
+        ">React.PureComponent : Symbol(React.PureComponent, Decl(react.d.ts, 1, 22))\r\n",
+        ">React : Symbol(React, Decl(react.d.ts, 0, 0))\r\n",
+        ">PureComponent : Symbol(React.PureComponent, Decl(react.d.ts, 1, 22))\r\n",
+        "\r\n",
+        "/**\r\n",
+        " * @extends {React.Component}\r\n",
+        " */\r\n",
+        "class D extends React.Component {}\r\n",
+        ">D : Symbol(D, Decl(main.js, 3, 38))\r\n",
+        ">React.Component : Symbol(React.Component, Decl(react.d.ts, 0, 25))\r\n",
+        ">React : Symbol(React, Decl(react.d.ts, 0, 0))\r\n",
+        ">Component : Symbol(React.Component, Decl(react.d.ts, 0, 25))\r\n",
+        "\r\n",
+    );
+    const EXPECTED_ERRORS: &str = concat!(
+        "main.js(2,20): error TS8023: JSDoc '@extends Component' does not match the 'extends PureComponent' clause.\r\n",
+        "\r\n",
+        "\r\n",
+        "==== react.d.ts (0 errors) ====\r\n",
+        "    declare namespace React {\r\n",
+        "        class Component {}\r\n",
+        "        class PureComponent {}\r\n",
+        "    }\r\n",
+        "    \r\n",
+        "==== main.js (1 errors) ====\r\n",
+        "    /**\r\n",
+        "     * @extends {React.Component}\r\n",
+        "                       ~~~~~~~~~\r\n",
+        "!!! error TS8023: JSDoc '@extends Component' does not match the 'extends PureComponent' clause.\r\n",
+        "     */\r\n",
+        "    class C extends React.PureComponent {}\r\n",
+        "    \r\n",
+        "    /**\r\n",
+        "     * @extends {React.Component}\r\n",
+        "     */\r\n",
+        "    class D extends React.Component {}\r\n",
+        "    ",
+    );
+
+    let case = Case::parse(
+        "testdata/tests/cases/compiler/jsdocExtendsClauseMismatch.ts",
+        ORIGINAL_CASE,
+    )
+    .unwrap();
+    let mut variants = expand_option_matrix(&case);
+    let [variant] = variants.as_mut_slice() else {
+        panic!("the original fixture must retain one option variant")
+    };
+    assert!(variant.unsupported_details.is_empty());
+    let options = fixture_compiler_options(&case, variant);
+    assert!(options.allow_js && options.check_js && options.no_emit);
+    assert!(!options.no_check && !options.no_lib);
+    let compilation =
+        crate::compile_case_variant(&case, variant, crate::FixtureChecker::Canonical, true)
+            .unwrap();
+    assert!(variant.unsupported_details.is_empty());
+    let [diagnostic] = compilation.diagnostics.as_slice() else {
+        panic!("the original fixture must retain only TS8023")
+    };
+    assert_eq!(diagnostic.code, Some(8023));
+    assert_eq!(diagnostic.file_name.as_deref(), Some("/.src/main.js"));
+    assert_eq!(
+        diagnostic.source_text.as_ref(),
+        Some(&case.units[1].source_text)
+    );
+    assert_eq!(
+        diagnostic.category,
+        Some(crate::CompilationDiagnosticCategory::Error)
+    );
+    assert_eq!(
+        diagnostic.message,
+        "JSDoc '@extends Component' does not match the 'extends PureComponent' clause."
+    );
+    let range = diagnostic.range.unwrap();
+    assert_eq!(range.start.get(), 23);
+    assert_eq!(range.len(), 9);
+    assert_eq!(diagnostic.related_information.as_deref(), Some(&[][..]));
+    let errors = crate::render_error_baseline(&case, &compilation.diagnostics);
+    assert!(errors.unsupported_details.is_empty());
+    assert_eq!(errors.text, EXPECTED_ERRORS);
+
+    let artifacts = compilation.semantic_artifacts.unwrap();
+    assert_eq!(artifacts.walk.types.len(), 11);
+    assert_eq!(artifacts.walk.symbols.len(), 11);
+    assert_eq!(artifacts.walk.types, artifacts.walk.symbols);
+    assert_eq!(artifacts.types.unwrap(), EXPECTED_TYPES);
+    assert_eq!(artifacts.symbols.unwrap(), EXPECTED_SYMBOLS);
+}
