@@ -34,7 +34,14 @@ builds. All 201 required test names ran. The complete original
 `ambiguousCallsWhereReturnTypesAgree.ts` fixture passed diagnostics, types and
 symbols. The [complete result](../target/wave202-next-full-core-gate-7-report.md)
 does not replace the accepted original test subset. Its complete corpus
-comparison is being prepared separately.
+comparison finished with a regression. All 423 exact diagnostic records remain
+unchanged. The semantic run has 60 exact results, 31 unsupported results and
+four artifact mismatches in 95 variants, with no crashes. One previously exact
+type artifact now prints `typeof foo` instead of the expected object shape in
+`invocationErrorRecovery.ts`. That regression prevents acceptance. The three
+old crash cases have changed outcomes, not three accepted passes. The
+[full semantic result](../target/wave202-core-class-source-next-artifact-corpus-3/semantic.json)
+retains each record. A separate pair is repairing the display rule.
 
 The newer combined core/class source is
 `aea8d39c730a2db79e4d2fae965f5b164d1240bf`. Its full checker run passed 5,981
@@ -106,11 +113,27 @@ either test harness started. All 4,904 tests were unrun. The import-only fix
 is committed at `01ac9bb590bfbf03f2f2def53a38974804960b49`. The corrected
 focused run completed all 4,904 tests, with 4,900 passes and four failures.
 The library passed 4,899 of 4,900. The public harness passed its complete Hono
-negative control. Its three positive controls stop in a test helper. Those
-failures still need diagnosis and are not passes. Optional named fields
+negative control. Its three positive controls stop in a test helper. The full
+diagnosis found two test-only assumptions that need correction: scalar
+annotations need not have node-cache rows, and one damaged base-table entry
+has a different exact error. The corrections are under review. The later
+assertions still need to run. Optional named fields
 and imported conditional class annotations are also committed and reviewed,
 but not runtime-verified.
 One first project failure does not tell us how many remain.
+
+The separate exported-class constructor repair has now passed both new private
+controls and all three unchanged public constructor-default tests. This clears
+the two previously failing local exported-constructor tests. Its complete
+library run passed 5,115 of 5,143 tests. The remaining 28 library failures stay
+visible. This result is not a Hono project pass.
+
+One worker combines the eight reviewed Hono dependencies. A separate worker
+prepares a fresh reporter build and full original-project check. Further source
+audits found named method return annotations, property truthiness flow and
+ambient `Response` construction restrictions in the original `getResponse`
+method. Five independent pairs now check the required implementation paths.
+These are source findings, not the next measured project error.
 
 The Query source audit identifies missing contextual typing for the first
 two-parameter object-property arrow. Its declared `TimeoutProvider` property
@@ -126,10 +149,12 @@ and branching callback bodies. Query is not one or two fixes from a proved
 complete pass. Separate workers now implement the shared source features.
 Generic class methods, generic class bodies, optional calls, branching arrow
 bodies and generic function-type aliases are committed and source-reviewed.
-Their runtime checks remain pending. Executable class
-imports now have a separate implementation team. Generic construction has a
-reviewed design and waits for the class-body provider. These audit findings do
-not predict the next runtime failure.
+Their runtime checks remain pending. The first generic function-alias run
+stopped before tests because of a missing Rust import. The reviewed import-only
+fix is committed, and a new run is being prepared. Executable class imports
+have a separate implementation team. Generic construction now has five workers
+using the committed class-body provider and exported-constructor repair.
+These audit findings do not predict the next runtime failure.
 
 Pinned project commits:
 
