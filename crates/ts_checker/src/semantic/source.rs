@@ -3872,7 +3872,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             statements.push(PlannedStatement::ClassGrammar(grammar));
                             continue;
                         }
-                        if self.needs_early_source_constructor_plan(&class.members.nodes)
+                        if (self.needs_early_source_constructor_plan(&class.members.nodes)
+                            || store.source_class_provenance_for_symbol(symbol).is_some())
                             && let Some(source) = self.try_plan_source_class(statement, symbol)?
                         {
                             statements.push(PlannedStatement::SourceClass(Box::new(source)));
@@ -4020,7 +4021,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         statements.push(PlannedStatement::ClassGrammar(grammar));
                         continue;
                     }
-                    if self.needs_early_source_constructor_plan(&class.members.nodes)
+                    if (self.needs_early_source_constructor_plan(&class.members.nodes)
+                        || store.source_class_provenance_for_symbol(symbol).is_some())
                         && let Some(source) = self.try_plan_source_class(statement, symbol)?
                     {
                         statements.push(PlannedStatement::SourceClass(Box::new(source)));
@@ -125774,4 +125776,6 @@ class Foo2 {
         );
         assert!(diagnostics.is_empty());
     }
+
+    include!("source_class_warm_replay_tests.rs");
 }
