@@ -2735,6 +2735,8 @@ pub(super) fn plan_source_callable(
     owner_symbol: SemanticSymbolId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<SourceCallablePlan, SourceCallableError> {
+    let local_context =
+        stored_local_contextual_arrow_plan(store, host, declaration, owner_symbol, array_targets)?;
     plan_source_callable_with_owner_shape(
         store,
         host,
@@ -2742,7 +2744,107 @@ pub(super) fn plan_source_callable(
         owner_symbol,
         array_targets,
         SourceCallableOwnerShape::Unique,
+        local_context.as_ref(),
     )
+}
+
+/// Uses a checked variable-context proof only to plan its existing source body.
+pub(super) fn plan_checked_local_contextual_arrow_body(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    context: &super::source_arrows::SourceContextualArrowPlan,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceCallablePlan, SourceCallableError> {
+    let actual = super::source_arrows::replan_local_contextual_source_arrow(
+        store,
+        host,
+        context.variable_declaration,
+        array_targets,
+    )
+    .map_err(|_| invariant(SourceCallableInvariant::InvalidSyntax(context.declaration)))?;
+    if actual != *context {
+        return Err(invariant(SourceCallableInvariant::InvalidSyntax(
+            context.declaration,
+        )));
+    }
+    plan_source_callable_with_owner_shape(
+        store,
+        host,
+        context.declaration,
+        context.owner_symbol,
+        array_targets,
+        SourceCallableOwnerShape::Unique,
+        Some(context),
+    )
+}
+
+fn stored_local_contextual_arrow_plan(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<super::source_arrows::SourceContextualArrowPlan>, SourceCallableError> {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction) {
+        return Ok(None);
+    }
+    let Some(type_) = store.source_callable_type_for_owner(owner_symbol) else {
+        return Ok(None);
+    };
+    let Some(provenance) = store.source_callable_provenance(type_) else {
+        return Ok(None);
+    };
+    let (Some(variable), Some(target)) =
+        (provenance.contextual_variable, provenance.contextual_target)
+    else {
+        return Ok(None);
+    };
+    let Some(SourceNodeParent::Parent(variable_node)) = store.source_node_parent(declaration)
+    else {
+        return Ok(None);
+    };
+    if store.source_node_kind(variable_node) != Some(SyntaxKind::VariableDeclaration) {
+        return Ok(None);
+    }
+    let mut parent = variable_node;
+    for kind in [
+        SyntaxKind::VariableDeclarationList,
+        SyntaxKind::VariableStatement,
+        SyntaxKind::Block,
+    ] {
+        let Some(SourceNodeParent::Parent(next)) = store.source_node_parent(parent) else {
+            return Ok(None);
+        };
+        if store.source_node_kind(next) != Some(kind) {
+            return Ok(None);
+        }
+        parent = next;
+    }
+    let invalid = || invariant(SourceCallableInvariant::InvalidTypeCache(declaration));
+    let context = super::source_arrows::replan_local_contextual_source_arrow(
+        store,
+        host,
+        variable_node,
+        array_targets,
+    )
+    .map_err(|_| invalid())?;
+    if context.declaration != declaration
+        || context.owner_symbol != owner_symbol
+        || context.variable_symbol != variable
+        || provenance.declaration != declaration
+        || provenance.owner_symbol != owner_symbol
+        || store
+            .type_node_links(context.contextual_type.type_node)
+            .and_then(|links| links.resolved_type)
+            != Some(target)
+        || !matches!(
+            validate_stored_source_callable(store, type_),
+            StoredSourceCallableValidation::Valid(_)
+        )
+    {
+        return Err(invalid());
+    }
+    Ok(Some(context))
 }
 
 /// Finds the source scope of an exact callable annotation without resolving types.
@@ -2868,6 +2970,7 @@ pub(super) fn plan_source_ambient_overload_declaration(
         owner_symbol,
         array_targets,
         SourceCallableOwnerShape::AmbientOverload(declarations),
+        None,
     )
 }
 
@@ -2887,6 +2990,7 @@ pub(super) fn plan_source_jsdoc_overload_declaration(
         owner_symbol,
         array_targets,
         SourceCallableOwnerShape::JavaScriptOverload(declarations),
+        None,
     )
 }
 
@@ -2905,6 +3009,7 @@ pub(super) fn plan_javascript_duplicate_function_implementation(
         owner_symbol,
         array_targets,
         SourceCallableOwnerShape::JavaScriptDuplicateImplementation,
+        None,
     )
 }
 
@@ -2915,6 +3020,7 @@ fn plan_source_callable_with_owner_shape(
     owner_symbol: SemanticSymbolId,
     array_targets: Option<CanonicalArrayTargets>,
     owner_shape: SourceCallableOwnerShape<'_>,
+    local_context: Option<&super::source_arrows::SourceContextualArrowPlan>,
 ) -> Result<SourceCallablePlan, SourceCallableError> {
     let record = preflight_node(store, host, declaration)?;
     let javascript_jsdoc_overload = match owner_shape {
@@ -3597,6 +3703,15 @@ fn plan_source_callable_with_owner_shape(
                         && view.parameters.range.end > parameter_record.range.end
                     || object_property_arrow
                         && view.parameters.nodes.as_slice() == [parameter.node]
+                    || local_context.is_some_and(|context| {
+                        context.declaration == declaration
+                            && context.owner_symbol == owner_symbol
+                            && context.parameters.get(source_index).is_some_and(|planned| {
+                                planned.declaration == parameter
+                                    && planned.name == name
+                                    && planned.annotation.is_none()
+                            })
+                    })
                     || direct_call_argument_arrow
                     || direct_implicit_any_rest_arrow)
                     || body_mode.is_ambient() && !rest
@@ -4110,7 +4225,22 @@ fn plan_source_callable_with_owner_shape(
                                             })
                                         }))
                         });
-            if contextual_source_arrow {
+            let contextual_local_arrow = local_context.is_some_and(|context| {
+                store
+                    .source_callable_type_for_owner(owner_symbol)
+                    .and_then(|type_| store.source_callable_provenance(type_))
+                    .is_some_and(|provenance| {
+                        provenance.declaration == context.declaration
+                            && provenance.owner_symbol == context.owner_symbol
+                            && provenance.contextual_variable == Some(context.variable_symbol)
+                            && provenance.contextual_target.is_some()
+                            && provenance.contextual_target
+                                == store
+                                    .type_node_links(context.contextual_type.type_node)
+                                    .and_then(|links| links.resolved_type)
+                    })
+            });
+            if contextual_source_arrow || contextual_local_arrow {
                 let type_ = store
                     .source_callable_type_for_owner(owner_symbol)
                     .expect("the contextual source arrow already retained its owner");

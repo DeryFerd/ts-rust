@@ -866,6 +866,22 @@ fn try_resolve_source_heritage_base(
     Ok(Some((symbol, reads)))
 }
 
+/// Finds the original type binding without following a mutable import target.
+pub(super) fn resolve_source_heritage_type_binding(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+) -> Result<Option<SemanticSymbolId>, DeclaredTypeError> {
+    let (resolved, _) = resolve_source_identifier_with_origins(
+        store,
+        host,
+        expression,
+        SymbolFlags::TYPE | SymbolFlags::ALIAS,
+        false,
+    )?;
+    resolved.map_err(DeclaredTypeError::from)
+}
+
 /// Proves the local namespace lookup before a caller considers a global entry.
 /// An alias binding still needs the existing import resolver's target proof.
 pub(super) fn resolve_source_local_namespace_binding(
@@ -1074,6 +1090,30 @@ pub(super) fn plan_source_interface_heritage_header(
                 return Err(source_heritage_error(declaration));
             }
         };
+        if declarations == [declaration]
+            && planned.bases.iter().all(|base| {
+                base.kind == DirectInterfaceBaseKind::Interface
+                    && base.type_arguments.is_empty()
+                    && base.defaults.is_empty()
+                    && store.source_node_kind(base.expression) == Some(SyntaxKind::Identifier)
+            })
+        {
+            for base in &planned.bases {
+                if super::source_imports::plan_source_interface_heritage_type_import(
+                    store,
+                    host,
+                    declaration,
+                    owner,
+                    base.node,
+                )
+                .map_err(|_| source_heritage_error(base.expression))?
+                    == Some(base.symbol)
+                {
+                    // Import proof belongs to the direct planner, not this source-alias header.
+                    return not_source_alias_heritage();
+                }
+            }
+        }
         for base in planned.bases {
             if !matches!(
                 base.kind,
@@ -1816,7 +1856,22 @@ fn plan_direct_interface_heritage_inner(
             return Err(DirectInterfaceHeritageError::Invalid);
         }
 
-        let resolved = if let Some(identifier) = identifier {
+        let resolved = if let Some(imported) = identifier
+            .map(|_| {
+                super::source_imports::plan_source_interface_heritage_type_import(
+                    store,
+                    host,
+                    declaration,
+                    owner,
+                    node,
+                )
+            })
+            .transpose()
+            .map_err(|_| DirectInterfaceHeritageError::Invalid)?
+            .flatten()
+        {
+            Some(imported)
+        } else if let Some(identifier) = identifier {
             let (arena, bound) = host
                 .source(expression)
                 .ok_or(DirectInterfaceHeritageError::Invalid)?;
