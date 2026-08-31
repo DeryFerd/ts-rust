@@ -12830,6 +12830,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let parameter_initializers = self.plan_parameter_initializers_and_enter_scope(callable)?;
         let body_prior_variables = self.prior_variables.clone();
         let body_readable_variables = self.readable_variables.clone();
+        let body_uninitialized_variables = self.assignable_uninitialized_variables.clone();
+        let body_assigned_variables = self.assigned_variables.clone();
         let body_hoisted_functions = self.hoisted_functions.clone();
         let body_prior_enums = self.prior_enums.clone();
         let result = self
@@ -12843,6 +12845,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         // unsupported boundary, before removing the parameters themselves.
         self.prior_variables = body_prior_variables;
         self.readable_variables = body_readable_variables;
+        self.assignable_uninitialized_variables = body_uninitialized_variables;
+        self.assigned_variables = body_assigned_variables;
         self.hoisted_functions = body_hoisted_functions;
         self.prior_enums = body_prior_enums;
         self.leave_callable_parameter_scope(callable)?;
@@ -14817,6 +14821,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     statement,
                     expression,
                 } => {
+                    if let Some(assignment) = self.plan_linear_annotated_local_assignment(
+                        callable, &locals, statement, expression,
+                    )? {
+                        statements.push(PlannedLinearFunctionStatement::ParameterAssignment(
+                            Box::new(assignment),
+                        ));
+                        continue;
+                    }
                     if let Some(assignment) =
                         self.plan_linear_captured_local_assignment(callable, statement, expression)?
                     {
@@ -14928,6 +14940,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .collect::<Vec<_>>();
         let assignments = locals
             .iter()
+            .filter(|local| matches!(local.initializer, PlannedVariableInitializer::Expression(_)))
             .map(|local| SourceFlowAssignment {
                 declaration: local.declaration,
                 symbol: local.symbol,
@@ -15403,6 +15416,78 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             operand,
             symbol,
         })
+    }
+
+    /// Uses the existing retained-write plan for a local with a written entry type.
+    fn plan_linear_annotated_local_assignment(
+        &mut self,
+        callable: &SourceCallablePlan,
+        locals: &[PlannedVariable],
+        statement: NodeRef,
+        expression: NodeRef,
+    ) -> Result<Option<PlannedLinearParameterAssignment>, SourceCheckError> {
+        let record = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &record.data else {
+            return Ok(None);
+        };
+        if self.node(self.reference(binary.operator_token))?.kind != SyntaxKind::EqualsToken {
+            return Ok(None);
+        }
+        let target = self.reference(binary.left);
+        let right = self.reference(binary.right);
+        let target_record = self.node(target)?;
+        let NodeData::Identifier(identifier) = &target_record.data else {
+            return Ok(None);
+        };
+        let name = identifier.text.clone();
+        let Some((store, host)) = self.semantic else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let read = plan_identifier_read(
+            self.arena,
+            self.bound,
+            store,
+            host,
+            &self.prior_variables,
+            &self.readable_variables,
+            target,
+            &name,
+        )
+        .map_err(Self::variable_plan_error)?;
+        let Some(local) = locals.iter().find(|local| {
+            local.symbol == read.value_symbol
+                && !local.binding.is_const()
+                && local.type_node.is_some()
+                && !callable
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.symbol == local.symbol)
+                && matches!(
+                    local.initializer,
+                    PlannedVariableInitializer::AbsentAnnotated
+                )
+        }) else {
+            return Ok(None);
+        };
+        if self.bound.container(local.declaration) != Some(callable.declaration)
+            || self.bound.container(target) != Some(callable.declaration)
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        self.identifier_reads.push((target, read.resolved_symbol));
+        self.primitive_binary_position_roots.insert(right);
+        let right = self.plan_expression(right)?;
+        self.assigned_variables.insert(local.symbol);
+        Ok(Some(PlannedLinearParameterAssignment {
+            statement,
+            expression,
+            flow: SourceFlowParameterAssignment {
+                target,
+                parameter: local.declaration,
+                symbol: local.symbol,
+            },
+            right,
+        }))
     }
 
     fn plan_linear_captured_local_assignment(
@@ -16354,6 +16439,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .iter()
             .chain(&then_branch.locals)
             .chain(&else_branch.locals)
+            .filter(|local| matches!(local.initializer, PlannedVariableInitializer::Expression(_)))
             .map(|local| SourceFlowAssignment {
                 declaration: local.declaration,
                 symbol: local.symbol,
@@ -16826,6 +16912,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .chain(&then_branch.locals)
             .chain(&else_branch.locals)
             .chain(&trailing)
+            .filter(|local| matches!(local.initializer, PlannedVariableInitializer::Expression(_)))
             .map(|local| SourceFlowAssignment {
                 declaration: local.declaration,
                 symbol: local.symbol,
@@ -17009,6 +17096,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 && self.readable_variables.insert(syntax.symbol)
         };
         if !valid_scope {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(syntax.symbol),
+            ));
+        }
+        if !shared_parameter
+            && matches!(initializer, PlannedVariableInitializer::AbsentAnnotated)
+            && !self
+                .assignable_uninitialized_variables
+                .insert(syntax.symbol)
+        {
             return Err(SourceCheckError::Variable(
                 VariableInvariant::InvalidSymbolShape(syntax.symbol),
             ));
@@ -23797,13 +23894,40 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     _ => unreachable!("an identifier syntax plans one identifier-family read"),
                 };
                 self.identifier_reads.push((expression, resolved_symbol));
-                let used_before_assignment = matches!(
-                    &kind,
-                    PlannedExpressionKind::Identifier(read)
-                        if self.assignable_uninitialized_variables.contains(&read.value_symbol)
-                            && !self.assigned_variables.contains(&read.value_symbol)
-                ) && self
-                    .is_top_level_execution_expression(expression)?;
+                let used_before_assignment = if let PlannedExpressionKind::Identifier(read) = &kind
+                    && self
+                        .assignable_uninitialized_variables
+                        .contains(&read.value_symbol)
+                    && !self.assigned_variables.contains(&read.value_symbol)
+                {
+                    let declaration_container = store
+                        .symbol(read.value_symbol)
+                        .and_then(ts_binder::semantic::Symbol::value_declaration)
+                        .and_then(|declaration| self.bound.container(declaration));
+                    let local_container = declaration_container.filter(|container| {
+                        self.arena.get(container.node).is_some_and(|node| {
+                            matches!(
+                                node.kind,
+                                SyntaxKind::FunctionDeclaration
+                                    | SyntaxKind::ArrowFunction
+                                    | SyntaxKind::MethodDeclaration
+                            )
+                        })
+                    });
+                    if local_container.is_some_and(|container| {
+                        self.bound.container(expression) != Some(container)
+                            || self.bound.flow_container(expression) != Some(container)
+                    }) {
+                        return Err(self.unsupported(
+                            expression,
+                            SyntaxKind::Identifier,
+                            SourceSyntaxRole::FunctionBody,
+                        ));
+                    }
+                    self.is_top_level_execution_expression(expression)? || local_container.is_some()
+                } else {
+                    false
+                };
                 Ok(PlannedExpression::new(expression, kind)
                     .with_used_before_assignment(used_before_assignment))
             }
@@ -30549,6 +30673,7 @@ fn expression_type(
     Ok(execute_expression_types(
         store,
         None,
+        None,
         &mut session,
         &HashMap::new(),
         &HashMap::new(),
@@ -30694,6 +30819,7 @@ fn prepare_const_object_property(
 #[allow(clippy::too_many_arguments)] // Prepared expressions keep their tuple context and caller session.
 fn execute_expression_types<F>(
     store: &mut CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
     global_types: Option<&CanonicalGlobalTypes>,
     session: &mut InstantiationSession,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
@@ -30796,6 +30922,17 @@ where
         {
             check_nested_expression(store, session, expression, None, None)
         }
+        (PlannedExpressionKind::Identifier(_), PreparedExpression::Identifier(treatment))
+            if host
+                .map(|host| uninitialized_local_read_annotation(store, host, expression))
+                .transpose()?
+                .flatten()
+                .is_some() =>
+        {
+            let mut checked = check_nested_expression(store, session, expression, None, None)?;
+            checked.result = identifier_expression_type(store, checked.result, *treatment)?;
+            Ok(checked)
+        }
         (PlannedExpressionKind::Identifier(read), PreparedExpression::Identifier(treatment)) => {
             let raw = *current_flow_types
                 .get(&read.value_symbol)
@@ -30877,6 +31014,7 @@ where
         ) => {
             let checked = execute_expression_types(
                 store,
+                host,
                 global_types,
                 session,
                 current_flow_types,
@@ -30910,6 +31048,7 @@ where
             for (index, (element, prepared)) in elements.iter().zip(prepared_elements).enumerate() {
                 let checked = execute_expression_types(
                     store,
+                    host,
                     Some(global_types),
                     session,
                     current_flow_types,
@@ -31072,6 +31211,7 @@ where
                     .transpose()?;
                 let mut checked = execute_expression_types(
                     store,
+                    host,
                     global_types,
                     session,
                     current_flow_types,
@@ -31157,6 +31297,7 @@ where
             }
             let receiver = execute_expression_types(
                 store,
+                host,
                 global_types,
                 session,
                 current_flow_types,
@@ -32138,6 +32279,164 @@ pub(super) fn missing_source_identifier_library(name: &str) -> Option<&'static s
     }
 }
 
+fn type_permits_uninitialized_read(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<bool, SourceCheckError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(RelationUnavailable::Type(type_))?;
+    if record
+        .flags()
+        .intersects(TypeFlags::ANY_OR_UNKNOWN | TypeFlags::UNDEFINED | TypeFlags::VOID)
+    {
+        return Ok(true);
+    }
+    let TypeData::Union(union) = record.data() else {
+        return Ok(false);
+    };
+    for &constituent in &union.union.types {
+        let record = store
+            .type_payload(constituent)
+            .ok_or(RelationUnavailable::Type(constituent))?;
+        if record.flags().intersects(TypeFlags::UNDEFINED) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn uninitialized_local_read_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: &PlannedExpression,
+) -> Result<Option<NodeRef>, SourceCheckError> {
+    let PlannedExpressionKind::Identifier(read) = &expression.kind else {
+        return Ok(None);
+    };
+    if !expression.used_before_assignment || read.kind != PlannedIdentifierReadKind::Variable {
+        return Ok(None);
+    }
+    super::source_flow::annotated_uninitialized_local_read_annotation(
+        store,
+        host,
+        expression.node,
+        read.value_symbol,
+    )
+    .map_err(|_| {
+        SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(read.value_symbol))
+    })
+}
+
+// A recovered read uses its declared type. The binder condition still uses its flow type.
+fn checked_identifier_flow_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: &PlannedExpression,
+    current: TypeId,
+    checked: &CheckedExpressionTypes,
+) -> Result<TypeId, SourceCheckError> {
+    if checked.raw == current {
+        return Ok(current);
+    }
+    let expression = expression.unparenthesized();
+    if uninitialized_local_read_annotation(store, host, expression)?.is_some()
+        && type_permits_uninitialized_read(store, current)?
+        && !type_permits_uninitialized_read(store, checked.raw)?
+        && store
+            .type_node_links(expression.node)
+            .and_then(|links| links.resolved_type)
+            == Some(checked.raw)
+    {
+        return Ok(current);
+    }
+    Ok(checked.raw)
+}
+
+#[allow(clippy::too_many_arguments)] // The read keeps the source query's options, capabilities, and caller.
+fn check_uninitialized_identifier_read(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    expression: &PlannedExpression,
+    read: PlannedIdentifierRead,
+    annotation: NodeRef,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    let current =
+        current_flow_types
+            .get(&read.value_symbol)
+            .copied()
+            .ok_or(SourceCheckError::Variable(
+                VariableInvariant::MissingCurrentFlowType(read.value_symbol),
+            ))?;
+    let mut result = current;
+    if options.intrinsic.strict_null_checks && type_permits_uninitialized_read(store, current)? {
+        let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+        let declared = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            &mut annotation_diagnostics,
+        )?
+        .with_type_reference_alias_targets(
+            type_import_execution
+                .annotation_capabilities
+                .get(&annotation)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .copied(),
+        )?
+        .get_type_from_type_node(annotation);
+        merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+        let declared = declared?;
+        if !type_permits_uninitialized_read(store, declared)? {
+            let node = host
+                .node(expression.node)
+                .ok_or(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MissingNode(expression.node),
+                ))?;
+            let NodeData::Identifier(identifier) = &node.data else {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(read.value_symbol),
+                ));
+            };
+            let asserted = node
+                .parent
+                .map(|parent| NodeRef::new(expression.node.arena, expression.node.file, parent))
+                .and_then(|parent| host.node(parent))
+                .is_some_and(|parent| {
+                    matches!(&parent.data, NodeData::NonNullExpression(non_null)
+                        if non_null.expression == expression.node.node)
+                });
+            if !asserted {
+                merge_retry_diagnostic(
+                    diagnostics,
+                    CanonicalCheckerDiagnostic {
+                        node: Some(expression.node),
+                        range_override: None,
+                        diagnostic: Diagnostic::with_arguments(
+                            message_by_code(2454)
+                                .ok_or(SourceCheckError::MissingDiagnostic(2454))?,
+                            [identifier.text.clone()],
+                        ),
+                        related_information: Vec::new(),
+                    },
+                );
+            }
+            result = declared;
+        }
+    }
+    publish_expression_type(store, expression.node, result)?;
+    Ok(CheckedExpressionTypes::leaf(result, result))
+}
+
 fn emit_uninitialized_variable_read_diagnostics(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -32162,6 +32461,9 @@ fn emit_uninitialized_variable_read_diagnostics(
             }
         }
         PlannedExpressionKind::Identifier(read) if expression.used_before_assignment => {
+            if uninitialized_local_read_annotation(store, host, expression)?.is_some() {
+                return Ok(());
+            }
             let type_ =
                 *current_flow_types
                     .get(&read.value_symbol)
@@ -32959,6 +33261,7 @@ fn check_source_object_literal_getters(
                 };
             execute_expression_types(
                 store,
+                Some(host),
                 Some(global_types),
                 session,
                 current_flow_types,
@@ -33363,6 +33666,23 @@ fn check_expression_type_with_capture_context(
             expression,
         )?;
     }
+    if let Some(annotation) = uninitialized_local_read_annotation(store, host, expression)?
+        && let PlannedExpressionKind::Identifier(read) = &expression.kind
+    {
+        return check_uninitialized_identifier_read(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            current_flow_types,
+            type_import_execution,
+            expression,
+            *read,
+            annotation,
+        );
+    }
     if options.no_implicit_any
         && let PlannedExpressionKind::Identifier(read) = &expression.kind
         && read.kind == PlannedIdentifierReadKind::Variable
@@ -33668,8 +33988,13 @@ fn check_expression_type_with_capture_context(
             ))
         }
         PlannedExpressionKind::Conditional(conditional) => {
-            let condition = if conditional.condition_expectation
-                == ConditionalScalarExpectation::Error
+            let condition = if uninitialized_local_read_annotation(
+                store,
+                host,
+                conditional.condition.unparenthesized(),
+            )?
+            .is_some()
+                || conditional.condition_expectation == ConditionalScalarExpectation::Error
                 || conditional.condition_expectation == ConditionalScalarExpectation::Dynamic
                     && matches!(
                         conditional.condition.unparenthesized().kind,
@@ -33732,10 +34057,32 @@ fn check_expression_type_with_capture_context(
                             read.value_symbol,
                         )) =>
                 {
+                    let condition_type = if uninitialized_local_read_annotation(
+                        store,
+                        host,
+                        conditional.condition.unparenthesized(),
+                    )?
+                    .is_some()
+                    {
+                        let current = current_flow_types.get(&read.value_symbol).copied().ok_or(
+                            SourceCheckError::Variable(VariableInvariant::MissingCurrentFlowType(
+                                read.value_symbol,
+                            )),
+                        )?;
+                        checked_identifier_flow_type(
+                            store,
+                            host,
+                            &conditional.condition,
+                            current,
+                            &condition,
+                        )?
+                    } else {
+                        condition.result
+                    };
                     let truthy = narrow_by_truthiness(
                         store,
                         Some(global_types),
-                        condition.result,
+                        condition_type,
                         TruthinessAssumption::Truthy,
                     )
                     .map_err(|error| match error {
@@ -33745,7 +34092,7 @@ fn check_expression_type_with_capture_context(
                     let falsy = narrow_by_truthiness(
                         store,
                         Some(global_types),
-                        condition.result,
+                        condition_type,
                         TruthinessAssumption::Falsy,
                     )
                     .map_err(|error| match error {
@@ -33780,17 +34127,23 @@ fn check_expression_type_with_capture_context(
             let when_true_flow = branch_flow_types
                 .as_ref()
                 .map_or(current_flow_types, |(truthy, _)| truthy);
-            let when_true = if matches!(
-                conditional.when_true_expectation,
-                ConditionalScalarExpectation::Error
-                    | ConditionalScalarExpectation::Object
-                    | ConditionalScalarExpectation::EnumMember(_)
-            ) || conditional.when_true_expectation
-                == ConditionalScalarExpectation::Dynamic
-                && matches!(
-                    conditional.when_true.unparenthesized().kind,
-                    PlannedExpressionKind::Conditional(_) | PlannedExpressionKind::Call(_)
+            let when_true = if uninitialized_local_read_annotation(
+                store,
+                host,
+                conditional.when_true.unparenthesized(),
+            )?
+            .is_some()
+                || matches!(
+                    conditional.when_true_expectation,
+                    ConditionalScalarExpectation::Error
+                        | ConditionalScalarExpectation::Object
+                        | ConditionalScalarExpectation::EnumMember(_)
                 )
+                || conditional.when_true_expectation == ConditionalScalarExpectation::Dynamic
+                    && matches!(
+                        conditional.when_true.unparenthesized().kind,
+                        PlannedExpressionKind::Conditional(_) | PlannedExpressionKind::Call(_)
+                    )
                 || matches!(
                     &conditional.when_true.unparenthesized().kind,
                     PlannedExpressionKind::Binary(binary)
@@ -33825,17 +34178,23 @@ fn check_expression_type_with_capture_context(
             let when_false_flow = branch_flow_types
                 .as_ref()
                 .map_or(current_flow_types, |(_, falsy)| falsy);
-            let when_false = if matches!(
-                conditional.when_false_expectation,
-                ConditionalScalarExpectation::Error
-                    | ConditionalScalarExpectation::Object
-                    | ConditionalScalarExpectation::EnumMember(_)
-            ) || conditional.when_false_expectation
-                == ConditionalScalarExpectation::Dynamic
-                && matches!(
-                    conditional.when_false.unparenthesized().kind,
-                    PlannedExpressionKind::Conditional(_) | PlannedExpressionKind::Call(_)
+            let when_false = if uninitialized_local_read_annotation(
+                store,
+                host,
+                conditional.when_false.unparenthesized(),
+            )?
+            .is_some()
+                || matches!(
+                    conditional.when_false_expectation,
+                    ConditionalScalarExpectation::Error
+                        | ConditionalScalarExpectation::Object
+                        | ConditionalScalarExpectation::EnumMember(_)
                 )
+                || conditional.when_false_expectation == ConditionalScalarExpectation::Dynamic
+                    && matches!(
+                        conditional.when_false.unparenthesized().kind,
+                        PlannedExpressionKind::Conditional(_) | PlannedExpressionKind::Call(_)
+                    )
                 || matches!(
                     &conditional.when_false.unparenthesized().kind,
                     PlannedExpressionKind::Binary(binary)
@@ -36066,6 +36425,7 @@ fn check_expression_type_with_capture_context(
                         };
                     execute_expression_types(
                         store,
+                        Some(host),
                         Some(global_types),
                         session,
                         current_flow_types,
@@ -41924,7 +42284,9 @@ fn check_conditional_return_branches(
             continue;
         }
 
-        let checked = if matches!(expression.kind, PlannedExpressionKind::Call(_)) {
+        let checked = if matches!(expression.kind, PlannedExpressionKind::Call(_))
+            || uninitialized_local_read_annotation(store, host, expression)?.is_some()
+        {
             let type_ = store
                 .type_node_links(expression.node)
                 .and_then(|links| links.resolved_type)
@@ -44648,7 +45010,9 @@ fn check_planned_typeof_switch_function_statements(
         None,
         deferred,
     )?;
-    if identifier.raw != current {
+    if checked_identifier_flow_type(store, host, &statements.identifier, current, &identifier)?
+        != current
+    {
         return Err(SourceCheckError::Function(
             SourceFunctionInvariant::Callable(callable.declaration),
         ));
@@ -48447,12 +48811,23 @@ fn check_planned_linear_function_statements_with_capture_entries(
                 let snapshot = frame
                     .snapshot_at(store, global_types, assignment.statement)
                     .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-                let declared_type = store
-                    .value_symbol_links(assignment.flow.symbol)
-                    .and_then(|links| links.resolved_type)
-                    .ok_or(SourceCheckError::Variable(
-                        VariableInvariant::MissingCurrentFlowType(assignment.flow.symbol),
-                    ))?;
+                let declared_type = if statements.locals.iter().any(|local| {
+                    local.declaration == assignment.flow.parameter
+                        && local.symbol == assignment.flow.symbol
+                        && matches!(
+                            local.initializer,
+                            PlannedVariableInitializer::AbsentAnnotated
+                        )
+                }) {
+                    staged_value_types.get(&assignment.flow.symbol).copied()
+                } else {
+                    store
+                        .value_symbol_links(assignment.flow.symbol)
+                        .and_then(|links| links.resolved_type)
+                }
+                .ok_or(SourceCheckError::Variable(
+                    VariableInvariant::MissingCurrentFlowType(assignment.flow.symbol),
+                ))?;
                 let checked = check_assignment_to_type_with_capture_context(
                     store,
                     host,
@@ -49177,7 +49552,12 @@ fn check_planned_truthiness_condition(
         None,
         deferred,
     )?;
-    if condition_flow.type_of(condition_symbol) != Some(checked.raw)
+    let flow_matches = if let Some(current) = condition_flow.type_of(condition_symbol) {
+        checked_identifier_flow_type(store, host, condition, current, &checked)? == current
+    } else {
+        false
+    };
+    if !flow_matches
         || !source_truthiness_condition_type_is_supported(
             store,
             checked.result,
@@ -49259,7 +49639,9 @@ fn check_planned_typeof_condition(
             None,
             deferred,
         )?;
-        if identifier.raw != current {
+        if checked_identifier_flow_type(store, host, &condition.identifier, current, &identifier)?
+            != current
+        {
             return Err(SourceCheckError::Function(
                 SourceFunctionInvariant::Callable(callable.declaration),
             ));
@@ -49308,7 +49690,9 @@ fn check_planned_typeof_condition(
             None,
             deferred,
         )?;
-        if identifier.raw != current {
+        if checked_identifier_flow_type(store, host, &condition.identifier, current, &identifier)?
+            != current
+        {
             return Err(SourceCheckError::Function(
                 SourceFunctionInvariant::Callable(callable.declaration),
             ));
@@ -49364,7 +49748,9 @@ fn check_planned_typeof_return(
             None,
             deferred,
         )?;
-        if checked.raw != current {
+        if checked_identifier_flow_type(store, host, &condition.identifier, current, &checked)?
+            != current
+        {
             return Err(SourceCheckError::Function(
                 SourceFunctionInvariant::Callable(callable.declaration),
             ));
@@ -49471,7 +49857,9 @@ fn check_planned_equality_condition(
                     .type_node_links(condition.identifier)
                     .and_then(|links| links.resolved_type)
             } else {
-                Some(result.raw)
+                Some(checked_identifier_flow_type(
+                    store, host, expression, current, &result,
+                )?)
             };
             if identifier_type != Some(current)
                 || condition.discriminant.is_some_and(|access| {
@@ -49756,103 +50144,155 @@ fn check_planned_function_locals(
     value_order: &mut Vec<SemanticSymbolId>,
 ) -> Result<(), SourceCheckError> {
     for local in locals {
-        let PlannedVariableInitializer::Expression(initializer) = &local.initializer else {
-            return Err(SourceCheckError::Variable(
-                VariableInvariant::InvalidSymbolShape(local.symbol),
-            ));
+        let initializer = match &local.initializer {
+            PlannedVariableInitializer::Expression(initializer) => Some(initializer),
+            PlannedVariableInitializer::AbsentAnnotated if local.type_node.is_some() => None,
+            _ => {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(local.symbol),
+                ));
+            }
         };
         session.reset_query();
         let snapshot = frame
             .snapshot_at(store, global_types, local.name)
             .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-        let (declared_type, mut current_type) = if let Some(type_node) = local.type_node {
-            let assignment = check_planned_assignment_with_capture_context(
-                store,
-                host,
-                global_types,
-                source,
-                options,
-                session,
-                diagnostics,
-                snapshot.types(),
-                type_import_execution,
-                deferred,
-                type_node,
-                type_import_capabilities
-                    .get(&type_node)
-                    .map_or(&[], Vec::as_slice),
-                initializer,
-                local.name,
-                None,
-                arrow_capture,
-            )?;
-            (
-                assignment.declared_type,
-                current_flow_type_after_assignment(
+        let (declared_type, mut current_type) = if let Some(initializer) = initializer {
+            if let Some(type_node) = local.type_node {
+                let assignment = check_planned_assignment_with_capture_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    snapshot.types(),
+                    type_import_execution,
+                    deferred,
+                    type_node,
+                    type_import_capabilities
+                        .get(&type_node)
+                        .map_or(&[], Vec::as_slice),
+                    initializer,
+                    local.name,
+                    None,
+                    arrow_capture,
+                )?;
+                (
+                    assignment.declared_type,
+                    current_flow_type_after_assignment(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        assignment,
+                    )?,
+                )
+            } else {
+                let initializer = check_expression_type_with_capture_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    snapshot.types(),
+                    type_import_execution,
+                    initializer,
+                    None,
+                    deferred,
+                    None,
+                    arrow_capture,
+                )?;
+                let declared_type = if local.evolving_array {
+                    global_types.auto_array_type
+                } else {
+                    inferred_variable_type(store, global_types, local.binding, initializer.result)?
+                };
+                if local.evolving_array {
+                    let never = store
+                        .intrinsic_bootstrap()
+                        .ok_or(SourceCheckError::LiteralCache(
+                            SourceLiteralCacheError::BootstrapUninitialized,
+                        ))?
+                        .never_type;
+                    let evolving = store.create_evolving_array_type(never)?;
+                    stage_value_type(
+                        store,
+                        staged_value_types,
+                        value_order,
+                        local.symbol,
+                        declared_type,
+                    )?;
+                    frame
+                        .complete_assignment(local.declaration, local.symbol, evolving)
+                        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                    continue;
+                }
+                let current_type = current_flow_type_after_assignment(
                     store,
                     host,
                     global_types,
                     options,
                     session,
                     diagnostics,
-                    assignment,
-                )?,
-            )
+                    CheckedAssignment {
+                        declared_type,
+                        assigned_type: initializer.result,
+                    },
+                )?;
+                (declared_type, current_type)
+            }
         } else {
-            let initializer = check_expression_type_with_capture_context(
+            let type_node = local.type_node.ok_or(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(local.symbol),
+            ))?;
+            let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+            let declared_type = CanonicalTypeQuery::new_with_global_types_and_session(
                 store,
                 host,
                 global_types,
-                source,
                 options,
                 session,
-                diagnostics,
-                snapshot.types(),
-                type_import_execution,
-                initializer,
-                None,
-                deferred,
-                None,
-                arrow_capture,
-            )?;
-            let declared_type = if local.evolving_array {
-                global_types.auto_array_type
-            } else {
-                inferred_variable_type(store, global_types, local.binding, initializer.result)?
-            };
-            if local.evolving_array {
-                let never = store
+                &mut annotation_diagnostics,
+            )?
+            .with_type_reference_alias_targets(
+                type_import_capabilities
+                    .get(&type_node)
+                    .map_or([].as_slice(), Vec::as_slice)
+                    .iter()
+                    .copied(),
+            )?
+            .get_type_from_type_node(type_node);
+            merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+            let declared_type = declared_type?;
+            let initial_type = if options.intrinsic.strict_null_checks
+                && !callable
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.symbol == local.symbol)
+                && !type_permits_uninitialized_read(store, declared_type)?
+            {
+                let undefined = store
                     .intrinsic_bootstrap()
                     .ok_or(SourceCheckError::LiteralCache(
                         SourceLiteralCacheError::BootstrapUninitialized,
                     ))?
-                    .never_type;
-                let evolving = store.create_evolving_array_type(never)?;
-                stage_value_type(
-                    store,
-                    staged_value_types,
-                    value_order,
-                    local.symbol,
-                    declared_type,
-                )?;
-                frame
-                    .complete_assignment(local.declaration, local.symbol, evolving)
-                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-                continue;
-            }
-            let current_type = current_flow_type_after_assignment(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                diagnostics,
-                CheckedAssignment {
-                    declared_type,
-                    assigned_type: initializer.result,
-                },
-            )?;
-            (declared_type, current_type)
+                    .undefined_type;
+                store.expression_union_type_with_global_types_and_session(
+                    global_types,
+                    &[declared_type, undefined],
+                    UnionReduction::Literal,
+                    session,
+                )?
+            } else {
+                declared_type
+            };
+            (declared_type, initial_type)
         };
         if let Some(parameter) = callable
             .parameters
@@ -49915,18 +50355,20 @@ fn check_planned_function_locals(
                     },
                 );
             }
-            current_type = current_flow_type_after_assignment(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                diagnostics,
-                CheckedAssignment {
-                    declared_type: parameter_type,
-                    assigned_type: current_type,
-                },
-            )?;
+            if initializer.is_some() {
+                current_type = current_flow_type_after_assignment(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    CheckedAssignment {
+                        declared_type: parameter_type,
+                        assigned_type: current_type,
+                    },
+                )?;
+            }
         } else {
             stage_value_type(
                 store,
@@ -49936,9 +50378,26 @@ fn check_planned_function_locals(
                 declared_type,
             )?;
         }
-        frame
-            .complete_assignment(local.declaration, local.symbol, current_type)
-            .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+        if initializer.is_some() {
+            frame
+                .complete_assignment(local.declaration, local.symbol, current_type)
+                .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+        } else if !callable
+            .parameters
+            .iter()
+            .any(|parameter| parameter.symbol == local.symbol)
+        {
+            frame
+                .enter_uninitialized_local(
+                    store,
+                    host,
+                    local.declaration,
+                    local.symbol,
+                    declared_type,
+                    current_type,
+                )
+                .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+        }
     }
     Ok(())
 }

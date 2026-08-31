@@ -63,6 +63,7 @@ use super::{
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
+    variables::{VariableBindingKind, plan_top_level_variable},
 };
 
 const FLOW_DEPTH_LIMIT: usize = 2_000;
@@ -4644,6 +4645,43 @@ fn class_type_has_uninitialized_value(
 }
 
 impl SourceFlowFrame<'_, '_> {
+    /// Keeps a local's declared type and initial flow type without an assignment node.
+    pub(super) fn enter_uninitialized_local(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+        declared_type: TypeId,
+        initial_type: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        let invalid = || SourceFlowInvariant::InvalidParameterAssignment(declaration);
+        let (arena, _) = host.source(declaration).ok_or_else(invalid)?;
+        let (name, _) = annotated_uninitialized_local(
+            arena,
+            self.bound,
+            store,
+            self.plan.container,
+            declaration,
+            symbol,
+        )?;
+        if self.plan.region.is_some()
+            || self.plan.class_body.is_some()
+            || !self.plan.points.contains_key(&name)
+            || self.plan.assignments.contains_key(&declaration)
+            || store.type_payload(declared_type).is_none()
+            || store.type_payload(initial_type).is_none()
+            || self.declared_types.contains_key(&symbol)
+            || self.base.type_of(symbol).is_some()
+        {
+            return Err(invalid().into());
+        }
+        self.declared_types.insert(symbol, declared_type);
+        self.base = self.base.with_type(symbol, initial_type);
+        self.memo.clear();
+        Ok(())
+    }
+
     pub(super) fn set_source_declared_entry_types(
         &mut self,
         store: &CanonicalTypeMapperStore,
@@ -6975,6 +7013,252 @@ fn validate_class_local_assignment(
     Ok(())
 }
 
+/// Rechecks the real declaration and mutable binding used by a local flow entry.
+fn annotated_uninitialized_local(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    container: NodeRef,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<(NodeRef, NodeRef), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(declaration);
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || !container.is_for(arena.id(), bound.file_id())
+        || !bound.contains(container)
+        || !declaration.is_for(arena.id(), bound.file_id())
+        || !bound.contains(declaration)
+        || bound.container(declaration) != Some(container)
+    {
+        return Err(invalid().into());
+    }
+    let reference = |node| NodeRef::new(declaration.arena, declaration.file, node);
+    let callable = arena.get(container.node).ok_or_else(invalid)?;
+    let body = match &callable.data {
+        NodeData::FunctionDeclaration(function)
+            if callable.kind == SyntaxKind::FunctionDeclaration =>
+        {
+            function.body.map(reference).ok_or_else(invalid)?
+        }
+        NodeData::ArrowFunction(_) if callable.kind == SyntaxKind::ArrowFunction => {
+            validate_source_arrow_owner(arena, bound, store, container)?
+        }
+        NodeData::MethodDeclaration(method)
+            if callable.kind == SyntaxKind::MethodDeclaration
+                && bound.symbol(container).is_some_and(|owner| {
+                    store.source_object_literal_method_owner_is_exact(container, owner)
+                }) =>
+        {
+            method.body.map(reference).ok_or_else(invalid)?
+        }
+        _ => return Err(invalid().into()),
+    };
+    let body_record = arena.get(body.node).ok_or_else(invalid)?;
+    if body_record.kind != SyntaxKind::Block
+        || body_record.parent != Some(container.node)
+        || !matches!(body_record.data, NodeData::Block(_))
+    {
+        return Err(invalid().into());
+    }
+    let record = arena.get(declaration.node).ok_or_else(invalid)?;
+    let NodeData::VariableDeclaration(variable) = &record.data else {
+        return Err(invalid().into());
+    };
+    let name = reference(variable.name);
+    let name_record = arena.get(name.node).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid().into());
+    };
+    let annotation = variable
+        .type_
+        .and_then(|node| arena.get(node))
+        .ok_or_else(invalid)?;
+    let list = record
+        .parent
+        .and_then(|node| arena.get(node))
+        .ok_or_else(invalid)?;
+    let NodeData::VariableDeclarationList(declarations) = &list.data else {
+        return Err(invalid().into());
+    };
+    let binding = match list.flags.0 {
+        0 => VariableBindingKind::Var,
+        1 => VariableBindingKind::Let,
+        _ => return Err(invalid().into()),
+    };
+    let statement = list.parent.map(reference).ok_or_else(invalid)?;
+    let statement_record = arena.get(statement.node).ok_or_else(invalid)?;
+    let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+        return Err(invalid().into());
+    };
+    let scope = bound
+        .block_scope_container(declaration)
+        .ok_or_else(invalid)?;
+    let locals_scope = if binding == VariableBindingKind::Var {
+        container
+    } else {
+        scope
+    };
+    if record.kind != SyntaxKind::VariableDeclaration
+        || record.flags.0 != 0
+        || variable.initializer.is_some()
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || annotation.parent != Some(declaration.node)
+        || list.kind != SyntaxKind::VariableDeclarationList
+        || declarations
+            .declarations
+            .nodes
+            .iter()
+            .filter(|node| **node == declaration.node)
+            .count()
+            != 1
+        || declarations.declarations.has_trailing_comma
+        || declarations.facts != 0
+        || statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.flags.0 != 0
+        || Some(statement_data.declaration_list) != record.parent
+        || statement_data.modifiers.is_some()
+        || statement_data.flow_node.is_some()
+        || statement_data.facts != 0
+        || !source_node_is_descendant_of(arena, statement, body.node)
+        || bound.block_scope_container(name) != Some(scope)
+        || bound.block_scope_container(statement) != Some(scope)
+        || bound
+            .locals(locals_scope)
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get_source(&identifier.text))
+            != Some(symbol)
+        || plan_top_level_variable(
+            bound,
+            store,
+            declaration,
+            name,
+            &identifier.text,
+            binding,
+            false,
+        )
+        .map_err(|_| invalid())?
+            != symbol
+    {
+        return Err(invalid().into());
+    }
+    Ok((name, body))
+}
+
+/// Reads the written type only after matching the local and its actual bound read.
+pub(super) fn annotated_uninitialized_local_read_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    read: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<Option<NodeRef>, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(read);
+    let (arena, bound) = host.source(read).ok_or_else(invalid)?;
+    let declaration = store
+        .symbol(symbol)
+        .and_then(ts_binder::semantic::Symbol::value_declaration)
+        .ok_or_else(invalid)?;
+    let container = bound.container(declaration).ok_or_else(invalid)?;
+    if container == bound.source_file() {
+        return Ok(None);
+    }
+    if bound.container(read) != Some(container)
+        || bound.flow_container(read) != Some(container)
+        || own_class_flow_symbol(store, host, bound, read)? != symbol
+    {
+        return Err(invalid().into());
+    }
+    annotated_uninitialized_local(arena, bound, store, container, declaration, symbol)?;
+    let NodeData::VariableDeclaration(variable) =
+        &arena.get(declaration.node).ok_or_else(invalid)?.data
+    else {
+        return Err(invalid().into());
+    };
+    variable
+        .type_
+        .map(|node| Some(NodeRef::new(declaration.arena, declaration.file, node)))
+        .ok_or_else(|| invalid().into())
+}
+
+fn validate_annotated_local_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    container: NodeRef,
+    assignment: SourceFlowParameterAssignment,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(assignment.target);
+    let (name, body) = annotated_uninitialized_local(
+        arena,
+        bound,
+        store,
+        container,
+        assignment.parameter,
+        assignment.symbol,
+    )?;
+    let target = arena.get(assignment.target.node).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &target.data else {
+        return Err(invalid().into());
+    };
+    let expression = target
+        .parent
+        .and_then(|node| arena.get(node))
+        .ok_or_else(invalid)?;
+    let NodeData::BinaryExpression(binary) = &expression.data else {
+        return Err(invalid().into());
+    };
+    let operator = arena.get(binary.operator_token).ok_or_else(invalid)?;
+    let statement = expression
+        .parent
+        .and_then(|node| arena.get(node))
+        .ok_or_else(invalid)?;
+    let NodeData::ExpressionStatement(statement_data) = &statement.data else {
+        return Err(invalid().into());
+    };
+    if !assignment.target.is_for(arena.id(), bound.file_id())
+        || !bound.contains(assignment.target)
+        || bound.container(assignment.target) != Some(container)
+        || bound.block_scope_container(assignment.target) != Some(container)
+        || bound.flow_container(assignment.target) != Some(container)
+        || bound.locals(container)
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get_source(&identifier.text)) != Some(assignment.symbol)
+        || target.kind != SyntaxKind::Identifier
+        || target.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || arena.get(name.node).is_none_or(|record| {
+            !matches!(&record.data, NodeData::Identifier(name) if name.text == identifier.text)
+        })
+        || expression.kind != SyntaxKind::BinaryExpression
+        || expression.flags.0 != 0
+        || binary.left != assignment.target.node
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.facts != 0
+        || binary.modifiers.is_some()
+        || operator.kind != SyntaxKind::EqualsToken
+        || operator.flags.0 != 0
+        || operator.parent != target.parent
+        || !matches!(operator.data, NodeData::Token(_))
+        || arena.get(binary.right).is_none_or(|right| right.parent != target.parent)
+        || statement.kind != SyntaxKind::ExpressionStatement
+        || statement.flags.0 != 0
+        || statement.parent != Some(body.node)
+        || Some(statement_data.expression) != target.parent
+        || statement_data.flow_node.is_some()
+    {
+        return Err(invalid().into());
+    }
+    Ok(())
+}
+
 fn validate_parameter_assignment(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -6982,6 +7266,12 @@ fn validate_parameter_assignment(
     container: NodeRef,
     assignment: SourceFlowParameterAssignment,
 ) -> Result<(), SourceFlowError> {
+    if arena
+        .get(assignment.parameter.node)
+        .is_some_and(|record| record.kind == SyntaxKind::VariableDeclaration)
+    {
+        return validate_annotated_local_assignment(arena, bound, store, container, assignment);
+    }
     let invalid = || SourceFlowInvariant::InvalidParameterAssignment(assignment.target);
     if !assignment.target.is_for(arena.id(), bound.file_id())
         || !assignment.parameter.is_for(arena.id(), bound.file_id())
