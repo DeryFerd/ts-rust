@@ -19891,7 +19891,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         .map_err(|error| Self::new_plan_error(access, error))?;
         if !self
             .prior_classes
-            .contains_key(&construction.resolved_symbol())
+            .contains_key(&construction.provider_symbol())
             || construction
                 .constructor_accessibility_diagnostic(self.arena, self.bound, store, host)
                 .map_err(|error| Self::new_plan_error(access, error))?
@@ -65342,7 +65342,7 @@ pub(super) fn check_source_file(
         source,
         early_default_news
             .iter()
-            .map(|construction| (construction.node(), construction.resolved_symbol())),
+            .map(|construction| (construction.node(), construction.provider_symbol())),
         |store| {
             prepare_direct_default_news(
                 store,
@@ -66113,7 +66113,7 @@ pub(super) fn check_source_file(
         source,
         default_news
             .iter()
-            .map(|construction| (construction.node(), construction.resolved_symbol())),
+            .map(|construction| (construction.node(), construction.provider_symbol())),
         |store| {
             prepare_direct_default_news(
                 store,

@@ -16798,6 +16798,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.strict_builtin_iterator_return,
             self.type_reference_alias_targets,
         );
+        // Keep warm references in the local intersection operand plan.
+        planner.intersection_planning_depth = 1;
         let mut children = Vec::new();
         let mut previous_end = record.range.start;
         for &child in &intersection.types.nodes {

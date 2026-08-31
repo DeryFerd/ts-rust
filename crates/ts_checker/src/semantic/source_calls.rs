@@ -5402,7 +5402,18 @@ fn resolve_source_call_once(
     } else {
         false
     };
-    if explicit_type_arguments.is_none() || nongeneric_type_arguments {
+    // A generic call caches an instantiation, not a declaration candidate or
+    // a nongeneric overload-failure signature. Its own resolver checks that cache.
+    let generic_source_call = form == DirectCallForm::Call
+        && matches!(
+            validate_stored_source_callable(store, callee_type),
+            StoredSourceCallableValidation::Valid(_)
+        )
+        && store
+            .source_callable_provenance(callee_type)
+            .and_then(|provenance| store.signature(provenance.signature))
+            .is_some_and(|signature| !signature.type_parameters().is_empty());
+    if explicit_type_arguments.is_none() && !generic_source_call || nongeneric_type_arguments {
         if let Some(existing) = existing_call_signature
             && let StoredCallableSetValidation::Valid { projection, .. } =
                 validate_stored_callable_set_with_array_targets(
@@ -15125,6 +15136,244 @@ mod tests {
             signatures
         );
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source proves the saved signature, mapper, and caller together.
+    fn generic_source_replay_keeps_saved_signatures_mappers_and_caller_state() {
+        let source = parsed(concat!(
+            "declare function identity<T>(value: T): T; ",
+            "declare function other<T>(value: T): T; ",
+            "identity('kept'); identity('other'); other('kept');",
+        ));
+        let file = FileId::new(203_801);
+        let mut context = context(&source, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let mut call_nodes = calls(&source, file);
+        call_nodes.sort_by_key(|call| source.arena.get(call.node).unwrap().range.start);
+        let [first, changed_argument, changed_owner] = call_nodes.as_slice() else {
+            panic!("expected two identity calls and one call to the other declaration")
+        };
+        let first = *first;
+        let signatures = [first, *changed_argument, *changed_owner].map(|call| {
+            context
+                .store()
+                .signature_links(call)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap()
+        });
+        let owner = first_function_symbol(&source, &context, file);
+        let callee = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let original = context
+            .store()
+            .source_callable_provenance(callee)
+            .unwrap()
+            .signature;
+        let type_parameter = context
+            .store()
+            .signature(original)
+            .unwrap()
+            .type_parameters()[0];
+        let record = context.store().signature(signatures[0]).unwrap();
+        let mapper = record.mapper().unwrap();
+        let returned = record.resolved_return_type().unwrap();
+        let parameter = record.parameters()[0];
+        assert_eq!(record.target(), Some(original));
+        assert_eq!(
+            context.store().signature(signatures[1]).unwrap().target(),
+            Some(original)
+        );
+        assert_ne!(
+            context.store().signature(signatures[2]).unwrap().target(),
+            Some(original)
+        );
+        assert_ne!(signatures[0], signatures[1]);
+        let changed_mapper = context
+            .store()
+            .signature(signatures[1])
+            .unwrap()
+            .mapper()
+            .unwrap();
+        assert_ne!(mapper, changed_mapper);
+        assert_eq!(
+            context
+                .store()
+                .type_mapper_has_exact_endpoints(mapper, &[type_parameter], &[returned]),
+            Some(true),
+        );
+        let NodeData::CallExpression(call) = &source.arena.get(first.node).unwrap().data else {
+            panic!("the saved call must retain its real argument")
+        };
+        let argument = NodeRef::new(source.arena.id(), file, call.arguments.nodes[0]);
+        let arguments = [context
+            .store()
+            .type_node_links(argument)
+            .unwrap()
+            .resolved_type
+            .unwrap()];
+        let bound = context.file(file).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_count: 1,
+            ..InstantiationLimits::default()
+        });
+        assert_eq!(
+            super::super::instantiate::instantiate_type_with_session(
+                context.store_mut_for_test(),
+                type_parameter,
+                mapper,
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+                &mut session,
+            ),
+            Ok(returned),
+        );
+        let caller_count = session.query_count();
+        assert!(caller_count > 0);
+        let caller_total = session.total_count();
+        let limit_mark = session.limit_event_mark();
+        let resolve = |context: &mut CanonicalCheckerContext<'_>,
+                       session: &mut InstantiationSession,
+                       saved| {
+            resolve_source_call_once(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                Some(saved),
+                session,
+                SourceCallResolutionRequest {
+                    form: DirectCallForm::Call,
+                    callee_type: callee,
+                    argument_types: &arguments,
+                    explicit_type_arguments: None,
+                    receiver: None,
+                },
+            )
+        };
+        let warm = call_publication_state(&context, first);
+        for _ in 0..2 {
+            let ResolvedSourceCall::Vector(resolution) =
+                resolve(&mut context, &mut session, signatures[0]).unwrap()
+            else {
+                panic!("the source declaration must use generic resolution")
+            };
+            assert_eq!(
+                materialize_generic_source_call_selection(
+                    context.store_mut_for_test(),
+                    &mut session,
+                    first,
+                    &resolution,
+                    Some(signatures[0]),
+                ),
+                Ok((signatures[0], returned)),
+            );
+            assert_eq!(call_publication_state(&context, first), warm);
+            assert!(session.query_count() >= caller_count);
+            assert!(session.total_count() >= caller_total);
+            assert!(!session.limit_event_occurred_since(limit_mark));
+        }
+        for wrong in [signatures[1], signatures[2], original] {
+            for _ in 0..2 {
+                assert_eq!(
+                    resolve(&mut context, &mut session, wrong),
+                    Err(SourceCallResolutionError::Invariant)
+                );
+                assert_eq!(call_publication_state(&context, first), warm);
+            }
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_target_and_mapper(
+                    signatures[0],
+                    Some(original),
+                    Some(changed_mapper),
+                )
+        );
+        let damaged = call_publication_state(&context, first);
+        for _ in 0..2 {
+            assert_eq!(
+                resolve(&mut context, &mut session, signatures[0]),
+                Err(SourceCallResolutionError::Invariant)
+            );
+            assert_eq!(call_publication_state(&context, first), damaged);
+            assert_eq!(
+                context.store().signature(signatures[0]).unwrap().mapper(),
+                Some(changed_mapper)
+            );
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_target_and_mapper(signatures[0], Some(original), Some(mapper),)
+        );
+        let ResolvedSourceCall::Vector(resolution) =
+            resolve(&mut context, &mut session, signatures[0]).unwrap()
+        else {
+            panic!("restored provenance must retain the generic route")
+        };
+        assert_eq!(
+            materialize_generic_source_call_selection(
+                context.store_mut_for_test(),
+                &mut session,
+                first,
+                &resolution,
+                Some(signatures[0]),
+            ),
+            Ok((signatures[0], returned)),
+        );
+        assert_eq!(call_publication_state(&context, first), warm);
+        assert!(session.query_count() >= caller_count);
+        assert!(session.total_count() >= caller_total);
+        assert!(!session.limit_event_occurred_since(limit_mark));
+
+        // The saved signature stays intact while its real lazy parameter uses
+        // the caller's exhausted budget. A fresh session would wrongly succeed.
+        let parameter_links = context
+            .store()
+            .value_symbol_links(parameter)
+            .unwrap()
+            .clone();
+        let mut lazy_parameter = parameter_links.clone();
+        lazy_parameter.resolved_type = None;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(parameter, lazy_parameter.clone())
+        );
+        let exhausted = (session.query_count(), session.total_count());
+        for event in 1..=2 {
+            assert_eq!(
+                resolve(&mut context, &mut session, signatures[0]),
+                Err(SourceCallResolutionError::Unsupported)
+            );
+            assert_eq!(session.limit_event_count(), event);
+            assert_eq!((session.query_count(), session.total_count()), exhausted);
+            assert_eq!(
+                context.store().value_symbol_links(parameter),
+                Some(&lazy_parameter)
+            );
+            assert_eq!(call_publication_state(&context, first), warm);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(parameter, parameter_links)
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(call_publication_state(&context, first), warm);
     }
 
     #[test]
