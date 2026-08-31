@@ -8750,7 +8750,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 Ok(false)
             }
             NodeData::TypeReferenceNode(_) => {
-                let symbol = self.resolve_uncached_type_reference_symbol(node)?;
+                let symbol = self.resolve_source_query_reference_symbol(node)?;
                 let symbol = self.store.get_merged_symbol(symbol).ok_or_else(|| {
                     type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
                 })?;
@@ -8801,6 +8801,78 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             _ => Ok(false),
         }
+    }
+
+    /// Classifies imported aliases with the same current proofs used by type planning.
+    fn resolve_source_query_reference_symbol(
+        &self,
+        node: NodeRef,
+    ) -> Result<SemanticSymbolId, DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::TypeReferenceNode(reference) = &record.data else {
+            return self.resolve_uncached_type_reference_symbol(node);
+        };
+        let name = NodeRef::new(node.arena, node.file, reference.type_name);
+        let name_record = preflight_node(self.store, self.host, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return self.resolve_uncached_type_reference_symbol(node);
+        };
+        if name_record.parent != Some(node.node) || name_record.flags.0 & NODE_FLAG_JSDOC != 0 {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        let capability = self.type_reference_alias_targets.get(&node).copied();
+        let probe =
+            source_imports::probe_source_alias_body_type_import(self.store, self.host, node)
+                .map_err(|error| property_type_import_error(node, error))?;
+        if let Some(body) = probe.plan {
+            if capability.is_some_and(|capability| !body.matches_capability(&capability)) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidImportAliasTarget {
+                        node,
+                        alias: body.alias_symbol(),
+                        target: body.target_symbol(),
+                    },
+                ));
+            }
+            return Ok(body.target_symbol());
+        }
+        if let Some(capability) = capability {
+            if let Some(class) = source_imports::plan_source_class_annotation_type_import(
+                self.store, self.host, node,
+            )
+            .map_err(|error| property_type_import_error(node, error))?
+            {
+                if !class.matches_capability(&capability) {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidImportAliasTarget {
+                            node,
+                            alias: class.alias_symbol(),
+                            target: class.target_symbol(),
+                        },
+                    ));
+                }
+                return self.resolve_uncached_type_reference_symbol(node);
+            }
+            return self.resolve_type_reference_alias_target(
+                node,
+                name,
+                &identifier.text,
+                capability,
+                self.store
+                    .symbol_node_links(node)
+                    .and_then(|links| links.resolved_symbol),
+            );
+        }
+        if let Some(resolved) = probe.lexical_resolution {
+            return self
+                .reject_resolved_import_alias_without_capability(node, resolved)?
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::MissingTypeReference(node))
+                });
+        }
+        self.resolve_uncached_type_reference_symbol(node)
     }
 
     fn validate_conditional_reference_metadata(
@@ -9630,7 +9702,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.plan_type_reference(node, alias_owner, union_constituent)
             }
             SyntaxKind::ImportType => {
-                if self.jsdoc_import_type_target.is_some() {
+                if self.jsdoc_import_type_target.is_some()
+                    || self.is_source_jsdoc_import_type(node)?
+                {
                     self.plan_jsdoc_import_type(node, alias_owner, union_constituent)
                 } else {
                     self.plan_ordinary_import_type(node)
@@ -9697,6 +9771,38 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.validate_replayed_annotation_cache(node)?;
         }
         Ok(())
+    }
+
+    // Source identity selects the missing-capability error, not permission to resolve an import.
+    fn is_source_jsdoc_import_type(&self, node: NodeRef) -> Result<bool, DeclaredTypeError> {
+        let Some(bound) = self.host.bound_file(node) else {
+            return Ok(false);
+        };
+        if !bound
+            .source_facts()
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
+        {
+            return Ok(false);
+        }
+        let Some(parent) = preflight_node(self.store, self.host, node)?.parent else {
+            return Ok(false);
+        };
+        let declaration = NodeRef::new(node.arena, node.file, parent);
+        if preflight_node(self.store, self.host, declaration)?.kind
+            != SyntaxKind::JsTypeAliasDeclaration
+        {
+            return Ok(false);
+        }
+        let Some(symbol) = bound
+            .symbol(declaration)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+        else {
+            return Ok(false);
+        };
+        Ok(
+            authenticated_type_alias_declaration(self.store, self.host, declaration, symbol)?
+                .is_some_and(|alias| alias.type_ == node.node),
+        )
     }
 
     fn plan_jsdoc_import_type(
@@ -61835,6 +61941,292 @@ export type Env = {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep cold and prepared import proofs with damage and restoration.
+    fn source_query_import_classification_rechecks_alias_body_proofs_without_writes() {
+        let source = parse_source_file(concat!(
+            "import type { Plain, Choice } from '../types'; ",
+            "type Direct = Plain; type Selected<T> = Choice<T>;",
+        ));
+        let barrel = parse_source_file("export * from './utils';");
+        let provider = parse_source_file(concat!(
+            "export type Plain = number; ",
+            "export type Choice<T> = T extends string ? string : number;",
+        ));
+        let sources = [&source, &barrel, &provider];
+        let (mut context, bounds, manifest) = property_type_import_test_context(sources);
+        let roots = ["Direct", "Selected"]
+            .map(|name| library_query_alias_node(&source, PROPERTY_IMPORT_FILES[0], name));
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let make_host = || {
+            DeclaredTypeHost::new_after_global_merge(
+                sources
+                    .into_iter()
+                    .zip(&bounds)
+                    .map(|(parsed, bound)| (&parsed.arena, bound)),
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap()
+        };
+        let missing_manifest = make_host();
+        let host = make_host().with_module_resolutions(&manifest);
+        let store = context.store_mut_for_test();
+        let imports = roots.map(|node| {
+            source_imports::plan_source_alias_body_type_import(store, &host, node)
+                .unwrap()
+                .unwrap()
+        });
+        let empty = HashMap::new();
+        let classify = |store: &CanonicalTypeMapperStore,
+                        host: &DeclaredTypeHost<'_>,
+                        capabilities: &HashMap<NodeRef, CanonicalTypeReferenceAliasTarget>,
+                        node| {
+            TypeQueryPlanner::new(
+                store,
+                host,
+                Some(globals.array_type),
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+                options.strict_builtin_iterator_return,
+                capabilities,
+            )
+            .with_source_globals(Some(&globals))
+            .source_query_rhs(node, &mut HashSet::new())
+        };
+        assert!(
+            store
+                .alias_symbol_links(imports[0].alias_symbol())
+                .is_none()
+        );
+        assert!(
+            store
+                .alias_symbol_links(imports[1].alias_symbol())
+                .is_none()
+        );
+        for prepared in [false, true] {
+            if prepared {
+                for import in &imports {
+                    source_imports::prepare_source_alias_body_type_import(store, &host, import)
+                        .unwrap();
+                }
+            }
+            let before = format!("{store:?}");
+            for _ in 0..2 {
+                assert_eq!(classify(store, &host, &empty, roots[0]), Ok(false));
+                assert_eq!(classify(store, &host, &empty, roots[1]), Ok(true));
+                assert!(classify(store, &missing_manifest, &empty, roots[0]).is_err());
+                assert_eq!(format!("{store:?}"), before);
+            }
+
+            let declaration = store
+                .symbol(imports[0].alias_symbol())
+                .unwrap()
+                .declarations()
+                .unwrap()[0];
+            let conflict = CanonicalTypeReferenceAliasTarget::new(
+                roots[0],
+                roots[0],
+                declaration,
+                imports[0].alias_symbol(),
+                imports[1].target_symbol(),
+                imports[1].target_symbol(),
+            );
+            let capabilities = HashMap::from([(roots[0], conflict)]);
+            assert_eq!(
+                classify(store, &host, &capabilities, roots[0]),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidImportAliasTarget {
+                        node: roots[0],
+                        alias: imports[0].alias_symbol(),
+                        target: imports[0].target_symbol(),
+                    }
+                )),
+            );
+            assert_eq!(format!("{store:?}"), before);
+        }
+
+        let alias = imports[0].alias_symbol();
+        let original = store.alias_symbol_links(alias).unwrap().clone();
+        let restored = format!("{store:?}");
+        let mut wrong = original.clone();
+        wrong.immediate_target = Some(imports[1].target_symbol());
+        wrong.alias_target = super::super::AliasTargetState::Resolved(imports[1].target_symbol());
+        assert!(store.set_alias_symbol_links(alias, wrong));
+        let damaged = format!("{store:?}");
+        for _ in 0..2 {
+            assert!(classify(store, &host, &empty, roots[0]).is_err());
+            assert_eq!(format!("{store:?}"), damaged);
+        }
+        assert!(store.set_alias_symbol_links(alias, original));
+        assert_eq!(classify(store, &host, &empty, roots[0]), Ok(false));
+        assert_eq!(classify(store, &host, &empty, roots[1]), Ok(true));
+        assert_eq!(format!("{store:?}"), restored);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Use real composite roots and reject stale or substituted capabilities.
+    fn source_query_import_classification_keeps_exact_annotation_capabilities() {
+        let source = parse_source_file(concat!(
+            "import type { Choice, Count } from '../types'; ",
+            "const selected: Choice | null = null; const plain: Count | null = null;",
+        ));
+        let barrel = parse_source_file("export * from './utils';");
+        let provider = parse_source_file(concat!(
+            "export type Choice = unknown extends unknown ? string : number; ",
+            "export type Count = number;",
+        ));
+        let sources = [&source, &barrel, &provider];
+        let (mut context, bounds, manifest) = property_type_import_test_context(sources);
+        let roots = ["selected", "plain"].map(|name| {
+            source
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    (identifier_text(&source.arena, variable.name) == Some(name)).then(|| {
+                        NodeRef::new(
+                            source.arena.id(),
+                            PROPERTY_IMPORT_FILES[0],
+                            variable.type_.unwrap(),
+                        )
+                    })
+                })
+                .unwrap()
+        });
+        let references = roots.map(|root| {
+            let NodeData::UnionTypeNode(union) = &source.arena.get(root.node).unwrap().data else {
+                unreachable!()
+            };
+            NodeRef::new(root.arena, root.file, union.types.nodes[0])
+        });
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ImportDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    PROPERTY_IMPORT_FILES[0],
+                    node,
+                ))
+            })
+            .unwrap();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources
+                .into_iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (&parsed.arena, bound)),
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap()
+        .with_module_resolutions(&manifest);
+        let store = context.store_mut_for_test();
+        let import = source_imports::plan_top_level_named_type_import(
+            &source.arena,
+            &bounds[0],
+            store,
+            declaration,
+        )
+        .unwrap();
+        assert_eq!(import.bindings.len(), 2);
+        let mut aliases = host.alias_target_host(store, &manifest).unwrap();
+        let capabilities = [0, 1].map(|index| {
+            let resolved = source_imports::resolve_source_type_import_binding(
+                store,
+                &mut aliases,
+                &host,
+                &import.bindings[index],
+            )
+            .unwrap();
+            source_imports::plan_source_type_import_reference(
+                store,
+                &host,
+                &resolved,
+                roots[index],
+                references[index],
+            )
+            .unwrap()
+        });
+        let classify = |store: &CanonicalTypeMapperStore,
+                        proof: &HashMap<NodeRef, CanonicalTypeReferenceAliasTarget>,
+                        root| {
+            let planner = TypeQueryPlanner::new(
+                store,
+                &host,
+                Some(globals.array_type),
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+                options.strict_builtin_iterator_return,
+                proof,
+            )
+            .with_source_globals(Some(&globals));
+            planner.require_type_reference_alias_roots_capability([root])?;
+            planner.source_query_rhs(root, &mut HashSet::new())
+        };
+        for (index, expected) in [true, false].into_iter().enumerate() {
+            let root = roots[index];
+            let reference = references[index];
+            let capability = capabilities[index];
+            let proof = HashMap::from([(reference, capability)]);
+            let before = format!("{store:?}");
+            for _ in 0..2 {
+                assert_eq!(classify(store, &proof, root), Ok(expected));
+                assert_eq!(format!("{store:?}"), before);
+            }
+            assert_eq!(
+                classify(store, &HashMap::new(), root),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::ImportAliasTypeReference {
+                        node: reference,
+                        alias: capability.alias,
+                    }
+                )),
+            );
+            let substituted = CanonicalTypeReferenceAliasTarget {
+                root,
+                reference,
+                ..capabilities[1 - index]
+            };
+            assert_eq!(
+                classify(store, &HashMap::from([(reference, substituted)]), root),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidImportAliasTarget {
+                        node: reference,
+                        alias: substituted.alias,
+                        target: substituted.target,
+                    }
+                )),
+            );
+            let wrong_root = CanonicalTypeReferenceAliasTarget {
+                root: roots[1 - index],
+                ..capability
+            };
+            assert_eq!(
+                classify(store, &HashMap::from([(reference, wrong_root)]), root),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::ImportAliasCapabilityUnsupported(reference)
+                )),
+            );
+            assert_eq!(format!("{store:?}"), before);
+
+            let original = store.alias_symbol_links(capability.alias).unwrap().clone();
+            let mut wrong = original.clone();
+            wrong.immediate_target = Some(substituted.immediate_target);
+            wrong.alias_target = super::super::AliasTargetState::Resolved(substituted.target);
+            assert!(store.set_alias_symbol_links(capability.alias, wrong));
+            let damaged = format!("{store:?}");
+            for _ in 0..2 {
+                assert!(classify(store, &proof, root).is_err());
+                assert_eq!(format!("{store:?}"), damaged);
+            }
+            assert!(store.set_alias_symbol_links(capability.alias, original));
+            assert_eq!(classify(store, &proof, root), Ok(expected));
+            assert_eq!(format!("{store:?}"), before);
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Verify the whole import plan before publication and exact session replay.
     fn alias_body_type_import_query_checks_argument_caches_before_publication() {
         let source = parse_source_file(concat!(
@@ -63262,6 +63654,134 @@ export type Env = {
         }
     }
 
+    #[test]
+    fn jsdoc_import_dispatch_requires_the_real_reparsed_alias_without_a_capability() {
+        let mut fixture = javascript_typedef_fixture(
+            "/** @typedef {import('./target').C} C */\n/** @type {C} */\nvar c;",
+            CanonicalModuleState::Script,
+            |_| {},
+        );
+        let declaration = named_node(&fixture, SyntaxKind::JsTypeAliasDeclaration, "C");
+        let symbol = node_symbol(&fixture, declaration);
+        let record = fixture.parsed.arena.get(declaration.node).unwrap();
+        assert_eq!(record.flags, NodeFlags::REPARSED);
+        let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+            unreachable!()
+        };
+        let import = NodeRef::new(declaration.arena, declaration.file, alias.type_);
+        let name = NodeRef::new(declaration.arena, declaration.file, alias.name);
+        let import_record = fixture.parsed.arena.get(import.node).unwrap();
+        assert_eq!(import_record.kind, SyntaxKind::ImportType);
+        assert_eq!(import_record.flags, NodeFlags::default());
+        assert_eq!(import_record.parent, Some(declaration.node));
+        let source_role = |fixture: &Fixture, node| {
+            let bound = fixture.files.get(&fixture.file).unwrap();
+            assert!(bound.source_facts().unwrap().is_javascript_file());
+            let host = post_global_host(&fixture.parsed.arena, bound);
+            let capabilities = HashMap::new();
+            TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &capabilities)
+                .is_source_jsdoc_import_type(node)
+        };
+        let snapshot = |fixture: &Fixture| {
+            (
+                function_store_state(&fixture.store),
+                library_query_source_links(&fixture.parsed, fixture.file, &fixture.store),
+                fixture.store.type_alias_links(symbol).cloned(),
+            )
+        };
+        let before = snapshot(&fixture);
+        assert_eq!(source_role(&fixture, import), Ok(true));
+        assert_eq!(source_role(&fixture, name), Ok(false));
+        assert_eq!(snapshot(&fixture), before);
+        let expected = type_node_unavailable(
+            TypeNodeUnavailable::JsDocImportTypeCapabilityUnsupported(import),
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        for _ in 0..2 {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    symbol,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(expected),
+            );
+            assert_eq!(snapshot(&fixture), before);
+            assert!(diagnostics.is_empty());
+        }
+        let original = fixture.store.symbol(symbol).unwrap().clone();
+        assert!(fixture.store.set_symbol_declarations(symbol, None, None));
+        let damaged = snapshot(&fixture);
+        assert_eq!(source_role(&fixture, import), Ok(false));
+        assert_eq!(snapshot(&fixture), damaged);
+        assert!(fixture.store.set_symbol_declarations(
+            symbol,
+            original.declarations().map(<[_]>::to_vec),
+            original.value_declaration(),
+        ));
+        let restored = snapshot(&fixture);
+        assert_eq!(source_role(&fixture, import), Ok(true));
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                symbol,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(expected),
+        );
+        assert_eq!(snapshot(&fixture), restored);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn ordinary_typescript_import_dispatch_keeps_its_nonliteral_diagnostic() {
+        let mut fixture = fixture("type Use = import(123).C;");
+        let (_, _, import) = alias_parts(&fixture, "Use");
+        let NodeData::ImportTypeNode(data) = &fixture.parsed.arena.get(import.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let argument = NodeRef::new(import.arena, import.file, data.argument);
+        let bound = fixture.files.get(&fixture.file).unwrap();
+        assert!(!bound.source_facts().unwrap().is_javascript_file());
+        let host = post_global_host(&fixture.parsed.arena, bound);
+        let capabilities = HashMap::new();
+        let planner =
+            TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &capabilities);
+        assert_eq!(planner.is_source_jsdoc_import_type(import), Ok(false));
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_node(&mut fixture, import, &mut diagnostics),
+            Ok(error_type)
+        );
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("the ordinary import keeps its string-literal diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 1141);
+        assert_eq!(diagnostic.node, Some(argument));
+        assert!(diagnostic.diagnostic.arguments.is_empty());
+        assert!(diagnostic.range_override.is_none());
+        assert!(diagnostic.related_information.is_empty());
+        let snapshot = |fixture: &Fixture, diagnostics: &CanonicalCheckerDiagnostics| {
+            (
+                function_store_state(&fixture.store),
+                library_query_source_links(&fixture.parsed, fixture.file, &fixture.store),
+                diagnostics.clone(),
+            )
+        };
+        let warm = snapshot(&fixture, &diagnostics);
+        for _ in 0..2 {
+            assert_eq!(
+                query_node(&mut fixture, import, &mut diagnostics),
+                Ok(error_type)
+            );
+            assert_eq!(snapshot(&fixture, &diagnostics), warm);
+        }
+    }
+
     fn mutate_first_type_argument_list(
         parsed: &mut ParseResult,
         empty: bool,
@@ -63418,6 +63938,20 @@ export type Env = {
             file,
             files,
             store,
+        }
+    }
+
+    // Copies the fixture's binder facts into the checker store before queries.
+    fn retain_fixture_file_facts(
+        store: &mut CanonicalTypeMapperStore,
+        sources: &[(&NodeArena, &BoundFile)],
+    ) {
+        for &(arena, bound) in sources {
+            let root = bound.source_file();
+            let source = store
+                .register_source_file(arena, root.node, root.file)
+                .unwrap();
+            assert!(store.register_source_file_facts(source, bound.source_facts().unwrap()));
         }
     }
 
@@ -64100,6 +64634,13 @@ export type Env = {
             "namespace N { export type Box<T> = { value:T } } ",
             "type Wrap<T> = N.Box<T>;",
         ));
+        retain_fixture_file_facts(
+            &mut fixture.store,
+            &[(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            )],
+        );
         let boxed = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Box");
         let wrapped = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Wrap");
         let body = alias_parts(&fixture, "Wrap").2;
@@ -89947,6 +90488,14 @@ export type Env = {
             files,
             mut store,
         } = react_dom_fixture(true);
+        retain_fixture_file_facts(
+            &mut store,
+            &[
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&react.arena, files.get(&react_file).unwrap()),
+                (&source.arena, files.get(&source_file).unwrap()),
+            ],
+        );
         let host = DeclaredTypeHost::new_after_global_merge(
             [
                 (&library.arena, files.get(&library_file).unwrap()),
@@ -90154,6 +90703,14 @@ export type Env = {
             files,
             mut store,
         } = react_dom_fixture_with_owner(true, Some("react"));
+        retain_fixture_file_facts(
+            &mut store,
+            &[
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&react.arena, files.get(&react_file).unwrap()),
+                (&source.arena, files.get(&source_file).unwrap()),
+            ],
+        );
         let host = DeclaredTypeHost::new_after_global_merge(
             [
                 (&library.arena, files.get(&library_file).unwrap()),
@@ -90339,6 +90896,14 @@ export type Env = {
             files,
             mut store,
         } = react_dom_fixture_with_owner(true, Some("react"));
+        retain_fixture_file_facts(
+            &mut store,
+            &[
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&react.arena, files.get(&react_file).unwrap()),
+                (&source.arena, files.get(&source_file).unwrap()),
+            ],
+        );
         let host = DeclaredTypeHost::new_after_global_merge(
             [
                 (&library.arena, files.get(&library_file).unwrap()),
@@ -90464,6 +91029,14 @@ export type Env = {
             files,
             mut store,
         } = react_dom_fixture_with_owner(true, Some("react"));
+        retain_fixture_file_facts(
+            &mut store,
+            &[
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&react.arena, files.get(&react_file).unwrap()),
+                (&source.arena, files.get(&source_file).unwrap()),
+            ],
+        );
         let host = DeclaredTypeHost::new_after_global_merge(
             [
                 (&library.arena, files.get(&library_file).unwrap()),
@@ -91501,6 +92074,13 @@ export type Env = {
             "import * as Remote from 'pkg'; type Bad = Remote.Value;",
             CanonicalModuleState::External,
         );
+        retain_fixture_file_facts(
+            &mut fixture.store,
+            &[(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            )],
+        );
         let bad = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
         let before = store_state(&fixture.store);
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
@@ -91749,6 +92329,13 @@ export type Env = {
             )),
             true,
         );
+        retain_fixture_file_facts(
+            &mut store,
+            &[
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&declarations.arena, files.get(&declaration_file).unwrap()),
+            ],
+        );
         let bound = files.get(&declaration_file).unwrap();
         let host = DeclaredTypeHost::new_after_global_merge(
             [
@@ -91954,6 +92541,13 @@ export type Env = {
                 "}",
             )),
             true,
+        );
+        retain_fixture_file_facts(
+            &mut store,
+            &[
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&declarations.arena, files.get(&declaration_file).unwrap()),
+            ],
         );
         let bound = files.get(&declaration_file).unwrap();
         let host = DeclaredTypeHost::new_after_global_merge(
@@ -92433,11 +93027,13 @@ export type Env = {
             (&declarations, declaration_file),
             (&importer, importer_file),
         ] {
-            assert!(
-                store
-                    .register_source_file(&parsed.arena, parsed.source_file, file)
-                    .is_some()
-            );
+            let source = store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .unwrap();
+            assert!(store.register_source_file_facts(
+                source,
+                files.get(&file).unwrap().source_facts().unwrap(),
+            ));
         }
         store
             .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
@@ -114918,6 +115514,13 @@ export type Env = {
         let mut fixture = fixture(
             "namespace N { export type Again<T> = Alias<T>; } type Alias<T> = N.Again<T>; declare function f<T>(value: Alias<T>): void;",
         );
+        retain_fixture_file_facts(
+            &mut fixture.store,
+            &[(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            )],
+        );
         let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "f");
         let owner = node_symbol(&fixture, declaration);
         let nodes = fixture
@@ -115002,6 +115605,13 @@ export type Env = {
     fn generic_arrow_qualified_alias_cycle_rejects_before_links_and_retries() {
         let mut fixture = fixture(
             "namespace N { export type Again<T> = Alias<T>; } type Alias<T> = N.Again<T>; const f = <T>(value: Alias<T>): void => {};",
+        );
+        retain_fixture_file_facts(
+            &mut fixture.store,
+            &[(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            )],
         );
         let declaration = variable_initializer_node(&fixture, "f");
         let owner = node_symbol(&fixture, declaration);
@@ -115109,6 +115719,13 @@ export type Env = {
         let mut fixture = fixture(
             "namespace N { export type Again<T> = Alias<T>; } type Alias<T> = N.Again<T>; declare function f<T>(value: Alias<T>): void;",
         );
+        retain_fixture_file_facts(
+            &mut fixture.store,
+            &[(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            )],
+        );
         let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "f");
         let owner = node_symbol(&fixture, declaration);
         let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Alias");
@@ -115148,6 +115765,13 @@ export type Env = {
     fn source_callable_query_acyclic_qualified_alias_keeps_identity_and_replay() {
         let mut fixture = fixture(
             "namespace N { export type Again<T> = T; } type Alias<T> = N.Again<T>; declare function f<T>(value: Alias<T>): void;",
+        );
+        retain_fixture_file_facts(
+            &mut fixture.store,
+            &[(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            )],
         );
         let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "f");
         let owner = node_symbol(&fixture, declaration);
