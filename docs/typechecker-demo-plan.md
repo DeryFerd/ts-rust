@@ -2,11 +2,15 @@
 
 Updated 2026-08-31. The full port goal remains active.
 
+Read the [current demo status](typechecker-demo-status.md) first. It has the
+latest complete Hono and Query measurements, build failures and next work.
+The detailed results below retain earlier checkpoints and their evidence.
+
 ## Decision
 
 Use Hono and TanStack Query core as the two complete-project demo targets.
-Keep Hono as the main integration target while the full Query census measures
-its remaining work. Choose the first demo from complete measured results.
+Keep Hono as the main integration target. The full Query census is now complete.
+Choose the first demo from complete measured results, not source-file counts.
 Three unchanged Hono class-annotation tests now pass,
 including rejected status codes and renamed imports. The full Hono run still
 stops on an unavailable interface declaration in `http-exception.ts`.
