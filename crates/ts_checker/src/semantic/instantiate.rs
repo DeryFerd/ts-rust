@@ -28,6 +28,7 @@ use super::{
     },
     declared::{DeclaredTypeError, cached_ordinary_type_parameter_owner, type_list_key},
     indexed_access_types::{
+        SourceAliasIndexedBoundPlan, SourceAliasIndexedReadMode, SourceAliasIndexedSelection,
         cached_deferred_indexed_access_type, get_instantiated_indexed_access_type,
     },
     instantiated_members::{
@@ -50,7 +51,7 @@ use super::{
     },
     mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
     object_aliases::{
-        InlinePropertyObjectProjection, PropertyObjectAliasProjection,
+        InlinePropertyObjectProjection, PropertyObjectAliasProjection, SourceAliasOperandGraph,
         SourcePropertyObjectProjection, closed_declared_property_object_is_mapping_invariant,
         inline_property_object_projection, inline_property_object_template_matches,
         property_object_alias_identity_source_header, property_object_alias_projection,
@@ -1300,6 +1301,117 @@ pub(super) fn instantiate_type_with_vector_and_session(
     )
 }
 
+/// Uses the ordinary mapper with one source-owned bound or default graph.
+pub(super) fn instantiate_source_alias_operand_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    graph: &SourceAliasOperandGraph,
+    source_type: TypeId,
+    formal_ids: &[TypeId],
+    argument_ids: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    validate_source_alias_operand_mapping(
+        store,
+        graph,
+        source_type,
+        formal_ids,
+        argument_ids,
+        array_targets,
+    )?;
+    instantiate_type_with_alias_input_and_operand(
+        store,
+        source_type,
+        InstantiationMapping::Vector {
+            sources: formal_ids,
+            targets: argument_ids,
+        },
+        array_targets,
+        None,
+        session,
+        None,
+        None,
+        Some(graph),
+    )
+}
+
+/// Replays the same source and mapper proof without allocating a type or mapper.
+pub(super) fn cached_source_alias_operand_instantiation(
+    store: &CanonicalTypeMapperStore,
+    graph: &SourceAliasOperandGraph,
+    source_type: TypeId,
+    formal_ids: &[TypeId],
+    argument_ids: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    validate_source_alias_operand_mapping(
+        store,
+        graph,
+        source_type,
+        formal_ids,
+        argument_ids,
+        array_targets,
+    )?;
+    cached_instantiated_type_with_operand_worker(
+        store,
+        source_type,
+        InstantiationMapping::Vector {
+            sources: formal_ids,
+            targets: argument_ids,
+        },
+        array_targets,
+        None,
+        &mut HashSet::new(),
+        None,
+        Some(graph),
+    )
+}
+
+fn validate_source_alias_operand_mapping(
+    store: &CanonicalTypeMapperStore,
+    graph: &SourceAliasOperandGraph,
+    source_type: TypeId,
+    formal_ids: &[TypeId],
+    argument_ids: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), InstantiationError> {
+    let invalid = || InstantiationError::InvalidType(source_type);
+    graph
+        .validate_retained(store, source_type, array_targets)
+        .map_err(|_| invalid())?;
+    if formal_ids.len() != argument_ids.len()
+        || argument_ids
+            .iter()
+            .any(|&type_| store.type_payload(type_).is_none())
+    {
+        return Err(invalid());
+    }
+    let source = graph.source();
+    let parameters = source.parameters();
+    let selected_index = parameters
+        .iter()
+        .position(|&parameter| parameter == source.parameter())
+        .ok_or_else(invalid)?;
+    let matches = |type_, (declaration, symbol)| {
+        cached_ordinary_type_parameter_owner(store, type_) == Some(symbol)
+            && store.source_declaration_symbol(declaration) == Some(symbol)
+            && store
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                == Some(type_)
+    };
+    let prefix = (formal_ids.len() == parameters.len() || formal_ids.len() == selected_index)
+        && formal_ids
+            .iter()
+            .zip(parameters)
+            .all(|(&type_, &parameter)| matches(type_, parameter));
+    let selected = matches!(formal_ids, [type_] if matches(*type_, source.parameter()));
+    if !prefix && !selected {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 struct InstantiationSource<'a> {
     globals: &'a CanonicalGlobalTypes,
     branches: &'a mut dyn ConditionalBranchSource,
@@ -1646,10 +1758,37 @@ fn instantiate_type_with_alias_input_and_source(
     receipt: Option<&mut OrdinaryIntersectionReceiptBuilder>,
     source: Option<&mut InstantiationSource<'_>>,
 ) -> Result<TypeId, InstantiationError> {
-    if matches!(
-        store.type_payload(type_).map(TypeRecord::data),
-        Some(TypeData::Union(_))
-    ) {
+    instantiate_type_with_alias_input_and_operand(
+        store,
+        type_,
+        mapping,
+        array_targets,
+        alias,
+        session,
+        receipt,
+        source,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Both source proofs borrow the same ordinary mapper frame.
+fn instantiate_type_with_alias_input_and_operand(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    alias: Option<InstantiationAliasInput<'_>>,
+    session: &mut InstantiationSession,
+    receipt: Option<&mut OrdinaryIntersectionReceiptBuilder>,
+    source: Option<&mut InstantiationSource<'_>>,
+    operand: Option<&SourceAliasOperandGraph>,
+) -> Result<TypeId, InstantiationError> {
+    if operand.is_none()
+        && matches!(
+            store.type_payload(type_).map(TypeRecord::data),
+            Some(TypeData::Union(_))
+        )
+    {
         instantiable_union_source_types(store, type_, array_targets)?;
     }
     let conditional_source = source.as_ref().filter(|_| {
@@ -1658,7 +1797,11 @@ fn instantiate_type_with_alias_input_and_source(
             Some(TypeData::Conditional(_))
         )
     });
-    let contains = if let Some(source) = conditional_source {
+    let contains = if let Some(operand) = operand {
+        !operand
+            .mapping_type_is_closed(store, type_, array_targets)
+            .map_err(|_| InstantiationError::InvalidType(type_))?
+    } else if let Some(source) = conditional_source {
         conditional_remap_projection_with_source(store, type_, source.branches, array_targets)
             .map_err(|error| conditional_remap_error(type_, error))?;
         true
@@ -1677,10 +1820,12 @@ fn instantiate_type_with_alias_input_and_source(
         session,
         |store| instantiation_cache_key_for_input(store, type_, alias),
         |store, key, cached| {
-            if !matches!(
-                store.type_payload(type_).map(TypeRecord::data),
-                Some(TypeData::Conditional(_))
-            ) {
+            if operand.is_none()
+                && !matches!(
+                    store.type_payload(type_).map(TypeRecord::data),
+                    Some(TypeData::Conditional(_))
+                )
+            {
                 return Ok(());
             }
             let InstantiationCacheKey::Type { alias, .. } = key else {
@@ -1694,7 +1839,7 @@ fn instantiate_type_with_alias_input_and_source(
                 } => Some((*symbol, type_arguments.as_slice())),
             };
             let source = source.borrow();
-            if cached_instantiated_type_with_source_worker(
+            if cached_instantiated_type_with_operand_worker(
                 store,
                 type_,
                 mapping,
@@ -1704,6 +1849,7 @@ fn instantiate_type_with_alias_input_and_source(
                 source
                     .as_ref()
                     .map(|source| (source.globals, &*source.branches)),
+                operand,
             )? != Some(cached)
             {
                 return Err(InstantiationError::InvalidType(type_));
@@ -1731,6 +1877,7 @@ fn instantiate_type_with_alias_input_and_source(
                 session,
                 receipt,
                 source.borrow_mut().as_deref_mut(),
+                operand,
             )
         },
     )
@@ -2978,6 +3125,36 @@ fn cached_instantiated_type_with_source_worker(
     active: &mut HashSet<TypeId>,
     source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<Option<TypeId>, InstantiationError> {
+    cached_instantiated_type_with_operand_worker(
+        store,
+        template,
+        mapping,
+        array_targets,
+        alias_override,
+        active,
+        source,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Source operand replay uses the ordinary cached result matcher.
+fn cached_instantiated_type_with_operand_worker(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+    active: &mut HashSet<TypeId>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+    operand: Option<&SourceAliasOperandGraph>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    if let Some(operand) = operand
+        && operand
+            .mapping_type_is_closed(store, template, array_targets)
+            .map_err(|_| InstantiationError::InvalidType(template))?
+    {
+        return Ok(Some(template));
+    }
     if !active.insert(template) {
         return Err(InstantiationError::UnsupportedType(template));
     }
@@ -3197,19 +3374,28 @@ fn cached_instantiated_type_with_source_worker(
             }
         }
         TypeData::Union(_) => {
-            let constituents = instantiable_union_source_types(store, template, array_targets)?;
-            if !could_contain_installed_type_variables(store, template, array_targets)? {
+            let constituents = instantiable_union_source_types_with_operand(
+                store,
+                template,
+                array_targets,
+                operand,
+            )?;
+            if operand.is_none()
+                && !could_contain_installed_type_variables(store, template, array_targets)?
+            {
                 return Ok(Some(template));
             }
             let mut types = Vec::with_capacity(constituents.len());
             for constituent in constituents {
-                let Some(instantiated) = cached_instantiated_type_worker(
+                let Some(instantiated) = cached_instantiated_type_with_operand_worker(
                     store,
                     *constituent,
                     mapping,
                     array_targets,
                     None,
                     active,
+                    None,
+                    operand,
                 )?
                 else {
                     return Ok(None);
@@ -3224,13 +3410,15 @@ fn cached_instantiated_type_with_source_worker(
                 Some(alias)
             } else if let Some(alias) = source_alias {
                 for argument in alias.type_arguments().unwrap_or_default() {
-                    let Some(mapped) = cached_instantiated_type_worker(
+                    let Some(mapped) = cached_instantiated_type_with_operand_worker(
                         store,
                         *argument,
                         mapping,
                         array_targets,
                         None,
                         active,
+                        None,
+                        operand,
                     )?
                     else {
                         return Ok(None);
@@ -3385,13 +3573,15 @@ fn cached_instantiated_type_with_source_worker(
             let reference = validate_direct_generic_reference(store, template)?;
             let mut arguments = Vec::with_capacity(reference.type_arguments.len());
             for argument in &reference.type_arguments {
-                let Some(mapped) = cached_instantiated_type_worker(
+                let Some(mapped) = cached_instantiated_type_with_operand_worker(
                     store,
                     *argument,
                     mapping,
                     array_targets,
                     None,
                     active,
+                    None,
+                    operand,
                 )?
                 else {
                     return Ok(None);
@@ -3409,6 +3599,12 @@ fn cached_instantiated_type_with_source_worker(
             let actual = validate_direct_generic_reference(store, cached)?;
             if actual.target != reference.target || actual.type_arguments != arguments {
                 return Err(InstantiationError::InvalidType(cached));
+            }
+            if operand.is_some() {
+                let targets = array_targets.ok_or(InstantiationError::InvalidType(template))?;
+                store
+                    .canonical_array_reference_with_targets(targets, cached)?
+                    .ok_or(InstantiationError::InvalidType(cached))?;
             }
             Ok(Some(cached))
         }
@@ -4259,6 +4455,7 @@ fn instantiate_type_worker(
     session: &mut InstantiationSession,
     receipt: Option<&mut OrdinaryIntersectionReceiptBuilder>,
     mut source: Option<&mut InstantiationSource<'_>>,
+    operand: Option<&SourceAliasOperandGraph>,
 ) -> Result<TypeId, InstantiationError> {
     let work = {
         let record = store
@@ -4458,9 +4655,15 @@ fn instantiate_type_worker(
             array_targets,
             session,
         ),
-        InstantiationWork::Union => {
-            instantiate_union(store, type_, mapping, array_targets, alias, session)
-        }
+        InstantiationWork::Union => instantiate_union(
+            store,
+            type_,
+            mapping,
+            array_targets,
+            alias,
+            session,
+            operand,
+        ),
         InstantiationWork::Intersection(projection) => instantiate_intersection(
             store,
             type_,
@@ -4472,7 +4675,18 @@ fn instantiate_type_worker(
             receipt,
         ),
         InstantiationWork::TypeReference => {
-            instantiate_reference(store, type_, mapping, array_targets, session)
+            if operand.is_some() {
+                instantiate_array_reference_with_operand(
+                    store,
+                    type_,
+                    mapping,
+                    array_targets.ok_or(InstantiationError::InvalidType(type_))?,
+                    session,
+                    operand,
+                )
+            } else {
+                instantiate_reference(store, type_, mapping, array_targets, session)
+            }
         }
         InstantiationWork::PropertyObjectAlias(projection) => instantiate_property_object_alias(
             store,
@@ -4632,6 +4846,117 @@ fn resolve_instantiated_indexed_access(
             }
         }
     }
+}
+
+/// Reads the checked source property with the caller that owns the type-node query.
+pub(super) fn resolve_source_alias_indexed_read_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &SourceAliasIndexedBoundPlan,
+    graph: &SourceAliasOperandGraph,
+    object: TypeId,
+    key: TypeId,
+    globals: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    let targets = globals.map(CanonicalArrayTargets::from_global_types);
+    let (selection, name) =
+        checked_source_alias_indexed_property(store, plan, graph, object, key, targets)?;
+    let property = super::object_members::resolve_object_property_by_key_with_alias_operand(
+        store,
+        globals,
+        object,
+        name.as_ref(),
+        session,
+        Some((graph, plan.object())),
+    )
+    .map_err(|_| InstantiationError::InvalidType(object))?
+    .ok_or(InstantiationError::InvalidType(object))?;
+    if property.symbol != selection.property()
+        || property.type_ != selection.value_type()
+        || property.optional != selection.optional()
+    {
+        return Err(InstantiationError::InvalidType(object));
+    }
+    match indexed_access_property_optional_sentinel_with_mode(
+        store,
+        property.symbol,
+        property.type_,
+        Some(selection.read_mode()),
+    )? {
+        Some(sentinel) => store
+            .literal_union_type_with_alias_and_array_targets_and_session(
+                &[property.type_, sentinel],
+                None,
+                targets,
+                session,
+            )
+            .map_err(Into::into),
+        None => Ok(property.type_),
+    }
+}
+
+/// Selects the same member and optional read union without warming either cache.
+pub(super) fn cached_source_alias_indexed_read(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceAliasIndexedBoundPlan,
+    graph: &SourceAliasOperandGraph,
+    object: TypeId,
+    key: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    let (selection, _) =
+        checked_source_alias_indexed_property(store, plan, graph, object, key, array_targets)?;
+    match indexed_access_property_optional_sentinel_with_mode(
+        store,
+        selection.property(),
+        selection.value_type(),
+        Some(selection.read_mode()),
+    )? {
+        Some(sentinel) => store
+            .cached_literal_union_type_with_alias(
+                &[selection.value_type(), sentinel],
+                None,
+                array_targets,
+            )
+            .map_err(Into::into),
+        None => Ok(Some(selection.value_type())),
+    }
+}
+
+fn checked_source_alias_indexed_property(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceAliasIndexedBoundPlan,
+    graph: &SourceAliasOperandGraph,
+    object: TypeId,
+    key: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(SourceAliasIndexedSelection, EscapedName), InstantiationError> {
+    let invalid = || InstantiationError::InvalidType(object);
+    let selection = plan
+        .checked_selection(store, graph, object, key, array_targets)
+        .map_err(|_| invalid())?;
+    let IndexedAccessResolution::Property(name) =
+        indexed_access_resolution(store, object, key, AccessFlags::NONE, array_targets)?
+    else {
+        return Err(invalid());
+    };
+    let property = super::object_members::property_from_source_alias_members(
+        store,
+        graph,
+        plan.object(),
+        object,
+        name.as_ref(),
+        array_targets,
+    )
+    .map_err(|_| invalid())?
+    .ok_or_else(invalid)?;
+    if property.symbol != selection.property()
+        || property.type_ != selection.value_type()
+        || property.optional != selection.optional()
+    {
+        return Err(invalid());
+    }
+    Ok((selection, name))
 }
 
 fn instantiate_deferred_conditional(
@@ -5011,6 +5336,15 @@ fn indexed_access_property_optional_sentinel(
     property: SemanticSymbolId,
     value: TypeId,
 ) -> Result<Option<TypeId>, InstantiationError> {
+    indexed_access_property_optional_sentinel_with_mode(store, property, value, None)
+}
+
+fn indexed_access_property_optional_sentinel_with_mode(
+    store: &CanonicalTypeMapperStore,
+    property: SemanticSymbolId,
+    value: TypeId,
+    source_mode: Option<SourceAliasIndexedReadMode>,
+) -> Result<Option<TypeId>, InstantiationError> {
     let symbol = store
         .symbol(property)
         .ok_or(InstantiationError::InvalidType(value))?;
@@ -5038,7 +5372,10 @@ fn indexed_access_property_optional_sentinel(
     let record = store
         .type_payload(value)
         .ok_or(InstantiationError::InvalidType(value))?;
-    let sentinel = bootstrap.undefined_or_missing_type;
+    let sentinel = match source_mode {
+        Some(SourceAliasIndexedReadMode::SourceTypeNode) => bootstrap.undefined_type,
+        None => bootstrap.undefined_or_missing_type,
+    };
     // Match getOptionalType's identity return, including an existing alias.
     // A nil access node does not replace an exact-optional missing sentinel.
     if value == sentinel
@@ -5726,17 +6063,31 @@ fn instantiate_array_reference(
     array_targets: CanonicalArrayTargets,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
+    instantiate_array_reference_with_operand(store, source, mapping, array_targets, session, None)
+}
+
+fn instantiate_array_reference_with_operand(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: CanonicalArrayTargets,
+    session: &mut InstantiationSession,
+    operand: Option<&SourceAliasOperandGraph>,
+) -> Result<TypeId, InstantiationError> {
     let Some(reference) = store.canonical_array_reference_with_targets(array_targets, source)?
     else {
         return Err(InstantiationError::UnsupportedType(source));
     };
-    let element = instantiate_type_with_alias(
+    let element = instantiate_type_with_alias_input_and_operand(
         store,
         reference.element_type,
         mapping,
         Some(array_targets),
         None,
         session,
+        None,
+        None,
+        operand,
     )?;
     if element == reference.element_type {
         return Ok(source);
@@ -5783,6 +6134,31 @@ fn instantiable_union_source_types(
     Ok(&union.union.types)
 }
 
+fn instantiable_union_source_types_with_operand<'a>(
+    store: &'a CanonicalTypeMapperStore,
+    source: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    operand: Option<&SourceAliasOperandGraph>,
+) -> Result<&'a [TypeId], InstantiationError> {
+    let Some(operand) = operand else {
+        return instantiable_union_source_types(store, source, array_targets);
+    };
+    // The graph checks every written child before the annotation-union cache,
+    // including children removed by normal reduction.
+    operand
+        .mapping_type_is_closed(store, source, array_targets)
+        .map_err(|_| InstantiationError::InvalidType(source))?;
+    let Some(TypeData::Union(union)) = store.type_payload(source).map(TypeRecord::data) else {
+        return Err(InstantiationError::InvalidType(source));
+    };
+    if let Some(origin) = union.origin
+        && let Some(TypeData::Union(origin)) = store.type_payload(origin).map(TypeRecord::data)
+    {
+        return Ok(&origin.union.types);
+    }
+    Ok(&union.union.types)
+}
+
 fn instantiate_union(
     store: &mut CanonicalTypeMapperStore,
     source: TypeId,
@@ -5790,8 +6166,11 @@ fn instantiate_union(
     array_targets: Option<CanonicalArrayTargets>,
     alias_override: Option<(SemanticSymbolId, &[TypeId])>,
     session: &mut InstantiationSession,
+    operand: Option<&SourceAliasOperandGraph>,
 ) -> Result<TypeId, InstantiationError> {
-    let constituents = instantiable_union_source_types(store, source, array_targets)?.to_vec();
+    let constituents =
+        instantiable_union_source_types_with_operand(store, source, array_targets, operand)?
+            .to_vec();
     let source_alias = store.type_payload(source).and_then(TypeRecord::alias);
     let alias = if let Some((symbol, arguments)) = alias_override {
         Some((symbol, arguments.to_vec()))
@@ -5818,25 +6197,34 @@ fn instantiate_union(
         if store.type_payload(*constituent).is_none() {
             return Err(InstantiationError::InvalidType(*constituent));
         }
-        if !supported_instantiable_union_constituent(store, *constituent, array_targets)? {
+        if operand.is_none()
+            && !supported_instantiable_union_constituent(store, *constituent, array_targets)?
+        {
             return Err(InstantiationError::UnsupportedUnionConstituent(
                 *constituent,
             ));
         }
-        contains_type_variable |=
-            could_contain_installed_type_variables(store, *constituent, array_targets)?;
+        contains_type_variable |= match operand {
+            Some(operand) => !operand
+                .mapping_type_is_closed(store, *constituent, array_targets)
+                .map_err(|_| InstantiationError::InvalidType(*constituent))?,
+            None => could_contain_installed_type_variables(store, *constituent, array_targets)?,
+        };
     }
     if !contains_type_variable && alias.is_none() {
         return Ok(source);
     }
     for constituent in &constituents {
-        let instantiated = instantiate_type_with_alias(
+        let instantiated = instantiate_type_with_alias_input_and_operand(
             store,
             *constituent,
             mapping,
             array_targets,
             None,
             session,
+            None,
+            None,
+            operand,
         )?;
         changed |= instantiated != *constituent;
         mapped_types.push(instantiated);
@@ -5850,7 +6238,17 @@ fn instantiate_union(
             mapped_arguments.push(if alias_override.is_some() {
                 argument
             } else {
-                instantiate_type_with_alias(store, argument, mapping, array_targets, None, session)?
+                instantiate_type_with_alias_input_and_operand(
+                    store,
+                    argument,
+                    mapping,
+                    array_targets,
+                    None,
+                    session,
+                    None,
+                    None,
+                    operand,
+                )?
             });
         }
         return store
@@ -5926,6 +6324,430 @@ mod tests {
     };
     use ts_core::JsString;
     use ts_parser::{ParseResult, parse_source_file};
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One real source graph covers identity, mapper work, and both optional read modes.
+    fn source_alias_bound_mapping_keeps_closed_identity_and_spent_caller() {
+        use crate::semantic::object_aliases::source_alias_bound_test_support as fixture;
+
+        let state = |session: &InstantiationSession| {
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count(),
+                session.depth,
+                session.active_mappers.len(),
+            )
+        };
+        fixture::with_fixture(|context, files| {
+            let mut closed = Vec::new();
+            for name in ["EnvBound", "SchemaBound", "InputBound"] {
+                let node = fixture::operand(context, files, name, 0, false);
+                let (type_, graph) = fixture::prepare_graph(context, files, node);
+                let parameter = context
+                    .store()
+                    .declared_type_links(graph.source().parameter().1)
+                    .and_then(|links| links.declared_type)
+                    .unwrap();
+                closed.push((type_, graph, parameter));
+            }
+            let env = closed[0].0;
+            let dependent_node = fixture::operand(context, files, "Dependent", 1, true);
+            let (dependent, dependent_graph) =
+                fixture::prepare_graph(context, files, dependent_node);
+            let parameters = dependent_graph
+                .source()
+                .parameters()
+                .iter()
+                .map(|&(_, symbol)| {
+                    context
+                        .store()
+                        .declared_type_links(symbol)
+                        .and_then(|links| links.declared_type)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let [first, second] = parameters.as_slice() else {
+                panic!("the source has two ordered alias formals");
+            };
+            let (first, second) = (*first, *second);
+            assert_eq!(dependent, first);
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(context.store(), second),
+                Some(dependent_graph.source().parameter().1)
+            );
+            let array_node = fixture::operand(context, files, "ArrayDefault", 1, true);
+            let (array, array_graph) = fixture::prepare_graph(context, files, array_node);
+            let array_parameter = context
+                .store()
+                .declared_type_links(array_graph.source().parameters()[0].1)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+            let (error_type, empty, undefined, missing) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                assert!(bootstrap.options.strict_null_checks);
+                assert!(bootstrap.options.exact_optional_property_types);
+                assert_eq!(bootstrap.undefined_or_missing_type, bootstrap.missing_type);
+                (
+                    bootstrap.error_type,
+                    bootstrap.empty_type_literal_type,
+                    bootstrap.undefined_type,
+                    bootstrap.missing_type,
+                )
+            };
+            let store = context.store_mut_for_test();
+            let before = format!("{store:?}");
+            let zero_limits = InstantiationLimits {
+                max_depth: 100,
+                max_count: 0,
+            };
+            let mut zero =
+                InstantiationSession::new_recovering(store, zero_limits, error_type).unwrap();
+            for (type_, graph, parameter) in &closed {
+                let alias = store.type_payload(*type_).unwrap().alias();
+                assert_eq!(
+                    instantiate_source_alias_operand_with_session(
+                        store,
+                        graph,
+                        *type_,
+                        &[*parameter],
+                        &[*type_],
+                        Some(targets),
+                        &mut zero,
+                    ),
+                    Ok(*type_)
+                );
+                assert_eq!(
+                    cached_source_alias_operand_instantiation(
+                        store,
+                        graph,
+                        *type_,
+                        &[*parameter],
+                        &[*type_],
+                        Some(targets),
+                    ),
+                    Ok(Some(*type_))
+                );
+                assert_eq!(store.type_payload(*type_).unwrap().alias(), alias);
+                assert_eq!(state(&zero), (0, 0, 0, 0, 0));
+                assert_eq!(format!("{store:?}"), before);
+            }
+
+            let changed_graph = fixture::without_closed_object(&closed[0].1);
+            assert_eq!(
+                instantiate_source_alias_operand_with_session(
+                    store,
+                    &changed_graph,
+                    env,
+                    &[closed[0].2],
+                    &[env],
+                    Some(targets),
+                    &mut zero,
+                ),
+                Err(InstantiationError::InvalidType(env))
+            );
+            assert_eq!(
+                cached_source_alias_operand_instantiation(
+                    store,
+                    &changed_graph,
+                    env,
+                    &[closed[0].2],
+                    &[env],
+                    Some(targets),
+                ),
+                Err(InstantiationError::InvalidType(env))
+            );
+            assert_eq!(state(&zero), (0, 0, 0, 0, 0));
+            assert_eq!(format!("{store:?}"), before);
+
+            let mut success = InstantiationSession::new(InstantiationLimits {
+                max_depth: 100,
+                max_count: 2,
+            });
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    store,
+                    first,
+                    &[first],
+                    &[env],
+                    Some(targets),
+                    &mut success,
+                ),
+                Ok(env)
+            );
+            assert_eq!(state(&success), (1, 1, 0, 0, 0));
+            assert_eq!(
+                instantiate_source_alias_operand_with_session(
+                    store,
+                    &dependent_graph,
+                    dependent,
+                    &[first],
+                    &[env],
+                    Some(targets),
+                    &mut success,
+                ),
+                Ok(env)
+            );
+            assert_eq!(state(&success), (2, 2, 0, 0, 0));
+            assert_eq!(
+                cached_source_alias_operand_instantiation(
+                    store,
+                    &dependent_graph,
+                    dependent,
+                    &[first],
+                    &[env],
+                    Some(targets),
+                ),
+                Ok(Some(env))
+            );
+            assert_eq!(format!("{store:?}"), before);
+
+            // Source-default comparison substitutes the actual selected formal,
+            // even when that formal is not the first row.
+            let mut selected = InstantiationSession::new(InstantiationLimits::default());
+            assert_eq!(
+                instantiate_source_alias_operand_with_session(
+                    store,
+                    &dependent_graph,
+                    dependent,
+                    &[second],
+                    &[env],
+                    Some(targets),
+                    &mut selected,
+                ),
+                Ok(first)
+            );
+            assert_eq!(state(&selected), (1, 1, 0, 0, 0));
+            assert_eq!(format!("{store:?}"), before);
+
+            for recover in [false, true] {
+                let limits = InstantiationLimits {
+                    max_depth: 100,
+                    max_count: 1,
+                };
+                let mut spent = if recover {
+                    InstantiationSession::new_recovering(store, limits, error_type).unwrap()
+                } else {
+                    InstantiationSession::new(limits)
+                };
+                assert_eq!(
+                    instantiate_type_with_vector_and_session(
+                        store,
+                        first,
+                        &[first],
+                        &[env],
+                        Some(targets),
+                        &mut spent,
+                    ),
+                    Ok(env)
+                );
+                assert_eq!(state(&spent), (1, 1, 0, 0, 0));
+                let result = instantiate_source_alias_operand_with_session(
+                    store,
+                    &dependent_graph,
+                    dependent,
+                    &[first],
+                    &[env],
+                    Some(targets),
+                    &mut spent,
+                );
+                assert_eq!(
+                    result,
+                    if recover {
+                        Ok(error_type)
+                    } else {
+                        Err(InstantiationError::CountLimit { count: 1, limit: 1 })
+                    }
+                );
+                assert_eq!(state(&spent), (1, 1, 1, 0, 0));
+                assert_eq!(format!("{store:?}"), before);
+            }
+            assert_eq!(
+                instantiate_source_alias_operand_with_session(
+                    store,
+                    &dependent_graph,
+                    dependent,
+                    &[first],
+                    &[env],
+                    Some(targets),
+                    &mut zero,
+                ),
+                Ok(error_type)
+            );
+            assert_eq!(state(&zero), (0, 0, 1, 0, 0));
+            assert_eq!(format!("{store:?}"), before);
+
+            let mut array_caller = InstantiationSession::new(InstantiationLimits {
+                max_depth: 100,
+                max_count: 3,
+            });
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    store,
+                    array_parameter,
+                    &[array_parameter],
+                    &[env],
+                    Some(targets),
+                    &mut array_caller,
+                ),
+                Ok(env)
+            );
+            let array_result = instantiate_source_alias_operand_with_session(
+                store,
+                &array_graph,
+                array,
+                &[array_parameter],
+                &[env],
+                Some(targets),
+                &mut array_caller,
+            )
+            .unwrap();
+            assert_eq!(state(&array_caller), (3, 3, 0, 0, 0));
+            let reference = store
+                .canonical_array_reference_with_targets(targets, array_result)
+                .unwrap()
+                .unwrap();
+            assert_eq!(reference.element_type, env);
+            assert!(!reference.readonly);
+            let warm = format!("{store:?}");
+            assert_eq!(
+                cached_source_alias_operand_instantiation(
+                    store,
+                    &array_graph,
+                    array,
+                    &[array_parameter],
+                    &[env],
+                    Some(targets),
+                ),
+                Ok(Some(array_result))
+            );
+            let mut nested_spent = InstantiationSession::new(InstantiationLimits {
+                max_depth: 100,
+                max_count: 2,
+            });
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    store,
+                    array_parameter,
+                    &[array_parameter],
+                    &[env],
+                    Some(targets),
+                    &mut nested_spent,
+                ),
+                Ok(env)
+            );
+            assert_eq!(
+                instantiate_source_alias_operand_with_session(
+                    store,
+                    &array_graph,
+                    array,
+                    &[array_parameter],
+                    &[env],
+                    Some(targets),
+                    &mut nested_spent,
+                ),
+                Err(InstantiationError::CountLimit { count: 2, limit: 2 })
+            );
+            assert_eq!(state(&nested_spent), (2, 2, 1, 0, 0));
+            let mut missing_targets = InstantiationSession::new(InstantiationLimits::default());
+            assert_eq!(
+                instantiate_source_alias_operand_with_session(
+                    store,
+                    &array_graph,
+                    array,
+                    &[array_parameter],
+                    &[env],
+                    None,
+                    &mut missing_targets,
+                ),
+                Err(InstantiationError::InvalidType(array))
+            );
+            assert_eq!(state(&missing_targets), (0, 0, 0, 0, 0));
+            assert_eq!(format!("{store:?}"), warm);
+
+            let input_graph = &closed[2].1;
+            let indexed = context
+                .store()
+                .source_direct_children(input_graph.source().root())
+                .unwrap()
+                .into_iter()
+                .find(|&node| {
+                    context.store().source_node_kind(node) == Some(SyntaxKind::IndexedAccessType)
+                })
+                .unwrap();
+            let host = context
+                .declared_type_host()
+                .unwrap()
+                .with_module_resolutions(context.module_resolutions());
+            let plan = super::super::indexed_access_types::plan_source_alias_indexed_bound(
+                context.store(),
+                &host,
+                input_graph.source(),
+                indexed,
+            )
+            .unwrap();
+            let store = context.store();
+            let object = store
+                .type_node_links(plan.object())
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let key = store
+                .type_node_links(plan.index())
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let selection = plan
+                .checked_selection(store, input_graph, object, key, Some(targets))
+                .unwrap();
+            assert!(selection.optional());
+            assert_eq!(selection.value_type(), empty);
+            assert_ne!(undefined, missing);
+            let before_read = format!("{store:?}");
+            assert_eq!(
+                indexed_access_property_optional_sentinel(
+                    store,
+                    selection.property(),
+                    selection.value_type(),
+                ),
+                Ok(Some(missing))
+            );
+            assert_eq!(
+                resolved_indexed_access_members(store, object, Some(targets)),
+                Err(InstantiationError::InvalidType(object))
+            );
+            let source_read = cached_source_alias_indexed_read(
+                store,
+                &plan,
+                input_graph,
+                object,
+                key,
+                Some(targets),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                store
+                    .type_node_links(indexed)
+                    .and_then(|links| links.resolved_type),
+                Some(source_read)
+            );
+            let TypeData::Union(union) = store.type_payload(source_read).unwrap().data() else {
+                panic!("the optional source read keeps its undefined union");
+            };
+            assert_eq!(union.union.types.len(), 2);
+            assert!(union.union.types.contains(&empty));
+            assert!(union.union.types.contains(&undefined));
+            assert!(!union.union.types.contains(&missing));
+            assert_eq!(
+                store
+                    .value_symbol_links(selection.property())
+                    .and_then(|links| links.resolved_type),
+                Some(empty)
+            );
+            assert_eq!(format!("{store:?}"), before_read);
+            assert!(context.diagnostics().is_empty());
+        });
+    }
 
     struct DeferredGenericIntersectionFixture {
         store: CanonicalTypeMapperStore,
