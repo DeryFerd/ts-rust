@@ -1,6 +1,6 @@
 # First complete project demos
 
-Updated 2026-08-30. The full port goal remains active.
+Updated 2026-08-31. The full port goal remains active.
 
 ## Decision
 
@@ -25,6 +25,15 @@ percentages of the complete TypeScript test suite or project compatibility.
 The measured compiler source is `5c7c7bd20cb45ebc8f2171eed8478fa2797e8343`.
 New source candidates remain in separate worktrees. They have not replaced
 that accepted compiler on the primary branch.
+
+Those acceptance sets mix TypeScript-submodule and Go-owned originals.
+The TypeScript-only results are 283 exact diagnostics in 348 executions and
+seven exact semantic results in ten executions. An older full case-attempt
+census on `79d44b12` recorded 1,537 exact diagnostic results in 13,101
+configuration rows, plus 25 cases without a complete result. It did not
+compare type or symbol artifacts. Neither measurement proves current full
+TypeScript compatibility. The [coverage audit](../target/wave202-original-typechecking-corpus-coverage-audit.md)
+separates the complete scope, old census and current acceptance sets.
 
 The full core check is green at
 `4f7397046c08de663fede5e5281884bbbc092092`. All 6,399 tests passed in 133
@@ -98,8 +107,21 @@ graph, complete diagnostic set, type or symbol artifact, or replay result was
 returned. Both runtime stages and the separate cleanup check closed. The
 [complete result](../target/wave202-demo-hono-isolated-probe-2-report.md)
 retains all raw output and executable evidence. The 188-root input and all
-dependencies remain unchanged. A separate worker is tracing the failing
-reference. This clears the build failure, not the project check.
+dependencies remain unchanged. This clears the build failure, not the project
+check.
+
+The third isolated run used a diagnostic observer on source `c47b6749`.
+Its fresh build passed in 69 seconds. The original project again failed after
+5 seconds. The trace identifies `ContentfulStatusCode` in the real
+`HTTPException` constructor parameter, `status: ContentfulStatusCode = 500`.
+That name comes from the unchanged type-only import of `./utils/http-status`.
+Its import alias has no resolved target at the failure. The trace identifies
+the reference and its state, not the exact rejecting guard. The existing
+class-annotation path supports cold imports, so missing alias links alone do
+not prove that an import resolver must run earlier. The
+[complete result](../target/wave202-demo-hono-isolated-probe-3-report.md)
+retains the trace and both closed runtime stages. No complete diagnostic set,
+type or symbol artifact, or replay result was returned.
 
 The Query contextual-arrow candidate ran all 5,114 selected checker and public
 tests. It passed 5,064 and failed 50. Five failures are in the new controls.
@@ -114,7 +136,7 @@ retains every failed test. No result from this run is added to another run.
 
 | Target | Complete upstream scope | Why use it | Last project-stage result |
 | --- | --- | --- | --- |
-| Hono | `tsconfig.build.json`, 188 roots | Strict library build with ES2022 target. Dependencies are prepared. Saved Go cold diagnostics are empty. | Type-reference construction invariant in `http-exception.ts`. |
+| Hono | `tsconfig.build.json`, 188 roots | Strict library build with ES2022 target. Dependencies are prepared. Saved Go cold diagnostics are empty. | `ContentfulStatusCode` constructor-annotation invariant in `http-exception.ts`. |
 | TanStack Query core | `packages/query-core/tsconfig.prod.json`, 23 roots | Strict ESNext/Bundler package. Dependencies and declaration outputs are prepared. Saved Go cold and warm diagnostics are empty. | Unsupported arrow in `timeoutManager.ts`. |
 
 Roots are not the complete dependency graph. The saved Go runs load 186 files
@@ -170,7 +192,8 @@ recorded above. Further source
 audits found named method return annotations, property truthiness flow and
 ambient `Response` construction restrictions in the original `getResponse`
 method. Five independent pairs have prepared those changes in one new tree.
-The complete combined source still needs final review and runtime checks.
+The complete combined source is committed and reviewed at `1aebb12b`.
+It still needs runtime checks.
 The next parallel batch addresses the shared DOM/Node owner, alias heritage,
 globalThis, conditional, import, defaulted-union and condition queries.
 Another batch combines the committed generic class bodies, construction,
@@ -180,6 +203,14 @@ array/object field initializers and named/indexed alias bounds. The latter
 covers the real `Env`, `Schema` and `Input` bound declarations. Generic methods
 on generic classes and imported generic class heritage have reviewed plans.
 These are source findings, not the next measured project error.
+
+The first class-field check stopped with six Rust compile errors. No test ran.
+The errors came from one missing import and four reads of a private field.
+The five-site correction is committed and independently reviewed at
+`88a2b6b4`. It uses the existing immutable getter and changes no test or
+TypeScript input. The [commit receipt](../target/wave202-demo-class-field-initializers-compile-repair-commit-receipt.md)
+records the closed failed build and exact correction. The same 5,195-test
+selection still needs a fresh run.
 
 The Query source audit identifies missing contextual typing for the first
 two-parameter object-property arrow. Its declared `TimeoutProvider` property
@@ -201,9 +232,15 @@ imports. Both import-only corrections are committed. The third run executed
 all 5,080 selected tests and failed 70, including all 17 new controls. A pair
 proved two first-stop defects: copied signatures use a declaration-owned
 parameter publisher, and alias-owned union references lack their owner proof.
-The exact three-file repair is source-reviewed. All 17 controls stay intact, and
-aliases remain outside the current class-only integration.
-The other 53 failures are not assigned to this feature without a matched run.
+The exact three-file repair is committed at `4232597a`. Its fresh fourth run
+executed all 5,084 tests, with 5,028 passes and 56 failures. Fourteen of the
+17 old feature failures now pass, and all four new controls pass. No old pass
+was lost. Three feature failures remain. All 53 other failures are unchanged
+and remain unassigned. The [complete result](../target/wave202-demo-generic-function-type-aliases-focused-4-runtime.md)
+and [independent review](../target/wave202-demo-generic-function-type-aliases-focused-4-runtime-review.md)
+confirm the actual test executables and every outcome. All old inputs and
+assertions remain intact. Aliases remain outside the current class-only
+integration. This is local feature progress, not a Query project pass.
 Executable class imports are committed and reviewed at `c295104c`, with eight
 new private and eight new public tests. Generic construction is committed and
 reviewed at `d2a6a8a3`, with 16 new private and four new public tests. Neither
@@ -259,7 +296,7 @@ independent source, class, inference, relation, or library failures needed by
 these projects. Give each writer a fixed worktree and file list before edits.
 Keep review and reference checks in parallel with implementation. Keep the
 existing build limits. Forty agent slots do not authorize forty Cargo builds.
-The latest roster check showed all 40 subagents active. This is a worker count,
+The team has reached 40 active subagents. This is a worker count,
 not a speedup measurement. New builds must not reuse another source worktree's
 target directory. Keep one owner for each target and at most three compiler
 services at once.
