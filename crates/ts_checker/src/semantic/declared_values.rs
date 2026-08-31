@@ -409,13 +409,31 @@ pub(super) fn plan_global_type_literal_value(
                     || interface.symbol.is_some()
                     || interface.local_symbol.is_some()
                     || interface.flow_node.is_some()
-                    || if facts.is_external_module() {
+                    || if facts.is_external_module()
+                        || node.parent != Some(bound.source_file().node)
+                    {
                         !store.source_global_interface_augmentation_is_exact(symbol, declaration)
                     } else {
                         node.parent != Some(bound.source_file().node)
                     }
                 {
                     return Err(invalid());
+                }
+                if node.parent != Some(bound.source_file().node) {
+                    let block = node.parent.ok_or_else(invalid)?;
+                    let module = preflight_node(
+                        store,
+                        host,
+                        NodeRef::new(declaration.arena, declaration.file, block),
+                    )?
+                    .parent
+                    .ok_or_else(invalid)?;
+                    plan_global_augmentation_parent(
+                        store,
+                        host,
+                        symbol,
+                        NodeRef::new(declaration.arena, declaration.file, module),
+                    )?;
                 }
             }
             _ => return Err(invalid()),
@@ -519,9 +537,10 @@ fn plan_global_variable_declaration(
             return Err(invalid());
         }
     }
-    if bound
-        .source_facts()
-        .is_some_and(|facts| facts.is_external_module())
+    if statement_node.parent != Some(bound.source_file().node)
+        || bound
+            .source_facts()
+            .is_some_and(|facts| facts.is_external_module())
     {
         plan_global_variable_augmentation(store, host, symbol, declaration, statement)?;
     } else {
@@ -569,6 +588,7 @@ fn plan_global_variable_augmentation(
     let NodeData::ModuleDeclaration(module_data) = &module_node.data else {
         return Err(invalid());
     };
+    plan_global_augmentation_parent(store, host, symbol, module)?;
     let name = NodeRef::new(module.arena, module.file, module_data.name);
     let namespace = bound
         .symbol(module)
@@ -618,7 +638,6 @@ fn plan_global_variable_augmentation(
             .count()
             != 1
         || module_node.kind != SyntaxKind::ModuleDeclaration
-        || module_node.parent != Some(bound.source_file().node)
         || module_data.keyword != SyntaxKind::GlobalKeyword
         || module_data.body != Some(block.node)
         || !bound
@@ -672,6 +691,114 @@ fn plan_global_variable_augmentation(
             .is_some_and(|links| links != &ValueSymbolLinks::default())
     {
         return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Checks the written ambient-module parent without querying a contributed value.
+#[allow(clippy::too_many_lines)] // The syntax and raw binder module must agree before selecting its global scope.
+fn plan_global_augmentation_parent(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    module: NodeRef,
+) -> Result<(), DeclaredTypeError> {
+    let invalid = || invalid_value(symbol);
+    let bound = host.bound_file(module).ok_or_else(invalid)?;
+    let source = bound.source_file();
+    if !store.source_global_augmentation_parent_is_exact(module, source) {
+        return Err(invalid());
+    }
+    let node = preflight_node(store, host, module)?;
+    let NodeData::ModuleDeclaration(global) = &node.data else {
+        return Err(invalid());
+    };
+    let name = NodeRef::new(module.arena, module.file, global.name);
+    if global.keyword != SyntaxKind::GlobalKeyword
+        || !bound
+            .module_augmentations()
+            .iter()
+            .any(|origin| origin.name() == name)
+    {
+        return Err(invalid());
+    }
+    if node.parent == Some(source.node) {
+        return Ok(());
+    }
+    let parent = NodeRef::new(module.arena, module.file, node.parent.ok_or_else(invalid)?);
+    let parent_node = preflight_node(store, host, parent)?;
+    let NodeData::ModuleBlock(block) = &parent_node.data else {
+        return Err(invalid());
+    };
+    let outer = NodeRef::new(
+        module.arena,
+        module.file,
+        parent_node.parent.ok_or_else(invalid)?,
+    );
+    let outer_node = preflight_node(store, host, outer)?;
+    let NodeData::ModuleDeclaration(ambient) = &outer_node.data else {
+        return Err(invalid());
+    };
+    let name = NodeRef::new(module.arena, module.file, ambient.name);
+    let name_node = preflight_node(store, host, name)?;
+    let NodeData::StringLiteral(literal) = &name_node.data else {
+        return Err(invalid());
+    };
+    let raw = bound.symbol(outer).ok_or_else(invalid)?;
+    let owner = store.get_merged_symbol(raw).ok_or_else(invalid)?;
+    let outer_record = store.symbol(owner).ok_or_else(invalid)?;
+    if outer_node.kind != SyntaxKind::ModuleDeclaration
+        || outer_node.flags.0 != 0
+        || outer_node.parent != Some(source.node)
+        || ambient.keyword != SyntaxKind::ModuleKeyword
+        || ambient.body != Some(parent.node)
+        || ambient.symbol.is_some()
+        || ambient.local_symbol.is_some()
+        || ambient.facts != 0
+        || ambient.asterisk_token.is_some()
+        || ambient.flow_node.is_some()
+        || ambient.end_flow_node.is_some()
+        || ambient.next_container.is_some()
+        || !ambient.locals.is_empty()
+        || parent_node.flags.0 != 0
+        || block
+            .statements
+            .nodes
+            .iter()
+            .filter(|&&child| child == module.node)
+            .count()
+            != 1
+        || bound.container(module) != Some(outer)
+        || bound.container(outer) != Some(source)
+        || bound.local_symbol(outer).is_some()
+        || store.source_declaration_symbol(outer) != Some(owner)
+        || name_node.kind != SyntaxKind::StringLiteral
+        || name_node.flags.0 != 0
+        || name_node.parent != Some(outer.node)
+        || literal.token_flags.0 != 0
+        || literal.text.is_empty()
+        || outer_record.name().as_utf8() != Some(format!("\"{}\"", literal.text).as_str())
+    {
+        return Err(invalid());
+    }
+    if let Some(modifiers) = &ambient.modifiers {
+        let [modifier] = modifiers.list.nodes.as_slice() else {
+            return Err(invalid());
+        };
+        let modifier = preflight_node(
+            store,
+            host,
+            NodeRef::new(outer.arena, outer.file, *modifier),
+        )?;
+        if modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifier.kind != SyntaxKind::DeclareKeyword
+            || modifier.flags.0 != 0
+            || modifier.parent != Some(outer.node)
+            || !matches!(modifier.data, NodeData::Token(_))
+        {
+            return Err(invalid());
+        }
     }
     Ok(())
 }

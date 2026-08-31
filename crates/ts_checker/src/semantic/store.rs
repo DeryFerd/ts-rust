@@ -1910,7 +1910,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .and_then(|table| table.get(record.name()))
                 != Some(original.table_symbol)
             || facts.is_javascript_file()
-            || !facts.is_external_module()
             || facts.is_common_js_module()
             || facts.is_default_library()
             || self.source_file_rank(declaration.file).is_none()
@@ -1929,8 +1928,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || self.source_node_parent(origin.block)
                 != Some(SourceNodeParent::Parent(origin.module))
             || self.source_node_kind(origin.module) != Some(SyntaxKind::ModuleDeclaration)
-            || self.source_node_parent(origin.module)
-                != Some(SourceNodeParent::Parent(origin.source))
+            || !self.source_global_augmentation_parent_is_exact(origin.module, origin.source)
             || self
                 .source_node_fact(origin.module)
                 .is_none_or(|facts| !facts.global_augmentation)
@@ -2083,7 +2081,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             }
             match self.source_node_kind(declaration) {
                 Some(SyntaxKind::InterfaceDeclaration) => {
-                    if facts.is_external_module() {
+                    if self.source_node_parent(declaration)
+                        != Some(SourceNodeParent::Parent(source))
+                        || facts.is_external_module()
+                    {
                         if !self.source_global_interface_augmentation_is_exact(symbol, declaration)
                             || !self
                                 .source_global_interface_export_edges_are_exact(symbol, declaration)
@@ -2115,7 +2116,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                             != Some(&[name, annotation])
                         || self.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
                         || self.source_node_kind(statement) != Some(SyntaxKind::VariableStatement)
-                        || if facts.is_external_module() {
+                        || if self.source_node_parent(statement)
+                            != Some(SourceNodeParent::Parent(source))
+                            || facts.is_external_module()
+                        {
                             !self.source_global_variable_augmentation_is_exact(
                                 symbol,
                                 declaration,
@@ -2233,6 +2237,126 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     /// Retained global membership and original binder groups prove this augmentation.
+    /// Accepts the binder's top-level external or nested ambient-module scope.
+    #[allow(clippy::too_many_lines)] // The nested source chain and complete module owner form one proof.
+    pub(super) fn source_global_augmentation_parent_is_exact(
+        &self,
+        module: NodeRef,
+        source: NodeRef,
+    ) -> bool {
+        let Some(facts) = self.source_file_facts.get(&source.file) else {
+            return false;
+        };
+        if !module.is_for(source.arena, source.file)
+            || facts.is_javascript_file()
+            || facts.is_common_js_module()
+            || self
+                .source_files
+                .get(&source.file)
+                .map(|file| file.node_ref())
+                != Some(source)
+            || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || self.source_node_parent(source) != Some(SourceNodeParent::Root)
+            || self
+                .source_node_fact(module)
+                .is_none_or(|facts| !facts.global_augmentation)
+        {
+            return false;
+        }
+        let Some(SourceNodeParent::Parent(parent)) = self.source_node_parent(module) else {
+            return false;
+        };
+        if parent == source {
+            return facts.is_external_module();
+        }
+        if !facts.is_declaration_file() || facts.is_external_module() || facts.is_default_library()
+        {
+            return false;
+        }
+        let Some(SourceNodeParent::Parent(outer)) = self.source_node_parent(parent) else {
+            return false;
+        };
+        if self.source_node_kind(parent) != Some(SyntaxKind::ModuleBlock)
+            || self.source_node_kind(outer) != Some(SyntaxKind::ModuleDeclaration)
+            || self.source_node_parent(outer) != Some(SourceNodeParent::Parent(source))
+            || self.source_child_with_kind(outer, SyntaxKind::ModuleBlock) != Some(parent)
+            || self
+                .source_child_with_kind(outer, SyntaxKind::StringLiteral)
+                .is_none()
+            || self
+                .source_child_with_kind(outer, SyntaxKind::Identifier)
+                .is_some()
+            || self
+                .source_node_fact(outer)
+                .is_none_or(|facts| facts.global_augmentation)
+            || self
+                .source_direct_children(parent)
+                .is_none_or(|children| !children.contains(&module))
+            || self
+                .source_direct_children(source)
+                .is_none_or(|children| !children.contains(&outer))
+        {
+            return false;
+        }
+        let Some(raws) = self.source_declaration_owners.get(&outer) else {
+            return false;
+        };
+        let [raw] = raws.as_slice() else {
+            return false;
+        };
+        let Some(owner) = self.get_merged_symbol(*raw) else {
+            return false;
+        };
+        let (Some(raw_record), Some(record), Some(globals)) = (
+            self.symbol(*raw),
+            self.symbol(owner),
+            self.source_global_bindings.as_ref(),
+        ) else {
+            return false;
+        };
+        let Some(original) = globals.get(record.name()) else {
+            return false;
+        };
+        let Some(namespace) = self.source_declaration_symbol(module) else {
+            return false;
+        };
+        let Some(namespace_record) = self.symbol(namespace) else {
+            return false;
+        };
+        original.symbol == owner
+            && self.get_merged_symbol(original.table_symbol) == Some(owner)
+            && self
+                .intrinsic_bootstrap
+                .as_ref()
+                .is_some_and(|bootstrap| bootstrap.globals == globals.table)
+            && self
+                .symbol_table(globals.table)
+                .and_then(|table| table.get(record.name()))
+                == Some(original.table_symbol)
+            && record.flags() == original.flags
+            && record.flags().without(SymbolFlags::TRANSIENT) == SymbolFlags::VALUE_MODULE
+            && record.declarations() == original.declarations()
+            && record.value_declaration()
+                == original
+                    .declarations()
+                    .and_then(|declarations| declarations.first().copied())
+            && self.source_merged_symbol_declarations_match(owner)
+            && self.source_raw_symbol_declarations_match(*raw)
+            && self.source_symbol_export_table_matches(*raw)
+            && raw_record.name() == record.name()
+            && raw_record.check_flags() == CheckFlags::NONE
+            && raw_record.parent().is_none()
+            && raw_record.members().is_none()
+            && raw_record.export_symbol().is_none()
+            && record.check_flags() == CheckFlags::NONE
+            && record.parent().is_none()
+            && record.members().is_none()
+            && record.export_symbol().is_none()
+            && namespace_record.parent().is_none()
+            && namespace_record.export_symbol().is_none()
+            && namespace_record.members().is_none()
+    }
+
     #[allow(clippy::too_many_lines)] // Raw exports and local placeholders are different owners.
     fn source_global_variable_augmentation_is_exact(
         &self,
@@ -2252,7 +2376,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let Some(SourceNodeParent::Parent(module)) = self.source_node_parent(block) else {
             return false;
         };
-        let Some(SourceNodeParent::Parent(source)) = self.source_node_parent(module) else {
+        let Some(source) = self
+            .source_files
+            .get(&declaration.file)
+            .map(|file| file.node_ref())
+        else {
             return false;
         };
         if self.source_node_kind(block) != Some(SyntaxKind::ModuleBlock)
@@ -2260,6 +2388,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || self
                 .source_node_fact(module)
                 .is_none_or(|facts| !facts.global_augmentation)
+            || !self.source_global_augmentation_parent_is_exact(module, source)
             || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
             || self.source_node_parent(source) != Some(SourceNodeParent::Root)
             || self
@@ -15212,6 +15341,320 @@ mod source_global_owner_tests {
                     .then(|| NodeRef::new(parsed.arena.id(), file, variable.type_.unwrap()))
             })
             .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both cache states retain every nested owner through damage and restoration.
+    fn nested_global_constructor_owners_reject_changed_source_and_export_edges() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Vessel { browser: number; } ",
+            "declare var Vessel: { prototype: Vessel; new(): Vessel; };",
+        ));
+        let nested = parse_source_file(concat!(
+            "declare module 'vessel-provider' { ",
+            "global { interface Vessel { server: string; } ",
+            "var Vessel: typeof globalThis extends { onmessage: any; Vessel: infer T } ? T : never; } }",
+        ));
+        let companion =
+            parse_source_file("declare module 'vessel-provider' { interface Extra {} }");
+        let files = [
+            (&library, FileId::new(286_100), true),
+            (&nested, FileId::new(286_101), false),
+            (&companion, FileId::new(286_102), false),
+        ];
+        for warm in [false, true] {
+            let mut binder = CanonicalBinder::new();
+            for &(parsed, file, is_library) in &files {
+                assert!(parsed.diagnostics.is_empty());
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new_with_default_library(
+                            EscapedName::source(format!("\"/nested-owner-{}.d.ts\"", file.index())),
+                            CanonicalSourceLanguage::TypeScript,
+                            true,
+                            is_library,
+                            CanonicalModuleState::Script,
+                        ),
+                    )
+                    .unwrap();
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let mut checker = CanonicalCheckerContext::new(
+                binder.finish(),
+                files
+                    .iter()
+                    .map(|(parsed, file, _)| (*file, &parsed.arena))
+                    .collect(),
+                options(),
+            )
+            .unwrap();
+            let bounds = files
+                .iter()
+                .map(|(_, file, _)| checker.file(*file).unwrap().1.clone())
+                .collect::<Vec<_>>();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                files
+                    .iter()
+                    .zip(&bounds)
+                    .map(|((parsed, _, _), bound)| (&parsed.arena, bound)),
+                GlobalMergeCompletion::for_test(options().name_resolution),
+            )
+            .unwrap();
+            let globals = checker.global_types().clone();
+            let owner = global(checker.store(), "Vessel");
+            let proof = checker
+                .store()
+                .source_global_interface_value_owner(owner)
+                .unwrap()
+                .unwrap();
+            assert_eq!(proof.interfaces().len(), 2);
+            assert_eq!(proof.variables().len(), 2);
+            assert_eq!(proof.value_declaration().file, files[0].1);
+            let plan =
+                plan_global_constructor_value(checker.store(), &host, &globals, options(), owner)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(plan.value_annotation(), proof.value_annotation());
+            if warm {
+                checker
+                    .get_type_from_type_node(proof.value_annotation())
+                    .unwrap();
+            }
+            let store = checker.store_mut_for_test();
+            let pristine_plan =
+                plan_global_constructor_value(store, &host, &globals, options(), owner)
+                    .unwrap()
+                    .unwrap();
+            let origin = *store
+                .source_global_bindings
+                .as_ref()
+                .unwrap()
+                .interface_augmentations
+                .get(&proof.interfaces()[1])
+                .unwrap();
+            let raw = origin.raw_symbol.unwrap();
+            let local = origin.local_symbol.unwrap();
+            let namespace = origin.namespace.unwrap();
+            let outer_block = store
+                .source_node_fact(origin.module)
+                .unwrap()
+                .parent
+                .unwrap();
+            let outer = store
+                .source_node_fact(NodeRef::new(
+                    origin.module.arena,
+                    origin.module.file,
+                    outer_block,
+                ))
+                .unwrap()
+                .parent
+                .unwrap();
+            let outer = NodeRef::new(origin.module.arena, origin.module.file, outer);
+            let outer_owner = store.source_declaration_symbol(outer).unwrap();
+            assert_ne!(bounds[1].symbol(outer).unwrap(), outer_owner);
+            assert_eq!(
+                store
+                    .symbol(outer_owner)
+                    .unwrap()
+                    .declarations()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            let module_parent = store.source_node_fact(origin.module).unwrap().parent;
+            let outer_parent = store.source_node_fact(outer).unwrap().parent;
+            let outer_record = store.symbol(outer_owner).unwrap().clone();
+            let raw_record = store.symbol(raw).unwrap().clone();
+            let local_record = store.symbol(local).unwrap().clone();
+            let namespace_record = store.symbol(namespace).unwrap().clone();
+            let exports = namespace_record.exports().unwrap();
+            let global_table = proof.globals_table();
+            let outer_table_symbol = store
+                .symbol_table(global_table)
+                .unwrap()
+                .get(outer_record.name())
+                .unwrap();
+            let merge_target = store.merged_symbols.get(&raw).copied().unwrap();
+            let saved_links = store.type_node_links(proof.value_annotation()).cloned();
+            let unselected = store
+                .source_direct_type_annotation(proof.variables()[1])
+                .unwrap();
+            assert!(store.type_node_links(unselected).is_none());
+            // Setters invalidate maintenance caches. Keep that state fixed during each read.
+            store.mark_relation_inputs_dirty();
+            store.mark_union_cache_validation_dirty();
+            let baseline = format!("{store:?}");
+            for damage in 0..10 {
+                let type_links = store.links.type_node.checkpoint();
+                match damage {
+                    0 => {
+                        store
+                            .source_node_facts
+                            .get_mut(&origin.module.arena)
+                            .unwrap()[origin.module.node.index()]
+                        .as_mut()
+                        .unwrap()
+                        .parent = Some(origin.source.node)
+                    }
+                    1 => {
+                        store.source_node_facts.get_mut(&outer.arena).unwrap()[outer.node.index()]
+                            .as_mut()
+                            .unwrap()
+                            .parent = Some(outer_block)
+                    }
+                    2 => assert!(store.set_symbol_relationships(
+                        raw,
+                        raw_record.members(),
+                        raw_record.exports(),
+                        Some(outer_owner),
+                        raw_record.export_symbol()
+                    )),
+                    3 => assert!(store.set_symbol_relationships(
+                        local,
+                        local_record.members(),
+                        local_record.exports(),
+                        local_record.parent(),
+                        Some(owner)
+                    )),
+                    4 => {
+                        assert_eq!(
+                            store.insert_symbol(exports, EscapedName::source("Vessel"), owner),
+                            Some(Some(raw))
+                        );
+                    }
+                    5 => {
+                        store.merged_symbols.insert(raw, outer_owner);
+                    }
+                    6 => {
+                        assert_eq!(
+                            store.insert_symbol(
+                                global_table,
+                                outer_record.name().to_owned(),
+                                namespace
+                            ),
+                            Some(Some(outer_table_symbol))
+                        );
+                    }
+                    7 => assert!(store.set_symbol_relationships(
+                        namespace,
+                        namespace_record.members(),
+                        namespace_record.exports(),
+                        Some(outer_owner),
+                        namespace_record.export_symbol()
+                    )),
+                    8 => assert!(store.set_type_node_links(
+                        proof.value_annotation(),
+                        TypeNodeLinks {
+                            resolved_type: Some(store.intrinsic_bootstrap().unwrap().boolean_type),
+                            ..saved_links.clone().unwrap_or_default()
+                        }
+                    )),
+                    9 => assert!(store.set_symbol_declarations(
+                        outer_owner,
+                        outer_record.declarations().map(<[NodeRef]>::to_vec),
+                        None
+                    )),
+                    _ => unreachable!(),
+                }
+                let damaged = format!("{store:?}");
+                for _ in 0..2 {
+                    if damage == 8 {
+                        proof.validate_current(store).unwrap();
+                    } else {
+                        assert!(
+                            proof.validate_current(store).is_err(),
+                            "warm={warm}, damage={damage}"
+                        );
+                    }
+                    assert!(
+                        plan_global_constructor_value(store, &host, &globals, options(), owner)
+                            .is_err(),
+                        "warm={warm}, damage={damage}"
+                    );
+                    assert_eq!(format!("{store:?}"), damaged);
+                }
+                match damage {
+                    0 => {
+                        store
+                            .source_node_facts
+                            .get_mut(&origin.module.arena)
+                            .unwrap()[origin.module.node.index()]
+                        .as_mut()
+                        .unwrap()
+                        .parent = module_parent
+                    }
+                    1 => {
+                        store.source_node_facts.get_mut(&outer.arena).unwrap()[outer.node.index()]
+                            .as_mut()
+                            .unwrap()
+                            .parent = outer_parent
+                    }
+                    2 => assert!(store.set_symbol_relationships(
+                        raw,
+                        raw_record.members(),
+                        raw_record.exports(),
+                        raw_record.parent(),
+                        raw_record.export_symbol()
+                    )),
+                    3 => assert!(store.set_symbol_relationships(
+                        local,
+                        local_record.members(),
+                        local_record.exports(),
+                        local_record.parent(),
+                        local_record.export_symbol()
+                    )),
+                    4 => {
+                        assert_eq!(
+                            store.insert_symbol(exports, EscapedName::source("Vessel"), raw),
+                            Some(Some(owner))
+                        );
+                    }
+                    5 => {
+                        store.merged_symbols.insert(raw, merge_target);
+                    }
+                    6 => {
+                        assert_eq!(
+                            store.insert_symbol(
+                                global_table,
+                                outer_record.name().to_owned(),
+                                outer_table_symbol
+                            ),
+                            Some(Some(namespace))
+                        );
+                    }
+                    7 => assert!(store.set_symbol_relationships(
+                        namespace,
+                        namespace_record.members(),
+                        namespace_record.exports(),
+                        namespace_record.parent(),
+                        namespace_record.export_symbol()
+                    )),
+                    8 => {
+                        assert!(store.links.type_node.restore_checkpoint(type_links));
+                    }
+                    9 => assert!(store.set_symbol_declarations(
+                        outer_owner,
+                        outer_record.declarations().map(<[NodeRef]>::to_vec),
+                        outer_record.value_declaration()
+                    )),
+                    _ => unreachable!(),
+                }
+                proof.validate_current(store).unwrap();
+                assert_eq!(
+                    plan_global_constructor_value(store, &host, &globals, options(), owner)
+                        .unwrap(),
+                    Some(pristine_plan.clone())
+                );
+                assert_eq!(format!("{store:?}"), baseline);
+                assert!(store.type_node_links(unselected).is_none());
+            }
+        }
     }
 
     #[test]
