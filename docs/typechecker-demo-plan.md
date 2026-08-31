@@ -8,8 +8,8 @@ Make Hono the next complete-project demo target. Keep TanStack Query core as
 the second target. Three unchanged Hono class-annotation tests now pass,
 including rejected status codes and renamed imports. The full Hono run still
 stops on an unavailable interface declaration in `http-exception.ts`.
-The latest trace identifies the DOM `Response` declaration. A bounded trace
-change is in progress to identify the exact rejecting guard.
+The latest trace identifies the DOM `Response` declaration. A reviewed trace
+change is committed for the next run to identify the exact rejecting guard.
 Query still needs more source-language features before its next complete check.
 This changes the work order, not the acceptance criteria.
 Use their existing production typecheck configurations, not a new app
@@ -27,8 +27,9 @@ The latest complete core check passed 6,421 of 6,422 tests. All 729 public
 checker tests passed. All eight failures from the previous run now pass.
 The only failure is in a new display-control test. Its forced replay changes
 one relation-observation counter from 1 to 2. The other 112 store fields and
-diagnostics are byte-equal. A narrow test correction is in progress. This is
-not a passed gate or a full-project result. The original corpus has not rerun.
+diagnostics are byte-equal. The narrow test correction is committed at
+`57e743da`, and its full check is running. This is not yet a passed gate or a
+full-project result. The original corpus has not rerun.
 
 The latest Hono run still stops during construction. It builds correctly, but
 does not return a diagnostic set. Source `f5b684b5` combines the annotation-role
@@ -45,12 +46,14 @@ and [review](../target/wave202-demo-hono-isolated-probe-6-runtime-review.md)
 record the failure without a project-pass claim.
 The original Hono configuration, 188 roots and dependencies remain unchanged.
 
-The separate alias repair run is a measured gain. It completed 5,093 tests,
-with 5,069 passes and 24 failures. Thirty-six old failures now pass. All 5,028
-old passing tests still pass. Four of nine new tests fail. This is not a
-project pass or an accepted compiler. The class integration separately
-completed 6,149 tests, with 6,014 passes and 135 failures. These selections
-overlap and must not be added together.
+The latest alias repair run completed 5,094 tests, with 5,074 passes and 20
+failures. All five targeted failures now pass. All 5,069 passes from the
+previous run remain passed. The new relation control fails before its
+assertions because a nongeneric alias that wraps a generic function alias is
+still unsupported. Nineteen older failures remain. This is not a project pass
+or an accepted compiler. The class integration separately completed 6,149
+tests, with 6,014 passes and 135 failures. These selections overlap and must
+not be added together.
 
 The accepted original test subset has 423 exact diagnostic results in 511
 executed variants and 60 exact semantic results in 95 variants. These are not
@@ -101,15 +104,16 @@ harnesses. It passed 6,421 and failed one. All eight previous failures now
 pass. All eleven stages completed, including all public, compiler and fixture
 tests. All 228 required names ran, with 227 passes and one failure. The
 [complete result](../target/wave202-core-corpus-3-repair-full-3-quality-report.md)
-records the unchanged source and closed cleanup. Independent result review
-is in progress.
+records the unchanged source and closed cleanup. The
+[independent result review](../target/wave202-core-corpus-3-repair-full-3-quality-runtime-review.md)
+is complete.
 
 The sole failure is the new ambient-export display snapshot. Forced source
 replay advances `next_relation_observation_token` by exactly one. Independent
 diagnosis confirms that every other store field and the diagnostics stay
-exact. The new test will check that specific counter change while retaining
-all other byte comparisons. Its display and damage assertions remain intact.
-Later unrun assertions still need execution. The
+exact. The committed correction checks that specific counter change while
+retaining all other byte comparisons. Its display and damage assertions
+remain intact. The next full check is running on `57e743da`. The
 [diagnosis](../target/wave202-core-full3-symbol-display-failure-diagnosis.md)
 and [review](../target/wave202-core-full3-symbol-display-failure-review.md)
 record the scope. No production fix is proposed for this failure. The corpus
@@ -432,9 +436,15 @@ retain all 24 failures. The candidate is not accepted. The setup corrections
 preserve the original TypeScript, options, semantic assertions and query order.
 The five context failures now have a six-line relation repair committed and
 reviewed at `915ddea3`. It admits validated function-alias instances to the
-existing relation path. It does not force assignability. A new test checks
-separate instances and damaged warm caches. Its full 5,094-test check is in
-preparation. The remaining 19 failures have a separate completed census.
+existing relation path. It does not force assignability. Its complete run
+passed 5,074 of 5,094 tests. All five targeted failures and all 34 older
+required controls now pass. No old passing test regressed. The
+[complete result](../target/wave202-alias-context-relations-focused-1-runtime.md)
+and [independent review](../target/wave202-alias-context-relations-focused-1-runtime-review.md)
+are closed. The new relation control does not reach its assertions. Its
+original alias-wrapper query is unsupported. That source form needs a real
+repair, not a test route that avoids it. The remaining 19 older failures have
+a separate completed census.
 Executable class imports are committed and reviewed at `c295104c`, with eight
 new private and eight new public tests. Generic construction is committed and
 reviewed at `d2a6a8a3`, with 16 new private and four new public tests. Neither
@@ -494,13 +504,18 @@ The demo still needs a complete ordinary diagnostic check and the separate
 deliberate-error check. An unsupported report is never a successful demo.
 
 A separate diagnostic reporter is committed at `db8eda9a` to measure failures
-hidden behind the first project stop. Its source and test-packet reviews are
-closed. Its next step is the 313-test check, including 16 new controls.
-It loads the complete
-original Program, runs the ordinary-order control first, and checks each root
-in a fresh checker context. It records every root, incomplete attempt and
-failure. These isolated-root results will guide parallel repairs. They will
-not count as a normal complete-project pass.
+hidden behind the first project stop. It built and listed all 294 compiler
+tests, but the artifact check stopped the run before any test body ran. Two
+distinct `unicode-ident` outputs share the check's incomplete identity key.
+The saved failed result remains unchanged. A reviewed key correction will
+keep both full output identities and rerun the complete 313-test selection,
+including all 16 new controls, in a fresh target. The correction does not
+change checker behavior or waive duplicate artifacts.
+
+The reporter loads the complete original Program, runs the ordinary-order
+control first, and checks each root in a fresh checker context. It records
+every root, incomplete attempt and failure. These isolated-root results will
+guide parallel repairs. They will not count as a normal complete-project pass.
 
 The existing development entry point is `tsgo --check-canonical PROJECT`.
 It fails if construction is unsupported or canonical checking did not run.
