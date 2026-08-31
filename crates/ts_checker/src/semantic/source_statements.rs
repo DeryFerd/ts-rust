@@ -9376,7 +9376,7 @@ impl SyntaxPlanner<'_> {
                 self.validate_container(initializer, callable)?;
                 self.validate_block_scope_container(initializer, expected_scope)?;
             }
-            None if !allow_uninitialized || binding.is_const() => {
+            None if binding.is_const() || !allow_uninitialized && type_node.is_none() => {
                 return Err(SourceFunctionStatementsError::Unsupported(
                     SourceFunctionStatementsUnsupported::MissingInitializer(declaration),
                 ));
