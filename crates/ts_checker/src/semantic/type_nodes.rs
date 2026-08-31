@@ -39604,12 +39604,24 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 {
                     return Some(count);
                 }
-                plan.interfaces
+                let count = plan
+                    .interfaces
                     .values()
                     .chain(plan.generic_interfaces.values())
                     .chain(plan.type_literals.values())
                     .try_fold(count, |count, interface| {
-                        count.checked_add(object_members::optional_method_union_operations(
+                        count
+                            .checked_add(object_members::optional_method_union_operations(
+                                interface,
+                            )?)?
+                            .checked_add(object_members::optional_interface_call_union_operations(
+                                interface,
+                            )?)
+                    })?;
+                plan.generic_member_plans
+                    .values()
+                    .try_fold(count, |count, interface| {
+                        count.checked_add(object_members::optional_interface_call_union_operations(
                             interface,
                         )?)
                     })
@@ -40220,6 +40232,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         {
             return Err(invalid());
         }
+        object_members::prepare_interface_call_optional_parameters(
+            self.store,
+            &members,
+            prepared,
+            self.global_types.as_ref(),
+        )
+        .map_err(property_object_error)?;
         object_members::publish_generic_interface_declared_members(
             self.store,
             &members,
@@ -40499,6 +40518,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     return_type,
                 });
             }
+            object_members::prepare_interface_call_optional_parameters(
+                self.store,
+                &interface,
+                prepared,
+                self.global_types.as_ref(),
+            )
+            .map_err(property_object_error)?;
             let method_values = object_members::publish_interface_method_values_prepared(
                 self.store,
                 &interface,

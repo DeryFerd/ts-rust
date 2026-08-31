@@ -868,6 +868,7 @@ pub(super) fn reorder_direct_call_candidates<'a>(
                                     Some(super::store::SourceNodeParent::Parent(parent))
                                         if declarations.contains(&parent)
                                             && store.source_declaration_symbol(parent) == Some(owner))
+                            || store.source_interface_call_owner(declaration) == Some(owner)
                     }))
             })
         });

@@ -2403,6 +2403,110 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .all(|declaration| self.source_declaration_belongs_to_symbol(*declaration, symbol))
     }
 
+    /// Proves a call member against every original interface contribution.
+    pub(super) fn source_interface_call_owner(
+        &self,
+        declaration: NodeRef,
+    ) -> Option<SemanticSymbolId> {
+        let member = self.source_declaration_symbol(declaration)?;
+        let owner = self.get_parent_of_symbol(member)?;
+        let record = self.symbol(owner)?;
+        let declarations = record.declarations()?;
+        let members = self.symbol_table(record.members()?)?;
+        let call = self.symbol(member)?;
+        if self.source_node_kind(declaration) != Some(SyntaxKind::CallSignature)
+            || record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || record.check_flags() != CheckFlags::NONE
+            || record.value_declaration().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || self.get_merged_symbol(owner) != Some(owner)
+            || !self.source_merged_symbol_declarations_match(owner)
+            || members.get(InternalSymbolName::New.as_ref()).is_some()
+            || members
+                .get(InternalSymbolName::Call.as_ref())
+                .and_then(|member| self.get_merged_symbol(member))
+                != Some(member)
+            || call.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::SIGNATURE
+            || call.check_flags() != CheckFlags::NONE
+            || call.name() != InternalSymbolName::Call.as_ref()
+            || call.value_declaration().is_some()
+            || call.members().is_some()
+            || call.exports().is_some()
+            || call.export_symbol().is_some()
+            || !self.source_merged_symbol_declarations_match(member)
+        {
+            return None;
+        }
+        let mut calls = Vec::new();
+        for &parent in declarations {
+            if self.source_node_kind(parent) != Some(SyntaxKind::InterfaceDeclaration) {
+                return None;
+            }
+            for child in self.source_direct_children(parent)? {
+                if self.source_node_kind(child) == Some(SyntaxKind::CallSignature) {
+                    if !self.source_interface_call_member_is_exact(owner, member, child) {
+                        return None;
+                    }
+                    calls.push(child);
+                }
+            }
+        }
+        (calls.contains(&declaration) && call.declarations() == Some(calls.as_slice()))
+            .then_some(owner)
+    }
+
+    fn source_interface_call_member_is_exact(
+        &self,
+        owner: SemanticSymbolId,
+        member: SemanticSymbolId,
+        declaration: NodeRef,
+    ) -> bool {
+        let Some(SourceNodeParent::Parent(parent)) = self.source_node_parent(declaration) else {
+            return false;
+        };
+        let Some(owners) = self.source_declaration_owners.get(&declaration) else {
+            return false;
+        };
+        let [raw] = owners.as_slice() else {
+            return false;
+        };
+        let Some(raw_owner) = self.symbol(*raw).and_then(Symbol::parent) else {
+            return false;
+        };
+        self.get_merged_symbol(*raw) == Some(member)
+            && self.get_merged_symbol(raw_owner) == Some(owner)
+            && self.source_raw_symbol_declarations_match(*raw)
+            && self.source_raw_symbol_declarations_match(raw_owner)
+            && self.symbol(*raw).is_some_and(|record| {
+                record.flags() == SymbolFlags::SIGNATURE
+                    && record.check_flags() == CheckFlags::NONE
+                    && record.name() == InternalSymbolName::Call.as_ref()
+                    && record.members().is_none()
+                    && record.exports().is_none()
+                    && record.export_symbol().is_none()
+            })
+            && self.symbol(raw_owner).is_some_and(|record| {
+                record.check_flags() == CheckFlags::NONE
+                    && self
+                        .symbol(owner)
+                        .is_some_and(|owner| owner.name() == record.name())
+                    && self.get_parent_of_symbol(raw_owner) == self.get_parent_of_symbol(owner)
+                    && record.exports().is_none()
+                    && record.export_symbol().is_none()
+            })
+            && self
+                .source_declaration_owners
+                .get(&parent)
+                .is_some_and(|owners| owners.contains(&raw_owner))
+            && self
+                .symbol(raw_owner)
+                .and_then(Symbol::members)
+                .and_then(|members| self.symbol_table(members))
+                .and_then(|members| members.get(InternalSymbolName::Call.as_ref()))
+                == Some(*raw)
+    }
+
     /// Parses and copies one exact standalone `Identifier | QualifiedName`
     /// tree into the checker-owned synthetic entity-name arena.
     ///
