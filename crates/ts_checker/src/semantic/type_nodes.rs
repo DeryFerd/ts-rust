@@ -41970,6 +41970,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .try_reserve(tuple_preflight.length_values().len())
             .map_err(|_| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         numbers.extend_from_slice(tuple_preflight.length_values());
+        // Source-query and defaulted unions consume prepared operations on warm replay.
         let unions = plan
             .unions
             .iter()
@@ -41978,6 +41979,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .type_node_links(**node)
                     .and_then(|links| links.resolved_type)
                     .is_none()
+                    || plan.defaulted_interface_unions.contains(*node)
+                    || plan.source_query_unions.contains(*node)
             })
             .map(|(_, union)| union)
             .collect::<Vec<_>>();
