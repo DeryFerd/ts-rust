@@ -5,8 +5,7 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SignatureId,
-    SourceCheckError, TypeData, TypeId, artifact_queries::CanonicalArtifactQueryError,
-    signatures::SignatureFlags, type_records::StructuredTypeData,
+    TypeData, TypeId, signatures::SignatureFlags, type_records::StructuredTypeData,
 };
 use ts_options::ScriptTarget;
 use ts_parser::{ParseResult, parse_source_file};
@@ -892,8 +891,140 @@ fn assert_supported_method_overload_row(
     }
 }
 
+fn generic_method_row_nodes(parsed: &ParseResult, method: &Method) -> [NodeRef; 4] {
+    let NodeData::MethodDeclaration(data) =
+        &parsed.arena.get(method.declaration.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let [formal] = data.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+        panic!("the original method must keep its one formal")
+    };
+    let NodeData::ParameterDeclaration(parameter) =
+        &parsed.arena.get(method.parameters[0].node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let NodeData::Block(body) = &parsed.arena.get(data.body.unwrap()).unwrap().data else {
+        unreachable!()
+    };
+    let [statement] = body.statements.nodes.as_slice() else {
+        panic!("the original method must keep its one return")
+    };
+    let NodeData::ReturnStatement(returned) = &parsed.arena.get(*statement).unwrap().data else {
+        unreachable!()
+    };
+    [
+        node(parsed, *formal),
+        node(parsed, parameter.type_.unwrap()),
+        node(parsed, data.type_.unwrap()),
+        node(parsed, returned.expression.unwrap()),
+    ]
+}
+
+fn assert_supported_generic_method_row(
+    context: &mut CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    method: &Method,
+) {
+    let [
+        formal_node,
+        parameter_annotation,
+        return_annotation,
+        returned,
+    ] = generic_method_row_nodes(parsed, method);
+    assert!(
+        context
+            .store()
+            .signature_links(method.declaration)
+            .is_none()
+    );
+    let formal = context
+        .get_type_from_type_node(parameter_annotation)
+        .unwrap();
+    let callable = context.get_type_at_location(method.name).unwrap();
+    context.check_source_file(FILE).unwrap();
+    assert!(is_checked(context));
+    assert!(context.diagnostics().is_empty());
+    let formal_symbol = symbol(context, formal_node);
+    assert_eq!(
+        context.get_declared_type_of_symbol(formal_symbol),
+        Ok(formal)
+    );
+    let formal_record = context.store().type_payload(formal).unwrap();
+    assert_eq!(formal_record.symbol(), Some(formal_symbol));
+    let TypeData::TypeParameter(data) = formal_record.data() else {
+        panic!("the original T must remain a source type parameter")
+    };
+    assert_eq!(data.target, None);
+    assert_eq!(data.mapper, None);
+    assert_eq!(data.constraint, None);
+    assert_eq!(data.resolved_default_type, None);
+    let parameter = symbol(context, method.parameters[0]);
+    let signature_ids = signatures(context, callable);
+    let [signature] = signature_ids.as_slice() else {
+        panic!("the method must retain its one generic signature")
+    };
+    let signature = *signature;
+    let record = context.store().signature(signature).unwrap();
+    assert_eq!(record.declaration(), Some(method.declaration));
+    assert_eq!(record.type_parameters(), [formal]);
+    assert_eq!(record.parameters(), [parameter]);
+    assert_eq!(record.resolved_return_type(), Some(formal));
+    assert_eq!(record.min_argument_count(), 1);
+    assert_eq!(record.flags(), SignatureFlags::NONE);
+    assert_eq!(record.target(), None);
+    assert_eq!(record.mapper(), None);
+    let parameter_links = context.store().value_symbol_links(parameter).unwrap();
+    assert_eq!(parameter_links.resolved_type, Some(formal));
+    assert_eq!(
+        context.get_type_from_type_node(return_annotation),
+        Ok(formal)
+    );
+    assert_eq!(context.get_type_at_location(returned), Ok(formal));
+    assert_eq!(
+        context.get_symbol_at_location(returned).unwrap(),
+        Some(parameter)
+    );
+    assert_eq!(
+        context.get_type_at_location(method.declaration),
+        Ok(callable)
+    );
+    assert_eq!(context.get_return_type_of_signature(signature), Ok(formal));
+    let displays = [(callable, method.name, "<T>(value: T) => T")];
+    assert_display_read_only(context, parsed, &displays);
+    let warm = format!("{:?}", context.store());
+    for _ in 0..2 {
+        context.recheck_source_file(FILE).unwrap();
+        assert!(is_checked(context));
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(context.get_type_at_location(method.name), Ok(callable));
+        assert_eq!(
+            context.get_type_at_location(method.declaration),
+            Ok(callable)
+        );
+        assert_eq!(context.get_type_at_location(returned), Ok(formal));
+        assert_eq!(
+            context.get_type_from_type_node(parameter_annotation),
+            Ok(formal)
+        );
+        assert_eq!(
+            context.get_type_from_type_node(return_annotation),
+            Ok(formal)
+        );
+        assert_eq!(
+            context.get_declared_type_of_symbol(formal_symbol),
+            Ok(formal)
+        );
+        assert_eq!(context.get_return_type_of_signature(signature), Ok(formal));
+        assert_eq!(signatures(context, callable), signature_ids);
+        assert_display_read_only(context, parsed, &displays);
+        assert_eq!(format!("{:?}", context.store()), warm);
+    }
+}
+
 #[test]
-fn class_method_overloads_preserve_signatures_and_generic_methods_remain_unsupported() {
+fn class_method_overloads_and_generic_methods_preserve_signatures() {
     for (index, source) in [
         "class Service { read(value: number): number; read(value: string): string; read(value: number | string) { return value; } }",
         "class Service { read<T>(value: T): T { return value; } }",
@@ -908,33 +1039,6 @@ fn class_method_overloads_preserve_signatures_and_generic_methods_remain_unsuppo
             assert_supported_method_overload_row(&mut context, &parsed, &methods);
             continue;
         }
-        let before = counts(&context);
-        let error = context.check_source_file(FILE).unwrap_err();
-        assert!(
-            matches!(error, SourceCheckError::Unsupported(_)),
-            "{source}: {error:?}"
-        );
-        assert_eq!(context.check_source_file(FILE).unwrap_err(), error);
-        assert_eq!(
-            context.get_type_at_location(methods[0].name).unwrap_err(),
-            CanonicalArtifactQueryError::SourceCheck(error)
-        );
-        for method in methods {
-            assert!(
-                context
-                    .store()
-                    .signature_links(method.declaration)
-                    .is_none()
-            );
-            assert!(
-                context
-                    .store()
-                    .value_symbol_links(symbol(&context, method.declaration))
-                    .is_none()
-            );
-        }
-        assert_eq!(counts(&context), before);
-        assert!(context.diagnostics().is_empty());
-        assert!(!is_checked(&context));
+        assert_supported_generic_method_row(&mut context, &parsed, &methods[0]);
     }
 }

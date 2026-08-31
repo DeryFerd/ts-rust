@@ -496,15 +496,255 @@ fn method_object_annotations_keep_exact_argument_and_body_errors() {
     }
 }
 
+fn assert_generic_annotation_property(
+    context: &mut CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    method: &Method,
+    formal: TypeId,
+) -> TypeId {
+    let NodeData::TypeLiteralNode(literal) =
+        &parsed.arena.get(method.annotation.node).unwrap().data
+    else {
+        panic!("the original parameter must keep its inline type literal")
+    };
+    let [property] = literal.members.nodes.as_slice() else {
+        panic!("the original parameter must keep its one property")
+    };
+    let NodeData::PropertyDeclaration(data) = &parsed.arena.get(*property).unwrap().data else {
+        panic!("the property must keep its source declaration")
+    };
+    let declaration = reference(parsed, *property);
+    let annotation = reference(parsed, data.type_.unwrap());
+    let name = reference(parsed, data.name);
+    let owner = symbol(context, method.annotation);
+    let property = symbol(context, declaration);
+    let type_ = context.get_type_from_type_node(method.annotation).unwrap();
+    assert_eq!(context.get_type_from_type_node(annotation), Ok(formal));
+    assert_eq!(context.get_type_at_location(name), Ok(formal));
+    assert_eq!(
+        context.get_symbol_at_location(name).unwrap(),
+        Some(property)
+    );
+    assert_eq!(
+        context.get_type_at_location(method.parameter_name),
+        Ok(type_)
+    );
+    let store = context.store();
+    let record = store.type_payload(type_).unwrap();
+    assert_eq!(record.symbol(), Some(owner));
+    let TypeData::Object(object) = record.data() else {
+        panic!("the inline annotation must keep its actual object type")
+    };
+    assert_eq!(
+        object.structured.properties.as_deref(),
+        Some(&[property][..])
+    );
+    let member = store.symbol(property).unwrap();
+    assert_eq!(member.flags(), SymbolFlags::PROPERTY);
+    assert_eq!(member.parent(), Some(owner));
+    assert_eq!(member.declarations(), Some(&[declaration][..]));
+    assert_eq!(member.value_declaration(), Some(declaration));
+    assert_eq!(
+        store.value_symbol_links(property),
+        Some(&ValueSymbolLinks {
+            resolved_type: Some(formal),
+            ..ValueSymbolLinks::default()
+        })
+    );
+    type_
+}
+
+fn assert_generic_annotation_signature(
+    context: &mut CanonicalCheckerContext<'_>,
+    method: &Method,
+    formal: TypeId,
+    parameter_type: TypeId,
+    returned: TypeId,
+) -> (TypeId, SignatureId) {
+    let owner = symbol(context, method.declaration);
+    let class = symbol(context, method.class);
+    let parameter = symbol(context, method.parameter);
+    let callable = context.get_type_at_location(method.name).unwrap();
+    assert_eq!(
+        context.get_type_at_location(method.declaration),
+        Ok(callable)
+    );
+    let signature = signature(context, method.declaration);
+    assert_eq!(
+        context.get_return_type_of_signature(signature),
+        Ok(returned)
+    );
+    let store = context.store();
+    let member = store.symbol(owner).unwrap();
+    assert_eq!(member.flags(), SymbolFlags::METHOD);
+    assert_eq!(member.parent(), Some(class));
+    assert_eq!(member.declarations(), Some(&[method.declaration][..]));
+    assert_eq!(member.value_declaration(), Some(method.declaration));
+    let record = store.signature(signature).unwrap();
+    assert_eq!(record.declaration(), Some(method.declaration));
+    assert_eq!(record.flags(), SignatureFlags::NONE);
+    assert_eq!(record.type_parameters(), [formal]);
+    assert_eq!(record.parameters(), [parameter]);
+    assert_eq!(record.min_argument_count(), 1);
+    assert_eq!(record.resolved_return_type(), Some(returned));
+    assert_eq!(record.target(), None);
+    assert_eq!(record.mapper(), None);
+    assert_eq!(record.this_parameter(), None);
+    assert_eq!(
+        store.value_symbol_links(parameter),
+        Some(&ValueSymbolLinks {
+            resolved_type: Some(parameter_type),
+            ..ValueSymbolLinks::default()
+        })
+    );
+    let record = store.type_payload(callable).unwrap();
+    assert_eq!(record.symbol(), Some(owner));
+    let TypeData::Object(object) = record.data() else {
+        panic!("the method must keep its own callable type")
+    };
+    assert_eq!(
+        object.structured.signatures.as_deref(),
+        Some(&[signature][..])
+    );
+    assert_eq!(object.structured.call_signature_count, 1);
+    (callable, signature)
+}
+
+fn assert_generic_annotation_formal(
+    context: &mut CanonicalCheckerContext<'_>,
+    formal_node: NodeRef,
+) -> TypeId {
+    let formal_symbol = symbol(context, formal_node);
+    let formal = context.get_declared_type_of_symbol(formal_symbol).unwrap();
+    let store = context.store();
+    assert_eq!(
+        store.symbol(formal_symbol).unwrap().flags(),
+        SymbolFlags::TYPE_PARAMETER
+    );
+    assert_eq!(
+        store.symbol(formal_symbol).unwrap().declarations(),
+        Some(&[formal_node][..])
+    );
+    let record = store.type_payload(formal).unwrap();
+    assert_eq!(record.symbol(), Some(formal_symbol));
+    let TypeData::TypeParameter(data) = record.data() else {
+        panic!("the inline member must use the method's real T")
+    };
+    assert!(!data.is_this_type);
+    assert_eq!(data.target, None);
+    assert_eq!(data.mapper, None);
+    assert_eq!(data.constraint, None);
+    assert_eq!(data.resolved_default_type, None);
+    formal
+}
+
+fn assert_supported_generic_annotation_row(parsed: &ParseResult, method: &Method) {
+    let NodeData::ClassDeclaration(class) = &parsed.arena.get(method.class.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    assert!(class.type_parameters.is_none());
+    let NodeData::MethodDeclaration(data) =
+        &parsed.arena.get(method.declaration.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let [formal] = data.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+        panic!("the original method must keep its one formal")
+    };
+    let formal_node = reference(parsed, *formal);
+    assert_eq!(
+        parsed.arena.get(*formal).unwrap().parent,
+        Some(method.declaration.node)
+    );
+    let return_annotation = reference(parsed, data.type_.unwrap());
+    assert_eq!(
+        parsed.arena.get(return_annotation.node).unwrap().kind,
+        SyntaxKind::VoidKeyword
+    );
+    let NodeData::Block(body) = &parsed.arena.get(data.body.unwrap()).unwrap().data else {
+        unreachable!()
+    };
+    assert!(body.statements.nodes.is_empty());
+    for query_first in [false, true] {
+        let mut context = context(parsed);
+        let formal_symbol = symbol(&context, formal_node);
+        assert!(context.store().declared_type_links(formal_symbol).is_none());
+        assert!(
+            context
+                .store()
+                .signature_links(method.declaration)
+                .is_none()
+        );
+        let early =
+            query_first.then(|| context.get_type_from_type_node(method.annotation).unwrap());
+        context.check_source_file(FILE).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert!(
+            context
+                .store()
+                .source_file_links(context.source_file(FILE).unwrap())
+                .unwrap()
+                .type_checked
+        );
+        let formal = assert_generic_annotation_formal(&mut context, formal_node);
+        let returned = context.store().intrinsic_bootstrap().unwrap().void_type;
+        assert_eq!(
+            context.get_type_from_type_node(return_annotation),
+            Ok(returned)
+        );
+        let parameter = assert_generic_annotation_property(&mut context, parsed, method, formal);
+        if let Some(early) = early {
+            assert_eq!(parameter, early);
+        }
+        let identity =
+            assert_generic_annotation_signature(&mut context, method, formal, parameter, returned);
+        let warm = publication(&context, parsed);
+        assert_replay(&mut context, parsed);
+        for _ in 0..2 {
+            assert_eq!(
+                assert_generic_annotation_formal(&mut context, formal_node),
+                formal
+            );
+            assert_eq!(
+                context.get_type_from_type_node(return_annotation),
+                Ok(returned)
+            );
+            assert_eq!(
+                assert_generic_annotation_property(&mut context, parsed, method, formal),
+                parameter
+            );
+            assert_eq!(
+                assert_generic_annotation_signature(
+                    &mut context,
+                    method,
+                    formal,
+                    parameter,
+                    returned
+                ),
+                identity
+            );
+            assert_eq!(publication(&context, parsed), warm);
+        }
+    }
+}
+
 #[test]
-fn method_object_annotations_keep_generic_optional_and_rest_boundaries() {
-    for source in [
+fn method_object_annotations_keep_generic_identities_and_optional_rest_boundaries() {
+    for (index, source) in [
         "class Receiver { read<T>(source: { value: T }): void {} }",
         "class Receiver { read(source?: { value: number }): void {} }",
         "class Receiver { read(...source: { value: number }[]): void {} }",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let parsed = parse_source_file(source);
         let method = method(&parsed, "read");
+        if index == 0 {
+            assert_supported_generic_annotation_row(&parsed, &method);
+            continue;
+        }
         let mut context = context(&parsed);
         let owner = symbol(&context, method.class);
         let cold = publication(&context, &parsed);
