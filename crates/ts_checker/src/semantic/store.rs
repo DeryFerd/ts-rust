@@ -69,7 +69,10 @@ use super::{
         source_type_parameter_default_is_assignable, valid_source_generic_index_map,
     },
     source_flow::SourceCapturedLocal,
-    source_imports::SourceFileNamespaceIdentity,
+    source_imports::{
+        SourceFileNamespaceIdentity, SyntheticNamespacePropertyOrigin,
+        SyntheticNamespacePropertyState,
+    },
     source_meta::ImportMetaExpressionIdentity,
     source_namespaces::ModuleValueIdentity,
     type_nodes::{
@@ -777,6 +780,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     module_value_identities: HashMap<SemanticSymbolId, ModuleValueIdentity>,
     object_literal_property_clone_origins:
         HashMap<SemanticSymbolId, ObjectLiteralPropertyCloneOrigin>,
+    synthetic_namespace_property_origins:
+        HashMap<SemanticSymbolId, SyntheticNamespacePropertyState>,
     object_literal_getter_origins: HashMap<SemanticSymbolId, ObjectLiteralGetterOrigin>,
     object_literal_getter_return_proofs: HashMap<SemanticSymbolId, ObjectLiteralGetterReturnProof>,
     source_file_namespace_identities: HashMap<SemanticSymbolId, SourceFileNamespaceIdentity>,
@@ -946,6 +951,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_callable_type_queries: HashMap::new(),
             module_value_identities: HashMap::new(),
             object_literal_property_clone_origins: HashMap::new(),
+            synthetic_namespace_property_origins: HashMap::new(),
             object_literal_getter_origins: HashMap::new(),
             object_literal_getter_return_proofs: HashMap::new(),
             source_file_namespace_identities: HashMap::new(),
@@ -4017,6 +4023,90 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.object_literal_property_clone_origins.get(&symbol)
     }
 
+    pub(super) fn synthetic_namespace_property_origin(
+        &self,
+        property: SemanticSymbolId,
+    ) -> Option<&SyntheticNamespacePropertyOrigin> {
+        self.synthetic_namespace_property_state(property)
+            .map(SyntheticNamespacePropertyState::origin)
+    }
+
+    pub(super) fn synthetic_namespace_property_state(
+        &self,
+        property: SemanticSymbolId,
+    ) -> Option<&SyntheticNamespacePropertyState> {
+        self.synthetic_namespace_property_origins.get(&property)
+    }
+
+    pub(super) fn synthetic_namespace_property_origins(
+        &self,
+    ) -> impl Iterator<Item = &SyntheticNamespacePropertyOrigin> {
+        self.synthetic_namespace_property_origins
+            .values()
+            .map(SyntheticNamespacePropertyState::origin)
+    }
+
+    pub(super) fn try_reserve_synthetic_namespace_property_origins(
+        &mut self,
+        additional: usize,
+    ) -> bool {
+        self.synthetic_namespace_property_origins
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    pub(super) fn record_synthetic_namespace_property_origin(
+        &mut self,
+        origin: SyntheticNamespacePropertyOrigin,
+    ) -> bool {
+        if origin.property() == origin.source()
+            || self.symbol(origin.property()).is_none()
+            || self.symbol(origin.source()).is_none()
+            || self.symbol(origin.namespace()).is_none()
+            || self.type_payload(origin.namespace_type()).is_none()
+        {
+            return false;
+        }
+        if let Some(existing) = self.synthetic_namespace_property_state(origin.property()) {
+            return existing.origin() == &origin;
+        }
+        if self.synthetic_namespace_property_origins().any(|existing| {
+            existing.namespace() == origin.namespace() && existing.source() == origin.source()
+        }) || [origin.namespace(), origin.alias()]
+            .into_iter()
+            .any(|symbol| {
+                self.value_symbol_links(symbol)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+            })
+        {
+            return false;
+        }
+        self.synthetic_namespace_property_origins.insert(
+            origin.property(),
+            SyntheticNamespacePropertyState::new(origin),
+        );
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn synthetic_namespace_property_origin_len(&self) -> usize {
+        self.synthetic_namespace_property_origins.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_synthetic_namespace_property_state_for_test(
+        &mut self,
+        property: SemanticSymbolId,
+        replacement: Option<SyntheticNamespacePropertyState>,
+    ) -> Option<SyntheticNamespacePropertyState> {
+        match replacement {
+            Some(replacement) => self
+                .synthetic_namespace_property_origins
+                .insert(property, replacement),
+            None => self.synthetic_namespace_property_origins.remove(&property),
+        }
+    }
+
     pub(super) fn object_literal_getter_origin(
         &self,
         symbol: SemanticSymbolId,
@@ -5801,6 +5891,27 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         Ok(previous)
     }
 
+    #[cfg(test)]
+    pub(super) fn replace_merged_symbol_for_test(
+        &mut self,
+        source: SemanticSymbolId,
+        replacement: Option<SemanticSymbolId>,
+    ) -> Option<SemanticSymbolId> {
+        let previous = match replacement {
+            Some(target) => self.merged_symbols.insert(source, target),
+            None => self.merged_symbols.remove(&source),
+        };
+        if previous != replacement {
+            if self.relation_observable_symbols.contains(&source) {
+                self.mark_relation_inputs_dirty();
+            }
+            if self.has_callable_provenance() {
+                self.mark_union_cache_validation_dirty();
+            }
+        }
+        previous
+    }
+
     /// Returns a symbol's raw parent after exactly one merged redirect.
     #[must_use]
     pub fn get_parent_of_symbol(&self, symbol: SemanticSymbolId) -> Option<SemanticSymbolId> {
@@ -6311,6 +6422,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 })
         });
         self.links.value_symbol.replace_key(symbol, links);
+        if let Some(type_) = published_type {
+            for state in self.synthetic_namespace_property_origins.values_mut() {
+                state.mark_value_published(symbol, type_);
+            }
+        }
         let mut recovery_invalidated = false;
         for recovery in self.instantiated_property_recoveries.values_mut() {
             recovery_invalidated |= recovery.invalidate_for_raw_write(symbol);

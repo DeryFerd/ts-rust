@@ -64,7 +64,10 @@ use super::{
         source_function_owner_expando_exports_are_valid, validate_stored_source_callable,
     },
     source_flow::{ClassInitializationFrame, ClassPropertyFlowRead, SourceFlowError},
-    source_imports::{source_file_namespace_wrapper_member, validated_source_file_namespace_owner},
+    source_imports::{
+        source_file_namespace_wrapper_member, synthetic_namespace_value_property,
+        validated_source_file_namespace_owner,
+    },
     spelling::get_spelling_suggestion,
     store::SourceNodeParent,
     type_records::{StructuredTypeData, TypeData, TypeRecord},
@@ -2166,7 +2169,7 @@ where
     };
     let declared_property = match resolve_enum_property(store, plan, receiver_type)? {
         Some(property) => Some(property),
-        None => resolve_namespace_property(store, plan, receiver_type)?,
+        None => resolve_namespace_property(store, global_types, plan, receiver_type)?,
     };
     let (type_, property, diagnostic) = if let Some(declared_property) = declared_property {
         match declared_property {
@@ -4561,6 +4564,7 @@ fn resolve_enum_property(
 
 fn resolve_namespace_property(
     store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
     plan: &SourcePropertyPlan,
     receiver_type: TypeId,
 ) -> Result<Option<NamespaceProperty>, SourcePropertyError> {
@@ -4772,14 +4776,26 @@ fn resolve_namespace_property(
             {
                 return Err(SourcePropertyError::InvalidCache(plan.node));
             }
-            Some(
+            Some((
+                property,
                 links
                     .resolved_type
                     .ok_or(SourcePropertyError::InvalidCache(plan.node))?,
-            )
+            ))
         }
         _ => None,
     };
+    let selected = synthetic_namespace_value_property(
+        store,
+        module,
+        receiver_type,
+        symbol,
+        projected.map_or(symbol, |(property, _)| property),
+        global_types.map(CanonicalArrayTargets::from_global_types),
+    )
+    .map_err(|_| SourcePropertyError::InvalidCache(plan.node))?
+    .unwrap_or(symbol);
+    let projected = projected.map(|(_, type_)| type_);
     let cached = store
         .value_symbol_links(value_symbol)
         .and_then(|links| links.resolved_type);
@@ -4808,7 +4824,10 @@ fn resolve_namespace_property(
     if store.type_payload(type_).is_none() {
         return Err(SourcePropertyError::InvalidCache(plan.node));
     }
-    Ok(Some(NamespaceProperty::Present { symbol, type_ }))
+    Ok(Some(NamespaceProperty::Present {
+        symbol: selected,
+        type_,
+    }))
 }
 
 fn receiver_continues_optional_chain(arena: &NodeArena, receiver: &ts_ast::Node) -> bool {

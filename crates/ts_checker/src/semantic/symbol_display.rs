@@ -1273,6 +1273,12 @@ fn validate_symbol(
         class_expression_name(store, host, symbol)?
             .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
     }
+    if let Some(source) =
+        super::source_imports::validated_synthetic_namespace_property_source(store, host, symbol)
+            .map_err(|_| SymbolDisplayError::InvalidSymbol(symbol))?
+    {
+        return Ok(source);
+    }
     // Union properties share declarations without being object-literal clones.
     // Prove their cache before the clone validator rejects shared declarations.
     if let Some(source) =
@@ -1283,6 +1289,10 @@ fn validate_symbol(
     }
     let source = object_literal_property_source(store, host, symbol)?;
     if canonical != symbol {
+        super::source_imports::validated_synthetic_namespace_property_source(
+            store, host, canonical,
+        )
+        .map_err(|_| SymbolDisplayError::InvalidSymbol(canonical))?;
         super::member_resolution::published_union_property_source(store, host, canonical)
             .map_err(|_| SymbolDisplayError::InvalidSymbol(canonical))?;
         object_literal_property_source(store, host, canonical)?;

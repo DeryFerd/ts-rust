@@ -52,6 +52,7 @@ use ts_ast::{Node, NodeArena, NodeData, NodeFlags, NodeRef, SyntaxKind};
 use ts_binder::{
     BoundFile, CanonicalNameResolutionError, CanonicalNameResolver, CanonicalResolutionLocation,
     CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolData, SymbolFlags,
+    SymbolTableId,
 };
 
 use super::{
@@ -778,6 +779,249 @@ struct PreparedSourceImportModuleProperty {
     namespace: Option<Box<PreparedSourceImportNestedNamespace>>,
     recursive_const: Option<PreparedSourceImportRecursiveConst>,
     namespace_const: Option<Box<PreparedSourceImportNamespaceConst>>,
+}
+
+/// Keeps a copied namespace value property separate from its source export.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SyntheticNamespacePropertyOrigin {
+    property: SemanticSymbolId,
+    namespace: SemanticSymbolId,
+    namespace_type: TypeId,
+    alias: SemanticSymbolId,
+    originating_import: NodeRef,
+    source: SemanticSymbolId,
+    declaration: NodeRef,
+    annotation: NodeRef,
+    type_: TypeId,
+    array_targets: CanonicalArrayTargets,
+    source_record: ts_binder::semantic::Symbol,
+    source_exports: SymbolTableId,
+    namespace_exports: SymbolTableId,
+    namespace_members: SymbolTableId,
+    namespace_properties: Box<[SemanticSymbolId]>,
+}
+
+/// Keeps publication history separate from the write-once source facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SyntheticNamespacePropertyState {
+    origin: SyntheticNamespacePropertyOrigin,
+    namespace_published: bool,
+    alias_published: bool,
+}
+
+impl SyntheticNamespacePropertyState {
+    pub(super) const fn new(origin: SyntheticNamespacePropertyOrigin) -> Self {
+        Self {
+            origin,
+            namespace_published: false,
+            alias_published: false,
+        }
+    }
+
+    pub(super) const fn origin(&self) -> &SyntheticNamespacePropertyOrigin {
+        &self.origin
+    }
+
+    pub(super) fn mark_value_published(&mut self, symbol: SemanticSymbolId, type_: TypeId) {
+        if type_ != self.origin.namespace_type {
+            return;
+        }
+        if symbol == self.origin.namespace {
+            self.namespace_published = true;
+        }
+        if symbol == self.origin.alias {
+            self.alias_published = true;
+        }
+    }
+
+    fn value_links_are_exact(&self, store: &CanonicalTypeMapperStore) -> bool {
+        let expected = ValueSymbolLinks {
+            resolved_type: Some(self.origin.namespace_type),
+            ..ValueSymbolLinks::default()
+        };
+        [
+            (self.origin.namespace, self.namespace_published),
+            (self.origin.alias, self.alias_published),
+        ]
+        .into_iter()
+        .all(|(symbol, published)| {
+            if published {
+                store.value_symbol_links(symbol) == Some(&expected)
+            } else {
+                store
+                    .value_symbol_links(symbol)
+                    .is_none_or(|links| links == &ValueSymbolLinks::default())
+            }
+        })
+    }
+}
+
+impl SyntheticNamespacePropertyOrigin {
+    pub(super) const fn property(&self) -> SemanticSymbolId {
+        self.property
+    }
+
+    pub(super) const fn namespace(&self) -> SemanticSymbolId {
+        self.namespace
+    }
+
+    pub(super) const fn namespace_type(&self) -> TypeId {
+        self.namespace_type
+    }
+
+    pub(super) const fn alias(&self) -> SemanticSymbolId {
+        self.alias
+    }
+
+    pub(super) const fn source(&self) -> SemanticSymbolId {
+        self.source
+    }
+
+    #[allow(clippy::too_many_lines)] // Check the saved source and both current namespace rows together.
+    fn validate_current(&self, store: &CanonicalTypeMapperStore) -> Result<(), SourceImportError> {
+        let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(self.property));
+        let state = store
+            .synthetic_namespace_property_state(self.property)
+            .ok_or_else(invalid)?;
+        if state.origin() != self || !state.value_links_are_exact(store) {
+            return Err(invalid());
+        }
+        let authenticated =
+            authenticate_synthetic_import_namespace_identity(store, self.alias, self.namespace)?;
+        let source = store.symbol(self.source).ok_or_else(invalid)?;
+        let property = store.symbol(self.property).ok_or_else(invalid)?;
+        let source_parent = store.symbol(authenticated.original).ok_or_else(invalid)?;
+        let record = store
+            .type_payload(self.namespace_type)
+            .ok_or_else(invalid)?;
+        let TypeData::Object(object) = record.data() else {
+            return Err(invalid());
+        };
+        let structured = &object.structured;
+        let properties = structured.properties.as_deref().ok_or_else(invalid)?;
+        let members = structured
+            .members
+            .and_then(|members| store.symbol_table(members))
+            .ok_or_else(invalid)?;
+        let exports = store
+            .symbol(self.namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .ok_or_else(invalid)?;
+        let source_exports = store
+            .symbol_table(self.source_exports)
+            .ok_or_else(invalid)?;
+        let default_property = members
+            .get(InternalSymbolName::Default.as_ref())
+            .ok_or_else(invalid)?;
+        let callable = store
+            .source_callable_type_for_owner(authenticated.original)
+            .ok_or_else(invalid)?;
+        let provenance = store
+            .source_callable_provenance(callable)
+            .ok_or_else(invalid)?;
+        if self.property == self.source
+            || self.originating_import != authenticated.originating_import
+            || source != &self.source_record
+            || source.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+            || source.check_flags() != CheckFlags::NONE
+            || source.declarations() != Some(&[self.declaration])
+            || source.value_declaration() != Some(self.declaration)
+            || source.parent() != Some(authenticated.original)
+            || !store.source_symbol_declarations_match(authenticated.original)
+            || !store.source_symbol_export_table_matches(authenticated.original)
+            || store.source_symbol_flags(authenticated.original) != Some(source_parent.flags())
+            || source_parent.exports() != Some(self.source_exports)
+            || source_exports.len() != 1
+            || source_exports.get(source.name()) != Some(self.source)
+            || !store.source_symbol_declarations_match(self.source)
+            || store.source_declaration_symbol(self.declaration) != Some(self.source)
+            || store.source_direct_type_annotation(self.declaration) != Some(self.annotation)
+            || !store.source_direct_type_annotation_is_exact(self.annotation, self.type_)
+            || store.get_merged_symbol(self.source) != Some(self.source)
+            || store.get_merged_symbol(self.property) != Some(self.property)
+            || property.flags() != SymbolFlags::PROPERTY
+            || property.check_flags() != CheckFlags::NONE
+            || property.name() != source.name()
+            || property.declarations() != source.declarations()
+            || property.value_declaration().is_some()
+            || property.parent().is_some()
+            || property.members().is_some()
+            || property.exports().is_some()
+            || property.export_symbol().is_some()
+            || store.value_symbol_links(self.property)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(self.type_),
+                    ..ValueSymbolLinks::default()
+                })
+            || store.mapped_symbol_links(self.property).is_some()
+            || record.flags() != TypeFlags::OBJECT
+            || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+            || record.symbol().is_some()
+            || record.alias().is_some()
+            || object.target.is_some()
+            || object.mapper.is_some()
+            || object.instantiations != super::type_records::TypeCacheState::Unallocated
+            || structured.constrained != super::type_records::ConstrainedTypeData::default()
+            || structured.index_infos.is_some()
+            || structured.signatures.is_some()
+            || structured.call_signature_count != 0
+            || structured
+                .object_type_without_abstract_construct_signatures
+                .is_some()
+            || structured.members != Some(self.namespace_members)
+            || properties != self.namespace_properties.as_ref()
+            || store
+                .symbol(self.namespace)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                != Some(self.namespace_exports)
+            || properties.len() != exports.len()
+            || members.len() != exports.len()
+            || properties
+                .iter()
+                .filter(|&&property| property == self.property)
+                .count()
+                != 1
+            || members.get(source.name()) != Some(self.property)
+            || exports.get(source.name()) != Some(self.source)
+            || !synthetic_namespace_default_property_is_exact(store, default_property, callable)
+            || provenance.array_targets != Some(self.array_targets)
+            || provenance.owner_symbol != authenticated.original
+            || provenance.declaration != authenticated.function
+            || provenance.family != SourceCallableFamily::FunctionDeclaration
+            || !matches!(
+                validate_stored_source_callable(store, callable),
+                StoredSourceCallableValidation::Valid(_)
+            )
+            || store.synthetic_namespace_property_origins().any(|other| {
+                other.namespace != self.namespace
+                    && namespace_value_contains_property(store, other.namespace_type, self.property)
+            })
+        {
+            return Err(invalid());
+        }
+        prepare_value_links(store, self.source, self.type_, false)?;
+        prepare_value_links(store, self.namespace, self.namespace_type, false)?;
+        prepare_value_links(store, self.alias, self.namespace_type, true)?;
+        store
+            .validate_union_constituent_with_array_targets(self.array_targets, self.type_)
+            .map_err(|_| invalid())
+    }
+
+    fn validate_annotation(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+    ) -> Result<(), SourceImportError> {
+        super::type_nodes::validate_cached_merged_global_value_annotation(
+            store,
+            host,
+            Some(self.array_targets),
+            self.annotation,
+        )
+        .map_err(|_| invariant(SourceImportInvariant::InvalidTargetLinks(self.property)))?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7412,6 +7656,169 @@ fn authenticate_synthetic_import_namespace_identity(
     })
 }
 
+fn synthetic_namespace_import_identity(
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+) -> Result<Option<(SemanticSymbolId, AuthenticatedSyntheticImportNamespace)>, SourceImportError> {
+    if store
+        .source_file_namespace_wrapper_for_module(namespace)
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(namespace));
+    let Some(links) = store.export_type_links(namespace) else {
+        if store
+            .synthetic_namespace_property_origins()
+            .any(|origin| origin.namespace == namespace)
+        {
+            return Err(invalid());
+        }
+        return Ok(None);
+    };
+    let import = links.originating_import.ok_or_else(invalid)?;
+    let clause = store
+        .source_child_with_kind(import, SyntaxKind::ImportClause)
+        .ok_or_else(invalid)?;
+    let binding = store
+        .source_child_with_kind(clause, SyntaxKind::NamespaceImport)
+        .ok_or_else(invalid)?;
+    let alias = store
+        .source_declaration_symbol(binding)
+        .ok_or_else(invalid)?;
+    let authenticated = authenticate_synthetic_import_namespace_identity(store, alias, namespace)?;
+    Ok(Some((alias, authenticated)))
+}
+
+fn namespace_value_contains_property(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    property: SemanticSymbolId,
+) -> bool {
+    store
+        .type_payload(type_)
+        .and_then(|record| record.data().structured())
+        .is_some_and(|members| {
+            members
+                .properties
+                .as_deref()
+                .is_some_and(|properties| properties.contains(&property))
+                || members
+                    .members
+                    .and_then(|table| store.symbol_table(table))
+                    .is_some_and(|table| table.iter().any(|(_, member)| member == property))
+        })
+}
+
+fn synthetic_namespace_default_property_is_exact(
+    store: &CanonicalTypeMapperStore,
+    property: SemanticSymbolId,
+    callable: TypeId,
+) -> bool {
+    store.symbol(property).is_some_and(|record| {
+        record.flags() == SymbolFlags::PROPERTY
+            && record.check_flags() == CheckFlags::NONE
+            && record.name() == InternalSymbolName::Default.as_ref()
+            && record.declarations().is_none()
+            && record.value_declaration().is_none()
+            && record.parent().is_none()
+            && record.members().is_none()
+            && record.exports().is_none()
+            && record.export_symbol().is_none()
+            && store.get_merged_symbol(property) == Some(property)
+    }) && store.value_symbol_links(property)
+        == Some(&ValueSymbolLinks {
+            resolved_type: Some(callable),
+            ..ValueSymbolLinks::default()
+        })
+        && store
+            .synthetic_namespace_property_origin(property)
+            .is_none()
+}
+
+/// Selects a copied value member without replacing its source export.
+pub(super) fn synthetic_namespace_value_property(
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    namespace_type: TypeId,
+    source: SemanticSymbolId,
+    property: SemanticSymbolId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<SemanticSymbolId>, SourceImportError> {
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(property));
+    let origin = store.synthetic_namespace_property_origin(property);
+    let Some((alias, authenticated)) = synthetic_namespace_import_identity(store, namespace)?
+    else {
+        return if origin.is_some() {
+            Err(invalid())
+        } else {
+            Ok(None)
+        };
+    };
+    if source == authenticated.default {
+        return if origin.is_some() {
+            Err(invalid())
+        } else {
+            Ok(None)
+        };
+    }
+    let origin = origin.ok_or_else(invalid)?;
+    if origin.property != property
+        || origin.namespace != namespace
+        || origin.namespace_type != namespace_type
+        || origin.alias != alias
+        || origin.source != source
+        || array_targets.is_some_and(|targets| targets != origin.array_targets)
+    {
+        return Err(invalid());
+    }
+    origin.validate_current(store)?;
+    Ok(Some(property))
+}
+
+/// Proves the declaration source of an existing copied namespace property.
+pub(super) fn validated_synthetic_namespace_property_source(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    property: SemanticSymbolId,
+) -> Result<Option<SemanticSymbolId>, SourceImportError> {
+    let Some(origin) = store.synthetic_namespace_property_origin(property) else {
+        if store.source_symbol_declarations_match(property) {
+            return Ok(None);
+        }
+        // A removed receipt must not turn a copied member into an unproved symbol.
+        for (namespace, _) in store.symbol_store().symbols() {
+            if store.export_type_links(namespace).is_none()
+                || store
+                    .source_file_namespace_wrapper_for_module(namespace)
+                    .is_some()
+            {
+                continue;
+            }
+            if store
+                .value_symbol_links(namespace)
+                .and_then(|links| links.resolved_type)
+                .is_some_and(|type_| namespace_value_contains_property(store, type_, property))
+            {
+                validated_synthetic_namespace_symbol(store, host, namespace)?;
+            }
+        }
+        return Ok(None);
+    };
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(property));
+    if origin.property != property {
+        return Err(invalid());
+    }
+    origin.validate_current(store)?;
+    origin.validate_annotation(store, host)?;
+    if validated_synthetic_namespace_symbol(store, host, origin.namespace)?
+        != Some(origin.namespace_type)
+    {
+        return Err(invalid());
+    }
+    Ok(Some(origin.source))
+}
+
 pub(super) fn synthetic_source_import_origin(
     store: &CanonicalTypeMapperStore,
     alias: SemanticSymbolId,
@@ -8263,6 +8670,24 @@ fn materialize_imported_module_namespace(
             expected_type,
         );
     }
+    let synthetic = synthetic_namespace_import_identity(store, module)?;
+    let mut retained_synthetic_type = None;
+    if synthetic.is_some() {
+        let targets = CanonicalArrayTargets::from_global_types(global_types);
+        for origin in store
+            .synthetic_namespace_property_origins()
+            .filter(|origin| origin.namespace == module)
+        {
+            if origin.array_targets != targets
+                || retained_synthetic_type.is_some_and(|type_| type_ != origin.namespace_type)
+            {
+                return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
+            }
+            origin.validate_current(store)?;
+            origin.validate_annotation(store, host)?;
+            retained_synthetic_type = Some(origin.namespace_type);
+        }
+    }
     let owner =
         (store.source_node_kind(declaration) == Some(SyntaxKind::SourceFile)).then_some(module);
     let shared_owner = owner.filter(|owner| {
@@ -8289,19 +8714,28 @@ fn materialize_imported_module_namespace(
     let cached = store
         .value_symbol_links(module)
         .and_then(|links| links.resolved_type);
-    if expected_type.is_some() && cached.is_some() && expected_type != cached {
+    if expected_type.is_some() && cached.is_some() && expected_type != cached
+        || retained_synthetic_type.is_some_and(|retained| {
+            expected_type.is_some_and(|expected| expected != retained)
+                || cached.is_some_and(|cached| cached != retained)
+        })
+    {
         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
     }
-    let existing = expected_type.or(cached).or(retained_identity).or_else(|| {
-        owner.filter(|_| shared_owner.is_none()).and_then(|owner| {
-            store.types().find_map(|(type_, record)| {
-                (record.symbol() == Some(owner)
-                    && record.object_flags()
-                        == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
-                    .then_some(type_)
+    let existing = expected_type
+        .or(cached)
+        .or(retained_synthetic_type)
+        .or(retained_identity)
+        .or_else(|| {
+            owner.filter(|_| shared_owner.is_none()).and_then(|owner| {
+                store.types().find_map(|(type_, record)| {
+                    (record.symbol() == Some(owner)
+                        && record.object_flags()
+                            == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+                        .then_some(type_)
+                })
             })
-        })
-    });
+        });
     if shared_owner.is_some() && existing.is_some() && existing != retained_identity {
         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
     }
@@ -8345,6 +8779,27 @@ fn materialize_imported_module_namespace(
                     .is_some_and(|cached| cached != type_)
                 {
                     return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
+                }
+                if let Some((_, authenticated)) = synthetic
+                    && member.symbol != authenticated.default
+                {
+                    if synthetic_namespace_value_property(
+                        store,
+                        module,
+                        existing,
+                        member.symbol,
+                        symbol,
+                        Some(CanonicalArrayTargets::from_global_types(global_types)),
+                    )? != Some(symbol)
+                    {
+                        return Err(invariant(SourceImportInvariant::InvalidTargetLinks(symbol)));
+                    }
+                    let origin = store
+                        .synthetic_namespace_property_origin(symbol)
+                        .ok_or_else(|| {
+                            invariant(SourceImportInvariant::InvalidTargetLinks(symbol))
+                        })?;
+                    origin.validate_annotation(store, host)?;
                 }
                 Ok((member, symbol, type_))
             })
@@ -8569,6 +9024,53 @@ fn materialize_imported_module_namespace(
         ));
     }
 
+    let mut copied_sources = HashMap::new();
+    if let Some((_, authenticated)) = synthetic {
+        for (_, source, value, type_, _, _, _) in &resolved_members {
+            if *source == authenticated.default {
+                continue;
+            }
+            let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(*source));
+            let record = store.symbol(*source).ok_or_else(invalid)?;
+            let Some([declaration]) = record.declarations() else {
+                return Err(invalid());
+            };
+            let annotation = store
+                .source_direct_type_annotation(*declaration)
+                .ok_or_else(invalid)?;
+            let source_exports = store
+                .symbol(authenticated.original)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .ok_or_else(invalid)?;
+            let namespace_exports = store
+                .symbol(module)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .ok_or_else(invalid)?;
+            if source != value
+                || type_.is_none()
+                || record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+                || record.value_declaration() != Some(*declaration)
+                || record.parent() != Some(authenticated.original)
+                || !store.source_symbol_declarations_match(*source)
+                || store.source_declaration_symbol(*declaration) != Some(*source)
+                || store.get_merged_symbol(*source) != Some(*source)
+                || copied_sources
+                    .insert(
+                        *source,
+                        (
+                            *declaration,
+                            annotation,
+                            record.clone(),
+                            source_exports,
+                            namespace_exports,
+                        ),
+                    )
+                    .is_some()
+            {
+                return Err(invalid());
+            }
+        }
+    }
     let count = resolved_members.len();
     let recursive_namespace = resolved_members
         .iter()
@@ -8579,6 +9081,7 @@ fn materialize_imported_module_namespace(
     if !store.try_reserve_types(1)
         || !store.try_reserve_checker_symbol_allocations(count, usize::from(count != 0))
         || !store.try_reserve_value_symbol_links(count)
+        || !store.try_reserve_synthetic_namespace_property_origins(copied_sources.len())
     {
         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
     }
@@ -8599,8 +9102,19 @@ fn materialize_imported_module_namespace(
         resolved_members
     {
         let type_ = type_.unwrap_or(namespace_type);
+        let declarations = copied_sources
+            .get(&target_symbol)
+            .map(|(_, _, source, _, _)| {
+                source
+                    .declarations()
+                    .expect("copied const declarations were proved")
+                    .to_vec()
+            });
         let symbol = store
-            .alloc_symbol(SymbolData::new(SymbolFlags::PROPERTY, name.clone()))
+            .alloc_symbol(SymbolData {
+                declarations,
+                ..SymbolData::new(SymbolFlags::PROPERTY, name.clone())
+            })
             .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
         if !store.set_value_symbol_links(
             symbol,
@@ -8630,6 +9144,43 @@ fn materialize_imported_module_namespace(
     if !store.set_structured_type_members(namespace_type, table, property_symbols, None, None, None)
     {
         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
+    }
+    if let Some((alias, authenticated)) = synthetic {
+        let namespace_members =
+            table.ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
+        let namespace_properties = properties
+            .iter()
+            .map(|property| property.symbol)
+            .collect::<Box<[_]>>();
+        for property in &properties {
+            let Some((declaration, annotation, source_record, source_exports, namespace_exports)) =
+                copied_sources.remove(&property.target_symbol)
+            else {
+                continue;
+            };
+            let origin = SyntheticNamespacePropertyOrigin {
+                property: property.symbol,
+                namespace: module,
+                namespace_type,
+                alias,
+                originating_import: authenticated.originating_import,
+                source: property.target_symbol,
+                declaration,
+                annotation,
+                type_: property.type_,
+                array_targets: CanonicalArrayTargets::from_global_types(global_types),
+                source_record,
+                source_exports,
+                namespace_exports,
+                namespace_members,
+                namespace_properties: namespace_properties.clone(),
+            };
+            if !store.record_synthetic_namespace_property_origin(origin) {
+                return Err(invariant(SourceImportInvariant::InvalidTargetLinks(
+                    property.symbol,
+                )));
+            }
+        }
     }
     if shared_owner.is_some() {
         let mut identity = store
@@ -12006,18 +12557,34 @@ fn valid_prepared_imported_namespace(
                     .map(|wrapper| wrapper.default)
                     .or_else(|| exports.and_then(|exports| exports.get(property.name.as_ref())))
                     == Some(property.target_symbol)
-                && store.symbol(property.symbol).is_some_and(|record| {
-                    record.flags() == SymbolFlags::PROPERTY
-                        && record.check_flags() == CheckFlags::NONE
-                        && record.name() == property.name.as_ref()
-                        && record.parent().is_none()
-                        && record.declarations().is_none()
-                        && record.value_declaration().is_none()
-                        && record.members().is_none()
-                        && record.exports().is_none()
-                        && record.export_symbol().is_none()
-                        && store.get_merged_symbol(property.symbol) == Some(property.symbol)
-                })
+                && if synthetic
+                    .is_some_and(|authenticated| property.target_symbol != authenticated.default)
+                {
+                    synthetic_namespace_value_property(
+                        store,
+                        module,
+                        type_,
+                        property.target_symbol,
+                        property.symbol,
+                        None,
+                    ) == Ok(Some(property.symbol))
+                } else {
+                    store
+                        .synthetic_namespace_property_origin(property.symbol)
+                        .is_none()
+                        && store.symbol(property.symbol).is_some_and(|record| {
+                            record.flags() == SymbolFlags::PROPERTY
+                                && record.check_flags() == CheckFlags::NONE
+                                && record.name() == property.name.as_ref()
+                                && record.parent().is_none()
+                                && record.declarations().is_none()
+                                && record.value_declaration().is_none()
+                                && record.members().is_none()
+                                && record.exports().is_none()
+                                && record.export_symbol().is_none()
+                                && store.get_merged_symbol(property.symbol) == Some(property.symbol)
+                        })
+                }
                 && store
                     .value_symbol_links(property.symbol)
                     .is_some_and(|links| {
@@ -27047,4 +27614,6 @@ export default <T>(): Subject<T> => {
         assert!(specifier_only.plan_import(0, 0).bindings.is_empty());
         assert_eq!(specifier_only.plan_type_import(0, 0).bindings.len(), 1);
     }
+
+    include!("source_imports_namespace_property_identity_tests.rs");
 }
