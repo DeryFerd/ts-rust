@@ -1338,6 +1338,186 @@ fn later_invalid_new_preflights_before_earlier_class_or_new_publication() {
     assert!(context.diagnostics().is_empty());
 }
 
+#[allow(clippy::too_many_lines)] // The approved source row proves its original formal and selected constructor together.
+fn assert_constrained_model_inference(
+    context: &mut CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    file: FileId,
+    construction: NodeRef,
+) {
+    let declaration = class_declaration(parsed, file, "Model");
+    let owner = class_symbol(parsed, file, context, "Model");
+    let members = context.get_nongeneric_class_members(owner).unwrap();
+    let origin = context.get_declared_type_of_symbol(owner).unwrap();
+    let value = members.shells().value_type();
+    assert_eq!(members.shells().instance_type(), origin);
+    let NodeData::ClassDeclaration(class) = &parsed.arena.get(declaration.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let [parameter] = class.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+        panic!("the unchanged class must retain exactly its written T")
+    };
+    let parameter = NodeRef::new(parsed.arena.id(), file, *parameter);
+    let NodeData::TypeParameterDeclaration(parameter_data) =
+        &parsed.arena.get(parameter.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    assert!(parameter_data.default_type.is_none());
+    assert!(parameter_data.constraint.is_some());
+    let formal_owner = context.file(file).unwrap().1.symbol(parameter).unwrap();
+    let formal_owner = context.store().get_merged_symbol(formal_owner).unwrap();
+    let formal = context.get_declared_type_of_symbol(formal_owner).unwrap();
+    let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+    let TypeData::TypeParameter(formal_data) = context.store().type_payload(formal).unwrap().data()
+    else {
+        panic!("T must retain its own binder-owned type parameter")
+    };
+    assert_eq!(formal_data.constraint, Some(string));
+    assert!(!formal_data.is_this_type);
+    assert_eq!(
+        context.store().symbol(formal_owner).unwrap().parent(),
+        Some(owner)
+    );
+    assert_eq!(
+        context.store().symbol(formal_owner).unwrap().declarations(),
+        Some(&[parameter][..])
+    );
+    let TypeData::Interface(origin_data) = context.store().type_payload(origin).unwrap().data()
+    else {
+        panic!("Model<T> must retain its generic class origin")
+    };
+    assert_eq!(origin_data.reference.object.target, Some(origin));
+    assert_eq!(
+        origin_data.reference.resolved_type_arguments.as_deref(),
+        Some(&[formal][..])
+    );
+    let this_type = origin_data.this_type.unwrap();
+    assert_eq!(
+        origin_data.all_type_parameters.as_deref(),
+        Some(&[formal, this_type][..])
+    );
+    let callee = constructor(parsed, construction);
+    let NodeData::NewExpression(new) = &parsed.arena.get(construction.node).unwrap().data else {
+        unreachable!()
+    };
+    assert!(new.type_arguments.is_none());
+    assert!(new.arguments.as_ref().unwrap().nodes.is_empty());
+    let instance = context.get_type_at_location(construction).unwrap();
+    let TypeData::TypeReference(reference) = context.store().type_payload(instance).unwrap().data()
+    else {
+        panic!("the normal no-candidate constraint rule must produce Model<string>")
+    };
+    assert_eq!(reference.object.target, Some(origin));
+    assert_eq!(
+        reference.resolved_type_arguments.as_deref(),
+        Some(&[string][..])
+    );
+    assert_eq!(context.get_type_at_location(callee), Ok(value));
+    assert_eq!(
+        context.store().symbol_node_links(callee),
+        Some(&SymbolNodeLinks {
+            resolved_symbol: Some(owner)
+        })
+    );
+    let selected = context
+        .store()
+        .signature_links(construction)
+        .unwrap()
+        .resolved_signature
+        .signature()
+        .unwrap();
+    let original = members.default_construct_signature();
+    assert_ne!(selected, original);
+    let original_record = context.store().signature(original).unwrap();
+    assert_eq!(original_record.flags(), SignatureFlags::CONSTRUCT);
+    assert_eq!(original_record.declaration(), None);
+    assert_eq!(original_record.type_parameters(), [formal]);
+    assert!(original_record.parameters().is_empty());
+    assert!(!original_record.type_parameters().contains(&this_type));
+    assert_eq!(original_record.resolved_return_type(), Some(origin));
+    let selected_record = context.store().signature(selected).unwrap();
+    assert_eq!(selected_record.flags(), SignatureFlags::CONSTRUCT);
+    assert_eq!(selected_record.declaration(), None);
+    assert_eq!(selected_record.target(), Some(original));
+    assert!(selected_record.type_parameters().is_empty());
+    assert!(selected_record.parameters().is_empty());
+    let mapper = selected_record.mapper().unwrap();
+    assert_eq!(context.store().map_type(mapper, formal), Some(string));
+    assert_eq!(context.get_return_type_of_signature(original), Ok(origin));
+    assert_eq!(context.get_return_type_of_signature(selected), Ok(instance));
+    let model = variable_symbol(parsed, file, context, "model");
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(model)
+            .unwrap()
+            .resolved_type,
+        Some(instance)
+    );
+    assert!(context.diagnostics().is_empty());
+    let snapshot = |context: &CanonicalCheckerContext<'_>| {
+        let store = context.store();
+        (
+            [
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.type_alias_len(),
+                store.symbol_store().symbol_table_len(),
+            ],
+            parsed
+                .arena
+                .iter()
+                .map(|(id, _)| {
+                    let node = NodeRef::new(parsed.arena.id(), file, id);
+                    (
+                        node,
+                        store.type_node_links(node).cloned(),
+                        store.symbol_node_links(node).cloned(),
+                        store.signature_links(node).cloned(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            store
+                .symbol_store()
+                .symbols()
+                .map(|(symbol, _)| {
+                    (
+                        symbol,
+                        store.declared_type_links(symbol).cloned(),
+                        store.value_symbol_links(symbol).cloned(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            store
+                .source_file_links(context.source_file(file).unwrap())
+                .cloned(),
+            [origin, instance, formal]
+                .map(|type_| format!("{:?}", store.type_payload(type_).unwrap())),
+            [original, selected]
+                .map(|signature| format!("{:?}", store.signature(signature).unwrap())),
+            context.diagnostics().clone(),
+        )
+    };
+    let warm = snapshot(context);
+    for _ in 0..2 {
+        context.check_source_file(file).unwrap();
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.get_type_at_location(construction), Ok(instance));
+        assert_eq!(context.get_type_at_location(callee), Ok(value));
+        assert_eq!(context.get_return_type_of_signature(original), Ok(origin));
+        assert_eq!(context.get_return_type_of_signature(selected), Ok(instance));
+        assert_eq!(
+            context.get_nongeneric_class_members(owner).unwrap(),
+            members
+        );
+        assert_eq!(snapshot(context), warm);
+    }
+}
+
 #[test]
 fn unsupported_new_forms_stop_at_typed_boundaries() {
     for (source, expected_node) in [
@@ -1383,16 +1563,10 @@ fn unsupported_new_forms_stop_at_typed_boundaries() {
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(1_804);
     let construction = first_new_expression(&parsed, file);
-    let boundary = constructor(&parsed, construction);
     let mut context = checker_context(&parsed, file);
-    assert_eq!(
-        context.check_source_file(file),
-        Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
-            boundary
-        ))),
-        "{source}"
-    );
+    context.check_source_file(file).unwrap();
     assert!(context.diagnostics().is_empty());
+    assert_constrained_model_inference(&mut context, &parsed, file, construction);
 
     let source = "class Model { value!: string; } const model = new Model?.();";
     let parsed = parse_source_file(source);

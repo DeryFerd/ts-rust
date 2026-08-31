@@ -12,6 +12,7 @@
 //! separate call-node concern and never enter the global signature cache. The
 //! overload consumer checks each signature before it selects a recovery shell.
 //! Receiver methods retain their producer's source signature and composed mapper.
+//! Completed source classes use real Construct rows and class-owned formals.
 //! The original exact `<T>(value: T): T` entry points remain available for
 //! compatibility with the installed identity-call source path, but now share
 //! the same lazy shell, demand, recovery, and cache protocol.
@@ -27,7 +28,10 @@ use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, MinArgumentCountFlags,
     RelationUnavailable, SemanticSymbolId, SignatureId, TypeId, TypeMapperId, ValueSymbolLinks,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
-    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
+    callable_sets::{
+        StoredCallableSetValidation, completed_source_class_constructor_candidates,
+        validate_stored_callable_set_with_array_targets,
+    },
     callables::{
         CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
         validate_stored_single_callable, validate_stored_single_callable_with_array_targets,
@@ -35,6 +39,10 @@ use super::{
     calls::{
         DirectCallApplicability, DirectCallArgumentTarget, DirectCallError, DirectCallForm,
         DirectCallReturnKind, get_min_argument_count_with_array_targets,
+    },
+    classes::{
+        ClassError, CompletedSourceClassConstructors, SourceClassConstructorTypeParameter,
+        completed_source_class_constructor_signature_owner,
     },
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
     inference::{
@@ -47,7 +55,7 @@ use super::{
         validate_inference_leaf_with_array_targets,
     },
     instantiate::{
-        InstantiationError, InstantiationLimits, InstantiationSession,
+        InstantiationError, InstantiationLimitEventMark, InstantiationLimits, InstantiationSession,
         cached_instantiation_with_vector, instantiate_type_with_session,
         instantiate_type_with_vector_and_session,
     },
@@ -121,6 +129,12 @@ pub(super) enum GenericCallVectorUnsupported {
         type_parameter: TypeId,
         dependency: TypeId,
     },
+    InferencePair {
+        signature: SignatureId,
+        source: TypeId,
+        target: TypeId,
+    },
+    InstantiationLimitRecovery(SignatureId),
 }
 
 /// Malformed stored callable state or foreign semantic identities.
@@ -389,6 +403,7 @@ pub(super) struct SourceGenericConstraint {
 struct GenericCallSignatureShape {
     signature: SignatureId,
     instantiated_method: Option<GenericCallInstantiatedMethod>,
+    class_constructor: Option<TypeId>,
     type_parameters: Vec<GenericCallTypeParameter>,
     parameter_templates: Vec<TypeId>,
     rest_element_template: Option<TypeId>,
@@ -688,6 +703,17 @@ fn generic_call_signature_candidate(
     signature: SignatureId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<ValidatedSingleCallable, GenericCallVectorError> {
+    if let Some(constructors) = generic_class_constructor_candidates(store, callee, array_targets)?
+    {
+        return constructors
+            .signatures()
+            .iter()
+            .find(|candidate| candidate.signature == signature)
+            .cloned()
+            .ok_or_else(|| {
+                GenericCallVectorInvariant::CallableSignatureMismatch(signature).into()
+            });
+    }
     match validate_stored_callable_set_with_array_targets(store, callee, array_targets) {
         StoredCallableSetValidation::NotCallable => {
             Err(GenericCallVectorUnsupported::NotExactSingleCallable(callee).into())
@@ -739,10 +765,56 @@ fn generic_call_signature_callee(
     {
         return Ok(Some(callee));
     }
+    if let Some(callee) =
+        completed_source_class_constructor_signature_owner(store, signature, array_targets)
+            .map_err(|_| GenericCallVectorInvariant::CallableSignatureMismatch(signature))?
+    {
+        return Ok(Some(callee));
+    }
     generic_method_signature_callee(store, signature, array_targets)
 }
 
-/// Methods use the shared omitted-void rule without changing their stored arity.
+/// Constructor candidates retain their completed class receipt and never enter a call set.
+pub(super) fn generic_class_constructor_candidates(
+    store: &CanonicalTypeMapperStore,
+    callee: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<CompletedSourceClassConstructors>, GenericCallVectorError> {
+    completed_source_class_constructor_candidates(store, callee, array_targets).map_err(|error| {
+        match error {
+            ClassError::Unsupported(_) => {
+                GenericCallVectorUnsupported::PendingCallable(callee).into()
+            }
+            ClassError::Invariant(_) => {
+                GenericCallVectorInvariant::MalformedCallable(callee).into()
+            }
+        }
+    })
+}
+
+pub(super) fn generic_class_constructor_type_argument_bounds(
+    store: &CanonicalTypeMapperStore,
+    callable: &ValidatedSingleCallable,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(usize, usize), GenericCallVectorError> {
+    let constructors = generic_class_constructor_candidates(store, callable.owner, array_targets)?
+        .ok_or(GenericCallVectorUnsupported::NotExactSingleCallable(
+            callable.owner,
+        ))?;
+    if !constructors.signatures().contains(callable) {
+        return Err(
+            GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature).into(),
+        );
+    }
+    let parameters = constructors.type_parameters();
+    let minimum = parameters
+        .iter()
+        .rposition(|parameter| parameter.default_type().is_none())
+        .map_or(0, |index| index + 1);
+    Ok((minimum, parameters.len()))
+}
+
+/// Published candidates use the shared omitted-void rule without changing stored arity.
 pub(super) fn generic_call_signature_minimum_argument_count(
     store: &CanonicalTypeMapperStore,
     signature: SignatureId,
@@ -750,6 +822,10 @@ pub(super) fn generic_call_signature_minimum_argument_count(
 ) -> Result<usize, GenericCallVectorError> {
     if let Some(callee) = generic_method_signature_callee(store, signature, array_targets)?
         .or_else(|| store.source_overload_type_for_signature(signature))
+        .or(
+            completed_source_class_constructor_signature_owner(store, signature, array_targets)
+                .map_err(|_| GenericCallVectorInvariant::CallableSignatureMismatch(signature))?,
+        )
     {
         let callable = generic_call_signature_candidate(store, callee, signature, array_targets)?;
         return get_min_argument_count_with_array_targets(
@@ -1355,6 +1431,49 @@ pub(super) fn preflight_generic_call_signature_return_target(
     Ok(target)
 }
 
+/// Rejects a damaged New signature before any candidate or recovery shell is allocated.
+pub(super) fn preflight_generic_class_constructor_signature(
+    store: &CanonicalTypeMapperStore,
+    callee: TypeId,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SignatureId, GenericCallVectorError> {
+    let constructors = generic_class_constructor_candidates(store, callee, array_targets)?
+        .ok_or(GenericCallVectorUnsupported::NotExactSingleCallable(callee))?;
+    let record = store
+        .signature(signature)
+        .ok_or(GenericCallVectorInvariant::InvalidSignature(signature))?;
+    let Some(target) = record.target() else {
+        return if record.type_parameters().is_empty()
+            && record.mapper().is_none()
+            && constructors
+                .signatures()
+                .iter()
+                .any(|candidate| candidate.signature == signature)
+        {
+            Ok(signature)
+        } else {
+            Err(GenericCallVectorInvariant::InvalidCallInstantiation {
+                target: signature,
+                signature,
+            }
+            .into())
+        };
+    };
+    let invalid = || GenericCallVectorInvariant::InvalidCallInstantiation { target, signature };
+    if !constructors
+        .signatures()
+        .iter()
+        .any(|candidate| candidate.signature == target)
+    {
+        return Err(invalid().into());
+    }
+    if preflight_generic_call_signature_return_target(store, array_targets, signature)? != target {
+        return Err(invalid().into());
+    }
+    Ok(target)
+}
+
 /// Demands the return of a mapper-backed generic-call shell when only the
 /// instantiated signature is available (for example from a type node).
 ///
@@ -1624,7 +1743,11 @@ fn check_validated_generic_call_candidate(
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
 ) -> Result<GenericCallVectorCandidate, GenericCallVectorError> {
-    validate_generic_call_vector_request(store, request)?;
+    if request.form == DirectCallForm::New {
+        validate_generic_class_constructor_request(store, request, array_targets)?;
+    } else {
+        validate_generic_call_vector_request(store, request)?;
+    }
     let request = GenericCallVectorRequest {
         explicit_type_arguments: request
             .explicit_type_arguments
@@ -1633,6 +1756,10 @@ fn check_validated_generic_call_candidate(
     };
     let shape =
         validate_generic_call_signature_shape(store, request.callee, callable, array_targets)?;
+    if shape.class_constructor.is_some() != (request.form == DirectCallForm::New) {
+        return Err(GenericCallVectorUnsupported::Form(request.form).into());
+    }
+    let limit_mark = session.limit_event_mark();
     let minimum_type_arguments = minimum_type_argument_count(&shape.type_parameters);
     if let Some(explicit) = request.explicit_type_arguments
         && (explicit.len() < minimum_type_arguments || explicit.len() > shape.type_parameters.len())
@@ -1686,6 +1813,7 @@ fn check_validated_generic_call_candidate(
             session,
         )?,
     };
+    reject_constructor_limit_recovery(&shape, session, limit_mark)?;
 
     if let Some(explicit) = request.explicit_type_arguments
         && let Some(applicability) = check_explicit_type_argument_constraints(
@@ -1697,6 +1825,7 @@ fn check_validated_generic_call_candidate(
             session,
         )?
     {
+        reject_constructor_limit_recovery(&shape, session, limit_mark)?;
         return Ok(GenericCallVectorCandidate {
             callee: request.callee,
             shape,
@@ -1704,6 +1833,7 @@ fn check_validated_generic_call_candidate(
             applicability,
         });
     }
+    reject_constructor_limit_recovery(&shape, session, limit_mark)?;
 
     let sources = shape
         .type_parameters
@@ -1756,6 +1886,7 @@ fn check_validated_generic_call_candidate(
         }
     }
     .unwrap_or(GenericCallVectorApplicability::Applicable);
+    reject_constructor_limit_recovery(&shape, session, limit_mark)?;
     Ok(GenericCallVectorCandidate {
         callee: request.callee,
         shape,
@@ -1816,6 +1947,7 @@ fn finish_generic_call_candidate(
         .map(|parameter| parameter.type_)
         .collect::<Vec<_>>();
     if applicability != GenericCallVectorApplicability::Applicable {
+        let limit_mark = session.limit_event_mark();
         let recovery = match request.explicit_type_arguments {
             Some(explicit) => explicit_recovery_type_arguments(store, &shape, explicit)?,
             None => match &checked {
@@ -1832,6 +1964,7 @@ fn finish_generic_call_candidate(
                 )?,
             },
         };
+        reject_constructor_limit_recovery(&shape, session, limit_mark)?;
         let shell = get_or_create_generic_call_vector_recovery_shell(
             store,
             &shape,
@@ -1889,6 +2022,59 @@ pub(super) fn validate_generic_call_vector_request(
     if request.form != DirectCallForm::Call {
         return Err(GenericCallVectorUnsupported::Form(request.form).into());
     }
+    validate_generic_call_vector_arguments(store, request)
+}
+
+pub(super) fn validate_generic_class_constructor_request(
+    store: &CanonicalTypeMapperStore,
+    request: GenericCallVectorRequest<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), GenericCallVectorError> {
+    if request.form != DirectCallForm::New {
+        return Err(GenericCallVectorUnsupported::Form(request.form).into());
+    }
+    validate_generic_call_vector_arguments(store, request)?;
+    generic_class_constructor_candidates(store, request.callee, array_targets)?.ok_or(
+        GenericCallVectorUnsupported::NotExactSingleCallable(request.callee),
+    )?;
+    validate_constructor_type_argument_array_capability(
+        store,
+        array_targets,
+        request.explicit_type_arguments.unwrap_or_default(),
+    )?;
+    Ok(())
+}
+
+fn validate_constructor_type_argument_array_capability(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    type_arguments: &[TypeId],
+) -> Result<(), GenericCallVectorError> {
+    for (index, &type_) in type_arguments.iter().enumerate() {
+        store
+            .validate_cached_array_capability_with_pending_functions(array_targets, type_, &[])
+            .map_err(|_| GenericCallVectorInvariant::InvalidTypeArgument { index, type_ })?;
+    }
+    Ok(())
+}
+
+fn reject_constructor_limit_recovery(
+    shape: &GenericCallSignatureShape,
+    session: &InstantiationSession,
+    mark: InstantiationLimitEventMark,
+) -> Result<(), GenericCallVectorError> {
+    if shape.class_constructor.is_some() && session.limit_event_occurred_since(mark) {
+        return Err(
+            GenericCallVectorUnsupported::InstantiationLimitRecovery(shape.signature).into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_generic_call_vector_arguments(
+    store: &CanonicalTypeMapperStore,
+    request: GenericCallVectorRequest<'_>,
+) -> Result<(), GenericCallVectorError> {
     if request.optional_chain {
         return Err(GenericCallVectorUnsupported::OptionalChain.into());
     }
@@ -2111,6 +2297,18 @@ fn validate_generic_call_signature_shape_worker(
             GenericCallVectorUnsupported::SignatureTypeParameterCount(callable.signature).into(),
         );
     }
+    let constructors = generic_class_constructor_candidates(store, callee, array_targets)?;
+    if constructors
+        .as_ref()
+        .is_some_and(|constructors| !constructors.signatures().contains(callable))
+    {
+        return Err(
+            GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature).into(),
+        );
+    }
+    let class_constructor = constructors
+        .as_ref()
+        .map(|constructors| constructors.members().shells().instance_type());
     let has_rest_parameter = signature.has_rest_parameter();
     let method_parameters = validate_generic_method_type_parameter_view(
         store,
@@ -2129,7 +2327,13 @@ fn validate_generic_call_signature_shape_worker(
     } else {
         SignatureFlags::NONE
     };
-    if (method || source_overload)
+    if class_constructor.is_some() {
+        expected_flags |= SignatureFlags::CONSTRUCT;
+        if signature.flags().contains(SignatureFlags::ABSTRACT) {
+            expected_flags |= SignatureFlags::ABSTRACT;
+        }
+    }
+    if (method || source_overload || class_constructor.is_some())
         && signature
             .flags()
             .contains(SignatureFlags::HAS_LITERAL_TYPES)
@@ -2171,7 +2375,7 @@ fn validate_generic_call_signature_shape_worker(
             && (signature.target().is_some() || signature.mapper().is_some())
         || signature.isolated_signature_type().is_some()
         || signature.composite().is_some()
-        || callable.strict_variance_exempt && !method
+        || callable.strict_variance_exempt && !method && class_constructor.is_none()
     {
         return Err(
             GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature).into(),
@@ -2210,21 +2414,42 @@ fn validate_generic_call_signature_shape_worker(
         {
             return Err(GenericCallVectorInvariant::DuplicateTypeParameter(type_parameter).into());
         }
-        let (constraint, default_type, base_constraint) = validate_generic_call_type_parameter(
-            store,
-            type_parameter,
-            &type_parameters,
-            no_constraint,
-            query_evidence,
-            instantiated_method,
-            method_parameters
-                .as_ref()
-                .and_then(|view| view.parameters.get(type_parameters.len()))
-                .or_else(|| {
-                    contextual_parameters
-                        .and_then(|parameters| parameters.get(type_parameters.len()))
-                }),
-        )?;
+        let (constraint, default_type, base_constraint) = if let Some(constructors) = &constructors
+        {
+            if query_evidence.is_some()
+                || method_parameters.is_some()
+                || contextual_parameters.is_some()
+            {
+                return Err(GenericCallVectorInvariant::CallableSignatureMismatch(
+                    callable.signature,
+                )
+                .into());
+            }
+            let parameter = constructors
+                .type_parameters()
+                .get(type_parameters.len())
+                .copied()
+                .ok_or(GenericCallVectorInvariant::InvalidTypeParameter(
+                    type_parameter,
+                ))?;
+            validate_generic_class_constructor_type_parameter(store, type_parameter, parameter)?
+        } else {
+            validate_generic_call_type_parameter(
+                store,
+                type_parameter,
+                &type_parameters,
+                no_constraint,
+                query_evidence,
+                instantiated_method,
+                method_parameters
+                    .as_ref()
+                    .and_then(|view| view.parameters.get(type_parameters.len()))
+                    .or_else(|| {
+                        contextual_parameters
+                            .and_then(|parameters| parameters.get(type_parameters.len()))
+                    }),
+            )?
+        };
         type_parameters.push(GenericCallTypeParameter {
             type_: type_parameter,
             constraint,
@@ -2236,6 +2461,24 @@ fn validate_generic_call_signature_shape_worker(
         .iter()
         .map(|parameter| parameter.type_)
         .collect::<Vec<_>>();
+    if constructors.is_some() {
+        for parameter in &type_parameters {
+            for type_ in parameter
+                .constraint
+                .into_iter()
+                .chain(parameter.default_type)
+            {
+                validate_generic_mapper_type(
+                    store,
+                    type_,
+                    &type_parameter_ids,
+                    array_targets,
+                    callable.signature,
+                    &mut Vec::new(),
+                )?;
+            }
+        }
+    }
     let rest_element_template = match callable.rest_parameter {
         None => None,
         Some(rest) => {
@@ -2297,7 +2540,10 @@ fn validate_generic_call_signature_shape_worker(
             }
             .into());
         }
-        let valid_symbol = if instantiated_method.is_some() {
+        let valid_symbol = if constructors.is_some() {
+            // The completed constructor provider proves body-local versus optional call types.
+            true
+        } else if instantiated_method.is_some() {
             // The receiver provider has checked the exact source symbol and mapper links.
             store
                 .value_symbol_links(symbol)
@@ -2322,7 +2568,22 @@ fn validate_generic_call_signature_shape_worker(
             .into());
         }
     }
-    let return_requires_exact_cache = if let Some(return_type) = return_type {
+    let return_requires_exact_cache = if let Some(instance) = class_constructor {
+        if return_type != Some(instance) {
+            return Err(
+                GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature).into(),
+            );
+        }
+        let reference = validate_direct_generic_reference(store, instance).map_err(|_| {
+            GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature)
+        })?;
+        if reference.target != instance || reference.type_arguments != type_parameter_ids {
+            return Err(
+                GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature).into(),
+            );
+        }
+        false
+    } else if let Some(return_type) = return_type {
         let contains_keyof = validate_generic_mapper_type_worker(
             store,
             return_type,
@@ -2344,6 +2605,7 @@ fn validate_generic_call_signature_shape_worker(
     Ok(GenericCallSignatureShape {
         signature: callable.signature,
         instantiated_method,
+        class_constructor,
         type_parameters,
         parameter_templates,
         rest_element_template,
@@ -2903,6 +3165,63 @@ fn validate_generic_call_type_query<'store>(
         }
     }
     Ok(Some(evidence))
+}
+
+/// Class formals use their completed declaration receipt, not method or function sentinels.
+fn validate_generic_class_constructor_type_parameter(
+    store: &CanonicalTypeMapperStore,
+    type_parameter: TypeId,
+    parameter: SourceClassConstructorTypeParameter,
+) -> Result<(Option<TypeId>, Option<TypeId>, TypeId), GenericCallVectorError> {
+    let invalid = || GenericCallVectorInvariant::InvalidTypeParameter(type_parameter);
+    let record = store.type_payload(type_parameter).ok_or_else(invalid)?;
+    let TypeData::TypeParameter(data) = record.data() else {
+        return Err(invalid().into());
+    };
+    let symbol = record.symbol().ok_or_else(invalid)?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(GenericCallVectorInvariant::MissingBootstrap)?;
+    if parameter.type_parameter() != type_parameter
+        || record.flags() != TypeFlags::TYPE_PARAMETER
+        || record.alias().is_some()
+        || data.target.is_some()
+        || data.mapper.is_some()
+        || data.is_this_type
+        || cached_ordinary_type_parameter_owner(store, type_parameter) != Some(symbol)
+        || data.constraint
+            != parameter
+                .constraint()
+                .or(Some(bootstrap.no_constraint_type))
+        || data.resolved_default_type
+            != parameter
+                .default_type()
+                .or(Some(bootstrap.no_constraint_type))
+        || data.constrained.resolved_base_constraint != Some(parameter.base_constraint())
+    {
+        return Err(invalid().into());
+    }
+    for dependency in parameter
+        .constraint()
+        .into_iter()
+        .chain(parameter.default_type())
+        .chain([parameter.base_constraint()])
+    {
+        if dependency == bootstrap.circular_constraint_type
+            || dependency == bootstrap.resolving_default_type
+        {
+            return Err(GenericCallVectorUnsupported::TypeParameterDependency {
+                type_parameter,
+                dependency,
+            }
+            .into());
+        }
+    }
+    Ok((
+        parameter.constraint(),
+        parameter.default_type(),
+        parameter.base_constraint(),
+    ))
 }
 
 fn validate_generic_call_type_parameter(
@@ -3629,7 +3948,7 @@ fn infer_generic_call_type_arguments(
         if valid_fixed_generic_source_parameter_type(store, parameter) {
             continue;
         }
-        collect_generic_call_inferences(
+        collect_generic_call_inferences_worker(
             store,
             shape.array_targets,
             global_types,
@@ -3639,6 +3958,7 @@ fn infer_generic_call_type_arguments(
             &mut buckets,
             &mut contravariant_buckets,
             shape.signature,
+            shape.class_constructor.is_some(),
             &mut Vec::new(),
             false,
             session,
@@ -3823,7 +4143,7 @@ fn infer_generic_call_type_arguments(
     Ok(inferred)
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep wrapper and variance proofs in one inference walk.
+#[allow(clippy::too_many_arguments)]
 fn collect_generic_call_inferences(
     store: &mut CanonicalTypeMapperStore,
     array_targets: Option<CanonicalArrayTargets>,
@@ -3834,6 +4154,39 @@ fn collect_generic_call_inferences(
     buckets: &mut [Vec<TypeId>],
     contravariant_buckets: &mut [Vec<TypeId>],
     signature: SignatureId,
+    active_targets: &mut Vec<TypeId>,
+    contravariant: bool,
+    session: &mut InstantiationSession,
+) -> Result<(), GenericCallVectorError> {
+    collect_generic_call_inferences_worker(
+        store,
+        array_targets,
+        global_types,
+        source,
+        target,
+        type_parameters,
+        buckets,
+        contravariant_buckets,
+        signature,
+        false,
+        active_targets,
+        contravariant,
+        session,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep wrapper and variance proofs in one inference walk.
+fn collect_generic_call_inferences_worker(
+    store: &mut CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    source: TypeId,
+    target: TypeId,
+    type_parameters: &[TypeId],
+    buckets: &mut [Vec<TypeId>],
+    contravariant_buckets: &mut [Vec<TypeId>],
+    signature: SignatureId,
+    concrete_constructor: bool,
     active_targets: &mut Vec<TypeId>,
     contravariant: bool,
     session: &mut InstantiationSession,
@@ -3920,7 +4273,7 @@ fn collect_generic_call_inferences(
                 )
                 .map_err(|error| GenericCallVectorError::Inference(error.into()))?,
         };
-        return collect_generic_call_inferences(
+        return collect_generic_call_inferences_worker(
             store,
             array_targets,
             global_types,
@@ -3930,6 +4283,7 @@ fn collect_generic_call_inferences(
             buckets,
             contravariant_buckets,
             signature,
+            concrete_constructor,
             active_targets,
             contravariant,
             session,
@@ -3983,10 +4337,19 @@ fn collect_generic_call_inferences(
                     )
                 })?;
             let Some(source_reference) = source_reference else {
+                if concrete_constructor && constructor_inference_needs_property_pairs(store, source)
+                {
+                    return Err(GenericCallVectorUnsupported::InferencePair {
+                        signature,
+                        source,
+                        target,
+                    }
+                    .into());
+                }
                 return Ok(());
             };
             active_targets.push(target);
-            let result = collect_generic_call_inferences(
+            let result = collect_generic_call_inferences_worker(
                 store,
                 Some(array_targets),
                 global_types,
@@ -3996,6 +4359,7 @@ fn collect_generic_call_inferences(
                 buckets,
                 contravariant_buckets,
                 signature,
+                concrete_constructor,
                 active_targets,
                 contravariant,
                 session,
@@ -4028,6 +4392,14 @@ fn collect_generic_call_inferences(
             _ => None,
         });
     if source_target != Some(target_reference.target) {
+        if concrete_constructor && constructor_inference_needs_property_pairs(store, source) {
+            return Err(GenericCallVectorUnsupported::InferencePair {
+                signature,
+                source,
+                target,
+            }
+            .into());
+        }
         return Ok(());
     }
     let source_reference = validate_generic_interface_reference(store, source, signature)?.ok_or(
@@ -4067,7 +4439,7 @@ fn collect_generic_call_inferences(
                 .is_some_and(|variance| {
                     *variance & VarianceFlags::VARIANCE_MASK == VarianceFlags::CONTRAVARIANT
                 });
-            collect_generic_call_inferences(
+            collect_generic_call_inferences_worker(
                 store,
                 array_targets,
                 global_types,
@@ -4077,6 +4449,7 @@ fn collect_generic_call_inferences(
                 buckets,
                 contravariant_buckets,
                 signature,
+                concrete_constructor,
                 active_targets,
                 contravariant != argument_contravariant,
                 session,
@@ -4084,6 +4457,25 @@ fn collect_generic_call_inferences(
         });
     active_targets.pop();
     result
+}
+
+/// A missing wrapper match is not proof that a structural source has no inference candidates.
+fn constructor_inference_needs_property_pairs(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+) -> bool {
+    let structural = TypeFlags::OBJECT
+        | TypeFlags::TYPE_PARAMETER
+        | TypeFlags::INTERSECTION
+        | TypeFlags::CONDITIONAL
+        | TypeFlags::SUBSTITUTION;
+    store.type_payload(source).is_some_and(|record| {
+        record.flags().intersects(structural)
+            || matches!(record.data(), TypeData::Union(union)
+                if union.union.types.iter().any(|member| {
+                    store.type_payload(*member).is_some_and(|record| record.flags().intersects(structural))
+                }))
+    })
 }
 
 fn generic_union_fixed_constituent_matches(
@@ -4572,6 +4964,13 @@ fn prepare_generic_call_vector_signature(
     sources: &[TypeId],
     type_arguments: &[TypeId],
 ) -> Result<PreparedGenericCallVectorSignature, GenericCallVectorError> {
+    if shape.class_constructor.is_some() {
+        validate_constructor_type_argument_array_capability(
+            store,
+            shape.array_targets,
+            type_arguments,
+        )?;
+    }
     let original =
         store
             .signature(shape.signature)
@@ -5496,6 +5895,14 @@ fn valid_generic_call_vector_signature_shell(
     original: &super::signatures::Signature,
     signature: &super::signatures::Signature,
 ) -> Option<TypeMapperId> {
+    if shape.class_constructor.is_some() {
+        validate_constructor_type_argument_array_capability(
+            store,
+            shape.array_targets,
+            type_arguments,
+        )
+        .ok()?;
+    }
     let mapper = signature.mapper()?;
     if sources.len() != shape.type_parameters.len()
         || type_arguments.len() != sources.len()
@@ -5509,7 +5916,11 @@ fn valid_generic_call_vector_signature_shell(
         || signature.this_parameter().is_some()
         || signature.parameters().len() != original.parameters().len()
         || signature.resolved_return_type().is_some_and(|resolved| {
-            if shape.return_requires_exact_cache {
+            if let Some(origin) = shape.class_constructor {
+                !validate_direct_generic_reference(store, resolved).is_ok_and(|reference| {
+                    reference.target == origin && reference.type_arguments == type_arguments
+                })
+            } else if shape.return_requires_exact_cache {
                 // Keyof results need their real key cache even below retained wrappers.
                 !cached_instantiation_with_vector(
                     store,
@@ -5659,7 +6070,7 @@ fn validate_generic_call_vector_shell(
             signature,
         },
     )?;
-    valid_generic_call_vector_signature_shell(
+    let mapper = valid_generic_call_vector_signature_shell(
         store,
         shape,
         sources,
@@ -5667,13 +6078,66 @@ fn validate_generic_call_vector_shell(
         original,
         instantiated,
     )
-    .ok_or_else(|| {
-        GenericCallVectorInvariant::InvalidCachedInstantiation {
+    .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation {
+        target: shape.signature,
+        signature,
+    })?;
+    if shape.class_constructor.is_some() {
+        validate_constructor_signature_cache(
+            store,
+            shape,
+            sources,
+            type_arguments,
+            signature,
+            mapper,
+        )?;
+    }
+    Ok(mapper)
+}
+
+/// Return queries and New replay use the same checked-cache or call-local recovery proof.
+fn validate_constructor_signature_cache(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    sources: &[TypeId],
+    type_arguments: &[TypeId],
+    signature: SignatureId,
+    mapper: TypeMapperId,
+) -> Result<(), GenericCallVectorError> {
+    let checked = cached_generic_call_vector_instantiation_from_lookup(
+        store,
+        shape,
+        sources,
+        type_arguments,
+        store.cached_signature(
+            shape.signature,
+            type_list_key(type_arguments),
+            type_arguments,
+        ),
+    )?;
+    match store.cached_signatures_contain(signature) {
+        Some(true)
+            if checked.is_some_and(|checked| {
+                checked.signature == signature && checked.mapper == mapper
+            }) =>
+        {
+            Ok(())
+        }
+        Some(false) => validate_existing_generic_call_vector_recovery(
+            store,
+            shape,
+            sources,
+            type_arguments,
+            signature,
+            checked,
+        )
+        .map(|_| ()),
+        _ => Err(GenericCallVectorInvariant::InvalidCallInstantiation {
             target: shape.signature,
             signature,
         }
-        .into()
-    })
+        .into()),
+    }
 }
 
 fn demand_generic_call_vector_parameter(
@@ -5725,6 +6189,7 @@ fn demand_generic_call_vector_parameter(
             mapper,
         )
     };
+    let limit_mark = session.limit_event_mark();
     let resolved = if valid_fixed_generic_source_parameter_type(store, template) {
         template
     } else if constrained_string_rest_tuple_parameter(store, template, sources).is_some() {
@@ -5739,6 +6204,7 @@ fn demand_generic_call_vector_parameter(
     } else {
         instantiate_type_with_session(store, template, mapper, shape.array_targets, session)?
     };
+    reject_constructor_limit_recovery(shape, session, limit_mark)?;
     links.resolved_type = Some(resolved);
     assert!(
         store.set_value_symbol_links(parameter, links),
@@ -5771,7 +6237,9 @@ fn demand_generic_call_vector_return(
         shape.array_targets,
         session,
     )?;
-    if shape.return_requires_exact_cache && session.limit_event_occurred_since(limit_mark) {
+    if (shape.return_requires_exact_cache || shape.class_constructor.is_some())
+        && session.limit_event_occurred_since(limit_mark)
+    {
         return Ok(resolved);
     }
     assert!(
@@ -6508,6 +6976,7 @@ fn identity_generic_call_vector_shape(
     Ok(GenericCallSignatureShape {
         signature: shape.signature,
         instantiated_method: None,
+        class_constructor: None,
         type_parameters: vec![GenericCallTypeParameter {
             type_: shape.type_parameter,
             constraint: None,

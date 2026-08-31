@@ -90,7 +90,7 @@ use super::{
         valid_stored_callable_type_predicate, validate_stored_source_callable,
     },
     source_imports::synthetic_source_import_origin,
-    source_new::promise_executor_missing_argument_is_exact,
+    source_new::{SourceDefaultNewPlan, promise_executor_missing_argument_is_exact},
     source_properties::{ClassAccessContext, plan_class_access_context},
     store::{CachedSignatureLookup, SourceNodeParent},
     tuple_types::CanonicalTupleTypeRequest,
@@ -3743,93 +3743,7 @@ pub(super) fn plan_direct_source_call_syntax(
             }
         };
 
-    let type_arguments = call
-        .type_arguments
-        .as_ref()
-        .map(|type_arguments| {
-            let start = type_arguments.range.start.get();
-            let end = type_arguments.range.end.get();
-            if type_arguments.range.start < record.range.start
-                || type_arguments.range.end > record.range.end
-                || end < start.saturating_add(2)
-                || arena.source_text().is_some_and(|source| {
-                    let start = usize::try_from(start).ok();
-                    let close = usize::try_from(end.saturating_sub(1)).ok();
-                    start.is_none_or(|start| source.as_bytes().get(start) != Some(&b'<'))
-                        || close.is_none_or(|close| source.as_bytes().get(close) != Some(&b'>'))
-                })
-            {
-                return Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Call(node),
-                ));
-            }
-            let nodes = type_arguments
-                .nodes
-                .iter()
-                .map(|type_argument| {
-                    let type_argument = NodeRef::new(node.arena, node.file, *type_argument);
-                    let Some(type_argument_record) = arena.get(type_argument.node) else {
-                        return Err(SourceCheckError::Call(node));
-                    };
-                    if type_argument_record.parent != Some(node.node)
-                        || type_argument_record.range.start < type_arguments.range.start
-                        || type_argument_record.range.end > type_arguments.range.end
-                    {
-                        return Err(SourceCheckError::Unsupported(
-                            UnsupportedSourceSyntax::Call(node),
-                        ));
-                    }
-                    Ok(type_argument)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut trailing_comma_range = None;
-            let diagnostic_range = if let (Some(first), Some(last)) = (nodes.first(), nodes.last())
-            {
-                let first_range = arena
-                    .get(first.node)
-                    .ok_or(SourceCheckError::Call(node))?
-                    .range;
-                let last_range = arena
-                    .get(last.node)
-                    .ok_or(SourceCheckError::Call(node))?
-                    .range;
-                if first_range.start < TextPos::new(start.saturating_add(1))
-                    || last_range.end > TextPos::new(end.saturating_sub(1))
-                {
-                    return Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Call(node),
-                    ));
-                }
-                let diagnostic_end = if type_arguments.has_trailing_comma {
-                    trailing_comma_range = arena.source_text().and_then(|source| {
-                        trailing_type_argument_comma_range(
-                            source,
-                            last_range.end,
-                            TextPos::new(end.saturating_sub(1)),
-                        )
-                    });
-                    trailing_comma_range.map(|range| range.end)
-                } else {
-                    Some(last_range.end)
-                };
-                diagnostic_end
-                    .map(|diagnostic_end| TextRange::new(first_range.start, diagnostic_end))
-            } else {
-                None
-            };
-            if type_arguments.has_trailing_comma && trailing_comma_range.is_none() {
-                return Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Call(node),
-                ));
-            }
-            Ok(SourceTypeArgumentList {
-                nodes,
-                syntax_range: type_arguments.range,
-                diagnostic_range,
-                trailing_comma_range,
-            })
-        })
-        .transpose()?;
+    let type_arguments = plan_source_invocation_type_arguments(arena, node)?;
 
     let mut arguments = Vec::with_capacity(call.arguments.nodes.len());
     let mut argument_arrow_nodes = Vec::with_capacity(call.arguments.nodes.len());
@@ -4123,6 +4037,101 @@ fn plan_tagged_template_source_call_syntax(
         argument_arrow_nodes,
         array_argument_arrow_nodes,
     })
+}
+
+fn plan_source_invocation_type_arguments(
+    arena: &NodeArena,
+    node: NodeRef,
+) -> Result<Option<SourceTypeArgumentList>, SourceCheckError> {
+    let record = arena.get(node.node).ok_or(SourceCheckError::Call(node))?;
+    let (arguments, unsupported) = match (&record.data, record.kind) {
+        (NodeData::CallExpression(call), SyntaxKind::CallExpression) => (
+            call.type_arguments.as_ref(),
+            UnsupportedSourceSyntax::Call(node),
+        ),
+        (NodeData::NewExpression(construction), SyntaxKind::NewExpression) => (
+            construction.type_arguments.as_ref(),
+            UnsupportedSourceSyntax::New(node),
+        ),
+        _ => return Err(SourceCheckError::Call(node)),
+    };
+    arguments
+        .map(|type_arguments| {
+            let start = type_arguments.range.start.get();
+            let end = type_arguments.range.end.get();
+            if type_arguments.range.start < record.range.start
+                || type_arguments.range.end > record.range.end
+                || end < start.saturating_add(2)
+                || arena.source_text().is_some_and(|source| {
+                    let start = usize::try_from(start).ok();
+                    let close = usize::try_from(end.saturating_sub(1)).ok();
+                    start.is_none_or(|start| source.as_bytes().get(start) != Some(&b'<'))
+                        || close.is_none_or(|close| source.as_bytes().get(close) != Some(&b'>'))
+                })
+            {
+                return Err(SourceCheckError::Unsupported(unsupported));
+            }
+            let nodes = type_arguments
+                .nodes
+                .iter()
+                .map(|type_argument| {
+                    let type_argument = NodeRef::new(node.arena, node.file, *type_argument);
+                    let Some(type_argument_record) = arena.get(type_argument.node) else {
+                        return Err(SourceCheckError::Call(node));
+                    };
+                    if type_argument_record.parent != Some(node.node)
+                        || type_argument_record.range.start < type_arguments.range.start
+                        || type_argument_record.range.end > type_arguments.range.end
+                    {
+                        return Err(SourceCheckError::Unsupported(unsupported));
+                    }
+                    Ok(type_argument)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut trailing_comma_range = None;
+            let diagnostic_range = if let (Some(first), Some(last)) = (nodes.first(), nodes.last())
+            {
+                let first_range = arena
+                    .get(first.node)
+                    .ok_or(SourceCheckError::Call(node))?
+                    .range;
+                let last_range = arena
+                    .get(last.node)
+                    .ok_or(SourceCheckError::Call(node))?
+                    .range;
+                if first_range.start < TextPos::new(start.saturating_add(1))
+                    || last_range.end > TextPos::new(end.saturating_sub(1))
+                {
+                    return Err(SourceCheckError::Unsupported(unsupported));
+                }
+                let diagnostic_end = if type_arguments.has_trailing_comma {
+                    trailing_comma_range = arena.source_text().and_then(|source| {
+                        trailing_type_argument_comma_range(
+                            source,
+                            last_range.end,
+                            TextPos::new(end.saturating_sub(1)),
+                        )
+                    });
+                    trailing_comma_range.map(|range| range.end)
+                } else {
+                    Some(last_range.end)
+                };
+                diagnostic_end
+                    .map(|diagnostic_end| TextRange::new(first_range.start, diagnostic_end))
+            } else {
+                None
+            };
+            if type_arguments.has_trailing_comma && trailing_comma_range.is_none() {
+                return Err(SourceCheckError::Unsupported(unsupported));
+            }
+            Ok(SourceTypeArgumentList {
+                nodes,
+                syntax_range: type_arguments.range,
+                diagnostic_range,
+                trailing_comma_range,
+            })
+        })
+        .transpose()
 }
 
 fn trailing_type_argument_comma_range(
@@ -5764,7 +5773,7 @@ fn source_identity_fallback_is_exact(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_explicit_source_type_arguments(
+pub(super) fn resolve_explicit_source_type_arguments(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
@@ -5802,15 +5811,61 @@ pub(super) fn emit_call_type_argument_grammar_diagnostics(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     plan: &SourceCallPlan,
 ) -> Result<(), SourceCheckError> {
-    let Some(type_arguments) = &plan.type_arguments else {
+    emit_source_type_argument_grammar_diagnostics(
+        diagnostics,
+        plan.node,
+        plan.type_arguments.as_ref(),
+    )
+}
+
+fn source_new_type_argument_syntax(
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+) -> Result<Option<SourceTypeArgumentList>, SourceCheckError> {
+    let node = plan.node();
+    let (arena, _) = host.source(node).ok_or(SourceCheckError::Call(node))?;
+    let record = host.node(node).ok_or(SourceCheckError::Call(node))?;
+    let NodeData::NewExpression(expression) = &record.data else {
+        return Err(SourceCheckError::Call(node));
+    };
+    if !plan.is_generic_source_class()
+        || record.kind != SyntaxKind::NewExpression
+        || record.flags.0 != 0
+        || expression.facts != 0
+        || NodeRef::new(node.arena, node.file, expression.expression) != plan.constructor()
+    {
+        return Err(SourceCheckError::Call(node));
+    }
+    let syntax = plan_source_invocation_type_arguments(arena, node)?;
+    if syntax.as_ref().map(|syntax| syntax.nodes.as_slice()) != plan.written_type_argument_nodes() {
+        return Err(SourceCheckError::Call(node));
+    }
+    Ok(syntax)
+}
+
+pub(super) fn emit_source_new_type_argument_grammar_diagnostics(
+    host: &DeclaredTypeHost<'_>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    plan: &SourceDefaultNewPlan,
+) -> Result<(), SourceCheckError> {
+    let syntax = source_new_type_argument_syntax(host, plan)?;
+    emit_source_type_argument_grammar_diagnostics(diagnostics, plan.node(), syntax.as_ref())
+}
+
+fn emit_source_type_argument_grammar_diagnostics(
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    node: NodeRef,
+    type_arguments: Option<&SourceTypeArgumentList>,
+) -> Result<(), SourceCheckError> {
+    let Some(type_arguments) = type_arguments else {
         return Ok(());
     };
     if let Some(range) = type_arguments.trailing_comma_range {
         merge_retry_diagnostic(
             diagnostics,
             CanonicalCheckerDiagnostic {
-                node: Some(plan.node),
-                range_override: Some(CanonicalCheckerDiagnosticRange::new(plan.node, range)),
+                node: Some(node),
+                range_override: Some(CanonicalCheckerDiagnosticRange::new(node, range)),
                 diagnostic: Diagnostic::new(
                     message_by_code(1009).ok_or(SourceCheckError::MissingDiagnostic(1009))?,
                 ),
@@ -5823,9 +5878,9 @@ pub(super) fn emit_call_type_argument_grammar_diagnostics(
         merge_retry_diagnostic(
             diagnostics,
             CanonicalCheckerDiagnostic {
-                node: Some(plan.node),
+                node: Some(node),
                 range_override: Some(CanonicalCheckerDiagnosticRange::new(
-                    plan.node,
+                    node,
                     type_arguments.syntax_range,
                 )),
                 diagnostic: Diagnostic::new(
@@ -5869,14 +5924,6 @@ impl<'a> From<&'a SourceCallPlan> for SourceCallDiagnosticSite<'a> {
             receiver: source_call_receiver(&plan.callee),
         }
     }
-}
-
-fn extra_argument_diagnostic_range(
-    host: &DeclaredTypeHost<'_>,
-    plan: &SourceCallPlan,
-    first_extra: usize,
-) -> Result<CanonicalCheckerDiagnosticRange, SourceCheckError> {
-    extra_fixed_argument_diagnostic_range(host, plan.into(), first_extra)
 }
 
 fn extra_fixed_argument_diagnostic_range(
@@ -6809,15 +6856,13 @@ fn prepare_fixed_source_call_diagnostic(
 }
 
 fn prepare_source_type_argument_arity_diagnostic(
-    plan: &SourceCallPlan,
+    plan: SourceCallDiagnosticSite<'_>,
+    type_arguments: Option<&SourceTypeArgumentList>,
     explicit_type_arguments: &[TypeId],
     minimum: usize,
     maximum: usize,
 ) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
-    let syntax = plan
-        .type_arguments
-        .as_ref()
-        .ok_or(SourceCheckError::Call(plan.node))?;
+    let syntax = type_arguments.ok_or(SourceCheckError::Call(plan.node))?;
     let actual = explicit_type_arguments.len();
     if actual == 0
         || actual != syntax.nodes.len()
@@ -6860,7 +6905,8 @@ fn prepare_vector_source_call_diagnostic(
         options,
         session,
         diagnostics,
-        plan,
+        plan.into(),
+        plan.type_arguments.as_ref(),
         argument_types,
         explicit_type_arguments,
         resolution.projection().generic_signature,
@@ -6876,7 +6922,8 @@ fn prepare_generic_candidate_diagnostic(
     options: CanonicalCheckerOptions,
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
-    plan: &SourceCallPlan,
+    plan: SourceCallDiagnosticSite<'_>,
+    type_arguments: Option<&SourceTypeArgumentList>,
     argument_types: &[TypeId],
     explicit_type_arguments: Option<&[TypeId]>,
     signature: SignatureId,
@@ -6909,7 +6956,13 @@ fn prepare_generic_candidate_diagnostic(
             if actual != resolved.len() || maximum != type_parameter_count {
                 return Err(SourceCheckError::Call(plan.node));
             }
-            prepare_source_type_argument_arity_diagnostic(plan, resolved, minimum, maximum)?
+            prepare_source_type_argument_arity_diagnostic(
+                plan,
+                type_arguments,
+                resolved,
+                minimum,
+                maximum,
+            )?
         }
         GenericCallVectorApplicability::TooFewArguments { expected, actual } => {
             if expected != minimum_argument_count
@@ -6970,7 +7023,7 @@ fn prepare_generic_candidate_diagnostic(
             }
             CanonicalCheckerDiagnostic {
                 node: Some(plan.node),
-                range_override: Some(extra_argument_diagnostic_range(host, plan, expected)?),
+                range_override: Some(extra_fixed_argument_diagnostic_range(host, plan, expected)?),
                 diagnostic: Diagnostic::with_arguments(
                     message_by_code(2554).ok_or(SourceCheckError::MissingDiagnostic(2554))?,
                     [
@@ -6986,10 +7039,7 @@ fn prepare_generic_candidate_diagnostic(
             type_argument,
             constraint,
         } => {
-            let syntax = plan
-                .type_arguments
-                .as_ref()
-                .ok_or(SourceCheckError::Call(plan.node))?;
+            let syntax = type_arguments.ok_or(SourceCheckError::Call(plan.node))?;
             let resolved = explicit_type_arguments.ok_or(SourceCheckError::Call(plan.node))?;
             let node = *syntax
                 .nodes
@@ -8036,6 +8086,112 @@ pub(super) fn prepare_source_constructor_argument_diagnostics(
     )
 }
 
+/// Uses the real New syntax with the shared fixed and generic diagnostic workers.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_source_generic_constructor_diagnostics(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    plan: &SourceDefaultNewPlan,
+    argument_types: &[TypeId],
+    explicit_type_arguments: Option<&[TypeId]>,
+    resolution: &GenericMethodCallResolution,
+) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    let node = plan.node();
+    let syntax = source_new_type_argument_syntax(host, plan)?;
+    let arguments = plan
+        .checked_expression_arguments()
+        .ok_or(SourceCheckError::Call(node))?;
+    let Some(NodeData::NewExpression(expression)) = host.node(node).map(|record| &record.data)
+    else {
+        return Err(SourceCheckError::Call(node));
+    };
+    let nodes = expression
+        .arguments
+        .as_ref()
+        .map_or(&[][..], |arguments| arguments.nodes.as_slice());
+    if arguments.len() != nodes.len()
+        || argument_types.len() != nodes.len()
+        || arguments.iter().zip(nodes).any(|(argument, &expected)| {
+            argument.node != NodeRef::new(node.arena, node.file, expected)
+        })
+        || syntax
+            .as_ref()
+            .filter(|syntax| !syntax.nodes.is_empty())
+            .map(|syntax| syntax.nodes.len())
+            != explicit_type_arguments.map(<[TypeId]>::len)
+    {
+        return Err(SourceCheckError::Call(node));
+    }
+    if let (Some(syntax), Some(explicit)) = (&syntax, explicit_type_arguments) {
+        for (&argument, &type_) in syntax.nodes.iter().zip(explicit) {
+            if store
+                .type_node_links(argument)
+                .and_then(|links| links.resolved_type)
+                .is_some_and(|cached| cached != type_)
+            {
+                return Err(SourceCheckError::Call(node));
+            }
+        }
+    }
+    let site = SourceCallDiagnosticSite {
+        node,
+        callee_diagnostic_node: node,
+        form: DirectCallForm::New,
+        arguments,
+        receiver: None,
+    };
+    match &resolution.diagnostic {
+        None => Ok(Vec::new()),
+        Some(GenericMethodCallDiagnostic::Fixed(candidate)) => {
+            prepare_fixed_source_call_diagnostic(
+                store,
+                host,
+                globals,
+                options,
+                session,
+                diagnostics,
+                site,
+                argument_types,
+                legacy_class_call_resolution(candidate),
+            )
+        }
+        Some(GenericMethodCallDiagnostic::Generic {
+            signature,
+            applicability,
+        }) => prepare_generic_candidate_diagnostic(
+            store,
+            host,
+            globals,
+            options,
+            session,
+            diagnostics,
+            site,
+            syntax.as_ref(),
+            argument_types,
+            explicit_type_arguments,
+            *signature,
+            *applicability,
+        ),
+        Some(GenericMethodCallDiagnostic::TypeArgumentArity { expected, actual }) => {
+            let explicit = explicit_type_arguments.ok_or(SourceCheckError::Call(node))?;
+            if explicit.len() != *actual {
+                return Err(SourceCheckError::Call(node));
+            }
+            Ok(vec![prepare_source_type_argument_arity_diagnostic(
+                site,
+                syntax.as_ref(),
+                explicit,
+                *expected,
+                *expected,
+            )?])
+        }
+    }
+}
+
 /// Publishes the selected base signature while only the super call expression is void.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_source_super_call(
@@ -8591,7 +8747,13 @@ pub(super) fn check_direct_source_call(
             let explicit = explicit_type_arguments
                 .as_deref()
                 .ok_or(SourceCheckError::Call(plan.node))?;
-            let diagnostic = prepare_source_type_argument_arity_diagnostic(plan, explicit, 0, 0)?;
+            let diagnostic = prepare_source_type_argument_arity_diagnostic(
+                plan.into(),
+                plan.type_arguments.as_ref(),
+                explicit,
+                0,
+                0,
+            )?;
             (
                 resolution.signature,
                 resolution.return_type,
@@ -8624,7 +8786,8 @@ pub(super) fn check_direct_source_call(
                     options,
                     session,
                     diagnostics,
-                    plan,
+                    plan.into(),
+                    plan.type_arguments.as_ref(),
                     argument_types,
                     explicit_type_arguments.as_deref(),
                     *signature,
@@ -8638,7 +8801,11 @@ pub(super) fn check_direct_source_call(
                         return Err(SourceCheckError::Call(plan.node));
                     }
                     vec![prepare_source_type_argument_arity_diagnostic(
-                        plan, explicit, *expected, *expected,
+                        plan.into(),
+                        plan.type_arguments.as_ref(),
+                        explicit,
+                        *expected,
+                        *expected,
                     )?]
                 }
             };
@@ -11211,6 +11378,124 @@ mod tests {
             ),
             cold_counts
         );
+    }
+
+    #[test]
+    fn generic_new_grammar_keeps_real_new_nodes_and_type_argument_ranges() {
+        let text = concat!(
+            "class Box<T> { constructor(value: T) {} } ",
+            "const empty = new Box<>(1); ",
+            "const trailing = new Box< string , /* trivia */ >('text');",
+        );
+        let mut source = parsed(text);
+        let file = FileId::new(203_1801);
+        let mut context = context(&source, file);
+        context.check_source_file(file).unwrap();
+        let mut nodes = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        let [empty, trailing] = nodes.as_slice() else {
+            panic!("the source must retain both New expressions")
+        };
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, node, code, start, length, message) in [
+            (
+                &diagnostics[0],
+                *empty,
+                1099,
+                text.find("<>").unwrap(),
+                2,
+                "Type argument list cannot be empty.",
+            ),
+            (
+                &diagnostics[1],
+                *trailing,
+                1009,
+                text.find(", /* trivia */").unwrap(),
+                1,
+                "Trailing comma not allowed.",
+            ),
+        ] {
+            assert_eq!(diagnostic.node, Some(node));
+            assert_eq!(diagnostic.diagnostic.code(), code);
+            assert_eq!(diagnostic.diagnostic.render().unwrap(), message);
+            assert_eq!(
+                diagnostic.range_override,
+                Some(CanonicalCheckerDiagnosticRange::new(
+                    node,
+                    TextRange::new(
+                        TextPos::new(u32::try_from(start).unwrap()),
+                        TextPos::new(u32::try_from(start + length).unwrap()),
+                    ),
+                ))
+            );
+            assert_eq!(
+                plan_direct_source_call_syntax(&source.arena, context.store(), node).unwrap_err(),
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(node)),
+            );
+            let signature = context
+                .store()
+                .signature_links(node)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            assert!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .flags()
+                    .contains(SignatureFlags::CONSTRUCT)
+            );
+        }
+        let warm = nodes
+            .iter()
+            .map(|node| call_publication_state(&context, *node))
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                nodes
+                    .iter()
+                    .map(|node| call_publication_state(&context, *node))
+                    .collect::<Vec<_>>(),
+                warm
+            );
+        }
+        let trailing = *trailing;
+        let syntax = plan_source_invocation_type_arguments(&source.arena, trailing)
+            .unwrap()
+            .unwrap();
+        let [argument] = syntax.nodes.as_slice() else {
+            panic!("the written string argument must retain its original node")
+        };
+        let argument = *argument;
+        drop(context);
+        let parent = source.arena.get(argument.node).unwrap().parent;
+        source.arena.get_mut(argument.node).unwrap().parent = None;
+        assert_eq!(
+            plan_source_invocation_type_arguments(&source.arena, trailing).unwrap_err(),
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(trailing)),
+        );
+        source.arena.get_mut(argument.node).unwrap().parent = parent;
+        let restored = plan_source_invocation_type_arguments(&source.arena, trailing)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.nodes, syntax.nodes);
+        assert_eq!(restored.syntax_range, syntax.syntax_range);
+        assert_eq!(restored.diagnostic_range, syntax.diagnostic_range);
+        assert_eq!(restored.trailing_comma_range, syntax.trailing_comma_range);
     }
 
     #[test]

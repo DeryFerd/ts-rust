@@ -19,8 +19,10 @@ use super::{
         validate_stored_single_callable_provider,
     },
     classes::{
-        ClassHeritageMembersValidation, authenticated_class_constructor_value,
-        completed_source_class_receiver_members, validate_class_heritage_members,
+        ClassError, ClassHeritageMembersValidation, ClassInvariant,
+        CompletedSourceClassConstructors, authenticated_class_constructor_value,
+        completed_source_class_construct_candidates, completed_source_class_receiver_members,
+        validate_class_heritage_members,
     },
     declared::cached_ordinary_type_parameter_owner,
     instantiate::instantiated_member_type_matches,
@@ -626,6 +628,81 @@ fn validate_stored_class_constructor_callable_set(
         },
         None => StoredCallableSetValidation::Malformed { family },
     })
+}
+
+/// Keeps completed class construct rows separate from the stored call-signature projection.
+pub(super) fn completed_source_class_constructor_candidates(
+    store: &CanonicalTypeMapperStore,
+    value: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<CompletedSourceClassConstructors>, ClassError> {
+    let Some(constructors) =
+        completed_source_class_construct_candidates(store, value, array_targets)?
+    else {
+        return Ok(None);
+    };
+    let members = constructors.members();
+    let owner = members.shells().symbol();
+    let invalid = || ClassError::Invariant(ClassInvariant::InvalidConstructSignature(owner));
+    let structured = store
+        .type_payload(value)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(invalid)?;
+    let signatures = constructors.signatures();
+    if members.shells().value_type() != value
+        || signatures.is_empty()
+        || structured.call_signature_count != 0
+        || structured.signatures.as_deref().is_none_or(|stored| {
+            !stored
+                .iter()
+                .copied()
+                .eq(signatures.iter().map(|callable| callable.signature))
+        })
+        || constructors.implementation().is_some_and(|implementation| {
+            signatures
+                .iter()
+                .any(|callable| callable.signature == implementation.signature)
+        })
+    {
+        return Err(invalid());
+    }
+    let formals = constructors
+        .type_parameters()
+        .iter()
+        .map(|parameter| parameter.type_parameter())
+        .collect::<Vec<_>>();
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let mut edges = Vec::new();
+    for callable in signatures.iter().chain(constructors.implementation()) {
+        let signature = store.signature(callable.signature).ok_or_else(invalid)?;
+        if callable.owner != value
+            || !signature.flags().contains(SignatureFlags::CONSTRUCT)
+            || signature.type_parameters() != formals.as_slice()
+            || callable.return_type != Some(members.shells().instance_type())
+            || signature.resolved_return_type() != callable.return_type
+        {
+            return Err(invalid());
+        }
+        edges.extend(&callable.parameters);
+        edges.extend(callable.rest_parameter);
+        edges.extend(callable.return_type);
+    }
+    for parameter in constructors.type_parameters() {
+        edges.push(parameter.type_parameter());
+        edges.extend(parameter.constraint());
+        edges.extend(parameter.default_type());
+        if parameter.base_constraint() != bootstrap.no_constraint_type
+            && parameter.base_constraint() != bootstrap.circular_constraint_type
+        {
+            edges.push(parameter.base_constraint());
+        }
+    }
+    for edge in edges {
+        store
+            .validate_cached_array_capability_with_pending_functions(array_targets, edge, &[])
+            .map_err(|_| invalid())?;
+    }
+    Ok(Some(constructors))
 }
 
 fn validate_stored_class_constructor_union_callable_set(

@@ -32420,6 +32420,30 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
                 });
         }
+        if let Some(return_type) =
+            super::source_new::generic_new_error_signature_return_type(self.store, signature)
+                .map_err(|_| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+                })?
+        {
+            self.reject_type_reference_alias_capabilities()?;
+            return Ok(return_type);
+        }
+        if let Some(return_type) =
+            super::classes::completed_source_class_constructor_signature_return_type(
+                self.store,
+                self.host,
+                signature,
+                array_targets,
+                self.options,
+            )
+            .map_err(|_| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+            })?
+        {
+            self.reject_type_reference_alias_capabilities()?;
+            return Ok(return_type);
+        }
         let instantiation = self
             .store
             .signature(signature)
@@ -90135,6 +90159,117 @@ mod tests {
             Ok(string),
         );
         assert_eq!(function_store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the exact bootstrap identity and each damaged field's restoration together.
+    fn canonical_new_error_signature_returns_only_its_bootstrap_error_type() {
+        let mut fixture = fixture("");
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let signature = bootstrap.unknown_signature;
+        let returned = bootstrap.error_type;
+        let any = bootstrap.any_type;
+        let unrelated = [
+            bootstrap.any_signature,
+            bootstrap.resolving_signature,
+            bootstrap.silent_never_signature,
+        ];
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let invalid = |signature| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+        };
+        let before = function_store_state(&fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                query_signature_return(&mut fixture, signature, &mut diagnostics),
+                Ok(returned)
+            );
+            for other in unrelated {
+                assert_eq!(
+                    query_signature_return(&mut fixture, other, &mut diagnostics),
+                    Err(invalid(other))
+                );
+            }
+            assert_eq!(function_store_state(&fixture.store), before);
+        }
+        for (flags, return_type, target) in [
+            (SignatureFlags::CONSTRUCT, returned, None),
+            (SignatureFlags::NONE, any, None),
+            (SignatureFlags::NONE, returned, Some(unrelated[0])),
+        ] {
+            assert!(fixture.store.set_signature_flags(signature, flags));
+            assert!(
+                fixture
+                    .store
+                    .set_signature_resolved_return_type(signature, Some(return_type))
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_signature_target_and_mapper(signature, target, None)
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    query_signature_return(&mut fixture, signature, &mut diagnostics),
+                    Err(invalid(signature))
+                );
+                assert_eq!(fixture.store.signature(signature).unwrap().flags(), flags);
+                assert_eq!(
+                    fixture
+                        .store
+                        .signature(signature)
+                        .unwrap()
+                        .resolved_return_type(),
+                    Some(return_type)
+                );
+                assert_eq!(fixture.store.signature(signature).unwrap().target(), target);
+                assert_eq!(function_store_state(&fixture.store), before);
+            }
+            assert!(
+                fixture
+                    .store
+                    .set_signature_flags(signature, SignatureFlags::NONE)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_signature_resolved_return_type(signature, Some(returned))
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_signature_target_and_mapper(signature, None, None)
+            );
+            assert_eq!(
+                query_signature_return(&mut fixture, signature, &mut diagnostics),
+                Ok(returned)
+            );
+        }
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_count: 0,
+            ..InstantiationLimits::default()
+        });
+        assert_eq!(
+            CanonicalTypeQuery::new_with_session_for_test(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_return_type_of_signature(signature),
+            Ok(returned)
+        );
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(session.total_count(), 0);
+        assert_eq!(session.limit_event_count(), 0);
+        assert_eq!(function_store_state(&fixture.store), before);
         assert!(diagnostics.is_empty());
     }
 
