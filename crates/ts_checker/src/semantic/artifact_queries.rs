@@ -2652,6 +2652,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(None);
         };
         let (arena, _, declaration_record) = self.validated_artifact_node(declaration)?;
+        // Module names use the binder's canonical quotes, not property-name spelling.
+        if matches!(declaration_record.data, NodeData::ModuleDeclaration(_)) {
+            return Ok(None);
+        }
         let Some(name_id) = declaration_name(&declaration_record.data) else {
             return Ok(None);
         };

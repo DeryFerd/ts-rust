@@ -27,6 +27,7 @@ use super::{
         CanonicalAliasResolutionError, CanonicalAliasResolutionEvent, CanonicalAliasResolver,
         CanonicalAliasTargetHost, CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
     },
+    alias_provider::ProductionAliasSourceRegistry,
     array_types::CanonicalArrayTargets,
     bootstrap::UnionReduction,
     declared::{cached_ordinary_type_parameter_owner, preflight_class_or_interface_reference},
@@ -36,6 +37,7 @@ use super::{
     signatures::SignatureFlags,
     source_callables::{self, SourceCallableError, SourceCallableUnsupported},
     source_overloads::{self, SourceOverloadError},
+    store::{NativeAmbientAliasEdge, NativeAmbientExportTable, NativeAmbientModuleExportResult},
     type_nodes::{CanonicalTypeQuery, TypeNodeUnavailable, normalize_numeric_separators},
     type_records::{ObjectTypeData, TypeCacheState, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -492,6 +494,7 @@ fn module_value_exports(
             expected.entry(name).or_default().push(export);
         }
     }
+    let native = validate_native_ambient_module_exports(store, host, owner, &expected)?;
     let Some(exports) = exports else {
         return if expected.is_empty() {
             Ok(Box::default())
@@ -506,6 +509,13 @@ fn module_value_exports(
     let mut members = Vec::with_capacity(expected.len());
     for (name, symbol) in table.iter() {
         let source = expected.get(&name.to_owned()).ok_or_else(invalid)?;
+        let source = source
+            .iter()
+            .filter(|export| {
+                native.is_none()
+                    || store.get_merged_symbol(export.symbol) == store.get_merged_symbol(symbol)
+            })
+            .collect::<Vec<_>>();
         let record = store.symbol(symbol).ok_or_else(invalid)?;
         let Some(actual) = record.declarations() else {
             return Err(invalid());
@@ -548,6 +558,270 @@ fn module_value_exports(
         });
     }
     Ok(members.into_boxed_slice())
+}
+
+fn native_ambient_export_table_is_exact(
+    store: &CanonicalTypeMapperStore,
+    saved: &NativeAmbientExportTable,
+) -> bool {
+    store.symbol_table(saved.table).is_some_and(|table| {
+        table.len() == saved.entries.len()
+            && saved.entries.iter().all(|entry| {
+                table.get(entry.name.as_ref()) == Some(entry.symbol)
+                    && store.get_merged_symbol(entry.symbol) == Some(entry.canonical)
+                    && store.get_merged_symbol(entry.canonical) == Some(entry.canonical)
+            })
+    })
+}
+
+fn native_ambient_alias_is_type_only(
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+) -> Option<bool> {
+    let (arena, _) = host.source(declaration)?;
+    let record = host.node(declaration)?;
+    let parent = || arena.get(record.parent?);
+    match &record.data {
+        NodeData::ExportAssignment(_) | NodeData::NamespaceExportDeclaration(_) => Some(false),
+        NodeData::ImportEqualsDeclaration(import) => Some(import.is_type_only),
+        NodeData::ImportClause(clause) => {
+            Some(clause.phase_modifier == Some(SyntaxKind::TypeKeyword))
+        }
+        NodeData::NamespaceImport(_) => match &parent()?.data {
+            NodeData::ImportClause(clause) => {
+                Some(clause.phase_modifier == Some(SyntaxKind::TypeKeyword))
+            }
+            _ => None,
+        },
+        NodeData::ImportSpecifier(import) => match &arena.get(parent()?.parent?)?.data {
+            NodeData::ImportClause(clause) => {
+                Some(import.is_type_only || clause.phase_modifier == Some(SyntaxKind::TypeKeyword))
+            }
+            _ => None,
+        },
+        NodeData::ExportSpecifier(export) => match &arena.get(parent()?.parent?)?.data {
+            NodeData::ExportDeclaration(declaration) => {
+                Some(export.is_type_only || declaration.is_type_only)
+            }
+            _ => None,
+        },
+        NodeData::NamespaceExport(_) => match &parent()?.data {
+            NodeData::ExportDeclaration(declaration) => Some(declaration.is_type_only),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn native_ambient_alias_edge_is_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    edge: &NativeAmbientAliasEdge,
+) -> bool {
+    let Some(record) = store.symbol(edge.alias) else {
+        return false;
+    };
+    let Some((_, bound)) = host.source(edge.declaration) else {
+        return false;
+    };
+    let binding = if let Some(owner) = edge.binding_owner {
+        store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::exports)
+    } else {
+        edge.binding_container.and_then(|container| {
+            (bound.container(edge.declaration) == Some(container))
+                .then(|| bound.locals(container))
+                .flatten()
+        })
+    };
+    record.flags() == SymbolFlags::ALIAS
+        && record.check_flags() == CheckFlags::NONE
+        && record.declarations() == Some(&[edge.declaration])
+        && bound.symbol(edge.declaration) == Some(edge.alias)
+        && binding == Some(edge.binding_table)
+        && store
+            .symbol_table(edge.binding_table)
+            .and_then(|table| table.get(record.name()))
+            == Some(edge.alias)
+        && store.get_merged_symbol(edge.alias) == Some(edge.alias)
+        && store.get_merged_symbol(edge.immediate) == Some(edge.canonical_immediate)
+        && store.get_merged_symbol(edge.target) == Some(edge.canonical_target)
+        && store.get_merged_symbol(edge.canonical_immediate) == Some(edge.canonical_immediate)
+        && store.get_merged_symbol(edge.canonical_target) == Some(edge.canonical_target)
+        && store.alias_symbol_links(edge.alias).is_some_and(|links| {
+            links.immediate_target == Some(edge.immediate)
+                && links.alias_target == AliasTargetState::Resolved(edge.target)
+                && links.type_only_declaration == edge.type_only_declaration
+        })
+}
+
+/// Validates the native selection without resolving an alias or a member value.
+#[allow(clippy::too_many_lines)] // Keep the selected rows and every losing dependency in one proof.
+fn validate_native_ambient_module_exports<'store>(
+    store: &'store CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    expected: &BTreeMap<EscapedName, Vec<ModuleExportDeclaration>>,
+) -> Result<Option<&'store NativeAmbientModuleExportResult>, SourceCheckError> {
+    let Some(saved) = store.native_ambient_module_exports(owner) else {
+        return Ok(None);
+    };
+    let invalid = || SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(owner));
+    if saved.owner != owner
+        || store
+            .intrinsic_bootstrap()
+            .is_none_or(|bootstrap| bootstrap.globals != saved.globals)
+        || store.source_global_bindings().is_none_or(|bindings| {
+            bindings.table != saved.globals || bindings.get(saved.name.as_ref()).is_none()
+        })
+        || store
+            .symbol_table(saved.globals)
+            .and_then(|table| table.get(saved.name.as_ref()))
+            != Some(saved.table_symbol)
+        || store.get_merged_symbol(saved.table_symbol) != Some(owner)
+        || !store.source_merged_symbol_declarations_match(owner)
+        || !native_ambient_export_table_is_exact(store, &saved.selected)
+        || saved.selected.entries.len() != expected.len()
+    {
+        return Err(invalid());
+    }
+    for symbol in &saved.symbols {
+        if store.symbol(symbol.symbol) != Some(&symbol.record)
+            || store.get_merged_symbol(symbol.symbol) != Some(symbol.canonical)
+            || store.get_merged_symbol(symbol.canonical) != Some(symbol.canonical)
+            || store.get_parent_of_symbol(symbol.symbol) != symbol.canonical_parent
+            || symbol.record.declarations().is_none_or(|declarations| {
+                declarations.is_empty()
+                    || declarations.iter().any(|declaration| {
+                        !host.symbol_matches(store, *declaration, symbol.canonical)
+                    })
+            })
+        {
+            return Err(invalid());
+        }
+    }
+    for source in &saved.sources {
+        if store.get_merged_symbol(source.symbol) != Some(owner)
+            || !native_ambient_export_table_is_exact(store, &source.exports)
+        {
+            return Err(invalid());
+        }
+        for entry in &source.exports.entries {
+            let rows = expected.get(&entry.name).ok_or_else(invalid)?;
+            let contributed = rows
+                .iter()
+                .filter(|row| {
+                    host.bound_file(row.node).is_some_and(|bound| {
+                        bound
+                            .container(row.node)
+                            .and_then(|container| bound.symbol(container))
+                            == Some(source.symbol)
+                            && row.symbol == entry.symbol
+                    })
+                })
+                .map(|row| row.node)
+                .collect::<Vec<_>>();
+            let declarations = store
+                .symbol(entry.symbol)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .ok_or_else(invalid)?;
+            if contributed.is_empty()
+                || contributed.len() != declarations.len()
+                || declarations.iter().any(|node| !contributed.contains(node))
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    for (name, rows) in expected {
+        let selected = saved
+            .selected
+            .entries
+            .iter()
+            .find(|entry| &entry.name == name)
+            .ok_or_else(invalid)?;
+        for row in rows {
+            let bound = host.bound_file(row.node).ok_or_else(invalid)?;
+            let source_owner = bound
+                .container(row.node)
+                .and_then(|container| bound.symbol(container))
+                .ok_or_else(invalid)?;
+            let source = saved
+                .sources
+                .iter()
+                .find(|source| source.symbol == source_owner)
+                .ok_or_else(invalid)?;
+            let entry = source
+                .exports
+                .entries
+                .iter()
+                .find(|entry| &entry.name == name && entry.symbol == row.symbol)
+                .ok_or_else(invalid)?;
+            if entry.canonical != selected.canonical
+                && !saved.losing.iter().any(|losing| {
+                    losing.source_owner == source_owner
+                        && &losing.name == name
+                        && losing.symbol == entry.canonical
+                        && losing.selected == selected.canonical
+                })
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    for losing in &saved.losing {
+        let source = saved
+            .sources
+            .iter()
+            .find(|source| source.symbol == losing.source_owner)
+            .ok_or_else(invalid)?;
+        if losing.symbol == losing.selected
+            || source
+                .exports
+                .entries
+                .iter()
+                .all(|entry| entry.name != losing.name || entry.canonical != losing.symbol)
+            || saved
+                .selected
+                .entries
+                .iter()
+                .all(|entry| entry.name != losing.name || entry.canonical != losing.selected)
+            || losing
+                .aliases
+                .first()
+                .is_none_or(|edge| edge.alias != losing.symbol)
+        {
+            return Err(invalid());
+        }
+        let mut seen = HashSet::new();
+        for (index, edge) in losing.aliases.iter().enumerate() {
+            let next = losing
+                .aliases
+                .get(index + 1)
+                .map_or(edge.canonical_target, |edge| edge.alias);
+            let source_marker = native_ambient_alias_is_type_only(host, edge.declaration)
+                .ok_or_else(invalid)?
+                .then_some(edge.declaration)
+                .or_else(|| {
+                    losing.aliases[index + 1..]
+                        .iter()
+                        .find_map(|edge| edge.type_only_declaration)
+                });
+            if !seen.insert(edge.alias)
+                || !native_ambient_alias_edge_is_exact(store, host, edge)
+                || edge.canonical_immediate != next
+                || edge.type_only_declaration != source_marker
+                || store.symbol(edge.canonical_target).is_none_or(|record| {
+                    record.flags().intersects(SymbolFlags::ALIAS)
+                        || !record.flags().intersects(SymbolFlags::VALUE)
+                })
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(Some(saved))
 }
 
 fn plan_module_value(
@@ -8077,9 +8351,27 @@ fn plan_ambient_module_reexport(
     } else {
         None
     };
-    let exports = store
-        .symbol(owner)
-        .and_then(ts_binder::semantic::Symbol::exports)
+    // A conflicting export keeps its own source alias even when another
+    // declaration wins the merged module's public export table.
+    let source_owner = bound
+        .symbol(namespace)
+        .ok_or(SourceCheckError::Import(declaration))?;
+    let source_record = store
+        .symbol(source_owner)
+        .ok_or(SourceCheckError::Import(declaration))?;
+    if store.get_merged_symbol(source_owner) != Some(owner)
+        || !store.source_merged_symbol_declarations_match(owner)
+        || source_record
+            .declarations()
+            .is_none_or(|declarations| !declarations.contains(&namespace))
+        || store
+            .symbol(owner)
+            .is_none_or(|record| record.name() != source_record.name())
+    {
+        return Err(SourceCheckError::Import(declaration));
+    }
+    let exports = source_record
+        .exports()
         .and_then(|exports| store.symbol_table(exports))
         .ok_or(SourceCheckError::Import(declaration))?;
     let mut aliases = HashSet::with_capacity(named.elements.nodes.len());
@@ -11714,6 +12006,70 @@ fn namespace_imports<'plan>(
     }
 }
 
+/// Reuses the source provider for a same-file ambient import reached during merging.
+pub(super) fn ambient_module_merge_alias_target(
+    store: &CanonicalTypeMapperStore,
+    files: &ProductionAliasSourceRegistry<'_>,
+    alias: SemanticSymbolId,
+) -> Result<Option<SemanticSymbolId>, CanonicalAliasTargetUnavailable> {
+    let Some([declaration]) = store
+        .symbol(alias)
+        .and_then(ts_binder::semantic::Symbol::declarations)
+    else {
+        return Ok(None);
+    };
+    let declaration = *declaration;
+    if store.source_node_kind(declaration) != Some(SyntaxKind::NamespaceImport) {
+        return Ok(None);
+    }
+    let invalid = || CanonicalAliasTargetUnavailable::MalformedDeclaration(declaration);
+    let (arena, bound) = files.snapshot(declaration.file).ok_or_else(invalid)?;
+    if bound
+        .source_facts()
+        .is_none_or(|facts| !facts.is_declaration_file())
+    {
+        return Ok(None);
+    }
+    let Some(namespace) = bound.container(declaration) else {
+        return Ok(None);
+    };
+    let Some(NodeData::ModuleDeclaration(module)) =
+        arena.get(namespace.node).map(|node| &node.data)
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        arena.get(module.name).map(|node| &node.data),
+        Some(NodeData::StringLiteral(_))
+    ) {
+        return Ok(None);
+    }
+    let clause = owned_node(arena, bound, store, declaration)
+        .map_err(|_| invalid())?
+        .parent
+        .ok_or_else(invalid)?;
+    let import = arena
+        .get(clause)
+        .and_then(|node| node.parent)
+        .map(|node| child(declaration, node))
+        .ok_or_else(invalid)?;
+    if bound.symbol(declaration) != Some(alias)
+        || arena.get(import.node).and_then(|node| node.parent) != module.body
+    {
+        return Err(invalid());
+    }
+    let imports = match plan_ambient_module_import(arena, bound, store, namespace, import) {
+        Ok(imports) => imports,
+        Err(SourceCheckError::Unsupported(_)) => return Ok(None),
+        Err(_) => return Err(invalid()),
+    };
+    imports
+        .iter()
+        .find(|import| import.symbol == alias && import.declaration == declaration)
+        .map(|import| import.ambient_target)
+        .ok_or_else(invalid)
+}
+
 /// Resolves manifest-backed imports nested in quoted ambient modules.
 pub(super) fn resolve_source_namespace_external_imports(
     store: &mut CanonicalTypeMapperStore,
@@ -11869,11 +12225,96 @@ fn issue_ambient_module_export_collision(
     Ok(())
 }
 
+/// Keeps the existing source anchors and related notes inside the native merge callback.
+pub(super) fn report_ambient_module_merge_diagnostic(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    diagnostic: super::merge::SymbolMergeDiagnostic,
+) -> Result<bool, SourceCheckError> {
+    if diagnostic.kind != super::merge::SymbolMergeDiagnosticKind::IncompatibleDeclarations {
+        return Ok(false);
+    }
+    let (Some(target), Some(source)) = (
+        store.symbol(diagnostic.target),
+        store.symbol(diagnostic.source),
+    ) else {
+        return Ok(false);
+    };
+    if !(target.flags() | source.flags()).intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+        || !target
+            .flags()
+            .intersects(SymbolFlags::ALIAS | SymbolFlags::VALUE)
+        || !source
+            .flags()
+            .intersects(SymbolFlags::ALIAS | SymbolFlags::VALUE)
+    {
+        return Ok(false);
+    }
+    let (Some([target_declaration]), Some([source_declaration])) =
+        (target.declarations(), source.declarations())
+    else {
+        return Ok(false);
+    };
+    if [*target_declaration, *source_declaration]
+        .into_iter()
+        .any(|declaration| {
+            !matches!(
+                store.source_node_kind(declaration),
+                Some(SyntaxKind::ExportSpecifier | SyntaxKind::VariableDeclaration)
+            )
+        })
+    {
+        return Ok(false);
+    }
+    let parent_name = |symbol| {
+        let parent = store.get_parent_of_symbol(symbol)?;
+        let record = store.symbol(parent)?;
+        let name = record.name().as_utf8()?;
+        let declarations = record.declarations()?;
+        if !record.flags().intersects(SymbolFlags::MODULE)
+            || !name.starts_with('"')
+            || !name.ends_with('"')
+            || declarations.is_empty()
+            || !declarations.iter().all(|declaration| {
+                let Some(NodeData::ModuleDeclaration(module)) =
+                    host.node(*declaration).map(|record| &record.data)
+                else {
+                    return false;
+                };
+                matches!(host.node(child(*declaration, module.name)).map(|record| &record.data),
+                    Some(NodeData::StringLiteral(literal))
+                        if name == format!("\"{}\"", literal.text))
+            })
+        {
+            return None;
+        }
+        Some(name)
+    };
+    if parent_name(diagnostic.target).is_none()
+        || parent_name(diagnostic.target) != parent_name(diagnostic.source)
+    {
+        return Ok(false);
+    }
+    issue_ambient_module_export_collision(
+        store,
+        host,
+        diagnostics,
+        *target_declaration,
+        diagnostic.target,
+        diagnostic.source,
+    )?;
+    Ok(true)
+}
+
 fn ambient_module_collision_export_is_exact(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
     symbol: SemanticSymbolId,
 ) -> bool {
+    let Some(owner) = store.get_merged_symbol(owner) else {
+        return false;
+    };
     let Some(record) = store.symbol(symbol) else {
         return false;
     };
@@ -11936,6 +12377,71 @@ fn ambient_module_collision_export_is_exact(
     current == target
 }
 
+fn validate_ambient_module_merge_dependencies(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceNamespacePlan,
+) -> Result<(), SourceCheckError> {
+    let invalid = || SourceCheckError::Import(plan.declaration);
+    let owner = store.symbol(plan.symbol).ok_or_else(invalid)?;
+    let declarations = owner.declarations().ok_or_else(invalid)?;
+    if store.native_ambient_module_exports(plan.symbol).is_some() {
+        return module_value_exports(store, host, plan.symbol, declarations, owner.exports())
+            .map(drop)
+            .map_err(|_| invalid());
+    }
+    let binding = store
+        .source_global_bindings()
+        .and_then(|bindings| bindings.get(owner.name()))
+        .ok_or_else(invalid)?;
+    if binding.symbol != plan.symbol
+        || binding.flags != owner.flags()
+        || binding.declarations() != Some(declarations)
+        || !store.source_merged_symbol_declarations_match(plan.symbol)
+    {
+        return Err(invalid());
+    }
+
+    let mut source_owners = HashSet::new();
+    let mut exports = BTreeMap::<EscapedName, HashSet<SemanticSymbolId>>::new();
+    for &declaration in declarations {
+        let (_, bound) = host.source(declaration).ok_or_else(invalid)?;
+        let source = bound.symbol(declaration).ok_or_else(invalid)?;
+        if store.get_merged_symbol(source) != Some(plan.symbol) {
+            return Err(invalid());
+        }
+        if !source_owners.insert(source) {
+            continue;
+        }
+        let record = store.symbol(source).ok_or_else(invalid)?;
+        let Some(table) = record.exports() else {
+            continue;
+        };
+        for (name, symbol) in store.symbol_table(table).ok_or_else(invalid)?.iter() {
+            let symbol = store.get_merged_symbol(symbol).ok_or_else(invalid)?;
+            exports.entry(name.to_owned()).or_default().insert(symbol);
+        }
+    }
+    for symbols in exports.values().filter(|symbols| symbols.len() > 1) {
+        let mut block_scoped = false;
+        let mut values = true;
+        for &symbol in symbols {
+            let flags = store.symbol(symbol).ok_or_else(invalid)?.flags();
+            block_scoped |= flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE);
+            values &= flags.intersects(SymbolFlags::ALIAS | SymbolFlags::VALUE);
+        }
+        if block_scoped
+            && values
+            && symbols.iter().any(|&symbol| {
+                !ambient_module_collision_export_is_exact(store, plan.symbol, symbol)
+            })
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
 /// Registers reopened ambient modules and reports exact block-scoped export collisions.
 pub(super) fn merge_source_ambient_module_exports(
     store: &mut CanonicalTypeMapperStore,
@@ -11985,7 +12491,7 @@ pub(super) fn merge_source_ambient_module_exports(
             .ok_or(SourceCheckError::Import(plan.declaration));
     };
     if existing == plan.symbol {
-        return Ok(());
+        return validate_ambient_module_merge_dependencies(store, host, plan);
     }
     let existing_exports = store
         .symbol(existing)
@@ -14091,6 +14597,572 @@ mod tests {
                 CanonicalCheckerOptions::default(),
             )
             .unwrap(),
+        }
+    }
+
+    struct NativeAmbientValueFixture {
+        context: CanonicalCheckerContext<'static>,
+        plan: SourceNamespacePlan,
+        declarations: [NodeRef; 2],
+        names: [NodeRef; 2],
+        raw: [SemanticSymbolId; 2],
+        selected: SemanticSymbolId,
+        aliases: [SemanticSymbolId; 3],
+        other: SemanticSymbolId,
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep the real provider, raw owners, and alias chain together.
+    fn native_ambient_value_fixture() -> NativeAmbientValueFixture {
+        let sources = [
+            concat!(
+                "declare function foo(): void; ",
+                "declare namespace foo { export const items: number; } ",
+                "declare function other(): void; export = foo;",
+            ),
+            "declare module 'mymod' { import * as foo from 'foo'; export { foo }; }",
+            "declare module 'mymod' { export const foo: number; }",
+        ];
+        let parsed = sources.map(|source| {
+            let parsed: &'static ParseResult = Box::leak(Box::new(parse_source_file(source)));
+            parsed
+        });
+        let files = [7_541, 7_542, 7_543].map(FileId::new);
+        let node = |index: usize, kind| {
+            parsed[index]
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(
+                        parsed[index].arena.id(),
+                        files[index],
+                        node,
+                    ))
+                })
+                .unwrap()
+        };
+        let import = node(1, SyntaxKind::ImportDeclaration);
+        let NodeData::ImportDeclaration(import_data) =
+            &parsed[1].arena.get(import.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let context = ambient_module_context(
+            &[
+                (files[0], parsed[0], CanonicalModuleState::External),
+                (files[1], parsed[1], CanonicalModuleState::Script),
+                (files[2], parsed[2], CanonicalModuleState::Script),
+            ],
+            Some(CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    child(import, import_data.module_specifier),
+                    CanonicalResolvedModuleInput::new(
+                        files[0],
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::Esm,
+                    ),
+                ),
+            ])),
+        );
+        let raw_symbol = |node: NodeRef| context.file(node.file).unwrap().1.symbol(node).unwrap();
+        let declarations = [1, 2].map(|index| node(index, SyntaxKind::ModuleDeclaration));
+        let raw = declarations.map(raw_symbol);
+        let names = declarations.map(|declaration| {
+            let (arena, _) = context.file(declaration.file).unwrap();
+            let NodeData::ModuleDeclaration(module) = &arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            child(declaration, module.name)
+        });
+        let selected = raw_symbol(node(2, SyntaxKind::VariableDeclaration));
+        let aliases = [
+            node(1, SyntaxKind::ExportSpecifier),
+            node(1, SyntaxKind::NamespaceImport),
+            node(0, SyntaxKind::ExportAssignment),
+        ]
+        .map(raw_symbol);
+        let (_, provider) = context.file(files[0]).unwrap();
+        let other = context
+            .store()
+            .symbol_table(provider.locals(provider.source_file()).unwrap())
+            .unwrap()
+            .get_source("other")
+            .unwrap();
+        let (arena, bound) = context.file(files[2]).unwrap();
+        let plan = plan_source_namespace(arena, bound, context.store(), declarations[1]).unwrap();
+        let saved = context
+            .store()
+            .native_ambient_module_exports(plan.symbol)
+            .unwrap();
+        assert_eq!(saved.owner, plan.symbol);
+        assert_eq!(saved.sources.len(), 2);
+        assert_eq!(saved.losing.len(), 1);
+        assert_eq!(
+            saved.losing[0]
+                .aliases
+                .iter()
+                .map(|edge| edge.alias)
+                .collect::<Vec<_>>(),
+            aliases
+        );
+        assert_eq!(saved.selected.entries[0].symbol, selected);
+        NativeAmbientValueFixture {
+            context,
+            plan,
+            declarations,
+            names,
+            raw,
+            selected,
+            aliases,
+            other,
+        }
+    }
+
+    fn native_ambient_value_snapshot(
+        context: &CanonicalCheckerContext<'_>,
+    ) -> (String, CanonicalCheckerDiagnostics) {
+        // Include all store records, links, allocation counts, and private receipts.
+        (
+            format!("{:?}", context.store()),
+            context.diagnostics().clone(),
+        )
+    }
+
+    fn native_ambient_value_replay(
+        fixture: &NativeAmbientValueFixture,
+    ) -> Result<(), SourceCheckError> {
+        let host = fixture.context.declared_type_host().unwrap();
+        validate_ambient_module_merge_dependencies(fixture.context.store(), &host, &fixture.plan)
+    }
+
+    fn assert_native_ambient_value_failure(
+        fixture: &mut NativeAmbientValueFixture,
+        error: SourceCheckError,
+        replay_fails: bool,
+    ) {
+        let before = native_ambient_value_snapshot(&fixture.context);
+        for _ in 0..2 {
+            assert_eq!(
+                fixture
+                    .context
+                    .get_type_of_module_value(fixture.plan.symbol),
+                Err(error)
+            );
+            if replay_fails {
+                assert_eq!(
+                    native_ambient_value_replay(fixture),
+                    Err(SourceCheckError::Import(fixture.plan.declaration))
+                );
+            }
+            assert_eq!(native_ambient_value_snapshot(&fixture.context), before);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum NativeAmbientValueDamage {
+        SelectedTableCopy,
+        SelectedEntry,
+        RawTableCopy,
+        MissingRawEntry,
+        RawEntry,
+        PrunedDeclarations,
+        ReorderedDeclarations,
+        LosingDeclaration,
+        LosingValueDeclaration,
+        LosingParent,
+        LosingFlags,
+        ImmediateTarget,
+        UnknownTarget,
+        SkippedAlias,
+        CoherentTargets,
+        TypeOnlyMarker,
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each case changes one saved input and restores the native result.
+    fn native_ambient_values_reject_changed_receipt_inputs_cold_and_warm() {
+        use NativeAmbientValueDamage as Damage;
+
+        for warm in [false, true] {
+            for damage in [
+                Damage::SelectedTableCopy,
+                Damage::SelectedEntry,
+                Damage::RawTableCopy,
+                Damage::MissingRawEntry,
+                Damage::RawEntry,
+                Damage::PrunedDeclarations,
+                Damage::ReorderedDeclarations,
+                Damage::LosingDeclaration,
+                Damage::LosingValueDeclaration,
+                Damage::LosingParent,
+                Damage::LosingFlags,
+                Damage::ImmediateTarget,
+                Damage::UnknownTarget,
+                Damage::SkippedAlias,
+                Damage::CoherentTargets,
+                Damage::TypeOnlyMarker,
+            ] {
+                let mut fixture = native_ambient_value_fixture();
+                let owner = fixture.plan.symbol;
+                let type_ = warm.then(|| fixture.context.get_type_of_module_value(owner).unwrap());
+                let store = fixture.context.store_mut_for_test();
+                let saved = store.native_ambient_module_exports(owner).unwrap().clone();
+                let aliases = fixture
+                    .aliases
+                    .map(|alias| (alias, store.alias_symbol_links(alias).unwrap().clone()));
+                let selected_table = saved.selected.table;
+                let raw_table = store.symbol(fixture.raw[0]).unwrap().exports().unwrap();
+                match damage {
+                    Damage::SelectedTableCopy | Damage::RawTableCopy | Damage::MissingRawEntry => {
+                        let (symbol, table) = if matches!(damage, Damage::SelectedTableCopy) {
+                            (owner, selected_table)
+                        } else {
+                            (fixture.raw[0], raw_table)
+                        };
+                        let replacement = if matches!(damage, Damage::MissingRawEntry) {
+                            store.alloc_symbol_table()
+                        } else {
+                            store.clone_symbol_table(table).unwrap()
+                        };
+                        let record = store.symbol(symbol).unwrap().clone();
+                        assert!(store.set_symbol_relationships(
+                            symbol,
+                            record.members(),
+                            Some(replacement),
+                            record.parent(),
+                            record.export_symbol()
+                        ));
+                    }
+                    Damage::SelectedEntry | Damage::RawEntry => {
+                        let (table, replacement) = if matches!(damage, Damage::SelectedEntry) {
+                            (selected_table, fixture.aliases[0])
+                        } else {
+                            (raw_table, fixture.selected)
+                        };
+                        assert!(
+                            store
+                                .insert_symbol(table, EscapedName::source("foo"), replacement)
+                                .is_some()
+                        );
+                        if let Some(type_) = type_ {
+                            assert!(store.set_structured_type_members(
+                                type_,
+                                Some(selected_table),
+                                Some(vec![replacement]),
+                                None,
+                                None,
+                                None
+                            ));
+                        }
+                    }
+                    Damage::PrunedDeclarations | Damage::ReorderedDeclarations => {
+                        let declarations = if matches!(damage, Damage::PrunedDeclarations) {
+                            vec![fixture.declarations[1]]
+                        } else {
+                            fixture.declarations.into_iter().rev().collect()
+                        };
+                        assert!(store.set_symbol_declarations(
+                            owner,
+                            Some(declarations.clone()),
+                            Some(declarations[0])
+                        ));
+                    }
+                    Damage::LosingDeclaration | Damage::LosingValueDeclaration => {
+                        let record = store.symbol(fixture.aliases[0]).unwrap();
+                        let declarations = if matches!(damage, Damage::LosingDeclaration) {
+                            store
+                                .symbol(fixture.selected)
+                                .unwrap()
+                                .declarations()
+                                .map(<[_]>::to_vec)
+                        } else {
+                            record.declarations().map(<[_]>::to_vec)
+                        };
+                        let value = if matches!(damage, Damage::LosingValueDeclaration) {
+                            record.declarations().unwrap().first().copied()
+                        } else {
+                            record.value_declaration()
+                        };
+                        assert!(store.set_symbol_declarations(
+                            fixture.aliases[0],
+                            declarations,
+                            value
+                        ));
+                    }
+                    Damage::LosingParent => {
+                        assert!(store.set_symbol_relationships(
+                            fixture.aliases[0],
+                            None,
+                            None,
+                            Some(fixture.other),
+                            None
+                        ));
+                    }
+                    Damage::LosingFlags => {
+                        assert!(store.set_symbol_flags(
+                            fixture.aliases[0],
+                            SymbolFlags::ALIAS | SymbolFlags::NAMESPACE_MODULE,
+                            CheckFlags::NONE
+                        ));
+                    }
+                    Damage::ImmediateTarget
+                    | Damage::UnknownTarget
+                    | Damage::SkippedAlias
+                    | Damage::CoherentTargets
+                    | Damage::TypeOnlyMarker => {
+                        for (index, (alias, original)) in aliases.iter().enumerate() {
+                            if index != 0 && !matches!(damage, Damage::CoherentTargets) {
+                                continue;
+                            }
+                            let mut links = original.clone();
+                            match damage {
+                                Damage::ImmediateTarget => {
+                                    links.immediate_target = Some(fixture.other)
+                                }
+                                Damage::UnknownTarget => {
+                                    links.alias_target = AliasTargetState::Unknown
+                                }
+                                Damage::SkippedAlias => {
+                                    links.immediate_target = Some(fixture.aliases[2])
+                                }
+                                Damage::CoherentTargets => {
+                                    links.alias_target = AliasTargetState::Resolved(fixture.other);
+                                    if index == 2 {
+                                        links.immediate_target = Some(fixture.other);
+                                    }
+                                }
+                                Damage::TypeOnlyMarker => {
+                                    links.type_only_declaration = Some(fixture.declarations[0])
+                                }
+                                _ => unreachable!(),
+                            }
+                            assert!(store.set_alias_symbol_links(*alias, links));
+                        }
+                    }
+                }
+                let error =
+                    SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(owner));
+                assert_native_ambient_value_failure(&mut fixture, error, true);
+                let store = fixture.context.store_mut_for_test();
+                for symbol in &saved.symbols {
+                    let record = &symbol.record;
+                    assert!(store.set_symbol_flags(
+                        symbol.symbol,
+                        record.flags(),
+                        record.check_flags()
+                    ));
+                    assert!(store.set_symbol_declarations(
+                        symbol.symbol,
+                        record.declarations().map(<[_]>::to_vec),
+                        record.value_declaration()
+                    ));
+                    assert!(store.set_symbol_relationships(
+                        symbol.symbol,
+                        record.members(),
+                        record.exports(),
+                        record.parent(),
+                        record.export_symbol()
+                    ));
+                }
+                for table in std::iter::once(&saved.selected)
+                    .chain(saved.sources.iter().map(|source| &source.exports))
+                {
+                    for entry in &table.entries {
+                        assert!(
+                            store
+                                .insert_symbol(table.table, entry.name.clone(), entry.symbol)
+                                .is_some()
+                        );
+                    }
+                }
+                for (alias, links) in aliases {
+                    assert!(store.set_alias_symbol_links(alias, links));
+                }
+                if let Some(type_) = type_ {
+                    assert!(store.set_structured_type_members(
+                        type_,
+                        Some(selected_table),
+                        Some(vec![fixture.selected]),
+                        None,
+                        None,
+                        None
+                    ));
+                } else {
+                    assert!(store.module_value_identity(owner).is_none());
+                    assert!(store.value_symbol_links(owner).is_none());
+                }
+                assert_eq!(native_ambient_value_replay(&fixture), Ok(()), "{damage:?}");
+                let restored = fixture.context.get_type_of_module_value(owner).unwrap();
+                assert!(type_.is_none_or(|type_| type_ == restored), "{damage:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_ambient_values_reject_redirected_owners_and_losing_aliases() {
+        for warm in [false, true] {
+            for redirect_owner in [false, true] {
+                let mut fixture = native_ambient_value_fixture();
+                let owner = fixture.plan.symbol;
+                let original =
+                    warm.then(|| fixture.context.get_type_of_module_value(owner).unwrap());
+                let store = fixture.context.store_mut_for_test();
+                let queried = if redirect_owner {
+                    let record = store.symbol(owner).unwrap();
+                    let copy = ts_binder::SymbolData {
+                        flags: record.flags(),
+                        check_flags: record.check_flags(),
+                        name: record.name().to_owned(),
+                        declarations: Some(vec![fixture.declarations[1]]),
+                        value_declaration: Some(fixture.declarations[1]),
+                        members: record.members(),
+                        exports: record.exports(),
+                        parent: record.parent(),
+                        export_symbol: record.export_symbol(),
+                    };
+                    let copy = store.alloc_symbol(copy).unwrap();
+                    for raw in fixture.raw {
+                        assert_eq!(store.record_merged_symbol(copy, raw), Ok(Some(owner)));
+                    }
+                    assert_eq!(store.record_merged_symbol(copy, owner), Ok(None));
+                    assert_eq!(
+                        store.native_ambient_module_exports(copy).unwrap().owner,
+                        owner
+                    );
+                    copy
+                } else {
+                    assert_eq!(
+                        store.record_merged_symbol(fixture.selected, fixture.aliases[0]),
+                        Ok(None)
+                    );
+                    owner
+                };
+                assert_native_ambient_value_failure(
+                    &mut fixture,
+                    SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(queried)),
+                    true,
+                );
+                assert_eq!(
+                    fixture
+                        .context
+                        .store()
+                        .module_value_identity(owner)
+                        .map(|identity| identity.type_),
+                    original
+                );
+                if redirect_owner {
+                    assert!(
+                        fixture
+                            .context
+                            .store()
+                            .module_value_identity(queried)
+                            .is_none()
+                    );
+                    assert!(
+                        fixture
+                            .context
+                            .store()
+                            .value_symbol_links(queried)
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check the cold and published roots against the same native selection.
+    fn native_ambient_values_keep_root_caches_and_allow_usage_flags() {
+        for warm in [false, true] {
+            for (replace_value, replace_nodes) in [(false, true), (true, false), (true, true)] {
+                let mut fixture = native_ambient_value_fixture();
+                let owner = fixture.plan.symbol;
+                let original =
+                    warm.then(|| fixture.context.get_type_of_module_value(owner).unwrap());
+                let store = fixture.context.store_mut_for_test();
+                let forged = if replace_value && replace_nodes {
+                    store
+                        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(owner))
+                        .unwrap()
+                } else {
+                    store.intrinsic_bootstrap().unwrap().number_type
+                };
+                if replace_value {
+                    assert!(store.set_value_symbol_links(
+                        owner,
+                        ValueSymbolLinks {
+                            resolved_type: Some(forged),
+                            ..ValueSymbolLinks::default()
+                        }
+                    ));
+                }
+                if replace_nodes {
+                    for node in fixture.declarations.into_iter().chain(fixture.names) {
+                        assert!(store.set_type_node_links(
+                            node,
+                            TypeNodeLinks {
+                                resolved_type: Some(forged),
+                                ..TypeNodeLinks::default()
+                            }
+                        ));
+                    }
+                }
+                let error = SourceCheckError::Variable(VariableInvariant::InvalidValueLinks(owner));
+                assert_native_ambient_value_failure(&mut fixture, error, false);
+                let before = native_ambient_value_snapshot(&fixture.context);
+                for name in fixture.names {
+                    assert_eq!(
+                        fixture.context.get_type_at_location(name),
+                        Err(CanonicalArtifactQueryError::SourceCheck(error))
+                    );
+                }
+                assert_eq!(native_ambient_value_snapshot(&fixture.context), before);
+                assert_eq!(native_ambient_value_replay(&fixture), Ok(()));
+                let store = fixture.context.store_mut_for_test();
+                if replace_value {
+                    assert!(store.set_value_symbol_links(
+                        owner,
+                        ValueSymbolLinks {
+                            resolved_type: original,
+                            ..ValueSymbolLinks::default()
+                        }
+                    ));
+                }
+                if replace_nodes {
+                    for node in fixture.declarations.into_iter().chain(fixture.names) {
+                        assert!(store.set_type_node_links(node, TypeNodeLinks::default()));
+                    }
+                }
+                let type_ = fixture.context.get_type_of_module_value(owner).unwrap();
+                assert!(original.is_none_or(|original| original == type_));
+
+                let store = fixture.context.store_mut_for_test();
+                for alias in fixture.aliases {
+                    let mut links = store.alias_symbol_links(alias).unwrap().clone();
+                    assert!(!links.referenced);
+                    links.referenced = true;
+                    assert!(store.set_alias_symbol_links(alias, links));
+                }
+                let mut links = store
+                    .module_symbol_links(owner)
+                    .cloned()
+                    .unwrap_or_default();
+                links.exports_checked = true;
+                assert!(store.set_module_symbol_links(owner, links));
+                let before = native_ambient_value_snapshot(&fixture.context);
+                for _ in 0..2 {
+                    assert_eq!(fixture.context.get_type_of_module_value(owner), Ok(type_));
+                    assert_eq!(native_ambient_value_replay(&fixture), Ok(()));
+                    assert_eq!(native_ambient_value_snapshot(&fixture.context), before);
+                }
+                assert!(
+                    fixture
+                        .context
+                        .store()
+                        .value_symbol_links(fixture.selected)
+                        .is_none()
+                );
+            }
         }
     }
 
@@ -21572,9 +22644,42 @@ mod tests {
             })
             .unwrap();
 
+        let module_declarations =
+            [(first_file, &first), (second_file, &second)].map(|(file, parsed)| {
+                parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        let NodeData::ModuleDeclaration(module) = &record.data else {
+                            return None;
+                        };
+                        matches!(parsed.arena.get(module.name).map(|node| &node.data),
+                            Some(NodeData::StringLiteral(name)) if name.text == "mymod")
+                        .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                    })
+                    .unwrap()
+            });
+        let raw = module_declarations.map(|declaration| {
+            context
+                .file(declaration.file)
+                .unwrap()
+                .1
+                .symbol(declaration)
+                .unwrap()
+        });
+        assert_ne!(raw[0], raw[1]);
+        let merged = raw.map(|symbol| context.store().get_merged_symbol(symbol).unwrap());
+        assert_eq!(merged[0], merged[1]);
+        let owner = context.store().symbol(merged[0]).unwrap();
+        assert_eq!(owner.name().as_utf8(), Some("\"mymod\""));
+        assert_eq!(owner.declarations(), Some(module_declarations.as_slice()));
+        let initialized_diagnostics = context.diagnostics().as_slice().to_vec();
+        assert_eq!(initialized_diagnostics.len(), 2);
+
         context.check_source_file(first_file).unwrap();
-        assert!(context.diagnostics().is_empty());
+        assert_eq!(context.diagnostics().as_slice(), initialized_diagnostics);
         context.check_source_file(second_file).unwrap();
+        assert_eq!(context.diagnostics().as_slice(), initialized_diagnostics);
 
         let diagnostics = context.diagnostics().as_slice();
         assert_eq!(diagnostics.len(), 2);

@@ -3,12 +3,12 @@
 //! This module adopts declaration-complete canonical binder output into one
 //! checker-owned semantic store. Construction includes the dependency-closed
 //! prefix of typescript-go's `initializeChecker`: ordered global merging,
-//! deferred ambient-module collection, UMD globals, global-scope
+//! post-library ambient-module merging, UMD globals, global-scope
 //! augmentations, named ambient-module and star-reexport augmentations, the
 //! built-in `undefined` conflict rule, intrinsic value links, and eager
-//! standard-library type identities. Alias-dependent merging, general checker
-//! diagnostics, and unresolved named module augmentations remain explicit
-//! typed boundaries.
+//! standard-library type identities. Module merges use the existing alias
+//! resolver and diagnostic host. Other unavailable module targets remain typed
+//! boundaries.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,7 +32,7 @@ use super::{
     SourceCheckProvenanceError, SourceFileRef, SymbolMergeError, TypeDisplayUnavailable, TypeId,
     alias::{
         CanonicalAliasResolution, CanonicalAliasResolutionError, CanonicalAliasResolver,
-        CanonicalAliasTargetUnavailable,
+        CanonicalAliasTargetHost, CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
     },
     alias_flags::{
         CanonicalSymbolFlagsError, CanonicalSymbolFlagsResolution, CanonicalSymbolFlagsResolver,
@@ -502,18 +502,20 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         let files = ProductionAliasSourceRegistry::new(&store, retained_files)
             .map_err(CanonicalCheckerContextError::AliasTargetHost)?;
 
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut alias_host =
+            ProductionAliasTargetHost::from_registry(&store, &files, &module_resolutions)
+                .map_err(CanonicalCheckerContextError::AliasTargetHost)?;
         let initialized = initialize_globals(
             &mut store,
             &file_order,
             &files,
             options.strict_bind_call_apply,
             options.name_resolution,
+            &mut alias_host,
+            &mut diagnostics,
         )
         .map_err(CanonicalCheckerContextError::GlobalInitialization)?;
-        let mut diagnostics = CanonicalCheckerDiagnostics::default();
-        let mut alias_host =
-            ProductionAliasTargetHost::from_registry(&store, &files, &module_resolutions)
-                .map_err(CanonicalCheckerContextError::AliasTargetHost)?;
         merge_reexported_module_augmentations(
             &mut store,
             &file_order,
@@ -523,6 +525,11 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             &mut diagnostics,
         )
         .map_err(CanonicalCheckerContextError::GlobalInitialization)?;
+        if !store.finalize_native_ambient_module_exports(&files) {
+            return Err(CanonicalCheckerContextError::GlobalInitialization(
+                CanonicalGlobalInitializationError::InvalidGlobals(initialized.globals),
+            ));
+        }
         let error_type = store
             .intrinsic_bootstrap()
             .expect("successful checker bootstrap remains installed")
@@ -2247,7 +2254,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         Ok(())
     }
 
-    /// Quoted ambient-module symbols deferred until global library types exist.
+    /// Source ambient-module symbols collected before global library types exist.
+    /// Their merged owners are installed after library initialization.
     /// Entries follow Program order and escaped-byte name order within a file.
     #[must_use]
     pub fn pending_ambient_modules(&self) -> &[SemanticSymbolId] {
@@ -2304,12 +2312,14 @@ struct GlobalInitialization {
 }
 
 #[allow(clippy::too_many_lines)] // Preserves pinned initializeChecker phase order visibly.
-fn initialize_globals(
+fn initialize_globals<'source, 'arena, 'manifest>(
     store: &mut CanonicalTypeMapperStore,
     file_order: &[FileId],
-    files: &ProductionAliasSourceRegistry<'_>,
+    files: &'source ProductionAliasSourceRegistry<'arena>,
     strict_bind_call_apply: bool,
     name_resolution_options: CanonicalNameResolverOptions,
+    aliases: &mut ProductionAliasTargetHost<'source, 'arena, 'manifest>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<GlobalInitialization, CanonicalGlobalInitializationError> {
     let (globals, undefined_symbol) = store
         .intrinsic_bootstrap()
@@ -2454,6 +2464,24 @@ fn initialize_globals(
     let global_types =
         initialize_global_library_types(store, &declared_host, globals, strict_bind_call_apply)?;
 
+    // Pinned initializeChecker merges these only after the real library types exist.
+    let mut ambient_host = AmbientModuleMergeHost {
+        files,
+        aliases,
+        diagnostics,
+        name_resolution_options,
+        target_error: None,
+    };
+    for &symbol in &pending_ambient_modules {
+        if let Err(error) = store.merge_global_symbol_with_host(&mut ambient_host, globals, symbol)
+        {
+            return Err(ambient_host.target_error.map_or_else(
+                || CanonicalGlobalInitializationError::Merge(error),
+                CanonicalGlobalInitializationError::ModuleAugmentationTarget,
+            ));
+        }
+    }
+
     // Named module augmentation can depend on initialized global object types.
     for &file in file_order {
         let (arena, bound) = files
@@ -2522,11 +2550,16 @@ fn plan_named_ambient_module_augmentation(
         return Ok(None);
     }
     let quoted_name = EscapedName::source(format!("\"{}\"", module_name.text));
-    let mut candidates = pending_ambient_modules.iter().copied().filter(|candidate| {
-        store
-            .symbol(*candidate)
-            .is_some_and(|symbol| symbol.name().as_bytes() == quoted_name.as_bytes())
-    });
+    let mut seen = BTreeSet::new();
+    let mut candidates = pending_ambient_modules
+        .iter()
+        .filter_map(|candidate| store.get_merged_symbol(*candidate))
+        .filter(|candidate| seen.insert(*candidate))
+        .filter(|candidate| {
+            store
+                .symbol(*candidate)
+                .is_some_and(|symbol| symbol.name().as_bytes() == quoted_name.as_bytes())
+        });
     let Some(ambient_module) = candidates.next() else {
         return Ok(None);
     };
@@ -2913,6 +2946,119 @@ impl SymbolMergeHost<super::TypeRecord, super::TypeMapper> for ModuleAugmentatio
             source::merge_retry_diagnostic(self.diagnostics, diagnostic);
         }
         Ok(())
+    }
+}
+
+struct AmbientModuleMergeHost<'borrow, 'source, 'arena, 'manifest> {
+    files: &'source ProductionAliasSourceRegistry<'arena>,
+    aliases: &'borrow mut ProductionAliasTargetHost<'source, 'arena, 'manifest>,
+    diagnostics: &'borrow mut CanonicalCheckerDiagnostics,
+    name_resolution_options: CanonicalNameResolverOptions,
+    target_error: Option<CanonicalAliasTargetUnavailable>,
+}
+
+impl CanonicalAliasTargetHost<super::TypeMapper> for AmbientModuleMergeHost<'_, '_, '_, '_> {
+    fn get_target_of_alias_declaration(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        alias: SemanticSymbolId,
+    ) -> Result<CanonicalImmediateAliasTarget, CanonicalAliasTargetUnavailable> {
+        if let Some(target) =
+            super::source_namespaces::ambient_module_merge_alias_target(store, self.files, alias)?
+        {
+            return Ok(CanonicalImmediateAliasTarget::Resolved(target));
+        }
+        self.aliases.get_target_of_alias_declaration(store, alias)
+    }
+}
+
+impl SymbolMergeHost<super::TypeRecord, super::TypeMapper>
+    for AmbientModuleMergeHost<'_, '_, '_, '_>
+{
+    fn resolve_alias_for_merge(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        symbol: SemanticSymbolId,
+    ) -> Result<SemanticSymbolId, SymbolMergeError> {
+        let queried = (|| {
+            // Retain the real immediate edges for source replay in either file order.
+            let mut current = symbol;
+            let mut seen = BTreeSet::new();
+            while seen.insert(current) {
+                let record = store
+                    .symbol(current)
+                    .ok_or(CanonicalAliasResolutionError::InvalidSymbol(current))?;
+                if !record.flags().intersects(SymbolFlags::ALIAS) {
+                    break;
+                }
+                let Some(target) = CanonicalAliasResolver::new(store, &mut *self)
+                    .get_immediate_aliased_symbol(current)?
+                else {
+                    break;
+                };
+                current = target;
+            }
+            CanonicalAliasResolver::new(store, &mut *self).resolve_alias(symbol)
+        })();
+        let resolution = queried.map_err(|error| match error {
+            CanonicalAliasResolutionError::TargetUnavailable { alias, reason } => {
+                self.target_error = Some(reason);
+                SymbolMergeError::AliasResolutionRequired(alias)
+            }
+            CanonicalAliasResolutionError::InvalidSymbol(symbol)
+            | CanonicalAliasResolutionError::SymbolIsNotAlias(symbol)
+            | CanonicalAliasResolutionError::InvalidAliasLinks(symbol)
+            | CanonicalAliasResolutionError::ResolutionStackInvariant(symbol) => {
+                SymbolMergeError::InvalidSymbol(symbol)
+            }
+            CanonicalAliasResolutionError::InvalidTarget { target, .. } => {
+                SymbolMergeError::InvalidSymbol(target)
+            }
+            CanonicalAliasResolutionError::TypeResolutionTarget(_) => {
+                SymbolMergeError::StoreInvariant("ambient alias resolution stack is invalid")
+            }
+        })?;
+        if !resolution.events.is_empty() {
+            return Err(SymbolMergeError::AliasResolutionRequired(symbol));
+        }
+        match resolution.target {
+            super::AliasTargetState::Resolved(target) => Ok(target),
+            super::AliasTargetState::Unknown => store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.unknown_symbol)
+                .ok_or(SymbolMergeError::StoreInvariant(
+                    "ambient module merging requires intrinsic symbols",
+                )),
+            super::AliasTargetState::Unresolved => Err(SymbolMergeError::InvalidSymbol(symbol)),
+        }
+    }
+
+    fn report_merge_diagnostic(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        diagnostic: SymbolMergeDiagnostic,
+    ) -> Result<(), SymbolMergeError> {
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            self.files,
+            GlobalMergeCompletion::new(self.name_resolution_options),
+        )
+        .map_err(|_| SymbolMergeError::StoreInvariant("ambient module sources are invalid"))?;
+        if super::source_namespaces::report_ambient_module_merge_diagnostic(
+            store,
+            &host,
+            self.diagnostics,
+            diagnostic,
+        )
+        .map_err(|_| SymbolMergeError::StoreInvariant("ambient module collision is invalid"))?
+        {
+            return Ok(());
+        }
+        ModuleAugmentationMergeHost {
+            files: self.files,
+            diagnostics: self.diagnostics,
+        }
+        .report_merge_diagnostic(store, diagnostic)
     }
 }
 
@@ -3981,6 +4127,149 @@ mod tests {
             CanonicalModuleResolutionMode::Esm,
             CanonicalModuleResolutionMode::Esm,
         )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the earlier alias target and the final augmentation result together.
+    fn native_ambient_export_receipts_follow_star_augmentations_and_finalize_once() {
+        let parsed = [
+            "export declare class Foo {}",
+            "export * from './provider';",
+            "declare module 'mymod' { import { Foo as foo } from 'barrel'; export { foo }; }",
+            "declare module 'mymod' { export const foo: number; }",
+            "export {}; declare module 'barrel' { interface Foo { extra: number; } }",
+        ]
+        .map(parsed);
+        let files = [8_430, 8_431, 8_432, 8_433, 8_434].map(FileId::new);
+        let declarations = |index: usize, kind| {
+            parsed[index]
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind).then_some(node_ref(&parsed[index], files[index], node))
+                })
+                .unwrap()
+        };
+        let modules = [2, 3].map(|index| declarations(index, SyntaxKind::ModuleDeclaration));
+        let augmentation = declarations(4, SyntaxKind::ModuleDeclaration);
+        let NodeData::ModuleDeclaration(augmentation_data) =
+            &parsed[4].arena.get(augmentation.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let facts = parsed
+            .iter()
+            .enumerate()
+            .map(|(index, parsed)| {
+                (
+                    files[index],
+                    parsed,
+                    true,
+                    if index == 2 || index == 3 {
+                        CanonicalModuleState::Script
+                    } else {
+                        CanonicalModuleState::External
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let manifest = CanonicalModuleResolutionManifestInput::new([
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&parsed[1], files[1], module_specifiers(&parsed[1])[0]),
+                esm(files[0]),
+            ),
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&parsed[2], files[2], module_specifiers(&parsed[2])[0]),
+                esm(files[1]),
+            ),
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&parsed[4], files[4], augmentation_data.name),
+                esm(files[1]),
+            ),
+        ]);
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            completed_bindings_with_facts(&facts),
+            parsed
+                .iter()
+                .enumerate()
+                .map(|(index, parsed)| (files[index], &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+            manifest,
+        )
+        .unwrap();
+        let raw_owner = alias_symbol(&context, modules[0]);
+        let owner = context.store().get_merged_symbol(raw_owner).unwrap();
+        let raw_class = alias_symbol(&context, declarations(0, SyntaxKind::ClassDeclaration));
+        let interface = alias_symbol(&context, declarations(4, SyntaxKind::InterfaceDeclaration));
+        let target = context.store().get_merged_symbol(raw_class).unwrap();
+        assert_ne!(target, raw_class);
+        assert_eq!(context.store().get_merged_symbol(interface), Some(target));
+        assert_eq!(
+            context.store().symbol(target).unwrap().declarations(),
+            Some(
+                [
+                    declarations(0, SyntaxKind::ClassDeclaration),
+                    declarations(4, SyntaxKind::InterfaceDeclaration),
+                ]
+                .as_slice()
+            )
+        );
+        let saved = context
+            .store()
+            .native_ambient_module_exports(owner)
+            .unwrap()
+            .clone();
+        assert_eq!(saved.owner, owner);
+        let [losing] = saved.losing.as_ref() else {
+            panic!("the native collision retains one losing reexport")
+        };
+        assert_eq!(losing.aliases.len(), 2);
+        for edge in &losing.aliases {
+            assert_eq!(edge.target, raw_class);
+            assert_eq!(edge.canonical_target, target);
+        }
+        assert_eq!(losing.aliases[1].immediate, raw_class);
+        assert_eq!(losing.aliases[1].canonical_immediate, target);
+        assert_eq!(
+            context
+                .store()
+                .source_global_bindings()
+                .unwrap()
+                .get(EscapedName::source("\"mymod\"").as_ref())
+                .unwrap()
+                .declarations(),
+            Some(modules.as_slice())
+        );
+        assert!(context.store().value_symbol_links(target).is_none());
+        assert!(
+            context
+                .store()
+                .value_symbol_links(saved.selected.entries[0].symbol)
+                .is_none()
+        );
+
+        let before = format!("{:?}", context.store);
+        assert!(
+            !context
+                .store
+                .finalize_native_ambient_module_exports(&context.files)
+        );
+        assert_eq!(format!("{:?}", context.store), before);
+        let type_ = context.get_type_of_module_value(owner).unwrap();
+        let warm = format!("{:?}", context.store);
+        let diagnostics = context.diagnostics.clone();
+        for _ in 0..2 {
+            assert_eq!(context.get_type_of_module_value(owner), Ok(type_));
+            assert_eq!(format!("{:?}", context.store), warm);
+            assert_eq!(context.diagnostics, diagnostics);
+        }
+        assert!(
+            !context
+                .store
+                .finalize_native_ambient_module_exports(&context.files)
+        );
+        assert_eq!(format!("{:?}", context.store), warm);
     }
 
     fn alias_query_unavailable_reason(
@@ -5371,7 +5660,7 @@ mod tests {
     }
 
     #[test]
-    fn defers_quoted_ambient_modules_and_retains_patterns_in_stable_order() {
+    fn merges_quoted_ambient_modules_after_libraries_and_retains_pattern_order() {
         let source = parsed(
             r#"
 declare module "z" { export interface Z {} }
@@ -5390,7 +5679,27 @@ interface Visible {}
 
         assert!(global_symbol(&context, "Visible").is_some());
         for name in ["\"*.css\"", "\"a\"", "\"z\""] {
-            assert!(global_symbol(&context, name).is_none());
+            let symbol = global_symbol(&context, name).unwrap();
+            let declaration = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::ModuleDeclaration(module) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::StringLiteral(literal) = &source.arena.get(module.name)?.data
+                    else {
+                        return None;
+                    };
+                    (format!("\"{}\"", literal.text) == name)
+                        .then_some(node_ref(&source, file, node))
+                })
+                .unwrap();
+            let raw = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            assert_eq!(context.store().get_merged_symbol(raw), Some(symbol));
+            let record = context.store().symbol(symbol).unwrap();
+            assert_eq!(record.name().as_utf8(), Some(name));
+            assert_eq!(record.declarations(), Some([declaration].as_slice()));
         }
         let pending_names = context
             .pending_ambient_modules()

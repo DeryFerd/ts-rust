@@ -176,6 +176,70 @@ impl SourceGlobalBinding {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct NativeAmbientSymbol {
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) canonical: SemanticSymbolId,
+    pub(super) canonical_parent: Option<SemanticSymbolId>,
+    pub(super) record: Symbol,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct NativeAmbientExport {
+    pub(super) name: EscapedName,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) canonical: SemanticSymbolId,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct NativeAmbientExportTable {
+    pub(super) table: SymbolTableId,
+    pub(super) entries: Box<[NativeAmbientExport]>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct NativeAmbientModuleSource {
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) exports: NativeAmbientExportTable,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct NativeAmbientAliasEdge {
+    pub(super) alias: SemanticSymbolId,
+    pub(super) declaration: NodeRef,
+    pub(super) immediate: SemanticSymbolId,
+    pub(super) canonical_immediate: SemanticSymbolId,
+    pub(super) target: SemanticSymbolId,
+    pub(super) canonical_target: SemanticSymbolId,
+    pub(super) type_only_declaration: Option<NodeRef>,
+    pub(super) binding_table: SymbolTableId,
+    pub(super) binding_owner: Option<SemanticSymbolId>,
+    pub(super) binding_container: Option<NodeRef>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct NativeAmbientLosingExport {
+    pub(super) source_owner: SemanticSymbolId,
+    pub(super) name: EscapedName,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) selected: SemanticSymbolId,
+    pub(super) aliases: Box<[NativeAmbientAliasEdge]>,
+}
+
+/// The actual native selection after every constructor merge phase has finished.
+/// No member value type or mutable alias use flag is part of this receipt.
+#[derive(Clone, Debug)]
+pub(super) struct NativeAmbientModuleExportResult {
+    pub(super) globals: SymbolTableId,
+    pub(super) name: EscapedName,
+    pub(super) table_symbol: SemanticSymbolId,
+    pub(super) owner: SemanticSymbolId,
+    pub(super) selected: NativeAmbientExportTable,
+    pub(super) sources: Box<[NativeAmbientModuleSource]>,
+    pub(super) symbols: Box<[NativeAmbientSymbol]>,
+    pub(super) losing: Box<[NativeAmbientLosingExport]>,
+}
+
 /// Binder edges for one interface contributed by an actual `declare global` block.
 /// Missing bindings remain missing until a source query checks this contribution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,6 +261,7 @@ pub(super) struct SourceGlobalBindings {
     pub(super) table: SymbolTableId,
     entries: HashMap<EscapedName, SourceGlobalBinding>,
     interface_augmentations: HashMap<NodeRef, SourceGlobalInterfaceAugmentation>,
+    native_ambient_exports: Option<HashMap<SemanticSymbolId, NativeAmbientModuleExportResult>>,
 }
 
 impl SourceGlobalBindings {
@@ -1256,8 +1321,284 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             table,
             entries,
             interface_augmentations,
+            native_ambient_exports: None,
         });
         true
+    }
+
+    /// Saves only the existing native result. Unsupported groups stay lazy.
+    pub(super) fn finalize_native_ambient_module_exports(
+        &mut self,
+        sources: &ProductionAliasSourceRegistry<'_>,
+    ) -> bool {
+        let Some(bindings) = self.source_global_bindings.as_ref() else {
+            return false;
+        };
+        if sources.store_id() != self.id() || bindings.native_ambient_exports.is_some() {
+            return false;
+        }
+        let Some(globals) = self.symbol_table(bindings.table) else {
+            return false;
+        };
+        let mut results = HashMap::new();
+        if results.try_reserve(globals.len()).is_err() {
+            return false;
+        }
+        for (name, symbol) in globals.iter() {
+            if bindings.get(name).is_some()
+                && let Some(result) = self.capture_native_ambient_module_exports(
+                    sources,
+                    bindings.table,
+                    name,
+                    symbol,
+                )
+            {
+                results.insert(result.owner, result);
+            }
+        }
+        self.source_global_bindings
+            .as_mut()
+            .expect("the global receipt remains installed")
+            .native_ambient_exports = Some(results);
+        true
+    }
+
+    pub(super) fn native_ambient_module_exports(
+        &self,
+        owner: SemanticSymbolId,
+    ) -> Option<&NativeAmbientModuleExportResult> {
+        let results = self
+            .source_global_bindings
+            .as_ref()?
+            .native_ambient_exports
+            .as_ref()?;
+        results.get(&owner).or_else(|| {
+            let record = self.symbol(owner)?;
+            // A changed owner must not turn a saved selection into an absent receipt.
+            // The reader still requires the exact saved owner after this lookup.
+            results.values().find(|saved| {
+                record.name() == saved.name.as_ref()
+                    || saved.sources.iter().any(|source| {
+                        source.symbol == owner
+                            || self.get_merged_symbol(source.symbol) == Some(owner)
+                    })
+            })
+        })
+    }
+
+    fn remember_native_ambient_symbol(
+        &self,
+        symbol: SemanticSymbolId,
+        symbols: &mut BTreeMap<SemanticSymbolId, NativeAmbientSymbol>,
+    ) -> Option<()> {
+        let canonical = self.get_merged_symbol(symbol)?;
+        for symbol in [symbol, canonical] {
+            if let std::collections::btree_map::Entry::Vacant(entry) = symbols.entry(symbol) {
+                entry.insert(NativeAmbientSymbol {
+                    symbol,
+                    canonical: self.get_merged_symbol(symbol)?,
+                    canonical_parent: self.get_parent_of_symbol(symbol),
+                    record: self.symbol(symbol)?.clone(),
+                });
+            }
+        }
+        Some(())
+    }
+
+    fn capture_native_ambient_export_table(
+        &self,
+        table: SymbolTableId,
+        symbols: &mut BTreeMap<SemanticSymbolId, NativeAmbientSymbol>,
+    ) -> Option<NativeAmbientExportTable> {
+        let mut entries = Vec::new();
+        for (name, symbol) in self.symbol_table(table)?.iter() {
+            self.remember_native_ambient_symbol(symbol, symbols)?;
+            entries.push(NativeAmbientExport {
+                name: name.to_owned(),
+                symbol,
+                canonical: self.get_merged_symbol(symbol)?,
+            });
+        }
+        entries.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        Some(NativeAmbientExportTable {
+            table,
+            entries: entries.into_boxed_slice(),
+        })
+    }
+
+    fn capture_native_ambient_alias_chain(
+        &self,
+        sources: &ProductionAliasSourceRegistry<'_>,
+        root: SemanticSymbolId,
+        symbols: &mut BTreeMap<SemanticSymbolId, NativeAmbientSymbol>,
+    ) -> Option<Box<[NativeAmbientAliasEdge]>> {
+        let mut current = root;
+        let mut seen = HashSet::new();
+        let mut edges = Vec::new();
+        let target = self
+            .alias_symbol_links(root)?
+            .alias_target
+            .symbol()
+            .and_then(|target| self.get_merged_symbol(target))?;
+        while seen.insert(current) {
+            self.remember_native_ambient_symbol(current, symbols)?;
+            let record = self.symbol(current)?;
+            if !record.flags().intersects(SymbolFlags::ALIAS) {
+                return (current == target && record.flags().intersects(SymbolFlags::VALUE))
+                    .then(|| edges.into_boxed_slice());
+            }
+            let &[declaration] = record.declarations()? else {
+                return None;
+            };
+            if record.flags() != SymbolFlags::ALIAS
+                || !self.source_symbol_declarations_match(current)
+            {
+                return None;
+            }
+            let (arena, bound) = sources.snapshot(declaration.file)?;
+            if !declaration.is_for(arena.id(), bound.file_id())
+                || bound.symbol(declaration) != Some(current)
+            {
+                return None;
+            }
+            let links = self.alias_symbol_links(current)?;
+            let immediate = links.immediate_target?;
+            let canonical_immediate = self.get_merged_symbol(immediate)?;
+            let edge_target = links.alias_target.symbol()?;
+            if self.get_merged_symbol(edge_target) != Some(target) {
+                return None;
+            }
+            self.remember_native_ambient_symbol(immediate, symbols)?;
+            self.remember_native_ambient_symbol(edge_target, symbols)?;
+            let binding_owner = record.parent();
+            let binding_container = if binding_owner.is_none() {
+                bound.container(declaration)
+            } else {
+                None
+            };
+            let binding_table = if let Some(owner) = binding_owner {
+                self.remember_native_ambient_symbol(owner, symbols)?;
+                self.symbol(owner)?.exports()?
+            } else {
+                bound.locals(binding_container?)?
+            };
+            if self.symbol_table(binding_table)?.get(record.name()) != Some(current) {
+                return None;
+            }
+            edges.push(NativeAmbientAliasEdge {
+                alias: current,
+                declaration,
+                immediate,
+                canonical_immediate,
+                target: edge_target,
+                canonical_target: target,
+                type_only_declaration: links.type_only_declaration,
+                binding_table,
+                binding_owner,
+                binding_container,
+            });
+            current = canonical_immediate;
+        }
+        None
+    }
+
+    fn capture_native_ambient_module_exports(
+        &self,
+        sources: &ProductionAliasSourceRegistry<'_>,
+        globals: SymbolTableId,
+        name: EscapedNameRef<'_>,
+        table_symbol: SemanticSymbolId,
+    ) -> Option<NativeAmbientModuleExportResult> {
+        let owner = self.get_merged_symbol(table_symbol)?;
+        let record = self.symbol(owner)?;
+        let declarations = record.declarations()?;
+        if declarations.len() < 2
+            || !record.flags().intersects(SymbolFlags::MODULE)
+            || !name.as_bytes().starts_with(b"\"")
+            || !name.as_bytes().ends_with(b"\"")
+            || !self.source_merged_symbol_declarations_match(owner)
+        {
+            return None;
+        }
+        let mut symbols = BTreeMap::new();
+        self.remember_native_ambient_symbol(table_symbol, &mut symbols)?;
+        let selected = self.capture_native_ambient_export_table(record.exports()?, &mut symbols)?;
+        let mut source_owners = HashSet::new();
+        let mut contributions = Vec::new();
+        let mut losing = Vec::new();
+        for &declaration in declarations {
+            let (arena, bound) = sources.snapshot(declaration.file)?;
+            let NodeData::ModuleDeclaration(module) = &arena.get(declaration.node)?.data else {
+                return None;
+            };
+            let NodeData::StringLiteral(literal) = &arena.get(module.name)?.data else {
+                return None;
+            };
+            if name != EscapedName::source(format!("\"{}\"", literal.text)).as_ref()
+                || literal.text.contains('*')
+            {
+                return None;
+            }
+            let source = bound.symbol(declaration)?;
+            if self.get_merged_symbol(source) != Some(owner) {
+                return None;
+            }
+            if !source_owners.insert(source) {
+                continue;
+            }
+            self.remember_native_ambient_symbol(source, &mut symbols)?;
+            let exports = self.capture_native_ambient_export_table(
+                self.symbol(source)?.exports()?,
+                &mut symbols,
+            )?;
+            for entry in &exports.entries {
+                let result = selected
+                    .entries
+                    .iter()
+                    .find(|result| result.name == entry.name)?;
+                if entry.canonical == result.canonical {
+                    continue;
+                }
+                let omitted = self.symbol(entry.canonical)?;
+                let selected_record = self.symbol(result.canonical)?;
+                if omitted.flags() != SymbolFlags::ALIAS
+                    || !matches!(omitted.declarations(), Some([node])
+                        if self.source_node_kind(*node) == Some(SyntaxKind::ExportSpecifier))
+                    || selected_record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+                    || !matches!(selected_record.declarations(), Some([node])
+                        if self.source_node_kind(*node) == Some(SyntaxKind::VariableDeclaration))
+                    || self.get_parent_of_symbol(entry.canonical) != Some(owner)
+                    || self.get_parent_of_symbol(result.canonical) != Some(owner)
+                {
+                    return None;
+                }
+                losing.push(NativeAmbientLosingExport {
+                    source_owner: source,
+                    name: entry.name.clone(),
+                    symbol: entry.canonical,
+                    selected: result.canonical,
+                    aliases: self.capture_native_ambient_alias_chain(
+                        sources,
+                        entry.canonical,
+                        &mut symbols,
+                    )?,
+                });
+            }
+            contributions.push(NativeAmbientModuleSource {
+                symbol: source,
+                exports,
+            });
+        }
+        (!losing.is_empty()).then(|| NativeAmbientModuleExportResult {
+            globals,
+            name: name.to_owned(),
+            table_symbol,
+            owner,
+            selected,
+            sources: contributions.into_boxed_slice(),
+            symbols: symbols.into_values().collect::<Vec<_>>().into_boxed_slice(),
+            losing: losing.into_boxed_slice(),
+        })
     }
 
     /// Copies source facts only. Unsupported declarations do not fail initialization.
