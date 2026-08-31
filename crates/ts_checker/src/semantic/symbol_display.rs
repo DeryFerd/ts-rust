@@ -3837,6 +3837,15 @@ mod tests {
     fn native_ambient_losing_export_display_keeps_source_identity_and_parent_proofs() {
         use crate::semantic::artifact_queries::CanonicalArtifactQueryError;
 
+        fn split_observation_counter(snapshot: &str) -> (&str, u64, &str) {
+            const FIELD: &str = ", next_relation_observation_token: ";
+            let (prefix, remaining) = snapshot.split_once(FIELD).unwrap();
+            assert!(!remaining.contains(FIELD));
+            let (counter, suffix) = remaining.split_once(',').unwrap();
+            assert!(!counter.is_empty() && counter.bytes().all(|byte| byte.is_ascii_digit()));
+            (prefix, counter.parse().unwrap(), suffix)
+        }
+
         let inputs = [
             (
                 include_str!("../../../ts_bundled/libs/lib.es5.d.ts"),
@@ -4154,6 +4163,7 @@ mod tests {
             assert_eq!(context.global_types(), &globals);
             let warm = snapshot(&context);
             for forced in [false, true] {
+                assert!(!context.store().relation_read_observation_is_active());
                 for &file in files[3..].iter().rev() {
                     if forced {
                         context.recheck_source_file(file).unwrap();
@@ -4161,8 +4171,21 @@ mod tests {
                         context.check_source_file(file).unwrap();
                     }
                 }
+                assert!(!context.store().relation_read_observation_is_active());
                 assert_display(&mut context);
-                assert_eq!(snapshot(&context), warm);
+                if forced {
+                    let replayed = snapshot(&context);
+                    let (before_prefix, before_counter, before_suffix) =
+                        split_observation_counter(&warm.0);
+                    let (after_prefix, after_counter, after_suffix) =
+                        split_observation_counter(&replayed.0);
+                    assert_eq!((after_prefix, after_suffix), (before_prefix, before_suffix));
+                    assert_eq!(replayed.1, warm.1);
+                    // The empty array assignment opens one relation observation during source replay.
+                    assert_eq!(after_counter, before_counter.checked_add(1).unwrap());
+                } else {
+                    assert_eq!(snapshot(&context), warm);
+                }
             }
 
             let record = context.store().symbol(losing).unwrap().clone();
