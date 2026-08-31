@@ -63161,6 +63161,20 @@ export type Env = {
         }
     }
 
+    // Copies the fixture's binder facts into the checker store before queries.
+    fn retain_fixture_file_facts(
+        store: &mut CanonicalTypeMapperStore,
+        sources: &[(&NodeArena, &BoundFile)],
+    ) {
+        for &(arena, bound) in sources {
+            let root = bound.source_file();
+            let source = store
+                .register_source_file(arena, root.node, root.file)
+                .unwrap();
+            assert!(store.register_source_file_facts(source, bound.source_facts().unwrap()));
+        }
+    }
+
     fn post_global_host<'a>(arena: &'a NodeArena, bound: &'a BoundFile) -> DeclaredTypeHost<'a> {
         DeclaredTypeHost::new_after_global_merge(
             [(arena, bound)],
@@ -63840,6 +63854,13 @@ export type Env = {
             "namespace N { export type Box<T> = { value:T } } ",
             "type Wrap<T> = N.Box<T>;",
         ));
+        retain_fixture_file_facts(
+            &mut fixture.store,
+            &[(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            )],
+        );
         let boxed = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Box");
         let wrapped = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Wrap");
         let body = alias_parts(&fixture, "Wrap").2;
@@ -89687,6 +89708,14 @@ export type Env = {
             files,
             mut store,
         } = react_dom_fixture(true);
+        retain_fixture_file_facts(
+            &mut store,
+            &[
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&react.arena, files.get(&react_file).unwrap()),
+                (&source.arena, files.get(&source_file).unwrap()),
+            ],
+        );
         let host = DeclaredTypeHost::new_after_global_merge(
             [
                 (&library.arena, files.get(&library_file).unwrap()),
@@ -89894,6 +89923,14 @@ export type Env = {
             files,
             mut store,
         } = react_dom_fixture_with_owner(true, Some("react"));
+        retain_fixture_file_facts(
+            &mut store,
+            &[
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&react.arena, files.get(&react_file).unwrap()),
+                (&source.arena, files.get(&source_file).unwrap()),
+            ],
+        );
         let host = DeclaredTypeHost::new_after_global_merge(
             [
                 (&library.arena, files.get(&library_file).unwrap()),
@@ -90079,6 +90116,14 @@ export type Env = {
             files,
             mut store,
         } = react_dom_fixture_with_owner(true, Some("react"));
+        retain_fixture_file_facts(
+            &mut store,
+            &[
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&react.arena, files.get(&react_file).unwrap()),
+                (&source.arena, files.get(&source_file).unwrap()),
+            ],
+        );
         let host = DeclaredTypeHost::new_after_global_merge(
             [
                 (&library.arena, files.get(&library_file).unwrap()),
@@ -90204,6 +90249,14 @@ export type Env = {
             files,
             mut store,
         } = react_dom_fixture_with_owner(true, Some("react"));
+        retain_fixture_file_facts(
+            &mut store,
+            &[
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&react.arena, files.get(&react_file).unwrap()),
+                (&source.arena, files.get(&source_file).unwrap()),
+            ],
+        );
         let host = DeclaredTypeHost::new_after_global_merge(
             [
                 (&library.arena, files.get(&library_file).unwrap()),
@@ -91241,6 +91294,13 @@ export type Env = {
             "import * as Remote from 'pkg'; type Bad = Remote.Value;",
             CanonicalModuleState::External,
         );
+        retain_fixture_file_facts(
+            &mut fixture.store,
+            &[(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            )],
+        );
         let bad = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
         let before = store_state(&fixture.store);
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
@@ -91489,6 +91549,13 @@ export type Env = {
             )),
             true,
         );
+        retain_fixture_file_facts(
+            &mut store,
+            &[
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&declarations.arena, files.get(&declaration_file).unwrap()),
+            ],
+        );
         let bound = files.get(&declaration_file).unwrap();
         let host = DeclaredTypeHost::new_after_global_merge(
             [
@@ -91694,6 +91761,13 @@ export type Env = {
                 "}",
             )),
             true,
+        );
+        retain_fixture_file_facts(
+            &mut store,
+            &[
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&declarations.arena, files.get(&declaration_file).unwrap()),
+            ],
         );
         let bound = files.get(&declaration_file).unwrap();
         let host = DeclaredTypeHost::new_after_global_merge(
@@ -92173,11 +92247,13 @@ export type Env = {
             (&declarations, declaration_file),
             (&importer, importer_file),
         ] {
-            assert!(
-                store
-                    .register_source_file(&parsed.arena, parsed.source_file, file)
-                    .is_some()
-            );
+            let source = store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .unwrap();
+            assert!(store.register_source_file_facts(
+                source,
+                files.get(&file).unwrap().source_facts().unwrap(),
+            ));
         }
         store
             .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
@@ -114658,6 +114734,13 @@ export type Env = {
         let mut fixture = fixture(
             "namespace N { export type Again<T> = Alias<T>; } type Alias<T> = N.Again<T>; declare function f<T>(value: Alias<T>): void;",
         );
+        retain_fixture_file_facts(
+            &mut fixture.store,
+            &[(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            )],
+        );
         let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "f");
         let owner = node_symbol(&fixture, declaration);
         let nodes = fixture
@@ -114742,6 +114825,13 @@ export type Env = {
     fn generic_arrow_qualified_alias_cycle_rejects_before_links_and_retries() {
         let mut fixture = fixture(
             "namespace N { export type Again<T> = Alias<T>; } type Alias<T> = N.Again<T>; const f = <T>(value: Alias<T>): void => {};",
+        );
+        retain_fixture_file_facts(
+            &mut fixture.store,
+            &[(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            )],
         );
         let declaration = variable_initializer_node(&fixture, "f");
         let owner = node_symbol(&fixture, declaration);
@@ -114849,6 +114939,13 @@ export type Env = {
         let mut fixture = fixture(
             "namespace N { export type Again<T> = Alias<T>; } type Alias<T> = N.Again<T>; declare function f<T>(value: Alias<T>): void;",
         );
+        retain_fixture_file_facts(
+            &mut fixture.store,
+            &[(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            )],
+        );
         let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "f");
         let owner = node_symbol(&fixture, declaration);
         let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Alias");
@@ -114888,6 +114985,13 @@ export type Env = {
     fn source_callable_query_acyclic_qualified_alias_keeps_identity_and_replay() {
         let mut fixture = fixture(
             "namespace N { export type Again<T> = T; } type Alias<T> = N.Again<T>; declare function f<T>(value: Alias<T>): void;",
+        );
+        retain_fixture_file_facts(
+            &mut fixture.store,
+            &[(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            )],
         );
         let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "f");
         let owner = node_symbol(&fixture, declaration);
