@@ -15139,13 +15139,13 @@ mod tests {
                             let mut links = original.clone();
                             match damage {
                                 Damage::ImmediateTarget => {
-                                    links.immediate_target = Some(fixture.other)
+                                    links.immediate_target = Some(fixture.other);
                                 }
                                 Damage::UnknownTarget => {
-                                    links.alias_target = AliasTargetState::Unknown
+                                    links.alias_target = AliasTargetState::Unknown;
                                 }
                                 Damage::SkippedAlias => {
-                                    links.immediate_target = Some(fixture.aliases[2])
+                                    links.immediate_target = Some(fixture.aliases[2]);
                                 }
                                 Damage::CoherentTargets => {
                                     links.alias_target = AliasTargetState::Resolved(fixture.other);
@@ -15154,7 +15154,7 @@ mod tests {
                                     }
                                 }
                                 Damage::TypeOnlyMarker => {
-                                    links.type_only_declaration = Some(fixture.declarations[0])
+                                    links.type_only_declaration = Some(fixture.declarations[0]);
                                 }
                                 _ => unreachable!(),
                             }
