@@ -46886,7 +46886,7 @@ mod tests {
             let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
             let zero = fixture.store.intrinsic_bootstrap().unwrap().zero_type;
             let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
-            let literal = fixture.store.type_payload(zero).unwrap().clone();
+            let literal = fixture.store.type_payload(zero).unwrap();
             let TypeData::Literal(data) = literal.data() else {
                 panic!("bootstrap zero is a literal")
             };
@@ -46916,7 +46916,7 @@ mod tests {
             let selected =
                 query::plan_selected_class_member(&fixture.store, &host, property.symbol).unwrap();
             assert_eq!(source_class_snapshot!(fixture.store, zero), cold);
-            assert_eq!(fixture.store.type_payload(zero), Some(&literal));
+            assert_eq!(fixture.store.type_payload(zero), Some(literal));
             assert!(fixture.store.declared_type_links(owner).is_none());
             assert!(fixture.store.value_symbol_links(owner).is_none());
             assert!(fixture.store.value_symbol_links(property.symbol).is_none());
@@ -46986,7 +46986,7 @@ mod tests {
                         Ok(zero)
                     );
                 }
-                let literal = fixture.store.type_payload(zero).unwrap().clone();
+                let literal = fixture.store.type_payload(zero).unwrap();
                 let TypeData::Literal(data) = literal.data() else {
                     panic!("bootstrap zero is a literal")
                 };
@@ -46999,7 +46999,7 @@ mod tests {
                     assert!(fixture.store.set_literal_links(zero, Some(zero), zero));
                     zero
                 };
-                let damaged = fixture.store.type_payload(damaged_type).unwrap().clone();
+                let damaged = fixture.store.type_payload(damaged_type).unwrap();
                 let value = fixture.store.value_symbol_links(property.symbol).cloned();
                 let initializer = fixture.store.type_node_links(property.type_node).cloned();
                 let before = source_class_snapshot!(fixture.store, zero);
@@ -47015,7 +47015,7 @@ mod tests {
                         Err(expected)
                     );
                     assert_eq!(source_class_snapshot!(fixture.store, zero), before);
-                    assert_eq!(fixture.store.type_payload(damaged_type), Some(&damaged));
+                    assert_eq!(fixture.store.type_payload(damaged_type), Some(damaged));
                     assert_eq!(
                         fixture.store.value_symbol_links(property.symbol),
                         value.as_ref()
