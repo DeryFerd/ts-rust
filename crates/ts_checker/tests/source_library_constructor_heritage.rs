@@ -4,11 +4,11 @@ use ts_binder::{
     CanonicalSourceLanguage, EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
-    CanonicalArtifactQueryError, CanonicalCheckerContext, CanonicalCheckerOptions,
-    CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
-    CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, ClassMembers,
-    IntrinsicBootstrapOptions, SignatureId, SourceCheckError, TypeData, TypeId,
-    UnsupportedSourceSyntax, signatures::SignatureFlags,
+    CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalModuleResolutionEntry,
+    CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
+    CanonicalResolvedModuleInput, ClassMembers, IntrinsicBootstrapOptions, SignatureId,
+    SourceCheckError, TypeData, TypeId, UnsupportedSourceSyntax,
+    artifact_queries::CanonicalArtifactQueryError, signatures::SignatureFlags,
 };
 use ts_options::{ModuleKind, ScriptTarget};
 use ts_parser::{ParseResult, parse_source_file};
