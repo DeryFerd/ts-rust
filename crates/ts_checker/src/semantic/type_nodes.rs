@@ -262,6 +262,108 @@ pub(super) fn cached_fixed_keyword_tuple_annotation(
     Ok(type_)
 }
 
+/// Checks flat keyword unions through the ordinary type-node planner.
+pub(super) fn preflight_primitive_union_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Option<TypeId>, DeclaredTypeError> {
+    let record = preflight_node(store, host, node)?;
+    let unsupported = || {
+        type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+            node,
+            kind: record.kind,
+        })
+    };
+    let NodeData::UnionTypeNode(union) = &record.data else {
+        return Err(unsupported());
+    };
+    if record.kind != SyntaxKind::UnionType {
+        return Err(unsupported());
+    }
+    for &child in &union.types.nodes {
+        let child = preflight_node(store, host, NodeRef::new(node.arena, node.file, child))?;
+        if !matches!(child.data, NodeData::KeywordTypeNode(_))
+            || !child.kind.is_keyword_type()
+            || child.kind == SyntaxKind::IntrinsicKeyword
+        {
+            return Err(unsupported());
+        }
+    }
+    let aliases = HashMap::new();
+    let mut planner = TypeQueryPlanner::new(
+        store,
+        host,
+        None,
+        None,
+        store
+            .claimed_strict_builtin_iterator_return()
+            .unwrap_or(false),
+        &aliases,
+    );
+    planner.replay_cached_annotations = true;
+    planner.plan_type_node(node)?;
+    if planner
+        .plan
+        .unions
+        .get(&node)
+        .is_none_or(|union| union.alias_symbol.is_some())
+    {
+        return Err(unsupported());
+    }
+    store
+        .type_node_links(node)
+        .and_then(|links| links.resolved_type)
+        .map(|_| cached_primitive_union_annotation(store, node))
+        .transpose()
+}
+
+/// Rebuilds a keyword union's cache key from its actual source constituents.
+pub(super) fn cached_primitive_union_annotation(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+) -> Result<TypeId, DeclaredTypeError> {
+    let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidUnionType(node));
+    let type_ = store
+        .type_node_links(node)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    let children = store.source_direct_children(node).ok_or_else(invalid)?;
+    if store.source_node_kind(node) != Some(SyntaxKind::UnionType)
+        || children.len() < 2
+        || !store.source_direct_type_annotation_is_exact(node, type_)
+        || store
+            .symbol_node_links(node)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+    {
+        return Err(invalid());
+    }
+    let mut constituents = Vec::with_capacity(children.len());
+    for child in children {
+        if !store
+            .source_node_kind(child)
+            .is_some_and(|kind| kind.is_keyword_type() && kind != SyntaxKind::IntrinsicKeyword)
+            || store.source_node_parent(child) != Some(SourceNodeParent::Parent(node))
+        {
+            return Err(invalid());
+        }
+        let type_ =
+            object_members::cached_planned_type_identity(store, child).ok_or_else(invalid)?;
+        if !store.source_direct_type_annotation_is_exact(child, type_) {
+            return Err(invalid());
+        }
+        constituents.push(type_);
+    }
+    if store
+        .cached_annotation_union_type(&constituents, None)
+        .map_err(|_| invalid())?
+        != Some(type_)
+    {
+        return Err(invalid());
+    }
+    Ok(type_)
+}
+
 /// Preflights an annotation without claiming options or writing checker state.
 /// Callers without a diagnostic channel must not admit recovery plans.
 pub(super) fn preflight_type_annotation(
@@ -95530,6 +95632,281 @@ mod tests {
             functions::StoredFunctionTypeValidation::Valid(_)
         ));
         assert_eq!(fixture.store.callable_signature_parameter_types_len(), 2);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn primitive_union_annotations_keep_canonical_reduction_and_source_identity() {
+        let mut fixture = fixture_with_intrinsic(
+            concat!(
+                "let pair: number | string; let reordered: string | number | number; ",
+                "let flags: boolean | number; let truth: boolean | boolean; ",
+                "let text: never | string; let top: unknown | number; ",
+                "let untyped: any | string; let other: bigint | symbol | void | undefined | object;",
+            ),
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let names_and_types = [
+            ("pair", vec![bootstrap.number_type, bootstrap.string_type]),
+            (
+                "reordered",
+                vec![
+                    bootstrap.string_type,
+                    bootstrap.number_type,
+                    bootstrap.number_type,
+                ],
+            ),
+            ("flags", vec![bootstrap.boolean_type, bootstrap.number_type]),
+            (
+                "truth",
+                vec![bootstrap.boolean_type, bootstrap.boolean_type],
+            ),
+            ("text", vec![bootstrap.never_type, bootstrap.string_type]),
+            ("top", vec![bootstrap.unknown_type, bootstrap.number_type]),
+            ("untyped", vec![bootstrap.any_type, bootstrap.string_type]),
+            (
+                "other",
+                vec![
+                    bootstrap.bigint_type,
+                    bootstrap.es_symbol_type,
+                    bootstrap.void_type,
+                    bootstrap.undefined_type,
+                    bootstrap.non_primitive_type,
+                ],
+            ),
+        ];
+        let mut results = Vec::new();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        for (name, types) in names_and_types {
+            let node = variable_type_node(&fixture, name);
+            let host = post_global_host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+            let cold = function_store_state(&fixture.store);
+            let iterator_option = fixture.store.claimed_strict_builtin_iterator_return();
+            assert_eq!(
+                preflight_primitive_union_annotation(&fixture.store, &host, node),
+                Ok(None)
+            );
+            assert_eq!(function_store_state(&fixture.store), cold);
+            assert_eq!(
+                fixture.store.claimed_strict_builtin_iterator_return(),
+                iterator_option
+            );
+            let type_ = CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(node)
+            .unwrap();
+            assert_eq!(
+                fixture.store.cached_annotation_union_type(&types, None),
+                Ok(Some(type_))
+            );
+            let warm = function_store_state(&fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    preflight_primitive_union_annotation(&fixture.store, &host, node),
+                    Ok(Some(type_))
+                );
+                assert_eq!(
+                    cached_primitive_union_annotation(&fixture.store, node),
+                    Ok(type_)
+                );
+                assert_eq!(
+                    CanonicalTypeQuery::new(
+                        &mut fixture.store,
+                        &host,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    )
+                    .unwrap()
+                    .get_type_from_type_node(node),
+                    Ok(type_)
+                );
+                assert_eq!(function_store_state(&fixture.store), warm);
+            }
+            results.push(type_);
+        }
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        assert_eq!(results[0], results[1]);
+        assert_eq!(union_types(&fixture.store, results[0]).len(), 2);
+        for type_ in [bootstrap.number_type, bootstrap.string_type] {
+            assert!(union_types(&fixture.store, results[0]).contains(&type_));
+        }
+        assert_eq!(union_types(&fixture.store, results[2]).len(), 3);
+        for type_ in [
+            bootstrap.number_type,
+            bootstrap.regular_true_type,
+            bootstrap.regular_false_type,
+        ] {
+            assert!(union_types(&fixture.store, results[2]).contains(&type_));
+        }
+        assert_eq!(
+            &results[3..7],
+            &[
+                bootstrap.boolean_type,
+                bootstrap.string_type,
+                bootstrap.unknown_type,
+                bootstrap.any_type
+            ]
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn primitive_union_annotations_reject_cache_damage_and_restore_exact_identity() {
+        let mut fixture = fixture("let subject: number | string; let other: number | boolean;");
+        let node = variable_type_node(&fixture, "subject");
+        let other_node = variable_type_node(&fixture, "other");
+        let symbol = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "subject");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = query_node(&mut fixture, node, &mut diagnostics).unwrap();
+        let other = query_node(&mut fixture, other_node, &mut diagnostics).unwrap();
+        let members = union_types(&fixture.store, type_).to_vec();
+        let copied = fixture
+            .store
+            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, members)
+            .unwrap();
+        let children = fixture.store.source_direct_children(node).unwrap();
+        let [number_node, string_node] = children.as_slice() else {
+            panic!("the annotation has two keyword children")
+        };
+        assert_eq!(
+            fixture.store.source_node_kind(*number_node),
+            Some(SyntaxKind::NumberKeyword)
+        );
+        assert_eq!(
+            fixture.store.source_node_kind(*string_node),
+            Some(SyntaxKind::StringKeyword)
+        );
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        for child in children.iter().copied().chain([node]) {
+            assert!(
+                fixture
+                    .store
+                    .set_symbol_node_links(child, SymbolNodeLinks::default())
+            );
+        }
+        for child in &children {
+            assert!(
+                fixture
+                    .store
+                    .set_type_node_links(*child, TypeNodeLinks::default())
+            );
+        }
+        let host = post_global_host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let root_links = fixture.store.type_node_links(node).unwrap().clone();
+        let warm = function_store_state(&fixture.store);
+        let invalid = type_node_unavailable(TypeNodeUnavailable::InvalidUnionType(node));
+        let reject = |store: &CanonicalTypeMapperStore| {
+            let before = (function_store_state(store), store.relation_state_snapshot());
+            assert_eq!(cached_primitive_union_annotation(store, node), Err(invalid));
+            assert!(preflight_primitive_union_annotation(store, &host, node).is_err());
+            assert_eq!(
+                (function_store_state(store), store.relation_state_snapshot()),
+                before
+            );
+        };
+        for replacement in [string, other, copied] {
+            assert!(fixture.store.set_type_node_links(
+                node,
+                TypeNodeLinks {
+                    resolved_type: Some(replacement),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+            reject(&fixture.store);
+            assert!(fixture.store.set_type_node_links(node, root_links.clone()));
+            assert_eq!(
+                cached_primitive_union_annotation(&fixture.store, node),
+                Ok(type_)
+            );
+        }
+        for damaged in [node, *number_node] {
+            let saved = fixture.store.type_node_links(damaged).unwrap().clone();
+            assert!(fixture.store.set_type_node_links(
+                damaged,
+                TypeNodeLinks {
+                    outer_type_parameters: Some(Vec::new()),
+                    ..saved.clone()
+                }
+            ));
+            reject(&fixture.store);
+            assert!(fixture.store.set_type_node_links(damaged, saved));
+            assert!(fixture.store.set_symbol_node_links(
+                damaged,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(symbol)
+                }
+            ));
+            reject(&fixture.store);
+            assert!(
+                fixture
+                    .store
+                    .set_symbol_node_links(damaged, SymbolNodeLinks::default())
+            );
+        }
+        assert!(fixture.store.set_type_node_links(
+            *number_node,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        reject(&fixture.store);
+        assert!(fixture.store.set_type_node_links(
+            node,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        reject(&fixture.store);
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(*number_node, TypeNodeLinks::default())
+        );
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(node, TypeNodeLinks::default())
+        );
+        assert_eq!(
+            cached_primitive_union_annotation(&fixture.store, node),
+            Err(invalid)
+        );
+        assert_eq!(
+            preflight_primitive_union_annotation(&fixture.store, &host, node),
+            Ok(None)
+        );
+        assert!(fixture.store.set_type_node_links(node, root_links));
+        assert_eq!(
+            cached_primitive_union_annotation(&fixture.store, node),
+            Ok(type_)
+        );
+        assert_eq!(
+            preflight_primitive_union_annotation(&fixture.store, &host, node),
+            Ok(Some(type_))
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(node),
+            Ok(type_)
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
     }
 

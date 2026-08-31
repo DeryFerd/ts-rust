@@ -80,9 +80,9 @@
 //! diagnostics without replacing binder-owned property symbols.
 //! Direct inherited field calls through `super` retain their exact TS2855 span.
 //! Source-body plans also retain required class-reference constructor parameters,
-//! fixed keyword tuple and required property-only type literal method parameters,
-//! and function-typed fields.
-//! Tuple annotations use the ordinary type-node query before method publication.
+//! fixed keyword tuple, primitive-union, and required property-only type literal
+//! method parameters, and function-typed fields.
+//! Tuple and union annotations use the ordinary type-node query before method publication.
 //! The source executor checks field initializers before publishing their inferred types.
 //! Direct null fields use the same executor and retain strict-null widening and diagnostics.
 //! With the caller's type-query context, fields and required constructor
@@ -160,7 +160,8 @@ use super::{
     type_nodes::{
         CanonicalTypeQuery, CanonicalTypeQueryOptions, ConstructorAnnotationProof,
         TypeNodeUnavailable, cached_fixed_keyword_tuple_annotation,
-        preflight_fixed_keyword_tuple_annotation, preflight_source_class_annotation,
+        cached_primitive_union_annotation, preflight_fixed_keyword_tuple_annotation,
+        preflight_primitive_union_annotation, preflight_source_class_annotation,
         preflight_type_annotation,
     },
     type_records::{
@@ -227,6 +228,7 @@ pub(super) struct ClassBodyParameterPlan {
 pub(super) enum ClassBodyParameterType {
     Known(TypeId),
     Tuple(NodeRef),
+    PrimitiveUnion(NodeRef),
     Annotation(NodeRef),
     ClassReference {
         node: NodeRef,
@@ -240,6 +242,9 @@ impl ClassBodyParameterType {
             Self::Known(type_) => Ok(type_),
             Self::Tuple(node) => {
                 cached_fixed_keyword_tuple_annotation(store, node).map_err(ClassError::DeclaredType)
+            }
+            Self::PrimitiveUnion(node) => {
+                cached_primitive_union_annotation(store, node).map_err(ClassError::DeclaredType)
             }
             Self::Annotation(node) => store
                 .type_node_links(node)
@@ -274,7 +279,9 @@ impl ClassBodyParameterType {
         host: &DeclaredTypeHost<'_>,
     ) -> Result<TypeId, ClassError> {
         match self {
-            Self::Known(_) | Self::Tuple(_) | Self::Annotation(_) => self.resolved(store),
+            Self::Known(_) | Self::Tuple(_) | Self::PrimitiveUnion(_) | Self::Annotation(_) => {
+                self.resolved(store)
+            }
             Self::ClassReference { node, symbol } => {
                 let type_ = store.get_declared_type_of_symbol(host, symbol)?;
                 if !store.try_reserve_type_node_links(1) || !store.try_reserve_symbol_node_links(1)
@@ -410,6 +417,7 @@ fn capture_source_class_bindings(
                 ClassBodyParameterType::ClassReference { symbol, .. } => Some(symbol),
                 ClassBodyParameterType::Known(_)
                 | ClassBodyParameterType::Tuple(_)
+                | ClassBodyParameterType::PrimitiveUnion(_)
                 | ClassBodyParameterType::Annotation(_) => None,
             },
         ));
@@ -496,12 +504,13 @@ impl SourceClassPlan {
         self.header.abstract_class
     }
 
-    pub(super) fn tuple_parameter_annotations(&self) -> impl Iterator<Item = NodeRef> + '_ {
+    pub(super) fn queried_parameter_annotations(&self) -> impl Iterator<Item = NodeRef> + '_ {
         self.methods
             .iter()
             .flat_map(|method| &method.method.parameters)
             .filter_map(|parameter| match parameter.type_ {
-                ClassBodyParameterType::Tuple(node) => Some(node),
+                ClassBodyParameterType::Tuple(node)
+                | ClassBodyParameterType::PrimitiveUnion(node) => Some(node),
                 ClassBodyParameterType::Known(_)
                 | ClassBodyParameterType::Annotation(_)
                 | ClassBodyParameterType::ClassReference { .. } => None,
@@ -1018,6 +1027,7 @@ fn source_constructor_parameter(
         ),
         reference @ (ClassBodyParameterType::ClassReference { .. }
         | ClassBodyParameterType::Tuple(_)
+        | ClassBodyParameterType::PrimitiveUnion(_)
         | ClassBodyParameterType::Annotation(_)) => reference,
     };
     Ok(ClassBodyParameterPlan {
@@ -1530,7 +1540,8 @@ pub(super) fn plan_source_class_members_with_context(
                                 plan.annotated_properties.push(property);
                             }
                             ClassBodyParameterType::ClassReference { .. }
-                            | ClassBodyParameterType::Tuple(_) => {
+                            | ClassBodyParameterType::Tuple(_)
+                            | ClassBodyParameterType::PrimitiveUnion(_) => {
                                 return Err(invariant(ClassInvariant::InvalidProperty(
                                     parameter.declaration,
                                 )));
@@ -2779,7 +2790,7 @@ fn validate_source_class_stored_layout(
     Ok(())
 }
 
-/// Resolves retained tuple parameters in the caller's query session before publication.
+/// Resolves retained tuple and union parameters in the caller's query session before publication.
 pub(super) fn prepare_source_class_members_with_type_queries(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2792,7 +2803,7 @@ pub(super) fn prepare_source_class_members_with_type_queries(
     if !source_class_plan_is_current(store, host, plan)? {
         return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
     }
-    for annotation in plan.tuple_parameter_annotations() {
+    for annotation in plan.queried_parameter_annotations() {
         CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,
@@ -10716,6 +10727,24 @@ fn plan_class_method_parameter_with_body_mode(
             (
                 Some(type_node),
                 ClassBodyParameterType::Tuple(type_node),
+                cached,
+            )
+        } else if source_body
+            && data.question_token.is_none()
+            && matches!(type_record.data, NodeData::UnionTypeNode(_))
+        {
+            let cached =
+                preflight_primitive_union_annotation(store, host, type_node).map_err(|error| {
+                    match error {
+                        DeclaredTypeError::TypeNodeUnavailable(
+                            TypeNodeUnavailable::UnsupportedSyntax { .. },
+                        ) => reject(),
+                        error => ClassError::DeclaredType(error),
+                    }
+                })?;
+            (
+                Some(type_node),
+                ClassBodyParameterType::PrimitiveUnion(type_node),
                 cached,
             )
         } else if source_body
@@ -35697,6 +35726,213 @@ mod tests {
             source_class_snapshot!(fixture.store, prepared.instance_type),
             before
         );
+    }
+
+    #[test]
+    fn source_body_primitive_union_parameters_query_before_publication_and_replay() {
+        let mut fixture = fixture(concat!(
+            "class Subject { method(value: number | string) { return value; } ",
+            "static method(value: boolean | number) { return value; } }",
+        ));
+        let symbol = class_symbol(&fixture, "Subject");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let globals_table = bootstrap.globals;
+        let globals = crate::semantic::global_types::initialize_global_library_types(
+            &mut fixture.store,
+            &host,
+            globals_table,
+            false,
+        )
+        .unwrap();
+        let cold = source_class_snapshot!(fixture.store, number);
+        let plan = plan_source_class_members(&fixture.store, &host, symbol).unwrap();
+        let annotations = plan.queried_parameter_annotations().collect::<Vec<_>>();
+        assert_eq!(annotations.len(), 2);
+        assert_eq!(plan.methods[0].method.side, ClassPropertySide::Instance);
+        assert_eq!(plan.methods[1].method.side, ClassPropertySide::Static);
+        for (method, annotation) in plan.methods.iter().zip(&annotations) {
+            assert_eq!(
+                method.method.parameters[0].type_,
+                ClassBodyParameterType::PrimitiveUnion(*annotation)
+            );
+            assert!(fixture.store.type_node_links(*annotation).is_none());
+        }
+        assert_eq!(source_class_snapshot!(fixture.store, number), cold);
+        assert_eq!(
+            prepare_source_class_members(&mut fixture.store, &host, &plan),
+            Err(ClassError::DeclaredType(
+                DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::InvalidUnionType(
+                    annotations[0]
+                ))
+            )),
+        );
+        assert_eq!(source_class_snapshot!(fixture.store, number), cold);
+        assert!(fixture.store.declared_type_links(symbol).is_none());
+        assert!(fixture.store.value_symbol_links(symbol).is_none());
+
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let prepared = prepare_source_class_members_with_type_queries(
+            &mut fixture.store,
+            &host,
+            &globals,
+            CanonicalCheckerOptions::default(),
+            &mut session,
+            &mut diagnostics,
+            &plan,
+        )
+        .unwrap();
+        for (method, (_, signature)) in plan.methods.iter().zip(&prepared.methods) {
+            let parameter = method.method.parameters[0];
+            let type_ = parameter.type_.resolved(&fixture.store).unwrap();
+            let signature = fixture.store.signature(*signature).unwrap();
+            assert_eq!(signature.parameters(), &[parameter.symbol]);
+            assert_eq!(signature.resolved_return_type(), None);
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(parameter.symbol)
+                    .unwrap()
+                    .resolved_type,
+                Some(type_)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .type_node_links(parameter.type_node.unwrap())
+                    .unwrap()
+                    .resolved_type,
+                Some(type_)
+            );
+        }
+        let warm = source_class_snapshot!(fixture.store, prepared.instance_type);
+        let counts = (
+            session.query_count(),
+            session.total_count(),
+            session.limit_event_mark(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                plan_source_class_members(&fixture.store, &host, symbol),
+                Ok(plan.clone())
+            );
+            assert_eq!(
+                prepare_source_class_members_with_type_queries(
+                    &mut fixture.store,
+                    &host,
+                    &globals,
+                    CanonicalCheckerOptions::default(),
+                    &mut session,
+                    &mut diagnostics,
+                    &plan,
+                ),
+                Ok(prepared.clone()),
+            );
+            assert_eq!(
+                source_class_snapshot!(fixture.store, prepared.instance_type),
+                warm
+            );
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_mark()
+                ),
+                counts
+            );
+        }
+        let first = plan.methods[0].method.parameters[0];
+        let annotation = first.type_node.unwrap();
+        let saved = fixture.store.type_node_links(annotation).unwrap().clone();
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(annotation, TypeNodeLinks::default())
+        );
+        let damaged = source_class_snapshot!(fixture.store, prepared.instance_type);
+        assert_eq!(
+            prepare_source_class_members_with_type_queries(
+                &mut fixture.store,
+                &host,
+                &globals,
+                CanonicalCheckerOptions::default(),
+                &mut session,
+                &mut diagnostics,
+                &plan,
+            ),
+            Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+                first.symbol
+            ))),
+        );
+        assert_eq!(
+            source_class_snapshot!(fixture.store, prepared.instance_type),
+            damaged
+        );
+        assert!(fixture.store.set_type_node_links(annotation, saved));
+        assert_eq!(
+            prepare_source_class_members(&mut fixture.store, &host, &plan),
+            Ok(prepared.clone())
+        );
+        assert_eq!(
+            source_class_snapshot!(fixture.store, prepared.instance_type),
+            warm
+        );
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_mark()
+            ),
+            counts
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn source_body_primitive_union_parameters_keep_unsupported_boundaries() {
+        for method in [
+            "method(value?: number | string) {}",
+            "method(value: number | string = 0) {}",
+            "method(...value: (number | string)[]) {}",
+            "method<T>(value: T | number) {}",
+            "method(value: Missing | number) {}",
+            "method(value: number | 'text') {}",
+            "method(value: number | (string)) {}",
+            "method(value: number | intrinsic) {}",
+        ] {
+            let fixture = fixture(&format!("class Subject {{ {method} }}"));
+            let symbol = class_symbol(&fixture, "Subject");
+            let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::MethodDeclaration).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            let cold = source_class_snapshot!(fixture.store, number);
+            for _ in 0..2 {
+                assert_eq!(
+                    plan_source_class_members(&fixture.store, &host, symbol),
+                    Err(accessor_member_error(
+                        declaration,
+                        SyntaxKind::MethodDeclaration
+                    )),
+                    "{method}",
+                );
+                assert_eq!(source_class_snapshot!(fixture.store, number), cold);
+                assert!(fixture.store.declared_type_links(symbol).is_none());
+                assert!(fixture.store.value_symbol_links(symbol).is_none());
+            }
+        }
     }
 
     #[test]
