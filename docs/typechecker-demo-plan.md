@@ -20,7 +20,8 @@ The accepted original test subset has 423 exact diagnostic results in 511
 executed variants and 60 exact semantic results in 95 variants. These are not
 percentages of the complete TypeScript test suite or project compatibility.
 The measured compiler source is `5c7c7bd20cb45ebc8f2171eed8478fa2797e8343`.
-The primary checkpoint is `0f1920bb8a6d3bd2ca3ae970b8fde26f219125c9`.
+New source candidates remain in separate worktrees. They have not replaced
+that accepted compiler on the primary branch.
 
 Newer branches have useful results but are not accepted whole-project builds.
 The latest interface run passed 5,177 of 5,202 test executions. It cleared 28
@@ -32,8 +33,14 @@ These runs overlap and must not be added together as unique passing tests.
 A separate full core check passed 6,393 of 6,395 tests in 133 harnesses at
 `713a5211c21dd1dfd654cb612a23f5b585fca048`. Formatting, strict Clippy and both
 binary builds passed. The failures are an invalid literal-cache test setup
-and a missing union-type route for class method parameters. Both are being
-repaired. This result does not replace the accepted original test subset.
+and a missing union-type route for class method parameters. Both fixes are
+combined at `88fae170a9f422b2fb109abf4e8fb9553c60a0e0`. The next full run expects
+6,399 tests, including four new private controls. It has not run yet. This
+result does not replace the accepted original test subset.
+
+Combined core/interface source `3571142fc7fb7f6e3e23346370e668c2b90b4939`
+passes the complete workspace all-target compile check. One unused-method
+warning remains. This result does not prove that tests or projects pass.
 
 ## Selected projects
 
@@ -62,13 +69,22 @@ supersedes the old generic-setter trace for this compiler. The
 [Hono result](../target/wave202-demo-hono-current-probe-1-report.md) identifies
 the class but not its inner rejecting guard. A separate source audit proves
 missing constructor-valued heritage and ordinary annotated constructor
-defaults. Those repairs are in progress. One first failure does not tell us
-how many remain.
+defaults. Those repairs are committed but not yet runtime-verified. The first
+heritage test run failed to compile its tests. That test API repair is now
+committed. One first failure does not tell us how many remain.
 
 The Query source audit identifies missing contextual typing for the first
 two-parameter object-property arrow. Its declared `TimeoutProvider` property
 must supply both parameter types before the normal body check. The repair
 uses that general rule. It does not change the timer code or assume its return.
+The repair is committed with four private and five public tests. It is being
+combined with the newer checker before its first test run.
+
+A wider source audit covers all 23 Query roots. It finds more missing behavior,
+including generic class bodies, optional calls, generic function-type aliases,
+and branching callback bodies. Query is not one or two fixes from a proved
+complete pass. Separate workers now implement the shared source features.
+These audit findings do not predict the next runtime failure.
 
 Pinned project commits:
 
@@ -126,9 +142,13 @@ is not yet tested, and its recursive path types and JSX are not proved end to
 end. Its app also has diagnostics with the pinned Go version.
 
 ts-pattern is a useful strict type-system test, but its unchanged configuration
-has a recorded TS5011 diagnostic. The smaller cached libraries need dependency
-preparation or have older, non-strict configurations. None is a measured short
-path to a complete strict project pass.
+has a recorded TS5011 diagnostic. A new audit also checked sourcemap-codec,
+UFO, pathes and RailwaySDK. Sourcemap-codec has a strict four-file build config,
+but its dependencies are not prepared and its typed-array field initializer
+hits a current class-planning guard. The others have dependency or configuration
+limits. None is a measured short path to a complete strict project pass. The
+[smaller-project assessment](../target/wave202-demo-small-project-alternatives.md)
+records the exact limits. No project input was changed for that assessment.
 
 The local [project assessment](../target/wave202-demo-prepared-project-assessment.md)
 contains the exact input and result hashes. This plan changes scheduling. It
