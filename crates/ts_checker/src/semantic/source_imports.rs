@@ -1627,7 +1627,6 @@ pub(super) fn plan_source_class_annotation_type_import(
             || store.source_direct_children(parent).is_none_or(|children| {
                 children.iter().filter(|node| **node == current).count() != 1
             })
-            || !range_contains(record, child)
         {
             return Err(invalid());
         }
@@ -1675,6 +1674,19 @@ pub(super) fn plan_source_class_annotation_type_import(
         }
         break (parent, member, declaration);
     };
+    // Check range containment only after the source proves a class annotation path.
+    for (child, parent) in path
+        .iter()
+        .copied()
+        .zip(path.iter().copied().skip(1).chain(std::iter::once(holder)))
+    {
+        if !range_contains(
+            checked_node(arena, bound, store, parent)?,
+            checked_node(arena, bound, store, child)?,
+        ) {
+            return Err(invalid());
+        }
+    }
     let owner = bound
         .symbol(declaration)
         .and_then(|symbol| store.get_merged_symbol(symbol))
@@ -15449,6 +15461,255 @@ mod tests {
                 assert!(probe.plan.is_none());
                 assert_eq!(probe.lexical_resolution, None);
                 assert_eq!(store_state(context.store()), before);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the three real callable roles and full state checks together.
+    fn class_annotation_import_probe_declines_real_jsdoc_callable_roles() {
+        let source = parse_javascript_source_file(concat!(
+            "/** @template T @param {T} value @returns {number} */\n",
+            "function numeric(value) { return 1; }\n",
+            "/** @template T @param {T|undefined} value @returns {T|undefined} */\n",
+            "const identity = value => value;\n",
+            "/** @template T @param {T} value @returns {T}\n",
+            " * @overload @param {T} value @returns {T}\n",
+            " * @overload @param {T} value @param {number} count @returns {T} */\n",
+            "function keep(value) { return value; }\n",
+            "keep('text');\n",
+            "keep(2, 3);\n",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let function = |name, overload| {
+            source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::FunctionDeclaration(data) = &record.data else {
+                        return None;
+                    };
+                    (record.parent == Some(source.source_file)
+                        && data.body.is_none() == overload
+                        && matches!(
+                            &source.arena.get(data.name?).unwrap().data,
+                            NodeData::Identifier(identifier) if identifier.text == name
+                        ))
+                    .then_some((node, data.as_ref()))
+                })
+                .unwrap()
+        };
+        let (numeric, numeric_data) = function("numeric", false);
+        assert_eq!(numeric_data.parameters.nodes.len(), 1);
+        let numeric_parameter = numeric_data.parameters.nodes[0];
+        let (overload, overload_data) = function("keep", true);
+        assert_eq!(
+            source.arena.get(overload).unwrap().flags,
+            NodeFlags::REPARSED
+        );
+        let overload_return = overload_data.type_.unwrap();
+        let arrow = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(data) = &record.data else {
+                    return None;
+                };
+                matches!(
+                    &source.arena.get(data.name)?.data,
+                    NodeData::Identifier(identifier) if identifier.text == "identity"
+                )
+                .then_some(data.initializer.unwrap())
+            })
+            .unwrap();
+        let NodeData::ArrowFunction(arrow_data) = &source.arena.get(arrow).unwrap().data else {
+            panic!("identity has its real arrow initializer")
+        };
+        assert_eq!(arrow_data.parameters.nodes.len(), 1);
+        let arrow_parameter = arrow_data.parameters.nodes[0];
+        let parameter_type = |parameter| {
+            let NodeData::ParameterDeclaration(data) = &source.arena.get(parameter).unwrap().data
+            else {
+                panic!("the callable retains its parameter declaration")
+            };
+            data.type_.unwrap()
+        };
+        let direct_type = parameter_type(numeric_parameter);
+        let union_type = parameter_type(arrow_parameter);
+        let NodeData::UnionTypeNode(union) = &source.arena.get(union_type).unwrap().data else {
+            panic!("the arrow parameter keeps its written union")
+        };
+        assert_eq!(union.types.nodes.len(), 2);
+        let union_reference = union.types.nodes[0];
+        assert_eq!(
+            source.arena.get(numeric_parameter).unwrap().parent,
+            Some(numeric)
+        );
+        assert_eq!(
+            source.arena.get(arrow_parameter).unwrap().parent,
+            Some(arrow)
+        );
+
+        let file = FileId::new(70_194);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/callable-roles.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&source.arena, file)
+            .unwrap();
+        let context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let bound = context.file(file).unwrap().1;
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = format!("{:?}", context.store());
+        for (reference, annotation, holder) in [
+            (direct_type, direct_type, numeric_parameter),
+            (union_reference, union_type, arrow_parameter),
+            (overload_return, overload_return, overload),
+        ] {
+            let record = source.arena.get(reference).unwrap();
+            let NodeData::TypeReferenceNode(data) = &record.data else {
+                panic!("each role selects its original T reference")
+            };
+            assert!(matches!(
+                &source.arena.get(data.type_name).unwrap().data,
+                NodeData::Identifier(identifier) if identifier.text == "T"
+            ));
+            let root = source.arena.get(annotation).unwrap();
+            assert_eq!(root.flags, NodeFlags::REPARSED);
+            assert_eq!(root.parent, Some(holder));
+            assert!(!range_contains(source.arena.get(holder).unwrap(), root));
+            if reference != annotation {
+                assert_eq!(record.parent, Some(annotation));
+                assert!(range_contains(root, record));
+            }
+            let reference = NodeRef::new(source.arena.id(), file, reference);
+            for _ in 0..2 {
+                assert!(
+                    plan_source_class_annotation_type_import(context.store(), &host, reference)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(format!("{:?}", context.store()), before);
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both class paths and each range failure before owner admission.
+    fn class_annotation_import_probe_checks_ranges_before_owner_admission() {
+        #[derive(Clone, Copy, Debug)]
+        enum Damage {
+            None,
+            Wrapper,
+            Holder,
+        }
+
+        for constructor in [false, true] {
+            for damage in [Damage::None, Damage::Wrapper, Damage::Holder] {
+                let mut source = parsed(concat!(
+                    "interface Value {}\n",
+                    "class Holder<T> { field: (Value); constructor(value: (Value)) {} }\n",
+                ));
+                let (declaration, members) = source
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        let NodeData::ClassDeclaration(data) = &record.data else {
+                            return None;
+                        };
+                        matches!(
+                            &source.arena.get(data.name?)?.data,
+                            NodeData::Identifier(identifier) if identifier.text == "Holder"
+                        )
+                        .then_some((node, data.members.nodes.clone()))
+                    })
+                    .unwrap();
+                assert_eq!(members.len(), 2);
+                let member = members[usize::from(constructor)];
+                let holder = if constructor {
+                    let NodeData::ConstructorDeclaration(data) =
+                        &source.arena.get(member).unwrap().data
+                    else {
+                        panic!("the class retains its real constructor")
+                    };
+                    assert_eq!(data.parameters.nodes.len(), 1);
+                    data.parameters.nodes[0]
+                } else {
+                    member
+                };
+                let annotation = match &source.arena.get(holder).unwrap().data {
+                    NodeData::PropertyDeclaration(data) => data.type_.unwrap(),
+                    NodeData::ParameterDeclaration(data) => data.type_.unwrap(),
+                    _ => panic!("the class holder owns its written annotation"),
+                };
+                let NodeData::ParenthesizedTypeNode(wrapper) =
+                    &source.arena.get(annotation).unwrap().data
+                else {
+                    panic!("the class annotation keeps its original wrapper")
+                };
+                let reference = wrapper.type_;
+                let damaged = match damage {
+                    Damage::None => None,
+                    Damage::Wrapper => Some(annotation),
+                    Damage::Holder => Some(holder),
+                };
+                if let Some(damaged) = damaged {
+                    let record = source.arena.get_mut(damaged).unwrap();
+                    record.range = ts_core::TextRange::new(record.range.start, record.range.start);
+                }
+                let file = FileId::new(70_195);
+                let context = context_with_routes(&[(file, &source)], &[]);
+                let bound = context.file(file).unwrap().1;
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&source.arena, bound)],
+                    GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                )
+                .unwrap();
+                let declaration = NodeRef::new(source.arena.id(), file, declaration);
+                let owner = bound.symbol(declaration).unwrap();
+                assert!(!super::super::classes::source_class_annotation_is_owned(
+                    context.store(),
+                    &host,
+                    owner,
+                    NodeRef::new(source.arena.id(), file, annotation),
+                ));
+                let reference = NodeRef::new(source.arena.id(), file, reference);
+                let before = format!("{:?}", context.store());
+                for _ in 0..2 {
+                    let result =
+                        plan_source_class_annotation_type_import(context.store(), &host, reference);
+                    match damage {
+                        Damage::None => assert!(result.unwrap().is_none()),
+                        Damage::Wrapper | Damage::Holder => assert_eq!(
+                            result,
+                            Err(invariant(SourceImportInvariant::InvalidNode(reference))),
+                            "constructor={constructor}, damage={damage:?}",
+                        ),
+                    }
+                    assert_eq!(format!("{:?}", context.store()), before);
+                    assert!(context.diagnostics().is_empty());
+                }
             }
         }
     }
