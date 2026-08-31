@@ -326,7 +326,7 @@ pub(super) fn cached_primitive_union_annotation(
     {
         return Err(invalid());
     }
-    let mut types = Vec::with_capacity(children.len());
+    let mut constituents = Vec::with_capacity(children.len());
     for child in children {
         if !store
             .source_node_kind(child)
@@ -340,10 +340,10 @@ pub(super) fn cached_primitive_union_annotation(
         if !store.source_direct_type_annotation_is_exact(child, type_) {
             return Err(invalid());
         }
-        types.push(type_);
+        constituents.push(type_);
     }
     if store
-        .cached_annotation_union_type(&types, None)
+        .cached_annotation_union_type(&constituents, None)
         .map_err(|_| invalid())?
         != Some(type_)
     {
