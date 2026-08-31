@@ -11,16 +11,29 @@ integration target. Query tests whether the same fixes work in another codebase.
 
 | Project | Original source roots | Completed source checks | Unsupported | Other results | Load syntax diagnostics |
 | --- | ---: | ---: | ---: | --- | ---: |
-| Hono | 188 | 27 | 158 | 2 internal errors, 1 original-policy declaration skip | 55 |
-| TanStack Query core | 23 | 1 | 22 | None | 25 |
+| Hono | 188 | 26 | 155 | 6 internal errors, 1 original-policy declaration skip | 0 |
+| TanStack Query core | 23 | 1 | 22 | None | 0 |
 
-These are first-failure measurements on `db8eda9a`, not pass rates. A completed
+These are complete first-failure measurements on `069ebad6`, not pass rates. A completed
 source check does not include a complete diagnostic comparison. Both ordinary
-project controls failed. Every original source root has an outcome.
+project controls failed. Every original source root has an outcome. One binary
+checked both projects. Both commands and separate cleanup are closed. The raw
+streams and counts are verified. The final report review is still closing.
+
+The full loaded graphs and root lists are unchanged from the earlier run.
+Hono's 55 syntax diagnostics and Query's 25 syntax diagnostics are now gone.
+Typechecking completion has not improved. Hono's HTTP status source previously
+completed and now returns `InvalidCachedTypeAlias`. This regression is the
+first repair priority. Query's completion count is unchanged.
+
+The saved [Hono stream](../target/wave202-demo-shared-project-census-4-hono.jsonl)
+and [Query stream](../target/wave202-demo-shared-project-census-4-query.jsonl)
+retain every outcome, complete typed error and loaded diagnostic.
 
 The [Hono result](../target/wave202-demo-hono-first-failure-census-1-result.md)
 and [Query result](../target/wave202-demo-query-first-failure-census-1-result.md)
-have independent reviews and closed cleanup. Their original inputs stay fixed.
+are the older baseline, with independent reviews and closed cleanup. Their
+original inputs stay fixed.
 Query means its production core package, not React Query or the whole monorepo.
 
 ## What works and what is not verified
@@ -35,13 +48,15 @@ at `3b45a90d` passed formatting in the second check, then stopped on three
 Clippy findings. All 6,550 tests remain unrun on that source. The
 [latest core/parser result](../target/wave202-core-parser-combined-full-2-quality-report.md)
 retains every compiler error and the nine unattempted stages. The three small
-lint fixes are committed and independently reviewed at `4a09da42`. A fresh
-check of the same 6,550 tests is being prepared. The artifact fixes still need
-execution. The primary branch uses the previously accepted compiler source.
+lint fixes are committed and independently reviewed at `4a09da42`. Its fresh
+check of the same 6,550 tests is running. Formatting and Clippy passed, and
+the original-fixture test passed. The remaining test stages are not complete.
+The artifact fixes still need execution. The primary branch uses the
+previously accepted compiler source.
 
 The five parser repairs are committed at `b1746a95`, with 28 new tests.
-Static diagnosis links them to all 55 Hono syntax diagnostics and all 25 Query
-syntax diagnostics. This does not prove those diagnostics disappear in a run.
+The shared project run now confirms that all 55 Hono syntax diagnostics and
+all 25 Query syntax diagnostics disappear with unchanged input graphs.
 The focused parser check passed all 363 tests across 27 harnesses. All 335 old
 tests and all 28 new controls passed. Independent review and cleanup are closed.
 The [parser result](../target/wave202-hono-parser-syntax-focused-1-runtime.md)
@@ -94,28 +109,39 @@ matches in the compiler driver. Neither project ran. The
 has independent review and closed cleanup. The one-file driver repair is
 committed and independently reviewed at `069ebad6`. It keeps internal errors
 separate from unsupported language features and adds two classification tests.
-The next run will build that repair once and check both original projects.
+The next run built that repair in 78 seconds. The same binary checked Hono
+in 336 seconds and Query in 38 seconds. The table above records the full
+first-failure results. The 7,295 selected tests have not run on this shared source.
 
 Separate repair pairs committed fixes for three causes linked to 35 measured
 library failures: conditional alias publication, warm union preparation and
 property-kind checks. The last group includes one test setup correction.
 These are source fixes, not 35 new passing tests. Later assertions still need
-execution. These fixes stay outside the immediate project retry.
+execution. These fixes were outside the completed project measurement.
 The separate namespace query selection repair is also committed and reviewed
 at `b879db17`. Its first failing operation is shared by 20 measured tests.
-Those tests have not run on the repair. It also stays outside this retry.
+Those tests have not run on the repair. The four fixes are now combined and
+source-reviewed at `035a0751`, with 7,296 selected names and 559 required controls.
+That source has no runtime result yet.
+
+Separate import fixes are committed at `0a6254d8` and `7074c8c3`. The exact
+source-file setup correction for 14 tests is committed at `3356aa21`.
+All three have independent source review. Their integration plan is in progress.
+Three alias test setup fixes are also committed at `09f9e28d`. These are source
+changes, not additional passing tests.
 
 ## Next work
 
-1. Build `069ebad6` once and measure both unchanged projects with that same
-   binary. Keep this source fixed. Do not wait for later feature patches or
-   unrelated test repairs.
-2. Run the repaired core/parser tests in parallel with the project measurement.
-   Review the complete alias result and repair its remaining failures.
-3. Fix the measured library and class failures in separate worktrees. Combine
-   those repairs after the first project measurement.
-4. Prioritize the next actual project failure and any shared dependency. Repeat until
-   the ordinary project check returns complete diagnostics that match Go.
+1. Repair Hono's HTTP status alias regression. Check whether the already
+   committed alias publication repair covers the actual failing operation.
+2. Diagnose the measured project failures in parallel. The largest visible
+   groups include 37 Hono arrow-body stops and ten Query class-declaration
+   stops. These are error groups, not proof of one shared cause or fix.
+3. Combine the relevant closed source repairs, preserve existing tests, and
+   repeat both unchanged project checks with one fixed binary.
+4. Finish core/parser verification and repair the remaining alias tests in
+   parallel. Compare complete project diagnostics with TypeScript-Go before
+   calling either project fully checked.
 5. Show the clean result, then add one deliberate type error in a separate copy
    and show the correct diagnostic and location.
 
@@ -125,6 +151,13 @@ constructor owners, exported overloads and uninitialized locals. Shared
 function/arrow statement checking and generic class-method return diagnostics
 are also committed and source-reviewed. These later changes
 stay outside the first fixed project candidate so they do not delay measurement.
+
+Small libraries remain possible earlier demo targets, but none is proved
+close to a full check. The cached tiny-invariant, Mitt, UFO, Pathe and
+sourcemap-codec inputs lack dependencies. Current-source audits also retain
+known compiler limits. Mitt additionally needs its original generated package
+declarations. A valid measurement must prepare those inputs first and keep
+the full original configuration, including any tests and ambient types.
 
 Source workers have separate worktrees and test partners. Shared merge work
 has explicit file ownership and one Git coordinator. At most three Cargo
