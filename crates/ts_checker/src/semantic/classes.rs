@@ -14341,6 +14341,7 @@ fn plan_direct_class_base(
             node,
             expression,
             symbol,
+            constructor_value: None,
             type_arguments: Vec::new(),
         });
     }
