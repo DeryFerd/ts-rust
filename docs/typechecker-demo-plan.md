@@ -5,7 +5,8 @@ Updated 2026-08-31. The full port goal remains active.
 ## Decision
 
 Make Hono the next complete-project demo target. Keep TanStack Query core as
-the second target. Hono's immediate class repairs are committed and reviewed.
+the second target. The latest Hono trace exposed an exact annotation-role bug.
+Its narrow repair is now in progress, separate from the larger class batches.
 Query still needs more source-language features before its next complete check.
 This changes the work order, not the acceptance criteria.
 Use their existing production typecheck configurations, not a new app
@@ -18,6 +19,12 @@ Finish the current bounded patches. Do not start more unrelated feature
 batches while the demo path remains unmeasured.
 
 ## Current evidence
+
+The latest Hono run still stops during construction. It builds correctly, but
+does not return a diagnostic set. Two source audits prove that its imported
+constructor annotation fails a node-adjacency assumption when the parameter
+has a default value. The immediate task is to retain the actual annotation
+field, run the unchanged default-value controls, then check Hono again.
 
 The accepted original test subset has 423 exact diagnostic results in 511
 executed variants and 60 exact semantic results in 95 variants. These are not
@@ -51,6 +58,12 @@ type artifact now prints `typeof foo` instead of the expected object shape in
 old crash cases have changed outcomes, not three accepted passes. The
 [full semantic result](../target/wave202-core-class-source-next-artifact-corpus-3/semantic.json)
 retains each record. A separate pair is repairing the display rule.
+
+The combined four-repair core candidate is committed at `73f50f94`.
+The previous candidate, `77d7f4c1`, passed formatting, then failed strict Clippy
+before any test or corpus ran. The six-line style correction is reviewed. The next
+full check retains 6,418 tests, all 224 required names, and complete per-case
+corpus comparisons. Those are required checks, not new passing results.
 
 The newer combined core/class source is
 `aea8d39c730a2db79e4d2fae965f5b164d1240bf`. Its full checker run passed 5,981
@@ -123,6 +136,23 @@ not prove that an import resolver must run earlier. The
 retains the trace and both closed runtime stages. No complete diagnostic set,
 type or symbol artifact, or replay result was returned.
 
+The fourth isolated run used source `5f913a18`. Its fresh build passed in
+69 seconds, and the unchanged Hono project failed after 5 seconds. The trace
+now identifies the class-import plan's validation path. Both runtime stages
+and the separate cleanup closed. The [complete result](../target/wave202-demo-hono-isolated-probe-4-report.md)
+retains all output. It still has no complete diagnostics or artifacts.
+
+The parser creates the annotation, then the default initializer, then the
+parameter. The validator instead selects only the node immediately before
+the parameter. For the observed parameter 41 and annotation 39, that reader
+can return node 40 or no node. It cannot return the actual annotation.
+The [source audit](../target/wave202-demo-hono-probe-4-import-identity-audit.md)
+and [independent predicate audit](../target/wave202-demo-hono-probe-4-validate-current-audit.md)
+agree. The repair will retain the actual parameter/property annotation role
+and change this one validator. It will not warm imports early, remove a guard,
+or change Hono. Existing valid and invalid default-value tests stay unchanged.
+A repaired first failure will not establish that the rest of Hono passes.
+
 The Query contextual-arrow candidate ran all 5,114 selected checker and public
 tests. It passed 5,064 and failed 50. Five failures are in the new controls.
 Their diagnosis found three test-helper failures and two missing calls to
@@ -136,7 +166,7 @@ retains every failed test. No result from this run is added to another run.
 
 | Target | Complete upstream scope | Why use it | Last project-stage result |
 | --- | --- | --- | --- |
-| Hono | `tsconfig.build.json`, 188 roots | Strict library build with ES2022 target. Dependencies are prepared. Saved Go cold diagnostics are empty. | `ContentfulStatusCode` constructor-annotation invariant in `http-exception.ts`. |
+| Hono | `tsconfig.build.json`, 188 roots | Strict library build with ES2022 target. Dependencies are prepared. Saved Go cold diagnostics are empty. | Imported constructor annotation fails a proved source-role check. Repair in progress. |
 | TanStack Query core | `packages/query-core/tsconfig.prod.json`, 23 roots | Strict ESNext/Bundler package. Dependencies and declaration outputs are prepared. Saved Go cold and warm diagnostics are empty. | Unsupported arrow in `timeoutManager.ts`. |
 
 Roots are not the complete dependency graph. The saved Go runs load 186 files
@@ -204,6 +234,15 @@ covers the real `Env`, `Schema` and `Input` bound declarations. Generic methods
 on generic classes and imported generic class heritage have reviewed plans.
 These are source findings, not the next measured project error.
 
+The class-only batch is now committed and independently reviewed at `4cab980e`.
+Its full checker gate selects all 6,149 tests in 178 harnesses, including all
+72 additions. It has no allowed-failure list. The named-bounds source is
+committed and reviewed at `3f32cc52`. Neither candidate has a passing runtime
+result yet. The two later generic-class plans now use the actual `4cab980e`
+APIs and share file ownership. Their implementation is not part of this gate.
+The first named-bounds build stopped on one test-helper type mismatch before
+any of its 5,176 tests ran. Its one-line correction is being checked.
+
 The first class-field check stopped with six Rust compile errors. No test ran.
 The errors came from one missing import and four reads of a private field.
 The five-site correction is committed and independently reviewed at
@@ -212,13 +251,20 @@ TypeScript input. The [commit receipt](../target/wave202-demo-class-field-initia
 records the closed failed build and exact correction. The same 5,195-test
 selection still needs a fresh run.
 
+The second class-field build exposed five library-test compile errors and
+ran no tests. The four-site test-only correction is committed and reviewed
+at `b5be9d54`. It uses the current slice API and clones the full owned payloads
+in snapshots. All original inputs and substantive assertions stay unchanged.
+The next gate keeps all 5,195 tests and 52 required controls. Its name audit
+also corrected 12 inventory module paths without renaming any source test.
+
 The Query source audit identifies missing contextual typing for the first
 two-parameter object-property arrow. Its declared `TimeoutProvider` property
 must supply both parameter types before the normal body check. The repair
 uses that general rule. It does not change the timer code or assume its return.
 The repair is committed with four private and five public tests. Its first
-complete test run is recorded above. The follow-up patch preserves the actual
-arrow return, source property identities, parameter order and body diagnostics.
+complete test run is recorded above. The follow-up remains paused and is not
+included in the current Hono work.
 
 A wider source audit covers all 23 Query roots. It finds more missing behavior,
 including generic class bodies, optional calls, generic function-type aliases,
@@ -235,12 +281,20 @@ parameter publisher, and alias-owned union references lack their owner proof.
 The exact three-file repair is committed at `4232597a`. Its fresh fourth run
 executed all 5,084 tests, with 5,028 passes and 56 failures. Fourteen of the
 17 old feature failures now pass, and all four new controls pass. No old pass
-was lost. Three feature failures remain. All 53 other failures are unchanged
-and remain unassigned. The [complete result](../target/wave202-demo-generic-function-type-aliases-focused-4-runtime.md)
+was lost. Three feature failures remain. All 53 other failures are unchanged.
+The [complete result](../target/wave202-demo-generic-function-type-aliases-focused-4-runtime.md)
 and [independent review](../target/wave202-demo-generic-function-type-aliases-focused-4-runtime-review.md)
 confirm the actual test executables and every outcome. All old inputs and
 assertions remain intact. Aliases remain outside the current class-only
 integration. This is local feature progress, not a Query project pass.
+All 53 other failures now have indexed failure reports. Twenty-one share the
+generic-call replay path, and eight share exported function-alias ownership.
+Those two repairs are committed and reviewed at `ea201924` and `27ee97f1`.
+The direct alias-context repair is committed and reviewed at `7427a715`.
+Their combined source and test plan is being checked before integration.
+These are repairs for first failing operations, not new passing test results.
+Four separate test-setup corrections are also approved. They preserve the
+original TypeScript, options, semantic assertions and query order.
 Executable class imports are committed and reviewed at `c295104c`, with eight
 new private and eight new public tests. Generic construction is committed and
 reviewed at `d2a6a8a3`, with 16 new private and four new public tests. Neither
