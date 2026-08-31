@@ -33,7 +33,9 @@ prevent acceptance. Their fixes are combined with the parser at `706299ac`.
 Its full check passed formatting, then stopped at a parser function-length
 lint before running tests. The [core/parser result](../target/wave202-core-parser-combined-full-1-quality-report.md)
 retains that failure and the nine unattempted stages. The artifact fixes still
-need execution. The primary branch uses the previously accepted compiler source.
+need execution. The lint correction is committed at `3b45a90d`. Its next full
+check is prepared with the same 6,550 tests. The primary branch uses the
+previously accepted compiler source.
 
 The five parser repairs are committed at `b1746a95`, with 28 new tests.
 Static diagnosis links them to all 55 Hono syntax diagnostics and all 25 Query
@@ -66,24 +68,32 @@ Independent review and cleanup are closed. The
 [alias result](../target/wave202-alias-wrapper-numeric-method-focused-1-runtime.md)
 retains every failure. This batch is not accepted yet.
 
-The shared feature merge at `f2e9d14d` adds conditional
-expression operands, annotated local callbacks, object-method captured writes
-and imported interface heritage to the repaired library. The class merge is
-now committed and independently verified at `ca182725`. Its source inventory
-has 6,621 tests. It includes the two test API corrections above. These tests
-have not run on that combined source. Core/parser and reporter integration
-remain before the first shared project measurement.
+The first shared project compiler is committed and independently verified at
+`b71b4158`. It combines the repaired library, class work, core, parser and
+project reporter. It also adds conditional expression operands, annotated
+local callbacks, object-method captured writes and imported interface heritage.
+All 859 source files match the reviewed commit. Its source inventory has
+7,293 tests in 235 harnesses, including the two test API corrections above.
+These tests have not run on that combined source. The project runner is now
+being tied to this exact commit for the first shared measurement.
+
+Parallel diagnosis covered 128 of the 159 measured library failures. Two
+shared causes explain 28 first stops: conditional alias publication and warm
+union preparation. Separate repair pairs now own those paths. Another pair
+owns a property-kind correction for six failures and one test setup error.
+These are diagnosed causes, not 35 new passing tests. Later assertions still
+need execution.
 
 ## Next work
 
-1. Finish the core/parser and reporter joins in the fixed shared source.
-   Keep the completed class integration and all original project inputs.
-2. Fix the measured library, class and alias failures in parallel. Keep every
-   test and report all failures. Source review alone is not a test pass.
-3. Build the combined compiler once and measure both unchanged projects with
-   that same binary. Prepare the project checks while source integration runs.
-   Do not wait for every later feature patch or unrelated test repair.
-4. Prioritize the next actual failure and any shared dependency. Repeat until
+1. Build `b71b4158` once and measure both unchanged projects with that same
+   binary. Keep this source fixed. Do not wait for later feature patches or
+   unrelated test repairs.
+2. Run the prepared core/parser and alias checks in parallel with the project
+   measurement. Keep all tests and report every failure.
+3. Fix the measured library and class failures in separate worktrees. Combine
+   those repairs after the first project measurement.
+4. Prioritize the next actual project failure and any shared dependency. Repeat until
    the ordinary project check returns complete diagnostics that match Go.
 5. Show the clean result, then add one deliberate type error in a separate copy
    and show the correct diagnostic and location.
@@ -91,7 +101,8 @@ remain before the first shared project measurement.
 Additional committed source changes cover optional merged-interface calls,
 readonly array const assertions, typed class-field initializers, nested global
 constructor owners, exported overloads and uninitialized locals. Shared
-function/arrow statement checking is still in progress. These later changes
+function/arrow statement checking and generic class-method return diagnostics
+are also committed and source-reviewed. These later changes
 stay outside the first fixed project candidate so they do not delay measurement.
 
 Source workers have separate worktrees and test partners. Shared merge work
