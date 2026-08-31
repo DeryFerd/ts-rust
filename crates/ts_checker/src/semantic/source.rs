@@ -68,6 +68,9 @@
 //! synthesize `any`. Canonical memo caches are not rolled back after a later
 //! semantic failure; diagnostics coupled to those caches remain in private
 //! source staging until a retry completes and publishes them atomically.
+//! A used executable class import can suspend planning while the same context
+//! checks its provider. The importer still publishes values only after its own
+//! complete plan and execution succeed.
 //! Strict `arguments` collisions retain a bounded binder-authenticated recovery
 //! that preserves the real `IArguments` assignment diagnostic.
 //! Static class elements retain their exact class and lexical `this` captures.
@@ -84,10 +87,15 @@
 //! Malformed namespace arrows and unclosed JSX retain separate, fully
 //! authenticated parser-recovery paths without admitting unrelated source.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 #[cfg(test)]
 use super::classes::{plan_source_class_members, prepare_source_class_members};
+#[cfg(test)]
+use super::source_imports::preflight_prepared_source_import_publications_with_host;
 
 use ts_ast::{
     FileId, ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind,
@@ -258,15 +266,16 @@ use super::{
     source_imports::{
         PlannedSourceImportRead, PreparedSourceImportPublication, PreparedSourceImportValue,
         ResolvedSourceImportBinding, ResolvedSourceJsDocTypedefImport,
-        ResolvedSourceTypeImportBinding, SourceImportBindingPlan, SourceImportError,
-        SourceImportPlan, SourceImportUnsupported, SourceNamedReexportBindingPlan,
-        SourceNamedReexportPlan, plan_source_import_default_arrow_export,
-        plan_source_import_identifier_read, plan_source_jsdoc_typedef_import,
-        plan_source_property_type_import, plan_source_type_import_reference,
-        plan_top_level_import_equals, plan_top_level_javascript_require,
-        plan_top_level_named_reexport, plan_top_level_named_specifier_type_import,
-        plan_top_level_named_type_import, plan_top_level_named_value_import,
-        preflight_prepared_source_import_publications_with_host,
+        ResolvedSourceTypeImportBinding, SourceClassImportDemand, SourceClassImportPlan,
+        SourceImportBindingPlan, SourceImportError, SourceImportPlan, SourceImportUnsupported,
+        SourceNamedReexportBindingPlan, SourceNamedReexportPlan, plan_source_class_import_read,
+        plan_source_import_default_arrow_export, plan_source_import_identifier_read,
+        plan_source_jsdoc_typedef_import, plan_source_property_type_import,
+        plan_source_type_import_reference, plan_top_level_import_equals,
+        plan_top_level_javascript_require, plan_top_level_named_reexport,
+        plan_top_level_named_specifier_type_import, plan_top_level_named_type_import,
+        plan_top_level_named_value_import,
+        preflight_prepared_source_import_publications_with_context,
         preflight_source_default_arrow_export_value,
         prepare_source_import_value_with_type_import_capabilities,
         reject_source_type_import_value_use, resolve_source_import_binding,
@@ -2625,6 +2634,8 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     array_targets: Option<CanonicalArrayTargets>,
     meta_options: Option<CanonicalCheckerOptions>,
     class_type_context: Option<ClassTypeQueryContext>,
+    source_class_imports: &'semantic [SourceClassImportPlan],
+    source_class_import_demand: Option<&'semantic RefCell<Option<SourceClassImportDemand>>>,
     hoisted_functions: HashSet<SemanticSymbolId>,
     prior_variables: HashSet<SemanticSymbolId>,
     readable_variables: HashSet<SemanticSymbolId>,
@@ -2678,6 +2689,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             array_targets: None,
             meta_options: None,
             class_type_context: None,
+            source_class_imports: &[],
+            source_class_import_demand: None,
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
@@ -2735,6 +2748,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             array_targets: None,
             meta_options: None,
             class_type_context: None,
+            source_class_imports: &[],
+            source_class_import_demand: None,
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
@@ -2772,6 +2787,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         planner.no_implicit_any = options.no_implicit_any;
         planner.no_unused_locals = options.no_unused_locals;
         planner
+    }
+
+    fn with_source_class_imports(
+        mut self,
+        imports: &'semantic [SourceClassImportPlan],
+        demand: &'semantic RefCell<Option<SourceClassImportDemand>>,
+    ) -> Self {
+        self.source_class_imports = imports;
+        self.source_class_import_demand = Some(demand);
+        self
     }
 
     fn finish(mut self) -> Result<SourceCheckPlan, SourceCheckError> {
@@ -9385,13 +9410,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         {
             return Ok(None);
         }
-        let source = match super::classes::plan_source_class_members_with_context(
-            store,
-            host,
-            symbol,
-            self.array_targets,
-            self.class_type_context.as_ref(),
-        ) {
+        let source = if store.source_class_provenance_for_symbol(symbol).is_some() {
+            super::classes::plan_source_class_members_with_context(
+                store,
+                host,
+                symbol,
+                self.array_targets,
+                self.class_type_context.as_ref(),
+            )
+        } else {
+            super::classes::plan_source_class_members_with_imports(
+                store,
+                host,
+                symbol,
+                self.array_targets,
+                self.class_type_context.as_ref(),
+                self.source_class_imports,
+            )
+        };
+        let source = match source {
             Ok(source) => source,
             Err(
                 error @ super::classes::ClassError::Unsupported(
@@ -9401,9 +9438,37 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     },
                 ),
             ) => return Err(Self::class_plan_error(declaration, error)),
+            Err(
+                error @ super::classes::ClassError::Unsupported(
+                    super::classes::ClassUnsupported::Heritage(node),
+                ),
+            ) => {
+                if let Some(request) = self.source_class_import_demand
+                    && let Some(demand) = plan_source_class_import_read(
+                        store,
+                        host,
+                        &self.value_import_bindings,
+                        node,
+                    )
+                    .map_err(|error| Self::import_plan_error(node, &error))?
+                {
+                    if request.replace(Some(demand)).is_some() {
+                        return Err(SourceCheckError::Import(node));
+                    }
+                    return Err(Self::class_plan_error(declaration, error));
+                }
+                return Ok(None);
+            }
             Err(super::classes::ClassError::Unsupported(_)) => return Ok(None),
             Err(error) => return Err(Self::class_plan_error(declaration, error)),
         };
+        if let Some(imported) = source.imported_base() {
+            self.import_reads.push(imported.demand.read);
+            self.identifier_reads.push((
+                imported.demand.read.node,
+                imported.demand.read.resolved_symbol,
+            ));
+        }
         if source.declaration() != declaration
             || source.symbol() != symbol
             || !self.planned_classes.insert(symbol)
@@ -64012,6 +64077,14 @@ fn with_retained_class_annotation_scopes<T>(
     cleanup_error.map_or(result, Err)
 }
 
+/// Keeps dependency errors in the existing source import error families.
+pub(super) fn source_class_import_error(
+    node: NodeRef,
+    error: &SourceImportError,
+) -> SourceCheckError {
+    SourcePlanner::import_plan_error(node, error)
+}
+
 /// Checks one already-retained source into context-owned private staging.
 #[allow(clippy::too_many_arguments)] // Mirrors the context-owned source execution boundary.
 pub(super) fn check_source_file(
@@ -64026,6 +64099,8 @@ pub(super) fn check_source_file(
     classic_jsx_factories: Option<(&str, &str)>,
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
+    source_class_imports: &[SourceClassImportPlan],
+    source_class_import_demand: &RefCell<Option<SourceClassImportDemand>>,
 ) -> Result<(), SourceCheckError> {
     if !store.contains_source_file(source) {
         return Err(SourceCheckError::Provenance(
@@ -64072,10 +64147,14 @@ pub(super) fn check_source_file(
                 global_types,
                 options,
             )
+            .with_source_class_imports(source_class_imports, source_class_import_demand)
             .finish()
             {
                 Ok(plan) => break Ok(plan),
                 Err(error) => {
+                    if source_class_import_demand.borrow().is_some() {
+                        return Err(error);
+                    }
                     if let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(annotation)) =
                         error
                         && !prepared_class_parameters.insert(annotation)
@@ -65754,6 +65833,32 @@ pub(super) fn check_source_file(
                 return Err(SourceCheckError::Import(read.node));
             }
             continue;
+        }
+        if let Some(owner) =
+            super::classes::source_class_import_owner(store, host, resolved.target_symbol)
+                .map_err(|error| SourcePlanner::class_plan_error(read.node, error))?
+            && super::classes::completed_source_class_import_value(
+                store,
+                host,
+                global_types,
+                options,
+                owner,
+            )
+            .map_err(|error| SourcePlanner::class_plan_error(read.node, error))?
+            .is_none()
+        {
+            if source_class_import_demand
+                .replace(Some(SourceClassImportDemand {
+                    binding: resolved.binding.clone(),
+                    read: *read,
+                }))
+                .is_some()
+            {
+                return Err(SourceCheckError::Import(read.node));
+            }
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Import(read.node),
+            ));
         }
         resolve_source_import_namespace_exports(store, alias_host, host, resolved)
             .map_err(|error| SourcePlanner::import_plan_error(read.node, &error))?;
@@ -72646,10 +72751,11 @@ pub(super) fn check_source_file(
         diagnostics,
         &deferred,
     )?;
-    let import_publications = preflight_prepared_source_import_publications_with_host(
+    let import_publications = preflight_prepared_source_import_publications_with_context(
         store,
         host,
         global_types,
+        options,
         &prepared_imports,
     )
     .map_err(|error| SourcePlanner::import_plan_error(source.node_ref(), &error))?;

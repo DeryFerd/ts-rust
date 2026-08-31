@@ -11,7 +11,8 @@
 //! flag. Comment-only typedef imports authenticate promoted `CommonJS` type
 //! exports through their exact module-specifier nodes. Value preparation
 //! supports initialized annotated `const` declarations, exported ambient
-//! classes and generic constructors from declaration files, authenticated
+//! classes and generic constructors from declaration files, completed executable
+//! source-class values, authenticated
 //! `CommonJS` variables and named assignments, explicit and implicit ambient
 //! `export const` declarations in retained declaration files, annotated
 //! `FunctionDeclaration`s, source-proven ambient interface methods, regular and
@@ -33,8 +34,9 @@
 //! publishing the import alias. After the whole source has checked,
 //! [`preflight_prepared_source_import_publications`] validates and exposes
 //! those payloads for the source checker's one combined atomic publication
-//! batch. Importer-first Program order never recursively checks the target
-//! source: `CanonicalTypeQuery` materializes its canonical type lazily.
+//! batch. Most targets use lazy canonical type queries. An executable source
+//! class instead requires its provider's successful source transaction in the
+//! same caller context before this leaf can return its constructor value.
 //! Default arrow imports likewise leave the provider body and expression cache cold.
 //!
 //! The split follows the pinned TypeScript-Go paths in
@@ -65,8 +67,10 @@ use super::{
     alias_provider::AmbientImportMethodSource,
     array_types::CanonicalArrayTargets,
     classes::{
-        ClassMemberQueryPlan, execute_nongeneric_class_member_query,
+        ClassMemberQueryPlan, SourceClassImportOwner, SourceClassImportValue,
+        completed_source_class_import_value, execute_nongeneric_class_member_query,
         plan_nongeneric_class_member_query, preflight_nongeneric_class_member_query,
+        source_class_import_owner, validate_source_class_import_value,
     },
     derived_types::DerivedObjectLiteralValidation,
     enums,
@@ -76,7 +80,7 @@ use super::{
         preflight_planned_jsdoc_type, resolve_planned_jsdoc_type,
     },
     module_exports::CanonicalModuleExportQueryError,
-    module_resolution::CanonicalModuleResolutionLookup,
+    module_resolution::{CanonicalModuleResolutionLookup, CanonicalResolvedModule},
     object_members::{self, PlannedProperty, PropertyObjectPlan, PropertyObjectState},
     source_arrows::{
         SourceArrowBodyPlan, SourceArrowError, SourceDefaultArrowExportPlan,
@@ -211,6 +215,360 @@ pub(super) struct ResolvedSourceImportBinding {
     pub(super) target_symbol: SemanticSymbolId,
     ambient_method: Option<AmbientImportMethodSource>,
     namespace_aliases: RefCell<Vec<StagedSourceImportNamespaceAlias>>,
+}
+
+/// One real value read that can ask the source owner to check its provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassImportDemand {
+    pub(super) binding: SourceImportBindingPlan,
+    pub(super) read: PlannedSourceImportRead,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceClassImportHop {
+    alias: SemanticSymbolId,
+    immediate: SemanticSymbolId,
+    declaration: NodeRef,
+    module_specifier: NodeRef,
+    imported_text: String,
+    resolved_module: CanonicalResolvedModule,
+    module: SemanticSymbolId,
+    revision: ts_ast::NodeArenaRevision,
+}
+
+/// The normal alias resolver selects the route. Readers recheck its exact inputs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassImportPlan {
+    pub(super) demand: SourceClassImportDemand,
+    pub(super) owner: SourceClassImportOwner,
+    immediate: SemanticSymbolId,
+    route: Vec<SourceClassImportHop>,
+}
+
+impl SourceClassImportPlan {
+    pub(super) fn validate(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+    ) -> Result<(), SourceImportError> {
+        validate_source_class_import_read(store, host, &self.demand)?;
+        if source_class_import_owner(store, host, self.owner.symbol).map_err(|error| {
+            imported_ambient_class_error(self.owner.symbol, self.owner.declaration, error)
+        })? != Some(self.owner)
+            || self.owner.declaration.file == self.demand.read.node.file
+            || self.route.first().map(|hop| (hop.alias, hop.immediate))
+                != Some((self.demand.binding.alias_symbol, self.immediate))
+            || self.route.last().map(|hop| hop.immediate) != Some(self.owner.symbol)
+        {
+            return Err(invariant(SourceImportInvariant::InvalidTargetLinks(
+                self.owner.symbol,
+            )));
+        }
+        let mut seen = HashSet::new();
+        for (index, hop) in self.route.iter().enumerate() {
+            if !seen.insert(hop.alias)
+                || self
+                    .route
+                    .get(index + 1)
+                    .is_some_and(|next| next.alias != hop.immediate)
+                || source_class_import_hop(store, host, hop.alias, hop.immediate)? != *hop
+                || store.alias_symbol_links(hop.alias).is_none_or(|links| {
+                    links.alias_target != AliasTargetState::Resolved(self.owner.symbol)
+                        || links
+                            .immediate_target
+                            .is_some_and(|target| target != hop.immediate)
+                        || index == 0 && links.immediate_target != Some(hop.immediate)
+                        || links.type_only_declaration.is_some()
+                })
+            {
+                return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
+                    hop.alias,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn completed_value(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        global_types: &CanonicalGlobalTypes,
+        options: CanonicalCheckerOptions,
+    ) -> Result<Option<SourceClassImportValue>, SourceImportError> {
+        self.validate(store, host)?;
+        let value =
+            completed_source_class_import_value(store, host, global_types, options, self.owner)
+                .map_err(|error| {
+                    imported_ambient_class_error(self.owner.symbol, self.owner.declaration, error)
+                })?;
+        if let Some(value) = &value {
+            self.validate_constructor_value_links(store, value)?;
+        }
+        Ok(value)
+    }
+
+    /// A cold alias may have no value yet. A present value must be this constructor.
+    pub(super) fn validate_constructor_value_links(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        value: &SourceClassImportValue,
+    ) -> Result<(), SourceImportError> {
+        if value.owner != self.owner {
+            return Err(invariant(SourceImportInvariant::InvalidTargetLinks(
+                self.owner.symbol,
+            )));
+        }
+        prepare_value_links(
+            store,
+            self.demand.binding.alias_symbol,
+            value.members.shells().value_type(),
+            true,
+        )
+        .map(|_| ())
+    }
+}
+
+fn validate_source_class_import_read(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    demand: &SourceClassImportDemand,
+) -> Result<(), SourceImportError> {
+    let node = demand.read.node;
+    let invalid = || invariant(SourceImportInvariant::ReadBindingMismatch(node));
+    let (arena, bound) = host.source(node).ok_or_else(invalid)?;
+    let record = checked_node(arena, bound, store, node)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Err(invalid());
+    };
+    let mut names = host.name_resolver_host(store)?;
+    let alias = CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut names)
+        .map_err(DeclaredTypeError::from)?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(node)),
+            &identifier.text,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE | SymbolFlags::ALIAS,
+            None,
+            false,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?;
+    if alias != Some(demand.binding.alias_symbol)
+        || plan_source_import_identifier_read(
+            arena,
+            bound,
+            store,
+            &demand.binding,
+            node,
+            &identifier.text,
+            demand.binding.alias_symbol,
+        )? != demand.read
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Does not resolve an alias or demand an unused import's value.
+pub(super) fn plan_source_class_import_read(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bindings: &HashMap<SemanticSymbolId, SourceImportBindingPlan>,
+    node: NodeRef,
+) -> Result<Option<SourceClassImportDemand>, SourceImportError> {
+    let invalid = || invariant(SourceImportInvariant::InvalidNode(node));
+    let (arena, bound) = host.source(node).ok_or_else(invalid)?;
+    let record = checked_node(arena, bound, store, node)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Ok(None);
+    };
+    let mut names = host.name_resolver_host(store)?;
+    let Some(alias) = CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut names)
+        .map_err(DeclaredTypeError::from)?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(node)),
+            &identifier.text,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE | SymbolFlags::ALIAS,
+            None,
+            false,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?
+    else {
+        return Ok(None);
+    };
+    let Some(binding) = bindings.get(&alias) else {
+        return Ok(None);
+    };
+    let read = plan_source_import_identifier_read(
+        arena,
+        bound,
+        store,
+        binding,
+        node,
+        &identifier.text,
+        alias,
+    )?;
+    Ok(Some(SourceClassImportDemand {
+        binding: binding.clone(),
+        read,
+    }))
+}
+
+/// Resolves the normal import chain before retaining a source-class dependency.
+pub(super) fn resolve_source_class_import(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    aliases: &mut ProductionAliasTargetHost<'_, '_, '_>,
+    demand: &SourceClassImportDemand,
+) -> Result<Option<SourceClassImportPlan>, SourceImportError> {
+    validate_source_class_import_read(store, host, demand)?;
+    let mut hops = Vec::new();
+    let resolved = resolve_source_import_binding_phase_with_hops(
+        store,
+        aliases,
+        &demand.binding,
+        SourceImportPhase::Value,
+        Some(&mut hops),
+    )?;
+    let Some(owner) =
+        source_class_import_owner(store, host, resolved.target_symbol).map_err(|error| {
+            imported_ambient_class_error(resolved.target_symbol, demand.read.node, error)
+        })?
+    else {
+        return Ok(None);
+    };
+    let route = hops
+        .into_iter()
+        .map(|(alias, target)| source_class_import_hop(store, host, alias, target))
+        .collect::<Result<Vec<_>, _>>()?;
+    let plan = SourceClassImportPlan {
+        demand: demand.clone(),
+        owner,
+        immediate: resolved.immediate_target_symbol,
+        route,
+    };
+    plan.validate(store, host)?;
+    Ok(Some(plan))
+}
+
+/// Rechecks one selected hop with the existing import and module-export planners.
+fn source_class_import_hop(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    alias: SemanticSymbolId,
+    immediate: SemanticSymbolId,
+) -> Result<SourceClassImportHop, SourceImportError> {
+    let invalid = || invariant(SourceImportInvariant::InvalidAliasLinks(alias));
+    let record = store.symbol(alias).ok_or_else(invalid)?;
+    let [declaration] = record.declarations().unwrap_or_default() else {
+        return Err(invalid());
+    };
+    let declaration = *declaration;
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let node = checked_node(arena, bound, store, declaration)?;
+    let parents: &[SyntaxKind] = match node.kind {
+        SyntaxKind::ImportSpecifier => &[
+            SyntaxKind::NamedImports,
+            SyntaxKind::ImportClause,
+            SyntaxKind::ImportDeclaration,
+        ],
+        SyntaxKind::ImportClause => &[SyntaxKind::ImportDeclaration],
+        SyntaxKind::ExportSpecifier => &[SyntaxKind::NamedExports, SyntaxKind::ExportDeclaration],
+        kind => {
+            return Err(unsupported(SourceImportUnsupported::Declaration {
+                node: declaration,
+                kind,
+            }));
+        }
+    };
+    let mut parent = declaration;
+    for &kind in parents {
+        let id = checked_node(arena, bound, store, parent)?
+            .parent
+            .ok_or_else(invalid)?;
+        parent = NodeRef::new(declaration.arena, declaration.file, id);
+        if checked_node(arena, bound, store, parent)?.kind != kind {
+            return Err(invalid());
+        }
+    }
+    let (module_specifier, imported_text) = if node.kind == SyntaxKind::ExportSpecifier {
+        let export = plan_top_level_named_reexport(arena, bound, store, parent)?;
+        let binding = export
+            .bindings
+            .iter()
+            .find(|binding| binding.alias_symbol == alias)
+            .filter(|binding| binding.declaration == declaration && !binding.syntactic_type_only)
+            .ok_or_else(invalid)?;
+        (export.module_specifier, binding.imported_text.clone())
+    } else {
+        let import = plan_top_level_named_value_import(arena, bound, store, parent)?;
+        let binding = import
+            .bindings
+            .iter()
+            .find(|binding| binding.alias_symbol == alias)
+            .filter(|binding| binding.declaration == declaration)
+            .ok_or_else(invalid)?;
+        (import.module_specifier, binding.imported_text.clone())
+    };
+    let manifest = host.module_resolutions().ok_or_else(|| {
+        source_property_import_alias_error(
+            alias,
+            CanonicalAliasTargetUnavailable::ModuleResolutionCapabilityUnavailable(
+                module_specifier,
+            ),
+        )
+    })?;
+    let resolved_module = match manifest.lookup(module_specifier) {
+        CanonicalModuleResolutionLookup::Resolved(resolved) => resolved,
+        CanonicalModuleResolutionLookup::Unavailable => {
+            return Err(source_property_import_alias_error(
+                alias,
+                CanonicalAliasTargetUnavailable::ModuleResolutionCapabilityUnavailable(
+                    module_specifier,
+                ),
+            ));
+        }
+        CanonicalModuleResolutionLookup::EntryAbsent => {
+            return Err(source_property_import_alias_error(
+                alias,
+                CanonicalAliasTargetUnavailable::ModuleResolutionEntryAbsent(module_specifier),
+            ));
+        }
+        CanonicalModuleResolutionLookup::Unresolved => {
+            return Err(source_property_import_alias_error(
+                alias,
+                CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(module_specifier),
+            ));
+        }
+    };
+    let aliases = host
+        .alias_target_host(store, manifest)
+        .map_err(|error| source_property_import_module_error(alias, error.into()))?;
+    let module = aliases
+        .direct_source_module(store, declaration, resolved_module, false)
+        .map_err(|reason| source_property_import_alias_error(alias, reason))?;
+    let selected = super::module_exports::get_module_export_by_name(
+        store,
+        host,
+        &aliases,
+        module,
+        &imported_text,
+    )
+    .map_err(|error| source_property_import_module_error(alias, error))?;
+    if selected != Some(immediate) {
+        return Err(invalid());
+    }
+    Ok(SourceClassImportHop {
+        alias,
+        immediate,
+        declaration,
+        module_specifier,
+        imported_text,
+        resolved_module,
+        module,
+        revision: arena.revision(),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1795,6 +2153,10 @@ enum PreparedSourceImportTarget {
         instance_type: TypeId,
         signature: SignatureId,
     },
+    SourceClass {
+        plan: Box<SourceClassImportPlan>,
+        value: Box<SourceClassImportValue>,
+    },
     ConstEnum {
         declared_type: TypeId,
     },
@@ -1897,6 +2259,7 @@ enum PlannedSourceImportValueTarget {
     AmbientMethod(Box<SourceImportAmbientMethodPlan>),
     DefaultArrow(Box<SourceDefaultArrowExportPlan>),
     AmbientClass(Box<ClassMemberQueryPlan>),
+    SourceClass(SourceClassImportOwner),
     ConstEnum {
         declaration: NodeRef,
     },
@@ -4940,6 +5303,16 @@ fn resolve_source_import_binding_phase(
     binding: &SourceImportBindingPlan,
     phase: SourceImportPhase,
 ) -> Result<ResolvedSourceImportBinding, SourceImportError> {
+    resolve_source_import_binding_phase_with_hops(store, alias_host, binding, phase, None)
+}
+
+fn resolve_source_import_binding_phase_with_hops(
+    store: &mut CanonicalTypeMapperStore,
+    alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
+    binding: &SourceImportBindingPlan,
+    phase: SourceImportPhase,
+    hops: Option<&mut Vec<(SemanticSymbolId, SemanticSymbolId)>>,
+) -> Result<ResolvedSourceImportBinding, SourceImportError> {
     validate_alias_symbol(
         store,
         binding.alias_symbol,
@@ -5061,7 +5434,12 @@ fn resolve_source_import_binding_phase(
         }));
     }
     let (independent_immediate, independent_target) =
-        independently_resolve_source_alias_chain(store, alias_host, binding.alias_symbol)?;
+        independently_resolve_source_alias_chain_with_hops(
+            store,
+            alias_host,
+            binding.alias_symbol,
+            hops,
+        )?;
     if independent_immediate != direct_target || independent_target != resolved_target {
         return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
             binding.alias_symbol,
@@ -5175,6 +5553,15 @@ fn independently_resolve_source_alias_chain(
     alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
     alias: SemanticSymbolId,
 ) -> Result<(SemanticSymbolId, SemanticSymbolId), SourceImportError> {
+    independently_resolve_source_alias_chain_with_hops(store, alias_host, alias, None)
+}
+
+fn independently_resolve_source_alias_chain_with_hops(
+    store: &mut CanonicalTypeMapperStore,
+    alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
+    alias: SemanticSymbolId,
+    selected_hops: Option<&mut Vec<(SemanticSymbolId, SemanticSymbolId)>>,
+) -> Result<(SemanticSymbolId, SemanticSymbolId), SourceImportError> {
     let mut current = alias;
     let mut visited = HashSet::new();
     let mut hops = Vec::new();
@@ -5215,7 +5602,7 @@ fn independently_resolve_source_alias_chain(
     let mut resolved = current;
     let mut root_target = None;
     let mut propagated_type_only = None;
-    for (hop, immediate, syntactic_type_only) in hops.into_iter().rev() {
+    for &(hop, immediate, syntactic_type_only) in hops.iter().rev() {
         let expected_type_only = syntactic_type_only.or(propagated_type_only);
         let links = store
             .alias_symbol_links(hop)
@@ -5236,6 +5623,9 @@ fn independently_resolve_source_alias_chain(
     }
     let root_target =
         root_target.ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(alias)))?;
+    if let Some(selected) = selected_hops {
+        selected.extend(hops.into_iter().map(|(hop, immediate, _)| (hop, immediate)));
+    }
     Ok((first_target, root_target))
 }
 
@@ -6063,6 +6453,7 @@ pub(super) fn prepare_source_import_value_with_type_import_capabilities(
         PlannedSourceImportValueTarget::AmbientMethod(method) => method.source.method_declaration(),
         PlannedSourceImportValueTarget::DefaultArrow(export) => export.declaration,
         PlannedSourceImportValueTarget::AmbientClass(class) => class.declaration(),
+        PlannedSourceImportValueTarget::SourceClass(owner) => owner.declaration,
     };
     let same_source_namespace = matches!(
         &planned_target,
@@ -6220,6 +6611,40 @@ pub(super) fn prepare_source_import_value_with_type_import_capabilities(
             (
                 type_,
                 PreparedSourceImportTarget::DefaultArrow { export, signature },
+            )
+        }
+        PlannedSourceImportValueTarget::SourceClass(owner) => {
+            let manifest = declared_host.module_resolutions().ok_or_else(|| {
+                invariant(SourceImportInvariant::InvalidAliasLinks(
+                    binding.alias_symbol,
+                ))
+            })?;
+            let mut aliases =
+                declared_host
+                    .alias_target_host(store, manifest)
+                    .map_err(|error| {
+                        source_property_import_module_error(binding.alias_symbol, error.into())
+                    })?;
+            let demand = SourceClassImportDemand {
+                binding: binding.clone(),
+                read: *read,
+            };
+            let plan = resolve_source_class_import(store, declared_host, &mut aliases, &demand)?
+                .filter(|plan| plan.owner == owner)
+                .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(target)))?;
+            let value = plan
+                .completed_value(store, declared_host, global_types, options)?
+                .ok_or_else(|| {
+                    unsupported(SourceImportUnsupported::TargetDeclaration(
+                        owner.declaration,
+                    ))
+                })?;
+            (
+                value.members.shells().value_type(),
+                PreparedSourceImportTarget::SourceClass {
+                    plan: Box::new(plan),
+                    value: Box::new(value),
+                },
             )
         }
         PlannedSourceImportValueTarget::AmbientClass(class) => {
@@ -6391,28 +6816,50 @@ pub(super) fn preflight_prepared_source_import_publications(
     store: &CanonicalTypeMapperStore,
     prepared: &[PreparedSourceImportValue],
 ) -> Result<Vec<PreparedSourceImportPublication>, SourceImportError> {
-    preflight_prepared_source_import_publications_impl(store, prepared, None)
+    preflight_prepared_source_import_publications_impl(store, prepared, None, None)
 }
 
+#[cfg(test)]
 pub(super) fn preflight_prepared_source_import_publications_with_host(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     prepared: &[PreparedSourceImportValue],
 ) -> Result<Vec<PreparedSourceImportPublication>, SourceImportError> {
-    preflight_prepared_source_import_publications_impl(store, prepared, Some((host, global_types)))
+    preflight_prepared_source_import_publications_impl(
+        store,
+        prepared,
+        Some((host, global_types)),
+        None,
+    )
+}
+
+pub(super) fn preflight_prepared_source_import_publications_with_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    prepared: &[PreparedSourceImportValue],
+) -> Result<Vec<PreparedSourceImportPublication>, SourceImportError> {
+    preflight_prepared_source_import_publications_impl(
+        store,
+        prepared,
+        Some((host, global_types)),
+        Some(options),
+    )
 }
 
 fn preflight_prepared_source_import_publications_impl(
     store: &CanonicalTypeMapperStore,
     prepared: &[PreparedSourceImportValue],
     source: Option<(&DeclaredTypeHost<'_>, &CanonicalGlobalTypes)>,
+    options: Option<CanonicalCheckerOptions>,
 ) -> Result<Vec<PreparedSourceImportPublication>, SourceImportError> {
     let mut publications = Vec::<PreparedSourceImportPublication>::new();
     let mut publication_indices = HashMap::<SemanticSymbolId, usize>::new();
     let mut ambient_methods = HashMap::<SemanticSymbolId, &SourceImportAmbientMethodPlan>::new();
     for value in prepared {
-        validate_prepared_import_value(store, value, source)?;
+        validate_prepared_import_value(store, value, source, options)?;
         if let PreparedSourceImportTarget::AmbientMethod(method) = &value.target {
             ambient_methods.insert(value.target_symbol, method);
         }
@@ -7625,6 +8072,24 @@ fn plan_direct_import_value_target(
         .map(PlannedSourceImportValueTarget::AnnotatedFunction);
     }
     if flags == SymbolFlags::CLASS {
+        if namespace_module.is_none()
+            && let Some(declaration) = store
+                .symbol(target)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+            && host
+                .bound_file(declaration)
+                .and_then(BoundFile::source_facts)
+                .is_some_and(|facts| {
+                    !facts.is_declaration_file()
+                        && facts.is_external_module()
+                        && !facts.is_common_js_module()
+                        && !facts.is_javascript_file()
+                })
+            && let Some(owner) = source_class_import_owner(store, host, target)
+                .map_err(|error| imported_ambient_class_error(target, declaration, error))?
+        {
+            return Ok(PlannedSourceImportValueTarget::SourceClass(owner));
+        }
         return plan_direct_ambient_class_target(store, host, alias, target);
     }
     if matches!(flags, SymbolFlags::CONST_ENUM | SymbolFlags::REGULAR_ENUM) {
@@ -10116,6 +10581,11 @@ fn materialize_imported_module_member(
                 method.source.method_declaration(),
             )));
         }
+        PlannedSourceImportValueTarget::SourceClass(owner) => {
+            return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+                owner.declaration,
+            )));
+        }
         PlannedSourceImportValueTarget::AmbientClass(class) => {
             let members =
                 execute_nongeneric_class_member_query(store, host, &class).map_err(|error| {
@@ -10242,6 +10712,11 @@ fn preflight_imported_module_namespace_members(
             PlannedSourceImportValueTarget::AmbientMethod(method) => {
                 return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
                     method.source.method_declaration(),
+                )));
+            }
+            PlannedSourceImportValueTarget::SourceClass(owner) => {
+                return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+                    owner.declaration,
                 )));
             }
             PlannedSourceImportValueTarget::AmbientClass(class) => {
@@ -12787,6 +13262,7 @@ fn validate_prepared_import_value(
     store: &CanonicalTypeMapperStore,
     prepared: &PreparedSourceImportValue,
     source: Option<(&DeclaredTypeHost<'_>, &CanonicalGlobalTypes)>,
+    options: Option<CanonicalCheckerOptions>,
 ) -> Result<(), SourceImportError> {
     validate_alias_symbol(
         store,
@@ -12901,6 +13377,28 @@ fn validate_prepared_import_value(
                         .node(prepared.binding.declaration)
                         .is_some_and(|node| node.kind == SyntaxKind::ImportClause)
                     && default_arrow_value_is_exact(store, export, prepared.type_, *signature)
+            } else {
+                false
+            }
+        }
+        PreparedSourceImportTarget::SourceClass { plan, value } => {
+            if let (Some((host, globals)), Some(options)) = (source, options) {
+                plan.validate(store, host)?;
+                validate_source_class_import_value(store, host, globals, options, value).map_err(
+                    |error| {
+                        imported_ambient_class_error(
+                            value.owner.symbol,
+                            value.owner.declaration,
+                            error,
+                        )
+                    },
+                )?;
+                prepared.binding == plan.demand.binding
+                    && prepared.immediate_target_symbol == plan.immediate
+                    && prepared.target_symbol == value.owner.symbol
+                    && prepared.target_declaration == value.owner.declaration
+                    && plan.owner == value.owner
+                    && prepared.type_ == value.members.shells().value_type()
             } else {
                 false
             }

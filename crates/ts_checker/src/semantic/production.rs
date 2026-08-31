@@ -10,7 +10,10 @@
 //! resolver and diagnostic host. Other unavailable module targets remain typed
 //! boundaries.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use ts_ast::{
     FileId, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeId, NodeRef, SyntaxKind,
@@ -52,6 +55,7 @@ use super::{
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
     relation::RelationKind,
     source,
+    source_imports::{SourceClassImportDemand, SourceClassImportPlan, resolve_source_class_import},
     symbol_display::{SymbolDisplayContext, SymbolDisplayError},
     type_nodes::CanonicalTypeQuery,
     types::{ObjectFlags, TypeFlags},
@@ -1487,6 +1491,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             options,
             files,
             store,
+            module_resolutions,
             ..
         } = self;
         let host = DeclaredTypeHost::from_registry(
@@ -1494,7 +1499,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             files,
             GlobalMergeCompletion::new(options.name_resolution),
         )
-        .map_err(DeclaredTypeError::from)?;
+        .map_err(DeclaredTypeError::from)?
+        .with_module_resolutions(module_resolutions);
         let plan = plan_nongeneric_class(store, &host, symbol)?;
         execute_nongeneric_class_shells(store, &host, &plan)
     }
@@ -1516,6 +1522,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             options,
             files,
             store,
+            module_resolutions,
             ..
         } = self;
         let host = DeclaredTypeHost::from_registry(
@@ -1523,7 +1530,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             files,
             GlobalMergeCompletion::new(options.name_resolution),
         )
-        .map_err(DeclaredTypeError::from)?;
+        .map_err(DeclaredTypeError::from)?
+        .with_module_resolutions(module_resolutions);
         let plan = super::classes::plan_class_query(store, &host, symbol)?;
         super::classes::execute_class_query_shells(store, &host, &plan)
     }
@@ -1857,6 +1865,107 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         file: FileId,
         classic_jsx_factories: Option<(&str, &str)>,
     ) -> Result<(), SourceCheckError> {
+        self.check_source_file_with_class_imports(file, classic_jsx_factories, &mut Vec::new())
+    }
+
+    fn check_source_file_with_class_imports(
+        &mut self,
+        file: FileId,
+        classic_jsx_factories: Option<(&str, &str)>,
+        active: &mut Vec<SourceFileRef>,
+    ) -> Result<(), SourceCheckError> {
+        let source_file = self
+            .files
+            .source_file(file)
+            .ok_or(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingFile(file),
+            ))?;
+        active
+            .try_reserve(1)
+            .map_err(|_| SourceCheckError::Import(source_file.node_ref()))?;
+        active.push(source_file);
+        let result = (|| {
+            let mut imports = Vec::<SourceClassImportPlan>::new();
+            loop {
+                let request = RefCell::new(None);
+                let result =
+                    self.check_source_file_attempt(file, classic_jsx_factories, &imports, &request);
+                let Some(demand) = request.into_inner() else {
+                    return result;
+                };
+                let error = result
+                    .err()
+                    .ok_or(SourceCheckError::Import(demand.read.node))?;
+                if imports.iter().any(|known| known.demand.read == demand.read) {
+                    return Err(error);
+                }
+                let Some(imported) = self.resolve_source_class_import_demand(&demand)? else {
+                    return Err(error);
+                };
+                if active.contains(&imported.owner.source) {
+                    return Err(SourceCheckError::Unsupported(
+                        source::UnsupportedSourceSyntax::Import(demand.read.node),
+                    ));
+                }
+                self.check_source_file_with_class_imports(
+                    imported.owner.source.file(),
+                    None,
+                    active,
+                )?;
+                let host = DeclaredTypeHost::from_registry(
+                    &self.store,
+                    &self.files,
+                    GlobalMergeCompletion::new(self.options.name_resolution),
+                )
+                .map_err(DeclaredTypeError::from)?
+                .with_module_resolutions(&self.module_resolutions);
+                if imported
+                    .completed_value(&self.store, &host, &self.global_types, self.options)
+                    .map_err(|error| source::source_class_import_error(demand.read.node, &error))?
+                    .is_none()
+                {
+                    return Err(error);
+                }
+                imports
+                    .try_reserve(1)
+                    .map_err(|_| SourceCheckError::Import(demand.read.node))?;
+                imports.push(imported);
+            }
+        })();
+        if active.pop() != Some(source_file) {
+            return Err(SourceCheckError::Import(source_file.node_ref()));
+        }
+        result
+    }
+
+    fn resolve_source_class_import_demand(
+        &mut self,
+        demand: &SourceClassImportDemand,
+    ) -> Result<Option<SourceClassImportPlan>, SourceCheckError> {
+        let host = DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )
+        .map_err(DeclaredTypeError::from)?
+        .with_module_resolutions(&self.module_resolutions);
+        let mut aliases = ProductionAliasTargetHost::from_registry(
+            &self.store,
+            &self.files,
+            &self.module_resolutions,
+        )
+        .map_err(|_| SourceCheckError::Import(demand.read.node))?;
+        resolve_source_class_import(&mut self.store, &host, &mut aliases, demand)
+            .map_err(|error| source::source_class_import_error(demand.read.node, &error))
+    }
+
+    fn check_source_file_attempt(
+        &mut self,
+        file: FileId,
+        classic_jsx_factories: Option<(&str, &str)>,
+        class_imports: &[SourceClassImportPlan],
+        class_import_demand: &RefCell<Option<SourceClassImportDemand>>,
+    ) -> Result<(), SourceCheckError> {
         let Self {
             options,
             files,
@@ -1899,23 +2008,27 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             classic_jsx_factories,
             instantiation_session,
             &mut staged,
+            class_imports,
+            class_import_demand,
         );
         let result = match result {
-            Err(error) => match source::recover_strict_arguments_source(
-                arena,
-                bound,
-                &host,
-                global_types,
-                store,
-                *options,
-                instantiation_session,
-                &mut staged,
-                error,
-            ) {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(error),
-                Err(recovery_error) => Err(recovery_error),
-            },
+            Err(error) if class_import_demand.borrow().is_none() => {
+                match source::recover_strict_arguments_source(
+                    arena,
+                    bound,
+                    &host,
+                    global_types,
+                    store,
+                    *options,
+                    instantiation_session,
+                    &mut staged,
+                    error,
+                ) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(error),
+                    Err(recovery_error) => Err(recovery_error),
+                }
+            }
             result => result,
         };
         let owners = match diagnostic_owners(files, source_file, &staged) {
@@ -4162,6 +4275,896 @@ mod tests {
             CanonicalModuleResolutionMode::Esm,
             CanonicalModuleResolutionMode::Esm,
         )
+    }
+
+    const EXECUTABLE_IMPORT_BASE: &str =
+        "export class Base { value = 1; constructor() {} read() { return this.value; } }";
+    const EXECUTABLE_IMPORT_READ: &str =
+        "import { Base as Imported } from './base'; const Saved = Imported;";
+
+    fn executable_class_demand(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> SourceClassImportDemand {
+        let bound = context.file(file).unwrap().1;
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ImportDeclaration)
+                    .then_some(node_ref(parsed, file, node))
+            })
+            .unwrap();
+        let import = super::super::source_imports::plan_top_level_named_value_import(
+            &parsed.arena,
+            bound,
+            context.store(),
+            declaration,
+        )
+        .unwrap();
+        let [binding] = import.bindings.as_slice() else {
+            panic!("one real named import")
+        };
+        let read_node = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                (module_export_name(&parsed.arena, variable.name) == Some("Saved"))
+                    .then(|| node_ref(parsed, file, variable.initializer.unwrap()))
+            })
+            .unwrap();
+        let read = super::super::source_imports::plan_source_import_identifier_read(
+            &parsed.arena,
+            bound,
+            context.store(),
+            binding,
+            read_node,
+            &binding.local_text,
+            binding.alias_symbol,
+        )
+        .unwrap();
+        SourceClassImportDemand {
+            binding: binding.clone(),
+            read,
+        }
+    }
+
+    fn prepare_executable_class_import(
+        context: &mut CanonicalCheckerContext<'_>,
+        demand: &SourceClassImportDemand,
+    ) -> Result<
+        super::super::source_imports::PreparedSourceImportValue,
+        super::super::source_imports::SourceImportError,
+    > {
+        let host = DeclaredTypeHost::from_registry(
+            &context.store,
+            &context.files,
+            GlobalMergeCompletion::new(context.options.name_resolution),
+        )
+        .unwrap()
+        .with_module_resolutions(&context.module_resolutions);
+        let mut aliases = ProductionAliasTargetHost::from_registry(
+            &context.store,
+            &context.files,
+            &context.module_resolutions,
+        )
+        .unwrap();
+        let resolved = super::super::source_imports::resolve_source_import_binding(
+            &mut context.store,
+            &mut aliases,
+            &demand.binding,
+        )?;
+        super::super::source_imports::prepare_source_import_value(
+            &mut context.store,
+            &host,
+            &context.global_types,
+            context.options,
+            &mut context.instantiation_session,
+            &mut context.diagnostics,
+            &resolved,
+            &demand.read,
+        )
+    }
+
+    fn preflight_executable_class_import(
+        context: &CanonicalCheckerContext<'_>,
+        prepared: &super::super::source_imports::PreparedSourceImportValue,
+    ) -> Result<
+        Vec<super::super::source_imports::PreparedSourceImportPublication>,
+        super::super::source_imports::SourceImportError,
+    > {
+        let host = DeclaredTypeHost::from_registry(
+            &context.store,
+            &context.files,
+            GlobalMergeCompletion::new(context.options.name_resolution),
+        )
+        .unwrap()
+        .with_module_resolutions(&context.module_resolutions);
+        super::super::source_imports::preflight_prepared_source_import_publications_with_context(
+            context.store(),
+            &host,
+            &context.global_types,
+            context.options,
+            std::slice::from_ref(prepared),
+        )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Recheck the same import, manifest, target, and final batch before restoring them.
+    fn executable_class_import_publication_rechecks_manifest_target_and_value() {
+        use crate::semantic::{
+            ValueSymbolLinks,
+            source_imports::{SourceImportError, SourceImportInvariant},
+        };
+
+        let provider = parsed(EXECUTABLE_IMPORT_BASE);
+        let other = parsed(EXECUTABLE_IMPORT_BASE);
+        let consumer = parsed(EXECUTABLE_IMPORT_READ);
+        let [provider_file, other_file, consumer_file] =
+            [202_972, 202_973, 202_974].map(FileId::new);
+        let files = [
+            (provider_file, &provider),
+            (other_file, &other),
+            (consumer_file, &consumer),
+        ];
+        let specifier = node_ref(&consumer, consumer_file, module_specifiers(&consumer)[0]);
+        let mut context = external_context(
+            &files,
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(specifier, esm(provider_file)),
+            ]),
+        );
+        let demand = executable_class_demand(&context, &consumer, consumer_file);
+        let plan = context
+            .resolve_source_class_import_demand(&demand)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan.owner.symbol,
+            direct_export(&context, provider_file, "Base")
+        );
+        assert_eq!(
+            plan.owner.source,
+            context.source_file(provider_file).unwrap()
+        );
+        assert!(prepare_executable_class_import(&mut context, &demand).is_err());
+        assert!(
+            context
+                .store()
+                .value_symbol_links(demand.binding.alias_symbol)
+                .is_none()
+        );
+        context.check_source_file(provider_file).unwrap();
+        let prepared = prepare_executable_class_import(&mut context, &demand).unwrap();
+        let publication = preflight_executable_class_import(&context, &prepared).unwrap();
+        let instance = context
+            .store()
+            .declared_type_links(plan.owner.symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_ne!(prepared.type_, instance);
+        assert_eq!(
+            prepared.type_,
+            context
+                .store()
+                .value_symbol_links(plan.owner.symbol)
+                .unwrap()
+                .resolved_type
+                .unwrap()
+        );
+        assert!(
+            context
+                .store()
+                .value_symbol_links(demand.binding.alias_symbol)
+                .is_none()
+        );
+        assert!(context.store().type_node_links(demand.read.node).is_none());
+        let other_owner = direct_export(&context, other_file, "Base");
+        let alias_links = context
+            .store()
+            .alias_symbol_links(demand.binding.alias_symbol)
+            .unwrap()
+            .clone();
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+                context
+                    .store()
+                    .alias_symbol_links(demand.binding.alias_symbol)
+                    .cloned(),
+                context
+                    .store()
+                    .value_symbol_links(demand.binding.alias_symbol)
+                    .cloned(),
+                context.store().type_node_links(demand.read.node).cloned(),
+                context.store().source_class_provenance(instance).cloned(),
+                context.diagnostics().clone(),
+            )
+        };
+        for missing in [true, false] {
+            let wrong = if missing {
+                CanonicalModuleResolutionManifest::unavailable()
+            } else {
+                validate_module_resolution_manifest(
+                    CanonicalModuleResolutionManifestInput::new([
+                        CanonicalModuleResolutionEntry::resolved(specifier, esm(other_file)),
+                    ]),
+                    context.store().symbol_store(),
+                    files.iter().map(|(file, parsed)| {
+                        (*file, &parsed.arena, context.file(*file).unwrap().1)
+                    }),
+                )
+                .unwrap()
+            };
+            let correct = std::mem::replace(&mut context.module_resolutions, wrong);
+            let before = snapshot(&context);
+            for _ in 0..2 {
+                assert!(preflight_executable_class_import(&context, &prepared).is_err());
+                assert_eq!(snapshot(&context), before);
+            }
+            context.module_resolutions = correct;
+            assert_eq!(
+                preflight_executable_class_import(&context, &prepared),
+                Ok(publication.clone())
+            );
+        }
+        for change in 0..2 {
+            let mut changed = alias_links.clone();
+            if change == 0 {
+                changed.immediate_target = Some(other_owner);
+            } else {
+                changed.alias_target = AliasTargetState::Resolved(other_owner);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_alias_symbol_links(demand.binding.alias_symbol, changed)
+            );
+            let before = snapshot(&context);
+            for _ in 0..2 {
+                assert!(preflight_executable_class_import(&context, &prepared).is_err());
+                assert_eq!(snapshot(&context), before);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_alias_symbol_links(demand.binding.alias_symbol, alias_links.clone())
+            );
+        }
+        let mut wrong_value = prepared.clone();
+        wrong_value.type_ = instance;
+        assert_eq!(
+            preflight_executable_class_import(&context, &wrong_value),
+            Err(SourceImportError::Invariant(
+                SourceImportInvariant::PreparedStateChanged(demand.binding.alias_symbol)
+            ))
+        );
+        let value_links = ValueSymbolLinks {
+            resolved_type: Some(instance),
+            ..ValueSymbolLinks::default()
+        };
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(demand.binding.alias_symbol, value_links)
+        );
+        let before = snapshot(&context);
+        assert!(preflight_executable_class_import(&context, &prepared).is_err());
+        assert_eq!(snapshot(&context), before);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(demand.binding.alias_symbol, ValueSymbolLinks::default())
+        );
+        assert_eq!(
+            preflight_executable_class_import(&context, &prepared),
+            Ok(publication)
+        );
+        context.check_source_file(consumer_file).unwrap();
+        let warm = snapshot(&context);
+        for _ in 0..2 {
+            context.recheck_source_file(consumer_file).unwrap();
+            assert_eq!(snapshot(&context), warm);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // A real later provider failure must not grant its already completed class externally.
+    fn executable_class_provider_failure_keeps_completed_class_and_diagnostics_private() {
+        let provider = parsed(&format!(
+            concat!(
+                "interface Matcher {{ m<T extends string>(value: T): T; m<T extends number>(value: T): T; m(left: boolean, right: boolean): boolean; }} ",
+                "declare const matcher: Matcher; {} const wrong: string = 0; const bad = matcher.m(true);",
+            ),
+            EXECUTABLE_IMPORT_BASE
+        ));
+        let consumer = parsed(EXECUTABLE_IMPORT_READ);
+        let [provider_file, consumer_file] = [202_975, 202_976].map(FileId::new);
+        let mut context = external_context(
+            &[(provider_file, &provider), (consumer_file, &consumer)],
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&consumer, consumer_file, module_specifiers(&consumer)[0]),
+                    esm(provider_file),
+                ),
+            ]),
+        );
+        let demand = executable_class_demand(&context, &consumer, consumer_file);
+        let owner = direct_export(&context, provider_file, "Base");
+        let call = provider
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallExpression).then_some(node_ref(
+                    &provider,
+                    provider_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let expected = SourceCheckError::Call(call);
+        let provider_source = context.source_file(provider_file).unwrap();
+        let consumer_source = context.source_file(consumer_file).unwrap();
+        assert_eq!(context.check_source_file(consumer_file), Err(expected));
+        let host = DeclaredTypeHost::from_registry(
+            &context.store,
+            &context.files,
+            GlobalMergeCompletion::new(context.options.name_resolution),
+        )
+        .unwrap()
+        .with_module_resolutions(&context.module_resolutions);
+        assert!(
+            super::super::classes::completed_source_class_members(context.store(), &host, owner,)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !context
+                .store()
+                .source_file_links(provider_source)
+                .is_some_and(|links| links.type_checked)
+        );
+        assert!(
+            !context
+                .store()
+                .source_file_links(consumer_source)
+                .is_some_and(|links| links.type_checked)
+        );
+        assert!(
+            context
+                .store()
+                .value_symbol_links(demand.binding.alias_symbol)
+                .is_none()
+        );
+        assert!(context.diagnostics().is_empty());
+        let [diagnostic] = context
+            .source_diagnostic_staging
+            .get(&provider_source)
+            .unwrap()
+            .as_slice()
+        else {
+            panic!("one private provider diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(diagnostic.node.unwrap().file, provider_file);
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+                context
+                    .store()
+                    .source_class_provenance_for_symbol(owner)
+                    .cloned(),
+                context
+                    .store()
+                    .value_symbol_links(demand.binding.alias_symbol)
+                    .cloned(),
+                context.store().source_file_links(provider_source).cloned(),
+                context.store().source_file_links(consumer_source).cloned(),
+                context.source_diagnostic_staging.clone(),
+                context.diagnostics().clone(),
+            )
+        };
+        let failed = snapshot(&context);
+        for _ in 0..2 {
+            assert!(prepare_executable_class_import(&mut context, &demand).is_err());
+            assert_eq!(context.check_source_file(consumer_file), Err(expected));
+            assert_eq!(snapshot(&context), failed);
+        }
+    }
+
+    #[test]
+    fn executable_class_imports_keep_the_real_public_constructor_overload_set() {
+        let provider = parsed(concat!(
+            "export class Base { constructor(value: number); constructor(value: string); ",
+            "constructor(value: number | string) {} read() { return 1; } }",
+        ));
+        let consumer = parsed(EXECUTABLE_IMPORT_READ);
+        let [provider_file, consumer_file] = [202_977, 202_978].map(FileId::new);
+        let mut context = external_context(
+            &[(provider_file, &provider), (consumer_file, &consumer)],
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&consumer, consumer_file, module_specifiers(&consumer)[0]),
+                    esm(provider_file),
+                ),
+            ]),
+        );
+        let demand = executable_class_demand(&context, &consumer, consumer_file);
+        context.check_source_file(consumer_file).unwrap();
+        let owner = direct_export(&context, provider_file, "Base");
+        let members = context.get_nongeneric_class_members(owner).unwrap();
+        let value = context
+            .store()
+            .value_symbol_links(demand.binding.alias_symbol)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(value, members.shells().value_type());
+        let TypeData::Object(data) = context.store().type_payload(value).unwrap().data() else {
+            panic!("constructor value")
+        };
+        let signatures = data.structured.signatures.clone().unwrap();
+        assert_eq!(data.structured.call_signature_count, 0);
+        assert_eq!(signatures.len(), 2);
+        assert_eq!(members.default_construct_signature(), signatures[0]);
+        let mut constructors = provider
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::ConstructorDeclaration(constructor) = &record.data else {
+                    return None;
+                };
+                Some((
+                    node_ref(&provider, provider_file, node),
+                    constructor.body.is_some(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        constructors.sort_by_key(|(node, _)| provider.arena.get(node.node).unwrap().range.start);
+        let [first, second, implementation] = constructors.as_slice() else {
+            panic!("two rows and their implementation")
+        };
+        assert!(!first.1 && !second.1 && implementation.1);
+        for (&signature, declaration) in signatures.iter().zip([first.0, second.0]) {
+            let record = context.store().signature(signature).unwrap();
+            assert_eq!(record.declaration(), Some(declaration));
+            assert_eq!(
+                record.resolved_return_type(),
+                Some(members.shells().instance_type())
+            );
+            assert_eq!(record.parameters().len(), 1);
+            assert_eq!(record.min_argument_count(), 1);
+            assert!(record.type_parameters().is_empty());
+        }
+        let implementation_signature = context
+            .store()
+            .signature_links(implementation.0)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        assert!(!signatures.contains(&implementation_signature));
+        let counts = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+        );
+        for _ in 0..2 {
+            context.recheck_source_file(consumer_file).unwrap();
+            context.recheck_source_file(provider_file).unwrap();
+            assert_eq!(
+                context.get_nongeneric_class_members(owner),
+                Ok(members.clone())
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len()
+                ),
+                counts
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The cold provider and the warm value reader share the caller's real budget.
+    fn executable_class_imports_keep_provider_limits_and_the_spent_value_caller() {
+        use crate::semantic::{
+            array_types::CanonicalArrayTargets,
+            instantiate::{InstantiationError, instantiate_type_with_vector_and_session},
+        };
+
+        let provider = parsed(&format!(
+            "declare function keep<T>(value: T): T; {EXECUTABLE_IMPORT_BASE} const result = keep(1);",
+        ));
+        let consumer = parsed(EXECUTABLE_IMPORT_READ);
+        let [provider_file, consumer_file] = [202_979, 202_980].map(FileId::new);
+        let mut context = external_context(
+            &[(provider_file, &provider), (consumer_file, &consumer)],
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&consumer, consumer_file, module_specifiers(&consumer)[0]),
+                    esm(provider_file),
+                ),
+            ]),
+        );
+        let demand = executable_class_demand(&context, &consumer, consumer_file);
+        let call = provider
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallExpression).then_some(node_ref(
+                    &provider,
+                    provider_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let function = provider
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(node_ref(
+                    &provider,
+                    provider_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let keep = context
+            .file(provider_file)
+            .unwrap()
+            .1
+            .symbol(function)
+            .unwrap();
+        context.instantiation_session = InstantiationSession::new(InstantiationLimits {
+            max_count: 0,
+            ..InstantiationLimits::default()
+        });
+        let expected = SourceCheckError::Call(call);
+        for _ in 0..2 {
+            let mark = context.instantiation_session.limit_event_mark();
+            assert_eq!(context.check_source_file(consumer_file), Err(expected));
+            assert!(
+                context
+                    .instantiation_session
+                    .limit_event_occurred_since(mark)
+            );
+            assert_eq!(
+                (
+                    context.instantiation_session.query_count(),
+                    context.instantiation_session.total_count()
+                ),
+                (0, 0)
+            );
+            for file in [provider_file, consumer_file] {
+                assert!(
+                    !context
+                        .store()
+                        .source_file_links(context.source_file(file).unwrap())
+                        .is_some_and(|links| links.type_checked)
+                );
+            }
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(demand.binding.alias_symbol)
+                    .is_none()
+            );
+            assert!(context.store().type_node_links(call).is_none());
+            assert!(context.store().signature_links(call).is_none());
+            assert!(context.diagnostics().is_empty());
+        }
+        context.instantiation_session = InstantiationSession::new(InstantiationLimits::default());
+        context.check_source_file(consumer_file).unwrap();
+        assert!(context.instantiation_session.total_count() > 0);
+        let prepared = prepare_executable_class_import(&mut context, &demand).unwrap();
+        let counts = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.instantiation_session.total_count(),
+        );
+        for _ in 0..2 {
+            context.recheck_source_file(consumer_file).unwrap();
+            context.recheck_source_file(provider_file).unwrap();
+            assert_eq!(
+                prepare_executable_class_import(&mut context, &demand),
+                Ok(prepared.clone())
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.instantiation_session.total_count()
+                ),
+                counts
+            );
+        }
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(keep)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let parameter = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .type_parameters()[0];
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let arrays = CanonicalArrayTargets::from_global_types(context.global_types());
+        context.instantiation_session = InstantiationSession::new(InstantiationLimits {
+            max_count: 1,
+            ..InstantiationLimits::default()
+        });
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                &mut context.store,
+                parameter,
+                &[parameter],
+                &[number],
+                Some(arrays),
+                &mut context.instantiation_session,
+            ),
+            Ok(number)
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                prepare_executable_class_import(&mut context, &demand),
+                Ok(prepared.clone())
+            );
+            preflight_executable_class_import(&context, &prepared).unwrap();
+            assert_eq!(
+                (
+                    context.instantiation_session.query_count(),
+                    context.instantiation_session.total_count(),
+                    context.instantiation_session.limit_event_count()
+                ),
+                (1, 1, 0)
+            );
+        }
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                &mut context.store,
+                parameter,
+                &[parameter],
+                &[number],
+                Some(arrays),
+                &mut context.instantiation_session,
+            ),
+            Err(InstantiationError::CountLimit { count: 1, limit: 1 })
+        );
+        assert_eq!(
+            (
+                context.instantiation_session.query_count(),
+                context.instantiation_session.total_count(),
+                context.instantiation_session.limit_event_count()
+            ),
+            (1, 1, 1)
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The imported base keeps separate lexical, constructor, and instance caches.
+    fn executable_class_heritage_rechecks_its_alias_and_both_type_roles() {
+        use crate::semantic::{SymbolNodeLinks, TypeNodeLinks};
+
+        let provider = parsed(EXECUTABLE_IMPORT_BASE);
+        let consumer = parsed(concat!(
+            "import { Base as Imported } from './base'; ",
+            "export class Derived extends Imported { readAgain(): number { return this.value; } }",
+        ));
+        let [provider_file, consumer_file] = [202_981, 202_982].map(FileId::new);
+        let mut context = external_context(
+            &[(provider_file, &provider), (consumer_file, &consumer)],
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&consumer, consumer_file, module_specifiers(&consumer)[0]),
+                    esm(provider_file),
+                ),
+            ]),
+        );
+        let (wrapper, expression) = consumer
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ExpressionWithTypeArguments(data) = &record.data else {
+                    return None;
+                };
+                Some((
+                    node_ref(&consumer, consumer_file, node),
+                    node_ref(&consumer, consumer_file, data.expression),
+                ))
+            })
+            .unwrap();
+        let alias = alias_symbol(
+            &context,
+            alias_declaration_named(&consumer, consumer_file, "Imported"),
+        );
+        let base = direct_export(&context, provider_file, "Base");
+        let derived = direct_export(&context, consumer_file, "Derived");
+        context.check_source_file(consumer_file).unwrap();
+        let members = context.get_nongeneric_class_members(derived).unwrap();
+        let base_members = context.get_nongeneric_class_members(base).unwrap();
+        let expression_symbol = context
+            .store()
+            .symbol_node_links(expression)
+            .unwrap()
+            .clone();
+        let expression_type = context.store().type_node_links(expression).unwrap().clone();
+        let wrapper_type = context.store().type_node_links(wrapper).unwrap().clone();
+        let alias_value = context.store().value_symbol_links(alias).unwrap().clone();
+        assert_eq!(expression_symbol.resolved_symbol, Some(alias));
+        assert_eq!(
+            expression_type.resolved_type,
+            Some(base_members.shells().value_type())
+        );
+        assert_eq!(
+            wrapper_type.resolved_type,
+            Some(base_members.shells().instance_type())
+        );
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().symbol_node_links(expression).cloned(),
+                context.store().type_node_links(expression).cloned(),
+                context.store().type_node_links(wrapper).cloned(),
+                context.store().value_symbol_links(alias).cloned(),
+                context
+                    .store()
+                    .source_class_provenance_for_symbol(derived)
+                    .cloned(),
+                context.diagnostics().clone(),
+            )
+        };
+        let warm = snapshot(&context);
+        for change in 0..4 {
+            let store = context.store_mut_for_test();
+            match change {
+                0 => assert!(store.set_symbol_node_links(
+                    expression,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(base)
+                    }
+                )),
+                1 => assert!(store.set_type_node_links(
+                    expression,
+                    TypeNodeLinks {
+                        resolved_type: Some(base_members.shells().instance_type()),
+                        ..expression_type.clone()
+                    }
+                )),
+                2 => assert!(store.set_type_node_links(
+                    wrapper,
+                    TypeNodeLinks {
+                        resolved_type: Some(base_members.shells().value_type()),
+                        ..wrapper_type.clone()
+                    }
+                )),
+                3 => assert!(store.set_value_symbol_links(
+                    alias,
+                    super::super::ValueSymbolLinks {
+                        resolved_type: Some(base_members.shells().instance_type()),
+                        ..alias_value.clone()
+                    }
+                )),
+                _ => unreachable!(),
+            }
+            let poisoned = snapshot(&context);
+            for _ in 0..2 {
+                let result = context.get_nongeneric_class_members(derived);
+                if change == 3 {
+                    assert_eq!(
+                        result,
+                        Err(ClassError::Invariant(
+                            super::super::classes::ClassInvariant::InvalidHeritage(expression)
+                        ))
+                    );
+                } else {
+                    assert!(result.is_err());
+                }
+                assert_eq!(snapshot(&context), poisoned);
+            }
+            let store = context.store_mut_for_test();
+            assert!(store.set_symbol_node_links(expression, expression_symbol.clone()));
+            assert!(store.set_type_node_links(expression, expression_type.clone()));
+            assert!(store.set_type_node_links(wrapper, wrapper_type.clone()));
+            assert!(store.set_value_symbol_links(alias, alias_value.clone()));
+            assert_eq!(
+                context.get_nongeneric_class_members(derived),
+                Ok(members.clone())
+            );
+            assert_eq!(snapshot(&context), warm);
+        }
+        let manifest = std::mem::replace(
+            &mut context.module_resolutions,
+            CanonicalModuleResolutionManifest::unavailable(),
+        );
+        assert!(context.get_nongeneric_class_members(derived).is_err());
+        assert_eq!(snapshot(&context), warm);
+        context.module_resolutions = manifest;
+        assert_eq!(context.get_nongeneric_class_members(derived), Ok(members));
+        assert_eq!(snapshot(&context), warm);
+    }
+
+    #[test]
+    fn executable_class_imports_do_not_treat_legacy_only_headers_as_source_completion() {
+        let provider = parsed("export class Base {}");
+        let consumer = parsed(EXECUTABLE_IMPORT_READ);
+        let [provider_file, consumer_file] = [202_983, 202_984].map(FileId::new);
+        let mut context = external_context(
+            &[(provider_file, &provider), (consumer_file, &consumer)],
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&consumer, consumer_file, module_specifiers(&consumer)[0]),
+                    esm(provider_file),
+                ),
+            ]),
+        );
+        let demand = executable_class_demand(&context, &consumer, consumer_file);
+        let owner = direct_export(&context, provider_file, "Base");
+        let expected = SourceCheckError::Unsupported(source::UnsupportedSourceSyntax::Import(
+            demand.read.node,
+        ));
+        for _ in 0..2 {
+            assert_eq!(context.check_source_file(consumer_file), Err(expected));
+            assert!(
+                context
+                    .store()
+                    .source_file_links(context.source_file(provider_file).unwrap())
+                    .unwrap()
+                    .type_checked
+            );
+            assert!(
+                !context
+                    .store()
+                    .source_file_links(context.source_file(consumer_file).unwrap())
+                    .is_some_and(|links| links.type_checked)
+            );
+            assert!(
+                context
+                    .store()
+                    .source_class_provenance_for_symbol(owner)
+                    .is_none()
+            );
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(owner)
+                    .unwrap()
+                    .resolved_type
+                    .is_some()
+            );
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(demand.binding.alias_symbol)
+                    .is_none()
+            );
+        }
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

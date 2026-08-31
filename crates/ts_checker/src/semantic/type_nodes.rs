@@ -124,7 +124,7 @@ use super::{
     template_types::{StringMappingKind, TemplateTypeError},
     tuple_type_nodes::{self, TupleTypeNodeError, TupleTypeNodePlan, validate_warm_tuple_elements},
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError, TupleTypeQueryPreparationError},
-    type_records::{CacheHashKey, StructuredTypeData, TypeData, TypeRecord},
+    type_records::{CacheHashKey, StructuredTypeData, TypeData, TypeParameterData, TypeRecord},
     types::{AccessFlags, ObjectFlags, TypeFlags},
 };
 

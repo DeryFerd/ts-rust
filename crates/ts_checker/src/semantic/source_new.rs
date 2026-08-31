@@ -6111,8 +6111,8 @@ fn validate_generic_new_instance(
     let GenericMethodCallSelection::Generic(selected) = &resolution.selected else {
         return Err(invalid());
     };
-    if selected.projection.callee != checked.value_type
-        || selected.projection.instantiation.signature != checked.signature
+    if selected.projection().callee != checked.value_type
+        || selected.projection().instantiation.signature != checked.signature
         || preflight_generic_class_constructor_signature(
             store,
             checked.value_type,
@@ -6120,7 +6120,7 @@ fn validate_generic_new_instance(
             targets,
         )
         .map_err(|error| generic_constructor_error(plan.node, error.into()))?
-            != selected.projection.generic_signature
+            != selected.projection().generic_signature
         || store
             .signature(checked.signature)
             .and_then(Signature::resolved_return_type)
@@ -6131,7 +6131,7 @@ fn validate_generic_new_instance(
     let reference =
         validate_direct_generic_reference(store, checked.instance_type).map_err(|_| invalid())?;
     if reference.target != origin
-        || reference.type_arguments != selected.projection.instantiation.type_arguments
+        || reference.type_arguments != selected.projection().instantiation.type_arguments
     {
         return Err(invalid());
     }
