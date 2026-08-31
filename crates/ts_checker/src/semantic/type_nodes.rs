@@ -36192,6 +36192,33 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(())
     }
 
+    /// Numeric operands stay deferred only with their complete source and interner proof.
+    fn numeric_conditional_operand_is_deferred(
+        &self,
+        type_: TypeId,
+    ) -> Result<bool, IntersectionTypeError> {
+        let Some(TypeData::Intersection(intersection)) =
+            self.store.type_payload(type_).map(TypeRecord::data)
+        else {
+            return Ok(false);
+        };
+        if !intersection.intersection.types.iter().any(|constituent| {
+            self.store
+                .type_payload(*constituent)
+                .is_some_and(|record| record.flags() == TypeFlags::NUMBER_LITERAL)
+        }) {
+            return Ok(false);
+        }
+        self.store
+            .validate_deferred_intersection_type_with_array_targets(
+                type_,
+                self.global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types),
+            )
+            .map(|_| true)
+    }
+
     fn conditional_branch_demand(
         &mut self,
         node: NodeRef,
@@ -36235,6 +36262,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if check_flags.intersects(deferred_flags)
             || extends_flags.intersects(deferred_flags) && !has_inference
         {
+            return Ok(ConditionalBranchDemand::Neither);
+        }
+        let numeric_check_deferred = self
+            .numeric_conditional_operand_is_deferred(check_type)
+            .map_err(|_| unsupported())?;
+        let numeric_extends_deferred = self
+            .numeric_conditional_operand_is_deferred(extends_type)
+            .map_err(|_| unsupported())?;
+        if numeric_check_deferred || numeric_extends_deferred && !has_inference {
             return Ok(ConditionalBranchDemand::Neither);
         }
         if let Some([check, extends]) = self.simple_conditional_tuple_plans(node)? {
@@ -57733,6 +57769,196 @@ mod tests {
         assert_regular_literal(&fixture.store, one, &LiteralValue::Number(Number::new(1.0)));
         assert_eq!(snapshot(&fixture.store), before);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Deferral must reject damaged proof without changing the caller or caches.
+    fn numeric_conditional_deferral_rejects_damaged_proofs_and_other_intersections() {
+        let mut fixture = fixture(concat!(
+            "type Choose<T> = 0 extends 1 & T ? true : false; ",
+            "type Both<U, V> = 1 & U extends 2 & V ? true : false; ",
+            "type Solid<Model> = { [Key in keyof Model]-?: Model[Key] }; ",
+            "type Other<Shape> = 0 extends (Shape & Solid<Shape>) ? true : false;",
+        ));
+        let choose_node = alias_parts(&fixture, "Choose").2;
+        let both_node = alias_parts(&fixture, "Both").2;
+        let other_node = alias_parts(&fixture, "Other").2;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let choose = query_node(&mut fixture, choose_node, &mut diagnostics).unwrap();
+        let both = query_node(&mut fixture, both_node, &mut diagnostics).unwrap();
+        let conditional_operands = |store: &CanonicalTypeMapperStore, type_| {
+            let TypeData::Conditional(conditional) = store.type_payload(type_).unwrap().data()
+            else {
+                panic!("the numeric source conditional must remain deferred")
+            };
+            (conditional.check_type, conditional.extends_type)
+        };
+        let (zero, numeric) = conditional_operands(&fixture.store, choose);
+        let (both_check, both_extends) = conditional_operands(&fixture.store, both);
+        let NodeData::ConditionalTypeNode(other) =
+            &fixture.parsed.arena.get(other_node.node).unwrap().data
+        else {
+            panic!("the source has a nonnumeric conditional")
+        };
+        let other_check = NodeRef::new(other_node.arena, other_node.file, other.check_type);
+        let other_extends = NodeRef::new(other_node.arena, other_node.file, other.extends_type);
+        assert_eq!(
+            query_node(&mut fixture, other_check, &mut diagnostics),
+            Ok(zero)
+        );
+        let nonnumeric = query_node(&mut fixture, other_extends, &mut diagnostics).unwrap();
+        fixture
+            .store
+            .validate_deferred_intersection_type(nonnumeric)
+            .unwrap();
+        let projection = fixture
+            .store
+            .numeric_parameter_intersection_projection(numeric)
+            .unwrap()
+            .unwrap();
+        let [_, parameter] = projection.types.as_slice() else {
+            panic!("the source intersection has its numeric literal and parameter")
+        };
+        let parameter_owner =
+            cached_ordinary_type_parameter_owner(&fixture.store, *parameter).unwrap();
+        let owner = fixture.store.symbol(parameter_owner).unwrap();
+        let original_declarations = owner.declarations().unwrap().to_vec();
+        let original_value_declaration = owner.value_declaration();
+        let foreign = named_node(&fixture, SyntaxKind::TypeParameter, "U");
+        assert!(
+            !fixture
+                .store
+                .source_declaration_belongs_to_symbol(foreign, parameter_owner)
+        );
+        let nodes = fixture
+            .parsed
+            .arena
+            .iter()
+            .map(|(node, _)| NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+            .collect::<Vec<_>>();
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 0,
+            max_count: 0,
+        });
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let snapshot = |query: &CanonicalTypeQuery<'_, '_, '_, '_>| {
+            let store = &query.store;
+            let session = query.instantiation_session.as_deref().unwrap();
+            (
+                union_state(store),
+                store.conditional_root_len(),
+                store.relation_state_snapshot(),
+                store.intersection_types.clone(),
+                store.intersection_keys_by_type.clone(),
+                nodes
+                    .iter()
+                    .map(|&node| {
+                        (
+                            node,
+                            store.type_node_links(node).cloned(),
+                            store.symbol_node_links(node).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                store
+                    .symbol(parameter_owner)
+                    .unwrap()
+                    .declarations()
+                    .unwrap()
+                    .to_vec(),
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count(),
+                ),
+                query.diagnostics.clone(),
+            )
+        };
+        let unsupported = |node| {
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node,
+                    kind: SyntaxKind::ConditionalType,
+                },
+            ))
+        };
+        let warm = snapshot(&query);
+        for _ in 0..2 {
+            assert_eq!(
+                query.conditional_branch_demand(choose_node, zero, numeric, false, false),
+                Ok(ConditionalBranchDemand::Neither)
+            );
+            assert_eq!(
+                query.conditional_branch_demand(both_node, both_check, both_extends, false, false),
+                Ok(ConditionalBranchDemand::Neither)
+            );
+            assert_eq!(
+                query.conditional_branch_demand(other_node, zero, nonnumeric, false, false),
+                unsupported(other_node)
+            );
+            assert_eq!(snapshot(&query), warm);
+        }
+
+        // A healthy check operand cannot hide a damaged extends operand.
+        let key = query
+            .store
+            .intersection_keys_by_type
+            .remove(&both_extends)
+            .unwrap();
+        let damaged = snapshot(&query);
+        for _ in 0..2 {
+            assert_eq!(
+                query.conditional_branch_demand(both_node, both_check, both_extends, false, false),
+                unsupported(both_node)
+            );
+            assert_eq!(snapshot(&query), damaged);
+        }
+        assert!(
+            query
+                .store
+                .intersection_keys_by_type
+                .insert(both_extends, key)
+                .is_none()
+        );
+        assert!(query.store.set_symbol_declarations(
+            parameter_owner,
+            Some(vec![foreign]),
+            original_value_declaration,
+        ));
+        let damaged = snapshot(&query);
+        for _ in 0..2 {
+            assert_eq!(
+                query.conditional_branch_demand(choose_node, zero, numeric, false, false),
+                unsupported(choose_node)
+            );
+            assert_eq!(snapshot(&query), damaged);
+        }
+        assert!(query.store.set_symbol_declarations(
+            parameter_owner,
+            Some(original_declarations),
+            original_value_declaration,
+        ));
+        assert_eq!(
+            query.conditional_branch_demand(choose_node, zero, numeric, false, false),
+            Ok(ConditionalBranchDemand::Neither)
+        );
+        assert_eq!(
+            query.conditional_branch_demand(both_node, both_check, both_extends, false, false),
+            Ok(ConditionalBranchDemand::Neither)
+        );
+        assert_eq!(snapshot(&query), warm);
+        assert!(query.diagnostics.is_empty());
     }
 
     #[test]
