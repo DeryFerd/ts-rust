@@ -7804,6 +7804,29 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                 }
             }
+            NodeData::ConditionalTypeNode(conditional)
+                if record.kind == SyntaxKind::ConditionalType =>
+            {
+                for child in [
+                    conditional.check_type,
+                    conditional.extends_type,
+                    conditional.true_type,
+                    conditional.false_type,
+                ] {
+                    let child = self.reference(child);
+                    if self.node(child)?.parent != Some(node.node) {
+                        unsupported.get_or_insert(node);
+                        continue;
+                    }
+                    self.collect_type_import_annotation_graph(
+                        root,
+                        child,
+                        visited,
+                        references,
+                        unsupported,
+                    )?;
+                }
+            }
             NodeData::UnionTypeNode(union) if record.kind == SyntaxKind::UnionType => {
                 if union.types.nodes.len() < 2 || union.types.has_trailing_comma {
                     unsupported.get_or_insert(node);
@@ -23190,6 +23213,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     expression,
                     &name,
                 );
+                let global_this_type = match (&variable_read, self.global_types) {
+                    (
+                        Err(VariablePlanError::Unsupported(
+                            VariableUnsupported::NonVariableSymbol { node, symbol, .. },
+                        )),
+                        Some(global_types),
+                    ) if *node == expression => super::global_types::source_global_this_value_type(
+                        store,
+                        host,
+                        global_types,
+                        *symbol,
+                    )?,
+                    _ => None,
+                };
                 let type_import_alias = store
                     .symbol_node_links(expression)
                     .and_then(|links| links.resolved_symbol)
@@ -23324,6 +23361,34 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         PlannedExpressionKind::Identifier(PlannedIdentifierRead::unresolved(
                             bootstrap.unknown_symbol,
                         ))
+                    }
+                    Err(VariablePlanError::Unsupported(
+                        VariableUnsupported::NonVariableSymbol { node, symbol, .. },
+                    )) if node == expression && global_this_type.is_some() => {
+                        let type_ = global_this_type
+                            .expect("the source global identity was proved before this match");
+                        preflight_source_expression_cache(store, expression, type_)?;
+                        if store
+                            .symbol_node_links(expression)
+                            .and_then(|links| links.resolved_symbol)
+                            .is_some_and(|cached| cached != symbol)
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidSymbolNodeCache {
+                                    node: expression,
+                                    cached: store
+                                        .symbol_node_links(expression)
+                                        .and_then(|links| links.resolved_symbol),
+                                    expected: symbol,
+                                },
+                            ));
+                        }
+                        self.uses_global_this = true;
+                        PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                            resolved_symbol: symbol,
+                            value_symbol: symbol,
+                            kind: PlannedIdentifierReadKind::DeclaredValue,
+                        })
                     }
                     Err(VariablePlanError::Unsupported(
                         VariableUnsupported::NonVariableSymbol {
@@ -33073,6 +33138,42 @@ fn check_expression_type_with_capture_context(
         publish_expression_type(store, expression.node, type_)?;
         return Ok(CheckedExpressionTypes::leaf(type_, type_));
     }
+    if let PlannedExpressionKind::Identifier(read) = &expression.kind
+        && read.kind == PlannedIdentifierReadKind::DeclaredValue
+        && host
+            .node(expression.node)
+            .is_some_and(|node| node.kind == SyntaxKind::Identifier)
+        && let Some(type_) = super::global_types::source_global_this_value_type(
+            store,
+            host,
+            global_types,
+            read.value_symbol,
+        )?
+    {
+        if read.resolved_symbol != read.value_symbol
+            || current_flow_types.get(&read.value_symbol) != Some(&type_)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::MissingCurrentFlowType(read.value_symbol),
+            ));
+        }
+        if store
+            .symbol_node_links(expression.node)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|cached| cached != read.resolved_symbol)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolNodeCache {
+                    node: expression.node,
+                    cached: store
+                        .symbol_node_links(expression.node)
+                        .and_then(|links| links.resolved_symbol),
+                    expected: read.resolved_symbol,
+                },
+            ));
+        }
+        preflight_source_expression_cache(store, expression.node, type_)?;
+    }
     match &expression.kind {
         PlannedExpressionKind::ImportMeta(plan) => {
             let type_ = super::source_meta::check_import_meta_property(
@@ -36731,14 +36832,32 @@ fn check_class_statements(
                     SourceFlowCondition::ClassPropertyTruthiness(_) => true,
                     _ => false,
                 };
-                if !snapshot_matches
-                    || !source_truthiness_condition_type_is_supported(
+                if !snapshot_matches {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Class(branch.flow.expression()),
+                    ));
+                }
+                let condition_proof = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                )?
+                .prepare_source_condition_type(checked.raw, checked.result)?;
+                let supported = if let Some(proof) = condition_proof {
+                    proof.validate_checked_types(checked.raw, checked.result)?;
+                    true
+                } else {
+                    source_truthiness_condition_type_is_supported(
                         store,
                         checked.result,
                         branch.condition.node,
                         &mut HashSet::new(),
                     )?
-                {
+                };
+                if !supported {
                     return Err(SourceCheckError::Unsupported(
                         UnsupportedSourceSyntax::Class(branch.flow.expression()),
                     ));
@@ -69311,15 +69430,16 @@ pub(super) fn check_source_file(
                     ))?;
                 if let Some(type_node) = variable.type_node {
                     let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
-                    let actual = CanonicalTypeQuery::new_with_global_types_and_session(
+                    let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
                         store,
                         host,
                         global_types,
                         options,
                         session,
                         &mut annotation_diagnostics,
-                    )?
-                    .get_type_from_type_node(type_node)?;
+                    )?;
+                    query.check_type_node_declaration_children(type_node)?;
+                    let actual = query.get_type_from_type_node(type_node)?;
                     merge_retry_diagnostics(diagnostics, annotation_diagnostics);
                     check_variable_redeclaration_type(
                         store,
@@ -69671,19 +69791,20 @@ pub(super) fn check_source_file(
                                 type_import_capabilities
                                     .get(&type_node)
                                     .map_or(&[], Vec::as_slice);
-                            let declared_type =
-                                CanonicalTypeQuery::new_with_global_types_and_session(
-                                    store,
-                                    host,
-                                    global_types,
-                                    options,
-                                    session,
-                                    &mut annotation_diagnostics,
-                                )?
-                                .with_type_reference_alias_targets(
-                                    type_reference_alias_targets.iter().copied(),
-                                )?
-                                .get_type_from_type_node(type_node);
+                            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                session,
+                                &mut annotation_diagnostics,
+                            )?
+                            .with_type_reference_alias_targets(
+                                type_reference_alias_targets.iter().copied(),
+                            )?;
+                            let declared_type = query
+                                .check_type_node_declaration_children(type_node)
+                                .and_then(|()| query.get_type_from_type_node(type_node));
                             merge_retry_diagnostics(diagnostics, annotation_diagnostics);
                             let declared_type = declared_type?;
                             (declared_type, declared_type)

@@ -46,21 +46,26 @@ use super::{
         class_member_visibility, source_constructor_base_property_is_exact,
         validate_class_heritage_members, validated_class_derives_from,
     },
-    declared::cached_ordinary_type_parameter_owner,
+    declared::{DeclaredTypeError, cached_ordinary_type_parameter_owner},
     derived_types::DerivedObjectLiteralValidation,
     enums,
     generic_calls::{
         GenericCallVectorError, GenericCallVectorInvariant, GenericCallVectorUnsupported,
         instantiate_generic_signature_in_context_of,
     },
+    global_types::{GlobalThisMembers, is_global_this_type_candidate},
     ids::{IndexInfoId, SignatureId, TypeId},
     indexed_access_types::{is_template_pattern_index_key, template_pattern_index_matches_name},
-    instantiate::{InstantiationLimits, InstantiationSession},
+    instantiate::{InstantiationLimitEventMark, InstantiationLimits, InstantiationSession},
     instantiated_members::{
         GenericInterfaceMemberError, class_reference_field_target,
         demand_instantiated_property_type, resolve_members_with_array_targets_and_session,
         validate_generic_interface_members,
         validate_property_object_alias_members_with_array_targets,
+    },
+    interface_heritage::{
+        SourceInterfaceAliasBaseState, SourceInterfaceHeritageQueryContext,
+        source_interface_alias_base_state, validate_source_interface_heritage_header,
     },
     intersection_types::IntersectionTypeProjection,
     links::{MembersOrExportsResolutionKind, TypeNodeLinks, ValueSymbolLinks},
@@ -68,7 +73,7 @@ use super::{
         FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers,
         ResolvedMappedTypeMembers,
     },
-    mapper::TypeMapper,
+    mapper::{CanonicalTypeMapperStore, TypeMapper},
     object_aliases::source_property_object_projection,
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
@@ -86,13 +91,16 @@ use super::{
     source_overloads::source_overload_signature_type_query,
     store::{RelationObservationToken, SemanticStore, SourceNodeParent},
     structured_members::{
-        InterfaceHeritageMembersValidation, inherited_generic_property_reference,
-        validate_interface_heritage_members_with_array_targets,
+        InterfaceHeritageMembersValidation,
+        inherited_generic_property_reference_with_query_context,
+        validate_interface_heritage_members_with_query_context,
         validate_planned_interface_heritage_members,
     },
     template_types::StringMappingKind,
     tuple_types::{CanonicalTupleTypeRequest, TupleShape, TupleTypeError},
-    type_nodes::SourceCallableTypeQueryEvidence,
+    type_nodes::{
+        GlobalThisMemberValueProof, SourceCallableTypeQueryEvidence, SourceSignatureReturnProof,
+    },
     type_records::{
         CacheHashKey, ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord,
     },
@@ -163,6 +171,29 @@ pub enum RelationUnavailable {
     UnresolvedPropertyType(SemanticSymbolId),
     StrictOptionalProperty(SemanticSymbolId),
     UnresolvedGlobalObject(SemanticSymbolId),
+    GlobalThisMembersDemand {
+        receiver: TypeId,
+    },
+    GlobalThisValueDemand {
+        receiver: TypeId,
+        member: SemanticSymbolId,
+    },
+    SourceInterfaceHeaderDemand {
+        receiver: TypeId,
+    },
+    SourceInterfaceAliasDemand {
+        receiver: TypeId,
+        alias: SemanticSymbolId,
+        root: NodeRef,
+    },
+    SourceSignatureReturnDemand {
+        source: TypeId,
+        source_signature: SignatureId,
+        target: TypeId,
+        target_signature: SignatureId,
+        signature: SignatureId,
+        global_member: Option<(TypeId, SemanticSymbolId, TypeId)>,
+    },
     CanonicalGlobalType(CanonicalGlobalTypeInitializationError),
     UnavailableCanonicalArrayTarget(TypeId),
     MalformedCanonicalArrayReference(TypeId),
@@ -310,6 +341,35 @@ impl std::fmt::Display for RelationUnavailable {
                 formatter,
                 "global Object symbol {symbol:?} has no resolved declared object type"
             ),
+            Self::GlobalThisMembersDemand { receiver } => write!(
+                formatter,
+                "global object {receiver:?} requires current source member proof"
+            ),
+            Self::GlobalThisValueDemand { receiver, member } => write!(
+                formatter,
+                "global object {receiver:?} requires the current value query for {member:?}"
+            ),
+            Self::SourceInterfaceHeaderDemand { receiver } => write!(
+                formatter,
+                "interface {receiver:?} requires its current source member query"
+            ),
+            Self::SourceInterfaceAliasDemand {
+                receiver,
+                alias,
+                root,
+            } => write!(
+                formatter,
+                "interface {receiver:?} requires the current alias {alias:?} query at {root:?}"
+            ),
+            Self::SourceSignatureReturnDemand {
+                source,
+                target,
+                signature,
+                ..
+            } => write!(
+                formatter,
+                "signature {signature:?} requires current return proof for callable pair {source:?}, {target:?}"
+            ),
             Self::CanonicalGlobalType(error) => {
                 write!(
                     formatter,
@@ -338,14 +398,605 @@ impl std::fmt::Display for RelationUnavailable {
 
 impl std::error::Error for RelationUnavailable {}
 
+/// The actual global property being compared, not an earlier value demand.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct SourceSignatureGlobalMember {
+    receiver: TypeId,
+    member: SemanticSymbolId,
+    callable: TypeId,
+}
+
+impl SourceSignatureGlobalMember {
+    pub(super) const fn receiver(self) -> TypeId {
+        self.receiver
+    }
+
+    pub(super) const fn member(self) -> SemanticSymbolId {
+        self.member
+    }
+
+    pub(super) const fn callable(self) -> TypeId {
+        self.callable
+    }
+}
+
+/// One return read reached by the existing comparison of these exact callables.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct SourceSignatureReturnRequest {
+    source: TypeId,
+    source_signature: SignatureId,
+    target: TypeId,
+    target_signature: SignatureId,
+    signature: SignatureId,
+    global_member: Option<SourceSignatureGlobalMember>,
+}
+
+impl SourceSignatureReturnRequest {
+    pub(super) const fn source(self) -> TypeId {
+        self.source
+    }
+
+    pub(super) const fn source_signature(self) -> SignatureId {
+        self.source_signature
+    }
+
+    pub(super) const fn target(self) -> TypeId {
+        self.target
+    }
+
+    pub(super) const fn target_signature(self) -> SignatureId {
+        self.target_signature
+    }
+
+    pub(super) const fn signature(self) -> SignatureId {
+        self.signature
+    }
+
+    pub(super) const fn global_member(self) -> Option<SourceSignatureGlobalMember> {
+        self.global_member
+    }
+
+    fn unavailable(self) -> RelationUnavailable {
+        RelationUnavailable::SourceSignatureReturnDemand {
+            source: self.source,
+            source_signature: self.source_signature,
+            target: self.target,
+            target_signature: self.target_signature,
+            signature: self.signature,
+            global_member: self
+                .global_member
+                .map(|origin| (origin.receiver, origin.member, origin.callable)),
+        }
+    }
+}
+
+/// Read-only source checks. The hint cannot grant a return query or a result.
+pub(super) trait SourceSignatureReturnQuery {
+    fn has_global_this_return_dependency(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        owner: TypeId,
+        signature: SignatureId,
+    ) -> bool;
+
+    fn signature_return_is_eligible(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        request: SourceSignatureReturnRequest,
+        origin: Option<&GlobalThisMemberValueProof>,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+    ) -> Result<bool, DeclaredTypeError>;
+}
+
+/// Source work requested by the existing relation worker runs after its store
+/// observation closes. Implementations keep the current query and caller.
+pub(super) trait GlobalThisRelationSource {
+    type Error;
+
+    fn global_this_members(&self) -> Option<&GlobalThisMembers<'_, '_>>;
+
+    fn prepare_global_this_members(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        receiver: TypeId,
+        session: &mut InstantiationSession,
+    ) -> Result<(), Self::Error>;
+
+    fn resolve_global_this_member(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        receiver: TypeId,
+        member: SemanticSymbolId,
+        session: &mut InstantiationSession,
+    ) -> Result<GlobalThisMemberValueProof, Self::Error>;
+
+    fn validate_global_this_member_value_proof(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        proof: &GlobalThisMemberValueProof,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+    ) -> Result<(), Self::Error>;
+
+    fn source_signature_return_query(&self) -> Option<&dyn SourceSignatureReturnQuery> {
+        None
+    }
+
+    fn resolve_source_signature_return(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        request: SourceSignatureReturnRequest,
+        origin: Option<&GlobalThisMemberValueProof>,
+        session: &mut InstantiationSession,
+    ) -> Result<SourceSignatureReturnProof, Self::Error>;
+
+    fn validate_source_signature_return_proof(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        proof: &SourceSignatureReturnProof,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+    ) -> Result<(), Self::Error>;
+
+    fn source_interface_heritage_query_context(
+        &self,
+    ) -> Option<SourceInterfaceHeritageQueryContext<'_>> {
+        None
+    }
+
+    fn prepare_source_interface_heritage(
+        &mut self,
+        _store: &mut CanonicalTypeMapperStore,
+        _request: SourceInterfaceHeritageRequest,
+        _session: &mut InstantiationSession,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum SourceInterfaceHeritageRequest {
+    Header {
+        receiver: TypeId,
+    },
+    Alias {
+        receiver: TypeId,
+        alias: SemanticSymbolId,
+        root: NodeRef,
+    },
+}
+
+impl SourceInterfaceHeritageRequest {
+    fn receiver(self) -> TypeId {
+        match self {
+            Self::Header { receiver } | Self::Alias { receiver, .. } => receiver,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceRelationError<SourceError> {
+    Relation(RelationUnavailable),
+    Source(SourceError),
+}
+
+/// Only values and returns reached by this completed comparison enter the result.
+pub(super) struct SourceRelationResult {
+    related: bool,
+    member_values: Vec<GlobalThisMemberValueProof>,
+    signature_returns: Vec<SourceSignatureReturnProof>,
+}
+
+impl SourceRelationResult {
+    pub(super) const fn related(&self) -> bool {
+        self.related
+    }
+
+    pub(super) fn into_member_values(self) -> Vec<GlobalThisMemberValueProof> {
+        self.member_values
+    }
+
+    pub(super) fn into_proofs(
+        self,
+    ) -> (
+        Vec<GlobalThisMemberValueProof>,
+        Vec<SourceSignatureReturnProof>,
+    ) {
+        (self.member_values, self.signature_returns)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GlobalThisRelationContext<'query> {
+    globals: &'query CanonicalGlobalTypes,
+    members: Option<&'query GlobalThisMembers<'query, 'query>>,
+    member_values: &'query [GlobalThisMemberValueProof],
+    signature_returns: &'query [SourceSignatureReturnProof],
+    signature_return_query: Option<&'query dyn SourceSignatureReturnQuery>,
+    limit_mark: InstantiationLimitEventMark,
+    heritage: Option<SourceInterfaceHeritageQueryContext<'query>>,
+}
+
+impl<'query> GlobalThisRelationContext<'query> {
+    fn members(
+        self,
+        store: &CanonicalTypeMapperStore,
+        receiver: TypeId,
+    ) -> Result<&'query GlobalThisMembers<'query, 'query>, RelationUnavailable> {
+        if receiver != self.globals.global_this_value_type {
+            return Err(RelationUnavailable::UnsupportedStructuredType(receiver));
+        }
+        let members = self
+            .members
+            .ok_or(RelationUnavailable::GlobalThisMembersDemand { receiver })?;
+        if members.receiver() != receiver {
+            return Err(RelationUnavailable::InvalidStructuredMembers(receiver));
+        }
+        members.validate(store).map_err(|error| {
+            RelationUnavailable::CanonicalGlobalType(
+                CanonicalGlobalTypeInitializationError::DeclaredType(error),
+            )
+        })?;
+        Ok(members)
+    }
+
+    fn signature_return_origin(
+        self,
+        store: &CanonicalTypeMapperStore,
+        request: SourceSignatureReturnRequest,
+    ) -> Result<Option<&'query GlobalThisMemberValueProof>, RelationUnavailable> {
+        let Some(origin) = request.global_member else {
+            return Ok(None);
+        };
+        let invalid = || RelationUnavailable::UnsupportedProperty(origin.member);
+        if origin.callable != request.source && origin.callable != request.target {
+            return Err(invalid());
+        }
+        let member = self
+            .members(store, origin.receiver)?
+            .member(origin.member)
+            .ok_or_else(invalid)?;
+        let proof = self
+            .member_values
+            .iter()
+            .find(|proof| {
+                proof.receiver() == origin.receiver
+                    && proof.member() == origin.member
+                    && proof.type_id() == origin.callable
+            })
+            .ok_or_else(invalid)?;
+        if store
+            .value_symbol_links(member.symbol())
+            .and_then(|links| links.resolved_type)
+            != Some(origin.callable)
+        {
+            return Err(invalid());
+        }
+        Ok(Some(proof))
+    }
+}
+
+fn append_global_this_property_edges(
+    store: &CanonicalTypeMapperStore,
+    properties: impl IntoIterator<Item = SemanticSymbolId>,
+    types: &mut Vec<TypeId>,
+) {
+    for property in properties {
+        types.extend(
+            store
+                .value_symbol_links(property)
+                .and_then(|links| links.resolved_type),
+        );
+    }
+}
+
+fn append_global_this_table_edges(
+    store: &CanonicalTypeMapperStore,
+    table: Option<SymbolTableId>,
+    types: &mut Vec<TypeId>,
+) {
+    if let Some(table) = table.and_then(|table| store.symbol_table(table)) {
+        append_global_this_property_edges(store, table.iter().map(|(_, symbol)| symbol), types);
+    }
+}
+
+fn append_global_this_index_edges(
+    store: &CanonicalTypeMapperStore,
+    indexes: Option<&[IndexInfoId]>,
+    types: &mut Vec<TypeId>,
+) {
+    for index in indexes.into_iter().flatten() {
+        if let Some(index) = store.index_info(*index) {
+            types.extend([index.key_type(), index.value_type()]);
+        }
+    }
+}
+
+fn append_global_this_interface_edges(
+    store: &CanonicalTypeMapperStore,
+    interface: &super::type_records::InterfaceTypeData,
+    types: &mut Vec<TypeId>,
+    signatures: &mut Vec<SignatureId>,
+) {
+    types.extend(interface.reference.object.target);
+    types.extend(interface.reference.resolved_type_arguments.iter().flatten());
+    types.extend(interface.all_type_parameters.iter().flatten());
+    types.extend(interface.this_type);
+    types.extend(interface.resolved_base_constructor_type);
+    types.extend(interface.resolved_base_types.iter().flatten());
+    append_global_this_table_edges(store, interface.declared_members, types);
+    signatures.extend(interface.declared_call_signatures.iter().flatten());
+    signatures.extend(interface.declared_construct_signatures.iter().flatten());
+    append_global_this_index_edges(store, interface.declared_index_infos.as_deref(), types);
+}
+
+/// This walk only detects source authority needed by a shortcut. It reads
+/// populated edges, stops at globalThis, and never resolves a member value or
+/// visits an unrelated instantiation-cache entry.
+#[allow(clippy::too_many_lines)] // Read populated type and signature edges in one pass.
+fn validate_global_this_relation_inputs(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    global_this_hint: Option<TypeId>,
+    context: Option<GlobalThisRelationContext<'_>>,
+    require_complete_heritage: bool,
+) -> Result<bool, RelationUnavailable> {
+    let mut types = vec![target, source];
+    let mut signatures = Vec::new();
+    let mut seen_types = HashSet::new();
+    let mut seen_signatures = HashSet::new();
+    let mut depends_on_global_this = false;
+    loop {
+        if let Some(signature) = signatures.pop() {
+            if !seen_signatures.insert(signature) {
+                continue;
+            }
+            if let Some(signature) = store.signature(signature) {
+                types.extend(signature.type_parameters());
+                types.extend(signature.resolved_return_type());
+                types.extend(signature.isolated_signature_type());
+                append_global_this_property_edges(
+                    store,
+                    signature
+                        .parameters()
+                        .iter()
+                        .copied()
+                        .chain(signature.this_parameter()),
+                    &mut types,
+                );
+                signatures.extend(signature.target());
+                if let Some(composite) = signature.composite() {
+                    signatures.extend(composite.signatures());
+                }
+            }
+            continue;
+        }
+        let Some(type_) = types.pop() else {
+            break;
+        };
+        if !seen_types.insert(type_) {
+            continue;
+        }
+        if global_this_hint == Some(type_)
+            || is_global_this_type_candidate(store, context.map(|context| context.globals), type_)
+        {
+            let context = context.ok_or(RelationUnavailable::UnsupportedStructuredType(type_))?;
+            context.members(store, type_)?;
+            depends_on_global_this = true;
+            continue;
+        }
+        let Some(record) = store.type_payload(type_) else {
+            continue;
+        };
+        if let Some(header) = store.source_interface_heritage_header(type_) {
+            let edges = if require_complete_heritage {
+                source_interface_heritage_relation_edges(
+                    store,
+                    type_,
+                    array_targets,
+                    context
+                        .as_ref()
+                        .and_then(|context| context.heritage.as_ref()),
+                )?
+                .unwrap_or_default()
+            } else {
+                // A cache scan must not demand a later alias value before the
+                // ordinary unmatched-property pass can reject the pair.
+                validate_source_interface_heritage_header(store, type_, header, array_targets)
+                    .map_err(|error| {
+                        RelationUnavailable::CanonicalGlobalType(
+                            CanonicalGlobalTypeInitializationError::DeclaredType(error),
+                        )
+                    })?
+            };
+            depends_on_global_this = true;
+            types.extend(edges);
+        }
+        if let Some(alias) = record.alias().and_then(|alias| store.type_alias(alias)) {
+            types.extend(alias.type_arguments().into_iter().flatten());
+        }
+        if let Some(constrained) = record.data().constrained() {
+            types.extend(constrained.resolved_base_constraint);
+        }
+        if let Some(structured) = record.data().structured() {
+            if context
+                .and_then(|context| context.signature_return_query)
+                .is_some_and(|query| {
+                    structured.signatures.iter().flatten().any(|signature| {
+                        query.has_global_this_return_dependency(store, type_, *signature)
+                    })
+                })
+            {
+                // A written source dependency can outlive a changed warm return
+                // edge. This hint only prevents a physical cache shortcut.
+                depends_on_global_this = true;
+            }
+            append_global_this_table_edges(store, structured.members, &mut types);
+            append_global_this_property_edges(
+                store,
+                structured.properties.iter().flatten().copied(),
+                &mut types,
+            );
+            signatures.extend(structured.signatures.iter().flatten());
+            append_global_this_index_edges(store, structured.index_infos.as_deref(), &mut types);
+            types.extend(structured.object_type_without_abstract_construct_signatures);
+        }
+        match record.data() {
+            TypeData::Intrinsic(_) | TypeData::UniqueEsSymbol(_) => {}
+            TypeData::Literal(literal) => {
+                types.extend(literal.fresh_type);
+                types.push(literal.regular_type);
+            }
+            TypeData::Object(object) => types.extend(object.target),
+            TypeData::TypeReference(reference) => {
+                types.extend(reference.object.target);
+                types.extend(reference.resolved_type_arguments.iter().flatten());
+            }
+            TypeData::Interface(interface) => {
+                append_global_this_interface_edges(store, interface, &mut types, &mut signatures);
+            }
+            TypeData::Tuple(tuple) => {
+                append_global_this_interface_edges(
+                    store,
+                    &tuple.interface,
+                    &mut types,
+                    &mut signatures,
+                );
+            }
+            TypeData::InstantiationExpression(expression) => types.extend(expression.object.target),
+            TypeData::Mapped(mapped) => {
+                types.extend(mapped.object.target);
+                types.extend(mapped.type_parameter);
+                types.extend(mapped.constraint_type);
+                types.extend(mapped.name_type);
+                types.extend(mapped.template_type);
+                types.extend(mapped.modifiers_type);
+                types.extend(mapped.resolved_apparent_type);
+            }
+            TypeData::ReverseMapped(mapped) => {
+                types.extend(mapped.object.target);
+                types.extend(mapped.source);
+                types.extend(mapped.mapped_type);
+                types.extend(mapped.constraint_type);
+            }
+            TypeData::EvolvingArray(array) => {
+                types.extend(array.object.target);
+                types.extend(array.element_type);
+                types.extend(array.final_array_type);
+            }
+            TypeData::Union(union) => {
+                types.extend(&union.union.types);
+                types.extend(union.resolved_reduced_type);
+                types.extend(union.regular_type);
+                types.extend(union.origin);
+            }
+            TypeData::Intersection(intersection) => {
+                types.extend(&intersection.intersection.types);
+                types.extend(intersection.resolved_apparent_type);
+                types.extend(intersection.unique_literal_filled_instantiation);
+            }
+            TypeData::TypeParameter(parameter) => {
+                types.extend(parameter.constraint);
+                types.extend(parameter.target);
+                types.extend(parameter.resolved_default_type);
+            }
+            TypeData::Index(index) => types.push(index.target),
+            TypeData::IndexedAccess(access) => {
+                types.extend([access.object_type, access.index_type]);
+            }
+            TypeData::TemplateLiteral(template) => types.extend(&template.types),
+            TypeData::StringMapping(mapping) => types.push(mapping.target),
+            TypeData::Substitution(substitution) => {
+                types.extend([substitution.base_type, substitution.constraint]);
+            }
+            TypeData::Conditional(conditional) => {
+                types.extend([conditional.check_type, conditional.extends_type]);
+                types.extend(conditional.resolved_true_type);
+                types.extend(conditional.resolved_false_type);
+                types.extend(conditional.resolved_inferred_true_type);
+                types.extend(conditional.resolved_default_constraint);
+                types.extend(conditional.resolved_constraint_of_distributive);
+                if let Some(root) = store.conditional_root_payload(conditional.root) {
+                    types.extend([root.check_type(), root.extends_type()]);
+                    types.extend(root.infer_type_parameters().into_iter().flatten());
+                    types.extend(root.outer_type_parameters().into_iter().flatten());
+                }
+            }
+        }
+    }
+    Ok(depends_on_global_this)
+}
+
+fn source_interface_heritage_relation_edges(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Result<Option<Vec<TypeId>>, RelationUnavailable> {
+    let Some(header) = store.source_interface_heritage_header(type_) else {
+        return Ok(None);
+    };
+    let error = |error| {
+        RelationUnavailable::CanonicalGlobalType(
+            CanonicalGlobalTypeInitializationError::DeclaredType(error),
+        )
+    };
+    let mut edges = validate_source_interface_heritage_header(store, type_, header, array_targets)
+        .map_err(error)?;
+    if store.direct_interface_heritage_provenance(type_).is_none() {
+        return Err(if query.is_some() {
+            RelationUnavailable::SourceInterfaceHeaderDemand { receiver: type_ }
+        } else {
+            RelationUnavailable::UnresolvedStructuredMembers(type_)
+        });
+    }
+    for base in header.bases() {
+        let Some(request) = base.alias() else {
+            continue;
+        };
+        match source_interface_alias_base_state(store, request, array_targets, query)
+            .map_err(error)?
+        {
+            SourceInterfaceAliasBaseState::Pending { .. } => {
+                return Err(if query.is_some() {
+                    RelationUnavailable::SourceInterfaceAliasDemand {
+                        receiver: type_,
+                        alias: request.symbol(),
+                        root: request.root(),
+                    }
+                } else {
+                    RelationUnavailable::UnresolvedStructuredMembers(type_)
+                });
+            }
+            SourceInterfaceAliasBaseState::Ready {
+                type_: base,
+                edges: base_edges,
+            } => {
+                edges.push(base);
+                edges.extend(base_edges);
+            }
+        }
+    }
+    Ok(Some(edges))
+}
+
 fn validate_direct_interface_heritage_relation_endpoint(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     type_: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
 ) -> Result<(), RelationUnavailable> {
+    source_interface_heritage_relation_edges(store, type_, array_targets, query)?;
     if store.direct_interface_heritage_provenance(type_).is_some()
-        && validate_interface_heritage_members_with_array_targets(store, type_, array_targets)
-            != InterfaceHeritageMembersValidation::Valid
+        && validate_interface_heritage_members_with_query_context(
+            store,
+            type_,
+            array_targets,
+            query,
+        ) != InterfaceHeritageMembersValidation::Valid
     {
         return Err(RelationUnavailable::InvalidStructuredMembers(type_));
     }
@@ -935,6 +1586,7 @@ pub(super) fn validated_synthetic_structural_property(
 #[derive(Clone, Copy)]
 enum ObjectPropertyOrigin {
     Declared,
+    GlobalThis(TypeId),
     InterfaceHeritage(TypeId),
     ValidatedClass(TypeId),
     SyntheticStructural(TypeId),
@@ -1050,10 +1702,16 @@ struct RelaterSession<'store> {
     bootstrap: RelationBootstrapFacts,
     global_types: Option<RelationGlobalTypes>,
     strict_function_types: Option<bool>,
+    // The caller ID can reject a legacy shortcut. It does not grant source access.
+    global_this_hint: Option<TypeId>,
+    global_this: Option<GlobalThisRelationContext<'store>>,
+    heritage_query: Option<SourceInterfaceHeritageQueryContext<'store>>,
     validated_unions: HashMap<TypeId, Vec<TypeId>>,
     inherited_property_references: HashMap<SemanticSymbolId, TypeId>,
     mapped_property_receivers: HashMap<SemanticSymbolId, TypeId>,
     property_object_alias_receivers: HashMap<SemanticSymbolId, TypeId>,
+    global_this_property_receivers: HashMap<SemanticSymbolId, TypeId>,
+    signature_global_member: Option<SourceSignatureGlobalMember>,
     instantiation_session: RelationInstantiationSession<'store>,
     observation: RelationObservationToken,
     pending: PendingRelationCache,
@@ -1172,10 +1830,15 @@ impl<'store> RelaterSession<'store> {
             bootstrap,
             global_types,
             strict_function_types,
+            global_this_hint: None,
+            global_this: None,
+            heritage_query: None,
             validated_unions: HashMap::new(),
             inherited_property_references: HashMap::new(),
             mapped_property_receivers: HashMap::new(),
             property_object_alias_receivers: HashMap::new(),
+            global_this_property_receivers: HashMap::new(),
+            signature_global_member: None,
             instantiation_session: RelationInstantiationSession::Owned(instantiation_session),
             observation,
             pending: PendingRelationCache::default(),
@@ -1189,6 +1852,60 @@ impl<'store> RelaterSession<'store> {
             relation_count,
             stack_depth_limit,
         }
+    }
+
+    fn with_global_this_hint(mut self, receiver: Option<TypeId>) -> Self {
+        self.global_this_hint = receiver;
+        self
+    }
+
+    fn with_global_this(mut self, context: Option<GlobalThisRelationContext<'store>>) -> Self {
+        self.global_this_hint = context
+            .map(|context| context.globals.global_this_value_type)
+            .or(self.global_this_hint);
+        self.heritage_query = context.and_then(|context| context.heritage);
+        self.global_this = context;
+        self
+    }
+
+    fn global_this_members(
+        &self,
+        receiver: TypeId,
+    ) -> Result<&'store GlobalThisMembers<'store, 'store>, RelationUnavailable> {
+        self.global_this
+            .ok_or(RelationUnavailable::UnsupportedStructuredType(receiver))?
+            .members(self.store, receiver)
+    }
+
+    fn ensure_source_relation_completed(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        result: Ternary,
+    ) -> Result<(), RelationUnavailable> {
+        if self.global_this.is_some_and(|context| {
+            self.instantiation_session
+                .as_mut()
+                .limit_event_occurred_since(context.limit_mark)
+        }) {
+            return Err(RelationUnavailable::StructuralRelation {
+                source,
+                target,
+                relation: self.relation,
+            });
+        }
+        if result != Ternary::False {
+            validate_global_this_relation_inputs(
+                self.store,
+                source,
+                target,
+                self.global_types.map(|globals| globals.array_targets),
+                self.global_this_hint,
+                self.global_this,
+                true,
+            )?;
+        }
+        Ok(())
     }
 
     fn finish(
@@ -2332,6 +3049,15 @@ impl<'store> RelaterSession<'store> {
         recursion_flags: RecursionFlags,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
+        validate_global_this_relation_inputs(
+            self.store,
+            original_source,
+            original_target,
+            self.global_types.map(|globals| globals.array_targets),
+            self.global_this_hint,
+            self.global_this,
+            false,
+        )?;
         self.observe_type_surface(original_source);
         if original_target != original_source {
             self.observe_type_surface(original_target);
@@ -2340,6 +3066,7 @@ impl<'store> RelaterSession<'store> {
             self.store,
             original_source,
             self.global_types.map(|globals| globals.array_targets),
+            self.heritage_query.as_ref(),
         )?;
         validate_class_members_relation_endpoint(self.store, original_source)?;
         validate_property_object_alias_relation_endpoint(
@@ -2352,6 +3079,7 @@ impl<'store> RelaterSession<'store> {
                 self.store,
                 original_target,
                 self.global_types.map(|globals| globals.array_targets),
+                self.heritage_query.as_ref(),
             )?;
             validate_class_members_relation_endpoint(self.store, original_target)?;
             validate_property_object_alias_relation_endpoint(
@@ -3031,6 +3759,32 @@ impl<'store> RelaterSession<'store> {
             .map_err(|_| RelationUnavailable::InvalidStructuredMembers(tuple))
     }
 
+    fn signature_return_cache_requires_read(&self, source: TypeId, target: TypeId) -> bool {
+        let Some(query) = self
+            .global_this
+            .and_then(|context| context.signature_return_query)
+        else {
+            return false;
+        };
+        [source, target].into_iter().any(|owner| {
+            let Some(signatures) = self
+                .store
+                .type_payload(owner)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.signatures.as_deref())
+            else {
+                return false;
+            };
+            (!signatures.is_empty()
+                && self
+                    .signature_global_member
+                    .is_some_and(|origin| origin.callable == owner))
+                || signatures.iter().any(|signature| {
+                    query.has_global_this_return_dependency(self.store, owner, *signature)
+                })
+        })
+    }
+
     fn recursive_type_related_to(
         &mut self,
         source: TypeId,
@@ -3038,6 +3792,15 @@ impl<'store> RelaterSession<'store> {
         intersection_state: IntersectionState,
         recursion_flags: RecursionFlags,
     ) -> Result<Ternary, RelationUnavailable> {
+        let global_this_dependent = validate_global_this_relation_inputs(
+            self.store,
+            source,
+            target,
+            self.global_types.map(|globals| globals.array_targets),
+            self.global_this_hint,
+            self.global_this,
+            false,
+        )?;
         if self.overflow {
             return Ok(Ternary::False);
         }
@@ -3052,7 +3815,22 @@ impl<'store> RelaterSession<'store> {
             )
             .map_err(relation_key_unavailable)?;
         let key = built_key.key();
-        let entry = self.cache_get(key);
+        // A physical cache row has no list of demanded global values. Revisit
+        // its property comparisons with this query's admissions. Local cycle
+        // and completed-child rows still belong to the current attempt.
+        let entry = if self.signature_return_cache_requires_read(source, target) {
+            // A completed child can have a different property origin. Revisit
+            // the existing return reads with this attempt's exact pair proofs.
+            RelationComparisonResult::NONE
+        } else if global_this_dependent {
+            self.pending
+                .latest
+                .get(&key)
+                .copied()
+                .unwrap_or(RelationComparisonResult::NONE)
+        } else {
+            self.cache_get(key)
+        };
         if !entry.is_empty() {
             return Ok(if entry.intersects(RelationComparisonResult::SUCCEEDED) {
                 Ternary::True
@@ -4482,6 +5260,14 @@ impl<'store> RelaterSession<'store> {
             let Some(target_property) = target_property else {
                 return Ok(Ternary::False);
             };
+            if let ObjectPropertyOrigin::GlobalThis(receiver) = target_members.property_origin
+                && self
+                    .global_this_members(receiver)?
+                    .member(target_property)
+                    .is_none()
+            {
+                return Ok(Ternary::False);
+            }
             let (target_optional, target_readonly, target_declaration) = {
                 let target =
                     self.property_symbol(target_property, target_members.property_origin)?;
@@ -4831,12 +5617,85 @@ impl<'store> RelaterSession<'store> {
         Ok(result)
     }
 
+    fn reached_signature_return_type(
+        &self,
+        source: &ValidatedSingleCallable,
+        target: &ValidatedSingleCallable,
+        reached: &ValidatedSingleCallable,
+    ) -> Result<TypeId, RelationUnavailable> {
+        let ordinary = || {
+            reached
+                .return_type
+                .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
+                    reached.signature,
+                ))
+        };
+        let Some(context) = self.global_this else {
+            return ordinary();
+        };
+        let Some(query) = context.signature_return_query else {
+            return ordinary();
+        };
+        if (reached.owner, reached.signature) != (source.owner, source.signature)
+            && (reached.owner, reached.signature) != (target.owner, target.signature)
+        {
+            return Err(RelationUnavailable::MalformedFunctionType(reached.owner));
+        }
+        let request = SourceSignatureReturnRequest {
+            source: source.owner,
+            source_signature: source.signature,
+            target: target.owner,
+            target_signature: target.signature,
+            signature: reached.signature,
+            global_member: self.signature_global_member.filter(|origin| {
+                origin.callable == source.owner || origin.callable == target.owner
+            }),
+        };
+        let origin = context.signature_return_origin(self.store, request)?;
+        if !query
+            .signature_return_is_eligible(
+                self.store,
+                request,
+                origin,
+                context.globals,
+                self.strict_function_types,
+            )
+            .map_err(|error| {
+                RelationUnavailable::CanonicalGlobalType(
+                    CanonicalGlobalTypeInitializationError::DeclaredType(error),
+                )
+            })?
+        {
+            return ordinary();
+        }
+        let Some(proof) = context
+            .signature_returns
+            .iter()
+            .find(|proof| proof.request() == request)
+        else {
+            return Err(request.unavailable());
+        };
+        if proof.signature() != reached.signature || reached.return_type != Some(proof.type_id()) {
+            return Err(RelationUnavailable::MalformedFunctionType(reached.owner));
+        }
+        Ok(proof.type_id())
+    }
+
     fn compare_signatures_identical(
         &mut self,
         source: &ValidatedSingleCallable,
         target: &ValidatedSingleCallable,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
+        validate_global_this_relation_inputs(
+            self.store,
+            source.owner,
+            target.owner,
+            self.global_types.map(|globals| globals.array_targets),
+            self.global_this_hint,
+            self.global_this,
+            false,
+        )?;
         if source.signature == target.signature {
             return Ok(Ternary::True);
         }
@@ -4909,18 +5768,8 @@ impl<'store> RelaterSession<'store> {
                 }
                 result &= related;
             }
-            let source_return =
-                source
-                    .return_type
-                    .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
-                        source.signature,
-                    ))?;
-            let target_return =
-                target
-                    .return_type
-                    .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
-                        target.signature,
-                    ))?;
+            let source_return = self.reached_signature_return_type(source, target, source)?;
+            let target_return = self.reached_signature_return_type(source, target, target)?;
             let returns = self.is_related_to_ex(
                 source_return,
                 target_return,
@@ -4958,15 +5807,24 @@ impl<'store> RelaterSession<'store> {
         intersection_state: IntersectionState,
         failure: Option<&mut Option<CallableRelationFailure>>,
     ) -> Result<Ternary, RelationUnavailable> {
+        validate_global_this_relation_inputs(
+            self.store,
+            source.owner,
+            target.owner,
+            self.global_types.map(|globals| globals.array_targets),
+            self.global_this_hint,
+            self.global_this,
+            false,
+        )?;
         if source.signature == target.signature {
             return Ok(Ternary::True);
         }
         let strict_top_source = check_mode.intersects(SignatureCheckMode::STRICT_TOP_SIGNATURE)
-            && self.is_top_signature(source)?;
-        if !strict_top_source && self.is_top_signature(target)? {
+            && self.is_top_signature(source, source, target)?;
+        if !strict_top_source && self.is_top_signature(target, source, target)? {
             return Ok(Ternary::True);
         }
-        if strict_top_source && !self.is_top_signature(target)? {
+        if strict_top_source && !self.is_top_signature(target, source, target)? {
             return Ok(Ternary::False);
         }
         let key = (source.signature, target.signature, check_mode.bits());
@@ -5004,6 +5862,8 @@ impl<'store> RelaterSession<'store> {
     fn is_top_signature(
         &self,
         callable: &ValidatedSingleCallable,
+        source: &ValidatedSingleCallable,
+        target: &ValidatedSingleCallable,
     ) -> Result<bool, RelationUnavailable> {
         let signature = self
             .store
@@ -5040,12 +5900,7 @@ impl<'store> RelaterSession<'store> {
         {
             return Ok(false);
         }
-        let return_type =
-            callable
-                .return_type
-                .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
-                    callable.signature,
-                ))?;
+        let return_type = self.reached_signature_return_type(source, target, callable)?;
         Ok(self
             .store
             .type_flags(return_type)?
@@ -5278,6 +6133,15 @@ impl<'store> RelaterSession<'store> {
         excluded_positions: &[usize],
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
+        validate_global_this_relation_inputs(
+            self.store,
+            source,
+            target,
+            self.global_types.map(|globals| globals.array_targets),
+            self.global_this_hint,
+            self.global_this,
+            false,
+        )?;
         if source == target {
             return Ok(Ternary::True);
         }
@@ -5967,21 +6831,11 @@ impl<'store> RelaterSession<'store> {
         if check_mode.intersects(SignatureCheckMode::IGNORE_RETURN_TYPES) {
             return Ok(result);
         }
-        let target_return =
-            target
-                .return_type
-                .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
-                    target.signature,
-                ))?;
+        let target_return = self.reached_signature_return_type(source, target, target)?;
         if target_return == self.bootstrap.void_type || target_return == self.bootstrap.any_type {
             return Ok(result);
         }
-        let source_return =
-            source
-                .return_type
-                .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
-                    source.signature,
-                ))?;
+        let source_return = self.reached_signature_return_type(source, target, source)?;
         let mut related = Ternary::False;
         if check_mode.intersects(SignatureCheckMode::BIVARIANT_CALLBACK) {
             related = self.is_related_to_ex(
@@ -6113,7 +6967,27 @@ impl<'store> RelaterSession<'store> {
                 source_flags.intersects(SymbolFlags::OPTIONAL)
                     && self.relation != RelationKind::Comparable,
             )?;
-            self.property_types_related(&source_types, &target_types)?
+            let origin = match (source_origin, target_origin) {
+                (ObjectPropertyOrigin::GlobalThis(receiver), _) => {
+                    Some(SourceSignatureGlobalMember {
+                        receiver,
+                        member: source_property,
+                        callable: source_type,
+                    })
+                }
+                (_, ObjectPropertyOrigin::GlobalThis(receiver)) => {
+                    Some(SourceSignatureGlobalMember {
+                        receiver,
+                        member: target_property,
+                        callable: target_type,
+                    })
+                }
+                _ => None,
+            };
+            let previous_origin = std::mem::replace(&mut self.signature_global_member, origin);
+            let related = self.property_types_related(&source_types, &target_types);
+            self.signature_global_member = previous_origin;
+            related?
         };
         if self.relation != RelationKind::Comparable
             && related != Ternary::False
@@ -6234,6 +7108,32 @@ impl<'store> RelaterSession<'store> {
     }
 
     fn property_type(&mut self, symbol: SemanticSymbolId) -> Result<TypeId, RelationUnavailable> {
+        if let Some(receiver) = self.global_this_property_receivers.get(&symbol).copied() {
+            let members = self.global_this_members(receiver)?;
+            let member = members
+                .member(symbol)
+                .ok_or(RelationUnavailable::UnsupportedProperty(symbol))?;
+            let context = self
+                .global_this
+                .ok_or(RelationUnavailable::UnsupportedStructuredType(receiver))?;
+            let proof = context
+                .member_values
+                .iter()
+                .find(|proof| proof.receiver() == receiver && proof.member() == symbol)
+                .ok_or(RelationUnavailable::GlobalThisValueDemand {
+                    receiver,
+                    member: symbol,
+                })?;
+            if self
+                .store
+                .value_symbol_links(member.symbol())
+                .and_then(|links| links.resolved_type)
+                != Some(proof.type_id())
+            {
+                return Err(RelationUnavailable::UnsupportedProperty(symbol));
+            }
+            return Ok(proof.type_id());
+        }
         if self.store.object_literal_getter_origin(symbol).is_some() {
             return self.validated_object_literal_getter(symbol)?.require_type();
         }
@@ -6330,8 +7230,17 @@ impl<'store> RelaterSession<'store> {
                 .ok_or(RelationUnavailable::InvalidStructuredMembers(source))?
                 .get(name.as_ref());
             if let Some(property) = property {
-                self.property_symbol(property, source_members.property_origin)?;
-                return Ok(Some(property));
+                let is_value = match source_members.property_origin {
+                    ObjectPropertyOrigin::GlobalThis(receiver) => self
+                        .global_this_members(receiver)?
+                        .member(property)
+                        .is_some(),
+                    _ => true,
+                };
+                if is_value {
+                    self.property_symbol(property, source_members.property_origin)?;
+                    return Ok(Some(property));
+                }
             }
         }
         self.global_object_property(name.as_ref())
@@ -6689,11 +7598,12 @@ impl<'store> RelaterSession<'store> {
         if record.flags().contains(SymbolFlags::TRANSIENT)
             && record.check_flags().contains(CheckFlags::INSTANTIATED)
         {
-            let reference = inherited_generic_property_reference(
+            let reference = inherited_generic_property_reference_with_query_context(
                 self.store,
                 receiver,
                 symbol,
                 self.global_types.map(|globals| globals.array_targets),
+                self.heritage_query.as_ref(),
             )
             .ok_or(RelationUnavailable::UnsupportedProperty(symbol))?;
             Ok(ObjectPropertyOrigin::GenericReference(reference))
@@ -6708,6 +7618,18 @@ impl<'store> RelaterSession<'store> {
         origin: ObjectPropertyOrigin,
     ) -> Result<&ts_binder::semantic::Symbol, RelationUnavailable> {
         let origin = self.property_origin_for_symbol(symbol, origin)?;
+        if let ObjectPropertyOrigin::GlobalThis(receiver) = origin {
+            let canonical = self
+                .global_this_members(receiver)?
+                .member(symbol)
+                .ok_or(RelationUnavailable::UnsupportedProperty(symbol))?
+                .symbol();
+            self.global_this_property_receivers.insert(symbol, receiver);
+            return self
+                .store
+                .symbol(canonical)
+                .ok_or(RelationUnavailable::Symbol(canonical));
+        }
         if let ObjectPropertyOrigin::Mapped(receiver) = origin {
             self.store
                 .validate_mapped_type_relation_endpoint(receiver)
@@ -6736,6 +7658,9 @@ impl<'store> RelaterSession<'store> {
             .symbol(symbol)
             .ok_or(RelationUnavailable::Symbol(symbol))?;
         match origin {
+            ObjectPropertyOrigin::GlobalThis(_) => {
+                unreachable!("global members return after source validation")
+            }
             ObjectPropertyOrigin::Mapped(_) | ObjectPropertyOrigin::PropertyObjectAlias(_) => {
                 return Ok(record);
             }
@@ -6947,7 +7872,8 @@ impl<'store> RelaterSession<'store> {
                 | ObjectPropertyOrigin::GenericReference(_) => {
                     SymbolFlags::INTERFACE | SymbolFlags::TYPE_LITERAL
                 }
-                ObjectPropertyOrigin::FreshObjectLiteral(_)
+                ObjectPropertyOrigin::GlobalThis(_)
+                | ObjectPropertyOrigin::FreshObjectLiteral(_)
                 | ObjectPropertyOrigin::DerivedObjectLiteral { .. }
                 | ObjectPropertyOrigin::Intersection(_)
                 | ObjectPropertyOrigin::SyntheticStructural(_)
@@ -7265,6 +8191,22 @@ impl<'store> RelaterSession<'store> {
         type_id: TypeId,
         allow_fresh_literal: bool,
     ) -> Result<(), RelationUnavailable> {
+        source_interface_heritage_relation_edges(
+            self.store,
+            type_id,
+            self.global_types.map(|globals| globals.array_targets),
+            self.heritage_query.as_ref(),
+        )?;
+        if self.global_this_hint == Some(type_id)
+            || is_global_this_type_candidate(
+                self.store,
+                self.global_this.map(|context| context.globals),
+                type_id,
+            )
+        {
+            self.global_this_members(type_id)?;
+            return Ok(());
+        }
         if source_property_object_projection(self.store, type_id)?.is_some() {
             return validate_property_object_alias_members_with_array_targets(
                 self.store,
@@ -7315,6 +8257,7 @@ impl<'store> RelaterSession<'store> {
                 self.store,
                 type_id,
                 self.global_types.map(|globals| globals.array_targets),
+                self.heritage_query.as_ref(),
             )?;
             return Ok(());
         }
@@ -7801,10 +8744,11 @@ impl<'store> RelaterSession<'store> {
                     .type_payload(type_id)
                     .and_then(|record| record.data().structured())
                     != Some(structured)
-                || validate_interface_heritage_members_with_array_targets(
+                || validate_interface_heritage_members_with_query_context(
                     self.store,
                     type_id,
                     self.global_types.map(|globals| globals.array_targets),
+                    self.heritage_query.as_ref(),
                 ) != InterfaceHeritageMembersValidation::Valid
             {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
@@ -7890,6 +8834,26 @@ impl<'store> RelaterSession<'store> {
         type_id: TypeId,
         allow_fresh_literal: bool,
     ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
+        if self.global_this_hint == Some(type_id)
+            || is_global_this_type_candidate(
+                self.store,
+                self.global_this.map(|context| context.globals),
+                type_id,
+            )
+        {
+            let members = self.global_this_members(type_id)?;
+            let table = members.members_table();
+            let properties = members.properties().to_vec();
+            self.observe_symbol_table(table);
+            return Ok(ResolvedObjectMembers {
+                members: Some(table),
+                properties,
+                index_infos: Vec::new(),
+                property_origin: ObjectPropertyOrigin::GlobalThis(type_id),
+                call_signatures: Vec::new(),
+                exact_callable: false,
+            });
+        }
         if self
             .store
             .type_flags(type_id)?
@@ -8165,10 +9129,11 @@ impl<'store> RelaterSession<'store> {
         let heritage_members = if property_origin.is_declared()
             && class_members == ClassHeritageMembersValidation::NotClass
         {
-            validate_interface_heritage_members_with_array_targets(
+            validate_interface_heritage_members_with_query_context(
                 self.store,
                 type_id,
                 self.global_types.map(|globals| globals.array_targets),
+                self.heritage_query.as_ref(),
             )
         } else {
             InterfaceHeritageMembersValidation::NotHeritage
@@ -8694,7 +9659,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 bootstrap,
                 Some(RelationGlobalTypes::from_global_types(global_types)),
                 Some(strict_function_types),
-            );
+            )
+            .with_global_this_hint(Some(global_types.global_this_value_type));
             session.observe_type_surface(source);
             session.observe_type_surface(target);
             let source_members = session.class_constructor_static_members(source)?;
@@ -8876,6 +9842,46 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         RelaterSession::new(self, RelationKind::Assignable, bootstrap).global_object_property(name)
     }
 
+    /// Keeps the source caller and query proof on the existing Object fallback.
+    pub(super) fn global_object_property_symbol_with_query_context(
+        &mut self,
+        name: EscapedNameRef<'_>,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+        session: &mut InstantiationSession,
+        heritage: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+    ) -> Result<Option<SemanticSymbolId>, RelationUnavailable> {
+        if let Some(requested) = strict_function_types
+            && let Err(established) = self.claim_strict_function_types(requested)
+        {
+            return Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                established,
+                requested,
+            });
+        }
+        let bootstrap = self.relation_bootstrap_facts()?;
+        let limit_mark = session.limit_event_mark();
+        let result = {
+            let mut relation = RelaterSession::new_with_global_types_options_and_session(
+                self,
+                RelationKind::Assignable,
+                bootstrap,
+                Some(RelationGlobalTypes::from_global_types(globals)),
+                strict_function_types,
+                Some(&mut *session),
+            )
+            .with_global_this_hint(Some(globals.global_this_value_type));
+            relation.heritage_query = heritage.copied();
+            relation.global_object_property(name)
+        };
+        if session.limit_event_occurred_since(limit_mark) {
+            return Err(RelationUnavailable::UnresolvedStructuredMembers(
+                globals.object_type,
+            ));
+        }
+        result
+    }
+
     /// Looks up one required-or-optional own property without synthesizing an
     /// apparent member, a global `Object` augmentation, or an index result.
     ///
@@ -8957,7 +9963,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             global_types.map(RelationGlobalTypes::from_global_types),
             None,
             instantiation_session,
-        );
+        )
+        .with_global_this_hint(global_types.map(|globals| globals.global_this_value_type));
         let resolved = session.resolved_object_members(type_id, true)?;
         if resolved.exact_callable || !resolved.call_signatures.is_empty() {
             return Err(RelationUnavailable::StructuredSignatures(type_id));
@@ -9004,7 +10011,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         host: &DeclaredTypeHost<'_>,
         type_id: TypeId,
     ) -> Result<Option<ResolvedDeclaredPropertyObject>, RelationUnavailable> {
-        self.resolved_declared_property_object_with_optional_global_types(host, type_id, None)
+        self.resolved_declared_property_object_with_optional_global_types(host, type_id, None, None)
     }
 
     /// Retains the caller's array capability while validating lazy alias values.
@@ -9018,6 +10025,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             host,
             type_id,
             Some(RelationGlobalTypes::from_global_types(global_types)),
+            Some(global_types.global_this_value_type),
         )
     }
 
@@ -9026,6 +10034,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         host: &DeclaredTypeHost<'_>,
         type_id: TypeId,
         global_types: Option<RelationGlobalTypes>,
+        global_this_hint: Option<TypeId>,
     ) -> Result<Option<ResolvedDeclaredPropertyObject>, RelationUnavailable> {
         let flags = self
             .type_payload(type_id)
@@ -9049,7 +10058,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 RelationKind::Assignable,
                 bootstrap,
                 global_types,
-            );
+            )
+            .with_global_this_hint(global_this_hint);
             let resolved = session.resolved_object_members(type_id, false)?;
             if resolved.properties.len() != projection.properties().len()
                 || !matches!(
@@ -9105,7 +10115,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 RelationKind::Assignable,
                 bootstrap,
                 global_types,
-            );
+            )
+            .with_global_this_hint(global_this_hint);
             let resolved = session.resolved_object_members(type_id, false)?;
             return if matches!(
                 resolved.property_origin,
@@ -9271,7 +10282,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             RelationKind::Assignable,
             bootstrap,
             global_types,
-        );
+        )
+        .with_global_this_hint(global_this_hint);
         let resolved = session.resolved_object_members(type_id, false)?;
         if let Some((plan, property_types)) = plan {
             if plan.heritage.is_some() {
@@ -9376,7 +10388,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             RelationKind::StrictSubtype,
             bootstrap,
             Some(RelationGlobalTypes::from_global_types(global_types)),
-        );
+        )
+        .with_global_this_hint(Some(global_types.global_this_value_type));
         session.preflight_expression_union_array_object_pairs(types)
     }
 
@@ -9423,12 +10436,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         global_types: &CanonicalGlobalTypes,
         strict_function_types: bool,
     ) -> Result<bool, RelationUnavailable> {
-        self.is_type_related_to_with_optional_global_types_and_options(
+        self.is_type_related_to_with_current_global_types_options_and_session(
             source,
             target,
             RelationKind::Identity,
-            Some(RelationGlobalTypes::from_global_types(global_types)),
+            Some(global_types),
             Some(strict_function_types),
+            None,
         )
     }
 
@@ -9561,12 +10575,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         global_types: &CanonicalGlobalTypes,
         strict_function_types: bool,
     ) -> Result<bool, RelationUnavailable> {
-        self.is_type_related_to_with_optional_global_types_and_options(
+        self.is_type_related_to_with_current_global_types_options_and_session(
             source,
             target,
             RelationKind::Assignable,
-            Some(RelationGlobalTypes::from_global_types(global_types)),
+            Some(global_types),
             Some(strict_function_types),
+            None,
         )
     }
 
@@ -9666,7 +10681,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             Some(RelationGlobalTypes::from_global_types(global_types)),
             Some(strict_function_types),
             Some(instantiation_session),
-        );
+        )
+        .with_global_this_hint(Some(global_types.global_this_value_type));
         session.observe_type_surface(owner);
         let result = session.compare_signatures_related(
             &source,
@@ -9730,7 +10746,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             Some(RelationGlobalTypes::from_global_types(global_types)),
             Some(strict_function_types),
             Some(instantiation_session),
-        );
+        )
+        .with_global_this_hint(Some(global_types.global_this_value_type));
         session.observe_type_surface(implementation.owner);
         session.observe_type_surface(overload.owner);
         let result = session.compare_signatures_related(
@@ -9776,7 +10793,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             Some(RelationGlobalTypes::from_global_types(global_types)),
             Some(strict_function_types),
             Some(instantiation_session),
-        );
+        )
+        .with_global_this_hint(Some(global_types.global_this_value_type));
         relation.observe_type_surface(source);
         relation.observe_type_surface(target);
         let source = relation
@@ -9810,14 +10828,287 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         strict_function_types: Option<bool>,
         instantiation_session: &mut InstantiationSession,
     ) -> Result<bool, RelationUnavailable> {
-        self.is_type_related_to_with_optional_global_types_options_and_session(
+        self.is_type_related_to_with_current_global_types_options_and_session(
             source,
             target,
             relation,
-            global_types.map(RelationGlobalTypes::from_global_types),
+            global_types,
             strict_function_types,
             Some(instantiation_session),
         )
+    }
+
+    /// Runs source demands outside the existing comparison worker. Every retry
+    /// keeps the same caller and retains proofs for reached values and returns.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep source demands on one caller and retry path.
+    pub(super) fn is_type_related_to_with_global_this_source<
+        Query: GlobalThisRelationSource + ?Sized,
+    >(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        relation: RelationKind,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+        session: &mut InstantiationSession,
+        query: &mut Query,
+    ) -> Result<SourceRelationResult, SourceRelationError<Query::Error>> {
+        let mut member_values: Vec<GlobalThisMemberValueProof> = Vec::new();
+        let mut signature_returns: Vec<SourceSignatureReturnProof> = Vec::new();
+        let mut prepared = HashSet::new();
+        let mut prepared_heritage = HashSet::new();
+        let mut prepared_returns = HashSet::new();
+        let limit_mark = session.limit_event_mark();
+        loop {
+            if session.limit_event_occurred_since(limit_mark) {
+                return Err(SourceRelationError::Relation(
+                    RelationUnavailable::StructuralRelation {
+                        source,
+                        target,
+                        relation,
+                    },
+                ));
+            }
+            for proof in &member_values {
+                query
+                    .validate_global_this_member_value_proof(
+                        self,
+                        proof,
+                        globals,
+                        strict_function_types,
+                    )
+                    .map_err(SourceRelationError::Source)?;
+                let context = GlobalThisRelationContext {
+                    globals,
+                    members: query.global_this_members(),
+                    member_values: &member_values,
+                    signature_returns: &signature_returns,
+                    signature_return_query: query.source_signature_return_query(),
+                    limit_mark,
+                    heritage: query.source_interface_heritage_query_context(),
+                };
+                let member = context
+                    .members(self, proof.receiver())
+                    .map_err(SourceRelationError::Relation)?
+                    .member(proof.member())
+                    .ok_or(SourceRelationError::Relation(
+                        RelationUnavailable::UnsupportedProperty(proof.member()),
+                    ))?;
+                if self
+                    .value_symbol_links(member.symbol())
+                    .and_then(|links| links.resolved_type)
+                    != Some(proof.type_id())
+                {
+                    return Err(SourceRelationError::Relation(
+                        RelationUnavailable::UnsupportedProperty(proof.member()),
+                    ));
+                }
+            }
+            for proof in &signature_returns {
+                query
+                    .validate_source_signature_return_proof(
+                        self,
+                        proof,
+                        globals,
+                        strict_function_types,
+                    )
+                    .map_err(SourceRelationError::Source)?;
+            }
+            let context = GlobalThisRelationContext {
+                globals,
+                members: query.global_this_members(),
+                member_values: &member_values,
+                signature_returns: &signature_returns,
+                signature_return_query: query.source_signature_return_query(),
+                limit_mark,
+                heritage: query.source_interface_heritage_query_context(),
+            };
+            let result = self
+                .is_type_related_to_with_optional_global_types_options_session_and_source(
+                    source,
+                    target,
+                    relation,
+                    Some(RelationGlobalTypes::from_global_types(globals)),
+                    Some(globals.global_this_value_type),
+                    strict_function_types,
+                    Some(&mut *session),
+                    Some(context),
+                );
+            match result {
+                Ok(related) => {
+                    for proof in &member_values {
+                        query
+                            .validate_global_this_member_value_proof(
+                                self,
+                                proof,
+                                globals,
+                                strict_function_types,
+                            )
+                            .map_err(SourceRelationError::Source)?;
+                    }
+                    for proof in &signature_returns {
+                        query
+                            .validate_source_signature_return_proof(
+                                self,
+                                proof,
+                                globals,
+                                strict_function_types,
+                            )
+                            .map_err(SourceRelationError::Source)?;
+                    }
+                    return Ok(SourceRelationResult {
+                        related,
+                        member_values,
+                        signature_returns,
+                    });
+                }
+                Err(RelationUnavailable::GlobalThisMembersDemand { receiver }) => {
+                    if query.global_this_members().is_some() || !prepared.insert(receiver) {
+                        return Err(SourceRelationError::Relation(
+                            RelationUnavailable::UnsupportedStructuredType(receiver),
+                        ));
+                    }
+                    query
+                        .prepare_global_this_members(self, receiver, session)
+                        .map_err(SourceRelationError::Source)?;
+                    GlobalThisRelationContext {
+                        globals,
+                        members: query.global_this_members(),
+                        member_values: &member_values,
+                        signature_returns: &signature_returns,
+                        signature_return_query: query.source_signature_return_query(),
+                        limit_mark,
+                        heritage: query.source_interface_heritage_query_context(),
+                    }
+                    .members(self, receiver)
+                    .map_err(SourceRelationError::Relation)?;
+                }
+                Err(RelationUnavailable::GlobalThisValueDemand { receiver, member }) => {
+                    if member_values
+                        .iter()
+                        .any(|proof| proof.receiver() == receiver && proof.member() == member)
+                    {
+                        return Err(SourceRelationError::Relation(
+                            RelationUnavailable::UnsupportedProperty(member),
+                        ));
+                    }
+                    let proof = query
+                        .resolve_global_this_member(self, receiver, member, session)
+                        .map_err(SourceRelationError::Source)?;
+                    if proof.receiver() != receiver
+                        || proof.member() != member
+                        || self
+                            .intrinsic_bootstrap()
+                            .is_some_and(|bootstrap| proof.type_id() == bootstrap.error_type)
+                    {
+                        return Err(SourceRelationError::Relation(
+                            RelationUnavailable::UnsupportedProperty(member),
+                        ));
+                    }
+                    member_values.push(proof);
+                }
+                Err(RelationUnavailable::SourceSignatureReturnDemand {
+                    source: callable_source,
+                    source_signature,
+                    target: callable_target,
+                    target_signature,
+                    signature,
+                    global_member,
+                }) => {
+                    let request = SourceSignatureReturnRequest {
+                        source: callable_source,
+                        source_signature,
+                        target: callable_target,
+                        target_signature,
+                        signature,
+                        global_member: global_member.map(|(receiver, member, callable)| {
+                            SourceSignatureGlobalMember {
+                                receiver,
+                                member,
+                                callable,
+                            }
+                        }),
+                    };
+                    if !prepared_returns.insert(request) {
+                        return Err(SourceRelationError::Relation(
+                            RelationUnavailable::UnresolvedSignatureReturn(signature),
+                        ));
+                    }
+                    // Borrow only the driver's current receipt. No query-view
+                    // borrow crosses the mutable normal return query.
+                    let origin = request
+                        .global_member
+                        .map(|origin| {
+                            member_values
+                                .iter()
+                                .find(|proof| {
+                                    proof.receiver() == origin.receiver
+                                        && proof.member() == origin.member
+                                        && proof.type_id() == origin.callable
+                                })
+                                .ok_or(SourceRelationError::Relation(
+                                    RelationUnavailable::UnsupportedProperty(origin.member),
+                                ))
+                        })
+                        .transpose()?;
+                    let proof = query
+                        .resolve_source_signature_return(self, request, origin, session)
+                        .map_err(SourceRelationError::Source)?;
+                    if proof.request() != request
+                        || proof.signature() != signature
+                        || self
+                            .intrinsic_bootstrap()
+                            .is_some_and(|bootstrap| proof.type_id() == bootstrap.error_type)
+                        || self
+                            .signature(signature)
+                            .and_then(super::signatures::Signature::resolved_return_type)
+                            != Some(proof.type_id())
+                    {
+                        return Err(SourceRelationError::Relation(
+                            RelationUnavailable::UnresolvedSignatureReturn(signature),
+                        ));
+                    }
+                    query
+                        .validate_source_signature_return_proof(
+                            self,
+                            &proof,
+                            globals,
+                            strict_function_types,
+                        )
+                        .map_err(SourceRelationError::Source)?;
+                    signature_returns.push(proof);
+                }
+                Err(
+                    error @ (RelationUnavailable::SourceInterfaceHeaderDemand { .. }
+                    | RelationUnavailable::SourceInterfaceAliasDemand { .. }),
+                ) => {
+                    let request = match error {
+                        RelationUnavailable::SourceInterfaceHeaderDemand { receiver } => {
+                            SourceInterfaceHeritageRequest::Header { receiver }
+                        }
+                        RelationUnavailable::SourceInterfaceAliasDemand {
+                            receiver,
+                            alias,
+                            root,
+                        } => SourceInterfaceHeritageRequest::Alias {
+                            receiver,
+                            alias,
+                            root,
+                        },
+                        _ => unreachable!("the error is a source interface demand"),
+                    };
+                    if !prepared_heritage.insert(request) {
+                        return Err(SourceRelationError::Relation(
+                            RelationUnavailable::UnresolvedStructuredMembers(request.receiver()),
+                        ));
+                    }
+                    query
+                        .prepare_source_interface_heritage(self, request, session)
+                        .map_err(SourceRelationError::Source)?;
+                }
+                Err(error) => return Err(SourceRelationError::Relation(error)),
+            }
+        }
     }
 
     /// Pinned `isTypeSubtypeOf`.
@@ -10008,11 +11299,34 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         relation: RelationKind,
         global_types: &CanonicalGlobalTypes,
     ) -> Result<bool, RelationUnavailable> {
-        self.is_type_related_to_with_optional_global_types(
+        self.is_type_related_to_with_current_global_types_options_and_session(
             source,
             target,
             relation,
-            Some(RelationGlobalTypes::from_global_types(global_types)),
+            Some(global_types),
+            None,
+            None,
+        )
+    }
+
+    fn is_type_related_to_with_current_global_types_options_and_session(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        relation: RelationKind,
+        global_types: Option<&CanonicalGlobalTypes>,
+        strict_function_types: Option<bool>,
+        instantiation_session: Option<&mut InstantiationSession>,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_optional_global_types_options_session_and_source(
+            source,
+            target,
+            relation,
+            global_types.map(RelationGlobalTypes::from_global_types),
+            global_types.map(|globals| globals.global_this_value_type),
+            strict_function_types,
+            instantiation_session,
+            None,
         )
     }
 
@@ -10059,6 +11373,76 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         strict_function_types: Option<bool>,
         instantiation_session: Option<&mut InstantiationSession>,
     ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_optional_global_types_options_session_and_source(
+            source,
+            target,
+            relation,
+            global_types,
+            None,
+            strict_function_types,
+            instantiation_session,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn is_type_related_to_with_optional_global_types_options_session_and_source<'query>(
+        &'query mut self,
+        source: TypeId,
+        target: TypeId,
+        relation: RelationKind,
+        global_types: Option<RelationGlobalTypes>,
+        global_this_hint: Option<TypeId>,
+        strict_function_types: Option<bool>,
+        instantiation_session: Option<&'query mut InstantiationSession>,
+        global_this: Option<GlobalThisRelationContext<'query>>,
+    ) -> Result<bool, RelationUnavailable> {
+        let related = self
+            .is_type_related_to_with_optional_global_types_options_session_and_source_worker(
+                source,
+                target,
+                relation,
+                global_types,
+                global_this_hint,
+                strict_function_types,
+                instantiation_session,
+                global_this,
+            )?;
+        if related {
+            validate_global_this_relation_inputs(
+                self,
+                source,
+                target,
+                global_types.map(|globals| globals.array_targets),
+                global_this_hint,
+                global_this,
+                true,
+            )?;
+        }
+        Ok(related)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn is_type_related_to_with_optional_global_types_options_session_and_source_worker<'query>(
+        &'query mut self,
+        source: TypeId,
+        target: TypeId,
+        relation: RelationKind,
+        global_types: Option<RelationGlobalTypes>,
+        global_this_hint: Option<TypeId>,
+        strict_function_types: Option<bool>,
+        instantiation_session: Option<&'query mut InstantiationSession>,
+        global_this: Option<GlobalThisRelationContext<'query>>,
+    ) -> Result<bool, RelationUnavailable> {
+        let global_this_dependent = validate_global_this_relation_inputs(
+            self,
+            source,
+            target,
+            global_types.map(|globals| globals.array_targets),
+            global_this_hint,
+            global_this,
+            false,
+        )?;
         if let Some(requested) = strict_function_types
             && let Err(established) = self.claim_strict_function_types(requested)
         {
@@ -10104,6 +11488,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             self,
             source,
             global_types.map(|globals| globals.array_targets),
+            global_this
+                .as_ref()
+                .and_then(|context| context.heritage.as_ref()),
         )?;
         validate_class_members_relation_endpoint(self, source)?;
         validate_property_object_alias_relation_endpoint(
@@ -10116,6 +11503,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 self,
                 target,
                 global_types.map(|globals| globals.array_targets),
+                global_this
+                    .as_ref()
+                    .and_then(|context| context.heritage.as_ref()),
             )?;
             validate_class_members_relation_endpoint(self, target)?;
             validate_property_object_alias_relation_endpoint(
@@ -10163,11 +11553,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 global_types,
                 strict_function_types,
                 instantiation_session,
-            );
+            )
+            .with_global_this_hint(global_this_hint)
+            .with_global_this(global_this);
             session.observe_type_surface(original_source);
             session.observe_type_surface(original_target);
             let result = session
                 .branded_string_relation_related_to(branded_relation, IntersectionState::NONE)?;
+            session.ensure_source_relation_completed(source, target, result)?;
             return Ok(session.finish_without_specialized_root_cache(result));
         }
         if !relation.is_identity() {
@@ -10236,7 +11629,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 global_types,
                 strict_function_types,
                 instantiation_session,
-            );
+            )
+            .with_global_this_hint(global_this_hint)
+            .with_global_this(global_this);
             session.observe_type_surface(original_source);
             session.observe_type_surface(original_target);
             let result = session.call_signatures_related_to(
@@ -10246,6 +11641,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 std::slice::from_ref(&target_callable),
                 IntersectionState::NONE,
             )?;
+            session.ensure_source_relation_completed(source, target, result)?;
             return Ok(session.finish_without_specialized_root_cache(result));
         }
 
@@ -10306,6 +11702,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             && !supported_array_concat_relation
             && !supported_fixed_tuple_relation
             && !supported_broad_string_record_relation
+            && !global_this_dependent
             && (strict_function_types.is_some() || self.claimed_strict_function_types().is_none())
         {
             let key = self
@@ -10346,7 +11743,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     global_types,
                     strict_function_types,
                     instantiation_session,
-                );
+                )
+                .with_global_this_hint(global_this_hint)
+                .with_global_this(global_this);
                 session.observe_type_surface(original_source);
                 session.observe_type_surface(original_target);
                 let result = session.is_related_to_ex(
@@ -10355,6 +11754,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     RecursionFlags::BOTH,
                     IntersectionState::NONE,
                 )?;
+                session.ensure_source_relation_completed(source, target, result)?;
                 return if supported_array_relation
                     || supported_tuple_array_relation
                     || supported_array_concat_relation
@@ -11986,6 +13386,1705 @@ mod tests {
     };
 
     type TestStore = CanonicalTypeMapperStore;
+
+    mod global_this_source_relations {
+        use super::super::{
+            GlobalThisRelationSource, SourceRelationError, SourceSignatureReturnRequest,
+        };
+        use super::*;
+        use crate::semantic::callables::{
+            StoredSingleCallableValidation, validate_stored_single_callable_with_array_targets,
+        };
+        use crate::semantic::declared::{DeclaredTypeError, DeclaredTypeUnavailable};
+        use crate::semantic::global_types::{GlobalThisMembers, prepare_global_this_members};
+        use crate::semantic::instantiate::{
+            InstantiationLimits, InstantiationSession, instantiate_type_with_vector_and_session,
+        };
+        use crate::semantic::type_nodes::{
+            GlobalThisMemberValueProof, SourceSignatureReturnProof, TypeNodeUnavailable,
+        };
+
+        struct MetadataSource<'host, 'arena> {
+            members: Option<GlobalThisMembers<'host, 'arena>>,
+            preparations: usize,
+        }
+
+        impl GlobalThisRelationSource for MetadataSource<'_, '_> {
+            type Error = DeclaredTypeError;
+
+            fn global_this_members(&self) -> Option<&GlobalThisMembers<'_, '_>> {
+                self.members.as_ref()
+            }
+
+            fn prepare_global_this_members(
+                &mut self,
+                _store: &mut CanonicalTypeMapperStore,
+                _receiver: TypeId,
+                _session: &mut InstantiationSession,
+            ) -> Result<(), Self::Error> {
+                self.preparations += 1;
+                Ok(())
+            }
+
+            fn resolve_global_this_member(
+                &mut self,
+                _store: &mut CanonicalTypeMapperStore,
+                _receiver: TypeId,
+                _member: SemanticSymbolId,
+                _session: &mut InstantiationSession,
+            ) -> Result<GlobalThisMemberValueProof, Self::Error> {
+                panic!("metadata-only relations must not query a value")
+            }
+
+            fn validate_global_this_member_value_proof(
+                &self,
+                _store: &CanonicalTypeMapperStore,
+                _proof: &GlobalThisMemberValueProof,
+                _globals: &CanonicalGlobalTypes,
+                _strict_function_types: Option<bool>,
+            ) -> Result<(), Self::Error> {
+                panic!("metadata-only relations must not admit a value")
+            }
+
+            fn resolve_source_signature_return(
+                &mut self,
+                _store: &mut CanonicalTypeMapperStore,
+                _request: SourceSignatureReturnRequest,
+                _origin: Option<&GlobalThisMemberValueProof>,
+                _session: &mut InstantiationSession,
+            ) -> Result<SourceSignatureReturnProof, Self::Error> {
+                panic!("metadata-only relations must not query a signature return")
+            }
+
+            fn validate_source_signature_return_proof(
+                &self,
+                _store: &CanonicalTypeMapperStore,
+                _proof: &SourceSignatureReturnProof,
+                _globals: &CanonicalGlobalTypes,
+                _strict_function_types: Option<bool>,
+            ) -> Result<(), Self::Error> {
+                panic!("metadata-only relations must not admit a signature return")
+            }
+        }
+
+        fn alias_node(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &parsed.arena.get(alias.name)?.data else {
+                        return None;
+                    };
+                    (name.text == expected).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        alias.type_,
+                    ))
+                })
+                .unwrap_or_else(|| panic!("missing alias {expected}"))
+        }
+
+        #[allow(clippy::too_many_lines)] // Snapshot canonical records and caches, not internal observation tokens.
+        fn publication(
+            context: &CanonicalCheckerContext<'_>,
+        ) -> impl std::fmt::Debug + PartialEq + use<> {
+            let store = context.store();
+            let nodes = context
+                .file_order()
+                .iter()
+                .flat_map(|file| {
+                    let (arena, _) = context.file(*file).unwrap();
+                    arena
+                        .iter()
+                        .map(move |(node, _)| NodeRef::new(arena.id(), *file, node))
+                })
+                .collect::<Vec<_>>();
+            let mut types = nodes
+                .iter()
+                .filter_map(|node| {
+                    store
+                        .type_node_links(*node)
+                        .and_then(|links| links.resolved_type)
+                })
+                .chain([context.global_types().global_this_value_type])
+                .collect::<Vec<_>>();
+            types.sort_unstable();
+            types.dedup();
+            let mut relations = Vec::new();
+            for relation in [
+                RelationKind::Identity,
+                RelationKind::Assignable,
+                RelationKind::Comparable,
+                RelationKind::Subtype,
+                RelationKind::StrictSubtype,
+            ] {
+                for source in &types {
+                    for target in &types {
+                        relations.push((
+                            relation,
+                            *source,
+                            *target,
+                            store
+                                .relation_key_if_available(
+                                    *source,
+                                    *target,
+                                    crate::semantic::relation::IntersectionState::NONE,
+                                    relation.is_identity(),
+                                    false,
+                                )
+                                .map(|key| {
+                                    (key.key(), store.relation_cache_get(relation, key.key()))
+                                }),
+                        ));
+                    }
+                }
+            }
+            (
+                [
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.type_alias_len(),
+                    store.index_info_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.merged_symbol_len(),
+                    store.properties_type_cache_len(),
+                    store.conditional_root_len_internal(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+                relations,
+                store
+                    .types()
+                    .map(|(id, record)| (id, format!("{record:?}")))
+                    .collect::<Vec<_>>(),
+                format!("{:?}", store.symbol_store()),
+                store
+                    .symbol_store()
+                    .symbols()
+                    .map(|(symbol, _)| {
+                        (
+                            symbol,
+                            store.value_symbol_links(symbol).cloned(),
+                            store.declared_type_links(symbol).cloned(),
+                            store.type_alias_links(symbol).cloned(),
+                            store.members_and_exports_links(symbol).cloned(),
+                            store.alias_symbol_links(symbol).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                store
+                    .signatures()
+                    .map(|(id, record)| (id, format!("{record:?}")))
+                    .collect::<Vec<_>>(),
+                nodes
+                    .iter()
+                    .map(|node| {
+                        (
+                            *node,
+                            store.node_links(*node).cloned(),
+                            store.type_node_links(*node).cloned(),
+                            store.symbol_node_links(*node).cloned(),
+                            store.signature_links(*node).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                context
+                    .file_order()
+                    .iter()
+                    .map(|file| {
+                        (
+                            *file,
+                            store
+                                .source_file_links(context.source_file(*file).unwrap())
+                                .cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                (
+                    store.type_resolution_is_empty(),
+                    store.relation_read_observation_is_active(),
+                ),
+                context.diagnostics().clone(),
+            )
+        }
+
+        fn with_return_query<'arena, R>(
+            context: &mut CanonicalCheckerContext<'arena>,
+            library: &'arena ParseResult,
+            parsed: &'arena ParseResult,
+            file: FileId,
+            caller: &mut InstantiationSession,
+            diagnostics: &mut CanonicalCheckerDiagnostics,
+            operation: impl FnOnce(&mut CanonicalTypeQuery<'_, '_, '_, '_>) -> R,
+        ) -> R {
+            let options = context.options();
+            let globals = context.global_types().clone();
+            let order = context.file_order().to_vec();
+            let library_file = order
+                .iter()
+                .copied()
+                .find(|file| context.file(*file).unwrap().0.id() == library.arena.id())
+                .unwrap();
+            let library_bound = context.file(library_file).unwrap().1.clone();
+            let source_bound = context.file(file).unwrap().1.clone();
+            assert_eq!(context.file(file).unwrap().0.id(), parsed.arena.id());
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&parsed.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap()
+            .with_program_file_order(&order);
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                caller,
+                diagnostics,
+            )
+            .unwrap();
+            operation(&mut query)
+        }
+
+        fn return_signature(context: &CanonicalCheckerContext<'_>, type_: TypeId) -> SignatureId {
+            let StoredSingleCallableValidation::Valid { callable, .. } =
+                validate_stored_single_callable_with_array_targets(
+                    context.store(),
+                    type_,
+                    Some(CanonicalArrayTargets::from_global_types(
+                        context.global_types(),
+                    )),
+                )
+            else {
+                panic!("the source query must publish the real callable and parameters")
+            };
+            assert_eq!(callable.owner, type_);
+            callable.signature
+        }
+
+        fn return_property(
+            context: &CanonicalCheckerContext<'_>,
+            receiver: TypeId,
+            name: &str,
+        ) -> TypeId {
+            let members = context
+                .store()
+                .type_payload(receiver)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .members
+                .unwrap();
+            let member = context
+                .store()
+                .symbol_table(members)
+                .unwrap()
+                .get(EscapedName::source(name).as_ref())
+                .unwrap();
+            context
+                .store()
+                .value_symbol_links(member)
+                .unwrap()
+                .resolved_type
+                .unwrap()
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Keep the real pair, both read orders and replay together.
+        fn global_this_signature_returns_keep_pair_order_and_replay() {
+            let library = parse_source_file(concat!(
+                "interface Array<T> {} interface ReadonlyArray<T> {} ",
+                "declare function convert(value: number): string;",
+            ));
+            let parsed = parse_source_file(concat!(
+                "type World = typeof globalThis; ",
+                "type Match = { convert: (value: number) => string }; ",
+                "type Factory = () => typeof globalThis; ",
+                "type Mirror = () => typeof globalThis;",
+            ));
+            let file = FileId::new(202_834);
+            let options = CanonicalCheckerOptions {
+                strict_function_types: true,
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            };
+            for relation in [RelationKind::Assignable, RelationKind::Identity] {
+                let mut context = source_relation_context(&library, &parsed, file, options);
+                let source = context
+                    .get_type_from_type_node(alias_node(&parsed, file, "Factory"))
+                    .unwrap();
+                let target = context
+                    .get_type_from_type_node(alias_node(&parsed, file, "Mirror"))
+                    .unwrap();
+                let source_signature = return_signature(&context, source);
+                let target_signature = return_signature(&context, target);
+                for signature in [source_signature, target_signature] {
+                    assert!(
+                        context
+                            .store()
+                            .signature(signature)
+                            .unwrap()
+                            .resolved_return_type()
+                            .is_none()
+                    );
+                }
+                let expected = if relation == RelationKind::Identity {
+                    [source_signature, target_signature]
+                } else {
+                    [target_signature, source_signature]
+                };
+                let world = context.global_types().global_this_value_type;
+                let mut caller = InstantiationSession::new(InstantiationLimits::default());
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let mut stable = None;
+                for _ in 0..3 {
+                    let result = with_return_query(
+                        &mut context,
+                        &library,
+                        &parsed,
+                        file,
+                        &mut caller,
+                        &mut diagnostics,
+                        |query| query.relate_source_types(source, target, relation),
+                    )
+                    .unwrap();
+                    assert!(result.related());
+                    let (values, returns) = result.into_proofs();
+                    assert!(values.is_empty());
+                    assert_eq!(
+                        returns
+                            .iter()
+                            .map(SourceSignatureReturnProof::signature)
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                    for proof in &returns {
+                        let request = proof.request();
+                        assert_eq!(
+                            (request.source(), request.source_signature()),
+                            (source, source_signature)
+                        );
+                        assert_eq!(
+                            (request.target(), request.target_signature()),
+                            (target, target_signature)
+                        );
+                        assert_eq!(request.signature(), proof.signature());
+                        assert_eq!(request.global_member(), None);
+                        assert_eq!(proof.type_id(), world);
+                        assert_eq!(
+                            context
+                                .store()
+                                .signature(proof.signature())
+                                .unwrap()
+                                .resolved_return_type(),
+                            Some(world)
+                        );
+                    }
+                    if let Some(stable) = &stable {
+                        assert_eq!(&publication(&context), stable);
+                    } else {
+                        stable = Some(publication(&context));
+                    }
+                    assert_eq!((caller.query_count(), caller.total_count()), (0, 0));
+                    assert!(diagnostics.is_empty());
+                }
+            }
+
+            let mut context = source_relation_context(&library, &parsed, file, options);
+            let world = context
+                .get_type_from_type_node(alias_node(&parsed, file, "World"))
+                .unwrap();
+            let target = context
+                .get_type_from_type_node(alias_node(&parsed, file, "Match"))
+                .unwrap();
+            let target_callable = return_property(&context, target, "convert");
+            let target_signature = return_signature(&context, target_callable);
+            assert!(
+                context
+                    .store()
+                    .signature(target_signature)
+                    .unwrap()
+                    .resolved_return_type()
+                    .is_none()
+            );
+            let mut caller = InstantiationSession::new(InstantiationLimits::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = with_return_query(
+                &mut context,
+                &library,
+                &parsed,
+                file,
+                &mut caller,
+                &mut diagnostics,
+                |query| query.relate_source_types(world, target, RelationKind::Assignable),
+            )
+            .unwrap();
+            assert!(result.related());
+            let (values, returns) = result.into_proofs();
+            assert_eq!(values.len(), 1);
+            let source_callable = values[0].type_id();
+            let source_signature = return_signature(&context, source_callable);
+            assert_eq!(
+                returns
+                    .iter()
+                    .map(SourceSignatureReturnProof::signature)
+                    .collect::<Vec<_>>(),
+                [target_signature, source_signature]
+            );
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            for proof in &returns {
+                let request = proof.request();
+                assert_eq!(
+                    (request.source(), request.source_signature()),
+                    (source_callable, source_signature)
+                );
+                assert_eq!(
+                    (request.target(), request.target_signature()),
+                    (target_callable, target_signature)
+                );
+                let origin = request.global_member().unwrap();
+                assert_eq!(
+                    (origin.receiver(), origin.member(), origin.callable()),
+                    (world, values[0].member(), source_callable)
+                );
+                assert_eq!(proof.type_id(), string);
+            }
+            let stable = publication(&context);
+            let replay = with_return_query(
+                &mut context,
+                &library,
+                &parsed,
+                file,
+                &mut caller,
+                &mut diagnostics,
+                |query| query.relate_source_types(world, target, RelationKind::Assignable),
+            )
+            .unwrap();
+            assert!(replay.related());
+            let (_, returns) = replay.into_proofs();
+            assert_eq!(
+                returns
+                    .iter()
+                    .map(SourceSignatureReturnProof::signature)
+                    .collect::<Vec<_>>(),
+                [target_signature, source_signature]
+            );
+            assert_eq!(publication(&context), stable);
+            assert_eq!((caller.query_count(), caller.total_count()), (0, 0));
+            assert!(diagnostics.is_empty());
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Keep early exits and unrelated property origins in real source queries.
+        fn global_this_signature_returns_keep_early_exits_and_local_origin() {
+            let library = parse_source_file(concat!(
+                "interface Array<T> {} interface ReadonlyArray<T> {} ",
+                "declare var value: number; ",
+                "declare var box: { callback: () => number };",
+            ));
+            let file = FileId::new(202_835);
+            let options = CanonicalCheckerOptions {
+                strict_function_types: true,
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            };
+            for (text, related, return_count) in [
+                (
+                    "type Left = (value: number) => typeof globalThis; type Right = (value: string) => void;",
+                    false,
+                    0,
+                ),
+                (
+                    "type Left = (one: number, two: number) => typeof globalThis; type Right = (one: number) => void;",
+                    false,
+                    0,
+                ),
+                (
+                    "type Left = () => typeof globalThis; type Right = () => void;",
+                    true,
+                    1,
+                ),
+                (
+                    "type Left = () => typeof globalThis; type Right = () => any;",
+                    true,
+                    1,
+                ),
+                (
+                    "type Left = () => typeof globalThis; type Right = (...values: any[]) => any;",
+                    true,
+                    1,
+                ),
+            ] {
+                let parsed = parse_source_file(text);
+                let mut context = source_relation_context(&library, &parsed, file, options);
+                let source = context
+                    .get_type_from_type_node(alias_node(&parsed, file, "Left"))
+                    .unwrap();
+                let target = context
+                    .get_type_from_type_node(alias_node(&parsed, file, "Right"))
+                    .unwrap();
+                let source_signature = return_signature(&context, source);
+                let target_signature = return_signature(&context, target);
+                let source_return = context
+                    .store()
+                    .function_signature_return_annotation(source_signature)
+                    .unwrap()
+                    .0;
+                let target_return = context
+                    .store()
+                    .function_signature_return_annotation(target_signature)
+                    .unwrap()
+                    .0;
+                let mut caller = InstantiationSession::new(InstantiationLimits::default());
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let mark = caller.limit_event_mark();
+                for _ in 0..2 {
+                    let result = with_return_query(
+                        &mut context,
+                        &library,
+                        &parsed,
+                        file,
+                        &mut caller,
+                        &mut diagnostics,
+                        |query| query.relate_source_types(source, target, RelationKind::Assignable),
+                    )
+                    .unwrap();
+                    assert_eq!(result.related(), related, "{text}");
+                    let (values, returns) = result.into_proofs();
+                    assert!(values.is_empty(), "{text}");
+                    assert_eq!(returns.len(), return_count, "{text}");
+                    if let Some(proof) = returns.first() {
+                        assert_eq!(proof.signature(), target_signature, "{text}");
+                        assert_eq!(proof.request().global_member(), None);
+                    } else {
+                        assert!(
+                            context
+                                .store()
+                                .signature(target_signature)
+                                .unwrap()
+                                .resolved_return_type()
+                                .is_none(),
+                            "{text}"
+                        );
+                        assert!(
+                            context
+                                .store()
+                                .type_node_links(target_return)
+                                .is_none_or(|links| links.resolved_type.is_none()),
+                            "{text}"
+                        );
+                    }
+                    assert!(
+                        context
+                            .store()
+                            .signature(source_signature)
+                            .unwrap()
+                            .resolved_return_type()
+                            .is_none(),
+                        "{text}"
+                    );
+                    assert!(
+                        context
+                            .store()
+                            .type_node_links(source_return)
+                            .is_none_or(|links| links.resolved_type.is_none()),
+                        "{text}"
+                    );
+                    assert_eq!((caller.query_count(), caller.total_count()), (0, 0));
+                    assert_eq!(caller.limit_event_mark(), mark);
+                    assert!(diagnostics.is_empty());
+                }
+            }
+
+            for (text, path, warmed) in [
+                (
+                    "type Left = () => number; type Right = () => number;",
+                    &[][..],
+                    None,
+                ),
+                (
+                    "type Left = { scope: typeof globalThis; ordinary: () => number }; type Right = { scope: { value: number }; ordinary: () => number };",
+                    &["ordinary"][..],
+                    Some("value"),
+                ),
+                (
+                    "type Left = typeof globalThis; type Right = { box: { callback: () => number } };",
+                    &["box", "callback"][..],
+                    Some("box"),
+                ),
+            ] {
+                let parsed = parse_source_file(text);
+                let mut context = source_relation_context(&library, &parsed, file, options);
+                let source = context
+                    .get_type_from_type_node(alias_node(&parsed, file, "Left"))
+                    .unwrap();
+                let target = context
+                    .get_type_from_type_node(alias_node(&parsed, file, "Right"))
+                    .unwrap();
+                let mut target_callable = target;
+                for name in path {
+                    target_callable = return_property(&context, target_callable, name);
+                }
+                let target_signature = return_signature(&context, target_callable);
+                let mut caller = InstantiationSession::new(InstantiationLimits::default());
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let failed = with_return_query(
+                    &mut context,
+                    &library,
+                    &parsed,
+                    file,
+                    &mut caller,
+                    &mut diagnostics,
+                    |query| query.relate_source_types(source, target, RelationKind::Assignable),
+                )
+                .err();
+                assert_eq!(
+                    failed,
+                    Some(SourceRelationError::Relation(
+                        RelationUnavailable::UnresolvedSignatureReturn(target_signature)
+                    )),
+                    "{text}"
+                );
+                assert!(
+                    context
+                        .store()
+                        .signature(target_signature)
+                        .unwrap()
+                        .resolved_return_type()
+                        .is_none()
+                );
+                if let Some(warmed) = warmed {
+                    let library_file = context
+                        .file_order()
+                        .iter()
+                        .copied()
+                        .find(|file| context.file(*file).unwrap().0.id() == library.arena.id())
+                        .unwrap();
+                    let declaration = library
+                        .arena
+                        .iter()
+                        .find_map(|(node, record)| {
+                            let NodeData::VariableDeclaration(variable) = &record.data else {
+                                return None;
+                            };
+                            let NodeData::Identifier(name) =
+                                &library.arena.get(variable.name)?.data
+                            else {
+                                return None;
+                            };
+                            (name.text == warmed).then_some(NodeRef::new(
+                                library.arena.id(),
+                                library_file,
+                                node,
+                            ))
+                        })
+                        .unwrap();
+                    let owner = context
+                        .file(library_file)
+                        .unwrap()
+                        .1
+                        .symbol(declaration)
+                        .unwrap();
+                    assert!(
+                        context
+                            .store()
+                            .value_symbol_links(owner)
+                            .unwrap()
+                            .resolved_type
+                            .is_some()
+                    );
+                }
+                let stable = publication(&context);
+                assert_eq!(
+                    with_return_query(
+                        &mut context,
+                        &library,
+                        &parsed,
+                        file,
+                        &mut caller,
+                        &mut diagnostics,
+                        |query| query.relate_source_types(source, target, RelationKind::Assignable),
+                    )
+                    .err(),
+                    failed,
+                    "{text}"
+                );
+                assert_eq!(publication(&context), stable, "{text}");
+                assert_eq!((caller.query_count(), caller.total_count()), (0, 0));
+                assert!(diagnostics.is_empty());
+            }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Keep one spent caller through warm return damage and exact restore.
+        fn global_this_signature_returns_keep_spent_caller_and_warm_dependency_proof() {
+            let library = parse_source_file(concat!(
+                "interface Array<T> {} interface ReadonlyArray<T> {} ",
+                "interface Seed<T> { value: T; }",
+            ));
+            let parsed = parse_source_file(concat!(
+                "type Factory = () => typeof globalThis; ",
+                "type Mirror = () => typeof globalThis;",
+            ));
+            let file = FileId::new(202_836);
+            let mut context = source_relation_context(
+                &library,
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    strict_function_types: true,
+                    no_implicit_any: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let source = context
+                .get_type_from_type_node(alias_node(&parsed, file, "Factory"))
+                .unwrap();
+            let target = context
+                .get_type_from_type_node(alias_node(&parsed, file, "Mirror"))
+                .unwrap();
+            let source_signature = return_signature(&context, source);
+            let target_signature = return_signature(&context, target);
+            for signature in [source_signature, target_signature] {
+                assert!(
+                    context
+                        .store()
+                        .signature(signature)
+                        .unwrap()
+                        .resolved_return_type()
+                        .is_none()
+                );
+            }
+            let source_annotation = context
+                .store()
+                .function_signature_return_annotation(source_signature)
+                .unwrap()
+                .0;
+            assert_eq!(source_annotation.file, file);
+            assert_eq!(
+                context.store().source_node_kind(source_annotation),
+                Some(SyntaxKind::TypeQuery)
+            );
+            let library_file = context
+                .file_order()
+                .iter()
+                .copied()
+                .find(|file| context.file(*file).unwrap().0.id() == library.arena.id())
+                .unwrap();
+            let parameter = library
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &library.arena.get(interface.name)?.data
+                    else {
+                        return None;
+                    };
+                    if name.text != "Seed" {
+                        return None;
+                    }
+                    let parameter = interface.type_parameters.as_ref()?.nodes[0];
+                    context.file(library_file).unwrap().1.symbol(NodeRef::new(
+                        library.arena.id(),
+                        library_file,
+                        parameter,
+                    ))
+                })
+                .unwrap();
+            let parameter_type = context.get_declared_type_of_symbol(parameter).unwrap();
+            assert_eq!(
+                crate::semantic::declared::cached_ordinary_type_parameter_owner(
+                    context.store(),
+                    parameter_type,
+                ),
+                Some(parameter)
+            );
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let world = context.global_types().global_this_value_type;
+            let mut caller = InstantiationSession::new(InstantiationLimits {
+                max_depth: 100,
+                max_count: 1,
+            });
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    context.store_mut_for_test(),
+                    parameter_type,
+                    &[parameter_type],
+                    &[string],
+                    None,
+                    &mut caller,
+                ),
+                Ok(string)
+            );
+            let limit_mark = caller.limit_event_mark();
+            assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut warm = None;
+            for _ in 0..2 {
+                let result = with_return_query(
+                    &mut context,
+                    &library,
+                    &parsed,
+                    file,
+                    &mut caller,
+                    &mut diagnostics,
+                    |query| query.relate_source_types(source, target, RelationKind::Assignable),
+                )
+                .unwrap();
+                assert!(result.related());
+                let (values, returns) = result.into_proofs();
+                assert!(values.is_empty());
+                assert_eq!(
+                    returns
+                        .iter()
+                        .map(SourceSignatureReturnProof::signature)
+                        .collect::<Vec<_>>(),
+                    [target_signature, source_signature]
+                );
+                for proof in &returns {
+                    assert_eq!(proof.type_id(), world);
+                    assert_eq!(proof.request().source(), source);
+                    assert_eq!(proof.request().target(), target);
+                    assert_eq!(proof.request().global_member(), None);
+                }
+                if let Some(warm) = &warm {
+                    assert_eq!(&publication(&context), warm);
+                } else {
+                    warm = Some(publication(&context));
+                }
+                assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+                assert_eq!(caller.limit_event_mark(), limit_mark);
+                assert!(diagnostics.is_empty());
+            }
+            let warm = warm.unwrap();
+            let original_return = context
+                .store()
+                .signature(source_signature)
+                .unwrap()
+                .resolved_return_type();
+            let original_annotation = context
+                .store()
+                .type_node_links(source_annotation)
+                .unwrap()
+                .clone();
+            assert_eq!(original_return, Some(world));
+            assert_eq!(original_annotation.resolved_type, Some(world));
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_resolved_return_type(source_signature, Some(number))
+            );
+            assert!(context.store_mut_for_test().set_type_node_links(
+                source_annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(number),
+                    ..original_annotation.clone()
+                },
+            ));
+            let damaged = publication(&context);
+            for _ in 0..2 {
+                assert_eq!(
+                    with_return_query(
+                        &mut context,
+                        &library,
+                        &parsed,
+                        file,
+                        &mut caller,
+                        &mut diagnostics,
+                        |query| query.relate_source_types(source, target, RelationKind::Assignable),
+                    )
+                    .err(),
+                    Some(SourceRelationError::Relation(
+                        RelationUnavailable::CanonicalGlobalType(
+                            CanonicalGlobalTypeInitializationError::DeclaredType(
+                                DeclaredTypeError::TypeNodeUnavailable(
+                                    TypeNodeUnavailable::InvalidTypeReference(source_annotation),
+                                ),
+                            ),
+                        ),
+                    ))
+                );
+                assert_eq!(publication(&context), damaged);
+                assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+                assert_eq!(caller.limit_event_mark(), limit_mark);
+                assert!(diagnostics.is_empty());
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_resolved_return_type(source_signature, original_return)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(source_annotation, original_annotation)
+            );
+            let restored = with_return_query(
+                &mut context,
+                &library,
+                &parsed,
+                file,
+                &mut caller,
+                &mut diagnostics,
+                |query| query.relate_source_types(source, target, RelationKind::Assignable),
+            )
+            .unwrap();
+            assert!(restored.related());
+            let (values, returns) = restored.into_proofs();
+            assert!(values.is_empty());
+            assert_eq!(
+                returns
+                    .iter()
+                    .map(SourceSignatureReturnProof::signature)
+                    .collect::<Vec<_>>(),
+                [target_signature, source_signature]
+            );
+            assert!(returns.iter().all(|proof| proof.type_id() == world));
+            assert_eq!(publication(&context), warm);
+            assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+            assert_eq!(caller.limit_event_mark(), limit_mark);
+            assert!(diagnostics.is_empty());
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Keep warm direct and nested reads beside their missing-proof checks.
+        fn global_this_relations_need_current_proof_before_direct_and_nested_cache_reads() {
+            let library = parse_source_file(concat!(
+                "interface Array<T> {} interface ReadonlyArray<T> {} ",
+                "declare var value: number;",
+            ));
+            let parsed = parse_source_file(concat!(
+                "type World = typeof globalThis; ",
+                "type Target = { value: number }; ",
+                "type Outer = { scope: typeof globalThis }; ",
+                "type OuterTarget = { scope: { value: number } }; ",
+                "type Factory = () => typeof globalThis; ",
+                "type FactoryTarget = () => { value: number };",
+            ));
+            let file = FileId::new(202_831);
+            let mut context = source_relation_context(
+                &library,
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        exact_optional_property_types: false,
+                    },
+                    strict_function_types: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let types = [
+                "World",
+                "Target",
+                "Outer",
+                "OuterTarget",
+                "Factory",
+                "FactoryTarget",
+            ]
+            .map(|name| {
+                context
+                    .get_type_from_type_node(alias_node(&parsed, file, name))
+                    .unwrap()
+            });
+            let globals = context.global_types().clone();
+            assert_eq!(types[0], globals.global_this_value_type);
+            for pair in types.chunks_exact(2) {
+                assert_eq!(context.is_type_assignable_to(pair[0], pair[1]), Ok(true));
+            }
+            let warm = publication(&context);
+            let mut caller = InstantiationSession::new(InstantiationLimits {
+                max_depth: 100,
+                max_count: 1,
+            });
+            let limit_mark = caller.limit_event_mark();
+            for _ in 0..2 {
+                for pair in types.chunks_exact(2) {
+                    let store = context.store_mut_for_test();
+                    let expected = Err(RelationUnavailable::UnsupportedStructuredType(
+                        globals.global_this_value_type,
+                    ));
+                    assert_eq!(store.is_type_assignable_to(pair[0], pair[1]), expected);
+                    assert_eq!(store.is_type_identical_to(pair[0], pair[0]), expected);
+                    assert_eq!(
+                        store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                            pair[0], pair[1], &globals, true,
+                        ),
+                        expected
+                    );
+                    assert_eq!(
+                        store.is_type_related_to_with_session(
+                            pair[0],
+                            pair[1],
+                            RelationKind::Comparable,
+                            Some(&globals),
+                            Some(true),
+                            &mut caller,
+                        ),
+                        expected
+                    );
+                    assert_eq!(publication(&context), warm);
+                    assert_eq!((caller.query_count(), caller.total_count()), (0, 0));
+                    assert_eq!(caller.limit_event_mark(), limit_mark);
+                }
+                for pair in types.chunks_exact(2) {
+                    assert_eq!(context.is_type_assignable_to(pair[0], pair[1]), Ok(true));
+                }
+                assert_eq!(publication(&context), warm);
+            }
+            let options = context.options();
+            let order = context.file_order().to_vec();
+            let library_bound = context.file(order[0]).unwrap().1.clone();
+            let source_bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&parsed.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap()
+            .with_program_file_order(&order);
+            let members = prepare_global_this_members(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                types[0],
+            )
+            .unwrap()
+            .unwrap();
+            let mut source = MetadataSource {
+                members: Some(members),
+                preparations: 0,
+            };
+            for (requested, expected) in [
+                (None, RelationUnavailable::StructuredSignatures(types[4])),
+                (
+                    Some(false),
+                    RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                        established: true,
+                        requested: false,
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    context
+                        .store_mut_for_test()
+                        .is_type_related_to_with_global_this_source(
+                            types[4],
+                            types[5],
+                            RelationKind::Assignable,
+                            &globals,
+                            requested,
+                            &mut caller,
+                            &mut source,
+                        )
+                        .err(),
+                    Some(SourceRelationError::Relation(expected))
+                );
+                assert_eq!(source.preparations, 0);
+                assert_eq!(publication(&context), warm);
+                assert_eq!((caller.query_count(), caller.total_count()), (0, 0));
+                assert_eq!(caller.limit_event_mark(), limit_mark);
+            }
+            let world = types[0];
+            let owner = context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .global_this_symbol;
+            assert_eq!(
+                context.store().type_payload(world).unwrap().symbol(),
+                Some(owner)
+            );
+            let owner_links = context.store().value_symbol_links(owner).unwrap().clone();
+            assert_eq!(owner_links.resolved_type, Some(world));
+            assert!(context.store_mut_for_test().set_type_symbol(world, None));
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                owner,
+                ValueSymbolLinks {
+                    resolved_type: None,
+                    ..owner_links.clone()
+                },
+            ));
+            let damaged = publication(&context);
+            for pair in types.chunks_exact(2) {
+                let store = context.store_mut_for_test();
+                let expected = Err(RelationUnavailable::UnsupportedStructuredType(world));
+                assert_eq!(
+                    store.is_type_related_to_with_global_types(
+                        pair[0],
+                        pair[0],
+                        RelationKind::Identity,
+                        &globals,
+                    ),
+                    expected
+                );
+                assert_eq!(
+                    store.is_type_identical_to_with_global_types_and_strict_function_types(
+                        pair[0], pair[0], &globals, true,
+                    ),
+                    expected
+                );
+                assert_eq!(
+                    store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                        pair[0], pair[1], &globals, true,
+                    ),
+                    expected
+                );
+                assert_eq!(
+                    store.is_type_related_to_with_session(
+                        pair[0],
+                        pair[0],
+                        RelationKind::Identity,
+                        Some(&globals),
+                        Some(true),
+                        &mut caller,
+                    ),
+                    expected
+                );
+                assert_eq!(publication(&context), damaged);
+            }
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolved_own_property_by_key_with_context(
+                        world,
+                        ts_binder::EscapedNameRef::source("value"),
+                        Some(&globals),
+                        &mut caller,
+                    )
+                    .err(),
+                Some(RelationUnavailable::UnsupportedStructuredType(world))
+            );
+            let invalid = source
+                .members
+                .as_ref()
+                .unwrap()
+                .validate(context.store())
+                .unwrap_err();
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .is_type_related_to_with_global_this_source(
+                        world,
+                        world,
+                        RelationKind::Identity,
+                        &globals,
+                        Some(true),
+                        &mut caller,
+                        &mut source,
+                    )
+                    .err(),
+                Some(SourceRelationError::Relation(
+                    RelationUnavailable::CanonicalGlobalType(
+                        CanonicalGlobalTypeInitializationError::DeclaredType(invalid),
+                    )
+                ))
+            );
+            assert_eq!(publication(&context), damaged);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_symbol(world, Some(owner))
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(owner, owner_links.clone())
+            );
+            assert_eq!(
+                context.store().value_symbol_links(owner),
+                Some(&owner_links)
+            );
+            assert_eq!(
+                source.members.as_ref().unwrap().validate(context.store()),
+                Ok(())
+            );
+            for pair in types.chunks_exact(2) {
+                assert_eq!(context.is_type_assignable_to(pair[0], pair[1]), Ok(true));
+            }
+            let restored = publication(&context);
+            for pair in types.chunks_exact(2) {
+                assert_eq!(context.is_type_assignable_to(pair[0], pair[1]), Ok(true));
+            }
+            assert_eq!(publication(&context), restored);
+            assert_eq!((caller.query_count(), caller.total_count()), (0, 0));
+            assert_eq!(caller.limit_event_mark(), limit_mark);
+            assert!(context.diagnostics().is_empty());
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Check missing and damaged metadata without querying member values.
+        fn global_this_relation_metadata_demands_keep_order_errors_and_progress() {
+            let library = parse_source_file(concat!(
+                "interface Array<T> {} interface ReadonlyArray<T> {} ",
+                "declare var value: number;",
+            ));
+            let parsed = parse_source_file("type World = typeof globalThis;");
+            let file = FileId::new(202_832);
+            let mut context = source_relation_context(
+                &library,
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    strict_function_types: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let options = context.options();
+            let globals = context.global_types().clone();
+            let world = globals.global_this_value_type;
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let order = context.file_order().to_vec();
+            let library_bound = context.file(order[0]).unwrap().1.clone();
+            let source_bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&parsed.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let mut caller = InstantiationSession::new(InstantiationLimits {
+                max_depth: 100,
+                max_count: 1,
+            });
+            let mut source = MetadataSource {
+                members: None,
+                preparations: 0,
+            };
+            let result = context
+                .store_mut_for_test()
+                .is_type_related_to_with_global_this_source(
+                    number,
+                    number,
+                    RelationKind::Identity,
+                    &globals,
+                    Some(true),
+                    &mut caller,
+                    &mut source,
+                )
+                .unwrap();
+            assert!(result.related());
+            assert!(result.into_member_values().is_empty());
+            assert_eq!(source.preparations, 0);
+            let cold = publication(&context);
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .is_type_related_to_with_global_this_source(
+                        world,
+                        world,
+                        RelationKind::Identity,
+                        &globals,
+                        Some(true),
+                        &mut caller,
+                        &mut source,
+                    )
+                    .err(),
+                Some(SourceRelationError::Relation(
+                    RelationUnavailable::GlobalThisMembersDemand { receiver: world },
+                ))
+            );
+            assert_eq!(source.preparations, 1);
+            assert_eq!(publication(&context), cold);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            assert_eq!(
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut caller,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .relate_source_types(world, world, RelationKind::Identity)
+                .err(),
+                Some(SourceRelationError::Source(
+                    DeclaredTypeUnavailable::GlobalThisProgramOrderUnavailable(world).into(),
+                ))
+            );
+            assert_eq!(publication(&context), cold);
+            let host = host.with_program_file_order(&order);
+            let proof =
+                prepare_global_this_members(context.store_mut_for_test(), &host, &globals, world)
+                    .unwrap()
+                    .unwrap();
+            let members = proof.members_table();
+            let properties = proof.properties().to_vec();
+            let value = proof.get_source("value").unwrap();
+            let mut reversed = properties.clone();
+            reversed.reverse();
+            assert_ne!(reversed, properties);
+            source.members = Some(proof);
+            assert!(context.store_mut_for_test().set_structured_type_members(
+                world,
+                Some(members),
+                Some(reversed),
+                None,
+                None,
+                None,
+            ));
+            let damaged = publication(&context);
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .is_type_related_to_with_global_this_source(
+                        world,
+                        world,
+                        RelationKind::Identity,
+                        &globals,
+                        Some(true),
+                        &mut caller,
+                        &mut source,
+                    )
+                    .err(),
+                Some(SourceRelationError::Relation(
+                    RelationUnavailable::CanonicalGlobalType(
+                        CanonicalGlobalTypeInitializationError::DeclaredType(
+                            DeclaredTypeUnavailable::InvalidGlobalThisMembers(world).into(),
+                        ),
+                    ),
+                ))
+            );
+            assert_eq!(source.preparations, 1);
+            assert_eq!(publication(&context), damaged);
+            assert!(context.store_mut_for_test().set_structured_type_members(
+                world,
+                Some(members),
+                Some(properties),
+                None,
+                None,
+                None,
+            ));
+            let stable = publication(&context);
+            for _ in 0..2 {
+                let result = context
+                    .store_mut_for_test()
+                    .is_type_related_to_with_global_this_source(
+                        world,
+                        world,
+                        RelationKind::Identity,
+                        &globals,
+                        Some(true),
+                        &mut caller,
+                        &mut source,
+                    )
+                    .unwrap();
+                assert!(result.related());
+                assert!(result.into_member_values().is_empty());
+                assert_eq!(publication(&context), stable);
+                assert_eq!(source.preparations, 1);
+                assert!(
+                    context
+                        .store()
+                        .value_symbol_links(value)
+                        .is_none_or(|links| { links.resolved_type.is_none() })
+                );
+            }
+            assert_eq!((caller.query_count(), caller.total_count()), (0, 0));
+            assert!(diagnostics.is_empty());
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Keep one spent caller through source, Array, and warm cache checks.
+        fn global_this_value_relations_keep_spent_caller_arrays_and_warm_source_errors() {
+            let library = parse_source_file(concat!(
+                "interface Array<T> {} interface ReadonlyArray<T> {} ",
+                "interface Seed<T> { value: T; } ",
+                "declare var values: string[]; ",
+                "declare var untouched: typeof untouched;",
+            ));
+            let parsed = parse_source_file(concat!(
+                "type World = typeof globalThis; ",
+                "type Target = { values: object };",
+            ));
+            let file = FileId::new(202_833);
+            let mut context = source_relation_context(
+                &library,
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        exact_optional_property_types: false,
+                    },
+                    strict_function_types: true,
+                    no_implicit_any: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let target = context
+                .get_type_from_type_node(alias_node(&parsed, file, "Target"))
+                .unwrap();
+            let options = context.options();
+            let globals = context.global_types().clone();
+            let world = globals.global_this_value_type;
+            let order = context.file_order().to_vec();
+            let library_file = order[0];
+            let library_bound = context.file(library_file).unwrap().1.clone();
+            let source_bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&parsed.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap()
+            .with_program_file_order(&order);
+            let parameter = library
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &library.arena.get(interface.name)?.data
+                    else {
+                        return None;
+                    };
+                    if name.text != "Seed" {
+                        return None;
+                    }
+                    let parameter = interface.type_parameters.as_ref()?.nodes[0];
+                    library_bound.symbol(NodeRef::new(library.arena.id(), library_file, parameter))
+                })
+                .unwrap();
+            let parameter_type = context.get_declared_type_of_symbol(parameter).unwrap();
+            assert_eq!(
+                crate::semantic::declared::cached_ordinary_type_parameter_owner(
+                    context.store(),
+                    parameter_type,
+                ),
+                Some(parameter)
+            );
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            let missing_array = context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .empty_generic_type;
+            let mut caller = InstantiationSession::new(InstantiationLimits {
+                max_depth: 100,
+                max_count: 1,
+            });
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    context.store_mut_for_test(),
+                    parameter_type,
+                    &[parameter_type],
+                    &[string],
+                    None,
+                    &mut caller,
+                ),
+                Ok(string)
+            );
+            let limit_mark = caller.limit_event_mark();
+            assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+            let members =
+                prepare_global_this_members(context.store_mut_for_test(), &host, &globals, world)
+                    .unwrap()
+                    .unwrap();
+            let raw = members.get_source("values").unwrap();
+            let owner = members.member(raw).unwrap().symbol();
+            let untouched = members
+                .member(members.get_source("untouched").unwrap())
+                .unwrap()
+                .symbol();
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(owner)
+                    .is_none_or(|links| { links.resolved_type.is_none() })
+            );
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut caller,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .relate_source_types(world, target, RelationKind::Assignable)
+            .unwrap();
+            assert!(result.related());
+            let proofs = result.into_member_values();
+            assert_eq!(proofs.len(), 1);
+            assert_eq!(proofs[0].receiver(), world);
+            assert_eq!(proofs[0].member(), raw);
+            let array = proofs[0].type_id();
+            let TypeData::TypeReference(reference) =
+                context.store().type_payload(array).unwrap().data()
+            else {
+                panic!("the demanded source value must retain its Array reference")
+            };
+            assert_eq!(reference.object.target, Some(globals.array_type));
+            assert_eq!(
+                reference.resolved_type_arguments.as_deref(),
+                Some(&[string][..])
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(owner)
+                    .unwrap()
+                    .resolved_type,
+                Some(array)
+            );
+            assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+            assert_eq!(caller.limit_event_mark(), limit_mark);
+            let warm = publication(&context);
+            for _ in 0..2 {
+                let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut caller,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .relate_source_types(world, target, RelationKind::Assignable)
+                .unwrap();
+                assert!(result.related());
+                let proofs = result.into_member_values();
+                assert_eq!(proofs.len(), 1);
+                assert_eq!(
+                    (
+                        proofs[0].receiver(),
+                        proofs[0].member(),
+                        proofs[0].type_id()
+                    ),
+                    (world, raw, array)
+                );
+                assert_eq!(publication(&context), warm);
+                assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+                assert_eq!(caller.limit_event_mark(), limit_mark);
+            }
+            for wrong_array in [missing_array, globals.readonly_array_type] {
+                let mut wrong_globals = globals.clone();
+                wrong_globals.array_type = wrong_array;
+                let before = publication(&context);
+                let expected = CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &wrong_globals,
+                    options,
+                    &mut caller,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .resolve_global_this_member_value(&members, raw)
+                .err()
+                .expect("the current Array target must be checked");
+                let failed = publication(&context);
+                assert_eq!(failed, before);
+                assert_eq!(
+                    CanonicalTypeQuery::new_with_global_types_and_session(
+                        context.store_mut_for_test(),
+                        &host,
+                        &wrong_globals,
+                        options,
+                        &mut caller,
+                        &mut diagnostics,
+                    )
+                    .unwrap()
+                    .relate_source_types(world, target, RelationKind::Assignable)
+                    .err(),
+                    Some(SourceRelationError::Source(expected))
+                );
+                assert_eq!(publication(&context), failed);
+                assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+                assert_eq!(caller.limit_event_mark(), limit_mark);
+            }
+            let original = context.store().value_symbol_links(owner).unwrap().clone();
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                owner,
+                ValueSymbolLinks {
+                    resolved_type: Some(string),
+                    ..original.clone()
+                }
+            ));
+            let before = publication(&context);
+            let expected = CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut caller,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .resolve_global_this_member_value(&members, raw)
+            .err()
+            .expect("the source annotation must reject the changed warm value");
+            let damaged = publication(&context);
+            assert_eq!(damaged, before);
+            assert_eq!(
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut caller,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .relate_source_types(world, target, RelationKind::Assignable)
+                .err(),
+                Some(SourceRelationError::Source(expected))
+            );
+            assert_eq!(publication(&context), damaged);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(owner, original)
+            );
+            for _ in 0..2 {
+                let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut caller,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .relate_source_types(world, target, RelationKind::Assignable)
+                .unwrap();
+                assert!(result.related());
+                assert_eq!(result.into_member_values()[0].type_id(), array);
+                assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+                assert_eq!(caller.limit_event_mark(), limit_mark);
+            }
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(untouched)
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
 
     fn initialized(strict_null_checks: bool) -> TestStore {
         initialized_with_options(strict_null_checks, false)

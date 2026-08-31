@@ -18,18 +18,29 @@ use super::{
     callable_sets::StoredCallableSetValidation,
     constraints::{self, ConstraintError},
     declared::{DeclaredTypeError, cached_ordinary_type_parameter_owner, malformed_alias_merge},
+    global_types::{GlobalThisMembers, is_global_this_type_candidate},
     instantiate::{
-        InstantiationError, InstantiationLimits, InstantiationSession,
+        InstantiationError, InstantiationLimitEventMark, InstantiationLimits, InstantiationSession,
         cached_instantiation_with_vector, canonical_anonymous_union, instantiate_type_with_session,
         instantiate_type_with_vector_and_session,
     },
+    interface_heritage::SourceInterfaceHeritageQueryContext,
     mapper::CanonicalTypeMapperStore,
     object_members::{StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
+    relater::{
+        SourceInterfaceHeritageRequest, SourceRelationError, SourceSignatureReturnQuery,
+        SourceSignatureReturnRequest,
+    },
     signatures::{ElementFlags, SignatureFlags, TupleElementInfo},
     store::SourceNodeParent,
     template_types::{TemplateTypeError, split_first_template_code_point},
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
-    type_nodes::{ConditionalAliasDeclarationProof, ConditionalAliasReferenceProof},
+    type_nodes::{
+        CanonicalTypeQueryOptions, ConditionalAliasDeclarationProof,
+        ConditionalAliasReferenceProof, GlobalThisMemberValueProof,
+        SourceConditionalInputRecoveryProof, SourceConditionalRecoveryProof,
+        SourceSignatureReturnProof,
+    },
     type_records::{
         CacheHashKey, ConditionalTypeData, LiteralValue, TypeCacheState, TypeData, TypeRecord,
     },
@@ -52,6 +63,47 @@ pub(super) enum ConditionalBranchKind {
     False,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ConditionalSourceRoot {
+    pub root: ConditionalRootId,
+    pub node: NodeRef,
+}
+
+/// Identifies the normal input reads that preceded one source evaluation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConditionalSourceInputQuery<'a> {
+    Node {
+        node: NodeRef,
+        check_type: TypeId,
+        extends_type: TypeId,
+    },
+    Instantiation {
+        conditional_type: TypeId,
+        type_arguments: &'a [TypeId],
+        reference: Option<NodeRef>,
+        for_constraint: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum SourceConditionalBranchOutcome {
+    Complete(TypeId),
+    Recovered(SourceConditionalRecoveryProof),
+}
+
+impl SourceConditionalBranchOutcome {
+    pub(super) const fn type_id(&self) -> TypeId {
+        match self {
+            Self::Complete(type_) => *type_,
+            Self::Recovered(proof) => proof.type_id(),
+        }
+    }
+}
+
+fn missing_source_query() -> DeclaredTypeError {
+    super::TypeNodeUnavailable::InvalidPreparedTypeQuery.into()
+}
+
 /// Supplies source branch types. The conditional evaluator owns the decision
 /// and applies its current mapper after the source query returns.
 pub(super) trait ConditionalBranchSource {
@@ -68,12 +120,290 @@ pub(super) trait ConditionalBranchSource {
         branch: ConditionalBranchKind,
         session: &mut InstantiationSession,
     ) -> Result<TypeId, DeclaredTypeError>;
+
+    fn preflight_root(
+        &self,
+        _store: &CanonicalTypeMapperStore,
+        _root: ConditionalSourceRoot,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn resolve_root_branch(
+        &mut self,
+        _store: &mut CanonicalTypeMapperStore,
+        _root: ConditionalSourceRoot,
+        _branch: ConditionalBranchKind,
+        _session: &mut InstantiationSession,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn resolve_root_branch_outcome(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        root: ConditionalSourceRoot,
+        branch: ConditionalBranchKind,
+        session: &mut InstantiationSession,
+    ) -> Result<SourceConditionalBranchOutcome, DeclaredTypeError> {
+        self.resolve_root_branch(store, root, branch, session)
+            .map(SourceConditionalBranchOutcome::Complete)
+    }
+
+    fn validate_root_branch_recovery(
+        &self,
+        _store: &CanonicalTypeMapperStore,
+        _proof: &SourceConditionalRecoveryProof,
+        _session: &InstantiationSession,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn source_branch_recoveries(&self) -> &[SourceConditionalRecoveryProof] {
+        &[]
+    }
+
+    fn validate_source_conditional_input_recovery(
+        &self,
+        _store: &CanonicalTypeMapperStore,
+        _query: ConditionalSourceInputQuery<'_>,
+        _proof: &SourceConditionalInputRecoveryProof,
+        _globals: &CanonicalGlobalTypes,
+        _session: &InstantiationSession,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn retain_source_conditional_recovery(
+        &mut self,
+        _recovery: ConditionalSourceSemanticRecovery,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn validate_resolved_root_branch(
+        &self,
+        _store: &CanonicalTypeMapperStore,
+        _root: ConditionalSourceRoot,
+        _branch: ConditionalBranchKind,
+        _result: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn source_query_options(&self) -> Option<CanonicalTypeQueryOptions> {
+        None
+    }
+
+    fn prepare_global_this_members(
+        &mut self,
+        _store: &mut CanonicalTypeMapperStore,
+        _receiver: TypeId,
+        _session: &mut InstantiationSession,
+    ) -> Result<(), DeclaredTypeError> {
+        Ok(())
+    }
+
+    fn global_this_members(&self) -> Option<&GlobalThisMembers<'_, '_>> {
+        None
+    }
+
+    fn resolve_global_this_member(
+        &mut self,
+        _store: &mut CanonicalTypeMapperStore,
+        _receiver: TypeId,
+        _member: SemanticSymbolId,
+        _session: &mut InstantiationSession,
+    ) -> Result<GlobalThisMemberValueProof, DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn validate_global_this_member_value_proof(
+        &self,
+        _store: &CanonicalTypeMapperStore,
+        _proof: &GlobalThisMemberValueProof,
+        _globals: &CanonicalGlobalTypes,
+        _strict_function_types: Option<bool>,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn source_signature_return_query(&self) -> Option<&dyn SourceSignatureReturnQuery> {
+        None
+    }
+
+    fn resolve_source_signature_return(
+        &mut self,
+        _store: &mut CanonicalTypeMapperStore,
+        _request: SourceSignatureReturnRequest,
+        _origin: Option<&GlobalThisMemberValueProof>,
+        _session: &mut InstantiationSession,
+    ) -> Result<SourceSignatureReturnProof, DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn validate_source_signature_return_proof(
+        &self,
+        _store: &CanonicalTypeMapperStore,
+        _proof: &SourceSignatureReturnProof,
+        _globals: &CanonicalGlobalTypes,
+        _strict_function_types: Option<bool>,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn take_completed_source_conditionals(&mut self) -> Vec<ConditionalSourceResultProof> {
+        Vec::new()
+    }
+
+    fn retain_completed_source_conditional(
+        &mut self,
+        _proof: ConditionalSourceResultProof,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn completed_source_conditional(
+        &self,
+        _key: ConditionalQueryKey,
+    ) -> Option<&ConditionalSourceResultProof> {
+        None
+    }
+
+    fn source_interface_heritage_query_context(
+        &self,
+    ) -> Option<SourceInterfaceHeritageQueryContext<'_>> {
+        None
+    }
+
+    fn prepare_source_interface_heritage(
+        &mut self,
+        _store: &mut CanonicalTypeMapperStore,
+        _request: SourceInterfaceHeritageRequest,
+        _session: &mut InstantiationSession,
+    ) -> Result<(), DeclaredTypeError> {
+        Ok(())
+    }
+}
+
+impl<T: ConditionalBranchSource + ?Sized> super::relater::GlobalThisRelationSource for T {
+    type Error = DeclaredTypeError;
+
+    fn source_interface_heritage_query_context(
+        &self,
+    ) -> Option<SourceInterfaceHeritageQueryContext<'_>> {
+        ConditionalBranchSource::source_interface_heritage_query_context(self)
+    }
+
+    fn prepare_source_interface_heritage(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        request: SourceInterfaceHeritageRequest,
+        session: &mut InstantiationSession,
+    ) -> Result<(), Self::Error> {
+        ConditionalBranchSource::prepare_source_interface_heritage(self, store, request, session)
+    }
+
+    fn prepare_global_this_members(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        receiver: TypeId,
+        session: &mut InstantiationSession,
+    ) -> Result<(), Self::Error> {
+        ConditionalBranchSource::prepare_global_this_members(self, store, receiver, session)
+    }
+
+    fn global_this_members(&self) -> Option<&GlobalThisMembers<'_, '_>> {
+        ConditionalBranchSource::global_this_members(self)
+    }
+
+    fn resolve_global_this_member(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        receiver: TypeId,
+        member: SemanticSymbolId,
+        session: &mut InstantiationSession,
+    ) -> Result<GlobalThisMemberValueProof, Self::Error> {
+        ConditionalBranchSource::resolve_global_this_member(self, store, receiver, member, session)
+    }
+
+    fn validate_global_this_member_value_proof(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        proof: &GlobalThisMemberValueProof,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+    ) -> Result<(), Self::Error> {
+        ConditionalBranchSource::validate_global_this_member_value_proof(
+            self,
+            store,
+            proof,
+            globals,
+            strict_function_types,
+        )
+    }
+
+    fn source_signature_return_query(&self) -> Option<&dyn SourceSignatureReturnQuery> {
+        ConditionalBranchSource::source_signature_return_query(self)
+    }
+
+    fn resolve_source_signature_return(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        request: SourceSignatureReturnRequest,
+        origin: Option<&GlobalThisMemberValueProof>,
+        session: &mut InstantiationSession,
+    ) -> Result<SourceSignatureReturnProof, Self::Error> {
+        ConditionalBranchSource::resolve_source_signature_return(
+            self, store, request, origin, session,
+        )
+    }
+
+    fn validate_source_signature_return_proof(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        proof: &SourceSignatureReturnProof,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+    ) -> Result<(), Self::Error> {
+        ConditionalBranchSource::validate_source_signature_return_proof(
+            self,
+            store,
+            proof,
+            globals,
+            strict_function_types,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConditionalBranchInput {
     Resolved(ConditionalTypeBranches),
     Source(TypeId),
+    Root(ConditionalSourceRoot),
+}
+
+#[derive(Clone, Copy)]
+enum ConditionalValidation<'a> {
+    Operational(Option<&'a dyn ConditionalBranchSource>),
+    Metadata,
+}
+
+impl ConditionalValidation<'_> {
+    fn operand(
+        self,
+        store: &CanonicalTypeMapperStore,
+        type_: TypeId,
+        visiting: &mut HashSet<TypeId>,
+        arrays: Option<CanonicalArrayTargets>,
+    ) -> Result<(), ConditionalTypeError> {
+        match self {
+            Self::Operational(source) => {
+                validate_conditional_operand_with_source(store, type_, visiting, arrays, source)
+            }
+            Self::Metadata => validate_owned_type(store, type_),
+        }
+    }
 }
 
 impl ConditionalBranchInput {
@@ -84,6 +414,7 @@ impl ConditionalBranchInput {
         session: &mut InstantiationSession,
         source: &mut Option<&mut dyn ConditionalBranchSource>,
     ) -> Result<TypeId, ConditionalTypeError> {
+        let mark = session.limit_event_mark();
         let type_ = match self {
             Self::Resolved(branches) => match kind {
                 ConditionalBranchKind::True => branches.true_type,
@@ -94,7 +425,40 @@ impl ConditionalBranchInput {
                 .ok_or(ConditionalTypeError::InvalidConditional(conditional))?
                 .resolve_branch(store, conditional, kind, session)
                 .map_err(ConditionalTypeError::Declared)?,
+            Self::Root(root) => {
+                let source = source
+                    .as_deref_mut()
+                    .ok_or(ConditionalTypeError::InvalidRoot(root.root))?;
+                let recovery_mark = source.source_branch_recoveries().len();
+                let outcome = source
+                    .resolve_root_branch_outcome(store, root, kind, session)
+                    .map_err(ConditionalTypeError::Declared)?;
+                if let SourceConditionalBranchOutcome::Recovered(proof) = &outcome {
+                    let appended = source
+                        .source_branch_recoveries()
+                        .get(recovery_mark..)
+                        .and_then(<[_]>::last);
+                    if source.source_query_options().is_none()
+                        || proof.source_root() != root
+                        || proof.branch() != kind
+                        || appended.is_none_or(|appended| {
+                            appended.source_root() != root
+                                || appended.branch() != kind
+                                || appended.type_id() != proof.type_id()
+                        })
+                    {
+                        return Err(ConditionalTypeError::Declared(missing_source_query()));
+                    }
+                    source
+                        .validate_root_branch_recovery(store, proof, session)
+                        .map_err(ConditionalTypeError::Declared)?;
+                }
+                outcome.type_id()
+            }
         };
+        if let Some(recovery) = source_recovery_type(session, mark, source)? {
+            return Ok(recovery);
+        }
         validate_owned_type(store, type_)?;
         Ok(type_)
     }
@@ -113,6 +477,32 @@ pub(super) struct ConditionalTypeRequest<'a> {
     pub alias: Option<TypeAliasId>,
 }
 
+/// Source syntax supplies branches only after the existing engine demands one.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SourceConditionalTypeRequest<'a> {
+    pub node: NodeRef,
+    pub check_type: TypeId,
+    pub extends_type: TypeId,
+    pub infer_type_parameters: &'a [TypeId],
+    pub outer_type_parameters: Option<&'a [TypeId]>,
+    pub alias: Option<TypeAliasId>,
+    pub input_recovery: Option<&'a SourceConditionalInputRecoveryProof>,
+}
+
+impl<'a> From<ConditionalTypeRequest<'a>> for SourceConditionalTypeRequest<'a> {
+    fn from(request: ConditionalTypeRequest<'a>) -> Self {
+        Self {
+            node: request.node,
+            check_type: request.check_type,
+            extends_type: request.extends_type,
+            infer_type_parameters: request.infer_type_parameters,
+            outer_type_parameters: request.outer_type_parameters,
+            alias: request.alias,
+            input_recovery: None,
+        }
+    }
+}
+
 /// Inputs for one conditional-root instantiation.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ConditionalTypeInstantiation<'a> {
@@ -121,6 +511,15 @@ pub(super) struct ConditionalTypeInstantiation<'a> {
     pub branches: ConditionalTypeBranches,
     pub alias: Option<&'a ConditionalAliasReferenceProof>,
     pub for_constraint: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SourceConditionalTypeInstantiation<'a> {
+    pub conditional_type: TypeId,
+    pub type_arguments: &'a [TypeId],
+    pub alias: Option<&'a ConditionalAliasReferenceProof>,
+    pub for_constraint: bool,
+    pub input_recovery: Option<&'a SourceConditionalInputRecoveryProof>,
 }
 
 /// Alias inputs stay borrowed until evaluation returns a deferred type.
@@ -263,6 +662,579 @@ impl ConditionalQueryProduction {
 
     pub(super) const fn result(&self) -> TypeId {
         self.result
+    }
+}
+
+/// Header evidence alone cannot make a source-dependent result ready.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ConditionalSourceQueryRequest {
+    production: ConditionalQueryProduction,
+    identity_edges: Vec<TypeId>,
+    requires_source: bool,
+}
+
+impl ConditionalSourceQueryRequest {
+    pub(super) const fn key(&self) -> ConditionalQueryKey {
+        self.production.key
+    }
+
+    pub(super) const fn check_type(&self) -> TypeId {
+        self.production.definition.check_type
+    }
+
+    pub(super) const fn extends_type(&self) -> TypeId {
+        self.production.definition.extends_type
+    }
+
+    pub(super) fn infer_type_parameters(&self) -> &[TypeId] {
+        &self.production.definition.infer_type_parameters
+    }
+
+    pub(super) fn outer_type_parameters(&self) -> Option<&[TypeId]> {
+        self.production.definition.outer_type_parameters.as_deref()
+    }
+
+    pub(super) fn definition_alias(&self) -> Option<TypeAliasId> {
+        self.production
+            .definition
+            .alias
+            .as_ref()
+            .map(|alias| alias.id)
+    }
+
+    pub(super) fn definition_alias_identity(&self) -> Option<ConditionalAliasIdentity<'_>> {
+        self.production
+            .definition
+            .alias
+            .as_ref()
+            .map(RetainedConditionalAlias::identity)
+    }
+
+    pub(super) fn type_arguments(&self) -> &[TypeId] {
+        &self.production.type_arguments
+    }
+
+    /// This is the saved cache edge, not approval to use the result.
+    pub(super) const fn retained_result(&self) -> TypeId {
+        self.production.result
+    }
+
+    pub(super) const fn source_node(&self) -> NodeRef {
+        self.production.definition.node
+    }
+
+    pub(super) fn source_root(&self) -> ConditionalSourceRoot {
+        ConditionalSourceRoot {
+            root: self.production.definition.root,
+            node: self.production.definition.node,
+        }
+    }
+
+    pub(super) fn identity_type_edges(&self) -> impl Iterator<Item = TypeId> + '_ {
+        self.identity_edges.iter().copied()
+    }
+
+    pub(super) const fn requires_source_result_proof(&self) -> bool {
+        self.requires_source
+    }
+
+    pub(super) fn matches_result_proof(&self, proof: &ConditionalSourceResultProof) -> bool {
+        self.production == proof.production
+    }
+}
+
+/// This receipt lives in the active source query, never in the checker store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConditionalSourceBranchRead {
+    root: ConditionalSourceRoot,
+    branch: ConditionalBranchKind,
+    result: TypeId,
+}
+
+/// The result and only the source reads reached by its evaluation.
+#[derive(Clone, Debug)]
+pub(super) struct ConditionalSourceResultProof {
+    production: ConditionalQueryProduction,
+    globals: CanonicalGlobalTypes,
+    options: CanonicalTypeQueryOptions,
+    branch_reads: Vec<ConditionalSourceBranchRead>,
+    member_values: Vec<GlobalThisMemberValueProof>,
+    signature_returns: Vec<SourceSignatureReturnProof>,
+    nested: Vec<ConditionalSourceResultProof>,
+}
+
+impl ConditionalSourceResultProof {
+    pub(super) const fn key(&self) -> ConditionalQueryKey {
+        self.production.key
+    }
+
+    pub(super) const fn result(&self) -> TypeId {
+        self.production.result
+    }
+
+    pub(super) fn source_root(&self) -> ConditionalSourceRoot {
+        ConditionalSourceRoot {
+            root: self.production.definition.root,
+            node: self.production.definition.node,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum ConditionalSourceResult {
+    Complete(ConditionalSourceResultProof),
+    Recovered(TypeId),
+    SemanticRecovered(ConditionalSourceSemanticRecovery),
+}
+
+impl ConditionalSourceResult {
+    pub(super) const fn type_id(&self) -> TypeId {
+        match self {
+            Self::Complete(proof) => proof.result(),
+            Self::Recovered(type_) => *type_,
+            Self::SemanticRecovered(recovery) => recovery.type_id(),
+        }
+    }
+}
+
+/// The evaluator produced a normal result, but one reached source branch recovered.
+/// The dependency record is private and is never published as Complete.
+#[derive(Clone, Debug)]
+pub(super) struct ConditionalSourceSemanticRecovery {
+    result: ConditionalSourceResultProof,
+    recoveries: Vec<SourceConditionalRecoveryProof>,
+    nested: Vec<ConditionalSourceSemanticRecovery>,
+    input_recovery: Option<Box<SourceConditionalInputRecoveryProof>>,
+}
+
+impl ConditionalSourceSemanticRecovery {
+    pub(super) const fn type_id(&self) -> TypeId {
+        self.result.result()
+    }
+
+    pub(super) fn source_root(&self) -> ConditionalSourceRoot {
+        self.result.source_root()
+    }
+
+    pub(super) fn recoveries(&self) -> &[SourceConditionalRecoveryProof] {
+        &self.recoveries
+    }
+
+    /// Compares the recorded operation. Both proofs still require validation.
+    pub(super) fn same_operation(&self, other: &Self) -> bool {
+        self.result.production == other.result.production
+            && self.result.globals == other.result.globals
+            && self.result.options == other.result.options
+    }
+
+    #[cfg(test)]
+    pub(super) fn input_recovery(&self) -> Option<&SourceConditionalInputRecoveryProof> {
+        self.input_recovery.as_deref()
+    }
+}
+
+struct RecordingConditionalSource<'a> {
+    source: &'a mut dyn ConditionalBranchSource,
+    globals: &'a CanonicalGlobalTypes,
+    options: CanonicalTypeQueryOptions,
+    branch_reads: Vec<ConditionalSourceBranchRead>,
+    member_values: Vec<GlobalThisMemberValueProof>,
+    signature_returns: Vec<SourceSignatureReturnProof>,
+    nested: Vec<ConditionalSourceResultProof>,
+    recoveries: Vec<SourceConditionalRecoveryProof>,
+    semantic_dependencies: Vec<ConditionalSourceSemanticRecovery>,
+    input_recovery: Option<SourceConditionalInputRecoveryProof>,
+}
+
+impl RecordingConditionalSource<'_> {
+    fn validate_options(&self) -> Result<(), DeclaredTypeError> {
+        if self.source.source_query_options() == Some(self.options) {
+            Ok(())
+        } else {
+            Err(missing_source_query())
+        }
+    }
+
+    fn validate_reads(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        session: &InstantiationSession,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        if let Some(proof) = &self.input_recovery {
+            validate_source_input_recovery(
+                store,
+                proof.query(),
+                proof,
+                self.globals,
+                session,
+                self.source,
+            )
+            .map_err(|error| match error {
+                ConditionalTypeError::Declared(error) => error,
+                _ => missing_source_query(),
+            })?;
+        }
+        if let Some(members) = self.source.global_this_members() {
+            if members.receiver() != self.globals.global_this_value_type {
+                return Err(missing_source_query());
+            }
+            members.validate(store)?;
+        }
+        for read in &self.branch_reads {
+            self.source.validate_resolved_root_branch(
+                store,
+                read.root,
+                read.branch,
+                read.result,
+            )?;
+        }
+        for value in &self.member_values {
+            self.source.validate_global_this_member_value_proof(
+                store,
+                value,
+                self.globals,
+                self.options.strict_function_types,
+            )?;
+        }
+        for proof in &self.signature_returns {
+            self.source.validate_source_signature_return_proof(
+                store,
+                proof,
+                self.globals,
+                self.options.strict_function_types,
+            )?;
+        }
+        for nested in &self.nested {
+            validate_source_conditional_result(store, nested, self.globals, self.source).map_err(
+                |error| match error {
+                    ConditionalTypeError::Declared(error) => error,
+                    _ => missing_source_query(),
+                },
+            )?;
+        }
+        for recovery in &self.recoveries {
+            self.source
+                .validate_root_branch_recovery(store, recovery, session)?;
+        }
+        for recovery in &self.semantic_dependencies {
+            validate_source_conditional_recovery(
+                store,
+                recovery,
+                self.globals,
+                session,
+                self.source,
+            )
+            .map_err(|error| match error {
+                ConditionalTypeError::Declared(error) => error,
+                _ => missing_source_query(),
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl ConditionalBranchSource for RecordingConditionalSource<'_> {
+    fn source_branch_recoveries(&self) -> &[SourceConditionalRecoveryProof] {
+        &self.recoveries
+    }
+
+    fn validate_source_conditional_input_recovery(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        query: ConditionalSourceInputQuery<'_>,
+        proof: &SourceConditionalInputRecoveryProof,
+        globals: &CanonicalGlobalTypes,
+        session: &InstantiationSession,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        self.source
+            .validate_source_conditional_input_recovery(store, query, proof, globals, session)
+    }
+
+    fn validate_root_branch_recovery(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        proof: &SourceConditionalRecoveryProof,
+        session: &InstantiationSession,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        self.source
+            .validate_root_branch_recovery(store, proof, session)
+    }
+
+    fn retain_source_conditional_recovery(
+        &mut self,
+        recovery: ConditionalSourceSemanticRecovery,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        self.source
+            .retain_source_conditional_recovery(recovery.clone())?;
+        self.semantic_dependencies.push(recovery);
+        Ok(())
+    }
+
+    fn completed_source_conditional(
+        &self,
+        key: ConditionalQueryKey,
+    ) -> Option<&ConditionalSourceResultProof> {
+        self.nested
+            .iter()
+            .rev()
+            .find(|proof| proof.key() == key)
+            .or_else(|| self.source.completed_source_conditional(key))
+    }
+
+    fn retain_completed_source_conditional(
+        &mut self,
+        proof: ConditionalSourceResultProof,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        if let Some(previous) = self
+            .nested
+            .iter_mut()
+            .find(|item| item.key() == proof.key())
+        {
+            *previous = proof;
+        } else {
+            self.nested.push(proof);
+        }
+        Ok(())
+    }
+
+    fn source_interface_heritage_query_context(
+        &self,
+    ) -> Option<SourceInterfaceHeritageQueryContext<'_>> {
+        self.source.source_interface_heritage_query_context()
+    }
+
+    fn prepare_source_interface_heritage(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        request: SourceInterfaceHeritageRequest,
+        session: &mut InstantiationSession,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        self.source
+            .prepare_source_interface_heritage(store, request, session)?;
+        self.validate_options()?;
+        self.nested
+            .extend(self.source.take_completed_source_conditionals());
+        self.validate_reads(store, session)
+    }
+
+    fn preflight(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        conditional: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        self.source.preflight(store, conditional)
+    }
+
+    fn resolve_branch(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        conditional: TypeId,
+        branch: ConditionalBranchKind,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        self.validate_options()?;
+        let result = self
+            .source
+            .resolve_branch(store, conditional, branch, session)?;
+        self.validate_options()?;
+        self.nested
+            .extend(self.source.take_completed_source_conditionals());
+        self.validate_reads(store, session)?;
+        Ok(result)
+    }
+
+    fn preflight_root(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        root: ConditionalSourceRoot,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        self.source.preflight_root(store, root)
+    }
+
+    fn resolve_root_branch(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        root: ConditionalSourceRoot,
+        branch: ConditionalBranchKind,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        self.resolve_root_branch_outcome(store, root, branch, session)
+            .map(|outcome| outcome.type_id())
+    }
+
+    fn resolve_root_branch_outcome(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        root: ConditionalSourceRoot,
+        branch: ConditionalBranchKind,
+        session: &mut InstantiationSession,
+    ) -> Result<SourceConditionalBranchOutcome, DeclaredTypeError> {
+        self.validate_options()?;
+        let mark = session.limit_event_mark();
+        let recovery_mark = self.source.source_branch_recoveries().len();
+        let outcome = self
+            .source
+            .resolve_root_branch_outcome(store, root, branch, session)?;
+        self.validate_options()?;
+        self.nested
+            .extend(self.source.take_completed_source_conditionals());
+        self.validate_reads(store, session)?;
+        match &outcome {
+            SourceConditionalBranchOutcome::Complete(result)
+                if !session.limit_event_occurred_since(mark) =>
+            {
+                self.source
+                    .validate_resolved_root_branch(store, root, branch, *result)?;
+                self.branch_reads.push(ConditionalSourceBranchRead {
+                    root,
+                    branch,
+                    result: *result,
+                });
+            }
+            SourceConditionalBranchOutcome::Recovered(proof) => {
+                let appended = self
+                    .source
+                    .source_branch_recoveries()
+                    .get(recovery_mark..)
+                    .and_then(<[_]>::last);
+                if proof.source_root() != root
+                    || proof.branch() != branch
+                    || appended.is_none_or(|appended| {
+                        appended.source_root() != root
+                            || appended.branch() != branch
+                            || appended.type_id() != proof.type_id()
+                    })
+                {
+                    return Err(missing_source_query());
+                }
+                self.source
+                    .validate_root_branch_recovery(store, proof, session)?;
+                self.recoveries.push(proof.clone());
+            }
+            SourceConditionalBranchOutcome::Complete(_) => {}
+        }
+        Ok(outcome)
+    }
+
+    fn validate_resolved_root_branch(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        root: ConditionalSourceRoot,
+        branch: ConditionalBranchKind,
+        result: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        self.source
+            .validate_resolved_root_branch(store, root, branch, result)
+    }
+
+    fn source_query_options(&self) -> Option<CanonicalTypeQueryOptions> {
+        self.source.source_query_options()
+    }
+
+    fn prepare_global_this_members(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        receiver: TypeId,
+        session: &mut InstantiationSession,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        self.source
+            .prepare_global_this_members(store, receiver, session)?;
+        self.validate_reads(store, session)
+    }
+
+    fn global_this_members(&self) -> Option<&GlobalThisMembers<'_, '_>> {
+        self.source.global_this_members()
+    }
+
+    fn resolve_global_this_member(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        receiver: TypeId,
+        member: SemanticSymbolId,
+        session: &mut InstantiationSession,
+    ) -> Result<GlobalThisMemberValueProof, DeclaredTypeError> {
+        self.validate_options()?;
+        let proof = self
+            .source
+            .resolve_global_this_member(store, receiver, member, session)?;
+        self.validate_reads(store, session)?;
+        self.member_values.push(proof.clone());
+        Ok(proof)
+    }
+
+    fn validate_global_this_member_value_proof(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        proof: &GlobalThisMemberValueProof,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        self.source.validate_global_this_member_value_proof(
+            store,
+            proof,
+            globals,
+            strict_function_types,
+        )
+    }
+
+    fn source_signature_return_query(&self) -> Option<&dyn SourceSignatureReturnQuery> {
+        self.source.source_signature_return_query()
+    }
+
+    fn resolve_source_signature_return(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        request: SourceSignatureReturnRequest,
+        origin: Option<&GlobalThisMemberValueProof>,
+        session: &mut InstantiationSession,
+    ) -> Result<SourceSignatureReturnProof, DeclaredTypeError> {
+        self.validate_options()?;
+        let proof = self
+            .source
+            .resolve_source_signature_return(store, request, origin, session)?;
+        self.validate_reads(store, session)?;
+        if proof.request() != request || proof.signature() != request.signature() {
+            return Err(missing_source_query());
+        }
+        self.source.validate_source_signature_return_proof(
+            store,
+            &proof,
+            self.globals,
+            self.options.strict_function_types,
+        )?;
+        self.signature_returns.push(proof.clone());
+        Ok(proof)
+    }
+
+    fn validate_source_signature_return_proof(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        proof: &SourceSignatureReturnProof,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        self.source.validate_source_signature_return_proof(
+            store,
+            proof,
+            globals,
+            strict_function_types,
+        )
+    }
+
+    fn take_completed_source_conditionals(&mut self) -> Vec<ConditionalSourceResultProof> {
+        self.source.take_completed_source_conditionals()
     }
 }
 
@@ -528,6 +1500,766 @@ pub(super) fn get_type_from_conditional_type(
     Ok(result)
 }
 
+/// Evaluates real source branches in the caller's existing query.
+pub(super) fn get_type_from_conditional_type_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    request: SourceConditionalTypeRequest<'_>,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<ConditionalSourceResult, ConditionalTypeError> {
+    let mark = session.limit_event_mark();
+    let semantic_mark = source_input_recovery_mark(
+        store,
+        ConditionalSourceInputQuery::Node {
+            node: request.node,
+            check_type: request.check_type,
+            extends_type: request.extends_type,
+        },
+        request.input_recovery,
+        globals,
+        session,
+        source,
+    )?;
+    let options = source
+        .source_query_options()
+        .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?;
+    prepare_source_conditional_request(store, request, globals, session, source)?;
+    if let Some(recovery) = source_recovery_type(session, mark, &Some(&mut *source))? {
+        return Ok(ConditionalSourceResult::Recovered(recovery));
+    }
+    let (root, definition, cached) = source_conditional_root(store, request, globals, source)?;
+    source
+        .preflight_root(store, root)
+        .map_err(ConditionalTypeError::Declared)?;
+    let nested = source.take_completed_source_conditionals();
+    let recoveries = source.source_branch_recoveries().to_vec();
+    let mut recorded = RecordingConditionalSource {
+        source,
+        globals,
+        options,
+        branch_reads: Vec::new(),
+        member_values: Vec::new(),
+        signature_returns: Vec::new(),
+        nested,
+        recoveries,
+        semantic_dependencies: Vec::new(),
+        input_recovery: request.input_recovery.cloned(),
+    };
+    let result = evaluate_conditional_worker(
+        store,
+        root.root,
+        ConditionalBranchInput::Root(root),
+        &[],
+        &[],
+        Some(globals),
+        false,
+        None,
+        session,
+        0,
+        &mut Some(&mut recorded),
+        cached,
+    );
+    if session.limit_event_occurred_since(mark) {
+        if let Some(recovery) = session.recovery_error_type() {
+            return Ok(ConditionalSourceResult::Recovered(recovery));
+        }
+        result?;
+        return Err(ConditionalTypeError::Declared(missing_source_query()));
+    }
+    let result = result?;
+    if let Some(input) = request.input_recovery {
+        validate_source_input_recovery(
+            store,
+            input.query(),
+            input,
+            globals,
+            session,
+            recorded.source,
+        )?;
+    }
+    let semantically_recovered =
+        validate_source_branch_recoveries_since(store, &recorded, semantic_mark, session)?;
+    let production = ConditionalQueryProduction {
+        key: ConditionalQueryKey::Node(request.node),
+        definition,
+        type_arguments: request.outer_type_parameters.unwrap_or_default().to_vec(),
+        alias: None,
+        for_constraint: false,
+        result,
+        source_declaration: None,
+        result_alias: retain_result_alias(store, result)?,
+    };
+    let proof = ConditionalSourceResultProof {
+        production,
+        globals: globals.clone(),
+        options,
+        branch_reads: recorded.branch_reads,
+        member_values: recorded.member_values,
+        signature_returns: recorded.signature_returns,
+        nested: recorded.nested,
+    };
+    if semantically_recovered {
+        let recovery = ConditionalSourceSemanticRecovery {
+            result: proof,
+            recoveries: recorded.recoveries[semantic_mark..].to_vec(),
+            nested: recorded.semantic_dependencies,
+            input_recovery: recorded.input_recovery.map(Box::new),
+        };
+        validate_source_conditional_recovery(store, &recovery, globals, session, recorded.source)?;
+        return Ok(ConditionalSourceResult::SemanticRecovered(recovery));
+    }
+    if cached.is_some_and(|cached| cached != result) {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(request.node));
+    }
+    validate_source_result_dependencies(store, &proof, globals, recorded.source)?;
+    if cached.is_none() {
+        publish_source_conditional_result(store, &proof.production, globals, recorded.source)?;
+    }
+    validate_source_conditional_result(store, &proof, globals, recorded.source)?;
+    Ok(ConditionalSourceResult::Complete(proof))
+}
+
+fn prepare_source_conditional_request(
+    store: &mut CanonicalTypeMapperStore,
+    request: SourceConditionalTypeRequest<'_>,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<(), ConditionalTypeError> {
+    let arrays = Some(CanonicalArrayTargets::from_global_types(globals));
+    let options = source
+        .source_query_options()
+        .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?;
+    if let (Some(established), Some(requested)) = (
+        store.claimed_strict_function_types(),
+        options.strict_function_types,
+    ) && established != requested
+    {
+        return Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
+            established,
+            requested,
+        }
+        .into());
+    }
+    let result = validate_request_worker(store, request, None, arrays, Some(source));
+    let Err(ConditionalTypeError::Relation(RelationUnavailable::GlobalThisMembersDemand {
+        receiver,
+    })) = result
+    else {
+        return result;
+    };
+    source
+        .prepare_global_this_members(store, receiver, session)
+        .map_err(ConditionalTypeError::Declared)?;
+    validate_request_worker(store, request, None, arrays, Some(source))
+}
+
+fn source_conditional_root(
+    store: &mut CanonicalTypeMapperStore,
+    request: SourceConditionalTypeRequest<'_>,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<(ConditionalSourceRoot, ConditionalDefinition, Option<TypeId>), ConditionalTypeError> {
+    let arrays = Some(CanonicalArrayTargets::from_global_types(globals));
+    let key = ConditionalQueryKey::Node(request.node);
+    if let Some(cached) = store
+        .type_node_links(request.node)
+        .and_then(|links| links.resolved_type)
+    {
+        validate_cached_conditional_with_source(store, request, cached, arrays, Some(source))?;
+        let definition = store
+            .conditional_query_production(key)
+            .ok_or(ConditionalTypeError::InvalidTypeNodeCache(request.node))?
+            .definition
+            .clone();
+        return Ok((
+            ConditionalSourceRoot {
+                root: definition.root,
+                node: request.node,
+            },
+            definition,
+            Some(cached),
+        ));
+    }
+    if store.conditional_query_production(key).is_some() {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(request.node));
+    }
+    if !store.try_reserve_conditional_productions(0, 1)
+        || !store
+            .try_reserve_type_node_links(usize::from(store.type_node_links(request.node).is_none()))
+    {
+        return Err(ConditionalTypeError::Capacity);
+    }
+    let distributive = matches!(
+        store.type_payload(request.check_type).map(TypeRecord::data),
+        Some(TypeData::TypeParameter(_))
+    );
+    let root = store
+        .alloc_conditional_root(
+            request.node,
+            request.check_type,
+            request.extends_type,
+            distributive,
+            (!request.infer_type_parameters.is_empty())
+                .then(|| request.infer_type_parameters.to_vec()),
+            request.outer_type_parameters.map(<[_]>::to_vec),
+            request.alias,
+        )
+        .ok_or(ConditionalTypeError::InvalidNode(request.node))?;
+    let definition = conditional_definition_worker(
+        store,
+        root,
+        arrays,
+        ConditionalValidation::Operational(Some(source)),
+    )?;
+    Ok((
+        ConditionalSourceRoot {
+            root,
+            node: request.node,
+        },
+        definition,
+        None,
+    ))
+}
+
+fn publish_source_conditional_result(
+    store: &mut CanonicalTypeMapperStore,
+    proof: &ConditionalQueryProduction,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<(), ConditionalTypeError> {
+    let arrays = Some(CanonicalArrayTargets::from_global_types(globals));
+    if let Some(parameters) = proof.definition.outer_type_parameters.as_deref() {
+        let key =
+            conditional_type_key_with_source(store, parameters, None, false, arrays, Some(source))?;
+        if !store.set_conditional_root_instantiations(
+            proof.definition.root,
+            TypeCacheState::Allocated(HashMap::from([(key, proof.result)])),
+        ) {
+            return Err(ConditionalTypeError::InvalidInstantiationCache(
+                proof.definition.root,
+            ));
+        }
+    }
+    validate_query_production_with_source(store, proof, arrays, Some(source))?;
+    if !store.publish_conditional_query_production(proof.clone()) {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(
+            proof.definition.node,
+        ));
+    }
+    let mut links = store
+        .type_node_links(proof.definition.node)
+        .cloned()
+        .unwrap_or_default();
+    links.resolved_type = Some(proof.result);
+    if !store.set_type_node_links(proof.definition.node, links) {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(
+            proof.definition.node,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source_result_dependencies(
+    store: &CanonicalTypeMapperStore,
+    proof: &ConditionalSourceResultProof,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<(), ConditionalTypeError> {
+    if globals != &proof.globals || source.source_query_options() != Some(proof.options) {
+        return Err(ConditionalTypeError::Declared(missing_source_query()));
+    }
+    source
+        .preflight_root(store, proof.source_root())
+        .map_err(ConditionalTypeError::Declared)?;
+    validate_query_operands_with_source(
+        store,
+        &proof.production,
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+        Some(source),
+    )?;
+    validate_source_result_type(store, proof.result(), globals, source)?;
+    for value in &proof.member_values {
+        source
+            .validate_global_this_member_value_proof(
+                store,
+                value,
+                globals,
+                proof.options.strict_function_types,
+            )
+            .map_err(ConditionalTypeError::Declared)?;
+    }
+    for return_proof in &proof.signature_returns {
+        source
+            .validate_source_signature_return_proof(
+                store,
+                return_proof,
+                globals,
+                proof.options.strict_function_types,
+            )
+            .map_err(ConditionalTypeError::Declared)?;
+    }
+    for read in &proof.branch_reads {
+        source
+            .validate_resolved_root_branch(store, read.root, read.branch, read.result)
+            .map_err(ConditionalTypeError::Declared)?;
+    }
+    for nested in &proof.nested {
+        validate_source_conditional_result(store, nested, globals, source)?;
+    }
+    Ok(())
+}
+
+fn validate_source_result_type(
+    store: &CanonicalTypeMapperStore,
+    result: TypeId,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<(), ConditionalTypeError> {
+    if is_global_this_type_candidate(store, Some(globals), result) {
+        let members = source
+            .global_this_members()
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(result))?;
+        if result != globals.global_this_value_type || members.receiver() != result {
+            return Err(RelationUnavailable::InvalidStructuredMembers(result).into());
+        }
+        return members
+            .validate(store)
+            .map_err(ConditionalTypeError::Declared);
+    }
+    let arrays = CanonicalArrayTargets::from_global_types(globals);
+    // Substitution can return an object instance distinct from its source branch.
+    // Its member table and cached values must still match the source mapper.
+    store.validate_cached_array_capability_with_array_targets(arrays, result)?;
+    validate_conditional_operand_with_source(
+        store,
+        result,
+        &mut HashSet::new(),
+        Some(arrays),
+        Some(source),
+    )
+}
+
+pub(super) fn validate_source_conditional_result(
+    store: &CanonicalTypeMapperStore,
+    proof: &ConditionalSourceResultProof,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<(), ConditionalTypeError> {
+    if store.conditional_query_production(proof.production.key) != Some(&proof.production) {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(
+            proof.production.definition.node,
+        ));
+    }
+    conditional_source_query_request(
+        store,
+        proof.production.key,
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+    )?
+    .ok_or(ConditionalTypeError::InvalidTypeNodeCache(
+        proof.production.definition.node,
+    ))?;
+    validate_query_production_with_source(
+        store,
+        &proof.production,
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+        Some(source),
+    )?;
+    validate_source_result_dependencies(store, proof, globals, source)
+}
+
+fn source_input_recovery_mark(
+    store: &CanonicalTypeMapperStore,
+    query: ConditionalSourceInputQuery<'_>,
+    input: Option<&SourceConditionalInputRecoveryProof>,
+    globals: &CanonicalGlobalTypes,
+    session: &InstantiationSession,
+    source: &dyn ConditionalBranchSource,
+) -> Result<usize, ConditionalTypeError> {
+    let end = source.source_branch_recoveries().len();
+    let Some(proof) = input else {
+        return Ok(end);
+    };
+    if proof.event_end() != end {
+        return Err(ConditionalTypeError::Declared(missing_source_query()));
+    }
+    validate_source_input_recovery(store, query, proof, globals, session, source)?;
+    Ok(proof.event_start())
+}
+
+fn validate_source_input_recovery(
+    store: &CanonicalTypeMapperStore,
+    query: ConditionalSourceInputQuery<'_>,
+    proof: &SourceConditionalInputRecoveryProof,
+    globals: &CanonicalGlobalTypes,
+    session: &InstantiationSession,
+    source: &dyn ConditionalBranchSource,
+) -> Result<(), ConditionalTypeError> {
+    if proof.query() != query
+        || proof.event_start() >= proof.event_end()
+        || proof.event_end() > source.source_branch_recoveries().len()
+        || proof.aggregates().is_empty()
+    {
+        return Err(ConditionalTypeError::Declared(missing_source_query()));
+    }
+    // The source owner checks the exact ordered range, actual input reads and
+    // every sealed aggregate. Later callbacks may append but cannot replace it.
+    source
+        .validate_source_conditional_input_recovery(store, query, proof, globals, session)
+        .map_err(ConditionalTypeError::Declared)
+}
+
+fn validate_source_input_recovery_production(
+    store: &CanonicalTypeMapperStore,
+    input: &SourceConditionalInputRecoveryProof,
+    production: &ConditionalQueryProduction,
+    globals: &CanonicalGlobalTypes,
+    session: &InstantiationSession,
+    source: &dyn ConditionalBranchSource,
+) -> Result<(), ConditionalTypeError> {
+    validate_source_input_recovery(store, input.query(), input, globals, session, source)?;
+    let matches = match input.query() {
+        ConditionalSourceInputQuery::Node {
+            node,
+            check_type,
+            extends_type,
+        } => {
+            production.key == ConditionalQueryKey::Node(node)
+                && production.definition.node == node
+                && production.definition.check_type == check_type
+                && production.definition.extends_type == extends_type
+                && production.type_arguments.as_slice() == production.definition.outer_parameters()
+                && production.alias.is_none()
+                && !production.for_constraint
+        }
+        ConditionalSourceInputQuery::Instantiation {
+            conditional_type,
+            type_arguments,
+            reference,
+            for_constraint,
+        } => {
+            let arrays = Some(CanonicalArrayTargets::from_global_types(globals));
+            let definition = &validated_conditional_production_worker(
+                store,
+                conditional_type,
+                arrays,
+                ConditionalValidation::Metadata,
+            )?
+            .definition;
+            let key = if let Some(reference) = reference {
+                ConditionalQueryKey::AliasReference(reference)
+            } else if definition.outer_type_parameters.is_none()
+                || type_arguments == definition.outer_parameters() && !for_constraint
+            {
+                ConditionalQueryKey::Node(definition.node)
+            } else {
+                ConditionalQueryKey::Instantiation(
+                    definition.root,
+                    conditional_type_key_with_source(
+                        store,
+                        type_arguments,
+                        None,
+                        for_constraint,
+                        arrays,
+                        Some(source),
+                    )?,
+                )
+            };
+            definition == &production.definition
+                && production.key == key
+                && production.type_arguments.as_slice() == type_arguments
+                && production.for_constraint == for_constraint
+        }
+    };
+    if !matches {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(
+            production.definition.node,
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_source_conditional_recovery(
+    store: &CanonicalTypeMapperStore,
+    recovery: &ConditionalSourceSemanticRecovery,
+    globals: &CanonicalGlobalTypes,
+    session: &InstantiationSession,
+    source: &dyn ConditionalBranchSource,
+) -> Result<(), ConditionalTypeError> {
+    if recovery.recoveries.is_empty() {
+        return Err(ConditionalTypeError::Declared(missing_source_query()));
+    }
+    let production = &recovery.result.production;
+    if let Some(input) = &recovery.input_recovery {
+        validate_source_input_recovery_production(
+            store, input, production, globals, session, source,
+        )?;
+    }
+    validate_conditional_definition_worker(
+        store,
+        &production.definition,
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+        ConditionalValidation::Operational(Some(source)),
+    )?;
+    if retain_result_alias(store, production.result)? != production.result_alias {
+        return Err(ConditionalTypeError::InvalidInstantiationCache(
+            production.definition.root,
+        ));
+    }
+    if matches!(
+        store.type_payload(production.result).map(TypeRecord::data),
+        Some(TypeData::Conditional(_))
+    ) {
+        validated_conditional_production_worker(
+            store,
+            production.result,
+            Some(CanonicalArrayTargets::from_global_types(globals)),
+            ConditionalValidation::Operational(Some(source)),
+        )?;
+    }
+    if let ConditionalQueryKey::Node(node) = production.key {
+        validate_conditional_node_link_shape(store, node)?;
+    }
+    if let ConditionalQueryKey::AliasReference(reference) = production.key
+        && let Some((symbol, _)) = production.alias.as_ref()
+    {
+        validate_conditional_alias_reference_owner(store, reference, *symbol)?;
+    }
+    for branch in &recovery.recoveries {
+        source
+            .validate_root_branch_recovery(store, branch, session)
+            .map_err(ConditionalTypeError::Declared)?;
+    }
+    for nested in &recovery.nested {
+        validate_source_conditional_recovery(store, nested, globals, session, source)?;
+    }
+    // This checks the real result and its inputs without requiring or creating
+    // a completed source/root cache for the recovered operation.
+    validate_source_result_dependencies(store, &recovery.result, globals, source)
+}
+
+/// Returns cache identity edges, not permission to use the cached result.
+pub(super) fn conditional_source_query_request(
+    store: &CanonicalTypeMapperStore,
+    key: ConditionalQueryKey,
+    arrays: Option<CanonicalArrayTargets>,
+) -> Result<Option<ConditionalSourceQueryRequest>, ConditionalTypeError> {
+    let Some(proof) = store.conditional_query_production(key) else {
+        if let ConditionalQueryKey::Node(node) = key
+            && store.source_node_kind(node) == Some(SyntaxKind::ConditionalType)
+            && store
+                .type_node_links(node)
+                .is_some_and(|links| links.resolved_type.is_some())
+        {
+            return Err(ConditionalTypeError::InvalidTypeNodeCache(node));
+        }
+        return Ok(None);
+    };
+    validate_query_production_metadata(store, proof, arrays)?;
+    let cached = match key {
+        ConditionalQueryKey::Node(node) | ConditionalQueryKey::AliasReference(node) => store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type),
+        ConditionalQueryKey::AliasDeclaration(symbol) => store
+            .type_alias_links(symbol)
+            .and_then(|links| links.declared_type),
+        ConditionalQueryKey::Instantiation(_, _) => Some(proof.result),
+    };
+    if cached != Some(proof.result)
+        || store.source_node_kind(proof.definition.node) != Some(SyntaxKind::ConditionalType)
+        || matches!(key, ConditionalQueryKey::Node(node) if node != proof.definition.node)
+    {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(
+            proof.definition.node,
+        ));
+    }
+    let edges = conditional_query_identity_edges(proof);
+    let requires_source = conditional_query_requires_source(store, proof, &edges)?;
+    Ok(Some(ConditionalSourceQueryRequest {
+        production: proof.clone(),
+        identity_edges: edges,
+        requires_source,
+    }))
+}
+
+fn conditional_query_identity_edges(proof: &ConditionalQueryProduction) -> Vec<TypeId> {
+    let mut edges = vec![proof.definition.check_type, proof.definition.extends_type];
+    edges.extend_from_slice(&proof.definition.infer_type_parameters);
+    edges.extend_from_slice(proof.definition.outer_parameters());
+    edges.extend_from_slice(&proof.type_arguments);
+    if let Some((_, arguments)) = &proof.alias {
+        edges.extend_from_slice(arguments);
+    }
+    for alias in [proof.definition.alias.as_ref(), proof.result_alias.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        edges.extend_from_slice(&alias.type_arguments);
+    }
+    edges
+}
+
+fn conditional_query_requires_source(
+    store: &CanonicalTypeMapperStore,
+    proof: &ConditionalQueryProduction,
+    edges: &[TypeId],
+) -> Result<bool, ConditionalTypeError> {
+    let mut visited = HashSet::new();
+    let mut requires_source = false;
+    for edge in edges.iter().chain(std::iter::once(&proof.result)) {
+        requires_source |= conditional_identity_requires_source(store, *edge, &mut visited)?;
+    }
+    let mut nodes = vec![proof.definition.node];
+    let mut visited_nodes = HashSet::new();
+    while let Some(node) = nodes.pop() {
+        if !visited_nodes.insert(node) {
+            continue;
+        }
+        if let Some(symbol) = store
+            .symbol_node_links(node)
+            .and_then(|links| links.resolved_symbol)
+            && store
+                .intrinsic_bootstrap()
+                .is_some_and(|bootstrap| symbol == bootstrap.global_this_symbol)
+        {
+            requires_source = true;
+        }
+        if store.source_node_kind(node) == Some(SyntaxKind::TypeQuery)
+            && store
+                .type_node_links(node)
+                .is_some_and(|links| links.resolved_type.is_some())
+        {
+            // Follow the real queried value's annotation when its reduced type
+            // no longer contains the source conditional's operands.
+            for child in store.source_direct_children(node).unwrap_or_default() {
+                let Some(symbol) = store
+                    .symbol_node_links(child)
+                    .and_then(|links| links.resolved_symbol)
+                else {
+                    continue;
+                };
+                let symbol = store
+                    .get_merged_symbol(symbol)
+                    .ok_or(ConditionalTypeError::InvalidTypeNodeCache(node))?;
+                let record = store
+                    .symbol(symbol)
+                    .ok_or(ConditionalTypeError::InvalidTypeNodeCache(node))?;
+                for declaration in record.declarations().unwrap_or_default() {
+                    if let Some(annotation) = store.source_direct_type_annotation(*declaration) {
+                        nodes.push(annotation);
+                    }
+                }
+            }
+        }
+        for key in [
+            ConditionalQueryKey::Node(node),
+            ConditionalQueryKey::AliasReference(node),
+        ] {
+            if let Some(nested) = store.conditional_query_production(key) {
+                for edge in [nested.definition.check_type, nested.definition.extends_type]
+                    .iter()
+                    .chain(&nested.type_arguments)
+                {
+                    requires_source |=
+                        conditional_identity_requires_source(store, *edge, &mut visited)?;
+                }
+                if nested.definition.node != node {
+                    nodes.push(nested.definition.node);
+                }
+            }
+        }
+        nodes.extend(store.source_direct_children(node).unwrap_or_default());
+    }
+    Ok(requires_source)
+}
+
+fn conditional_identity_requires_source(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    visited: &mut HashSet<TypeId>,
+) -> Result<bool, ConditionalTypeError> {
+    if !visited.insert(type_) {
+        return Ok(false);
+    }
+    let record = store
+        .type_payload(type_)
+        .ok_or(ConditionalTypeError::InvalidType(type_))?;
+    if is_global_this_type_candidate(store, None, type_) {
+        return Ok(true);
+    }
+    let mut edges = Vec::new();
+    match record.data() {
+        TypeData::Union(data) => edges.extend_from_slice(&data.union.types),
+        TypeData::Intersection(data) => edges.extend_from_slice(&data.intersection.types),
+        TypeData::TypeReference(data) => {
+            edges.extend(data.object.target);
+            edges.extend_from_slice(data.resolved_type_arguments.as_deref().unwrap_or_default());
+        }
+        TypeData::Interface(data) => {
+            edges.extend(data.reference.object.target);
+            edges.extend_from_slice(
+                data.reference
+                    .resolved_type_arguments
+                    .as_deref()
+                    .unwrap_or_default(),
+            );
+        }
+        TypeData::Tuple(data) => {
+            edges.extend(data.interface.reference.object.target);
+            edges.extend_from_slice(
+                data.interface
+                    .reference
+                    .resolved_type_arguments
+                    .as_deref()
+                    .unwrap_or_default(),
+            );
+        }
+        TypeData::TypeParameter(data) => edges.extend(data.constraint),
+        TypeData::Object(data) => edges.extend(data.target),
+        TypeData::Conditional(data) => edges.extend([data.check_type, data.extends_type]),
+        TypeData::Index(data) => edges.push(data.target),
+        TypeData::IndexedAccess(data) => edges.extend([data.object_type, data.index_type]),
+        TypeData::TemplateLiteral(data) => edges.extend_from_slice(&data.types),
+        TypeData::StringMapping(data) => edges.push(data.target),
+        _ => {}
+    }
+    if let Some(alias) = record.alias() {
+        edges.extend_from_slice(
+            store
+                .type_alias(alias)
+                .ok_or(ConditionalTypeError::InvalidAlias(alias))?
+                .type_arguments()
+                .unwrap_or_default(),
+        );
+    }
+    if let Some(structured) = record.data().structured() {
+        for property in structured.properties.as_deref().unwrap_or_default() {
+            edges.extend(
+                store
+                    .value_symbol_links(*property)
+                    .and_then(|links| links.resolved_type),
+            );
+        }
+        for signature in structured.signatures.as_deref().unwrap_or_default() {
+            let signature_record = store
+                .signature(*signature)
+                .ok_or(ConditionalTypeError::InvalidSignature(*signature))?;
+            edges.extend(signature_record.resolved_return_type());
+            edges.extend_from_slice(
+                store
+                    .callable_signature_parameter_types(*signature)
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    let mut required = false;
+    for edge in edges {
+        required |= conditional_identity_requires_source(store, edge, visited)?;
+    }
+    Ok(required)
+}
+
 /// Instantiates a deferred root and distributes a naked parameter over unions.
 pub(super) fn get_conditional_type_instantiation(
     store: &mut CanonicalTypeMapperStore,
@@ -612,6 +2344,267 @@ pub(super) fn get_conditional_type_instantiation(
         }
     }
     Ok(result)
+}
+
+/// Evaluates the real root mapping without resolving either branch in advance.
+#[allow(clippy::too_many_lines)] // Keep the source proof, caller recovery and exact result publication together.
+pub(super) fn get_conditional_type_instantiation_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    request: SourceConditionalTypeInstantiation<'_>,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<ConditionalSourceResult, ConditionalTypeError> {
+    let mark = session.limit_event_mark();
+    let semantic_mark = source_input_recovery_mark(
+        store,
+        ConditionalSourceInputQuery::Instantiation {
+            conditional_type: request.conditional_type,
+            type_arguments: request.type_arguments,
+            reference: request.alias.map(ConditionalAliasReferenceProof::reference),
+            for_constraint: request.for_constraint,
+        },
+        request.input_recovery,
+        globals,
+        session,
+        source,
+    )?;
+    let arrays = Some(CanonicalArrayTargets::from_global_types(globals));
+    let options = source
+        .source_query_options()
+        .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?;
+    let definition = validated_conditional_production_worker(
+        store,
+        request.conditional_type,
+        arrays,
+        ConditionalValidation::Metadata,
+    )?
+    .definition
+    .clone();
+    prepare_source_conditional_request(
+        store,
+        SourceConditionalTypeRequest {
+            node: definition.node,
+            check_type: definition.check_type,
+            extends_type: definition.extends_type,
+            infer_type_parameters: &definition.infer_type_parameters,
+            outer_type_parameters: definition.outer_type_parameters.as_deref(),
+            alias: definition.alias.as_ref().map(|alias| alias.id),
+            input_recovery: None,
+        },
+        globals,
+        session,
+        source,
+    )?;
+    if let Some(recovery) = source_recovery_type(session, mark, &Some(&mut *source))? {
+        return Ok(ConditionalSourceResult::Recovered(recovery));
+    }
+    prepare_source_conditional_arguments(store, request.type_arguments, globals, session, source)?;
+    if let Some(recovery) = source_recovery_type(session, mark, &Some(&mut *source))? {
+        return Ok(ConditionalSourceResult::Recovered(recovery));
+    }
+    if let Some(alias) = request.alias
+        && (request.for_constraint
+            || !alias.matches_request(store, request.conditional_type, request.type_arguments))
+    {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(
+            alias.reference(),
+        ));
+    }
+    let root = ConditionalSourceRoot {
+        root: definition.root,
+        node: definition.node,
+    };
+    source
+        .preflight_root(store, root)
+        .map_err(ConditionalTypeError::Declared)?;
+    let alias = request
+        .alias
+        .and_then(ConditionalAliasReferenceProof::identity);
+    let alias_source = request.alias.and_then(|proof| {
+        proof
+            .identity()
+            .map(|identity| (identity, proof.reference()))
+    });
+    let nested = source.take_completed_source_conditionals();
+    let recoveries = source.source_branch_recoveries().to_vec();
+    let mut recorded = RecordingConditionalSource {
+        source,
+        globals,
+        options,
+        branch_reads: Vec::new(),
+        member_values: Vec::new(),
+        signature_returns: Vec::new(),
+        nested,
+        recoveries,
+        semantic_dependencies: Vec::new(),
+        input_recovery: request.input_recovery.cloned(),
+    };
+    let result = instantiate_conditional_root(
+        store,
+        ConditionalRootInstantiation {
+            conditional_type: request.conditional_type,
+            type_arguments: request.type_arguments,
+            branches: ConditionalBranchInput::Root(root),
+            alias,
+            alias_source,
+            for_constraint: request.for_constraint,
+            input_recovery: request.input_recovery,
+        },
+        Some(globals),
+        Some(session),
+        0,
+        &mut Some(&mut recorded),
+    );
+    if session.limit_event_occurred_since(mark) {
+        if let Some(recovery) = session.recovery_error_type() {
+            return Ok(ConditionalSourceResult::Recovered(recovery));
+        }
+        result?;
+        return Err(ConditionalTypeError::Declared(missing_source_query()));
+    }
+    let result = result?;
+    if let Some(input) = request.input_recovery {
+        validate_source_input_recovery(
+            store,
+            input.query(),
+            input,
+            globals,
+            session,
+            recorded.source,
+        )?;
+    }
+    let semantically_recovered =
+        validate_source_branch_recoveries_since(store, &recorded, semantic_mark, session)?;
+    let key = if let Some(alias) = request.alias {
+        ConditionalQueryKey::AliasReference(alias.reference())
+    } else if definition.outer_type_parameters.is_none()
+        || request.type_arguments == definition.outer_parameters() && !request.for_constraint
+    {
+        ConditionalQueryKey::Node(definition.node)
+    } else {
+        ConditionalQueryKey::Instantiation(
+            definition.root,
+            conditional_type_key_with_source(
+                store,
+                request.type_arguments,
+                None,
+                request.for_constraint,
+                arrays,
+                Some(recorded.source),
+            )?,
+        )
+    };
+    let proof = ConditionalSourceResultProof {
+        production: ConditionalQueryProduction {
+            key,
+            definition,
+            type_arguments: request.type_arguments.to_vec(),
+            alias: alias.map(|alias| (alias.symbol, alias.type_arguments.to_vec())),
+            for_constraint: request.for_constraint,
+            result,
+            source_declaration: None,
+            result_alias: retain_result_alias(store, result)?,
+        },
+        globals: globals.clone(),
+        options,
+        branch_reads: recorded.branch_reads,
+        member_values: recorded.member_values,
+        signature_returns: recorded.signature_returns,
+        nested: recorded.nested,
+    };
+    if semantically_recovered {
+        let recovery = ConditionalSourceSemanticRecovery {
+            result: proof,
+            recoveries: recorded.recoveries[semantic_mark..].to_vec(),
+            nested: recorded.semantic_dependencies,
+            input_recovery: recorded.input_recovery.map(Box::new),
+        };
+        validate_source_conditional_recovery(store, &recovery, globals, session, recorded.source)?;
+        return Ok(ConditionalSourceResult::SemanticRecovered(recovery));
+    }
+    publish_source_query_production(store, &proof, globals, recorded.source)?;
+    Ok(ConditionalSourceResult::Complete(proof))
+}
+
+fn prepare_source_conditional_arguments(
+    store: &mut CanonicalTypeMapperStore,
+    arguments: &[TypeId],
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<(), ConditionalTypeError> {
+    let validate = |store: &CanonicalTypeMapperStore, source: &dyn ConditionalBranchSource| {
+        let mut visited = HashSet::new();
+        for argument in arguments {
+            validate_conditional_operand_with_source(
+                store,
+                *argument,
+                &mut visited,
+                Some(CanonicalArrayTargets::from_global_types(globals)),
+                Some(source),
+            )?;
+        }
+        Ok(())
+    };
+    let result = validate(store, source);
+    let Err(ConditionalTypeError::Relation(RelationUnavailable::GlobalThisMembersDemand {
+        receiver,
+    })) = result
+    else {
+        return result;
+    };
+    source
+        .prepare_global_this_members(store, receiver, session)
+        .map_err(ConditionalTypeError::Declared)?;
+    validate(store, source)
+}
+
+/// G publishes its exact alias or reference link before using this receipt.
+fn publish_source_query_production(
+    store: &mut CanonicalTypeMapperStore,
+    proof: &ConditionalSourceResultProof,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<(), ConditionalTypeError> {
+    let arrays = Some(CanonicalArrayTargets::from_global_types(globals));
+    validate_source_result_dependencies(store, proof, globals, source)?;
+    validate_query_production_with_source(store, &proof.production, arrays, Some(source))?;
+    if let Some(previous) = store.conditional_query_production(proof.production.key) {
+        if previous != &proof.production {
+            return Err(ConditionalTypeError::InvalidTypeNodeCache(
+                proof.production.definition.node,
+            ));
+        }
+        // A prior production must still have its exact public cache edge.
+        conditional_source_query_request(store, proof.production.key, arrays)?.ok_or(
+            ConditionalTypeError::InvalidTypeNodeCache(proof.production.definition.node),
+        )?;
+        return Ok(());
+    }
+    let cached = match proof.production.key {
+        ConditionalQueryKey::Node(node) | ConditionalQueryKey::AliasReference(node) => store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type),
+        ConditionalQueryKey::AliasDeclaration(symbol) => store
+            .type_alias_links(symbol)
+            .and_then(|links| links.declared_type),
+        ConditionalQueryKey::Instantiation(_, _) => None,
+    };
+    if cached.is_some_and(|cached| cached != proof.result()) {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(
+            proof.production.definition.node,
+        ));
+    }
+    if !store.try_reserve_conditional_productions(0, 1) {
+        return Err(ConditionalTypeError::Capacity);
+    }
+    if !store.publish_conditional_query_production(proof.production.clone()) {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(
+            proof.production.definition.node,
+        ));
+    }
+    Ok(())
 }
 
 /// Returns authenticated alias data without evaluating conditional branches.
@@ -898,7 +2891,12 @@ fn conditional_remap_projection_worker(
     source: Option<&dyn ConditionalBranchSource>,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<ConditionalRemapProjection, ConditionalTypeError> {
-    let projection = conditional_remap_identity_projection(store, conditional, array_targets)?;
+    let projection = conditional_remap_identity_projection_with_source(
+        store,
+        conditional,
+        array_targets,
+        source,
+    )?;
     if let Some(source) = source {
         source
             .preflight(store, conditional)
@@ -914,8 +2912,22 @@ fn conditional_remap_identity_projection(
     conditional: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<ConditionalRemapProjection, ConditionalTypeError> {
-    let production = validated_conditional_production(store, conditional, array_targets)?;
-    conditional_snapshot(store, conditional, array_targets)?;
+    conditional_remap_identity_projection_with_source(store, conditional, array_targets, None)
+}
+
+fn conditional_remap_identity_projection_with_source(
+    store: &CanonicalTypeMapperStore,
+    conditional: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<&dyn ConditionalBranchSource>,
+) -> Result<ConditionalRemapProjection, ConditionalTypeError> {
+    let production = validated_conditional_production_worker(
+        store,
+        conditional,
+        array_targets,
+        ConditionalValidation::Operational(source),
+    )?;
+    conditional_snapshot_with_source(store, conditional, array_targets, source)?;
     let definition = &production.definition;
     let node_query = store
         .conditional_query_production(ConditionalQueryKey::Node(definition.node))
@@ -928,9 +2940,15 @@ fn conditional_remap_identity_projection(
     {
         return Err(ConditionalTypeError::InvalidTypeNodeCache(definition.node));
     }
-    validate_query_production(store, node_query, array_targets)?;
+    validate_query_production_with_source(store, node_query, array_targets, source)?;
     if let Some(alias) = &definition.alias {
-        validate_remap_source_alias_links(store, alias.identity(), definition, array_targets)?;
+        validate_remap_source_alias_links_with_source(
+            store,
+            alias.identity(),
+            definition,
+            array_targets,
+            source,
+        )?;
     }
     if let Some(reference) = production.alias_reference {
         let origin = store
@@ -946,9 +2964,9 @@ fn conditional_remap_identity_projection(
         {
             return Err(ConditionalTypeError::InvalidTypeNodeCache(reference));
         }
-        validate_query_production(store, origin, array_targets)?;
+        validate_query_production_with_source(store, origin, array_targets, source)?;
         if let Some((symbol, arguments)) = &origin.alias {
-            validate_remap_source_alias_links(
+            validate_remap_source_alias_links_with_source(
                 store,
                 ConditionalAliasIdentity {
                     symbol: *symbol,
@@ -956,6 +2974,7 @@ fn conditional_remap_identity_projection(
                 },
                 definition,
                 array_targets,
+                source,
             )?;
         }
     }
@@ -975,12 +2994,13 @@ fn conditional_remap_identity_projection(
     };
     // A distributed constituent may have no separate root-cache entry. An
     // existing entry or retained query must still pass the complete cache proof.
-    remap_cached_result(
+    remap_cached_result_with_source(
         store,
         &projection,
         projection.arguments(),
         projection.alias(),
         array_targets,
+        source,
     )?;
     Ok(projection)
 }
@@ -1149,11 +3169,12 @@ fn remap_alias_scope_is_supported(
     }
 }
 
-fn validate_remap_source_alias_links(
+fn validate_remap_source_alias_links_with_source(
     store: &CanonicalTypeMapperStore,
     source: ConditionalAliasIdentity<'_>,
     definition: &ConditionalDefinition,
     array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&dyn ConditionalBranchSource>,
 ) -> Result<(), ConditionalTypeError> {
     let invalid = || ConditionalTypeError::InvalidAliasSymbol(source.symbol);
     let links = store.type_alias_links(source.symbol);
@@ -1187,12 +3208,7 @@ fn validate_remap_source_alias_links(
     if proof.definition != *definition || links.declared_type != Some(proof.result) {
         return Err(invalid());
     }
-    validate_conditional_alias_declaration_with_array_targets(
-        store,
-        source.symbol,
-        proof.result,
-        array_targets,
-    )?;
+    validate_query_production_with_source(store, proof, array_targets, query)?;
     if proof.type_arguments.is_empty() {
         if links
             .instantiations
@@ -1252,7 +3268,13 @@ fn validate_conditional_remap_inputs_worker(
     }
     let mut visiting = HashSet::new();
     for argument in arguments {
-        validate_conditional_operand(store, *argument, &mut visiting, array_targets)?;
+        validate_conditional_operand_with_source(
+            store,
+            *argument,
+            &mut visiting,
+            array_targets,
+            source,
+        )?;
     }
     if alias.map(|alias| (alias.symbol, alias.type_arguments.len()))
         != projection
@@ -1264,7 +3286,13 @@ fn validate_conditional_remap_inputs_worker(
         ));
     }
     if let Some(alias) = alias {
-        validate_alias_identity(store, alias, &mut visiting, array_targets)?;
+        validate_alias_identity_worker(
+            store,
+            alias,
+            &mut visiting,
+            array_targets,
+            ConditionalValidation::Operational(source),
+        )?;
     }
     // Without a real alias-reference origin the visible alias is the root alias.
     // A remap cannot create a new source alias or claim a new reference node.
@@ -1323,6 +3351,17 @@ fn remap_cached_result(
     alias: Option<ConditionalAliasIdentity<'_>>,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<TypeId>, ConditionalTypeError> {
+    remap_cached_result_with_source(store, projection, arguments, alias, array_targets, None)
+}
+
+fn remap_cached_result_with_source(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    arguments: &[TypeId],
+    alias: Option<ConditionalAliasIdentity<'_>>,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<&dyn ConditionalBranchSource>,
+) -> Result<Option<TypeId>, ConditionalTypeError> {
     let root = projection.production.definition.root;
     let record = store
         .conditional_root(root)
@@ -1343,7 +3382,7 @@ fn remap_cached_result(
             Ok(None)
         };
     };
-    validate_cached_instantiation(
+    validate_cached_instantiation_with_source(
         store,
         root,
         key,
@@ -1353,6 +3392,7 @@ fn remap_cached_result(
         remap_query_alias(projection, alias),
         false,
         array_targets,
+        source,
     )?;
     Ok(Some(cached))
 }
@@ -1507,13 +3547,41 @@ pub(super) fn cached_conditional_remap_with_source(
         Some(source),
         Some(CanonicalArrayTargets::from_global_types(globals)),
     )?;
-    let cached = remap_cached_result(
+    let cached = remap_cached_result_with_source(
         store,
         projection,
         arguments,
         alias,
         Some(CanonicalArrayTargets::from_global_types(globals)),
+        Some(source),
     )?;
+    if source.source_query_options().is_some() {
+        let Some(cached) = cached else {
+            return Ok(None);
+        };
+        let key = ConditionalQueryKey::Instantiation(
+            projection.production.definition.root,
+            remap_cache_key(store, projection, arguments, alias)?,
+        );
+        let Some(proof) = source.completed_source_conditional(key).or_else(|| {
+            (arguments == projection.parameters() && remap_query_alias(projection, alias).is_none())
+                .then(|| {
+                    source.completed_source_conditional(ConditionalQueryKey::Node(
+                        projection.production.definition.node,
+                    ))
+                })
+                .flatten()
+        }) else {
+            return Ok(None);
+        };
+        validate_source_conditional_result(store, proof, globals, source)?;
+        if proof.result() != cached {
+            return Err(ConditionalTypeError::InvalidInstantiationCache(
+                projection.production.definition.root,
+            ));
+        }
+        return Ok(Some(cached));
+    }
     if cached.is_some() {
         let definition = &projection.production.definition;
         for operand in [definition.check_type, definition.extends_type] {
@@ -1551,6 +3619,11 @@ pub(super) fn remap_conditional_with_source(
     {
         return Ok(cached);
     }
+    if let Some(options) = source.source_query_options() {
+        return remap_source_conditional_result(
+            store, projection, arguments, alias, globals, session, source, options,
+        );
+    }
     let alias_source = projection
         .production
         .alias_reference
@@ -1565,12 +3638,136 @@ pub(super) fn remap_conditional_with_source(
             alias: remap_query_alias(projection, alias),
             alias_source,
             for_constraint: false,
+            input_recovery: None,
         },
         Some(globals),
         Some(session),
         0,
         &mut Some(source),
     )
+}
+
+#[allow(clippy::too_many_arguments)] // Keeps the active mapper and source proof in one operation.
+fn remap_source_conditional_result(
+    store: &mut CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    arguments: &[TypeId],
+    alias: Option<ConditionalAliasIdentity<'_>>,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+    options: CanonicalTypeQueryOptions,
+) -> Result<TypeId, ConditionalTypeError> {
+    let semantic_mark = source.source_branch_recoveries().len();
+    let root = ConditionalSourceRoot {
+        root: projection.production.definition.root,
+        node: projection.production.definition.node,
+    };
+    let nested = source.take_completed_source_conditionals();
+    let recoveries = source.source_branch_recoveries().to_vec();
+    let mut recorded = RecordingConditionalSource {
+        source,
+        globals,
+        options,
+        branch_reads: Vec::new(),
+        member_values: Vec::new(),
+        signature_returns: Vec::new(),
+        nested,
+        recoveries,
+        semantic_dependencies: Vec::new(),
+        input_recovery: None,
+    };
+    let mark = session.limit_event_mark();
+    let result = instantiate_conditional_root(
+        store,
+        ConditionalRootInstantiation {
+            conditional_type: projection.type_id(),
+            type_arguments: arguments,
+            branches: ConditionalBranchInput::Root(root),
+            alias: remap_query_alias(projection, alias),
+            alias_source: projection
+                .production
+                .alias_reference
+                .zip(alias)
+                .map(|(node, alias)| (alias, node)),
+            for_constraint: false,
+            input_recovery: None,
+        },
+        Some(globals),
+        Some(session),
+        0,
+        &mut Some(&mut recorded),
+    );
+    if session.limit_event_occurred_since(mark) {
+        if let Some(recovery) = session.recovery_error_type() {
+            return Ok(recovery);
+        }
+        return result;
+    }
+    let result = result?;
+    let key = ConditionalQueryKey::Instantiation(
+        root.root,
+        remap_cache_key(store, projection, arguments, alias)?,
+    );
+    if validate_source_branch_recoveries_since(store, &recorded, semantic_mark, session)? {
+        let recovery = ConditionalSourceSemanticRecovery {
+            result: ConditionalSourceResultProof {
+                production: ConditionalQueryProduction {
+                    key,
+                    definition: projection.production.definition.clone(),
+                    type_arguments: arguments.to_vec(),
+                    alias: remap_query_alias(projection, alias)
+                        .map(|alias| (alias.symbol, alias.type_arguments.to_vec())),
+                    for_constraint: false,
+                    result,
+                    source_declaration: None,
+                    result_alias: retain_result_alias(store, result)?,
+                },
+                globals: globals.clone(),
+                options,
+                branch_reads: recorded.branch_reads,
+                member_values: recorded.member_values,
+                signature_returns: recorded.signature_returns,
+                nested: recorded.nested,
+            },
+            recoveries: recorded.recoveries[semantic_mark..].to_vec(),
+            nested: recorded.semantic_dependencies,
+            input_recovery: None,
+        };
+        validate_source_conditional_recovery(store, &recovery, globals, session, recorded.source)?;
+        recorded
+            .source
+            .retain_source_conditional_recovery(recovery)
+            .map_err(ConditionalTypeError::Declared)?;
+        return Ok(result);
+    }
+    let production = store
+        .conditional_query_production(key)
+        .or_else(|| {
+            (arguments == projection.parameters() && remap_query_alias(projection, alias).is_none())
+                .then(|| store.conditional_query_production(ConditionalQueryKey::Node(root.node)))
+                .flatten()
+        })
+        .ok_or(ConditionalTypeError::InvalidInstantiationCache(root.root))?
+        .clone();
+    if production.result != result {
+        return Err(ConditionalTypeError::InvalidInstantiationCache(root.root));
+    }
+    let proof = ConditionalSourceResultProof {
+        production,
+        globals: globals.clone(),
+        options,
+        branch_reads: recorded.branch_reads,
+        member_values: recorded.member_values,
+        signature_returns: recorded.signature_returns,
+        nested: recorded.nested,
+    };
+    validate_source_conditional_result(store, &proof, globals, recorded.source)?;
+    recorded
+        .source
+        .retain_completed_source_conditional(proof)
+        .map_err(ConditionalTypeError::Declared)?;
+    Ok(result)
 }
 
 /// Remaps only a still-deferred conditional. Branch nodes and lazy branch caches
@@ -1714,6 +3911,28 @@ pub(super) fn validate_conditional_source_captures_with_array_targets(
     infer: &[SemanticSymbolId],
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), ConditionalTypeError> {
+    validate_conditional_source_captures_worker(store, node, outer, infer, array_targets, false)
+}
+
+/// Checks source capture identity without granting use of a cached result.
+pub(super) fn validate_conditional_source_capture_metadata(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    outer: Option<&[SemanticSymbolId]>,
+    infer: &[SemanticSymbolId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), ConditionalTypeError> {
+    validate_conditional_source_captures_worker(store, node, outer, infer, array_targets, true)
+}
+
+fn validate_conditional_source_captures_worker(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    outer: Option<&[SemanticSymbolId]>,
+    infer: &[SemanticSymbolId],
+    array_targets: Option<CanonicalArrayTargets>,
+    metadata_only: bool,
+) -> Result<(), ConditionalTypeError> {
     validate_conditional_node_link_shape(store, node)?;
     let invalid = || ConditionalTypeError::InvalidTypeNodeCache(node);
     let cached = store
@@ -1730,7 +3949,11 @@ pub(super) fn validate_conditional_source_captures_with_array_targets(
     if cached != Some(proof.result) {
         return Err(invalid());
     }
-    validate_query_production(store, proof, array_targets)?;
+    if metadata_only {
+        validate_query_production_metadata(store, proof, array_targets)?;
+    } else {
+        validate_query_production(store, proof, array_targets)?;
+    }
     let matches = |types: &[TypeId], symbols: &[SemanticSymbolId]| {
         types.len() == symbols.len()
             && types.iter().zip(symbols).all(|(type_, symbol)| {
@@ -1829,6 +4052,104 @@ pub(super) fn record_conditional_alias_declaration(
     Ok(())
 }
 
+pub(super) fn record_conditional_alias_declaration_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    declaration: &ConditionalAliasDeclarationProof,
+    completed: &ConditionalSourceResultProof,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<ConditionalSourceResultProof, ConditionalTypeError> {
+    validate_source_conditional_result(store, completed, globals, source)?;
+    let rhs = store.source_direct_type_annotation(declaration.declaration());
+    let source_node = match completed.production.key {
+        ConditionalQueryKey::Node(node) | ConditionalQueryKey::AliasReference(node) => Some(node),
+        _ => None,
+    };
+    if !declaration.matches_source(store)
+        || declaration.result() != completed.result()
+        || !source_annotation_reaches_query(store, rhs, source_node, completed.result())
+    {
+        return Err(ConditionalTypeError::InvalidAliasSymbol(
+            declaration.symbol(),
+        ));
+    }
+    let mut proof = completed.clone();
+    proof.production.key = ConditionalQueryKey::AliasDeclaration(declaration.symbol());
+    proof.production.type_arguments = declaration.type_parameters().to_vec();
+    proof.production.alias = None;
+    proof.production.source_declaration = Some(declaration.declaration());
+    proof.production.for_constraint = false;
+    proof.nested.push(completed.clone());
+    publish_source_query_production(store, &proof, globals, source)?;
+    Ok(proof)
+}
+
+fn source_annotation_reaches_query(
+    store: &CanonicalTypeMapperStore,
+    annotation: Option<NodeRef>,
+    query: Option<NodeRef>,
+    result: TypeId,
+) -> bool {
+    let (Some(mut annotation), Some(query)) = (annotation, query) else {
+        return false;
+    };
+    let mut visited = HashSet::new();
+    while annotation != query {
+        if !visited.insert(annotation)
+            || store.source_node_kind(annotation) != Some(SyntaxKind::ParenthesizedType)
+            || store.type_node_links(annotation).is_some_and(|links| {
+                links.outer_type_parameters.is_some()
+                    || links.resolved_type.is_some_and(|type_| type_ != result)
+            })
+            || store
+                .symbol_node_links(annotation)
+                .is_some_and(|links| links.resolved_symbol.is_some())
+        {
+            return false;
+        }
+        let Some(children) = store.source_direct_children(annotation) else {
+            return false;
+        };
+        let [child] = children.as_slice() else {
+            return false;
+        };
+        if store.source_node_parent(*child) != Some(SourceNodeParent::Parent(annotation)) {
+            return false;
+        }
+        annotation = *child;
+    }
+    true
+}
+
+pub(super) fn record_conditional_alias_reference_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    reference: &ConditionalAliasReferenceProof,
+    type_arguments: &[TypeId],
+    completed: &ConditionalSourceResultProof,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<ConditionalSourceResultProof, ConditionalTypeError> {
+    validate_source_conditional_result(store, completed, globals, source)?;
+    if !reference.matches_request(store, completed.result(), type_arguments)
+        || !type_arguments.is_empty()
+        || !completed.production.type_arguments.is_empty()
+        || completed.production.for_constraint
+    {
+        return Err(ConditionalTypeError::InvalidTypeNodeCache(
+            reference.reference(),
+        ));
+    }
+    let mut proof = completed.clone();
+    proof.production.key = ConditionalQueryKey::AliasReference(reference.reference());
+    proof.production.alias = reference
+        .identity()
+        .map(|alias| (alias.symbol, alias.type_arguments.to_vec()));
+    proof.production.source_declaration = None;
+    proof.nested.push(completed.clone());
+    publish_source_query_production(store, &proof, globals, source)?;
+    Ok(proof)
+}
+
 pub(super) fn validate_conditional_alias_declaration_with_array_targets(
     store: &CanonicalTypeMapperStore,
     symbol: SemanticSymbolId,
@@ -1858,10 +4179,30 @@ fn retain_conditional_alias(
     alias: Option<TypeAliasId>,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<RetainedConditionalAlias>, ConditionalTypeError> {
+    retain_conditional_alias_worker(
+        store,
+        alias,
+        array_targets,
+        ConditionalValidation::Operational(None),
+    )
+}
+
+fn retain_conditional_alias_worker(
+    store: &CanonicalTypeMapperStore,
+    alias: Option<TypeAliasId>,
+    array_targets: Option<CanonicalArrayTargets>,
+    validation: ConditionalValidation<'_>,
+) -> Result<Option<RetainedConditionalAlias>, ConditionalTypeError> {
     alias
         .map(|id| {
             let identity = stored_alias_identity(store, id)?;
-            validate_alias_identity(store, identity, &mut HashSet::new(), array_targets)?;
+            validate_alias_identity_worker(
+                store,
+                identity,
+                &mut HashSet::new(),
+                array_targets,
+                validation,
+            )?;
             Ok(RetainedConditionalAlias {
                 id,
                 symbol: identity.symbol,
@@ -1896,6 +4237,20 @@ fn conditional_definition(
     root: ConditionalRootId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<ConditionalDefinition, ConditionalTypeError> {
+    conditional_definition_worker(
+        store,
+        root,
+        array_targets,
+        ConditionalValidation::Operational(None),
+    )
+}
+
+fn conditional_definition_worker(
+    store: &CanonicalTypeMapperStore,
+    root: ConditionalRootId,
+    array_targets: Option<CanonicalArrayTargets>,
+    validation: ConditionalValidation<'_>,
+) -> Result<ConditionalDefinition, ConditionalTypeError> {
     let record = store
         .conditional_root(root)
         .ok_or(ConditionalTypeError::InvalidRoot(root))?;
@@ -1907,24 +4262,28 @@ fn conditional_definition(
         is_distributive: record.is_distributive(),
         infer_type_parameters: record.infer_type_parameters().unwrap_or_default().to_vec(),
         outer_type_parameters: record.outer_type_parameters().map(<[_]>::to_vec),
-        alias: retain_conditional_alias(store, record.alias(), array_targets)?,
+        alias: retain_conditional_alias_worker(store, record.alias(), array_targets, validation)?,
     })
 }
 
-fn validate_conditional_definition(
+fn validate_conditional_definition_worker(
     store: &CanonicalTypeMapperStore,
     definition: &ConditionalDefinition,
     array_targets: Option<CanonicalArrayTargets>,
+    validation: ConditionalValidation<'_>,
 ) -> Result<(), ConditionalTypeError> {
-    if conditional_definition(store, definition.root, array_targets)? != *definition {
+    if conditional_definition_worker(store, definition.root, array_targets, validation)?
+        != *definition
+    {
         return Err(ConditionalTypeError::InvalidRoot(definition.root));
     }
-    validate_root_alias(
+    validate_root_alias_worker(
         store,
         definition.node,
         definition.outer_parameters(),
         definition.alias.as_ref().map(|alias| alias.id),
         array_targets,
+        validation,
     )
 }
 
@@ -1933,6 +4292,20 @@ fn validated_conditional_production(
     conditional: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<&ConditionalTypeProduction, ConditionalTypeError> {
+    validated_conditional_production_worker(
+        store,
+        conditional,
+        array_targets,
+        ConditionalValidation::Operational(None),
+    )
+}
+
+fn validated_conditional_production_worker<'store>(
+    store: &'store CanonicalTypeMapperStore,
+    conditional: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    validation: ConditionalValidation<'_>,
+) -> Result<&'store ConditionalTypeProduction, ConditionalTypeError> {
     let invalid = || ConditionalTypeError::InvalidConditional(conditional);
     let proof = store
         .conditional_type_production(conditional)
@@ -1949,11 +4322,12 @@ fn validated_conditional_production(
         || data.extends_type != proof.extends_type
         || data.mapper != proof.mapper
         || data.combined_mapper.is_some()
-        || retain_conditional_alias(store, record.alias(), array_targets)? != proof.alias
+        || retain_conditional_alias_worker(store, record.alias(), array_targets, validation)?
+            != proof.alias
     {
         return Err(invalid());
     }
-    validate_conditional_definition(store, &proof.definition, array_targets)?;
+    validate_conditional_definition_worker(store, &proof.definition, array_targets, validation)?;
     if let Some(reference) = proof.alias_reference {
         let alias = proof.alias.as_ref().ok_or_else(invalid)?;
         validate_conditional_alias_reference_owner(store, reference, alias.symbol)?;
@@ -1978,7 +4352,38 @@ fn validate_query_production(
     proof: &ConditionalQueryProduction,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), ConditionalTypeError> {
-    validate_conditional_definition(store, &proof.definition, array_targets)?;
+    validate_query_production_with_source(store, proof, array_targets, None)
+}
+
+fn validate_query_production_with_source(
+    store: &CanonicalTypeMapperStore,
+    proof: &ConditionalQueryProduction,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<&dyn ConditionalBranchSource>,
+) -> Result<(), ConditionalTypeError> {
+    validate_query_production_worker(
+        store,
+        proof,
+        array_targets,
+        ConditionalValidation::Operational(source),
+    )
+}
+
+fn validate_query_production_metadata(
+    store: &CanonicalTypeMapperStore,
+    proof: &ConditionalQueryProduction,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), ConditionalTypeError> {
+    validate_query_production_worker(store, proof, array_targets, ConditionalValidation::Metadata)
+}
+
+fn validate_query_production_worker(
+    store: &CanonicalTypeMapperStore,
+    proof: &ConditionalQueryProduction,
+    array_targets: Option<CanonicalArrayTargets>,
+    validation: ConditionalValidation<'_>,
+) -> Result<(), ConditionalTypeError> {
+    validate_conditional_definition_worker(store, &proof.definition, array_targets, validation)?;
     if let ConditionalQueryKey::Node(node) = proof.key {
         validate_conditional_node_link_shape(store, node)?;
     }
@@ -1999,14 +4404,14 @@ fn validate_query_production(
                 proof.definition.root,
             ))?;
     if matches!(result.data(), TypeData::Conditional(_)) {
-        validated_conditional_production(store, proof.result, array_targets)?;
+        validated_conditional_production_worker(store, proof.result, array_targets, validation)?;
     }
     let root = store
         .conditional_root(proof.definition.root)
         .ok_or(ConditionalTypeError::InvalidRoot(proof.definition.root))?;
     let cache_key = match proof.key {
         ConditionalQueryKey::AliasDeclaration(symbol) => {
-            validate_alias_identity(
+            validate_alias_identity_worker(
                 store,
                 ConditionalAliasIdentity {
                     symbol,
@@ -2014,6 +4419,7 @@ fn validate_query_production(
                 },
                 &mut HashSet::new(),
                 array_targets,
+                validation,
             )?;
             let Some(declaration) = proof.source_declaration else {
                 return Err(ConditionalTypeError::InvalidAliasSymbol(symbol));
@@ -2030,13 +4436,13 @@ fn validate_query_production(
             {
                 return Err(ConditionalTypeError::InvalidAliasSymbol(symbol));
             }
-            return validate_query_operands(store, proof, array_targets);
+            return validate_query_operands_worker(store, proof, array_targets, validation);
         }
         ConditionalQueryKey::Node(_) | ConditionalQueryKey::AliasReference(_)
             if proof.definition.outer_type_parameters.is_none() =>
         {
             return if root.instantiations() == &TypeCacheState::Unallocated {
-                validate_query_operands(store, proof, array_targets)
+                validate_query_operands_worker(store, proof, array_targets, validation)
             } else {
                 Err(ConditionalTypeError::InvalidInstantiationCache(
                     proof.definition.root,
@@ -2068,13 +4474,28 @@ fn validate_query_production(
             proof.definition.root,
         ));
     }
-    validate_query_operands(store, proof, array_targets)
+    validate_query_operands_worker(store, proof, array_targets, validation)
 }
 
-fn validate_query_operands(
+fn validate_query_operands_with_source(
     store: &CanonicalTypeMapperStore,
     proof: &ConditionalQueryProduction,
     array_targets: Option<CanonicalArrayTargets>,
+    source: Option<&dyn ConditionalBranchSource>,
+) -> Result<(), ConditionalTypeError> {
+    validate_query_operands_worker(
+        store,
+        proof,
+        array_targets,
+        ConditionalValidation::Operational(source),
+    )
+}
+
+fn validate_query_operands_worker(
+    store: &CanonicalTypeMapperStore,
+    proof: &ConditionalQueryProduction,
+    array_targets: Option<CanonicalArrayTargets>,
+    validation: ConditionalValidation<'_>,
 ) -> Result<(), ConditionalTypeError> {
     let mut visiting = HashSet::new();
     for operand in [proof.definition.check_type, proof.definition.extends_type]
@@ -2088,7 +4509,17 @@ fn validate_query_operands(
                 .flat_map(|(_, arguments)| arguments),
         )
     {
-        validate_conditional_operand(store, *operand, &mut visiting, array_targets)?;
+        validation.operand(store, *operand, &mut visiting, array_targets)?;
+    }
+    if let ConditionalValidation::Operational(source) = validation
+        && source.is_none_or(|source| source.source_query_options().is_none())
+        && conditional_query_requires_source(
+            store,
+            proof,
+            &conditional_query_identity_edges(proof),
+        )?
+    {
+        return Err(ConditionalTypeError::Declared(missing_source_query()));
     }
     Ok(())
 }
@@ -2199,44 +4630,105 @@ pub(super) fn get_default_constraint_of_conditional_type(
     global_types: Option<&CanonicalGlobalTypes>,
     session: Option<&mut InstantiationSession>,
 ) -> Result<TypeId, ConditionalTypeError> {
-    let data = conditional_snapshot(
+    get_default_constraint_of_conditional_type_worker(
+        store,
+        conditional,
+        ConditionalBranchInput::Resolved(branches),
+        global_types,
+        session,
+        &mut None,
+    )
+}
+
+fn get_default_constraint_of_conditional_type_worker(
+    store: &mut CanonicalTypeMapperStore,
+    conditional: TypeId,
+    branches: ConditionalBranchInput,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: Option<&mut InstantiationSession>,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<TypeId, ConditionalTypeError> {
+    let semantic_mark = source_semantic_recovery_mark(source);
+    let data = conditional_snapshot_with_source(
         store,
         conditional,
         global_types.map(CanonicalArrayTargets::from_global_types),
+        source.as_deref(),
     )?;
     if let Some(cached) = data.resolved_default_constraint {
         validate_owned_type(store, cached)?;
-        return Ok(cached);
+        if !is_source_query(source) {
+            return Ok(cached);
+        }
     }
 
-    let mut owned_session = InstantiationSession::new(InstantiationLimits::default());
-    let session = session.unwrap_or(&mut owned_session);
-    let true_type = get_inferred_true_type_from_conditional_type(
+    let mut owned_session = session
+        .is_none()
+        .then(|| InstantiationSession::new(InstantiationLimits::default()));
+    let session = session
+        .or(owned_session.as_mut())
+        .expect("the caller or legacy session is present");
+    let mark = session.limit_event_mark();
+    let true_type = resolve_constraint_branch_input(
         store,
         conditional,
         branches,
+        ConditionalResolutionKind::InferredTrue,
         global_types,
-        Some(session),
+        session,
+        source,
     )?;
-    let false_type = get_false_type_from_conditional_type(
+    if let Some(recovery) = source_recovery_type(session, mark, source)? {
+        return Ok(recovery);
+    }
+    let false_type = resolve_constraint_branch_input(
         store,
         conditional,
         branches,
+        ConditionalResolutionKind::False,
         global_types,
-        Some(session),
+        session,
+        source,
     )?;
+    if let Some(recovery) = source_recovery_type(session, mark, source)? {
+        return Ok(recovery);
+    }
     let result = if type_flags(store, true_type)?.intersects(TypeFlags::ANY) {
         false_type
     } else if type_flags(store, false_type)?.intersects(TypeFlags::ANY) {
         true_type
     } else {
-        union_result(store, &[true_type, false_type], global_types)?
+        union_result_in_query(
+            store,
+            &[true_type, false_type],
+            global_types,
+            session,
+            source,
+        )?
     };
-    let mut data = conditional_snapshot(
+    let mut data = conditional_snapshot_with_source(
         store,
         conditional,
         global_types.map(CanonicalArrayTargets::from_global_types),
+        source.as_deref(),
     )?;
+    if is_source_query(source) {
+        if let Some(recovery) = source_recovery_type(session, mark, source)? {
+            return Ok(recovery);
+        }
+        if source_semantic_recovery_since(store, semantic_mark, session, source)? {
+            return Ok(result);
+        }
+        if let Some(cached) = data.resolved_default_constraint {
+            return if cached == result {
+                Ok(result)
+            } else {
+                Err(ConditionalTypeError::InvalidConditionalResolution(
+                    conditional,
+                ))
+            };
+        }
+    }
     data.resolved_default_constraint = Some(result);
     publish_conditional_snapshot(store, conditional, &data)?;
     Ok(result)
@@ -2250,10 +4742,30 @@ pub(super) fn get_constraint_of_distributive_conditional_type(
     global_types: Option<&CanonicalGlobalTypes>,
     session: Option<&mut InstantiationSession>,
 ) -> Result<Option<TypeId>, ConditionalTypeError> {
-    let data = conditional_snapshot(
+    get_constraint_of_distributive_conditional_type_worker(
+        store,
+        conditional,
+        ConditionalBranchInput::Resolved(branches),
+        global_types,
+        session,
+        &mut None,
+    )
+}
+
+fn get_constraint_of_distributive_conditional_type_worker(
+    store: &mut CanonicalTypeMapperStore,
+    conditional: TypeId,
+    branches: ConditionalBranchInput,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: Option<&mut InstantiationSession>,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<Option<TypeId>, ConditionalTypeError> {
+    let semantic_mark = source_semantic_recovery_mark(source);
+    let data = conditional_snapshot_with_source(
         store,
         conditional,
         global_types.map(CanonicalArrayTargets::from_global_types),
+        source.as_deref(),
     )?;
     let no_constraint = store
         .intrinsic_bootstrap()
@@ -2261,7 +4773,9 @@ pub(super) fn get_constraint_of_distributive_conditional_type(
         .no_constraint_type;
     if let Some(cached) = data.resolved_constraint_of_distributive {
         validate_owned_type(store, cached)?;
-        return Ok((cached != no_constraint).then_some(cached));
+        if !is_source_query(source) {
+            return Ok((cached != no_constraint).then_some(cached));
+        }
     }
 
     let (distributive, root_check, parameters) = {
@@ -2274,6 +4788,13 @@ pub(super) fn get_constraint_of_distributive_conditional_type(
             root.outer_type_parameters().unwrap_or_default().to_vec(),
         )
     };
+    let mut owned_session = session
+        .is_none()
+        .then(|| InstantiationSession::new(InstantiationLimits::default()));
+    let session = session
+        .or(owned_session.as_mut())
+        .expect("the caller or legacy session is present");
+    let mark = session.limit_event_mark();
     let mut result = None;
     if distributive {
         let declared_call_set_constraint = store
@@ -2291,7 +4812,20 @@ pub(super) fn get_constraint_of_distributive_conditional_type(
         let constraint = if declared_call_set_constraint.is_some() {
             declared_call_set_constraint
         } else {
-            match constraints::get_constraint_of_type(store, data.check_type) {
+            let constraint = if is_source_query(source) {
+                constraints::get_constraint_of_type_with_source(
+                    store,
+                    data.check_type,
+                    global_types.ok_or(ConditionalTypeError::MissingBootstrap)?,
+                    session,
+                    source
+                        .as_deref_mut()
+                        .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?,
+                )
+            } else {
+                constraints::get_constraint_of_type(store, data.check_type)
+            };
+            match constraint {
                 Ok(constraint) => constraint,
                 Err(ConstraintError::UnresolvedTypeParameter(type_))
                     if type_ == data.check_type =>
@@ -2301,49 +4835,93 @@ pub(super) fn get_constraint_of_distributive_conditional_type(
                 Err(error) => return Err(error.into()),
             }
         };
+        if let Some(recovery) = source_recovery_type(session, mark, source)? {
+            return Ok(Some(recovery));
+        }
         if let Some(constraint) = constraint
             && constraint != data.check_type
         {
-            let mut owned_session = InstantiationSession::new(InstantiationLimits::default());
-            let session = session.unwrap_or(&mut owned_session);
             let mut arguments = Vec::with_capacity(parameters.len());
             for parameter in parameters {
                 let argument = if parameter == root_check {
                     constraint
                 } else {
-                    map_type_with_stored_mapper(
+                    map_stored_type_in_query(
                         store,
                         parameter,
                         data.mapper,
                         global_types,
                         session,
+                        source,
                     )?
                 };
+                if let Some(recovery) = source_recovery_type(session, mark, source)? {
+                    return Ok(Some(recovery));
+                }
                 arguments.push(argument);
             }
-            let instantiated = get_conditional_type_instantiation(
-                store,
-                ConditionalTypeInstantiation {
-                    conditional_type: conditional,
-                    type_arguments: &arguments,
-                    branches,
-                    alias: None,
-                    for_constraint: true,
-                },
-                global_types,
-                Some(session),
-            )?;
+            let instantiated = if let ConditionalBranchInput::Resolved(branches) = branches
+                && !is_source_query(source)
+            {
+                get_conditional_type_instantiation(
+                    store,
+                    ConditionalTypeInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &arguments,
+                        branches,
+                        alias: None,
+                        for_constraint: true,
+                    },
+                    global_types,
+                    Some(session),
+                )?
+            } else {
+                instantiate_conditional_root(
+                    store,
+                    ConditionalRootInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &arguments,
+                        branches,
+                        alias: None,
+                        alias_source: None,
+                        for_constraint: true,
+                        input_recovery: None,
+                    },
+                    global_types,
+                    Some(session),
+                    0,
+                    source,
+                )?
+            };
             if !is_never(store, instantiated)? {
                 result = Some(instantiated);
             }
         }
     }
 
-    let mut data = conditional_snapshot(
+    let mut data = conditional_snapshot_with_source(
         store,
         conditional,
         global_types.map(CanonicalArrayTargets::from_global_types),
+        source.as_deref(),
     )?;
+    if is_source_query(source) {
+        if let Some(recovery) = source_recovery_type(session, mark, source)? {
+            return Ok(Some(recovery));
+        }
+        if source_semantic_recovery_since(store, semantic_mark, session, source)? {
+            return Ok(result);
+        }
+        if let Some(cached) = data.resolved_constraint_of_distributive {
+            return if cached == result.unwrap_or(no_constraint) {
+                Ok(result)
+            } else {
+                Err(ConditionalTypeError::InvalidConditionalResolution(
+                    conditional,
+                ))
+            };
+        }
+    }
     data.resolved_constraint_of_distributive = Some(result.unwrap_or(no_constraint));
     publish_conditional_snapshot(store, conditional, &data)?;
     Ok(result)
@@ -2357,23 +4935,96 @@ pub(super) fn get_constraint_from_conditional_type(
     global_types: Option<&CanonicalGlobalTypes>,
     session: Option<&mut InstantiationSession>,
 ) -> Result<TypeId, ConditionalTypeError> {
-    let mut owned_session = InstantiationSession::new(InstantiationLimits::default());
-    let session = session.unwrap_or(&mut owned_session);
-    if let Some(distributive) = get_constraint_of_distributive_conditional_type(
+    get_constraint_from_conditional_type_worker(
+        store,
+        conditional,
+        ConditionalBranchInput::Resolved(branches),
+        global_types,
+        session,
+        &mut None,
+    )
+}
+
+/// Uses the same constraint worker with the current source and caller.
+pub(super) fn get_constraint_from_conditional_type_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    conditional: TypeId,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<TypeId, ConditionalTypeError> {
+    if source.source_query_options().is_none() {
+        return Err(ConditionalTypeError::Declared(missing_source_query()));
+    }
+    let mark = session.limit_event_mark();
+    let semantic_mark = source.source_branch_recoveries().len();
+    let data = conditional_snapshot_with_source(
+        store,
+        conditional,
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+        Some(source),
+    )?;
+    let root = store
+        .conditional_root(data.root)
+        .ok_or(ConditionalTypeError::InvalidRoot(data.root))?;
+    let root = ConditionalSourceRoot {
+        root: data.root,
+        node: root.node(),
+    };
+    source
+        .preflight_root(store, root)
+        .map_err(ConditionalTypeError::Declared)?;
+    let result = get_constraint_from_conditional_type_worker(
+        store,
+        conditional,
+        ConditionalBranchInput::Root(root),
+        Some(globals),
+        Some(&mut *session),
+        &mut Some(&mut *source),
+    )?;
+    if !session.limit_event_occurred_since(mark) {
+        validate_source_branch_recoveries_since(store, source, semantic_mark, session)?;
+    }
+    Ok(result)
+}
+
+fn get_constraint_from_conditional_type_worker(
+    store: &mut CanonicalTypeMapperStore,
+    conditional: TypeId,
+    branches: ConditionalBranchInput,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: Option<&mut InstantiationSession>,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<TypeId, ConditionalTypeError> {
+    let mut owned_session = session
+        .is_none()
+        .then(|| InstantiationSession::new(InstantiationLimits::default()));
+    let session = session
+        .or(owned_session.as_mut())
+        .expect("the caller or legacy session is present");
+    let mark = session.limit_event_mark();
+    if let Some(distributive) = get_constraint_of_distributive_conditional_type_worker(
         store,
         conditional,
         branches,
         global_types,
         Some(session),
+        source,
     )? {
         return Ok(distributive);
     }
-    get_default_constraint_of_conditional_type(
+    if is_source_query(source) && session.limit_event_occurred_since(mark) {
+        return session.recovery_error_type().ok_or(
+            ConditionalTypeError::InvalidConditionalResolution(conditional),
+        );
+    }
+    get_default_constraint_of_conditional_type_worker(
         store,
         conditional,
         branches,
         global_types,
         Some(session),
+        source,
     )
 }
 
@@ -2410,6 +5061,107 @@ enum ConditionalResolutionKind {
     True,
     False,
     InferredTrue,
+}
+
+fn resolve_constraint_branch_input(
+    store: &mut CanonicalTypeMapperStore,
+    conditional: TypeId,
+    branches: ConditionalBranchInput,
+    branch: ConditionalResolutionKind,
+    globals: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<TypeId, ConditionalTypeError> {
+    let semantic_mark = source_semantic_recovery_mark(source);
+    if let ConditionalBranchInput::Resolved(branches) = branches
+        && !is_source_query(source)
+    {
+        return match branch {
+            ConditionalResolutionKind::InferredTrue => {
+                get_inferred_true_type_from_conditional_type(
+                    store,
+                    conditional,
+                    branches,
+                    globals,
+                    Some(session),
+                )
+            }
+            _ => resolve_conditional_branch(
+                store,
+                conditional,
+                branches,
+                branch,
+                globals,
+                Some(session),
+            ),
+        };
+    }
+    let arrays = globals.map(CanonicalArrayTargets::from_global_types);
+    let data = conditional_snapshot_with_source(store, conditional, arrays, source.as_deref())?;
+    let (cached, kind, mapper) = match branch {
+        ConditionalResolutionKind::True => (
+            data.resolved_true_type,
+            ConditionalBranchKind::True,
+            data.mapper,
+        ),
+        ConditionalResolutionKind::False => (
+            data.resolved_false_type,
+            ConditionalBranchKind::False,
+            data.mapper,
+        ),
+        ConditionalResolutionKind::InferredTrue => (
+            data.resolved_inferred_true_type,
+            ConditionalBranchKind::True,
+            data.combined_mapper.or(data.mapper),
+        ),
+    };
+    if let Some(cached) = cached {
+        validate_owned_type(store, cached)?;
+    }
+    let mark = session.limit_event_mark();
+    let branch_type = branches.get(store, kind, session, source)?;
+    if let Some(recovery) = source_recovery_type(session, mark, source)? {
+        return Ok(recovery);
+    }
+    let resolved = map_stored_type_in_query(store, branch_type, mapper, globals, session, source)?;
+    if let Some(recovery) = source_recovery_type(session, mark, source)? {
+        return Ok(recovery);
+    }
+    let mut current =
+        conditional_snapshot_with_source(store, conditional, arrays, source.as_deref())?;
+    if session.limit_event_occurred_since(mark) {
+        return Ok(resolved);
+    }
+    if source_semantic_recovery_since(store, semantic_mark, session, source)? {
+        return Ok(resolved);
+    }
+    if current != data || cached.is_some_and(|cached| cached != resolved) {
+        return Err(ConditionalTypeError::InvalidConditionalResolution(
+            conditional,
+        ));
+    }
+    match branch {
+        ConditionalResolutionKind::True => current.resolved_true_type = Some(resolved),
+        ConditionalResolutionKind::False => current.resolved_false_type = Some(resolved),
+        ConditionalResolutionKind::InferredTrue => {
+            current.resolved_inferred_true_type = Some(resolved);
+            if current.combined_mapper.is_none() {
+                if current
+                    .resolved_true_type
+                    .is_some_and(|cached| cached != resolved)
+                {
+                    return Err(ConditionalTypeError::InvalidConditionalResolution(
+                        conditional,
+                    ));
+                }
+                current.resolved_true_type = Some(resolved);
+            }
+        }
+    }
+    if current != data {
+        publish_conditional_snapshot(store, conditional, &current)?;
+    }
+    Ok(resolved)
 }
 
 fn resolve_conditional_branch(
@@ -2475,8 +5227,18 @@ fn conditional_snapshot(
     conditional: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<ConditionalTypeData, ConditionalTypeError> {
+    conditional_snapshot_with_source(store, conditional, array_targets, None)
+}
+
+fn conditional_snapshot_with_source(
+    store: &CanonicalTypeMapperStore,
+    conditional: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<&dyn ConditionalBranchSource>,
+) -> Result<ConditionalTypeData, ConditionalTypeError> {
+    let validation = ConditionalValidation::Operational(source);
     if store.conditional_type_production(conditional).is_some() {
-        validated_conditional_production(store, conditional, array_targets)?;
+        validated_conditional_production_worker(store, conditional, array_targets, validation)?;
     }
     match store.type_payload(conditional).map(TypeRecord::data) {
         Some(TypeData::Conditional(data)) => {
@@ -2486,20 +5248,22 @@ fn conditional_snapshot(
             if store.source_node_kind(root.node()) != Some(SyntaxKind::ConditionalType) {
                 return Err(ConditionalTypeError::InvalidNode(root.node()));
             }
-            validate_root_alias(
+            validate_root_alias_worker(
                 store,
                 root.node(),
                 root.outer_type_parameters().unwrap_or_default(),
                 root.alias(),
                 array_targets,
+                validation,
             )?;
             let mut visiting = HashSet::new();
             if let Some(alias) = store.type_payload(conditional).and_then(TypeRecord::alias) {
-                validate_alias_identity(
+                validate_alias_identity_worker(
                     store,
                     stored_alias_identity(store, alias)?,
                     &mut visiting,
                     array_targets,
+                    validation,
                 )?;
             }
             for type_ in [
@@ -2508,7 +5272,13 @@ fn conditional_snapshot(
                 root.check_type(),
                 root.extends_type(),
             ] {
-                validate_conditional_operand(store, type_, &mut visiting, array_targets)?;
+                validate_conditional_operand_with_source(
+                    store,
+                    type_,
+                    &mut visiting,
+                    array_targets,
+                    source,
+                )?;
             }
             Ok(data.clone())
         }
@@ -2586,6 +5356,7 @@ fn get_conditional_type_instantiation_with_tail_count(
             alias,
             alias_source,
             for_constraint: request.for_constraint,
+            input_recovery: None,
         },
         global_types,
         session,
@@ -2602,6 +5373,42 @@ struct ConditionalRootInstantiation<'a> {
     alias: Option<ConditionalAliasIdentity<'a>>,
     alias_source: Option<(ConditionalAliasIdentity<'a>, NodeRef)>,
     for_constraint: bool,
+    input_recovery: Option<&'a SourceConditionalInputRecoveryProof>,
+}
+
+fn validate_root_input_recovery(
+    store: &CanonicalTypeMapperStore,
+    request: ConditionalRootInstantiation<'_>,
+    globals: Option<&CanonicalGlobalTypes>,
+    session: &InstantiationSession,
+    source: &Option<&mut dyn ConditionalBranchSource>,
+) -> Result<(), ConditionalTypeError> {
+    let Some(proof) = request.input_recovery else {
+        return Ok(());
+    };
+    if !matches!(
+        proof.query(),
+        ConditionalSourceInputQuery::Instantiation {
+            conditional_type,
+            type_arguments,
+            for_constraint,
+            ..
+        } if conditional_type == request.conditional_type
+            && type_arguments == request.type_arguments
+            && for_constraint == request.for_constraint
+    ) {
+        return Err(ConditionalTypeError::Declared(missing_source_query()));
+    }
+    validate_source_input_recovery(
+        store,
+        proof.query(),
+        proof,
+        globals.ok_or(ConditionalTypeError::MissingBootstrap)?,
+        session,
+        source
+            .as_deref()
+            .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?,
+    )
 }
 
 fn instantiate_conditional_root(
@@ -2612,16 +5419,32 @@ fn instantiate_conditional_root(
     tail_count: usize,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<TypeId, ConditionalTypeError> {
+    let semantic_mark = if let Some(input) = request.input_recovery {
+        validate_root_input_recovery(
+            store,
+            request,
+            global_types,
+            session
+                .as_deref()
+                .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?,
+            source,
+        )?;
+        input.event_start()
+    } else {
+        source_semantic_recovery_mark(source)
+    };
     if tail_count >= CONDITIONAL_TAIL_RECURSION_LIMIT {
         return Err(ConditionalTypeError::TailRecursionLimit {
             count: tail_count,
             limit: CONDITIONAL_TAIL_RECURSION_LIMIT,
         });
     }
-    let definition = validated_conditional_production(
+    let validation = ConditionalValidation::Operational(source.as_deref());
+    let definition = validated_conditional_production_worker(
         store,
         request.conditional_type,
         global_types.map(CanonicalArrayTargets::from_global_types),
+        validation,
     )?
     .definition
     .clone();
@@ -2633,18 +5456,20 @@ fn instantiate_conditional_root(
     let alias = request.alias;
     let alias_source = request.alias_source;
     if let Some(alias) = alias {
-        validate_alias_identity(
+        validate_alias_identity_worker(
             store,
             alias,
             &mut HashSet::new(),
             global_types.map(CanonicalArrayTargets::from_global_types),
+            validation,
         )?;
     }
 
-    let data = conditional_snapshot(
+    let data = conditional_snapshot_with_source(
         store,
         request.conditional_type,
         global_types.map(CanonicalArrayTargets::from_global_types),
+        source.as_deref(),
     )?;
     let (root, existing_mapper) = (data.root, data.mapper);
     if let Some(mapper) = existing_mapper
@@ -2679,7 +5504,39 @@ fn instantiate_conditional_root(
                 actual: request.type_arguments.len(),
             });
         }
-        return Ok(request.conditional_type);
+        if !is_source_query(source) {
+            return Ok(request.conditional_type);
+        }
+        let session =
+            session.ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?;
+        let mark = session.limit_event_mark();
+        let result = evaluate_conditional_worker(
+            store,
+            root,
+            request.branches,
+            &[],
+            &[],
+            global_types,
+            request.for_constraint,
+            alias_source,
+            session,
+            tail_count,
+            source,
+            Some(request.conditional_type),
+        )?;
+        if session.limit_event_occurred_since(mark) {
+            return Ok(result);
+        }
+        validate_root_input_recovery(store, request, global_types, session, source)?;
+        if source_semantic_recovery_since(store, semantic_mark, session, source)? {
+            return Ok(result);
+        }
+        if result != request.conditional_type {
+            return Err(ConditionalTypeError::InvalidConditional(
+                request.conditional_type,
+            ));
+        }
+        return Ok(result);
     }
     if outer_parameters.len() != request.type_arguments.len() {
         return Err(ConditionalTypeError::InvalidInstantiationArity {
@@ -2689,23 +5546,26 @@ fn instantiate_conditional_root(
     }
     let mut visiting = HashSet::new();
     for argument in request.type_arguments {
-        validate_conditional_operand(
+        validate_conditional_operand_with_source(
             store,
             *argument,
             &mut visiting,
             global_types.map(CanonicalArrayTargets::from_global_types),
+            source.as_deref(),
         )?;
     }
 
-    let key = conditional_type_key(
+    let key = conditional_type_key_with_source(
         store,
         request.type_arguments,
         alias,
         request.for_constraint,
         global_types.map(CanonicalArrayTargets::from_global_types),
+        source.as_deref(),
     )?;
-    if let Some(cached) = cached_values.get(&key).copied() {
-        validate_cached_instantiation(
+    let cached = cached_values.get(&key).copied();
+    if let Some(cached) = cached {
+        validate_cached_instantiation_with_source(
             store,
             root,
             key,
@@ -2715,19 +5575,26 @@ fn instantiate_conditional_root(
             alias,
             request.for_constraint,
             global_types.map(CanonicalArrayTargets::from_global_types),
+            source.as_deref(),
         )?;
-        return Ok(cached);
+        if !is_source_query(source) {
+            return Ok(cached);
+        }
     }
     let query_key = ConditionalQueryKey::Instantiation(root, key);
-    if store.conditional_query_production(query_key).is_some() {
+    if cached.is_none() && store.conditional_query_production(query_key).is_some() {
         return Err(ConditionalTypeError::InvalidInstantiationCache(root));
     }
-    if !store.try_reserve_conditional_productions(0, 1) {
+    if cached.is_none() && !store.try_reserve_conditional_productions(0, 1) {
         return Err(ConditionalTypeError::Capacity);
     }
 
-    let mut owned_session = InstantiationSession::new(InstantiationLimits::default());
-    let session = session.unwrap_or(&mut owned_session);
+    let mut owned_session = session
+        .is_none()
+        .then(|| InstantiationSession::new(InstantiationLimits::default()));
+    let session = session
+        .or(owned_session.as_mut())
+        .expect("the caller or legacy session is present");
     let mark = session.limit_event_mark();
     let mapped_check = map_type_with_source(
         store,
@@ -2765,9 +5632,17 @@ fn instantiate_conditional_root(
                         session,
                         tail_count,
                         source,
+                        cached,
                     )?);
                 }
-                union_result_with_alias(store, &results, global_types, alias)?
+                union_result_with_alias_in_query(
+                    store,
+                    &results,
+                    global_types,
+                    alias,
+                    session,
+                    source,
+                )?
             }
             Some(_) if is_never(store, mapped_check)? => mapped_check,
             Some(_) => evaluate_conditional_worker(
@@ -2782,6 +5657,7 @@ fn instantiate_conditional_root(
                 session,
                 tail_count,
                 source,
+                cached,
             )?,
             None => return Err(ConditionalTypeError::InvalidType(mapped_check)),
         }
@@ -2798,6 +5674,7 @@ fn instantiate_conditional_root(
             session,
             tail_count,
             source,
+            cached,
         )?
     };
 
@@ -2806,6 +5683,29 @@ fn instantiate_conditional_root(
         && let Some(error) = session.recovery_error_type()
     {
         return Ok(error);
+    }
+    validate_root_input_recovery(store, request, global_types, session, source)?;
+    if source_semantic_recovery_since(store, semantic_mark, session, source)? {
+        return Ok(result);
+    }
+
+    if let Some(cached) = cached {
+        if cached != result {
+            return Err(ConditionalTypeError::InvalidInstantiationCache(root));
+        }
+        validate_cached_instantiation_with_source(
+            store,
+            root,
+            key,
+            cached,
+            &outer_parameters,
+            request.type_arguments,
+            alias,
+            request.for_constraint,
+            global_types.map(CanonicalArrayTargets::from_global_types),
+            source.as_deref(),
+        )?;
+        return Ok(cached);
     }
 
     let mut cache = match store
@@ -2836,10 +5736,11 @@ fn instantiate_conditional_root(
         source_declaration: None,
         result_alias: retain_result_alias(store, result)?,
     };
-    validate_query_production(
+    validate_query_production_with_source(
         store,
         &proof,
         global_types.map(CanonicalArrayTargets::from_global_types),
+        source.as_deref(),
     )?;
     if !store.publish_conditional_query_production(proof) {
         return Err(ConditionalTypeError::InvalidInstantiationCache(root));
@@ -2872,6 +5773,7 @@ fn evaluate_conditional(
         session,
         tail_count,
         &mut None,
+        None,
     )
 }
 
@@ -2888,6 +5790,7 @@ fn evaluate_conditional_worker(
     session: &mut InstantiationSession,
     tail_count: usize,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
+    retained_result: Option<TypeId>,
 ) -> Result<TypeId, ConditionalTypeError> {
     if tail_count >= CONDITIONAL_TAIL_RECURSION_LIMIT {
         return Err(ConditionalTypeError::TailRecursionLimit {
@@ -2905,6 +5808,7 @@ fn evaluate_conditional_worker(
             record.infer_type_parameters().unwrap_or_default().to_vec(),
         )
     };
+    let mark = session.limit_event_mark();
     let check_type = map_type_with_source(
         store,
         root_check,
@@ -2914,6 +5818,9 @@ fn evaluate_conditional_worker(
         session,
         source,
     )?;
+    if let Some(recovery) = source_recovery_type(session, mark, source)? {
+        return Ok(recovery);
+    }
     let extends_type = map_type_with_source(
         store,
         root_extends,
@@ -2923,6 +5830,9 @@ fn evaluate_conditional_worker(
         session,
         source,
     )?;
+    if let Some(recovery) = source_recovery_type(session, mark, source)? {
+        return Ok(recovery);
+    }
 
     let bootstrap = store
         .intrinsic_bootstrap()
@@ -2955,7 +5865,7 @@ fn evaluate_conditional_worker(
         }
     }
     if contains_type_parameter(store, check_type, &resolved_check_parameters)? {
-        return deferred_conditional(
+        return deferred_conditional_in_query(
             store,
             root,
             check_type,
@@ -2964,6 +5874,8 @@ fn evaluate_conditional_worker(
             type_arguments,
             alias,
             global_types.map(CanonicalArrayTargets::from_global_types),
+            source,
+            retained_result,
         );
     }
 
@@ -2984,7 +5896,11 @@ fn evaluate_conditional_worker(
             },
             &mut candidates,
             session,
+            source,
         )?;
+        if let Some(recovery) = source_recovery_type(session, mark, source)? {
+            return Ok(recovery);
+        }
         if !matched {
             let branch = branches.get(store, ConditionalBranchKind::False, session, source)?;
             return map_type_with_source(
@@ -3006,9 +5922,12 @@ fn evaluate_conditional_worker(
             let inferred = match candidates.as_slice() {
                 [] => unknown_type,
                 [candidate] => *candidate,
-                _ => union_result(store, &candidates, global_types)?,
+                _ => union_result_in_query(store, &candidates, global_types, session, source)?,
             };
-            if !inferred_candidate_satisfies_constraint(
+            if let Some(recovery) = source_recovery_type(session, mark, source)? {
+                return Ok(recovery);
+            }
+            let satisfies_constraint = inferred_candidate_satisfies_constraint(
                 store,
                 *parameter,
                 inferred,
@@ -3017,7 +5936,11 @@ fn evaluate_conditional_worker(
                 global_types,
                 session,
                 source,
-            )? {
+            )?;
+            if let Some(recovery) = source_recovery_type(session, mark, source)? {
+                return Ok(recovery);
+            }
+            if !satisfies_constraint {
                 let branch = branches.get(store, ConditionalBranchKind::False, session, source)?;
                 return map_type_with_source(
                     store,
@@ -3042,9 +5965,12 @@ fn evaluate_conditional_worker(
         session,
         source,
     )?;
+    if let Some(recovery) = source_recovery_type(session, mark, source)? {
+        return Ok(recovery);
+    }
     let resolved_parameters = combined_parameters.iter().copied().collect::<HashSet<_>>();
     if contains_type_parameter(store, inferred_extends, &resolved_parameters)? {
-        return deferred_conditional(
+        return deferred_conditional_in_query(
             store,
             root,
             check_type,
@@ -3053,6 +5979,8 @@ fn evaluate_conditional_worker(
             type_arguments,
             alias,
             global_types.map(CanonicalArrayTargets::from_global_types),
+            source,
+            retained_result,
         );
     }
 
@@ -3070,8 +5998,11 @@ fn evaluate_conditional_worker(
             inferred_extends,
             global_types,
             session,
-            source.is_some(),
+            source,
         )?;
+    if let Some(recovery) = source_recovery_type(session, mark, source)? {
+        return Ok(recovery);
+    }
 
     if is_any && !extends_any_or_unknown {
         let true_branch = branches.get(store, ConditionalBranchKind::True, session, source)?;
@@ -3084,6 +6015,9 @@ fn evaluate_conditional_worker(
             session,
             source,
         )?;
+        if let Some(recovery) = source_recovery_type(session, mark, source)? {
+            return Ok(recovery);
+        }
         let false_branch = branches.get(store, ConditionalBranchKind::False, session, source)?;
         let when_false = map_type_with_source(
             store,
@@ -3094,7 +6028,16 @@ fn evaluate_conditional_worker(
             session,
             source,
         )?;
-        return union_result(store, &[when_true, when_false], global_types);
+        if let Some(recovery) = source_recovery_type(session, mark, source)? {
+            return Ok(recovery);
+        }
+        return union_result_in_query(
+            store,
+            &[when_true, when_false],
+            global_types,
+            session,
+            source,
+        );
     }
 
     if !assignable && for_constraint && !is_never(store, inferred_extends)? {
@@ -3104,8 +6047,11 @@ fn evaluate_conditional_worker(
             check_type,
             global_types,
             session,
-            source.is_some(),
+            source,
         )?;
+        if let Some(recovery) = source_recovery_type(session, mark, source)? {
+            return Ok(recovery);
+        }
         if reverse {
             let true_branch = branches.get(store, ConditionalBranchKind::True, session, source)?;
             let when_true = map_type_with_source(
@@ -3117,6 +6063,9 @@ fn evaluate_conditional_worker(
                 session,
                 source,
             )?;
+            if let Some(recovery) = source_recovery_type(session, mark, source)? {
+                return Ok(recovery);
+            }
             let false_branch =
                 branches.get(store, ConditionalBranchKind::False, session, source)?;
             let when_false = map_type_with_source(
@@ -3128,7 +6077,16 @@ fn evaluate_conditional_worker(
                 session,
                 source,
             )?;
-            return union_result(store, &[when_true, when_false], global_types);
+            if let Some(recovery) = source_recovery_type(session, mark, source)? {
+                return Ok(recovery);
+            }
+            return union_result_in_query(
+                store,
+                &[when_true, when_false],
+                global_types,
+                session,
+                source,
+            );
         }
     }
 
@@ -3535,6 +6493,7 @@ fn evaluate_conditional_tail(
             alias: None,
             alias_source: None,
             for_constraint,
+            input_recovery: None,
         },
         global_types,
         Some(session),
@@ -3587,6 +6546,22 @@ fn validate_alias_identity(
     visiting: &mut HashSet<TypeId>,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), ConditionalTypeError> {
+    validate_alias_identity_worker(
+        store,
+        alias,
+        visiting,
+        array_targets,
+        ConditionalValidation::Operational(None),
+    )
+}
+
+fn validate_alias_identity_worker(
+    store: &CanonicalTypeMapperStore,
+    alias: ConditionalAliasIdentity<'_>,
+    visiting: &mut HashSet<TypeId>,
+    array_targets: Option<CanonicalArrayTargets>,
+    validation: ConditionalValidation<'_>,
+) -> Result<(), ConditionalTypeError> {
     let symbol = store
         .symbol(alias.symbol)
         .ok_or(ConditionalTypeError::InvalidAliasSymbol(alias.symbol))?;
@@ -3604,7 +6579,7 @@ fn validate_alias_identity(
         return Err(ConditionalTypeError::InvalidAliasSymbol(alias.symbol));
     }
     for argument in alias.type_arguments {
-        validate_conditional_operand(store, *argument, visiting, array_targets)?;
+        validation.operand(store, *argument, visiting, array_targets)?;
     }
     Ok(())
 }
@@ -3616,11 +6591,35 @@ fn validate_root_alias(
     alias: Option<TypeAliasId>,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), ConditionalTypeError> {
+    validate_root_alias_worker(
+        store,
+        node,
+        outer_parameters,
+        alias,
+        array_targets,
+        ConditionalValidation::Operational(None),
+    )
+}
+
+fn validate_root_alias_worker(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    outer_parameters: &[TypeId],
+    alias: Option<TypeAliasId>,
+    array_targets: Option<CanonicalArrayTargets>,
+    validation: ConditionalValidation<'_>,
+) -> Result<(), ConditionalTypeError> {
     let Some(alias) = alias else {
         return Ok(());
     };
     let identity = stored_alias_identity(store, alias)?;
-    validate_alias_identity(store, identity, &mut HashSet::new(), array_targets)?;
+    validate_alias_identity_worker(
+        store,
+        identity,
+        &mut HashSet::new(),
+        array_targets,
+        validation,
+    )?;
     let declaration = conditional_alias_declaration(store, node)
         .ok_or(ConditionalTypeError::InvalidAlias(alias))?;
     if store
@@ -3677,6 +6676,89 @@ fn mapped_root_alias(
     Ok(Some((identity.symbol, type_arguments)))
 }
 
+#[allow(clippy::too_many_arguments)] // Reuses only the current query's already proved result graph.
+fn deferred_conditional_in_query(
+    store: &mut CanonicalTypeMapperStore,
+    root: ConditionalRootId,
+    check_type: TypeId,
+    extends_type: TypeId,
+    parameters: &[TypeId],
+    arguments: &[TypeId],
+    alias: Option<(ConditionalAliasIdentity<'_>, NodeRef)>,
+    arrays: Option<CanonicalArrayTargets>,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+    retained_result: Option<TypeId>,
+) -> Result<TypeId, ConditionalTypeError> {
+    if !is_source_query(source) {
+        return deferred_conditional(
+            store,
+            root,
+            check_type,
+            extends_type,
+            parameters,
+            arguments,
+            alias,
+            arrays,
+        );
+    }
+    let validation = ConditionalValidation::Operational(source.as_deref());
+    if let Some(retained) = retained_result {
+        let definition = conditional_definition_worker(store, root, arrays, validation)?;
+        let mapped_alias = mapped_root_alias(store, root, parameters, arguments)?;
+        let expected_alias = alias.map(|(identity, _)| identity).or_else(|| {
+            mapped_alias
+                .as_ref()
+                .map(|(symbol, arguments)| ConditionalAliasIdentity {
+                    symbol: *symbol,
+                    type_arguments: arguments,
+                })
+        });
+        let mut pending = vec![retained];
+        let mut visited = HashSet::new();
+        while let Some(candidate) = pending.pop() {
+            if !visited.insert(candidate) {
+                continue;
+            }
+            let record = store
+                .type_payload(candidate)
+                .ok_or(ConditionalTypeError::InvalidType(candidate))?;
+            if let TypeData::Union(union) = record.data() {
+                pending.extend(union.union.types.iter().copied());
+            } else if matches!(record.data(), TypeData::Conditional(_)) {
+                let proof =
+                    validated_conditional_production_worker(store, candidate, arrays, validation)?;
+                let exact_mapping =
+                    proof.mapped_parameters == parameters && proof.type_arguments == arguments;
+                let identity_mapping = proof.mapper.is_none()
+                    && parameters == arguments
+                    && proof.mapped_parameters == proof.type_arguments;
+                if proof.definition == definition
+                    && proof.check_type == check_type
+                    && proof.extends_type == extends_type
+                    && (exact_mapping || identity_mapping)
+                    && proof.alias.as_ref().map(RetainedConditionalAlias::identity)
+                        == expected_alias
+                    && proof.alias_reference == alias.map(|(_, reference)| reference)
+                {
+                    return Ok(candidate);
+                }
+            }
+        }
+        return Err(ConditionalTypeError::InvalidInstantiationCache(root));
+    }
+    deferred_conditional_worker(
+        store,
+        root,
+        check_type,
+        extends_type,
+        parameters,
+        arguments,
+        alias,
+        arrays,
+        validation,
+    )
+}
+
 #[allow(clippy::too_many_arguments)] // Keeps the deferred root, mapper inputs, alias, and array targets explicit.
 fn deferred_conditional(
     store: &mut CanonicalTypeMapperStore,
@@ -3688,9 +6770,34 @@ fn deferred_conditional(
     alias: Option<(ConditionalAliasIdentity<'_>, NodeRef)>,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<TypeId, ConditionalTypeError> {
+    deferred_conditional_worker(
+        store,
+        root,
+        check_type,
+        extends_type,
+        parameters,
+        arguments,
+        alias,
+        array_targets,
+        ConditionalValidation::Operational(None),
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // The same allocator also serves the checked source route.
+fn deferred_conditional_worker(
+    store: &mut CanonicalTypeMapperStore,
+    root: ConditionalRootId,
+    check_type: TypeId,
+    extends_type: TypeId,
+    parameters: &[TypeId],
+    arguments: &[TypeId],
+    alias: Option<(ConditionalAliasIdentity<'_>, NodeRef)>,
+    array_targets: Option<CanonicalArrayTargets>,
+    validation: ConditionalValidation<'_>,
+) -> Result<TypeId, ConditionalTypeError> {
     let alias_reference = alias.map(|(_, reference)| reference);
     let alias = alias.map(|(identity, _)| identity);
-    let definition = conditional_definition(store, root, array_targets)?;
+    let definition = conditional_definition_worker(store, root, array_targets, validation)?;
     let mapped_alias = mapped_root_alias(store, root, parameters, arguments)?;
     let alias = alias.or_else(|| {
         mapped_alias
@@ -3701,7 +6808,13 @@ fn deferred_conditional(
             })
     });
     if let Some(identity) = alias {
-        validate_alias_identity(store, identity, &mut HashSet::new(), array_targets)?;
+        validate_alias_identity_worker(
+            store,
+            identity,
+            &mut HashSet::new(),
+            array_targets,
+            validation,
+        )?;
     }
     if !store.try_reserve_conditional_productions(1, 0)
         || !store.try_reserve_types(1)
@@ -3756,7 +6869,7 @@ fn deferred_conditional(
         mapper,
         mapped_parameters: parameters.to_vec(),
         type_arguments: arguments.to_vec(),
-        alias: retain_conditional_alias(store, alias, array_targets)?,
+        alias: retain_conditional_alias_worker(store, alias, array_targets, validation)?,
         alias_reference,
     };
     if !store.publish_conditional_type_production(proof) {
@@ -3770,6 +6883,22 @@ fn validate_request(
     request: ConditionalTypeRequest<'_>,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), ConditionalTypeError> {
+    validate_request_worker(
+        store,
+        request.into(),
+        Some(request.branches),
+        array_targets,
+        None,
+    )
+}
+
+fn validate_request_worker(
+    store: &CanonicalTypeMapperStore,
+    request: SourceConditionalTypeRequest<'_>,
+    branches: Option<ConditionalTypeBranches>,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<&dyn ConditionalBranchSource>,
+) -> Result<(), ConditionalTypeError> {
     if !store.contains_node_ref(request.node)
         || store.source_node_kind(request.node) != Some(SyntaxKind::ConditionalType)
     {
@@ -3777,15 +6906,30 @@ fn validate_request(
     }
     validate_conditional_node_link_shape(store, request.node)?;
     let mut visiting = HashSet::new();
-    validate_conditional_operand(store, request.check_type, &mut visiting, array_targets)?;
-    validate_conditional_operand(store, request.extends_type, &mut visiting, array_targets)?;
-    validate_branch_types(store, request.branches, array_targets)?;
-    validate_root_alias(
+    validate_conditional_operand_with_source(
+        store,
+        request.check_type,
+        &mut visiting,
+        array_targets,
+        source,
+    )?;
+    validate_conditional_operand_with_source(
+        store,
+        request.extends_type,
+        &mut visiting,
+        array_targets,
+        source,
+    )?;
+    if let Some(branches) = branches {
+        validate_branch_types(store, branches, array_targets)?;
+    }
+    validate_root_alias_worker(
         store,
         request.node,
         request.outer_type_parameters.unwrap_or_default(),
         request.alias,
         array_targets,
+        ConditionalValidation::Operational(source),
     )?;
     let mut seen = HashSet::new();
     for parameter in request
@@ -3813,12 +6957,38 @@ fn validate_conditional_operand(
     visiting: &mut HashSet<TypeId>,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), ConditionalTypeError> {
+    validate_conditional_operand_with_source(store, type_, visiting, array_targets, None)
+}
+
+fn validate_conditional_operand_with_source(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    visiting: &mut HashSet<TypeId>,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<&dyn ConditionalBranchSource>,
+) -> Result<(), ConditionalTypeError> {
     if !visiting.insert(type_) {
         return Ok(());
     }
     let record = store
         .type_payload(type_)
         .ok_or(ConditionalTypeError::InvalidType(type_))?;
+    if is_global_this_type_candidate(store, None, type_) {
+        let Some(source) = source else {
+            return Err(RelationUnavailable::UnresolvedStructuredMembers(type_).into());
+        };
+        let Some(members) = source.global_this_members() else {
+            return Err(RelationUnavailable::GlobalThisMembersDemand { receiver: type_ }.into());
+        };
+        if members.receiver() != type_ {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_).into());
+        }
+        members
+            .validate(store)
+            .map_err(ConditionalTypeError::Declared)?;
+        visiting.remove(&type_);
+        return Ok(());
+    }
     let mut dependencies = Vec::new();
     if let Some(alias) = record.alias() {
         let alias_record = store
@@ -3967,7 +7137,13 @@ fn validate_conditional_operand(
         _ => {}
     }
     for dependency in dependencies {
-        validate_conditional_operand(store, dependency, visiting, array_targets)?;
+        validate_conditional_operand_with_source(
+            store,
+            dependency,
+            visiting,
+            array_targets,
+            source,
+        )?;
     }
     visiting.remove(&type_);
     Ok(())
@@ -3979,6 +7155,16 @@ fn validate_cached_conditional(
     cached: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<TypeId, ConditionalTypeError> {
+    validate_cached_conditional_with_source(store, request.into(), cached, array_targets, None)
+}
+
+fn validate_cached_conditional_with_source(
+    store: &CanonicalTypeMapperStore,
+    request: SourceConditionalTypeRequest<'_>,
+    cached: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<&dyn ConditionalBranchSource>,
+) -> Result<TypeId, ConditionalTypeError> {
     let proof = store
         .conditional_query_production(ConditionalQueryKey::Node(request.node))
         .ok_or(ConditionalTypeError::InvalidTypeNodeCache(request.node))?;
@@ -3987,11 +7173,17 @@ fn validate_cached_conditional(
         || proof.definition.extends_type != request.extends_type
         || proof.definition.infer_type_parameters != request.infer_type_parameters
         || proof.definition.outer_type_parameters.as_deref() != request.outer_type_parameters
-        || proof.definition.alias != retain_conditional_alias(store, request.alias, array_targets)?
+        || proof.definition.alias
+            != retain_conditional_alias_worker(
+                store,
+                request.alias,
+                array_targets,
+                ConditionalValidation::Operational(source),
+            )?
     {
         return Err(ConditionalTypeError::InvalidTypeNodeCache(request.node));
     }
-    validate_query_production(store, proof, array_targets)?;
+    validate_query_production_with_source(store, proof, array_targets, source)?;
     Ok(cached)
 }
 
@@ -4006,6 +7198,33 @@ fn validate_cached_instantiation(
     alias: Option<ConditionalAliasIdentity<'_>>,
     for_constraint: bool,
     array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), ConditionalTypeError> {
+    validate_cached_instantiation_with_source(
+        store,
+        root,
+        key,
+        cached,
+        parameters,
+        arguments,
+        alias,
+        for_constraint,
+        array_targets,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Checks the same retained key in the source-aware caller.
+fn validate_cached_instantiation_with_source(
+    store: &CanonicalTypeMapperStore,
+    root: ConditionalRootId,
+    key: CacheHashKey,
+    cached: TypeId,
+    parameters: &[TypeId],
+    arguments: &[TypeId],
+    alias: Option<ConditionalAliasIdentity<'_>>,
+    for_constraint: bool,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<&dyn ConditionalBranchSource>,
 ) -> Result<(), ConditionalTypeError> {
     let proof = store
         .conditional_query_production(ConditionalQueryKey::Instantiation(root, key))
@@ -4036,7 +7255,7 @@ fn validate_cached_instantiation(
     {
         return Err(ConditionalTypeError::InvalidInstantiationCache(root));
     }
-    validate_query_production(store, proof, array_targets)
+    validate_query_production_with_source(store, proof, array_targets, source)
 }
 
 fn validate_owned_type(
@@ -4076,8 +7295,32 @@ fn conditional_type_key(
     for_constraint: bool,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<CacheHashKey, ConditionalTypeError> {
+    conditional_type_key_with_source(
+        store,
+        type_arguments,
+        alias,
+        for_constraint,
+        array_targets,
+        None,
+    )
+}
+
+fn conditional_type_key_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    type_arguments: &[TypeId],
+    alias: Option<ConditionalAliasIdentity<'_>>,
+    for_constraint: bool,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<&dyn ConditionalBranchSource>,
+) -> Result<CacheHashKey, ConditionalTypeError> {
     let alias = if let Some(alias) = alias {
-        validate_alias_identity(store, alias, &mut HashSet::new(), array_targets)?;
+        validate_alias_identity_worker(
+            store,
+            alias,
+            &mut HashSet::new(),
+            array_targets,
+            ConditionalValidation::Operational(source),
+        )?;
         let symbol = store
             .global_symbol_id(alias.symbol)
             .ok_or(ConditionalTypeError::InvalidAliasSymbol(alias.symbol))?;
@@ -4261,8 +7504,95 @@ fn map_type_with_source(
         return map_type(store, type_, parameters, arguments, global_types, session);
     };
     let globals = global_types.ok_or(ConditionalTypeError::MissingBootstrap)?;
+    if source.source_query_options().is_some()
+        && (parameters.is_empty() || is_global_this_type_candidate(store, Some(globals), type_))
+        && !matches!(
+            store.type_payload(type_).map(TypeRecord::data),
+            Some(TypeData::Conditional(_))
+        )
+    {
+        if parameters.len() != arguments.len() {
+            return Err(InstantiationError::InvalidType(type_).into());
+        }
+        for endpoint in parameters.iter().chain(arguments) {
+            if store.type_payload(*endpoint).is_none() {
+                return Err(InstantiationError::InvalidType(*endpoint).into());
+            }
+        }
+        validate_conditional_operand_with_source(
+            store,
+            type_,
+            &mut HashSet::new(),
+            Some(CanonicalArrayTargets::from_global_types(globals)),
+            Some(source),
+        )?;
+        return Ok(type_);
+    }
+    if source.source_query_options().is_some()
+        && matches!(
+            store.type_payload(type_).map(TypeRecord::data),
+            Some(TypeData::Object(_))
+        )
+        && conditional_identity_requires_source(store, type_, &mut HashSet::new())?
+    {
+        validate_conditional_operand_with_source(
+            store,
+            type_,
+            &mut HashSet::new(),
+            Some(CanonicalArrayTargets::from_global_types(globals)),
+            Some(source),
+        )?;
+        // Nested global objects need a source-aware object instantiator. This
+        // query admits only an empty mapper or the exact global leaf above.
+        return Err(InstantiationError::UnsupportedType(type_).into());
+    }
     super::instantiate::instantiate_type_with_vector_and_source(
         store, type_, parameters, arguments, globals, session, source,
+    )
+    .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)] // Inference keeps its mapper and current query together.
+fn map_inference_type(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    parameters: &[TypeId],
+    arguments: &[TypeId],
+    globals: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+    query: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<TypeId, ConditionalTypeError> {
+    if is_source_query(query) {
+        map_type_with_source(store, type_, parameters, arguments, globals, session, query)
+    } else {
+        map_type(store, type_, parameters, arguments, globals, session)
+    }
+}
+
+fn map_stored_type_in_query(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapper: Option<TypeMapperId>,
+    globals: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<TypeId, ConditionalTypeError> {
+    if !is_source_query(source) {
+        return map_type_with_stored_mapper(store, type_, mapper, globals, session);
+    }
+    validate_owned_type(store, type_)?;
+    let Some(mapper) = mapper else {
+        return Ok(type_);
+    };
+    super::instantiate::instantiate_type_with_source(
+        store,
+        type_,
+        mapper,
+        globals.ok_or(ConditionalTypeError::MissingBootstrap)?,
+        session,
+        source
+            .as_deref_mut()
+            .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?,
     )
     .map_err(Into::into)
 }
@@ -4599,6 +7929,27 @@ fn infer_from_types(
     context: ConditionalInferenceContext<'_>,
     candidates: &mut [Vec<TypeId>],
     session: &mut InstantiationSession,
+    query: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<bool, ConditionalTypeError> {
+    let mark = session.limit_event_mark();
+    let result =
+        infer_from_types_worker(store, source, target, context, candidates, session, query)?;
+    if source_recovery_type(session, mark, query)?.is_some() {
+        // The enclosing evaluation returns the caller's recovery type. Stop
+        // inference here so later properties cannot demand another value.
+        return Ok(false);
+    }
+    Ok(result)
+}
+
+fn infer_from_types_worker(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    target: TypeId,
+    context: ConditionalInferenceContext<'_>,
+    candidates: &mut [Vec<TypeId>],
+    session: &mut InstantiationSession,
+    query: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<bool, ConditionalTypeError> {
     if let Some(index) = context
         .infer_parameters
@@ -4621,6 +7972,7 @@ fn infer_from_types(
             context,
             candidates,
             session,
+            query,
         );
     }
 
@@ -4641,12 +7993,17 @@ fn infer_from_types(
             TypeData::TemplateLiteral(template) => (template.texts.clone(), template.types.clone()),
             _ => return Ok(false),
         };
-        let Some(matches) = infer_template_literal_matches(
+        let Some(matches) = infer_template_literal_matches_in_query(
             store,
             &source_texts,
             &source_types,
             &target_texts,
             &target_types,
+            context
+                .global_types
+                .map(CanonicalArrayTargets::from_global_types),
+            session,
+            is_source_query(query),
         )?
         else {
             return Ok(false);
@@ -4654,7 +8011,9 @@ fn infer_from_types(
         for (source, target) in matches.into_iter().zip(target_types) {
             let candidate =
                 template_inference_candidate(store, source, target, context.infer_parameters)?;
-            if !infer_from_types(store, candidate, target, context, candidates, session)? {
+            if !infer_from_types(
+                store, candidate, target, context, candidates, session, query,
+            )? {
                 return Ok(false);
             }
         }
@@ -4680,7 +8039,7 @@ fn infer_from_types(
             return Ok(false);
         }
         for (source, target) in source_arguments.into_iter().zip(target_arguments) {
-            if !infer_from_types(store, source, target, context, candidates, session)? {
+            if !infer_from_types(store, source, target, context, candidates, session, query)? {
                 return Ok(false);
             }
         }
@@ -4693,17 +8052,19 @@ fn infer_from_types(
                 .flags()
                 .intersects(TypeFlags::ANY | TypeFlags::NEVER)
             {
-                is_assignable(store, source, target, context.global_types)
+                inference_assignability(store, source, target, context.global_types, session, query)
             } else {
                 Ok(false)
             };
         }
-        return infer_from_structured_types(store, source, target, context, candidates, session);
+        return infer_from_structured_types(
+            store, source, target, context, candidates, session, query,
+        );
     }
     if contains_type_parameter(store, target, &HashSet::new())? {
         Err(ConditionalTypeError::UnsupportedInference { source, target })
     } else {
-        is_assignable(store, source, target, context.global_types)
+        inference_assignability(store, source, target, context.global_types, session, query)
     }
 }
 
@@ -4714,6 +8075,7 @@ fn infer_from_tuple_types(
     context: ConditionalInferenceContext<'_>,
     candidates: &mut [Vec<TypeId>],
     session: &mut InstantiationSession,
+    query: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<bool, ConditionalTypeError> {
     let variable_indices = target
         .element_infos
@@ -4740,6 +8102,7 @@ fn infer_from_tuple_types(
                 context,
                 candidates,
                 session,
+                query,
             );
         }
         [_, _, _, ..] => return Ok(false),
@@ -4750,7 +8113,7 @@ fn infer_from_tuple_types(
             return Ok(false);
         }
         for (source, target) in source.element_types.iter().zip(&target.element_types) {
-            if !infer_from_types(store, *source, *target, context, candidates, session)? {
+            if !infer_from_types(store, *source, *target, context, candidates, session, query)? {
                 return Ok(false);
             }
         }
@@ -4769,6 +8132,7 @@ fn infer_from_tuple_types(
             context,
             candidates,
             session,
+            query,
         )? {
             return Ok(false);
         }
@@ -4783,6 +8147,7 @@ fn infer_from_tuple_types(
             context,
             candidates,
             session,
+            query,
         )? {
             return Ok(false);
         }
@@ -4808,6 +8173,7 @@ fn infer_from_tuple_types(
             context,
             candidates,
             session,
+            query,
         );
     }
     for element in middle_types {
@@ -4818,6 +8184,7 @@ fn infer_from_tuple_types(
             context,
             candidates,
             session,
+            query,
         )? {
             return Ok(false);
         }
@@ -4825,6 +8192,7 @@ fn infer_from_tuple_types(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)] // Keep inference inputs with the current source query and caller.
 fn infer_from_rest_and_variadic_tuple(
     store: &mut CanonicalTypeMapperStore,
     source: &InferenceTupleShape,
@@ -4833,6 +8201,7 @@ fn infer_from_rest_and_variadic_tuple(
     context: ConditionalInferenceContext<'_>,
     candidates: &mut [Vec<TypeId>],
     session: &mut InstantiationSession,
+    query: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<bool, ConditionalTypeError> {
     let [first, second] = variable_indices;
     if second != first + 1 {
@@ -4850,16 +8219,32 @@ fn infer_from_rest_and_variadic_tuple(
     if !context.infer_parameters.contains(&variadic_type) {
         return Ok(false);
     }
-    let Some(constraint) = constraints::get_base_constraint_of_type(store, variadic_type)? else {
+    let constraint = if is_source_query(query) {
+        constraints::get_base_constraint_of_type_with_source(
+            store,
+            variadic_type,
+            context
+                .global_types
+                .ok_or(ConditionalTypeError::MissingBootstrap)?,
+            session,
+            query
+                .as_deref_mut()
+                .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?,
+        )?
+    } else {
+        constraints::get_base_constraint_of_type(store, variadic_type)?
+    };
+    let Some(constraint) = constraint else {
         return Ok(false);
     };
-    validate_conditional_operand(
+    validate_conditional_operand_with_source(
         store,
         constraint,
         &mut HashSet::new(),
         context
             .global_types
             .map(CanonicalArrayTargets::from_global_types),
+        query.as_deref(),
     )?;
     let Some(constraint_shape) = inference_tuple_shape(store, constraint)? else {
         return Ok(false);
@@ -4893,6 +8278,7 @@ fn infer_from_rest_and_variadic_tuple(
             context,
             candidates,
             session,
+            query,
         )? {
             return Ok(false);
         }
@@ -4907,6 +8293,7 @@ fn infer_from_rest_and_variadic_tuple(
             context,
             candidates,
             session,
+            query,
         )? {
             return Ok(false);
         }
@@ -4930,6 +8317,7 @@ fn infer_from_rest_and_variadic_tuple(
             context,
             candidates,
             session,
+            query,
         )? {
             return Ok(false);
         }
@@ -4946,7 +8334,15 @@ fn infer_from_rest_and_variadic_tuple(
             request.with_array_targets(CanonicalArrayTargets::from_global_types(global_types));
     }
     let captured = store.create_canonical_tuple_type(request)?;
-    infer_from_types(store, captured, variadic_type, context, candidates, session)
+    infer_from_types(
+        store,
+        captured,
+        variadic_type,
+        context,
+        candidates,
+        session,
+        query,
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -4960,8 +8356,26 @@ fn structured_inference_shape(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&dyn ConditionalBranchSource>,
 ) -> Result<StructuredInferenceShape, ConditionalTypeError> {
-    validate_conditional_operand(store, type_, &mut HashSet::new(), array_targets)?;
+    let query = query.filter(|source| source.source_query_options().is_some());
+    validate_conditional_operand_with_source(
+        store,
+        type_,
+        &mut HashSet::new(),
+        array_targets,
+        query,
+    )?;
+    if is_global_this_type_candidate(store, None, type_) {
+        let members = query
+            .and_then(|source| source.global_this_members())
+            .ok_or(RelationUnavailable::UnresolvedStructuredMembers(type_))?;
+        return Ok(StructuredInferenceShape {
+            properties: members.properties().to_vec(),
+            call_signatures: Vec::new(),
+            construct_signatures: Vec::new(),
+        });
+    }
     if matches!(
         super::instantiated_members::validate_generic_interface_callable(
             store,
@@ -5000,13 +8414,16 @@ fn infer_from_structured_types(
     context: ConditionalInferenceContext<'_>,
     candidates: &mut [Vec<TypeId>],
     session: &mut InstantiationSession,
+    query: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<bool, ConditionalTypeError> {
+    let mark = session.limit_event_mark();
     let source_shape = structured_inference_shape(
         store,
         source,
         context
             .global_types
             .map(CanonicalArrayTargets::from_global_types),
+        query.as_deref(),
     )?;
     let target_shape = structured_inference_shape(
         store,
@@ -5014,12 +8431,20 @@ fn infer_from_structured_types(
         context
             .global_types
             .map(CanonicalArrayTargets::from_global_types),
+        query.as_deref(),
     )?;
     if target_shape.properties.is_empty()
         && target_shape.call_signatures.is_empty()
         && target_shape.construct_signatures.is_empty()
     {
-        return is_assignable(store, source, target, context.global_types);
+        return inference_assignability(
+            store,
+            source,
+            target,
+            context.global_types,
+            session,
+            query,
+        );
     }
 
     for target_property in target_shape.properties {
@@ -5035,30 +8460,54 @@ fn infer_from_structured_types(
         }) else {
             return Ok(false);
         };
-        let source_type = store
-            .value_symbol_links(source_property)
-            .and_then(|links| links.resolved_type)
-            .ok_or(ConditionalTypeError::UnsupportedInference { source, target })?;
-        let target_type = store
-            .value_symbol_links(target_property)
-            .and_then(|links| links.resolved_type)
-            .ok_or(ConditionalTypeError::UnsupportedInference { source, target })?;
-        let source_type = map_type(
+        let source_type = inference_property_type(
+            store,
+            source,
+            source_property,
+            context.global_types,
+            session,
+            query,
+        )?
+        .ok_or(ConditionalTypeError::UnsupportedInference { source, target })?;
+        if source_recovery_type(session, mark, query)?.is_some() {
+            return Ok(false);
+        }
+        let target_type = inference_property_type(
+            store,
+            target,
+            target_property,
+            context.global_types,
+            session,
+            query,
+        )?
+        .ok_or(ConditionalTypeError::UnsupportedInference { source, target })?;
+        if source_recovery_type(session, mark, query)?.is_some() {
+            return Ok(false);
+        }
+        let source_type = map_inference_type(
             store,
             source_type,
             context.mapped_parameters,
             context.type_arguments,
             context.global_types,
             session,
+            query,
         )?;
-        let target_type = map_type(
+        if source_recovery_type(session, mark, query)?.is_some() {
+            return Ok(false);
+        }
+        let target_type = map_inference_type(
             store,
             target_type,
             context.mapped_parameters,
             context.type_arguments,
             context.global_types,
             session,
+            query,
         )?;
+        if source_recovery_type(session, mark, query)?.is_some() {
+            return Ok(false);
+        }
         if !infer_from_types(
             store,
             source_type,
@@ -5066,6 +8515,7 @@ fn infer_from_structured_types(
             context,
             candidates,
             session,
+            query,
         )? {
             return Ok(false);
         }
@@ -5096,6 +8546,7 @@ fn infer_from_structured_types(
                     source_signature,
                     context.global_types,
                     session,
+                    query,
                 )?;
             let (target_parameters, _, target_return) =
                 inference_signature_parts(store, target_signature)?;
@@ -5105,21 +8556,23 @@ fn infer_from_structured_types(
             for (source_parameter, target_parameter) in
                 source_parameters.into_iter().zip(target_parameters)
             {
-                let source_parameter = map_type(
+                let source_parameter = map_inference_type(
                     store,
                     source_parameter,
                     context.mapped_parameters,
                     context.type_arguments,
                     context.global_types,
                     session,
+                    query,
                 )?;
-                let target_parameter = map_type(
+                let target_parameter = map_inference_type(
                     store,
                     target_parameter,
                     context.mapped_parameters,
                     context.type_arguments,
                     context.global_types,
                     session,
+                    query,
                 )?;
                 let compatible = if contains_mapped_type_parameter(
                     store,
@@ -5134,34 +8587,39 @@ fn infer_from_structured_types(
                         context,
                         candidates,
                         session,
+                        query,
                     )?
                 } else {
-                    is_assignable(
+                    inference_assignability(
                         store,
                         target_parameter,
                         source_parameter,
                         context.global_types,
+                        session,
+                        query,
                     )?
                 };
                 if !compatible {
                     return Ok(false);
                 }
             }
-            let source_return = map_type(
+            let source_return = map_inference_type(
                 store,
                 source_return,
                 context.mapped_parameters,
                 context.type_arguments,
                 context.global_types,
                 session,
+                query,
             )?;
-            let target_return = map_type(
+            let target_return = map_inference_type(
                 store,
                 target_return,
                 context.mapped_parameters,
                 context.type_arguments,
                 context.global_types,
                 session,
+                query,
             )?;
             if !infer_from_types(
                 store,
@@ -5170,12 +8628,59 @@ fn infer_from_structured_types(
                 context,
                 candidates,
                 session,
+                query,
             )? {
                 return Ok(false);
             }
         }
     }
     Ok(true)
+}
+
+fn inference_property_type(
+    store: &mut CanonicalTypeMapperStore,
+    receiver: TypeId,
+    member: SemanticSymbolId,
+    globals: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+    query: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<Option<TypeId>, ConditionalTypeError> {
+    if !is_source_query(query) || !is_global_this_type_candidate(store, globals, receiver) {
+        return Ok(store
+            .value_symbol_links(member)
+            .and_then(|links| links.resolved_type));
+    }
+    let globals = globals.ok_or(ConditionalTypeError::MissingBootstrap)?;
+    let query = query
+        .as_deref_mut()
+        .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?;
+    let members = query
+        .global_this_members()
+        .ok_or(RelationUnavailable::UnresolvedStructuredMembers(receiver))?;
+    if members.receiver() != receiver || members.member(member).is_none() {
+        return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
+    }
+    members
+        .validate(store)
+        .map_err(ConditionalTypeError::Declared)?;
+    let proof = query
+        .resolve_global_this_member(store, receiver, member, session)
+        .map_err(ConditionalTypeError::Declared)?;
+    if proof.receiver() != receiver || proof.member() != member {
+        return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
+    }
+    query
+        .validate_global_this_member_value_proof(
+            store,
+            &proof,
+            globals,
+            query
+                .source_query_options()
+                .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?
+                .strict_function_types,
+        )
+        .map_err(ConditionalTypeError::Declared)?;
+    Ok(Some(proof.type_id()))
 }
 
 fn inference_signature_parts(
@@ -5206,6 +8711,7 @@ fn base_inference_signature_parts(
     signature: SignatureId,
     global_types: Option<&CanonicalGlobalTypes>,
     session: &mut InstantiationSession,
+    query: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<(Vec<TypeId>, usize, TypeId), ConditionalTypeError> {
     let (parameters, minimum, return_type) = inference_signature_parts(store, signature)?;
     let local_parameters = store
@@ -5246,46 +8752,50 @@ fn base_inference_signature_parts(
     for _ in 1..local_parameters.len() {
         let previous = constraints.clone();
         for constraint in &mut constraints {
-            *constraint = map_type(
+            *constraint = map_inference_type(
                 store,
                 *constraint,
                 &local_parameters,
                 &previous,
                 global_types,
                 session,
+                query,
             )?;
         }
     }
     let erased = vec![any; local_parameters.len()];
     for constraint in &mut constraints {
-        *constraint = map_type(
+        *constraint = map_inference_type(
             store,
             *constraint,
             &local_parameters,
             &erased,
             global_types,
             session,
+            query,
         )?;
     }
 
     let mut base_parameters = Vec::with_capacity(parameters.len());
     for parameter in parameters {
-        base_parameters.push(map_type(
+        base_parameters.push(map_inference_type(
             store,
             parameter,
             &local_parameters,
             &constraints,
             global_types,
             session,
+            query,
         )?);
     }
-    let base_return = map_type(
+    let base_return = map_inference_type(
         store,
         return_type,
         &local_parameters,
         &constraints,
         global_types,
         session,
+        query,
     )?;
     Ok((base_parameters, minimum, base_return))
 }
@@ -5424,6 +8934,58 @@ fn infer_template_literal_matches(
     target_texts: &[String],
     target_types: &[TypeId],
 ) -> Result<Option<Vec<TypeId>>, ConditionalTypeError> {
+    infer_template_literal_matches_worker(
+        store,
+        source_texts,
+        source_types,
+        target_texts,
+        target_types,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Source inference retains the existing template inputs and caller.
+fn infer_template_literal_matches_in_query(
+    store: &mut CanonicalTypeMapperStore,
+    source_texts: &[String],
+    source_types: &[TypeId],
+    target_texts: &[String],
+    target_types: &[TypeId],
+    arrays: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+    source_query: bool,
+) -> Result<Option<Vec<TypeId>>, ConditionalTypeError> {
+    if source_query {
+        infer_template_literal_matches_worker(
+            store,
+            source_texts,
+            source_types,
+            target_texts,
+            target_types,
+            arrays,
+            Some(session),
+        )
+    } else {
+        infer_template_literal_matches(
+            store,
+            source_texts,
+            source_types,
+            target_texts,
+            target_types,
+        )
+    }
+}
+
+fn infer_template_literal_matches_worker(
+    store: &mut CanonicalTypeMapperStore,
+    source_texts: &[String],
+    source_types: &[TypeId],
+    target_texts: &[String],
+    target_types: &[TypeId],
+    arrays: Option<CanonicalArrayTargets>,
+    mut session: Option<&mut InstantiationSession>,
+) -> Result<Option<Vec<TypeId>>, ConditionalTypeError> {
     if source_texts.len() != source_types.len().saturating_add(1)
         || target_texts.len() != target_types.len().saturating_add(1)
         || source_texts.is_empty()
@@ -5494,6 +9056,8 @@ fn infer_template_literal_matches(
             position,
             match_segment,
             match_position,
+            arrays,
+            session.as_deref_mut(),
         )?);
         segment = match_segment;
         position = match_position + delimiter.len();
@@ -5507,6 +9071,8 @@ fn infer_template_literal_matches(
         position,
         last_source,
         remaining_end.len(),
+        arrays,
+        session,
     )?);
     Ok(Some(matches))
 }
@@ -5521,6 +9087,8 @@ fn capture_template_literal_part(
     start_position: usize,
     end_segment: usize,
     end_position: usize,
+    arrays: Option<CanonicalArrayTargets>,
+    session: Option<&mut InstantiationSession>,
 ) -> Result<TypeId, ConditionalTypeError> {
     let source_text = |index: usize| {
         if index + 1 == source_texts.len() {
@@ -5541,9 +9109,16 @@ fn capture_template_literal_part(
     texts.push(source_texts[start_segment][start_position..].to_owned());
     texts.extend(source_texts[start_segment + 1..end_segment].iter().cloned());
     texts.push(source_text(end_segment)[..end_position].to_owned());
-    store
-        .get_template_literal_type(&texts, &source_types[start_segment..end_segment])
-        .map_err(Into::into)
+    match session {
+        Some(session) => store.get_template_literal_type_with_array_targets_and_session(
+            &texts,
+            &source_types[start_segment..end_segment],
+            arrays,
+            session,
+        ),
+        None => store.get_template_literal_type(&texts, &source_types[start_segment..end_segment]),
+    }
+    .map_err(Into::into)
 }
 
 #[allow(clippy::too_many_arguments)] // A constraint uses the same active mapper as its root.
@@ -5579,14 +9154,7 @@ fn inferred_candidate_satisfies_constraint(
         session,
         source,
     )?;
-    is_assignable_in_query(
-        store,
-        candidate,
-        constraint,
-        global_types,
-        session,
-        source.is_some(),
-    )
+    is_assignable_in_query(store, candidate, constraint, global_types, session, source)
 }
 
 fn union_result(
@@ -5605,6 +9173,47 @@ fn union_result(
     } else {
         canonical_anonymous_union(store, types).map_err(Into::into)
     }
+}
+
+fn union_result_in_query(
+    store: &mut CanonicalTypeMapperStore,
+    types: &[TypeId],
+    globals: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+    source: &Option<&mut dyn ConditionalBranchSource>,
+) -> Result<TypeId, ConditionalTypeError> {
+    if !is_source_query(source) {
+        return union_result(store, types, globals);
+    }
+    store
+        .literal_union_type_with_alias_and_array_targets_and_session(
+            types,
+            None,
+            globals.map(CanonicalArrayTargets::from_global_types),
+            session,
+        )
+        .map_err(Into::into)
+}
+
+fn union_result_with_alias_in_query(
+    store: &mut CanonicalTypeMapperStore,
+    types: &[TypeId],
+    globals: Option<&CanonicalGlobalTypes>,
+    alias: Option<ConditionalAliasIdentity<'_>>,
+    session: &mut InstantiationSession,
+    source: &Option<&mut dyn ConditionalBranchSource>,
+) -> Result<TypeId, ConditionalTypeError> {
+    if !is_source_query(source) {
+        return union_result_with_alias(store, types, globals, alias);
+    }
+    store
+        .literal_union_type_with_alias_and_array_targets_and_session(
+            types,
+            alias.map(|alias| (alias.symbol, alias.type_arguments)),
+            globals.map(CanonicalArrayTargets::from_global_types),
+            session,
+        )
+        .map_err(Into::into)
 }
 
 fn union_result_with_alias(
@@ -5641,7 +9250,121 @@ pub(super) fn conditional_check_is_assignable(
         global_types,
         &mut HashSet::new(),
         &mut None,
+        &mut None,
     )
+}
+
+fn is_source_query(query: &Option<&mut dyn ConditionalBranchSource>) -> bool {
+    query
+        .as_deref()
+        .and_then(|source| source.source_query_options())
+        .is_some()
+}
+
+fn source_recovery_type(
+    session: &InstantiationSession,
+    mark: InstantiationLimitEventMark,
+    source: &Option<&mut dyn ConditionalBranchSource>,
+) -> Result<Option<TypeId>, ConditionalTypeError> {
+    if is_source_query(source) && session.limit_event_occurred_since(mark) {
+        session
+            .recovery_error_type()
+            .map(Some)
+            .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn source_semantic_recovery_mark(source: &Option<&mut dyn ConditionalBranchSource>) -> usize {
+    source
+        .as_deref()
+        .map_or(0, |source| source.source_branch_recoveries().len())
+}
+
+pub(super) fn validate_source_branch_recoveries_since(
+    store: &CanonicalTypeMapperStore,
+    source: &dyn ConditionalBranchSource,
+    mark: usize,
+    session: &InstantiationSession,
+) -> Result<bool, ConditionalTypeError> {
+    if source.source_query_options().is_none() {
+        return Ok(false);
+    }
+    let reached = source
+        .source_branch_recoveries()
+        .get(mark..)
+        .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?;
+    for proof in reached {
+        source
+            .validate_root_branch_recovery(store, proof, session)
+            .map_err(ConditionalTypeError::Declared)?;
+    }
+    Ok(!reached.is_empty())
+}
+
+fn source_semantic_recovery_since(
+    store: &CanonicalTypeMapperStore,
+    mark: usize,
+    session: &InstantiationSession,
+    source: &Option<&mut dyn ConditionalBranchSource>,
+) -> Result<bool, ConditionalTypeError> {
+    source.as_deref().map_or(Ok(false), |source| {
+        validate_source_branch_recoveries_since(store, source, mark, session)
+    })
+}
+
+pub(super) fn source_query_is_assignable(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    target: TypeId,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    query: &mut dyn ConditionalBranchSource,
+) -> Result<bool, ConditionalTypeError> {
+    let options = query
+        .source_query_options()
+        .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?;
+    let result = store
+        .is_type_related_to_with_global_this_source(
+            source,
+            target,
+            super::RelationKind::Assignable,
+            globals,
+            options.strict_function_types,
+            session,
+            query,
+        )
+        .map_err(|error| match error {
+            SourceRelationError::Relation(error) => ConditionalTypeError::Relation(error),
+            SourceRelationError::Source(error) => ConditionalTypeError::Declared(error),
+        })?;
+    if query.source_query_options() != Some(options) {
+        return Err(ConditionalTypeError::Declared(missing_source_query()));
+    }
+    let related = result.related();
+    let (member_values, signature_returns) = result.into_proofs();
+    for proof in &member_values {
+        query
+            .validate_global_this_member_value_proof(
+                store,
+                proof,
+                globals,
+                options.strict_function_types,
+            )
+            .map_err(ConditionalTypeError::Declared)?;
+    }
+    for proof in &signature_returns {
+        query
+            .validate_source_signature_return_proof(
+                store,
+                proof,
+                globals,
+                options.strict_function_types,
+            )
+            .map_err(ConditionalTypeError::Declared)?;
+    }
+    Ok(related)
 }
 
 fn is_assignable(
@@ -5659,9 +9382,9 @@ fn is_assignable_in_query(
     target: TypeId,
     globals: Option<&CanonicalGlobalTypes>,
     session: &mut InstantiationSession,
-    use_caller: bool,
+    query: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<bool, ConditionalTypeError> {
-    if !use_caller {
+    if query.is_none() {
         return is_assignable(store, source, target, globals);
     }
     validate_owned_type(store, source)?;
@@ -5673,7 +9396,23 @@ fn is_assignable_in_query(
         globals,
         &mut HashSet::new(),
         &mut Some(session),
+        query,
     )
+}
+
+fn inference_assignability(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    target: TypeId,
+    globals: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+    query: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<bool, ConditionalTypeError> {
+    if is_source_query(query) {
+        is_assignable_in_query(store, source, target, globals, session, query)
+    } else {
+        is_assignable(store, source, target, globals)
+    }
 }
 
 fn conditional_check_is_assignable_worker(
@@ -5683,7 +9422,31 @@ fn conditional_check_is_assignable_worker(
     global_types: Option<&CanonicalGlobalTypes>,
     visiting: &mut HashSet<(TypeId, TypeId)>,
     session: &mut Option<&mut InstantiationSession>,
+    query: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<bool, ConditionalTypeError> {
+    // This walk is only a demand hint. It cannot admit an operand or a cache.
+    for endpoint in [source, target] {
+        if is_global_this_type_candidate(store, global_types, endpoint)
+            || conditional_identity_requires_source(store, endpoint, &mut HashSet::new())
+                .is_ok_and(|required| required)
+        {
+            if !is_source_query(query) {
+                return Err(RelationUnavailable::UnresolvedStructuredMembers(endpoint).into());
+            }
+            return source_query_is_assignable(
+                store,
+                source,
+                target,
+                global_types.ok_or(ConditionalTypeError::MissingBootstrap)?,
+                session
+                    .as_deref_mut()
+                    .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?,
+                query
+                    .as_deref_mut()
+                    .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?,
+            );
+        }
+    }
     if source == target {
         return Ok(true);
     }
@@ -5701,6 +9464,7 @@ fn conditional_check_is_assignable_worker(
             global_types,
             visiting,
             session,
+            query,
         )
     } else if matches!(
         store.type_payload(target).map(TypeRecord::data),
@@ -5715,6 +9479,16 @@ fn conditional_check_is_assignable_worker(
             .map_err(Into::into)
     } else {
         match session.as_deref_mut() {
+            Some(session) if is_source_query(query) => source_query_is_assignable(
+                store,
+                source,
+                target,
+                global_types.ok_or(ConditionalTypeError::MissingBootstrap)?,
+                session,
+                query
+                    .as_deref_mut()
+                    .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?,
+            ),
             Some(session) => store
                 .is_type_assignable_to_with_session(source, target, global_types, None, session)
                 .map_err(Into::into),
@@ -5732,6 +9506,7 @@ fn concrete_tuple_types_are_assignable(
     global_types: Option<&CanonicalGlobalTypes>,
     visiting: &mut HashSet<(TypeId, TypeId)>,
     session: &mut Option<&mut InstantiationSession>,
+    query: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<bool, ConditionalTypeError> {
     if source.readonly && !target.readonly {
         return Ok(false);
@@ -5781,6 +9556,7 @@ fn concrete_tuple_types_are_assignable(
             global_types,
             visiting,
             session,
+            query,
         )? {
             return Ok(false);
         }
@@ -5846,6 +9622,1518 @@ mod tests {
         type_records::{RegularLiteralLink, StructuredTypeData},
         types::{AccessFlags, ObjectFlags},
     };
+
+    mod source_query_controls {
+        use super::*;
+
+        const FILE: FileId = FileId::new(20_422);
+
+        fn context(parsed: &ParseResult, strict_functions: bool) -> CanonicalCheckerContext<'_> {
+            assert!(parsed.diagnostics.is_empty());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    FILE,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/source-conditional-control.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, FILE)
+                .unwrap();
+            CanonicalCheckerContext::new(
+                binder.finish(),
+                vec![(FILE, &parsed.arena)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    strict_function_types: strict_functions,
+                    ..CanonicalCheckerOptions::default()
+                },
+            )
+            .unwrap()
+        }
+
+        fn annotation(context: &CanonicalCheckerContext<'_>, name: &str) -> NodeRef {
+            source_conditional_annotation(context, source_conditional_symbol(context, name))
+        }
+
+        fn declared(context: &mut CanonicalCheckerContext<'_>, name: &str) -> TypeId {
+            let symbol = source_conditional_symbol(context, name);
+            context.get_declared_type_of_symbol(symbol).unwrap()
+        }
+
+        fn source_options(context: &CanonicalCheckerContext<'_>) -> CanonicalTypeQueryOptions {
+            let options = context.options();
+            CanonicalTypeQueryOptions {
+                strict_builtin_iterator_return: options.strict_builtin_iterator_return,
+                strict_function_types: Some(options.strict_function_types),
+                no_implicit_any: options.no_implicit_any,
+            }
+        }
+
+        struct HeaderSource<'host, 'arena> {
+            options: CanonicalTypeQueryOptions,
+            members: Option<GlobalThisMembers<'host, 'arena>>,
+        }
+
+        impl ConditionalBranchSource for HeaderSource<'_, '_> {
+            fn preflight(
+                &self,
+                _: &CanonicalTypeMapperStore,
+                _: TypeId,
+            ) -> Result<(), DeclaredTypeError> {
+                Err(missing_source_query())
+            }
+
+            fn resolve_branch(
+                &mut self,
+                _: &mut CanonicalTypeMapperStore,
+                _: TypeId,
+                _: ConditionalBranchKind,
+                _: &mut InstantiationSession,
+            ) -> Result<TypeId, DeclaredTypeError> {
+                Err(missing_source_query())
+            }
+
+            fn source_query_options(&self) -> Option<CanonicalTypeQueryOptions> {
+                Some(self.options)
+            }
+
+            fn global_this_members(&self) -> Option<&GlobalThisMembers<'_, '_>> {
+                self.members.as_ref()
+            }
+        }
+
+        fn charge_source_parameter(
+            context: &mut CanonicalCheckerContext<'_>,
+            caller: &mut InstantiationSession,
+        ) -> TypeId {
+            let node = annotation(context, "Caller");
+            let parameter = context.get_type_from_type_node(node).unwrap();
+            assert!(cached_ordinary_type_parameter_owner(context.store(), parameter).is_some());
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let arrays = Some(CanonicalArrayTargets::from_global_types(
+                context.global_types(),
+            ));
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    context.store_mut_for_test(),
+                    parameter,
+                    &[parameter],
+                    &[number],
+                    arrays,
+                    caller
+                ),
+                Ok(number)
+            );
+            assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+            parameter
+        }
+
+        fn query(
+            context: &mut CanonicalCheckerContext<'_>,
+            parsed: &ParseResult,
+            node: NodeRef,
+            caller: &mut InstantiationSession,
+            diagnostics: &mut CanonicalCheckerDiagnostics,
+        ) -> Result<TypeId, DeclaredTypeError> {
+            let options = context.options();
+            let query_options = source_options(context);
+            let bound = context.file(FILE).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let globals = context.global_types().clone();
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                query_options,
+                caller,
+                diagnostics,
+            )?
+            .get_type_from_type_node(node)
+        }
+
+        fn state(
+            context: &CanonicalCheckerContext<'_>,
+            parsed: &ParseResult,
+            root: NodeRef,
+        ) -> impl std::fmt::Debug + PartialEq + use<> {
+            let store = context.store();
+            let globals = store.symbol_table(context.globals()).unwrap();
+            let members = store
+                .type_payload(context.global_types().global_this_value_type)
+                .and_then(|record| record.data().structured())
+                .and_then(|data| data.members);
+            (
+                conditional_allocation_counts(store),
+                conditional_callable_counts(store),
+                store
+                    .conditional_query_production(ConditionalQueryKey::Node(root))
+                    .cloned(),
+                members.and_then(|table| store.symbol_table(table)).cloned(),
+                parsed
+                    .arena
+                    .iter()
+                    .map(|(id, _)| {
+                        let node = NodeRef::new(parsed.arena.id(), FILE, id);
+                        (
+                            store.type_node_links(node).cloned(),
+                            store.symbol_node_links(node).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                globals
+                    .iter()
+                    .map(|(_, symbol)| {
+                        (
+                            symbol,
+                            store.value_symbol_links(symbol).cloned(),
+                            store.type_alias_links(symbol).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+
+        const GLOBAL_INFERENCE: &str = concat!(
+            "declare var ready: number;\n",
+            "declare var payload: { code: string };\n",
+            "type Selected = typeof globalThis extends { ready: number; payload: infer T } ? T : import(\"./cold\").Missing;\n",
+            "type Caller<T> = T;\n",
+        );
+
+        #[test]
+        fn source_conditional_recovery_keeps_the_spent_caller_and_root_result_cold() {
+            let parsed = parse_source_file(GLOBAL_INFERENCE);
+            let mut context = context(&parsed, true);
+            let root = annotation(&context, "Selected");
+            let parameter_node = annotation(&context, "Caller");
+            let parameter = context.get_type_from_type_node(parameter_node).unwrap();
+            assert!(cached_ordinary_type_parameter_owner(context.store(), parameter).is_some());
+            let globals = context.global_types().clone();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (number, error) = (bootstrap.number_type, bootstrap.error_type);
+            let mut caller = InstantiationSession::new_recovering(
+                context.store(),
+                InstantiationLimits {
+                    max_count: 1,
+                    ..InstantiationLimits::default()
+                },
+                error,
+            )
+            .unwrap();
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    context.store_mut_for_test(),
+                    parameter,
+                    &[parameter],
+                    &[number],
+                    Some(CanonicalArrayTargets::from_global_types(&globals)),
+                    &mut caller
+                ),
+                Ok(number)
+            );
+            assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+            let NodeData::ConditionalTypeNode(syntax) = &parsed.arena.get(root.node).unwrap().data
+            else {
+                panic!("real conditional required")
+            };
+            let cold_import = NodeRef::new(root.arena, root.file, syntax.false_type);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            for _ in 0..2 {
+                let mark = caller.limit_event_mark();
+                assert_eq!(
+                    query(&mut context, &parsed, root, &mut caller, &mut diagnostics),
+                    Ok(error)
+                );
+                assert!(caller.limit_event_occurred_since(mark));
+                assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+                assert!(
+                    context
+                        .store()
+                        .conditional_query_production(ConditionalQueryKey::Node(root))
+                        .is_none()
+                );
+                assert!(
+                    context
+                        .store()
+                        .type_node_links(root)
+                        .is_none_or(|links| links.resolved_type.is_none())
+                );
+                assert!(context.store().type_node_links(cold_import).is_none());
+                assert!(
+                    context
+                        .store()
+                        .source_file_links(context.source_file(FILE).unwrap())
+                        .is_none_or(|links| !links.type_checked)
+                );
+            }
+        }
+
+        #[test]
+        fn source_conditional_warm_queries_recheck_the_actual_global_member_table() {
+            let parsed = parse_source_file(GLOBAL_INFERENCE);
+            let mut context = context(&parsed, true);
+            let root = annotation(&context, "Selected");
+            let mut caller = InstantiationSession::new(InstantiationLimits::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = query(&mut context, &parsed, root, &mut caller, &mut diagnostics).unwrap();
+            let payload = source_conditional_symbol(&context, "payload");
+            let ready = source_conditional_symbol(&context, "ready");
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(payload)
+                    .unwrap()
+                    .resolved_type,
+                Some(result)
+            );
+            let globals = context.global_types().clone();
+            let global = globals.global_this_value_type;
+            let table = context
+                .store()
+                .type_payload(global)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .members
+                .unwrap();
+            let warm = state(&context, &parsed, root);
+            for _ in 0..2 {
+                assert_eq!(
+                    query(&mut context, &parsed, root, &mut caller, &mut diagnostics),
+                    Ok(result)
+                );
+                assert_eq!(state(&context, &parsed, root), warm);
+            }
+            assert_eq!(
+                conditional_check_is_assignable(
+                    context.store_mut_for_test(),
+                    global,
+                    global,
+                    Some(&globals)
+                ),
+                Err(ConditionalTypeError::Relation(
+                    RelationUnavailable::UnresolvedStructuredMembers(global)
+                ))
+            );
+            assert_eq!(
+                context.store_mut_for_test().insert_symbol(
+                    table,
+                    EscapedName::source("payload"),
+                    ready
+                ),
+                Some(Some(payload))
+            );
+            let poisoned = state(&context, &parsed, root);
+            let counts = (
+                caller.query_count(),
+                caller.total_count(),
+                caller.limit_event_mark(),
+            );
+            for _ in 0..2 {
+                assert_eq!(query(&mut context, &parsed, root, &mut caller, &mut diagnostics),
+                    Err(super::super::super::declared::DeclaredTypeUnavailable::InvalidGlobalThisMembers(global).into()));
+                assert_eq!(state(&context, &parsed, root), poisoned);
+                assert_eq!(
+                    (
+                        caller.query_count(),
+                        caller.total_count(),
+                        caller.limit_event_mark()
+                    ),
+                    counts
+                );
+            }
+            assert_eq!(
+                context.store_mut_for_test().insert_symbol(
+                    table,
+                    EscapedName::source("payload"),
+                    payload
+                ),
+                Some(Some(ready))
+            );
+            assert_eq!(
+                query(&mut context, &parsed, root, &mut caller, &mut diagnostics),
+                Ok(result)
+            );
+            assert_eq!(state(&context, &parsed, root), warm);
+            assert!(diagnostics.is_empty());
+            scalar_selected_branch_keeps_its_source_dependency();
+        }
+
+        fn scalar_selected_branch_keeps_its_source_dependency() {
+            let parsed = parse_source_file(concat!(
+                "declare var ready: number;\n",
+                "type Inner = typeof globalThis extends { ready: number } ? number : string;\n",
+                "type Outer = number extends number ? Inner : string;\n",
+            ));
+            let mut context = context(&parsed, true);
+            let root = annotation(&context, "Outer");
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let mut caller = InstantiationSession::new(InstantiationLimits::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            assert_eq!(
+                query(&mut context, &parsed, root, &mut caller, &mut diagnostics),
+                Ok(number)
+            );
+            let arrays = Some(CanonicalArrayTargets::from_global_types(
+                context.global_types(),
+            ));
+            let metadata = conditional_source_query_request(
+                context.store(),
+                ConditionalQueryKey::Node(root),
+                arrays,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                (
+                    metadata.check_type(),
+                    metadata.extends_type(),
+                    metadata.retained_result()
+                ),
+                (number, number, number)
+            );
+            assert!(metadata.requires_source_result_proof());
+            let warm = state(&context, &parsed, root);
+            for _ in 0..2 {
+                assert_eq!(
+                    conditional_query_alias_with_array_targets(context.store(), root, arrays),
+                    Err(ConditionalTypeError::Declared(missing_source_query()))
+                );
+                assert_eq!(state(&context, &parsed, root), warm);
+                assert_eq!(
+                    query(&mut context, &parsed, root, &mut caller, &mut diagnostics),
+                    Ok(number)
+                );
+                assert_eq!(state(&context, &parsed, root), warm);
+            }
+            assert!(diagnostics.is_empty());
+        }
+
+        #[test]
+        fn source_conditional_deferred_replay_keeps_the_real_root_and_unqueried_branches() {
+            let parsed = parse_source_file(
+                "type Deferred<T> = T extends { global: typeof globalThis } ? number : boolean;",
+            );
+            let mut context = context(&parsed, true);
+            let root = annotation(&context, "Deferred");
+            let NodeData::ConditionalTypeNode(syntax) = &parsed.arena.get(root.node).unwrap().data
+            else {
+                panic!("real conditional required")
+            };
+            let branches = [syntax.true_type, syntax.false_type]
+                .map(|node| NodeRef::new(root.arena, root.file, node));
+            let mut caller = InstantiationSession::new(InstantiationLimits::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = query(&mut context, &parsed, root, &mut caller, &mut diagnostics).unwrap();
+            let Some(TypeData::Conditional(data)) =
+                context.store().type_payload(result).map(TypeRecord::data)
+            else {
+                panic!("the source parameter must keep the conditional deferred")
+            };
+            let root_id = data.root;
+            assert_eq!(
+                context.store().conditional_root(root_id).unwrap().node(),
+                root
+            );
+            assert_eq!(
+                (
+                    data.resolved_true_type,
+                    data.resolved_false_type,
+                    data.resolved_inferred_true_type
+                ),
+                (None, None, None)
+            );
+            let warm = state(&context, &parsed, root);
+            let caller_state = (
+                caller.query_count(),
+                caller.total_count(),
+                caller.limit_event_mark(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    query(&mut context, &parsed, root, &mut caller, &mut diagnostics),
+                    Ok(result)
+                );
+                for branch in branches {
+                    assert!(context.store().type_node_links(branch).is_none());
+                }
+                assert_eq!(state(&context, &parsed, root), warm);
+                assert_eq!(
+                    (
+                        caller.query_count(),
+                        caller.total_count(),
+                        caller.limit_event_mark()
+                    ),
+                    caller_state
+                );
+            }
+            let original = context.store().type_node_links(root).cloned().unwrap();
+            let mut poison = original.clone();
+            poison.resolved_type = Some(context.store().intrinsic_bootstrap().unwrap().string_type);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(root, poison)
+            );
+            let poisoned = state(&context, &parsed, root);
+            assert_eq!(
+                conditional_source_query_request(
+                    context.store(),
+                    ConditionalQueryKey::Node(root),
+                    Some(CanonicalArrayTargets::from_global_types(
+                        context.global_types()
+                    ))
+                ),
+                Err(ConditionalTypeError::InvalidTypeNodeCache(root))
+            );
+            assert_eq!(state(&context, &parsed, root), poisoned);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(root, original)
+            );
+            assert_eq!(
+                query(&mut context, &parsed, root, &mut caller, &mut diagnostics),
+                Ok(result)
+            );
+            assert_eq!(state(&context, &parsed, root), warm);
+        }
+
+        #[test]
+        fn source_conditional_inference_fallback_keeps_strict_options_and_the_caller() {
+            let parsed = parse_source_file(concat!(
+                "type Selected = { accept: (value: string) => void; result: number } extends ",
+                "{ accept: ((value: string | number) => void) | number; result: infer T } ? T : \"absent\";\n",
+                "type Caller<T> = T;\n",
+            ));
+            for strict in [false, true] {
+                let mut context = context(&parsed, strict);
+                let root = annotation(&context, "Selected");
+                let mut caller = InstantiationSession::new(InstantiationLimits::default());
+                charge_source_parameter(&mut context, &mut caller);
+                let caller_address = std::ptr::from_ref(&caller);
+                let mark = caller.limit_event_mark();
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let result =
+                    query(&mut context, &parsed, root, &mut caller, &mut diagnostics).unwrap();
+                if strict {
+                    assert!(
+                        matches!(context.store().type_payload(result).unwrap().data(),
+                        TypeData::Literal(literal) if literal.value == LiteralValue::String("absent".to_owned()))
+                    );
+                } else {
+                    assert_eq!(
+                        result,
+                        context.store().intrinsic_bootstrap().unwrap().number_type
+                    );
+                }
+                let proof = context
+                    .store()
+                    .conditional_query_production(ConditionalQueryKey::Node(root))
+                    .unwrap();
+                let target = proof.definition.extends_type;
+                assert_eq!(proof.definition.infer_type_parameters.len(), 1);
+                assert!(is_structural_inference_target(context.store(), target).unwrap());
+                assert_eq!(
+                    context.store().claimed_strict_function_types(),
+                    Some(strict)
+                );
+                let warm = state(&context, &parsed, root);
+                let count = caller.query_count();
+                assert!(count >= 1);
+                assert_eq!(
+                    query(&mut context, &parsed, root, &mut caller, &mut diagnostics),
+                    Ok(result)
+                );
+                assert_eq!(std::ptr::from_ref(&caller), caller_address);
+                assert!(caller.query_count() >= count);
+                assert_eq!(caller.query_count(), caller.total_count());
+                assert_eq!(caller.limit_event_mark(), mark);
+                assert_eq!(state(&context, &parsed, root), warm);
+                assert!(diagnostics.is_empty());
+            }
+            inference_fallback_spends_the_actual_member_caller();
+        }
+
+        #[allow(clippy::too_many_lines)] // Keep the cold proxy, spent caller and exact retry in one control.
+        fn inference_fallback_spends_the_actual_member_caller() {
+            let parsed = parse_source_file(concat!(
+                "interface Box<T> { value: T; }\n",
+                "type Accepted = Box<number>;\n",
+                "type Pattern = { value: number } | number;\n",
+                "type Caller<T> = T;\n",
+            ));
+            for limited in [true, false] {
+                let mut context = context(&parsed, true);
+                let accepted = declared(&mut context, "Accepted");
+                let pattern = declared(&mut context, "Pattern");
+                let node = annotation(&context, "Accepted");
+                let globals = context.global_types().clone();
+                let arrays = Some(CanonicalArrayTargets::from_global_types(&globals));
+                let mut source = HeaderSource {
+                    options: source_options(&context),
+                    members: None,
+                };
+                let mut caller = InstantiationSession::new(InstantiationLimits {
+                    max_count: if limited {
+                        1
+                    } else {
+                        InstantiationLimits::default().max_count
+                    },
+                    ..InstantiationLimits::default()
+                });
+                charge_source_parameter(&mut context, &mut caller);
+                assert_eq!(
+                    super::super::super::instantiated_members::validate_generic_interface_members(
+                        context.store(),
+                        accepted,
+                        arrays
+                    ),
+                    Ok(None)
+                );
+                assert!(matches!(
+                    context.store().type_payload(pattern).unwrap().data(),
+                    TypeData::Union(_)
+                ));
+                assert!(
+                    !contains_type_parameter(context.store(), pattern, &HashSet::new()).unwrap()
+                );
+                let inference = ConditionalInferenceContext {
+                    infer_parameters: &[],
+                    mapped_parameters: &[],
+                    type_arguments: &[],
+                    global_types: Some(&globals),
+                };
+                let address = std::ptr::from_ref(&caller);
+                let mark = caller.limit_event_mark();
+                let result = infer_from_types(
+                    context.store_mut_for_test(),
+                    accepted,
+                    pattern,
+                    inference,
+                    &mut [],
+                    &mut caller,
+                    &mut Some(&mut source),
+                );
+                let members = context
+                    .store()
+                    .type_payload(accepted)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap()
+                    .members
+                    .unwrap();
+                let property = context
+                    .store()
+                    .symbol_table(members)
+                    .unwrap()
+                    .get_source("value")
+                    .unwrap();
+                let links = context
+                    .store()
+                    .value_symbol_links(property)
+                    .cloned()
+                    .unwrap();
+                let original = links.target.unwrap();
+                let template = context
+                    .store()
+                    .value_symbol_links(original)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                assert!(cached_ordinary_type_parameter_owner(context.store(), template).is_some());
+                let warm = state(&context, &parsed, node);
+                if limited {
+                    assert_eq!(
+                        result,
+                        Err(ConditionalTypeError::Relation(
+                            RelationUnavailable::UnsupportedProperty(property)
+                        ))
+                    );
+                    assert_eq!(links.resolved_type, None);
+                    assert!(caller.limit_event_occurred_since(mark));
+                    assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+                    assert_eq!(
+                        infer_from_types(
+                            context.store_mut_for_test(),
+                            accepted,
+                            pattern,
+                            inference,
+                            &mut [],
+                            &mut caller,
+                            &mut Some(&mut source)
+                        ),
+                        Err(ConditionalTypeError::Relation(
+                            RelationUnavailable::UnsupportedProperty(property)
+                        ))
+                    );
+                    assert_eq!(context.store().value_symbol_links(property), Some(&links));
+                    assert_eq!(state(&context, &parsed, node), warm);
+                    assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+                } else {
+                    assert_eq!(result, Ok(true));
+                    assert!(caller.query_count() > 1);
+                    assert_eq!(caller.query_count(), caller.total_count());
+                    assert_eq!(caller.limit_event_mark(), mark);
+                    assert_eq!(
+                        links.resolved_type,
+                        Some(context.store().intrinsic_bootstrap().unwrap().number_type)
+                    );
+                }
+                assert_eq!(std::ptr::from_ref(&caller), address);
+                assert!(source.members.is_none());
+            }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Keep the exact global leaf and rejected nested mapping together.
+        fn source_conditional_mapping_keeps_the_nested_global_object_boundary() {
+            let parsed = parse_source_file(concat!(
+                "declare var untouched: number;\n",
+                "type Wrapped = { global: typeof globalThis };\n",
+                "type Caller<T> = T;\n",
+            ));
+            let mut context = context(&parsed, true);
+            let node = annotation(&context, "Wrapped");
+            let wrapped = declared(&mut context, "Wrapped");
+            assert_eq!(
+                context.store().type_node_links(node).unwrap().resolved_type,
+                Some(wrapped)
+            );
+            let parameter_node = annotation(&context, "Caller");
+            let parameter = context.get_type_from_type_node(parameter_node).unwrap();
+            assert!(cached_ordinary_type_parameter_owner(context.store(), parameter).is_some());
+            let globals = context.global_types().clone();
+            let global = globals.global_this_value_type;
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let bound = context.file(FILE).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let options = source_options(&context);
+            let members = super::super::super::global_types::prepare_global_this_members(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                global,
+            )
+            .unwrap()
+            .unwrap();
+            let mut source = HeaderSource {
+                options,
+                members: Some(members),
+            };
+            let mut caller = InstantiationSession::new(InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            });
+            let before = state(&context, &parsed, node);
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_source_result_type(context.store(), global, &globals, &source),
+                    Ok(())
+                );
+                assert_eq!(
+                    map_type_with_source(
+                        context.store_mut_for_test(),
+                        wrapped,
+                        &[],
+                        &[],
+                        Some(&globals),
+                        &mut caller,
+                        &mut Some(&mut source)
+                    ),
+                    Ok(wrapped)
+                );
+                assert_eq!(
+                    map_type_with_source(
+                        context.store_mut_for_test(),
+                        global,
+                        &[parameter],
+                        &[number],
+                        Some(&globals),
+                        &mut caller,
+                        &mut Some(&mut source)
+                    ),
+                    Ok(global)
+                );
+                assert_eq!(
+                    map_type_with_source(
+                        context.store_mut_for_test(),
+                        wrapped,
+                        &[parameter],
+                        &[number],
+                        Some(&globals),
+                        &mut caller,
+                        &mut Some(&mut source)
+                    ),
+                    Err(ConditionalTypeError::Instantiation(
+                        InstantiationError::UnsupportedType(wrapped)
+                    ))
+                );
+                assert_eq!(state(&context, &parsed, node), before);
+                assert_eq!(
+                    (
+                        caller.query_count(),
+                        caller.total_count(),
+                        caller.limit_event_count()
+                    ),
+                    (0, 0, 0)
+                );
+            }
+            let untouched = source_conditional_symbol(&context, "untouched");
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(untouched)
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+            mapped_result_controls::recheck_completed_object_and_array_results();
+        }
+
+        mod mapped_result_controls {
+            use super::*;
+            use crate::semantic::{
+                array_types::ArrayTypeError,
+                instantiated_members::{
+                    demand_property_object_alias_property,
+                    resolve_property_object_alias_members_with_array_targets,
+                    validate_property_object_alias_members_with_array_targets,
+                },
+                object_aliases::source_property_object_projection,
+            };
+
+            struct Source<'host, 'arena> {
+                host: &'host DeclaredTypeHost<'arena>,
+                globals: CanonicalGlobalTypes,
+                options: CanonicalTypeQueryOptions,
+            }
+
+            impl Source<'_, '_> {
+                fn branch_node(
+                    &self,
+                    store: &CanonicalTypeMapperStore,
+                    root: ConditionalSourceRoot,
+                    branch: ConditionalBranchKind,
+                ) -> Result<NodeRef, DeclaredTypeError> {
+                    self.preflight_root(store, root)?;
+                    let Some(NodeData::ConditionalTypeNode(syntax)) =
+                        self.host.node(root.node).map(|node| &node.data)
+                    else {
+                        return Err(missing_source_query());
+                    };
+                    let node = NodeRef::new(
+                        root.node.arena,
+                        root.node.file,
+                        match branch {
+                            ConditionalBranchKind::True => syntax.true_type,
+                            ConditionalBranchKind::False => syntax.false_type,
+                        },
+                    );
+                    if store.source_node_parent(node) != Some(SourceNodeParent::Parent(root.node)) {
+                        return Err(missing_source_query());
+                    }
+                    Ok(node)
+                }
+            }
+
+            impl ConditionalBranchSource for Source<'_, '_> {
+                fn preflight(
+                    &self,
+                    store: &CanonicalTypeMapperStore,
+                    conditional: TypeId,
+                ) -> Result<(), DeclaredTypeError> {
+                    let Some(TypeData::Conditional(data)) =
+                        store.type_payload(conditional).map(TypeRecord::data)
+                    else {
+                        return Err(missing_source_query());
+                    };
+                    let root = store
+                        .conditional_root(data.root)
+                        .ok_or_else(missing_source_query)?;
+                    self.preflight_root(
+                        store,
+                        ConditionalSourceRoot {
+                            root: data.root,
+                            node: root.node(),
+                        },
+                    )
+                }
+
+                fn resolve_branch(
+                    &mut self,
+                    _: &mut CanonicalTypeMapperStore,
+                    _: TypeId,
+                    _: ConditionalBranchKind,
+                    _: &mut InstantiationSession,
+                ) -> Result<TypeId, DeclaredTypeError> {
+                    Err(missing_source_query())
+                }
+
+                fn preflight_root(
+                    &self,
+                    store: &CanonicalTypeMapperStore,
+                    root: ConditionalSourceRoot,
+                ) -> Result<(), DeclaredTypeError> {
+                    let request = conditional_source_query_request(
+                        store,
+                        ConditionalQueryKey::Node(root.node),
+                        Some(CanonicalArrayTargets::from_global_types(&self.globals)),
+                    )
+                    .map_err(|_| missing_source_query())?;
+                    if request.is_none_or(|request| request.source_root() != root) {
+                        return Err(missing_source_query());
+                    }
+                    Ok(())
+                }
+
+                fn resolve_root_branch(
+                    &mut self,
+                    store: &mut CanonicalTypeMapperStore,
+                    root: ConditionalSourceRoot,
+                    branch: ConditionalBranchKind,
+                    caller: &mut InstantiationSession,
+                ) -> Result<TypeId, DeclaredTypeError> {
+                    let node = self.branch_node(store, root, branch)?;
+                    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                    let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        self.host,
+                        &self.globals,
+                        self.options,
+                        caller,
+                        &mut diagnostics,
+                    )?
+                    .get_type_from_type_node(node)?;
+                    assert!(diagnostics.is_empty());
+                    Ok(result)
+                }
+
+                fn validate_resolved_root_branch(
+                    &self,
+                    store: &CanonicalTypeMapperStore,
+                    root: ConditionalSourceRoot,
+                    branch: ConditionalBranchKind,
+                    result: TypeId,
+                ) -> Result<(), DeclaredTypeError> {
+                    let node = self.branch_node(store, root, branch)?;
+                    if store
+                        .type_node_links(node)
+                        .and_then(|links| links.resolved_type)
+                        != Some(result)
+                    {
+                        return Err(missing_source_query());
+                    }
+                    validate_source_result_type(store, result, &self.globals, self)
+                        .map_err(|_| missing_source_query())
+                }
+
+                fn source_query_options(&self) -> Option<CanonicalTypeQueryOptions> {
+                    Some(self.options)
+                }
+            }
+
+            fn payload_state(
+                store: &CanonicalTypeMapperStore,
+                proof: &ConditionalSourceResultProof,
+            ) -> impl std::fmt::Debug + PartialEq + use<> {
+                let record = store.type_payload(proof.result()).unwrap();
+                let structured = record.data().structured().unwrap();
+                (
+                    (
+                        record.flags(),
+                        record.object_flags(),
+                        record.symbol(),
+                        record.alias(),
+                    ),
+                    match record.data() {
+                        TypeData::Object(data) => Some(data.clone()),
+                        _ => None,
+                    },
+                    match record.data() {
+                        TypeData::TypeReference(data) => Some(data.clone()),
+                        _ => None,
+                    },
+                    structured
+                        .members
+                        .and_then(|table| store.symbol_table(table))
+                        .cloned(),
+                    structured
+                        .properties
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|&property| (property, store.value_symbol_links(property).cloned()))
+                        .collect::<Vec<_>>(),
+                    store
+                        .conditional_root(proof.source_root().root)
+                        .unwrap()
+                        .instantiations()
+                        .clone(),
+                    store.conditional_query_production(proof.key()).cloned(),
+                )
+            }
+
+            #[allow(clippy::too_many_lines)] // Keep the real mapped result, damage rows and restored proof together.
+            pub(super) fn recheck_completed_object_and_array_results() {
+                let parsed = parse_source_file(concat!(
+                    "interface Array<T> {} interface ReadonlyArray<T> {}\n",
+                    "type Box<T> = { value: T };\n",
+                    "type Pick<T> = T extends string ? Box<T> : never;\n",
+                    "type ArrayPick<T> = T extends string ? T[] : never;\n",
+                    "type Caller<T> = T;\n",
+                ));
+                let mut context = context(&parsed, true);
+                let mut caller = InstantiationSession::new(InstantiationLimits::default());
+                charge_source_parameter(&mut context, &mut caller);
+                let globals = context.global_types().clone();
+                let options = context.options();
+                let targets = CanonicalArrayTargets::from_global_types(&globals);
+                let arrays = Some(targets);
+                let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                let bound = context.file(FILE).unwrap().1.clone();
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&parsed.arena, &bound)],
+                    GlobalMergeCompletion::for_test(options.name_resolution),
+                )
+                .unwrap();
+                let mut source = Source {
+                    host: &host,
+                    globals: globals.clone(),
+                    options: source_options(&context),
+                };
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                for name in ["Pick", "ArrayPick"] {
+                    let node = annotation(&context, name);
+                    let conditional = declared(&mut context, name);
+                    let TypeData::Conditional(data) =
+                        context.store().type_payload(conditional).unwrap().data()
+                    else {
+                        panic!("the written parameter must leave a real deferred conditional")
+                    };
+                    let root = ConditionalSourceRoot {
+                        root: data.root,
+                        node,
+                    };
+                    let selected = source
+                        .branch_node(context.store(), root, ConditionalBranchKind::True)
+                        .unwrap();
+                    let excluded = source
+                        .branch_node(context.store(), root, ConditionalBranchKind::False)
+                        .unwrap();
+                    assert!(
+                        context
+                            .store()
+                            .type_node_links(selected)
+                            .is_none_or(|links| links.resolved_type.is_none())
+                    );
+                    let arguments = [string];
+                    let request = SourceConditionalTypeInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &arguments,
+                        alias: None,
+                        for_constraint: false,
+                        input_recovery: None,
+                    };
+                    let ConditionalSourceResult::Complete(proof) =
+                        get_conditional_type_instantiation_with_source(
+                            context.store_mut_for_test(),
+                            request,
+                            &globals,
+                            &mut caller,
+                            &mut source,
+                        )
+                        .unwrap()
+                    else {
+                        panic!("the real source mapping must complete")
+                    };
+                    let result = proof.result();
+                    let raw = context
+                        .store()
+                        .type_node_links(selected)
+                        .unwrap()
+                        .resolved_type
+                        .unwrap();
+                    assert_ne!(result, raw);
+                    assert_eq!(proof.branch_reads.len(), 1);
+                    assert_eq!(proof.branch_reads[0].result, raw);
+                    assert_eq!(proof.branch_reads[0].root, root);
+                    assert_eq!(proof.branch_reads[0].branch, ConditionalBranchKind::True);
+                    assert!(proof.member_values.is_empty() && proof.nested.is_empty());
+                    let cold = (
+                        state(&context, &parsed, node),
+                        payload_state(context.store(), &proof),
+                    );
+                    for _ in 0..2 {
+                        assert_eq!(
+                            validate_source_conditional_result(
+                                context.store(),
+                                &proof,
+                                &globals,
+                                &source
+                            ),
+                            Ok(())
+                        );
+                        assert_eq!(
+                            (
+                                state(&context, &parsed, node),
+                                payload_state(context.store(), &proof)
+                            ),
+                            cold
+                        );
+                    }
+                    let mut object_member = None;
+                    if name == "Pick" {
+                        let projection = source_property_object_projection(context.store(), result)
+                            .unwrap()
+                            .unwrap();
+                        let raw_projection =
+                            source_property_object_projection(context.store(), raw)
+                                .unwrap()
+                                .unwrap();
+                        assert_eq!(raw_projection.target(), projection.target());
+                        assert_eq!(
+                            raw_projection.arguments(),
+                            &[context
+                                .store()
+                                .conditional_root(root.root)
+                                .unwrap()
+                                .check_type()]
+                        );
+                        assert_eq!(projection.arguments(), &[string]);
+                        assert_ne!(projection.type_(), projection.target());
+                        assert_eq!(projection.properties().len(), 1);
+                        assert_eq!(
+                            context
+                                .store()
+                                .source_declaration_symbol(annotation(&context, "Box")),
+                            Some(projection.source_symbol())
+                        );
+                        assert_eq!(
+                            validate_property_object_alias_members_with_array_targets(
+                                context.store(),
+                                result,
+                                arrays
+                            ),
+                            Ok(None)
+                        );
+                        let original = projection.properties()[0].symbol;
+                        assert_eq!(
+                            context
+                                .store()
+                                .source_declaration_symbol(projection.properties()[0].declaration),
+                            Some(original)
+                        );
+                        let members = resolve_property_object_alias_members_with_array_targets(
+                            context.store_mut_for_test(),
+                            result,
+                            arrays,
+                        )
+                        .unwrap();
+                        let [property] = members.properties.as_slice() else {
+                            panic!("Box has one actual source property")
+                        };
+                        let property = *property;
+                        assert_ne!(property, original);
+                        assert_eq!(
+                            context.store().value_symbol_links(property).unwrap().target,
+                            Some(original)
+                        );
+                        assert_eq!(
+                            demand_property_object_alias_property(
+                                context.store_mut_for_test(),
+                                &host,
+                                &globals,
+                                options,
+                                &mut caller,
+                                &mut diagnostics,
+                                result,
+                                property,
+                            ),
+                            Ok(string)
+                        );
+                        assert_eq!(
+                            context
+                                .store()
+                                .value_symbol_links(original)
+                                .unwrap()
+                                .resolved_type,
+                            Some(projection.parameters()[0])
+                        );
+                        assert_eq!(
+                            context.store().symbol(original).unwrap().parent(),
+                            Some(projection.source_symbol())
+                        );
+                        object_member = Some((
+                            members.members.unwrap(),
+                            property,
+                            original,
+                            context
+                                .store()
+                                .value_symbol_links(property)
+                                .cloned()
+                                .unwrap(),
+                        ));
+                    } else {
+                        let array = context
+                            .store()
+                            .canonical_array_reference_with_targets(targets, result)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(array.element_type, string);
+                        assert!(!array.readonly);
+                        assert!(matches!(
+                            context.store().type_payload(result).unwrap().data(),
+                            TypeData::TypeReference(reference)
+                                if reference.object.target == Some(globals.array_type)
+                                    && reference.object.mapper.is_none()
+                        ));
+                    }
+                    let warm = (
+                        state(&context, &parsed, node),
+                        payload_state(context.store(), &proof),
+                    );
+                    let caller_state = (
+                        caller.query_count(),
+                        caller.total_count(),
+                        caller.limit_event_mark(),
+                    );
+                    let caller_address = std::ptr::from_ref(&caller);
+                    for _ in 0..2 {
+                        assert_eq!(
+                            validate_source_conditional_result(
+                                context.store(),
+                                &proof,
+                                &globals,
+                                &source
+                            ),
+                            Ok(())
+                        );
+                        assert_eq!(
+                            (
+                                state(&context, &parsed, node),
+                                payload_state(context.store(), &proof)
+                            ),
+                            warm
+                        );
+                        assert_eq!(
+                            (
+                                caller.query_count(),
+                                caller.total_count(),
+                                caller.limit_event_mark()
+                            ),
+                            caller_state
+                        );
+                    }
+                    for damage in 0..if object_member.is_some() { 2 } else { 1 } {
+                        let expected =
+                            if let Some((table, property, original, links)) = &object_member {
+                                if damage == 0 {
+                                    assert_eq!(
+                                        context.store_mut_for_test().insert_symbol(
+                                            *table,
+                                            EscapedName::source("value"),
+                                            *original
+                                        ),
+                                        Some(Some(*property))
+                                    );
+                                } else {
+                                    let mut changed = links.clone();
+                                    changed.resolved_type = Some(number);
+                                    assert!(
+                                        context
+                                            .store_mut_for_test()
+                                            .set_value_symbol_links(*property, changed)
+                                    );
+                                }
+                                ConditionalTypeError::Union(
+                                    LiteralTypeCacheError::InvalidCachedUnion(result),
+                                )
+                            } else {
+                                assert!(context.store_mut_for_test().set_object_target_and_mapper(
+                                    result,
+                                    Some(globals.readonly_array_type),
+                                    None
+                                ));
+                                ConditionalTypeError::Union(LiteralTypeCacheError::ArrayType {
+                                    type_: result,
+                                    error: ArrayTypeError::InvalidReference(result),
+                                })
+                            };
+                        let damaged = (
+                            state(&context, &parsed, node),
+                            payload_state(context.store(), &proof),
+                        );
+                        for _ in 0..2 {
+                            assert_eq!(
+                                validate_source_conditional_result(
+                                    context.store(),
+                                    &proof,
+                                    &globals,
+                                    &source
+                                )
+                                .as_ref()
+                                .err(),
+                                Some(&expected)
+                            );
+                            assert_eq!(
+                                (
+                                    state(&context, &parsed, node),
+                                    payload_state(context.store(), &proof)
+                                ),
+                                damaged
+                            );
+                            assert_eq!(
+                                (
+                                    caller.query_count(),
+                                    caller.total_count(),
+                                    caller.limit_event_mark()
+                                ),
+                                caller_state
+                            );
+                            assert_eq!(std::ptr::from_ref(&caller), caller_address);
+                        }
+                        if let Some((table, property, _, links)) = &object_member {
+                            assert!(
+                                context
+                                    .store_mut_for_test()
+                                    .insert_symbol(*table, EscapedName::source("value"), *property)
+                                    .is_some()
+                            );
+                            assert!(
+                                context
+                                    .store_mut_for_test()
+                                    .set_value_symbol_links(*property, links.clone())
+                            );
+                        } else {
+                            assert!(context.store_mut_for_test().set_object_target_and_mapper(
+                                result,
+                                Some(globals.array_type),
+                                None
+                            ));
+                        }
+                        assert_eq!(
+                            validate_source_conditional_result(
+                                context.store(),
+                                &proof,
+                                &globals,
+                                &source
+                            ),
+                            Ok(())
+                        );
+                        assert_eq!(
+                            (
+                                state(&context, &parsed, node),
+                                payload_state(context.store(), &proof)
+                            ),
+                            warm
+                        );
+                    }
+                    let ConditionalSourceResult::Complete(replayed) =
+                        get_conditional_type_instantiation_with_source(
+                            context.store_mut_for_test(),
+                            request,
+                            &globals,
+                            &mut caller,
+                            &mut source,
+                        )
+                        .unwrap()
+                    else {
+                        panic!("restoring the mapped result must keep its complete identity")
+                    };
+                    assert_eq!(replayed.result(), result);
+                    assert_eq!(replayed.production, proof.production);
+                    assert_eq!(
+                        (
+                            state(&context, &parsed, node),
+                            payload_state(context.store(), &proof)
+                        ),
+                        warm
+                    );
+                    assert!(
+                        context
+                            .store()
+                            .type_node_links(excluded)
+                            .is_none_or(|links| links.resolved_type.is_none())
+                    );
+                }
+                assert!(diagnostics.is_empty());
+                assert_eq!(caller.limit_event_count(), 0);
+            }
+        }
+
+        fn literal_members(store: &CanonicalTypeMapperStore, type_: TypeId) -> Vec<String> {
+            let TypeData::Union(union) = store.type_payload(type_).unwrap().data() else {
+                panic!("the written literal alternatives must remain a union")
+            };
+            union
+                .union
+                .types
+                .iter()
+                .map(|member| {
+                    let TypeData::Literal(literal) = store.type_payload(*member).unwrap().data()
+                    else {
+                        panic!("each constraint result must be a real literal")
+                    };
+                    let LiteralValue::String(value) = &literal.value else {
+                        panic!("each mapped bound must be a string literal")
+                    };
+                    value.clone()
+                })
+                .collect()
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Keep each written bound, damaged cache and restored identity together.
+        fn source_conditional_constraints_replay_template_and_mapping_bounds_in_the_same_caller() {
+            let parsed = parse_source_file(concat!(
+                "type Uppercase<S extends string> = intrinsic;\n",
+                "type Template<T extends \"a\" | \"b\"> = `pre-${T}`;\n",
+                "type Mapping<T extends \"a\" | \"b\"> = Uppercase<T>;\n",
+                "type Caller<T> = T;\n",
+            ));
+            let mut context = context(&parsed, true);
+            let template = declared(&mut context, "Template");
+            let mapping = declared(&mut context, "Mapping");
+            let globals = context.global_types().clone();
+            let mut source = HeaderSource {
+                options: source_options(&context),
+                members: None,
+            };
+            let mut caller = InstantiationSession::new(InstantiationLimits {
+                max_count: 1,
+                ..InstantiationLimits::default()
+            });
+            charge_source_parameter(&mut context, &mut caller);
+            let caller_address = std::ptr::from_ref(&caller);
+            let caller_state = (
+                caller.query_count(),
+                caller.total_count(),
+                caller.limit_event_mark(),
+            );
+            for (type_, expected) in [(template, ["pre-a", "pre-b"]), (mapping, ["A", "B"])] {
+                let result = constraints::get_base_constraint_of_type_with_source(
+                    context.store_mut_for_test(),
+                    type_,
+                    &globals,
+                    &mut caller,
+                    &mut source,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(literal_members(context.store(), result), expected);
+                assert_eq!(
+                    context
+                        .store()
+                        .type_payload(type_)
+                        .unwrap()
+                        .data()
+                        .constrained()
+                        .unwrap()
+                        .resolved_base_constraint,
+                    Some(result)
+                );
+                let root = annotation(&context, "Template");
+                let warm = state(&context, &parsed, root);
+                for _ in 0..2 {
+                    assert_eq!(
+                        constraints::get_base_constraint_of_type_with_source(
+                            context.store_mut_for_test(),
+                            type_,
+                            &globals,
+                            &mut caller,
+                            &mut source
+                        ),
+                        Ok(Some(result))
+                    );
+                    assert_eq!(std::ptr::from_ref(&caller), caller_address);
+                    assert_eq!(
+                        (
+                            caller.query_count(),
+                            caller.total_count(),
+                            caller.limit_event_mark()
+                        ),
+                        caller_state
+                    );
+                    assert_eq!(state(&context, &parsed, root), warm);
+                }
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_resolved_base_constraint(type_, Some(number))
+                );
+                for _ in 0..2 {
+                    assert_eq!(
+                        constraints::get_base_constraint_of_type_with_source(
+                            context.store_mut_for_test(),
+                            type_,
+                            &globals,
+                            &mut caller,
+                            &mut source
+                        ),
+                        Err(ConstraintError::InvalidCachedConstraint(type_))
+                    );
+                    assert_eq!(
+                        context
+                            .store()
+                            .type_payload(type_)
+                            .unwrap()
+                            .data()
+                            .constrained()
+                            .unwrap()
+                            .resolved_base_constraint,
+                        Some(number)
+                    );
+                    assert_eq!(state(&context, &parsed, root), warm);
+                    assert_eq!(
+                        (
+                            caller.query_count(),
+                            caller.total_count(),
+                            caller.limit_event_mark()
+                        ),
+                        caller_state
+                    );
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_resolved_base_constraint(type_, Some(result))
+                );
+                assert_eq!(
+                    constraints::get_base_constraint_of_type_with_source(
+                        context.store_mut_for_test(),
+                        type_,
+                        &globals,
+                        &mut caller,
+                        &mut source
+                    ),
+                    Ok(Some(result))
+                );
+                assert_eq!(state(&context, &parsed, root), warm);
+            }
+        }
+    }
 
     fn source_conditional_context(
         parsed: &ParseResult,

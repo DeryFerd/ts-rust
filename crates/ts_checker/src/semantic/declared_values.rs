@@ -264,7 +264,7 @@ pub(super) fn plan_declared_value(
     plan_declared_value_cache(store, symbol, annotation, readonly)
 }
 
-fn plan_declared_value_cache(
+pub(super) fn plan_declared_value_cache(
     store: &CanonicalTypeMapperStore,
     symbol: SemanticSymbolId,
     annotation: NodeRef,
@@ -337,19 +337,33 @@ pub(super) fn plan_global_type_literal_value(
     {
         return Ok(None);
     }
+    // The type-side and value-side readers share this ordered mixed-owner proof.
+    // The variable-only route retains its complete host proof below.
+    let mixed = store.source_global_interface_value_owner(symbol)?;
+    let (table, table_symbol, selected, annotation) = mixed.as_ref().map_or(
+        (globals.table, original.table_symbol, selected, annotation),
+        |owner| {
+            (
+                owner.globals_table(),
+                owner.table_symbol(),
+                owner.value_declaration(),
+                owner.value_annotation(),
+            )
+        },
+    );
     let record = store.symbol(symbol).ok_or_else(invalid)?;
     if store.get_merged_symbol(symbol) != Some(symbol)
-        || store.get_merged_symbol(original.table_symbol) != Some(symbol)
-        || globals.get(record.name()).is_none_or(|entry| {
-            entry.symbol != symbol || entry.table_symbol != original.table_symbol
-        })
+        || store.get_merged_symbol(table_symbol) != Some(symbol)
+        || globals
+            .get(record.name())
+            .is_none_or(|entry| entry.symbol != symbol || entry.table_symbol != table_symbol)
         || store
             .intrinsic_bootstrap()
-            .is_none_or(|bootstrap| bootstrap.globals != globals.table)
+            .is_none_or(|bootstrap| bootstrap.globals != table)
         || store
-            .symbol_table(globals.table)
+            .symbol_table(table)
             .and_then(|table| table.get(record.name()))
-            != Some(original.table_symbol)
+            != Some(table_symbol)
         || record.flags() != original.flags
         || record.declarations() != Some(declarations)
         || !store.source_merged_symbol_declarations_match(symbol)

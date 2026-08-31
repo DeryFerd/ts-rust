@@ -10,18 +10,27 @@
 use std::collections::HashSet;
 
 use super::{
-    RelationUnavailable, SemanticSymbolId, TypeId, TypeResolutionTarget, TypeSystemPropertyName,
+    CanonicalGlobalTypes, RelationUnavailable, SemanticSymbolId, TypeId, TypeResolutionTarget,
+    TypeSystemPropertyName,
+    array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     conditional_types::{
-        ConditionalTypeError, cached_conditional_branches, get_constraint_from_conditional_type,
+        ConditionalBranchSource, ConditionalTypeError, cached_conditional_branches,
+        get_constraint_from_conditional_type, get_constraint_from_conditional_type_with_source,
+        source_query_is_assignable, validate_source_branch_recoveries_since,
     },
-    instantiate::{InstantiationError, canonical_anonymous_union, instantiate_type},
+    global_types::is_global_this_type_candidate,
+    instantiate::{
+        InstantiationError, InstantiationLimitEventMark, InstantiationSession,
+        canonical_anonymous_union, instantiate_type, instantiate_type_with_source,
+    },
     intersection_types::IntersectionTypeError,
     mapper::CanonicalTypeMapperStore,
     object_members::{
         DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
     },
     template_types::TemplateTypeError,
+    type_nodes::CanonicalTypeQueryOptions,
     type_records::{TypeData, TypeRecord},
     types::TypeFlags,
 };
@@ -202,7 +211,14 @@ enum ConstraintKind {
     Unsupported,
 }
 
-struct ConstraintSession<'store> {
+struct ConstraintSource<'query, 'source> {
+    globals: &'query CanonicalGlobalTypes,
+    caller: &'query mut InstantiationSession,
+    source: &'query mut (dyn ConditionalBranchSource + 'source),
+    options: CanonicalTypeQueryOptions,
+}
+
+struct ConstraintSession<'store, 'source> {
     store: &'store mut CanonicalTypeMapperStore,
     limits: ConstraintLimits,
     count: usize,
@@ -210,9 +226,10 @@ struct ConstraintSession<'store> {
     failed_resolutions: HashSet<TypeId>,
     no_constraint: TypeId,
     circular_constraint: TypeId,
+    source: Option<ConstraintSource<'store, 'source>>,
 }
 
-impl<'store> ConstraintSession<'store> {
+impl<'store, 'source> ConstraintSession<'store, 'source> {
     fn new(
         store: &'store mut CanonicalTypeMapperStore,
         limits: ConstraintLimits,
@@ -234,7 +251,122 @@ impl<'store> ConstraintSession<'store> {
             failed_resolutions: HashSet::new(),
             no_constraint,
             circular_constraint,
+            source: None,
         })
+    }
+
+    fn new_with_source(
+        store: &'store mut CanonicalTypeMapperStore,
+        globals: &'store CanonicalGlobalTypes,
+        caller: &'store mut InstantiationSession,
+        source: &'store mut (dyn ConditionalBranchSource + 'source),
+    ) -> Result<Self, ConstraintError> {
+        let options = source.source_query_options().ok_or_else(|| {
+            ConstraintError::from(ConditionalTypeError::Declared(
+                super::TypeNodeUnavailable::InvalidPreparedTypeQuery.into(),
+            ))
+        })?;
+        let mut session = Self::new(store, ConstraintLimits::default())?;
+        session.source = Some(ConstraintSource {
+            globals,
+            caller,
+            source,
+            options,
+        });
+        Ok(session)
+    }
+
+    fn limit_mark(&self) -> Option<InstantiationLimitEventMark> {
+        self.source
+            .as_ref()
+            .map(|source| source.caller.limit_event_mark())
+    }
+
+    fn recovered_since(&self, mark: Option<InstantiationLimitEventMark>) -> bool {
+        self.source
+            .as_ref()
+            .zip(mark)
+            .is_some_and(|(source, mark)| {
+                source.caller.recovery_error_type().is_some()
+                    && source.caller.limit_event_occurred_since(mark)
+            })
+    }
+
+    fn recovered_constraint(&self, type_: TypeId) -> Result<BaseConstraint, ConstraintError> {
+        self.source
+            .as_ref()
+            .and_then(|query| query.caller.recovery_error_type())
+            .map(BaseConstraint::Type)
+            .ok_or(ConstraintError::InvalidConstraintPublication(type_))
+    }
+
+    fn semantic_mark(&self) -> usize {
+        self.source
+            .as_ref()
+            .map_or(0, |query| query.source.source_branch_recoveries().len())
+    }
+
+    fn semantic_recovered_since(&self, mark: usize) -> Result<bool, ConstraintError> {
+        self.source.as_ref().map_or(Ok(false), |query| {
+            validate_source_branch_recoveries_since(self.store, query.source, mark, query.caller)
+                .map_err(Into::into)
+        })
+    }
+
+    fn validate_source_options(&self) -> Result<(), ConstraintError> {
+        if self
+            .source
+            .as_ref()
+            .is_some_and(|query| query.source.source_query_options() != Some(query.options))
+        {
+            return Err(ConditionalTypeError::Declared(
+                super::TypeNodeUnavailable::InvalidPreparedTypeQuery.into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn validate_source_alias_constraint(&self, type_: TypeId) -> Result<(), ConstraintError> {
+        if self.source.is_none() {
+            return Ok(());
+        }
+        let Some(owner) = super::declared::cached_ordinary_type_parameter_owner(self.store, type_)
+        else {
+            return Ok(());
+        };
+        if !self.store.source_symbol_declarations_match(owner) {
+            return Err(ConstraintError::InvalidCachedConstraint(type_));
+        }
+        let Some([declaration]) = self
+            .store
+            .symbol(owner)
+            .and_then(|owner| owner.declarations())
+        else {
+            return Ok(());
+        };
+        let Some(annotations) = self
+            .store
+            .source_alias_type_parameter_annotations(*declaration)
+        else {
+            return Ok(());
+        };
+        let Some(TypeData::TypeParameter(data)) =
+            self.store.type_payload(type_).map(TypeRecord::data)
+        else {
+            return Err(ConstraintError::InvalidCachedConstraint(type_));
+        };
+        if !self
+            .store
+            .source_declaration_belongs_to_symbol(*declaration, owner)
+            || annotations.constraint.is_none()
+                && data
+                    .constraint
+                    .is_some_and(|constraint| constraint != self.no_constraint)
+        {
+            return Err(ConstraintError::InvalidCachedConstraint(type_));
+        }
+        Ok(())
     }
 
     fn enter(&mut self) -> Result<(), ConstraintError> {
@@ -249,6 +381,14 @@ impl<'store> ConstraintSession<'store> {
     }
 
     fn classify_constraint(&self, type_: TypeId) -> Result<BaseConstraint, ConstraintError> {
+        self.validate_source_options()?;
+        if let Some(source) = &self.source {
+            self.store
+                .validate_cached_array_capability_with_array_targets(
+                    CanonicalArrayTargets::from_global_types(source.globals),
+                    type_,
+                )?;
+        }
         let record = self
             .store
             .type_payload(type_)
@@ -257,6 +397,8 @@ impl<'store> ConstraintSession<'store> {
             Ok(BaseConstraint::None)
         } else if type_ == self.circular_constraint {
             Ok(BaseConstraint::Circular)
+        } else if self.source_global_constraint_is_exact(type_)? {
+            Ok(BaseConstraint::Type(type_))
         } else if matches!(record.data(), TypeData::Object(_))
             && !matches!(
                 validate_resolved_declared_property_object(self.store, type_),
@@ -276,6 +418,26 @@ impl<'store> ConstraintSession<'store> {
             }
             Ok(BaseConstraint::Type(type_))
         }
+    }
+
+    fn source_global_constraint_is_exact(&self, type_: TypeId) -> Result<bool, ConstraintError> {
+        let Some(query) = &self.source else {
+            return Ok(false);
+        };
+        if !is_global_this_type_candidate(self.store, Some(query.globals), type_) {
+            return Ok(false);
+        }
+        let members = query
+            .source
+            .global_this_members()
+            .ok_or(RelationUnavailable::GlobalThisMembersDemand { receiver: type_ })?;
+        if type_ != query.globals.global_this_value_type || members.receiver() != type_ {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_).into());
+        }
+        members
+            .validate(self.store)
+            .map_err(ConditionalTypeError::Declared)?;
+        Ok(true)
     }
 
     fn validate_mapped_constraint(&self, type_: TypeId) -> Result<(), ConstraintError> {
@@ -316,6 +478,9 @@ impl<'store> ConstraintSession<'store> {
             if type_ == self.no_constraint || type_ == self.circular_constraint {
                 continue;
             }
+            if self.source_global_constraint_is_exact(type_)? {
+                continue;
+            }
             match record.data() {
                 TypeData::Union(data) => {
                     pending.extend(data.union.types.iter().rev().copied());
@@ -350,6 +515,9 @@ impl<'store> ConstraintSession<'store> {
     }
 
     fn direct_constraint(&mut self, type_: TypeId) -> Result<BaseConstraint, ConstraintError> {
+        let mark = self.limit_mark();
+        let semantic_mark = self.semantic_mark();
+        self.validate_source_alias_constraint(type_)?;
         let (constraint, target, mapper, resolved_default_type) = {
             let record = self
                 .store
@@ -366,15 +534,35 @@ impl<'store> ConstraintSession<'store> {
             )
         };
         if let Some(constraint) = constraint {
-            return self.classify_constraint(constraint);
+            let resolved = self.classify_constraint(constraint)?;
+            if self.source.is_none() || target.is_none() {
+                return Ok(resolved);
+            }
         }
         let Some(target) = target else {
             return Err(ConstraintError::UnresolvedTypeParameter(type_));
         };
         let target_constraint = self.constraint_of_type_parameter(target)?;
+        if self.recovered_since(mark) {
+            return self.recovered_constraint(type_);
+        }
         let result = if let BaseConstraint::Type(target_constraint) = target_constraint {
             if let Some(mapper) = mapper {
-                let instantiated = instantiate_type(self.store, target_constraint, mapper)?;
+                let instantiated = if let Some(query) = &mut self.source {
+                    instantiate_type_with_source(
+                        self.store,
+                        target_constraint,
+                        mapper,
+                        query.globals,
+                        query.caller,
+                        query.source,
+                    )?
+                } else {
+                    instantiate_type(self.store, target_constraint, mapper)?
+                };
+                if self.recovered_since(mark) {
+                    return self.recovered_constraint(type_);
+                }
                 self.classify_constraint(instantiated)?
             } else {
                 BaseConstraint::Type(target_constraint)
@@ -382,11 +570,25 @@ impl<'store> ConstraintSession<'store> {
         } else {
             target_constraint
         };
+        self.validate_source_options()?;
+        if self.recovered_since(mark) {
+            return self.recovered_constraint(type_);
+        }
+        if self.semantic_recovered_since(semantic_mark)? {
+            return Ok(result);
+        }
         let cached = match result {
             BaseConstraint::Type(type_) => type_,
             BaseConstraint::None => self.no_constraint,
             BaseConstraint::Circular => self.circular_constraint,
         };
+        if let Some(previous) = constraint {
+            return if previous == cached {
+                Ok(result)
+            } else {
+                Err(ConstraintError::InvalidCachedConstraint(type_))
+            };
+        }
         if !self.store.set_type_parameter_resolution(
             type_,
             Some(cached),
@@ -404,6 +606,18 @@ impl<'store> ConstraintSession<'store> {
         type_: TypeId,
         stack: &mut Vec<ConstraintRecursionIdentity>,
     ) -> Result<BaseConstraint, ConstraintError> {
+        let mark = self.limit_mark();
+        let semantic_mark = self.semantic_mark();
+        self.validate_source_options()?;
+        self.validate_source_alias_constraint(type_)?;
+        if let Some(source) = &self.source {
+            self.store
+                .validate_cached_array_capability_with_array_targets(
+                    CanonicalArrayTargets::from_global_types(source.globals),
+                    type_,
+                )?;
+        }
+        let source_global = self.source_global_constraint_is_exact(type_)?;
         let (cached, kind, identity, constrained) = {
             let record = self
                 .store
@@ -416,10 +630,11 @@ impl<'store> ConstraintSession<'store> {
                 | TypeData::Interface(_)
                 | TypeData::Tuple(_) => ConstraintKind::Leaf,
                 TypeData::Object(_)
-                    if matches!(
-                        validate_resolved_declared_property_object(self.store, type_),
-                        DeclaredPropertyObjectValidation::Valid(_)
-                    ) =>
+                    if source_global
+                        || matches!(
+                            validate_resolved_declared_property_object(self.store, type_),
+                            DeclaredPropertyObjectValidation::Valid(_)
+                        ) =>
                 {
                     ConstraintKind::Leaf
                 }
@@ -474,9 +689,15 @@ impl<'store> ConstraintSession<'store> {
             )
         };
         if let Some(cached) = cached {
-            return self.classify_constraint(cached);
+            let resolved = self.classify_constraint(cached)?;
+            if self.source.is_none() {
+                return Ok(resolved);
+            }
         }
         if matches!(kind, ConstraintKind::Leaf) {
+            if cached.is_some_and(|cached| cached != type_) {
+                return Err(ConstraintError::InvalidCachedConstraint(type_));
+            }
             return Ok(BaseConstraint::Type(type_));
         }
         self.enter()?;
@@ -521,13 +742,30 @@ impl<'store> ConstraintSession<'store> {
         if !cycle_free || failed {
             result = BaseConstraint::Circular;
         }
+        self.validate_source_options()?;
+        if self.recovered_since(mark) {
+            return self.recovered_constraint(type_);
+        }
+        if self.semantic_recovered_since(semantic_mark)? {
+            return Ok(result);
+        }
         if constrained {
-            let cached = match result {
+            let resolved = match result {
                 BaseConstraint::Type(type_) => type_,
                 BaseConstraint::None => self.no_constraint,
                 BaseConstraint::Circular => self.circular_constraint,
             };
-            if !self.store.set_resolved_base_constraint(type_, Some(cached)) {
+            if let Some(previous) = cached {
+                return if previous == resolved {
+                    Ok(result)
+                } else {
+                    Err(ConstraintError::InvalidCachedConstraint(type_))
+                };
+            }
+            if !self
+                .store
+                .set_resolved_base_constraint(type_, Some(resolved))
+            {
                 return Err(ConstraintError::InvalidConstraintPublication(type_));
             }
         }
@@ -589,6 +827,7 @@ impl<'store> ConstraintSession<'store> {
         types: &[TypeId],
         stack: &mut Vec<ConstraintRecursionIdentity>,
     ) -> Result<BaseConstraint, ConstraintError> {
+        let mark = self.limit_mark();
         let mut constraints = Vec::with_capacity(types.len());
         let mut changed = false;
         let mut missing = false;
@@ -603,6 +842,9 @@ impl<'store> ConstraintSession<'store> {
                     missing = true;
                 }
             }
+            if self.recovered_since(mark) {
+                return self.recovered_constraint(source);
+            }
         }
         if missing {
             return Ok(BaseConstraint::None);
@@ -610,10 +852,18 @@ impl<'store> ConstraintSession<'store> {
         if !changed {
             return Ok(BaseConstraint::Type(source));
         }
-        Ok(BaseConstraint::Type(canonical_anonymous_union(
-            self.store,
-            &constraints,
-        )?))
+        let result = if let Some(query) = &mut self.source {
+            self.store
+                .literal_union_type_with_alias_and_array_targets_and_session(
+                    &constraints,
+                    None,
+                    Some(CanonicalArrayTargets::from_global_types(query.globals)),
+                    query.caller,
+                )?
+        } else {
+            canonical_anonymous_union(self.store, &constraints)?
+        };
+        Ok(BaseConstraint::Type(result))
     }
 
     fn compute_intersection_constraint(
@@ -622,6 +872,7 @@ impl<'store> ConstraintSession<'store> {
         types: &[TypeId],
         stack: &mut Vec<ConstraintRecursionIdentity>,
     ) -> Result<BaseConstraint, ConstraintError> {
+        let mark = self.limit_mark();
         let mut constraints = Vec::with_capacity(types.len());
         let mut changed = false;
         for type_ in types {
@@ -631,6 +882,9 @@ impl<'store> ConstraintSession<'store> {
                     constraints.push(constraint);
                 }
                 BaseConstraint::None | BaseConstraint::Circular => changed = true,
+            }
+            if self.recovered_since(mark) {
+                return self.recovered_constraint(source);
             }
         }
         if !changed {
@@ -649,6 +903,7 @@ impl<'store> ConstraintSession<'store> {
         types: &[TypeId],
         stack: &mut Vec<ConstraintRecursionIdentity>,
     ) -> Result<BaseConstraint, ConstraintError> {
+        let mark = self.limit_mark();
         let mut constraints = Vec::with_capacity(types.len());
         for type_ in types {
             match self.resolve_base_constraint(*type_, stack)? {
@@ -662,10 +917,22 @@ impl<'store> ConstraintSession<'store> {
                     ));
                 }
             }
+            if self.recovered_since(mark) {
+                return self.recovered_constraint(*type_);
+            }
         }
-        Ok(BaseConstraint::Type(
-            self.store.get_template_literal_type(texts, &constraints)?,
-        ))
+        let result = if let Some(query) = &mut self.source {
+            self.store
+                .get_template_literal_type_with_array_targets_and_session(
+                    texts,
+                    &constraints,
+                    Some(CanonicalArrayTargets::from_global_types(query.globals)),
+                    query.caller,
+                )?
+        } else {
+            self.store.get_template_literal_type(texts, &constraints)?
+        };
+        Ok(BaseConstraint::Type(result))
     }
 
     fn compute_string_mapping_constraint(
@@ -674,13 +941,27 @@ impl<'store> ConstraintSession<'store> {
         target: TypeId,
         stack: &mut Vec<ConstraintRecursionIdentity>,
     ) -> Result<BaseConstraint, ConstraintError> {
-        if let BaseConstraint::Type(constraint) = self.resolve_base_constraint(target, stack)?
+        let mark = self.limit_mark();
+        let constraint = self.resolve_base_constraint(target, stack)?;
+        if self.recovered_since(mark) {
+            return self.recovered_constraint(target);
+        }
+        if let BaseConstraint::Type(constraint) = constraint
             && constraint != target
         {
             let symbol = symbol.ok_or(ConstraintError::UnsupportedBaseType(target))?;
-            return Ok(BaseConstraint::Type(
-                self.store.get_string_mapping_type(symbol, constraint)?,
-            ));
+            let result = if let Some(query) = &mut self.source {
+                self.store
+                    .get_string_mapping_type_with_array_targets_and_session(
+                        symbol,
+                        constraint,
+                        Some(CanonicalArrayTargets::from_global_types(query.globals)),
+                        query.caller,
+                    )?
+            } else {
+                self.store.get_string_mapping_type(symbol, constraint)?
+            };
+            return Ok(BaseConstraint::Type(result));
         }
         Ok(BaseConstraint::Type(
             self.store
@@ -695,6 +976,20 @@ impl<'store> ConstraintSession<'store> {
         conditional: TypeId,
         stack: &mut Vec<ConstraintRecursionIdentity>,
     ) -> Result<BaseConstraint, ConstraintError> {
+        let mark = self.limit_mark();
+        if let Some(query) = &mut self.source {
+            let constraint = get_constraint_from_conditional_type_with_source(
+                self.store,
+                conditional,
+                query.globals,
+                query.caller,
+                query.source,
+            )?;
+            if self.recovered_since(mark) {
+                return self.recovered_constraint(conditional);
+            }
+            return self.resolve_base_constraint(constraint, stack);
+        }
         let branches = cached_conditional_branches(self.store, conditional)?
             .ok_or(ConstraintError::UnresolvedConditionalBranches(conditional))?;
         let constraint =
@@ -708,8 +1003,15 @@ impl<'store> ConstraintSession<'store> {
         constraint: TypeId,
         stack: &mut Vec<ConstraintRecursionIdentity>,
     ) -> Result<BaseConstraint, ConstraintError> {
+        let mark = self.limit_mark();
         let base = self.resolve_base_constraint(base_type, stack)?;
+        if self.recovered_since(mark) {
+            return self.recovered_constraint(base_type);
+        }
         let constraint = self.resolve_base_constraint(constraint, stack)?;
+        if self.recovered_since(mark) {
+            return self.recovered_constraint(base_type);
+        }
         match (base, constraint) {
             (BaseConstraint::Type(base), BaseConstraint::Type(constraint)) => self
                 .intersect_constraints(&[base, constraint])
@@ -719,6 +1021,7 @@ impl<'store> ConstraintSession<'store> {
     }
 
     fn intersect_constraints(&mut self, types: &[TypeId]) -> Result<TypeId, ConstraintError> {
+        let mark = self.limit_mark();
         let mut result = types[0];
         let never = self
             .store
@@ -726,10 +1029,27 @@ impl<'store> ConstraintSession<'store> {
             .ok_or(ConstraintError::MissingBootstrap)?
             .never_type;
         for candidate in &types[1..] {
-            if result == *candidate || self.store.is_type_assignable_to(result, *candidate)? {
+            let related =
+                result == *candidate || self.constraint_is_assignable(result, *candidate)?;
+            if self.recovered_since(mark) {
+                return self
+                    .source
+                    .as_ref()
+                    .and_then(|query| query.caller.recovery_error_type())
+                    .ok_or(ConstraintError::InvalidConstraintPublication(result));
+            }
+            if related {
                 continue;
             }
-            if self.store.is_type_assignable_to(*candidate, result)? {
+            let related = self.constraint_is_assignable(*candidate, result)?;
+            if self.recovered_since(mark) {
+                return self
+                    .source
+                    .as_ref()
+                    .and_then(|query| query.caller.recovery_error_type())
+                    .ok_or(ConstraintError::InvalidConstraintPublication(result));
+            }
+            if related {
                 result = *candidate;
                 continue;
             }
@@ -748,11 +1068,40 @@ impl<'store> ConstraintSession<'store> {
             {
                 return Ok(never);
             }
-            result = self
-                .store
-                .canonical_intersection_type(&[result, *candidate], None)?;
+            result = if let Some(query) = &self.source {
+                self.store.canonical_intersection_type_with_array_targets(
+                    &[result, *candidate],
+                    None,
+                    Some(CanonicalArrayTargets::from_global_types(query.globals)),
+                )?
+            } else {
+                self.store
+                    .canonical_intersection_type(&[result, *candidate], None)?
+            };
         }
         Ok(result)
+    }
+
+    fn constraint_is_assignable(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<bool, ConstraintError> {
+        if let Some(query) = &mut self.source {
+            source_query_is_assignable(
+                self.store,
+                source,
+                target,
+                query.globals,
+                query.caller,
+                query.source,
+            )
+            .map_err(Into::into)
+        } else {
+            self.store
+                .is_type_assignable_to(source, target)
+                .map_err(Into::into)
+        }
     }
 }
 
@@ -840,6 +1189,72 @@ pub(super) fn get_base_constraint_of_type_with_limits(
     )
 }
 
+pub(super) fn get_base_constraint_of_type_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    globals: &CanonicalGlobalTypes,
+    caller: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<Option<TypeId>, ConstraintError> {
+    source_constraint(store, type_, globals, caller, source, false)
+}
+
+pub(super) fn get_constraint_of_type_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    globals: &CanonicalGlobalTypes,
+    caller: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<Option<TypeId>, ConstraintError> {
+    source_constraint(store, type_, globals, caller, source, true)
+}
+
+fn source_constraint(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    globals: &CanonicalGlobalTypes,
+    caller: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+    direct: bool,
+) -> Result<Option<TypeId>, ConstraintError> {
+    let mut session = ConstraintSession::new_with_source(store, globals, caller, source)?;
+    let semantic_mark = session.semantic_mark();
+    let record = session
+        .store
+        .type_payload(type_)
+        .ok_or(ConstraintError::InvalidType(type_))?;
+    if !matches!(
+        record.data(),
+        TypeData::TypeParameter(_)
+            | TypeData::Union(_)
+            | TypeData::Intersection(_)
+            | TypeData::Index(_)
+            | TypeData::TemplateLiteral(_)
+            | TypeData::StringMapping(_)
+            | TypeData::Conditional(_)
+            | TypeData::Substitution(_)
+    ) {
+        return Ok(None);
+    }
+    let mark = session.limit_mark();
+    let result = if direct && matches!(record.data(), TypeData::TypeParameter(_)) {
+        session.constraint_of_type_parameter(type_)
+    } else {
+        session.resolve_base_constraint(type_, &mut Vec::new())
+    };
+    let result = if session.recovered_since(mark) {
+        session.recovered_constraint(type_)?
+    } else {
+        let result = result?;
+        session.semantic_recovered_since(semantic_mark)?;
+        result
+    };
+    Ok(match result {
+        BaseConstraint::Type(type_) => Some(type_),
+        BaseConstraint::None | BaseConstraint::Circular => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use ts_ast::{FileId, NodeRef, SyntaxKind};
@@ -862,6 +1277,497 @@ mod tests {
         type_records::{ConstrainedTypeData, StructuredTypeData, TypeData, TypeRecord},
         types::ObjectFlags,
     };
+
+    mod source_query_controls {
+        use super::*;
+        use crate::semantic::{
+            DeclaredTypeError, TypeNodeUnavailable,
+            conditional_types::{
+                ConditionalBranchKind, ConditionalQueryKey, ConditionalSourceRoot,
+                conditional_source_query_request,
+            },
+            global_types::{GlobalThisMembers, prepare_global_this_members},
+            instantiate::instantiate_type_with_vector_and_session,
+        };
+
+        const FILE: FileId = FileId::new(92);
+
+        struct Source<'host, 'arena> {
+            host: &'host DeclaredTypeHost<'arena>,
+            globals: CanonicalGlobalTypes,
+            options: CanonicalTypeQueryOptions,
+            members: GlobalThisMembers<'host, 'arena>,
+            branch_queries: usize,
+        }
+
+        impl Source<'_, '_> {
+            fn branch_node(
+                &self,
+                store: &CanonicalTypeMapperStore,
+                root: ConditionalSourceRoot,
+                branch: ConditionalBranchKind,
+            ) -> Result<NodeRef, DeclaredTypeError> {
+                self.preflight_root(store, root)?;
+                let Some(ts_ast::NodeData::ConditionalTypeNode(syntax)) =
+                    self.host.node(root.node).map(|node| &node.data)
+                else {
+                    return Err(TypeNodeUnavailable::InvalidPreparedTypeQuery.into());
+                };
+                let node = NodeRef::new(
+                    root.node.arena,
+                    root.node.file,
+                    match branch {
+                        ConditionalBranchKind::True => syntax.true_type,
+                        ConditionalBranchKind::False => syntax.false_type,
+                    },
+                );
+                assert_eq!(
+                    store.source_node_kind(node),
+                    Some(SyntaxKind::StringKeyword)
+                );
+                Ok(node)
+            }
+        }
+
+        impl ConditionalBranchSource for Source<'_, '_> {
+            fn preflight(
+                &self,
+                _: &CanonicalTypeMapperStore,
+                _: TypeId,
+            ) -> Result<(), DeclaredTypeError> {
+                Err(TypeNodeUnavailable::InvalidPreparedTypeQuery.into())
+            }
+
+            fn resolve_branch(
+                &mut self,
+                _: &mut CanonicalTypeMapperStore,
+                _: TypeId,
+                _: ConditionalBranchKind,
+                _: &mut InstantiationSession,
+            ) -> Result<TypeId, DeclaredTypeError> {
+                Err(TypeNodeUnavailable::InvalidPreparedTypeQuery.into())
+            }
+
+            fn source_query_options(&self) -> Option<CanonicalTypeQueryOptions> {
+                Some(self.options)
+            }
+
+            fn global_this_members(&self) -> Option<&GlobalThisMembers<'_, '_>> {
+                Some(&self.members)
+            }
+
+            fn preflight_root(
+                &self,
+                store: &CanonicalTypeMapperStore,
+                root: ConditionalSourceRoot,
+            ) -> Result<(), DeclaredTypeError> {
+                let request = conditional_source_query_request(
+                    store,
+                    ConditionalQueryKey::Node(root.node),
+                    Some(CanonicalArrayTargets::from_global_types(&self.globals)),
+                )
+                .map_err(|_| TypeNodeUnavailable::InvalidPreparedTypeQuery)?;
+                if request.is_none_or(|request| request.source_root() != root) {
+                    return Err(TypeNodeUnavailable::InvalidPreparedTypeQuery.into());
+                }
+                Ok(())
+            }
+
+            fn resolve_root_branch(
+                &mut self,
+                store: &mut CanonicalTypeMapperStore,
+                root: ConditionalSourceRoot,
+                branch: ConditionalBranchKind,
+                caller: &mut InstantiationSession,
+            ) -> Result<TypeId, DeclaredTypeError> {
+                let node = self.branch_node(store, root, branch)?;
+                self.branch_queries += 1;
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    self.host,
+                    &self.globals,
+                    self.options,
+                    caller,
+                    &mut diagnostics,
+                )?
+                .get_type_from_type_node(node)
+            }
+
+            fn validate_resolved_root_branch(
+                &self,
+                store: &CanonicalTypeMapperStore,
+                root: ConditionalSourceRoot,
+                branch: ConditionalBranchKind,
+                result: TypeId,
+            ) -> Result<(), DeclaredTypeError> {
+                self.branch_node(store, root, branch)?;
+                if store
+                    .intrinsic_bootstrap()
+                    .is_none_or(|bootstrap| result != bootstrap.string_type)
+                {
+                    return Err(TypeNodeUnavailable::InvalidPreparedTypeQuery.into());
+                }
+                Ok(())
+            }
+        }
+
+        fn symbol(context: &CanonicalCheckerContext<'_>, name: &str) -> SemanticSymbolId {
+            let store = context.store();
+            let raw = store
+                .symbol_table(context.globals())
+                .unwrap()
+                .get_source(name)
+                .unwrap();
+            store.get_merged_symbol(raw).unwrap()
+        }
+
+        fn declared(context: &CanonicalCheckerContext<'_>, name: &str) -> TypeId {
+            context
+                .store()
+                .type_alias_links(symbol(context, name))
+                .unwrap()
+                .declared_type
+                .unwrap()
+        }
+
+        fn state(
+            context: &CanonicalCheckerContext<'_>,
+            parsed: &ParseResult,
+            types: &[TypeId],
+        ) -> impl std::fmt::Debug + PartialEq + use<> {
+            let store = context.store();
+            (
+                mapped_constraint_lengths(store),
+                store.type_resolution_internal_state(),
+                types
+                    .iter()
+                    .map(|type_| {
+                        let record = store.type_payload(*type_).unwrap();
+                        (
+                            record
+                                .data()
+                                .constrained()
+                                .and_then(|data| data.resolved_base_constraint),
+                            match record.data() {
+                                TypeData::TypeParameter(data) => Some(data.clone()),
+                                _ => None,
+                            },
+                            match record.data() {
+                                TypeData::Conditional(data) => Some(data.clone()),
+                                _ => None,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                parsed
+                    .arena
+                    .iter()
+                    .map(|(node, _)| {
+                        let node = NodeRef::new(parsed.arena.id(), FILE, node);
+                        (
+                            store.type_node_links(node).cloned(),
+                            store.symbol_node_links(node).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                store
+                    .symbol_table(context.globals())
+                    .unwrap()
+                    .iter()
+                    .map(|(_, symbol)| {
+                        (
+                            store.value_symbol_links(symbol).cloned(),
+                            store.type_alias_links(symbol).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+
+        fn check_array_constraint(
+            context: &mut CanonicalCheckerContext<'_>,
+            parsed: &ParseResult,
+            caller: &mut InstantiationSession,
+            source: &mut Source<'_, '_>,
+        ) {
+            let parameter = declared(context, "ArrayBound");
+            let TypeData::TypeParameter(data) =
+                context.store().type_payload(parameter).unwrap().data()
+            else {
+                panic!("the actual alias parameter is required")
+            };
+            let array = data.constraint.unwrap();
+            let globals = source.globals.clone();
+            for _ in 0..2 {
+                assert_eq!(
+                    get_constraint_of_type_with_source(
+                        context.store_mut_for_test(),
+                        parameter,
+                        &globals,
+                        caller,
+                        source
+                    ),
+                    Ok(Some(array))
+                );
+                assert_eq!(
+                    get_base_constraint_of_type_with_source(
+                        context.store_mut_for_test(),
+                        parameter,
+                        &globals,
+                        caller,
+                        source
+                    ),
+                    Ok(Some(array))
+                );
+            }
+            let before = state(context, parsed, &[parameter, array]);
+            let mut wrong = globals.clone();
+            wrong.array_type = globals.readonly_array_type;
+            for _ in 0..2 {
+                assert_eq!(
+                    get_base_constraint_of_type_with_source(
+                        context.store_mut_for_test(),
+                        parameter,
+                        &wrong,
+                        caller,
+                        source
+                    ),
+                    Err(ConstraintError::Union(LiteralTypeCacheError::ArrayType {
+                        type_: array,
+                        error: super::super::super::array_types::ArrayTypeError::InvalidReference(
+                            array
+                        ),
+                    }))
+                );
+                assert_eq!(state(context, parsed, &[parameter, array]), before);
+            }
+            assert_eq!(
+                get_base_constraint_of_type_with_source(
+                    context.store_mut_for_test(),
+                    parameter,
+                    &globals,
+                    caller,
+                    source
+                ),
+                Ok(Some(array))
+            );
+            assert_eq!(state(context, parsed, &[parameter, array]), before);
+        }
+
+        #[allow(clippy::too_many_lines)] // Keep the real deferred root and complete poison/restore sequence together.
+        fn check_warm_alias_constraint_cycle(
+            context: &mut CanonicalCheckerContext<'_>,
+            parsed: &ParseResult,
+            caller: &mut InstantiationSession,
+            source: &mut Source<'_, '_>,
+        ) {
+            let conditional = declared(context, "Loop");
+            let TypeData::Conditional(data) =
+                context.store().type_payload(conditional).unwrap().data()
+            else {
+                panic!("the source query must retain its actual deferred root")
+            };
+            let root = context.store().conditional_root(data.root).unwrap();
+            let parameter = root.check_type();
+            assert_eq!(data.check_type, parameter);
+            assert_eq!(root.outer_type_parameters(), Some(&[parameter][..]));
+            let owner = super::super::super::declared::cached_ordinary_type_parameter_owner(
+                context.store(),
+                parameter,
+            )
+            .unwrap();
+            let declaration = context
+                .store()
+                .symbol(owner)
+                .unwrap()
+                .declarations()
+                .unwrap()[0];
+            assert!(
+                context
+                    .store()
+                    .source_declaration_belongs_to_symbol(declaration, owner)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .source_alias_type_parameter_annotations(declaration)
+                    .unwrap()
+                    .constraint,
+                None
+            );
+            let globals = source.globals.clone();
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            for _ in 0..2 {
+                assert_eq!(
+                    get_base_constraint_of_type_with_source(
+                        context.store_mut_for_test(),
+                        conditional,
+                        &globals,
+                        caller,
+                        source
+                    ),
+                    Ok(Some(string))
+                );
+            }
+            let TypeData::TypeParameter(saved) =
+                context.store().type_payload(parameter).unwrap().data()
+            else {
+                unreachable!()
+            };
+            let saved = saved.clone();
+            let warm = state(context, parsed, &[conditional, parameter]);
+            assert!(context.store_mut_for_test().set_type_parameter_resolution(
+                parameter,
+                Some(conditional),
+                saved.target,
+                saved.mapper,
+                saved.resolved_default_type
+            ));
+            let poisoned = state(context, parsed, &[conditional, parameter]);
+            let reads = source.branch_queries;
+            for _ in 0..2 {
+                assert_eq!(
+                    get_base_constraint_of_type_with_source(
+                        context.store_mut_for_test(),
+                        conditional,
+                        &globals,
+                        caller,
+                        source
+                    ),
+                    Err(ConstraintError::Conditional(Box::new(
+                        ConditionalTypeError::Constraint(Box::new(
+                            ConstraintError::InvalidCachedConstraint(parameter)
+                        ))
+                    )))
+                );
+                assert_eq!(
+                    get_constraint_of_type_with_source(
+                        context.store_mut_for_test(),
+                        parameter,
+                        &globals,
+                        caller,
+                        source
+                    ),
+                    Err(ConstraintError::InvalidCachedConstraint(parameter))
+                );
+                assert_eq!(state(context, parsed, &[conditional, parameter]), poisoned);
+                assert_eq!(source.branch_queries, reads);
+            }
+            assert!(context.store_mut_for_test().set_type_parameter_resolution(
+                parameter,
+                saved.constraint,
+                saved.target,
+                saved.mapper,
+                saved.resolved_default_type
+            ));
+            assert_eq!(
+                get_base_constraint_of_type_with_source(
+                    context.store_mut_for_test(),
+                    conditional,
+                    &globals,
+                    caller,
+                    source
+                ),
+                Ok(Some(string))
+            );
+            assert_eq!(state(context, parsed, &[conditional, parameter]), warm);
+        }
+
+        #[test]
+        fn source_conditional_constraints_keep_global_members_cold_and_recheck_array_authority() {
+            let parsed = parse_source_file(concat!(
+                "interface Array<T> {} interface ReadonlyArray<T> {}\n",
+                "declare var untouched: number;\n",
+                "type Global = typeof globalThis;\n",
+                "type ArrayBound<T extends string[]> = T;\n",
+                "type Loop<T> = T extends string ? string : string;\n",
+                "type Caller<T> = T;\n",
+            ));
+            let (mut context, objects) = declared_object_context(&parsed);
+            assert!(objects.is_empty());
+            let globals = context.global_types().clone();
+            let global = declared(&context, "Global");
+            assert_eq!(global, globals.global_this_value_type);
+            let caller_parameter = declared(&context, "Caller");
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let options = context.options();
+            let bound = context.file(FILE).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let members =
+                prepare_global_this_members(context.store_mut_for_test(), &host, &globals, global)
+                    .unwrap()
+                    .unwrap();
+            let mut source = Source {
+                host: &host,
+                globals: globals.clone(),
+                options: CanonicalTypeQueryOptions {
+                    strict_builtin_iterator_return: options.strict_builtin_iterator_return,
+                    strict_function_types: Some(options.strict_function_types),
+                    no_implicit_any: options.no_implicit_any,
+                },
+                members,
+                branch_queries: 0,
+            };
+            let mut caller = InstantiationSession::new(InstantiationLimits {
+                max_count: 1,
+                ..InstantiationLimits::default()
+            });
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    context.store_mut_for_test(),
+                    caller_parameter,
+                    &[caller_parameter],
+                    &[number],
+                    Some(CanonicalArrayTargets::from_global_types(&globals)),
+                    &mut caller
+                ),
+                Ok(number)
+            );
+            assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+            let address = std::ptr::from_ref(&caller);
+            let mark = caller.limit_event_mark();
+            let before = state(&context, &parsed, &[global]);
+            for _ in 0..2 {
+                assert_eq!(
+                    ConstraintSession::new_with_source(
+                        context.store_mut_for_test(),
+                        &globals,
+                        &mut caller,
+                        &mut source
+                    )
+                    .unwrap()
+                    .resolve_base_constraint(global, &mut Vec::new()),
+                    Ok(BaseConstraint::Type(global))
+                );
+                assert_eq!(state(&context, &parsed, &[global]), before);
+            }
+            assert_eq!(
+                ConstraintSession::new(context.store_mut_for_test(), ConstraintLimits::default())
+                    .unwrap()
+                    .resolve_base_constraint(global, &mut Vec::new()),
+                Err(ConstraintError::UnsupportedBaseType(global))
+            );
+            assert_eq!(state(&context, &parsed, &[global]), before);
+            check_array_constraint(&mut context, &parsed, &mut caller, &mut source);
+            check_warm_alias_constraint_cycle(&mut context, &parsed, &mut caller, &mut source);
+            assert_eq!(std::ptr::from_ref(&caller), address);
+            assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+            assert_eq!(caller.limit_event_mark(), mark);
+            let untouched = symbol(&context, "untouched");
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(untouched)
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+            assert!(context.store().type_resolution_is_empty());
+        }
+    }
 
     fn initialized_store() -> CanonicalTypeMapperStore {
         let mut store = SemanticStore::<TypeRecord, TypeMapper>::new();

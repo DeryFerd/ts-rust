@@ -42,6 +42,11 @@ use super::{
         InstantiatedIndexRecovery, InstantiatedPropertyAliasCallable, InstantiatedPropertyRecovery,
         PublishedInterfaceMethodOrigin, PublishedInterfaceMethodRecovery,
     },
+    interface_heritage::{
+        SourceInterfaceHeritageHeader, SourceInterfaceHeritageQueryContext,
+        validate_source_interface_heritage_complete_bases,
+        validate_source_interface_heritage_header,
+    },
     intersection_types::IntersectionTypeCacheKey,
     jsdoc::{SourceJsDocCallbackIdentity, SourceJsDocTypedefIdentity},
     links::{
@@ -206,6 +211,71 @@ pub(super) struct SourceGlobalBinding {
 impl SourceGlobalBinding {
     pub(super) fn declarations(&self) -> Option<&[NodeRef]> {
         self.declarations.as_deref()
+    }
+}
+
+/// Ordered source ownership only. Cached types need their producer's proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceGlobalInterfaceValueOwner {
+    globals_table: SymbolTableId,
+    table_symbol: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    declarations: Box<[NodeRef]>,
+    interfaces: Box<[NodeRef]>,
+    variables: Box<[NodeRef]>,
+    value_declaration: NodeRef,
+    value_annotation: NodeRef,
+}
+
+impl SourceGlobalInterfaceValueOwner {
+    pub(super) fn globals_table(&self) -> SymbolTableId {
+        self.globals_table
+    }
+
+    pub(super) fn table_symbol(&self) -> SemanticSymbolId {
+        self.table_symbol
+    }
+
+    pub(super) fn symbol(&self) -> SemanticSymbolId {
+        self.symbol
+    }
+
+    pub(super) fn declarations(&self) -> &[NodeRef] {
+        &self.declarations
+    }
+
+    pub(super) fn interfaces(&self) -> &[NodeRef] {
+        &self.interfaces
+    }
+
+    pub(super) fn variables(&self) -> &[NodeRef] {
+        &self.variables
+    }
+
+    pub(super) fn value_declaration(&self) -> NodeRef {
+        self.value_declaration
+    }
+
+    pub(super) fn value_annotation(&self) -> NodeRef {
+        self.value_annotation
+    }
+
+    /// Rechecks source metadata without reading any annotation type cache.
+    pub(super) fn validate_current(
+        &self,
+        store: &super::CanonicalTypeMapperStore,
+    ) -> Result<(), super::DeclaredTypeError> {
+        if store
+            .source_global_interface_value_owner(self.symbol)?
+            .as_ref()
+            == Some(self)
+        {
+            Ok(())
+        } else {
+            Err(super::DeclaredTypeError::Unavailable(
+                super::DeclaredTypeUnavailable::SymbolNotOwned(self.symbol),
+            ))
+        }
     }
 }
 
@@ -587,6 +657,13 @@ pub(super) struct PreparedSourceOverloadPublication {
 pub(super) struct DirectInterfaceHeritageProvenance {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) bases: Vec<(SemanticSymbolId, TypeId)>,
+    pub(super) source: Option<SourceInterfaceHeritageHeader>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DirectInterfaceHeritageState {
+    Header(SourceInterfaceHeritageHeader),
+    Complete(DirectInterfaceHeritageProvenance),
 }
 
 /// Immutable source-plan edge for one direct local class base.
@@ -784,7 +861,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     function_type_provenance: HashSet<TypeId>,
     declared_call_set_provenance: HashSet<TypeId>,
     declared_call_set_types_by_signature: HashMap<SignatureId, TypeId>,
-    direct_interface_heritage_provenance: HashMap<TypeId, DirectInterfaceHeritageProvenance>,
+    direct_interface_heritage_provenance: HashMap<TypeId, DirectInterfaceHeritageState>,
     direct_class_heritage_provenance: HashMap<TypeId, DirectClassHeritageProvenance>,
     constructor_annotation_bindings: HashMap<NodeRef, SemanticSymbolId>,
     declared_value_provenance: HashMap<SemanticSymbolId, DeclaredValueProvenance>,
@@ -1301,6 +1378,25 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 && record.value_declaration() == source.value_declaration
                 && source.declarations.iter().all(|declaration| {
                     self.source_declaration_belongs_to_symbol(*declaration, symbol)
+                })
+        })
+    }
+
+    /// Checks the original raw declaration and value list after a canonical merge.
+    #[must_use]
+    pub(super) fn source_raw_symbol_declarations_match(&self, raw: SemanticSymbolId) -> bool {
+        let Some(source) = self.source_symbol_declarations.get(&raw) else {
+            return false;
+        };
+        let Some(owner) = self.get_merged_symbol(raw) else {
+            return false;
+        };
+        self.symbol(raw).is_some_and(|record| {
+            record.flags() == source.flags
+                && record.declarations() == Some(source.declarations.as_ref())
+                && record.value_declaration() == source.value_declaration
+                && source.declarations.iter().all(|declaration| {
+                    self.source_declaration_belongs_to_symbol(*declaration, owner)
                 })
         })
     }
@@ -1910,6 +2006,373 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     pub(super) fn source_global_bindings(&self) -> Option<&SourceGlobalBindings> {
         self.source_global_bindings.as_ref()
+    }
+
+    /// Proves the ordered mixed global owner without querying any annotation.
+    #[allow(clippy::too_many_lines)] // The retained order, selector and source owners form one proof.
+    pub(super) fn source_global_interface_value_owner(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<Option<SourceGlobalInterfaceValueOwner>, super::DeclaredTypeError> {
+        let invalid = || {
+            super::DeclaredTypeError::Unavailable(super::DeclaredTypeUnavailable::SymbolNotOwned(
+                symbol,
+            ))
+        };
+        let Some(globals) = self.source_global_bindings.as_ref() else {
+            return Ok(None);
+        };
+        let Some(original) = globals.iter().find(|entry| entry.symbol == symbol) else {
+            return Ok(None);
+        };
+        let mixed_flags = SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE;
+        if original.flags.without(SymbolFlags::TRANSIENT) != mixed_flags {
+            return Ok(None);
+        }
+        let declarations = original.declarations().ok_or_else(invalid)?;
+        let owner = self.symbol(symbol).ok_or_else(invalid)?;
+        if declarations.is_empty()
+            || self.get_merged_symbol(symbol) != Some(symbol)
+            || self.get_merged_symbol(original.table_symbol) != Some(symbol)
+            || globals.get(owner.name()).is_none_or(|entry| {
+                entry.symbol != symbol || entry.table_symbol != original.table_symbol
+            })
+            || self
+                .intrinsic_bootstrap
+                .as_ref()
+                .is_none_or(|bootstrap| bootstrap.globals != globals.table)
+            || self
+                .symbol_table(globals.table)
+                .and_then(|table| table.get(owner.name()))
+                != Some(original.table_symbol)
+            || owner.flags() != original.flags
+            || owner.declarations() != Some(declarations)
+            || !self.source_merged_symbol_declarations_match(symbol)
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.parent().is_some()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+        {
+            return Err(invalid());
+        }
+
+        let mut interfaces = Vec::new();
+        let mut variables = Vec::new();
+        for &declaration in declarations {
+            let facts = self
+                .source_file_facts
+                .get(&declaration.file)
+                .ok_or_else(invalid)?;
+            let source = self
+                .source_files
+                .get(&declaration.file)
+                .map(|source| source.node_ref())
+                .ok_or_else(invalid)?;
+            let name = self
+                .source_child_with_kind(declaration, SyntaxKind::Identifier)
+                .ok_or_else(invalid)?;
+            if facts.is_javascript_file()
+                || facts.is_common_js_module()
+                || self.source_file_rank(declaration.file).is_none()
+                || self.source_node_parent(source) != Some(SourceNodeParent::Root)
+                || !self.source_declaration_belongs_to_symbol(declaration, symbol)
+                || self.source_identifier_text(name) != owner.name().as_utf8()
+                || self.source_node_parent(name) != Some(SourceNodeParent::Parent(declaration))
+            {
+                return Err(invalid());
+            }
+            match self.source_node_kind(declaration) {
+                Some(SyntaxKind::InterfaceDeclaration) => {
+                    if facts.is_external_module() {
+                        if !self.source_global_interface_augmentation_is_exact(symbol, declaration)
+                            || !self
+                                .source_global_interface_export_edges_are_exact(symbol, declaration)
+                        {
+                            return Err(invalid());
+                        }
+                    } else if self.source_node_parent(declaration)
+                        != Some(SourceNodeParent::Parent(source))
+                        || !self.source_global_script_owner_is_exact(symbol, declaration)
+                    {
+                        return Err(invalid());
+                    }
+                    interfaces.push(declaration);
+                }
+                Some(SyntaxKind::VariableDeclaration) => {
+                    let annotation = self
+                        .source_direct_type_annotation(declaration)
+                        .ok_or_else(invalid)?;
+                    let Some(SourceNodeParent::Parent(list)) = self.source_node_parent(declaration)
+                    else {
+                        return Err(invalid());
+                    };
+                    let Some(SourceNodeParent::Parent(statement)) = self.source_node_parent(list)
+                    else {
+                        return Err(invalid());
+                    };
+                    if !facts.is_declaration_file()
+                        || self.source_direct_children(declaration).as_deref()
+                            != Some(&[name, annotation])
+                        || self.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+                        || self.source_node_kind(statement) != Some(SyntaxKind::VariableStatement)
+                        || if facts.is_external_module() {
+                            !self.source_global_variable_augmentation_is_exact(
+                                symbol,
+                                declaration,
+                                statement,
+                            )
+                        } else {
+                            self.source_node_parent(statement)
+                                != Some(SourceNodeParent::Parent(source))
+                                || !self.source_global_script_owner_is_exact(symbol, declaration)
+                        }
+                    {
+                        return Err(invalid());
+                    }
+                    variables.push(declaration);
+                }
+                _ => return Err(invalid()),
+            }
+        }
+        let selected = variables.first().copied().ok_or_else(invalid)?;
+        if interfaces.is_empty() || owner.value_declaration() != Some(selected) {
+            return Err(invalid());
+        }
+        let annotation = self
+            .source_direct_type_annotation(selected)
+            .ok_or_else(invalid)?;
+        Ok(Some(SourceGlobalInterfaceValueOwner {
+            globals_table: globals.table,
+            table_symbol: original.table_symbol,
+            symbol,
+            declarations: declarations.into(),
+            interfaces: interfaces.into_boxed_slice(),
+            variables: variables.into_boxed_slice(),
+            value_declaration: selected,
+            value_annotation: annotation,
+        }))
+    }
+
+    fn source_global_interface_export_edges_are_exact(
+        &self,
+        owner: SemanticSymbolId,
+        declaration: NodeRef,
+    ) -> bool {
+        let Some(origin) = self
+            .source_global_bindings
+            .as_ref()
+            .and_then(|globals| globals.interface_augmentations.get(&declaration))
+        else {
+            return false;
+        };
+        let (Some(namespace), Some(raw), Some(local)) = (
+            origin
+                .namespace
+                .and_then(|symbol| self.get_merged_symbol(symbol)),
+            origin.raw_symbol,
+            origin.local_symbol,
+        ) else {
+            return false;
+        };
+        let Some(name) = self.symbol(owner).map(Symbol::name) else {
+            return false;
+        };
+        self.source_symbol_export_table_matches(namespace)
+            && self
+                .symbol(namespace)
+                .and_then(Symbol::exports)
+                .and_then(|table| self.symbol_table(table))
+                .and_then(|table| table.get(name))
+                == Some(raw)
+            && self.source_symbol_export_table_matches(raw)
+            && self
+                .symbol(raw)
+                .is_some_and(|record| record.export_symbol().is_none())
+            && self.symbol(local).and_then(Symbol::export_symbol) == Some(raw)
+    }
+
+    fn source_global_script_owner_is_exact(
+        &self,
+        owner: SemanticSymbolId,
+        declaration: NodeRef,
+    ) -> bool {
+        let Some(owners) = self.source_declaration_owners.get(&declaration) else {
+            return false;
+        };
+        let mut sources = owners.iter().copied().filter(|&symbol| {
+            self.get_merged_symbol(symbol) == Some(owner)
+                && self.source_symbol_declarations.contains_key(&symbol)
+        });
+        let Some(raw) = sources.next() else {
+            return false;
+        };
+        if sources.next().is_some() {
+            return false;
+        }
+        let Some(original) = self.source_symbol_declarations.get(&raw) else {
+            return false;
+        };
+        let Some(record) = self.symbol(raw) else {
+            return false;
+        };
+        let Some(owner_record) = self.symbol(owner) else {
+            return false;
+        };
+        let allowed = SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE;
+        original.flags.without(allowed) == SymbolFlags::NONE
+            && original.declarations.contains(&declaration)
+            && record.name() == owner_record.name()
+            && record.parent().is_none()
+            && record.exports().is_none()
+            && record.export_symbol().is_none()
+            && record.check_flags() == CheckFlags::NONE
+            && (raw == owner
+                || record.flags() == original.flags
+                    && record.declarations() == Some(original.declarations.as_ref())
+                    && record.value_declaration() == original.value_declaration)
+    }
+
+    /// Retained global membership and original binder groups prove this augmentation.
+    #[allow(clippy::too_many_lines)] // Raw exports and local placeholders are different owners.
+    fn source_global_variable_augmentation_is_exact(
+        &self,
+        owner: SemanticSymbolId,
+        declaration: NodeRef,
+        statement: NodeRef,
+    ) -> bool {
+        let Some(owner_record) = self.symbol(owner) else {
+            return false;
+        };
+        let Some(declarations) = owner_record.declarations() else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(block)) = self.source_node_parent(statement) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(module)) = self.source_node_parent(block) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(source)) = self.source_node_parent(module) else {
+            return false;
+        };
+        if self.source_node_kind(block) != Some(SyntaxKind::ModuleBlock)
+            || self.source_node_kind(module) != Some(SyntaxKind::ModuleDeclaration)
+            || self
+                .source_node_fact(module)
+                .is_none_or(|facts| !facts.global_augmentation)
+            || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || self.source_node_parent(source) != Some(SourceNodeParent::Root)
+            || self
+                .source_files
+                .get(&declaration.file)
+                .map(|file| file.node_ref())
+                != Some(source)
+        {
+            return false;
+        }
+        let Some(owners) = self.source_declaration_owners.get(&declaration) else {
+            return false;
+        };
+        let source_owner = |flags: SymbolFlags| {
+            let mut matches = owners.iter().copied().filter(|symbol| {
+                self.source_symbol_declarations
+                    .get(symbol)
+                    .is_some_and(|record| record.flags.contains(flags))
+            });
+            let symbol = matches.next()?;
+            matches.next().is_none().then_some(symbol)
+        };
+        let (Some(raw), Some(local)) = (
+            source_owner(SymbolFlags::FUNCTION_SCOPED_VARIABLE),
+            source_owner(SymbolFlags::EXPORT_VALUE),
+        ) else {
+            return false;
+        };
+        let Some(namespace) = self.source_declaration_symbol(module) else {
+            return false;
+        };
+        let (Some(namespace_record), Some(raw_record), Some(local_record)) =
+            (self.symbol(namespace), self.symbol(raw), self.symbol(local))
+        else {
+            return false;
+        };
+        let (Some(raw_source), Some(local_source)) = (
+            self.source_symbol_declarations.get(&raw),
+            self.source_symbol_declarations.get(&local),
+        ) else {
+            return false;
+        };
+        let raw_declarations = declarations
+            .iter()
+            .copied()
+            .filter(|declaration| {
+                self.source_declaration_owners
+                    .get(declaration)
+                    .is_some_and(|owners| owners.contains(&raw))
+            })
+            .collect::<Vec<_>>();
+        let raw_value = raw_declarations
+            .iter()
+            .copied()
+            .find(|&node| self.source_node_kind(node) == Some(SyntaxKind::VariableDeclaration));
+        let raw_flags = SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            | if raw_declarations
+                .iter()
+                .any(|&node| self.source_node_kind(node) == Some(SyntaxKind::InterfaceDeclaration))
+            {
+                SymbolFlags::INTERFACE
+            } else {
+                SymbolFlags::NONE
+            };
+        namespace_record.flags().intersects(SymbolFlags::MODULE)
+            && namespace_record.flags().without(SymbolFlags::TRANSIENT)
+                == self
+                    .source_symbol_flags(namespace)
+                    .unwrap_or(SymbolFlags::NONE)
+            && namespace_record.name() == InternalSymbolName::Global.as_ref()
+            && namespace_record.check_flags() == CheckFlags::NONE
+            && self.source_symbol_declarations_match(namespace)
+            && self.source_symbol_export_table_matches(namespace)
+            && namespace_record
+                .exports()
+                .and_then(|table| self.symbol_table(table))
+                .and_then(|table| table.get(owner_record.name()))
+                == Some(raw)
+            && raw != owner
+            && self.get_merged_symbol(raw) == Some(owner)
+            && raw_record.name() == owner_record.name()
+            && raw_record.flags() == raw_flags
+            && raw_source.flags == raw_flags
+            && raw_source.declarations.as_ref() == raw_declarations.as_slice()
+            && raw_record.declarations() == Some(raw_declarations.as_slice())
+            && raw_record.value_declaration() == raw_value
+            && raw_source.value_declaration == raw_value
+            && raw_record.check_flags() == CheckFlags::NONE
+            && raw_record
+                .parent()
+                .and_then(|parent| self.get_merged_symbol(parent))
+                == Some(namespace)
+            && raw_record.exports().is_none()
+            && raw_record.export_symbol().is_none()
+            && (raw_flags.contains(SymbolFlags::INTERFACE) || raw_record.members().is_none())
+            && raw_declarations
+                .iter()
+                .all(|node| node.is_for(declaration.arena, declaration.file))
+            && local != raw
+            && local != owner
+            && self.get_merged_symbol(local) == Some(local)
+            && local_source.flags == SymbolFlags::EXPORT_VALUE
+            && local_record.flags() == SymbolFlags::EXPORT_VALUE
+            && local_record.check_flags() == CheckFlags::NONE
+            && local_record.name() == owner_record.name()
+            && local_source.declarations.as_ref() == raw_declarations.as_slice()
+            && local_record.declarations() == Some(raw_declarations.as_slice())
+            && self.source_symbol_declarations_match(local)
+            && local_record.value_declaration().is_none()
+            && local_record.parent().is_none()
+            && local_record.members().is_none()
+            && local_record.exports().is_none()
+            && local_record.export_symbol() == Some(raw)
     }
 
     /// Checks complete binder declarations and flags after canonical symbol merges.
@@ -11048,7 +11511,22 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         type_: TypeId,
     ) -> Option<&DirectInterfaceHeritageProvenance> {
         self.observe_relation_type_read(type_);
-        self.direct_interface_heritage_provenance.get(&type_)
+        match self.direct_interface_heritage_provenance.get(&type_)? {
+            DirectInterfaceHeritageState::Header(_) => None,
+            DirectInterfaceHeritageState::Complete(provenance) => Some(provenance),
+        }
+    }
+
+    /// Returns stored source evidence. The caller must validate it before use.
+    pub(super) fn source_interface_heritage_header(
+        &self,
+        type_: TypeId,
+    ) -> Option<&SourceInterfaceHeritageHeader> {
+        self.observe_relation_type_read(type_);
+        match self.direct_interface_heritage_provenance.get(&type_)? {
+            DirectInterfaceHeritageState::Header(header) => Some(header),
+            DirectInterfaceHeritageState::Complete(provenance) => provenance.source.as_ref(),
+        }
     }
 }
 
@@ -11831,7 +12309,51 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         Some(late)
     }
 
+    /// Publishes only a host-proved source header, without member or result flags.
+    pub(super) fn publish_source_interface_heritage_header(
+        &mut self,
+        type_: TypeId,
+        header: SourceInterfaceHeritageHeader,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> bool {
+        if validate_source_interface_heritage_header(self, type_, &header, array_targets).is_err() {
+            return false;
+        }
+        if let Some(state) = self.direct_interface_heritage_provenance.get(&type_) {
+            // Replaying a header grants no authority over a completed result.
+            return match state {
+                DirectInterfaceHeritageState::Header(previous) => previous == &header,
+                DirectInterfaceHeritageState::Complete(provenance) => {
+                    provenance.source.as_ref() == Some(&header)
+                }
+            };
+        }
+        if !self.try_reserve_direct_interface_heritage_provenance(1) {
+            return false;
+        }
+        self.direct_interface_heritage_provenance
+            .insert(type_, DirectInterfaceHeritageState::Header(header));
+        if self.relation_type_is_observable(type_) {
+            self.mark_relation_inputs_dirty();
+        }
+        true
+    }
+
+    /// Keeps the legacy direct-interface publication path unchanged.
+    pub(super) fn publish_direct_interface_heritage_provenance(
+        &mut self,
+        type_: TypeId,
+        provenance: DirectInterfaceHeritageProvenance,
+    ) -> bool {
+        self.publish_direct_interface_heritage_provenance_with_array_targets(
+            type_, provenance, None, None,
+        )
+    }
+
     /// Publishes ordered source-planned direct-base edges exactly once.
+    ///
+    /// An alias record upgrades only its exact header after real base queries.
+    /// The borrowed query proof is checked here and is not stored.
     ///
     /// Callers stage the edge list and reserve the map slot before mutation.
     /// Every declared-type link is authoritative by the time heritage members
@@ -11840,11 +12362,38 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
     /// property-only interface. Repeated bases require the exact nongeneric
     /// source sequence. More than two edges require nongeneric identities.
     #[allow(clippy::too_many_lines)] // Keep every edge proof before the single publication.
-    pub(super) fn publish_direct_interface_heritage_provenance(
+    pub(super) fn publish_direct_interface_heritage_provenance_with_array_targets(
         &mut self,
         type_: TypeId,
         provenance: DirectInterfaceHeritageProvenance,
+        array_targets: Option<CanonicalArrayTargets>,
+        query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
     ) -> bool {
+        if let Some(source) = provenance.source.as_ref() {
+            if !matches!(self.direct_interface_heritage_provenance.get(&type_),
+                Some(DirectInterfaceHeritageState::Header(header)) if header == source)
+                || self
+                    .type_payload(type_)
+                    .is_none_or(|record| record.symbol() != Some(provenance.owner_symbol))
+                || validate_source_interface_heritage_complete_bases(
+                    self,
+                    type_,
+                    source,
+                    &provenance.bases,
+                    array_targets,
+                    query,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            self.direct_interface_heritage_provenance
+                .insert(type_, DirectInterfaceHeritageState::Complete(provenance));
+            if self.relation_type_is_observable(type_) {
+                self.mark_relation_inputs_dirty();
+            }
+            return true;
+        }
         let Some(&(first_symbol, first_type)) = provenance.bases.first() else {
             return false;
         };
@@ -11965,7 +12514,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         else {
             return false;
         };
-        entry.insert(provenance);
+        entry.insert(DirectInterfaceHeritageState::Complete(provenance));
         if self.relation_type_is_observable(type_) {
             self.mark_relation_inputs_dirty();
         }
@@ -14553,6 +15102,751 @@ fn canonical_type_resolution_property(
         | TypeSystemPropertyName::WriteType
         | TypeSystemPropertyName::InitializerIsUndefined
         | TypeSystemPropertyName::AliasTarget => None,
+    }
+}
+
+#[cfg(test)]
+mod source_global_owner_tests {
+    use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
+
+    use super::{DirectInterfaceHeritageProvenance, DirectInterfaceHeritageState};
+    use crate::semantic::{
+        CacheHashKey, CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeMapperStore,
+        DeclaredTypeHost, IntrinsicBootstrapOptions, TypeData,
+        array_types::CanonicalArrayTargets,
+        constructor_values::plan_global_constructor_value,
+        interface_heritage::validate_source_interface_heritage_header,
+        links::TypeNodeLinks,
+        production::GlobalMergeCompletion,
+        relation::{RelationComparisonResult, RelationKind},
+        types::ObjectFlags,
+    };
+
+    #[derive(Clone, Copy)]
+    enum SourceKind {
+        Library,
+        ExternalDeclarations,
+        Script,
+    }
+
+    fn options() -> CanonicalCheckerOptions {
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            strict_function_types: true,
+            no_implicit_any: true,
+            ..CanonicalCheckerOptions::default()
+        }
+    }
+
+    fn context<'a>(
+        sources: &[(&'a ParseResult, FileId, SourceKind)],
+    ) -> CanonicalCheckerContext<'a> {
+        let mut binder = CanonicalBinder::new();
+        for &(parsed, file, kind) in sources {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/owner-proof-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        !matches!(kind, SourceKind::Script),
+                        matches!(kind, SourceKind::Library),
+                        if matches!(kind, SourceKind::ExternalDeclarations) {
+                            CanonicalModuleState::External
+                        } else {
+                            CanonicalModuleState::Script
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+        for &(parsed, file, _) in sources {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            sources
+                .iter()
+                .map(|(parsed, file, _)| (*file, &parsed.arena))
+                .collect(),
+            options(),
+        )
+        .unwrap()
+    }
+
+    fn global(store: &CanonicalTypeMapperStore, name: &str) -> SemanticSymbolId {
+        store
+            .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+            .unwrap()
+            .get_source(name)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .unwrap()
+    }
+
+    fn variable_annotation(parsed: &ParseResult, file: FileId, name: &str) -> NodeRef {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::VariableDeclaration(variable) = &node.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(variable.name)?.data
+                else {
+                    return None;
+                };
+                (identifier.text == name)
+                    .then(|| NodeRef::new(parsed.arena.id(), file, variable.type_.unwrap()))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn mixed_global_owner_metadata_keeps_generic_headers_and_rejects_changed_sources() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Packet<T = string> { item: T; } ",
+            "declare var Packet: { prototype: Packet; new(): Packet; }; ",
+            "interface Plain { item: number; } ",
+            "declare var Plain: { prototype: Plain; values: number[]; new(): Plain; }; ",
+            "interface TypeOnly {} declare var ValueOnly: number;",
+        ));
+        let augmentation = parse_source_file(concat!(
+            "export {}; declare global { ",
+            "interface Packet<T = string> { node: T; } ",
+            "var Packet: typeof globalThis extends { onmessage: any; Packet: infer T } ? T : never; ",
+            "var Plain: typeof globalThis extends { onmessage: any; Plain: infer T } ? T : never; }",
+        ));
+        let script = parse_source_file("interface Packet<T = string> { user: boolean; }");
+        let library_file = FileId::new(285_010);
+        let augmentation_file = FileId::new(285_011);
+        let script_file = FileId::new(285_012);
+        let sources = [
+            (
+                &augmentation,
+                augmentation_file,
+                SourceKind::ExternalDeclarations,
+            ),
+            (&library, library_file, SourceKind::Library),
+            (&script, script_file, SourceKind::Script),
+        ];
+        let mut checker = context(&sources);
+        let bounds = sources
+            .iter()
+            .map(|(_, file, _)| checker.file(*file).unwrap().1.clone())
+            .collect::<Vec<_>>();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources
+                .iter()
+                .zip(&bounds)
+                .map(|((parsed, _, _), bound)| (&parsed.arena, bound)),
+            GlobalMergeCompletion::for_test(options().name_resolution),
+        )
+        .unwrap();
+        let globals = checker.global_types().clone();
+        let [owner, plain, other, value_only] =
+            ["Packet", "Plain", "TypeOnly", "ValueOnly"].map(|name| global(checker.store(), name));
+        let proof = checker
+            .store()
+            .source_global_interface_value_owner(owner)
+            .unwrap()
+            .unwrap();
+        let plain_proof = checker
+            .store()
+            .source_global_interface_value_owner(plain)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.symbol(), owner);
+        assert_eq!(proof.globals_table(), checker.globals());
+        assert_eq!(
+            proof
+                .declarations()
+                .iter()
+                .map(|node| node.file)
+                .collect::<Vec<_>>(),
+            [
+                library_file,
+                library_file,
+                script_file,
+                augmentation_file,
+                augmentation_file
+            ]
+        );
+        assert_eq!(
+            proof.interfaces(),
+            &[
+                proof.declarations()[0],
+                proof.declarations()[2],
+                proof.declarations()[3]
+            ]
+        );
+        assert_eq!(
+            proof.variables(),
+            &[proof.declarations()[1], proof.declarations()[4]]
+        );
+        assert_eq!(proof.value_declaration(), proof.variables()[0]);
+        assert_eq!(plain_proof.variables().len(), 2);
+        assert_eq!(plain_proof.interfaces().len(), 1);
+        assert_eq!(
+            checker
+                .store()
+                .source_global_interface_value_owner(other)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            checker
+                .store()
+                .source_global_interface_value_owner(value_only)
+                .unwrap(),
+            None
+        );
+        let before = format!("{:?}", checker.store());
+        for _ in 0..2 {
+            proof.validate_current(checker.store()).unwrap();
+            plain_proof.validate_current(checker.store()).unwrap();
+            assert!(checker.store().declared_type_links(owner).is_none());
+            assert!(checker.store().declared_type_links(plain).is_none());
+            for declaration in proof
+                .declarations()
+                .iter()
+                .chain(plain_proof.declarations())
+            {
+                if let Some(annotation) =
+                    checker.store().source_direct_type_annotation(*declaration)
+                {
+                    assert!(checker.store().type_node_links(annotation).is_none());
+                }
+            }
+            for &(parsed, file, _) in &sources {
+                for (node, record) in parsed.arena.iter().filter(|(_, record)| {
+                    record.kind == SyntaxKind::TypeParameter
+                        && record.parent.is_some_and(|parent| {
+                            proof.interfaces().iter().any(|declaration| {
+                                declaration.is_for(parsed.arena.id(), file)
+                                    && declaration.node == parent
+                            })
+                        })
+                }) {
+                    let node = NodeRef::new(parsed.arena.id(), file, node);
+                    let parameter = checker.store().source_declaration_symbol(node).unwrap();
+                    assert!(
+                        checker.store().declared_type_links(parameter).is_none(),
+                        "{record:?}"
+                    );
+                    assert!(checker.store().type_node_links(node).is_none());
+                }
+            }
+            assert_eq!(format!("{:?}", checker.store()), before);
+        }
+
+        // This real full query gives the metadata reader a valid warm Array annotation.
+        let value_type = checker
+            .get_type_from_type_node(plain_proof.value_annotation())
+            .unwrap();
+        let store = checker.store_mut_for_test();
+        assert!(
+            store
+                .type_payload(value_type)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        plain_proof.validate_current(store).unwrap();
+        assert!(plan_global_constructor_value(store, &host, &globals, options(), plain).is_ok());
+        let original_links = store
+            .type_node_links(plain_proof.value_annotation())
+            .unwrap()
+            .clone();
+        assert!(store.set_type_node_links(
+            plain_proof.value_annotation(),
+            TypeNodeLinks {
+                resolved_type: Some(store.intrinsic_bootstrap().unwrap().boolean_type),
+                ..original_links.clone()
+            }
+        ));
+        let damaged = format!("{store:?}");
+        plain_proof.validate_current(store).unwrap();
+        assert!(plan_global_constructor_value(store, &host, &globals, options(), plain).is_err());
+        assert_eq!(format!("{store:?}"), damaged);
+        assert!(store.set_type_node_links(plain_proof.value_annotation(), original_links));
+        assert!(plan_global_constructor_value(store, &host, &globals, options(), plain).is_ok());
+        assert!(
+            store
+                .type_node_links(
+                    store
+                        .source_direct_type_annotation(plain_proof.variables()[1])
+                        .unwrap()
+                )
+                .is_none()
+        );
+
+        let declarations = proof.declarations().to_vec();
+        let augmentation_interface = proof.interfaces()[2];
+        let origin = *store
+            .source_global_bindings
+            .as_ref()
+            .unwrap()
+            .interface_augmentations
+            .get(&augmentation_interface)
+            .unwrap();
+        let raw = origin.raw_symbol.unwrap();
+        let local = origin.local_symbol.unwrap();
+        let namespace = store.get_merged_symbol(origin.namespace.unwrap()).unwrap();
+        let raw_record = store.symbol(raw).unwrap().clone();
+        let local_record = store.symbol(local).unwrap().clone();
+        let namespace_record = store.symbol(namespace).unwrap().clone();
+        let exports = namespace_record.exports().unwrap();
+        let other_exports = store.clone_symbol_table(exports).unwrap();
+        assert!(store.source_raw_symbol_declarations_match(raw));
+        assert!(!store.source_symbol_declarations_match(raw));
+
+        #[derive(Clone, Copy, Debug)]
+        enum Damage {
+            Order,
+            MissingVariable,
+            SelectedValue,
+            RawParent,
+            RawValue,
+            RawFlags,
+            RawDeclarations,
+            LocalDeclarations,
+            LocalExport,
+            ExportTable,
+            GlobalEntry,
+            Keyword,
+        }
+        for damage in [
+            Damage::Order,
+            Damage::MissingVariable,
+            Damage::SelectedValue,
+            Damage::RawParent,
+            Damage::RawValue,
+            Damage::RawFlags,
+            Damage::RawDeclarations,
+            Damage::LocalDeclarations,
+            Damage::LocalExport,
+            Damage::ExportTable,
+            Damage::GlobalEntry,
+            Damage::Keyword,
+        ] {
+            match damage {
+                Damage::Order => {
+                    let mut changed = declarations.clone();
+                    changed.swap(3, 4);
+                    assert!(store.set_symbol_declarations(
+                        owner,
+                        Some(changed),
+                        Some(proof.value_declaration())
+                    ));
+                    assert!(store.source_merged_symbol_declarations_match(owner));
+                }
+                Damage::MissingVariable => {
+                    let mut changed = declarations.clone();
+                    changed.pop();
+                    assert!(store.set_symbol_declarations(
+                        owner,
+                        Some(changed),
+                        Some(proof.value_declaration())
+                    ));
+                }
+                Damage::SelectedValue => assert!(store.set_symbol_declarations(
+                    owner,
+                    Some(declarations.clone()),
+                    Some(proof.variables()[1])
+                )),
+                Damage::RawParent => assert!(store.set_symbol_relationships(
+                    raw,
+                    raw_record.members(),
+                    raw_record.exports(),
+                    Some(other),
+                    raw_record.export_symbol()
+                )),
+                Damage::RawValue => assert!(store.set_symbol_declarations(
+                    raw,
+                    raw_record.declarations().map(<[NodeRef]>::to_vec),
+                    None
+                )),
+                Damage::RawFlags => assert!(store.set_symbol_flags(
+                    raw,
+                    SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                    CheckFlags::NONE
+                )),
+                Damage::RawDeclarations => assert!(store.set_symbol_declarations(
+                    raw,
+                    Some(vec![augmentation_interface]),
+                    None
+                )),
+                Damage::LocalDeclarations => assert!(store.set_symbol_declarations(
+                    local,
+                    Some(vec![augmentation_interface]),
+                    None
+                )),
+                Damage::LocalExport => assert!(store.set_symbol_relationships(
+                    local,
+                    local_record.members(),
+                    local_record.exports(),
+                    local_record.parent(),
+                    Some(owner)
+                )),
+                Damage::ExportTable => assert!(store.set_symbol_relationships(
+                    namespace,
+                    namespace_record.members(),
+                    Some(other_exports),
+                    namespace_record.parent(),
+                    namespace_record.export_symbol()
+                )),
+                Damage::GlobalEntry => {
+                    assert_eq!(
+                        store.insert_symbol(
+                            proof.globals_table(),
+                            EscapedName::source("Packet"),
+                            raw
+                        ),
+                        Some(Some(proof.table_symbol()))
+                    );
+                }
+                Damage::Keyword => {
+                    store
+                        .source_node_facts
+                        .get_mut(&origin.module.arena)
+                        .unwrap()[origin.module.node.index()]
+                    .as_mut()
+                    .unwrap()
+                    .global_augmentation = false
+                }
+            }
+            if matches!(
+                damage,
+                Damage::RawValue | Damage::RawFlags | Damage::RawDeclarations
+            ) {
+                assert!(!store.source_raw_symbol_declarations_match(raw));
+            }
+            let damaged = format!("{store:?}");
+            for _ in 0..2 {
+                assert!(
+                    store.source_global_interface_value_owner(owner).is_err(),
+                    "{damage:?}"
+                );
+                assert!(proof.validate_current(store).is_err(), "{damage:?}");
+                if matches!(damage, Damage::Keyword | Damage::ExportTable) {
+                    assert!(plain_proof.validate_current(store).is_err());
+                }
+                assert_eq!(format!("{store:?}"), damaged);
+            }
+            assert!(store.set_symbol_declarations(
+                owner,
+                Some(declarations.clone()),
+                Some(proof.value_declaration())
+            ));
+            assert!(store.set_symbol_declarations(
+                raw,
+                raw_record.declarations().map(<[NodeRef]>::to_vec),
+                raw_record.value_declaration()
+            ));
+            assert!(store.set_symbol_flags(raw, raw_record.flags(), raw_record.check_flags()));
+            assert!(store.set_symbol_relationships(
+                raw,
+                raw_record.members(),
+                raw_record.exports(),
+                raw_record.parent(),
+                raw_record.export_symbol()
+            ));
+            assert!(store.set_symbol_declarations(
+                local,
+                local_record.declarations().map(<[NodeRef]>::to_vec),
+                local_record.value_declaration()
+            ));
+            assert!(store.set_symbol_relationships(
+                local,
+                local_record.members(),
+                local_record.exports(),
+                local_record.parent(),
+                local_record.export_symbol()
+            ));
+            assert!(store.set_symbol_relationships(
+                namespace,
+                namespace_record.members(),
+                namespace_record.exports(),
+                namespace_record.parent(),
+                namespace_record.export_symbol()
+            ));
+            assert!(
+                store
+                    .insert_symbol(
+                        proof.globals_table(),
+                        EscapedName::source("Packet"),
+                        proof.table_symbol()
+                    )
+                    .is_some()
+            );
+            store
+                .source_node_facts
+                .get_mut(&origin.module.arena)
+                .unwrap()[origin.module.node.index()]
+            .as_mut()
+            .unwrap()
+            .global_augmentation = true;
+            assert_eq!(
+                store.source_global_interface_value_owner(owner).unwrap(),
+                Some(proof.clone())
+            );
+            assert!(store.source_raw_symbol_declarations_match(raw));
+        }
+        assert!(store.declared_type_links(owner).is_none());
+        assert!(checker.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn interface_heritage_headers_keep_source_identity_and_complete_only_after_ready_bases() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Left = { values: number[]; }; type Right = { other: string; }; ",
+            "interface First extends Left { own: boolean; } ",
+            "interface Other extends Right { own: number; } ",
+            "declare let first: First; declare let other: Other; declare let left: Left;",
+        ));
+        let file = FileId::new(285_020);
+        let sources = [(&parsed, file, SourceKind::Library)];
+        let mut checker = context(&sources);
+        let first = checker
+            .get_type_from_type_node(variable_annotation(&parsed, file, "first"))
+            .unwrap();
+        let other = checker
+            .get_type_from_type_node(variable_annotation(&parsed, file, "other"))
+            .unwrap();
+        let left_type = checker
+            .get_type_from_type_node(variable_annotation(&parsed, file, "left"))
+            .unwrap();
+        let arrays = CanonicalArrayTargets::from_global_types(checker.global_types());
+        let foreign = context(&sources);
+        let foreign_arrays = CanonicalArrayTargets::from_global_types(foreign.global_types());
+        let store = checker.store_mut_for_test();
+        let [owner, left, right] = ["First", "Left", "Right"].map(|name| global(store, name));
+        let header = store
+            .source_interface_heritage_header(first)
+            .unwrap()
+            .clone();
+        let other_header = store
+            .source_interface_heritage_header(other)
+            .unwrap()
+            .clone();
+        let cold_type = format!("{:?}", store.type_payload(first));
+        let record = store.type_payload(first).unwrap();
+        let TypeData::Interface(interface) = record.data() else {
+            panic!("actual interface")
+        };
+        assert!(interface.this_type.is_some());
+        assert_eq!(interface.reference.object.target, Some(first));
+        assert!(
+            !record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        assert!(!interface.declared_members_resolved);
+        assert!(!interface.base_types_resolved);
+        assert!(store.direct_interface_heritage_provenance(first).is_none());
+        assert_eq!(
+            store.direct_interface_heritage_provenance.remove(&first),
+            Some(DirectInterfaceHeritageState::Header(header.clone()))
+        );
+
+        // An unavailable completed read must still observe its real receiver.
+        let observation = store.begin_relation_read_observation().unwrap();
+        assert!(store.direct_interface_heritage_provenance(first).is_none());
+        let key = CacheHashKey::from_halves(285_020, 1);
+        assert!(store.commit_relation_cache_writes(
+            observation,
+            RelationKind::Assignable,
+            [(key, RelationComparisonResult::SUCCEEDED)]
+        ));
+        assert!(store.publish_source_interface_heritage_header(
+            first,
+            header.clone(),
+            Some(arrays)
+        ));
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE
+        );
+        assert_eq!(format!("{:?}", store.type_payload(first)), cold_type);
+        let before = format!("{store:?}");
+        assert!(store.publish_source_interface_heritage_header(
+            first,
+            header.clone(),
+            Some(arrays)
+        ));
+        assert_eq!(format!("{store:?}"), before);
+        assert!(!store.publish_source_interface_heritage_header(
+            other,
+            header.clone(),
+            Some(arrays)
+        ));
+        assert_eq!(format!("{store:?}"), before);
+        let complete = DirectInterfaceHeritageProvenance {
+            owner_symbol: owner,
+            bases: vec![(left, left_type)],
+            source: Some(header.clone()),
+        };
+        assert!(
+            !store.publish_direct_interface_heritage_provenance_with_array_targets(
+                first,
+                complete.clone(),
+                Some(foreign_arrays),
+                None
+            )
+        );
+        assert_eq!(format!("{store:?}"), before);
+        let mut wrong = complete.clone();
+        wrong.bases[0].0 = right;
+        assert!(
+            !store.publish_direct_interface_heritage_provenance_with_array_targets(
+                first,
+                wrong,
+                Some(arrays),
+                None
+            )
+        );
+        let mut legacy = complete.clone();
+        legacy.source = None;
+        assert!(!store.publish_direct_interface_heritage_provenance(first, legacy));
+        assert_eq!(format!("{store:?}"), before);
+
+        assert_eq!(
+            store
+                .direct_interface_heritage_provenance
+                .insert(first, DirectInterfaceHeritageState::Header(other_header)),
+            Some(DirectInterfaceHeritageState::Header(header.clone()))
+        );
+        let damaged = format!("{store:?}");
+        for _ in 0..2 {
+            assert!(!store.publish_source_interface_heritage_header(
+                first,
+                header.clone(),
+                Some(arrays)
+            ));
+            assert!(
+                !store.publish_direct_interface_heritage_provenance_with_array_targets(
+                    first,
+                    complete.clone(),
+                    Some(arrays),
+                    None
+                )
+            );
+            assert_eq!(format!("{store:?}"), damaged);
+        }
+        store
+            .direct_interface_heritage_provenance
+            .insert(first, DirectInterfaceHeritageState::Header(header.clone()));
+
+        // The source getter observes the same receiver before the exact upgrade.
+        let observation = store.begin_relation_read_observation().unwrap();
+        assert_eq!(store.source_interface_heritage_header(first), Some(&header));
+        let key = CacheHashKey::from_halves(285_020, 2);
+        assert!(store.commit_relation_cache_writes(
+            observation,
+            RelationKind::Assignable,
+            [(key, RelationComparisonResult::SUCCEEDED)]
+        ));
+        assert!(
+            store.publish_direct_interface_heritage_provenance_with_array_targets(
+                first,
+                complete.clone(),
+                Some(arrays),
+                None
+            )
+        );
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE
+        );
+        assert_eq!(
+            store.direct_interface_heritage_provenance(first),
+            Some(&complete)
+        );
+        assert_eq!(store.source_interface_heritage_header(first), Some(&header));
+        assert_eq!(format!("{:?}", store.type_payload(first)), cold_type);
+        assert!(store.set_interface_base_resolution(first, true, None, Some(vec![left_type])));
+        let record = store.type_payload(first).unwrap();
+        let TypeData::Interface(interface) = record.data() else {
+            panic!("actual interface")
+        };
+        assert_eq!(
+            interface.resolved_base_types.as_deref(),
+            Some(&[left_type][..])
+        );
+        assert!(interface.base_types_resolved);
+        assert!(!interface.declared_members_resolved);
+        assert!(
+            !record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        let warm_type = format!("{:?}", store.type_payload(first));
+        let before = format!("{store:?}");
+        assert!(
+            !store.publish_direct_interface_heritage_provenance_with_array_targets(
+                first,
+                complete.clone(),
+                Some(arrays),
+                None
+            )
+        );
+        assert!(store.publish_source_interface_heritage_header(
+            first,
+            header.clone(),
+            Some(arrays)
+        ));
+        assert_eq!(format!("{store:?}"), before);
+
+        let declaration = store.symbol(left).unwrap().declarations().unwrap()[0];
+        let root = store.source_direct_type_annotation(declaration).unwrap();
+        let original = store.type_node_links(root).unwrap().clone();
+        assert!(store.set_type_node_links(
+            root,
+            TypeNodeLinks {
+                resolved_type: Some(store.intrinsic_bootstrap().unwrap().boolean_type),
+                ..original.clone()
+            }
+        ));
+        let damaged = format!("{store:?}");
+        for _ in 0..2 {
+            assert!(
+                validate_source_interface_heritage_header(store, first, &header, Some(arrays))
+                    .is_err()
+            );
+            assert!(!store.publish_source_interface_heritage_header(
+                first,
+                header.clone(),
+                Some(arrays)
+            ));
+            assert_eq!(format!("{store:?}"), damaged);
+        }
+        assert!(store.set_type_node_links(root, original));
+        assert!(
+            validate_source_interface_heritage_header(store, first, &header, Some(arrays)).is_ok()
+        );
+        assert_eq!(
+            store.direct_interface_heritage_provenance(first),
+            Some(&complete)
+        );
+        assert_eq!(format!("{:?}", store.type_payload(first)), warm_type);
+        assert!(checker.diagnostics().is_empty());
     }
 }
 
@@ -21375,6 +22669,7 @@ mod tests {
                 super::DirectInterfaceHeritageProvenance {
                     owner_symbol,
                     bases: vec![(base_symbol, base_type), second_base],
+                    source: None,
                 },
             ));
             assert_eq!(
@@ -21390,6 +22685,7 @@ mod tests {
         let paired = super::DirectInterfaceHeritageProvenance {
             owner_symbol,
             bases: vec![(base_symbol, base_type), (second_symbol, second_type)],
+            source: None,
         };
         assert!(store.try_reserve_direct_interface_heritage_provenance(2));
         assert!(store.publish_direct_interface_heritage_provenance(owner_type, paired.clone()));
@@ -21402,6 +22698,7 @@ mod tests {
         let single = super::DirectInterfaceHeritageProvenance {
             owner_symbol: single_owner,
             bases: vec![(base_symbol, base_type)],
+            source: None,
         };
         assert!(store.publish_direct_interface_heritage_provenance(single_type, single.clone()));
         assert_eq!(
@@ -21471,7 +22768,13 @@ mod tests {
         assert_eq!(original.owner_symbol, owner);
         assert_eq!(original.bases, vec![edge; 4]);
         assert_eq!(
-            store.direct_interface_heritage_provenance.remove(&derived),
+            store
+                .direct_interface_heritage_provenance
+                .remove(&derived)
+                .and_then(|state| match state {
+                    super::DirectInterfaceHeritageState::Complete(provenance) => Some(provenance),
+                    super::DirectInterfaceHeritageState::Header(_) => None,
+                }),
             Some(original.clone()),
         );
         assert!(store.try_reserve_direct_interface_heritage_provenance(1));
@@ -21511,6 +22814,7 @@ mod tests {
                 super::DirectInterfaceHeritageProvenance {
                     owner_symbol: candidate_owner,
                     bases,
+                    source: None,
                 },
             ));
             assert_eq!(snapshot(store), before);
@@ -21597,7 +22901,13 @@ mod tests {
         assert_eq!(original.owner_symbol, owner);
         assert_eq!(original.bases, [(first, first_type), (second, second_type)]);
         assert_eq!(
-            store.direct_interface_heritage_provenance.remove(&derived),
+            store
+                .direct_interface_heritage_provenance
+                .remove(&derived)
+                .and_then(|state| match state {
+                    super::DirectInterfaceHeritageState::Complete(provenance) => Some(provenance),
+                    super::DirectInterfaceHeritageState::Header(_) => None,
+                }),
             Some(original.clone()),
         );
         assert!(store.try_reserve_direct_interface_heritage_provenance(1));

@@ -5114,7 +5114,12 @@ fn instantiate_template_literal(
         return Ok(source);
     }
     store
-        .get_template_literal_type(texts, &placeholders)
+        .get_template_literal_type_with_array_targets_and_session(
+            texts,
+            &placeholders,
+            array_targets,
+            session,
+        )
         .map_err(Into::into)
 }
 
@@ -5136,7 +5141,12 @@ fn instantiate_string_mapping(
         return Ok(source);
     }
     store
-        .get_string_mapping_type(symbol, target)
+        .get_string_mapping_type_with_array_targets_and_session(
+            symbol,
+            target,
+            array_targets,
+            session,
+        )
         .map_err(Into::into)
 }
 

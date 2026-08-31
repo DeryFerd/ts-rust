@@ -297,6 +297,26 @@ impl CanonicalTypeMapperStore {
         texts: &[String],
         types: &[TypeId],
     ) -> Result<TypeId, TemplateTypeError> {
+        self.get_template_literal_type_with_query(texts, types, None, None)
+    }
+
+    pub(super) fn get_template_literal_type_with_array_targets_and_session(
+        &mut self,
+        texts: &[String],
+        types: &[TypeId],
+        array_targets: Option<CanonicalArrayTargets>,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, TemplateTypeError> {
+        self.get_template_literal_type_with_query(texts, types, array_targets, Some(session))
+    }
+
+    fn get_template_literal_type_with_query(
+        &mut self,
+        texts: &[String],
+        types: &[TypeId],
+        array_targets: Option<CanonicalArrayTargets>,
+        session: Option<&mut InstantiationSession>,
+    ) -> Result<TypeId, TemplateTypeError> {
         if texts.len() != types.len().saturating_add(1) {
             return Err(TemplateTypeError::InvalidShape {
                 text_count: texts.len(),
@@ -311,7 +331,7 @@ impl CanonicalTypeMapperStore {
                 return Err(TemplateTypeError::InvalidType(*type_));
             }
         }
-        self.get_template_literal_type_worker(texts, types)
+        self.get_template_literal_type_worker(texts, types, array_targets, session)
     }
 
     /// Applies a standard-library intrinsic while retaining its symbol identity.
@@ -325,6 +345,26 @@ impl CanonicalTypeMapperStore {
         symbol: SemanticSymbolId,
         target: TypeId,
     ) -> Result<TypeId, TemplateTypeError> {
+        self.get_string_mapping_type_with_query(symbol, target, None, None)
+    }
+
+    pub(super) fn get_string_mapping_type_with_array_targets_and_session(
+        &mut self,
+        symbol: SemanticSymbolId,
+        target: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, TemplateTypeError> {
+        self.get_string_mapping_type_with_query(symbol, target, array_targets, Some(session))
+    }
+
+    fn get_string_mapping_type_with_query(
+        &mut self,
+        symbol: SemanticSymbolId,
+        target: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+        session: Option<&mut InstantiationSession>,
+    ) -> Result<TypeId, TemplateTypeError> {
         if self.intrinsic_bootstrap().is_none() {
             return Err(TemplateTypeError::BootstrapUninitialized);
         }
@@ -332,7 +372,7 @@ impl CanonicalTypeMapperStore {
         if self.type_payload(target).is_none() {
             return Err(TemplateTypeError::InvalidType(target));
         }
-        self.get_string_mapping_type_worker(symbol, kind, target)
+        self.get_string_mapping_type_worker(symbol, kind, target, array_targets, session)
     }
 
     /// Tests whether a string-like source satisfies a canonical template pattern.
@@ -997,6 +1037,8 @@ impl CanonicalTypeMapperStore {
         &mut self,
         texts: &[String],
         types: &[TypeId],
+        array_targets: Option<CanonicalArrayTargets>,
+        mut session: Option<&mut InstantiationSession>,
     ) -> Result<TypeId, TemplateTypeError> {
         if let Some(index) = types.iter().position(|type_| {
             self.type_payload(*type_).is_some_and(|record| {
@@ -1030,9 +1072,14 @@ impl CanonicalTypeMapperStore {
                     return Err(TemplateTypeError::InvalidType(constituent));
                 }
                 selected[index] = constituent;
-                mapped.push(self.get_template_literal_type_worker(texts, &selected)?);
+                mapped.push(self.get_template_literal_type_worker(
+                    texts,
+                    &selected,
+                    array_targets,
+                    session.as_deref_mut(),
+                )?);
             }
-            return self.template_result_union(&mapped);
+            return self.template_result_union_worker(&mapped, array_targets, session);
         }
 
         let (wildcard, string) = {
@@ -1454,6 +1501,8 @@ impl CanonicalTypeMapperStore {
         symbol: SemanticSymbolId,
         kind: StringMappingKind,
         target: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+        mut session: Option<&mut InstantiationSession>,
     ) -> Result<TypeId, TemplateTypeError> {
         let record = self
             .type_payload(target)
@@ -1469,12 +1518,18 @@ impl CanonicalTypeMapperStore {
                 }
                 let mut mapped = Vec::with_capacity(constituents.len());
                 for constituent in &constituents {
-                    mapped.push(self.get_string_mapping_type_worker(symbol, kind, *constituent)?);
+                    mapped.push(self.get_string_mapping_type_worker(
+                        symbol,
+                        kind,
+                        *constituent,
+                        array_targets,
+                        session.as_deref_mut(),
+                    )?);
                 }
                 if mapped == constituents {
                     Ok(target)
                 } else {
-                    self.template_result_union(&mapped)
+                    self.template_result_union_worker(&mapped, array_targets, session)
                 }
             }
             TypeData::Literal(literal) if record.flags().intersects(TypeFlags::STRING_LITERAL) => {
@@ -1496,19 +1551,30 @@ impl CanonicalTypeMapperStore {
                             *text = kind.apply(text);
                         }
                         for type_ in &mut types {
-                            *type_ = self.get_string_mapping_type_worker(symbol, kind, *type_)?;
+                            *type_ = self.get_string_mapping_type_worker(
+                                symbol,
+                                kind,
+                                *type_,
+                                array_targets,
+                                session.as_deref_mut(),
+                            )?;
                         }
                     }
                     StringMappingKind::Capitalize | StringMappingKind::Uncapitalize => {
                         if texts[0].is_empty() {
-                            types[0] =
-                                self.get_string_mapping_type_worker(symbol, kind, types[0])?;
+                            types[0] = self.get_string_mapping_type_worker(
+                                symbol,
+                                kind,
+                                types[0],
+                                array_targets,
+                                session.as_deref_mut(),
+                            )?;
                         } else {
                             texts[0] = kind.apply(&texts[0]);
                         }
                     }
                 }
-                self.get_template_literal_type_worker(&texts, &types)
+                self.get_template_literal_type_worker(&texts, &types, array_targets, session)
             }
             TypeData::StringMapping(_) if record.symbol() == Some(symbol) => Ok(target),
             _ if record
@@ -1519,8 +1585,12 @@ impl CanonicalTypeMapperStore {
                 self.get_string_mapping_type_for_generic_type(symbol, target)
             }
             _ if self.is_template_pattern_placeholder(target, &mut HashSet::new())? => {
-                let template = self
-                    .get_template_literal_type_worker(&[String::new(), String::new()], &[target])?;
+                let template = self.get_template_literal_type_worker(
+                    &[String::new(), String::new()],
+                    &[target],
+                    array_targets,
+                    session,
+                )?;
                 self.get_string_mapping_type_for_generic_type(symbol, template)
             }
             _ => Ok(target),

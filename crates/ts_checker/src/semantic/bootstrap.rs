@@ -2786,6 +2786,22 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Ok(())
             }
             TypeData::Object(_) | TypeData::Interface(_) => {
+                if let Some(edges) = self.source_interface_condition_identity_edges(
+                    type_,
+                    array_validation,
+                    visited,
+                    allowed_pending,
+                )? {
+                    for edge in edges {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            visited,
+                            allowed_pending,
+                        )?;
+                    }
+                    return Ok(());
+                }
                 if let TypeData::Interface(interface) = record.data()
                     && let Some(edges) = self.native_global_heritage_interface_edges(
                         type_,
@@ -3603,50 +3619,63 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             if !self.native_global_interface_member_metadata_is_exact(owner) {
                 return None;
             }
-            let mut pending = Vec::new();
-            for &declaration in self.native_global_source_declarations(owner)? {
-                if self.source_node_kind(declaration)? != SyntaxKind::InterfaceDeclaration {
-                    continue;
-                }
-                for node in self.source_direct_children(declaration)? {
-                    match self.source_node_kind(node)? {
-                        SyntaxKind::Identifier | SyntaxKind::DeclareKeyword => {}
-                        SyntaxKind::HeritageClause if source.clauses.contains(&node) => {}
-                        SyntaxKind::MethodSignature
-                        | SyntaxKind::PropertyDeclaration
-                        | SyntaxKind::PropertySignature
-                        | SyntaxKind::GetAccessor
-                        | SyntaxKind::SetAccessor
-                        | SyntaxKind::IndexSignature
-                        | SyntaxKind::CallSignature
-                        | SyntaxKind::ConstructSignature => pending.push(node),
-                        _ => return None,
-                    }
+            edges.extend(self.source_interface_cached_member_edges(
+                self.native_global_source_declarations(owner)?,
+                &source.clauses,
+            )?);
+        }
+        Some(edges)
+    }
+
+    fn source_interface_cached_member_edges(
+        &self,
+        declarations: &[NodeRef],
+        heritage: &[NodeRef],
+    ) -> Option<Vec<TypeId>> {
+        let mut pending = Vec::new();
+        for &declaration in declarations {
+            if self.source_node_kind(declaration)? != SyntaxKind::InterfaceDeclaration {
+                continue;
+            }
+            for node in self.source_direct_children(declaration)? {
+                match self.source_node_kind(node)? {
+                    SyntaxKind::Identifier | SyntaxKind::DeclareKeyword => {}
+                    SyntaxKind::HeritageClause if heritage.contains(&node) => {}
+                    SyntaxKind::MethodSignature
+                    | SyntaxKind::PropertyDeclaration
+                    | SyntaxKind::PropertySignature
+                    | SyntaxKind::GetAccessor
+                    | SyntaxKind::SetAccessor
+                    | SyntaxKind::IndexSignature
+                    | SyntaxKind::CallSignature
+                    | SyntaxKind::ConstructSignature => pending.push(node),
+                    _ => return None,
                 }
             }
-            while let Some(node) = pending.pop() {
-                if let Some(type_) = self
-                    .type_node_links(node)
-                    .and_then(|links| links.resolved_type)
+        }
+        let mut edges = Vec::new();
+        while let Some(node) = pending.pop() {
+            if let Some(type_) = self
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type)
+            {
+                let kind = self.source_node_kind(node)?;
+                if !kind.is_keyword_type()
+                    && !(SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
+                        .contains(&(kind as u16))
                 {
-                    let kind = self.source_node_kind(node)?;
-                    if !kind.is_keyword_type()
-                        && !(SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
-                            .contains(&(kind as u16))
-                    {
-                        return None;
-                    }
-                    edges.push(type_);
+                    return None;
                 }
-                if let Some(type_) = self
-                    .source_declaration_symbol(node)
-                    .and_then(|symbol| self.value_symbol_links(symbol))
-                    .and_then(|links| links.resolved_type)
-                {
-                    edges.push(type_);
-                }
-                pending.extend(self.source_direct_children(node)?);
+                edges.push(type_);
             }
+            if let Some(type_) = self
+                .source_declaration_symbol(node)
+                .and_then(|symbol| self.value_symbol_links(symbol))
+                .and_then(|links| links.resolved_type)
+            {
+                edges.push(type_);
+            }
+            pending.extend(self.source_direct_children(node)?);
         }
         Some(edges)
     }
@@ -3759,6 +3788,123 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.native_global_heritage_source_edges(&source, true, array_validation.targets())
             .map(Some)
             .ok_or_else(invalid)
+    }
+
+    /// A source heritage header proves identity, not a selected alias base or member absence.
+    fn source_interface_condition_identity_edges(
+        &self,
+        type_: TypeId,
+        array_validation: UnionArrayValidation<'_>,
+        array_visited: &mut CachedArrayWalk<'_>,
+        allowed_pending: &HashSet<TypeId>,
+    ) -> Result<Option<Vec<TypeId>>, LiteralTypeCacheError> {
+        let Some(header) = self.source_interface_heritage_header(type_) else {
+            return Ok(None);
+        };
+        let invalid = || LiteralTypeCacheError::InvalidCachedUnion(type_);
+        let mut edges = super::interface_heritage::validate_source_interface_heritage_header(
+            self,
+            type_,
+            header,
+            array_validation.targets(),
+        )
+        .map_err(|_| invalid())?;
+
+        // Complete members retain their existing structured validator. A changed
+        // complete receipt must fail the header check before reaching that path.
+        if self.direct_interface_heritage_provenance(type_).is_some() {
+            return Ok(None);
+        }
+        let record = self.type_payload(type_).ok_or_else(invalid)?;
+        let TypeData::Interface(interface) = record.data() else {
+            return Err(invalid());
+        };
+        let flags = record.object_flags()
+            & !(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES);
+        if flags != ObjectFlags::INTERFACE
+            && flags != ObjectFlags::INTERFACE | ObjectFlags::REFERENCE
+            || interface.base_types_resolved
+            || interface.resolved_base_types.is_some()
+            || interface.resolved_base_constructor_type.is_some()
+            || interface.reference.object.structured != StructuredTypeData::default()
+            || interface.declared_members_resolved
+            || interface.declared_members.is_some()
+            || interface.declared_call_signatures.is_some()
+            || interface.declared_construct_signatures.is_some()
+            || interface.declared_index_infos.is_some()
+        {
+            return Err(invalid());
+        }
+        if self
+            .members_and_exports_links(header.owner_symbol())
+            .is_some_and(|links| links != &MembersAndExportsLinks::default())
+        {
+            return Err(invalid());
+        }
+        for &declaration in header.owner_declarations() {
+            if self.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration) {
+                continue;
+            }
+            for node in self
+                .source_direct_children(declaration)
+                .ok_or_else(invalid)?
+            {
+                if matches!(
+                    self.source_node_kind(node),
+                    Some(
+                        SyntaxKind::Identifier
+                            | SyntaxKind::DeclareKeyword
+                            | SyntaxKind::HeritageClause
+                    )
+                ) {
+                    continue;
+                }
+                let member = self.source_declaration_symbol(node).ok_or_else(invalid)?;
+                object_members::validate_cold_source_member_symbol(
+                    self,
+                    header.owner_symbol(),
+                    member,
+                )
+                .map_err(|_| invalid())?;
+                let record = self.symbol(member).ok_or_else(invalid)?;
+                if !record.flags().contains(SymbolFlags::SIGNATURE) {
+                    let name = self
+                        .source_child_with_kind(node, SyntaxKind::Identifier)
+                        .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+                    if record.name().as_utf8() != self.source_identifier_text(name) {
+                        return Err(invalid());
+                    }
+                }
+            }
+        }
+        let mut clauses = Vec::new();
+        for base in header.bases() {
+            if !clauses.contains(&base.clause()) {
+                clauses.push(base.clause());
+            }
+        }
+        let cached_edges = self
+            .source_interface_cached_member_edges(header.owner_declarations(), &clauses)
+            .ok_or_else(invalid)?;
+        for edge in cached_edges {
+            self.validate_cached_array_capability_worker(
+                edge,
+                array_validation,
+                array_visited,
+                allowed_pending,
+            )?;
+        }
+        edges.extend(
+            self.lazy_default_library_interface_member_edges_worker(
+                header.owner_symbol(),
+                array_validation.targets(),
+                None,
+                &clauses,
+            )
+            .ok_or_else(invalid)?,
+        );
+        Ok(Some(edges))
     }
 
     /// Global interface annotations keep their identity as member queries populate caches.
@@ -5280,6 +5426,25 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
             }
             TypeData::Interface(interface) => {
+                if let Some(edges) = self.source_interface_condition_identity_edges(
+                    type_,
+                    array_validation,
+                    array_visited,
+                    allowed_pending,
+                )? {
+                    if !visiting.insert(type_) {
+                        return Ok(());
+                    }
+                    for edge in edges {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            array_visited,
+                            allowed_pending,
+                        )?;
+                    }
+                    return Ok(());
+                }
                 if let Some(edges) = self.native_global_heritage_interface_edges(
                     type_,
                     record,
@@ -8222,6 +8387,324 @@ mod tests {
             );
             assert_eq!(native_heritage_snapshot(store), before);
         }
+    }
+
+    const SOURCE_HEADER_IDENTITY_SOURCE: &str = concat!(
+        "interface Array<T> {} interface ReadonlyArray<T> {} ",
+        "type HeaderFields = {}; ",
+        "interface HeaderValue extends HeaderFields { ",
+        "readonly label: string; read(): string; items: string[]; } ",
+        "declare var HeaderValue: unknown;",
+    );
+
+    fn assert_source_header_identity_result(
+        store: &TestStore,
+        receiver: TypeId,
+        targets: Option<CanonicalArrayTargets>,
+        expected: Result<(), LiteralTypeCacheError>,
+    ) {
+        let before = native_heritage_snapshot(store);
+        for _ in 0..2 {
+            assert_eq!(
+                targets.map_or_else(
+                    || store.validate_union_constituent(receiver),
+                    |targets| store
+                        .validate_union_constituent_with_array_targets(targets, receiver),
+                ),
+                expected,
+            );
+            assert_eq!(
+                targets.map_or_else(
+                    || store.validate_cached_array_capability(receiver),
+                    |targets| store
+                        .validate_cached_array_capability_with_array_targets(targets, receiver),
+                ),
+                expected,
+            );
+            assert_eq!(native_heritage_snapshot(store), before);
+        }
+    }
+
+    #[test]
+    fn source_alias_heritage_union_keeps_cold_header_and_warm_member_edges() {
+        let parsed = parse_source_file(SOURCE_HEADER_IDENTITY_SOURCE);
+        let file = FileId::new(39_831);
+        let mut context = native_heritage_context(&parsed, file, true);
+        let owner = native_heritage_owner(&context, "HeaderValue");
+        let alias = native_heritage_owner(&context, "HeaderFields");
+        let receiver = context.get_declared_type_of_symbol(owner).unwrap();
+        let globals = context.global_types().clone();
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let header = context
+            .store()
+            .source_interface_heritage_header(receiver)
+            .unwrap()
+            .clone();
+        assert_eq!(header.owner_symbol(), owner);
+        let [base] = header.bases() else {
+            panic!("the real interface has one alias base");
+        };
+        assert_eq!(base.symbol(), alias);
+        let request = base.alias().unwrap();
+        assert_eq!(request.symbol(), alias);
+        assert!(
+            context
+                .store()
+                .declared_type_links(alias)
+                .is_none_or(|links| links.declared_type.is_none())
+        );
+        assert!(
+            context
+                .store()
+                .type_node_links(request.root())
+                .is_none_or(|links| links.resolved_type.is_none())
+        );
+        let TypeData::Interface(interface) = context.store().type_payload(receiver).unwrap().data()
+        else {
+            panic!("the source query must retain the interface identity");
+        };
+        assert_eq!(interface.reference.object.target, Some(receiver));
+        let this = interface.this_type.unwrap();
+        let TypeData::TypeParameter(this_parameter) =
+            context.store().type_payload(this).unwrap().data()
+        else {
+            panic!("alias heritage retains the actual this parameter");
+        };
+        assert!(this_parameter.is_this_type);
+        assert_eq!(this_parameter.constraint, Some(receiver));
+        assert!(!interface.base_types_resolved);
+        assert!(!interface.declared_members_resolved);
+        assert!(
+            context
+                .store()
+                .direct_interface_heritage_provenance(receiver)
+                .is_none()
+        );
+        assert_source_header_identity_result(context.store(), receiver, targets, Ok(()));
+
+        let undefined = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .undefined_type;
+        let union = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[receiver, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let (method, method_name) = native_heritage_member(context.store(), owner, "read");
+        assert!(context.store().value_symbol_links(method).is_none());
+        let callable = context.get_type_at_location(method_name).unwrap();
+        let alias_type = context.get_declared_type_of_symbol(alias).unwrap();
+        assert_eq!(
+            alias_type,
+            context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .empty_type_literal_type,
+        );
+        assert_source_header_identity_result(context.store(), receiver, targets, Ok(()));
+        let warm = native_heritage_snapshot(context.store());
+        for _ in 0..2 {
+            assert_eq!(context.get_declared_type_of_symbol(owner), Ok(receiver));
+            assert_eq!(context.get_declared_type_of_symbol(alias), Ok(alias_type));
+            assert_eq!(context.get_type_at_location(method_name), Ok(callable));
+            let store = context.store_mut_for_test();
+            assert_eq!(
+                store.source_interface_heritage_header(receiver),
+                Some(&header)
+            );
+            assert!(
+                store
+                    .direct_interface_heritage_provenance(receiver)
+                    .is_none()
+            );
+            assert_eq!(
+                store.expression_union_type_with_global_types(
+                    &globals,
+                    &[receiver, undefined],
+                    UnionReduction::Literal,
+                ),
+                Ok(union),
+            );
+            assert_source_header_identity_result(store, receiver, targets, Ok(()));
+            assert_eq!(native_heritage_snapshot(store), warm);
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn source_alias_heritage_union_rejects_changed_header_and_method_caches() {
+        let parsed = parse_source_file(SOURCE_HEADER_IDENTITY_SOURCE);
+        let file = FileId::new(39_832);
+        let mut context = native_heritage_context(&parsed, file, true);
+        let owner = native_heritage_owner(&context, "HeaderValue");
+        let receiver = context.get_declared_type_of_symbol(owner).unwrap();
+        let header = context
+            .store()
+            .source_interface_heritage_header(receiver)
+            .unwrap()
+            .clone();
+        let base = header.bases()[0].clone();
+        let (_, method_name) = native_heritage_member(context.store(), owner, "read");
+        let callable = context.get_type_at_location(method_name).unwrap();
+        let (label, _) = native_heritage_member(context.store(), owner, "label");
+        let label_type = native_heritage_publish_property(&mut context, &parsed, file, label);
+        let targets = Some(CanonicalArrayTargets::from_global_types(
+            context.global_types(),
+        ));
+        let store = context.store_mut_for_test();
+        let invalid = Err(LiteralTypeCacheError::InvalidCachedUnion(receiver));
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(label_type, store.intrinsic_bootstrap().unwrap().string_type);
+        assert!(store.set_source_property_readonly(label, false));
+        assert_source_header_identity_result(store, receiver, targets, invalid);
+        assert!(store.set_source_property_readonly(label, true));
+        assert_source_header_identity_result(store, receiver, targets, Ok(()));
+        let flags = store.symbol(label).unwrap().flags();
+        assert!(store.set_symbol_flags(label, flags | SymbolFlags::OPTIONAL, CheckFlags::READONLY));
+        assert_source_header_identity_result(store, receiver, targets, invalid);
+        assert!(store.set_symbol_flags(label, flags, CheckFlags::READONLY));
+        assert_source_header_identity_result(store, receiver, targets, Ok(()));
+        let array_owner = store
+            .type_payload(targets.unwrap().array_type())
+            .unwrap()
+            .symbol()
+            .unwrap();
+        for claimed in [None, Some(array_owner)] {
+            assert!(store.set_type_symbol(receiver, claimed));
+            assert_source_header_identity_result(store, receiver, targets, invalid);
+            assert!(store.set_type_symbol(receiver, Some(owner)));
+            assert_source_header_identity_result(store, receiver, targets, Ok(()));
+        }
+        let original = store
+            .symbol_node_links(base.expression())
+            .cloned()
+            .unwrap_or_default();
+        assert!(store.set_symbol_node_links(
+            base.expression(),
+            SymbolNodeLinks {
+                resolved_symbol: Some(array_owner)
+            },
+        ));
+        assert_source_header_identity_result(store, receiver, targets, invalid);
+        assert!(store.set_symbol_node_links(base.expression(), original));
+        assert_source_header_identity_result(store, receiver, targets, Ok(()));
+        for bases in [None, Some(vec![number])] {
+            assert!(store.set_interface_base_resolution(receiver, true, None, bases));
+            assert_source_header_identity_result(store, receiver, targets, invalid);
+            assert!(store.set_interface_base_resolution(receiver, false, None, None));
+            assert_source_header_identity_result(store, receiver, targets, Ok(()));
+        }
+        let root = base.alias().unwrap().root();
+        let root_links = store.type_node_links(root).cloned().unwrap_or_default();
+        assert!(store.set_type_node_links(
+            root,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                outer_type_parameters: None
+            },
+        ));
+        assert_source_header_identity_result(store, receiver, targets, invalid);
+        assert!(store.set_type_node_links(root, root_links));
+        assert_source_header_identity_result(store, receiver, targets, Ok(()));
+
+        let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+            validate_stored_declared_method_callable_set(store, callable)
+        else {
+            panic!("the real selected method must keep its callable proof");
+        };
+        let signature = projection.call_signatures[0].signature;
+        let returned = store.signature(signature).unwrap().resolved_return_type();
+        assert_eq!(
+            returned,
+            Some(store.intrinsic_bootstrap().unwrap().string_type)
+        );
+        assert!(store.set_signature_resolved_return_type(signature, Some(number)));
+        assert_source_header_identity_result(
+            store,
+            receiver,
+            targets,
+            Err(LiteralTypeCacheError::InvalidCachedUnion(callable)),
+        );
+        assert!(store.set_signature_resolved_return_type(signature, returned));
+        assert_source_header_identity_result(store, receiver, targets, Ok(()));
+    }
+
+    #[test]
+    fn source_alias_heritage_union_keeps_unread_and_published_array_authority() {
+        let parsed = parse_source_file(SOURCE_HEADER_IDENTITY_SOURCE);
+        let file = FileId::new(39_833);
+        let mut context = native_heritage_context(&parsed, file, true);
+        let foreign = native_heritage_context(&parsed, file, true);
+        let globals = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        let foreign_targets = CanonicalArrayTargets::from_global_types(foreign.global_types());
+        let owner = native_heritage_owner(&context, "HeaderValue");
+        let receiver = context.get_declared_type_of_symbol(owner).unwrap();
+        let (items, name) = native_heritage_member(context.store(), owner, "items");
+        let annotation = context
+            .store()
+            .symbol(items)
+            .unwrap()
+            .value_declaration()
+            .and_then(|node| context.store().source_direct_type_annotation(node))
+            .unwrap();
+        assert_source_header_identity_result(context.store(), receiver, None, Ok(()));
+        let array = context.get_type_from_type_node(annotation).unwrap();
+        let mismatch = CanonicalArrayTargets::for_test(
+            targets.readonly_array_type(),
+            targets.readonly_array_type(),
+        );
+        for publish in [false, true] {
+            if publish {
+                assert_eq!(
+                    native_heritage_publish_property(&mut context, &parsed, file, items),
+                    array
+                );
+                assert_eq!(context.get_type_at_location(name), Ok(array));
+            } else {
+                assert!(
+                    context
+                        .store()
+                        .value_symbol_links(items)
+                        .is_none_or(|links| links == &ValueSymbolLinks::default())
+                );
+            }
+            let store = context.store_mut_for_test();
+            assert_source_header_identity_result(store, receiver, Some(targets), Ok(()));
+            let missing = Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array));
+            assert_source_header_identity_result(store, receiver, None, missing);
+            for wrong in [foreign_targets, mismatch] {
+                let expected =
+                    store.validate_cached_array_capability_with_array_targets(wrong, array);
+                assert!(
+                    matches!(expected, Err(LiteralTypeCacheError::ArrayType { type_, .. }) if type_ == array)
+                );
+                assert_source_header_identity_result(store, receiver, Some(wrong), expected);
+                assert_source_header_identity_result(store, receiver, Some(targets), Ok(()));
+            }
+            let any = store.intrinsic_bootstrap().unwrap().any_type;
+            let before = native_heritage_snapshot(store);
+            assert_eq!(
+                store.expression_union_type(&[receiver, any], UnionReduction::Literal),
+                missing.map(|()| any)
+            );
+            assert_eq!(native_heritage_snapshot(store), before);
+            assert_eq!(
+                store.expression_union_type_with_global_types(
+                    &globals,
+                    &[receiver, any],
+                    UnionReduction::Literal
+                ),
+                Ok(any)
+            );
+        }
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

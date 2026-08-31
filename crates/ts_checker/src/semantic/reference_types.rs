@@ -482,6 +482,22 @@ pub(super) fn validate_nongeneric_interface_argument_origin(
         return Err(invalid());
     }
 
+    let mixed_owner =
+        if super::object_members::source_interface_uses_legacy_single_script_value_owner(
+            store, owner,
+        ) {
+            None
+        } else {
+            store
+                .source_global_interface_value_owner(owner)
+                .map_err(|_| invalid())?
+        };
+    if mixed_owner
+        .as_ref()
+        .is_some_and(|proof| proof.declarations() != declarations)
+    {
+        return Err(invalid());
+    }
     let mut seen = HashSet::with_capacity(declarations.len());
     let mut has_interface = false;
     let mut value_declaration = None;
@@ -502,6 +518,13 @@ pub(super) fn validate_nongeneric_interface_argument_origin(
                     return Err(invalid());
                 }
                 has_interface = true;
+            }
+            Some(SyntaxKind::VariableDeclaration)
+                if mixed_owner
+                    .as_ref()
+                    .is_some_and(|proof| proof.variables().contains(&declaration)) =>
+            {
+                value_declaration = mixed_owner.as_ref().map(|proof| proof.value_declaration());
             }
             Some(SyntaxKind::VariableDeclaration)
                 if value_declaration.replace(declaration).is_none() => {}
@@ -1413,6 +1436,241 @@ mod tests {
             store.signature_len(),
             store.symbol_store().symbol_table_len(),
         ]
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the real mixed owner and each damage/restore pair together.
+    fn mixed_global_interface_origins_keep_all_variables_and_the_real_this_type() {
+        let library = parse_source_file(concat!(
+            "interface Packet { self: this; library: number }\n",
+            "declare var Packet: { marker: number };\n",
+            "interface Other { self: this }\n",
+        ));
+        let augmentation = parse_source_file(concat!(
+            "export {}; declare global {\n",
+            "interface Packet { added: string }\n",
+            "var Packet: { marker: number };\n",
+            "}\n",
+        ));
+        let library_file = FileId::new(203_187);
+        let augmentation_file = FileId::new(203_188);
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed, path, default_library, module) in [
+            (
+                library_file,
+                &library,
+                "\"/lib/lib.packet-origin.d.ts\"",
+                true,
+                CanonicalModuleState::Script,
+            ),
+            (
+                augmentation_file,
+                &augmentation,
+                "\"/types/packet-origin.d.ts\"",
+                false,
+                CanonicalModuleState::External,
+            ),
+        ] {
+            assert!(parsed.diagnostics.is_empty());
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        default_library,
+                        module,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (library_file, &library.arena),
+                (augmentation_file, &augmentation.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let [owner, other] = ["Packet", "Other"].map(|name| {
+            let store = context.store();
+            store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .unwrap()
+                .get_source(name)
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap()
+        });
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let augmentation_bound = context.file(augmentation_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&augmentation.arena, &augmentation_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let proof = store
+            .source_global_interface_value_owner(owner)
+            .unwrap()
+            .unwrap();
+        let declarations = proof.declarations().to_vec();
+        let variables = proof.variables().to_vec();
+        assert_eq!(variables.len(), 2);
+        let selected = proof.value_declaration();
+        assert_eq!(selected, variables[0]);
+        let annotations = variables
+            .iter()
+            .map(|declaration| store.source_direct_type_annotation(*declaration).unwrap())
+            .collect::<Vec<_>>();
+        let argument = store.get_declared_type_of_symbol(&host, owner).unwrap();
+        store.get_declared_type_of_symbol(&host, other).unwrap();
+        let TypeData::Interface(interface) = store.type_payload(argument).unwrap().data() else {
+            panic!("the mixed owner keeps its real interface identity")
+        };
+        let this_type = interface.this_type.unwrap();
+        assert_eq!(interface.reference.object.target, Some(argument));
+        assert_eq!(
+            validate_nongeneric_interface_argument_origin(store, argument),
+            Ok(())
+        );
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                reference_store_counts(store),
+                store.checker_link_allocated_lengths(),
+                store
+                    .symbol(owner)
+                    .unwrap()
+                    .declarations()
+                    .map(<[_]>::to_vec),
+                store.symbol(owner).unwrap().value_declaration(),
+                store.type_payload(argument).cloned(),
+                store.type_payload(this_type).cloned(),
+                annotations
+                    .iter()
+                    .map(|node| store.type_node_links(*node).cloned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for damage in 0..3 {
+            match damage {
+                0 => assert!(
+                    store.set_symbol_declarations(
+                        owner,
+                        Some(
+                            declarations
+                                .iter()
+                                .copied()
+                                .filter(|declaration| *declaration != variables[1])
+                                .collect()
+                        ),
+                        Some(selected),
+                    )
+                ),
+                1 => assert!(store.set_symbol_declarations(
+                    owner,
+                    Some(declarations.clone()),
+                    Some(variables[1]),
+                )),
+                2 => assert!(store.set_type_symbol(this_type, Some(other))),
+                _ => unreachable!(),
+            }
+            assert!(
+                !super::super::object_members::source_interface_uses_legacy_single_script_value_owner(
+                    store, owner,
+                )
+            );
+            let damaged = snapshot(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_nongeneric_interface_argument_origin(store, argument),
+                    Err(DirectGenericReferenceError::InvalidTarget(argument))
+                );
+                assert_eq!(snapshot(store), damaged);
+            }
+            assert!(store.set_symbol_declarations(
+                owner,
+                Some(declarations.clone()),
+                Some(selected)
+            ));
+            assert!(store.set_type_symbol(this_type, Some(owner)));
+            let restored = snapshot(store);
+            assert_eq!(
+                validate_nongeneric_interface_argument_origin(store, argument),
+                Ok(())
+            );
+            assert_eq!(snapshot(store), restored);
+            assert!(
+                annotations
+                    .iter()
+                    .all(|node| store.type_node_links(*node).is_none())
+            );
+            assert!(store.value_symbol_links(owner).is_none());
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn nongeneric_origin_keeps_the_original_single_script_variable_route() {
+        let parsed =
+            parse_source_file("interface Legacy { self: this } declare var Legacy: number;");
+        let file = FileId::new(203_189);
+        let mut context =
+            source_interface_context(&[(&parsed, file, CanonicalModuleState::Script)]);
+        let declaration = source_interface_node(&parsed, file, "Legacy");
+        let raw = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let owner = context.store().get_merged_symbol(raw).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let store = context.store_mut_for_test();
+        assert!(
+            super::super::object_members::source_interface_uses_legacy_single_script_value_owner(
+                store, owner,
+            )
+        );
+        assert!(store.source_global_interface_value_owner(owner).is_err());
+        let argument = store.get_declared_type_of_symbol(&host, owner).unwrap();
+        let annotation = store
+            .symbol(owner)
+            .unwrap()
+            .value_declaration()
+            .and_then(|declaration| store.source_direct_type_annotation(declaration))
+            .unwrap();
+        let warm = (
+            reference_store_counts(store),
+            store.checker_link_allocated_lengths(),
+            store.type_payload(argument).cloned(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                validate_nongeneric_interface_argument_origin(store, argument),
+                Ok(())
+            );
+            assert_eq!(
+                (
+                    reference_store_counts(store),
+                    store.checker_link_allocated_lengths(),
+                    store.type_payload(argument).cloned()
+                ),
+                warm
+            );
+            assert!(store.type_node_links(annotation).is_none());
+            assert!(store.value_symbol_links(owner).is_none());
+        }
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

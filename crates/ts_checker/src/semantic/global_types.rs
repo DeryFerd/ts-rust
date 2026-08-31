@@ -11,17 +11,19 @@
 
 use std::collections::HashSet;
 
-use ts_ast::{NodeData, NodeRef, SyntaxKind};
+use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
-    CanonicalNameResolutionError, SemanticSymbolId, SymbolFlags, SymbolTableId, resolve_global_name,
+    CanonicalNameResolutionError, CheckFlags, EscapedName, EscapedNameRef, InternalSymbolName,
+    SemanticStoreId, SemanticSymbolId, SymbolFlags, SymbolTableId, resolve_global_name,
+    semantic::{PreparedSymbolTable, should_replace_value_declaration},
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId, ValueSymbolLinks,
-    declared::{cached_ordinary_type_parameter_owner, type_list_key},
+    declared::{DeclaredTypeUnavailable, cached_ordinary_type_parameter_owner, type_list_key},
     store::SourceNodeParent,
-    type_records::{TypeCacheState, TypeData},
+    type_records::{StructuredTypeData, TypeCacheState, TypeData},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -129,6 +131,779 @@ impl CanonicalGlobalTypes {
     #[must_use]
     pub fn diagnostics(&self) -> &[CanonicalGlobalTypeDiagnostic] {
         &self.diagnostics
+    }
+}
+
+/// One original global entry. Value types stay with the normal source query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GlobalThisMember {
+    export_name: EscapedName,
+    name: EscapedName,
+    table_symbol: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    flags: SymbolFlags,
+    canonical_flags: SymbolFlags,
+    check_flags: CheckFlags,
+    parent: Option<SemanticSymbolId>,
+    declarations: Vec<NodeRef>,
+    value_declaration: Option<NodeRef>,
+    builtin_value_type: Option<TypeId>,
+    first_declaration: Option<(usize, u32)>,
+    retained: bool,
+    value: bool,
+}
+
+impl GlobalThisMember {
+    pub(super) const fn table_symbol(&self) -> SemanticSymbolId {
+        self.table_symbol
+    }
+
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        self.symbol
+    }
+
+    pub(super) const fn flags(&self) -> SymbolFlags {
+        self.flags
+    }
+
+    pub(super) const fn check_flags(&self) -> CheckFlags {
+        self.check_flags
+    }
+
+    pub(super) const fn parent(&self) -> Option<SemanticSymbolId> {
+        self.parent
+    }
+
+    pub(super) fn declarations(&self) -> &[NodeRef] {
+        &self.declarations
+    }
+
+    pub(super) const fn value_declaration(&self) -> Option<NodeRef> {
+        self.value_declaration
+    }
+
+    pub(super) const fn builtin_value_type(&self) -> Option<TypeId> {
+        self.builtin_value_type
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GlobalThisMemberPlan {
+    store: SemanticStoreId,
+    receiver: TypeId,
+    symbol: SemanticSymbolId,
+    globals: SymbolTableId,
+    exports: Vec<GlobalThisMember>,
+    members: Vec<(EscapedName, SemanticSymbolId)>,
+    properties: Vec<SemanticSymbolId>,
+}
+
+/// A query-local proof over the context's borrowed Program order.
+/// It does not borrow the store or prepare any ordinary member value.
+#[derive(Clone, Debug)]
+pub(super) struct GlobalThisMembers<'host, 'arena> {
+    host: &'host DeclaredTypeHost<'arena>,
+    plan: GlobalThisMemberPlan,
+    members_table: SymbolTableId,
+}
+
+impl GlobalThisMembers<'_, '_> {
+    pub(super) const fn receiver(&self) -> TypeId {
+        self.plan.receiver
+    }
+
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        self.plan.symbol
+    }
+
+    pub(super) const fn globals(&self) -> SymbolTableId {
+        self.plan.globals
+    }
+
+    pub(super) const fn members_table(&self) -> SymbolTableId {
+        self.members_table
+    }
+
+    pub(super) fn members(&self) -> &[(EscapedName, SemanticSymbolId)] {
+        &self.plan.members
+    }
+
+    pub(super) fn properties(&self) -> &[SemanticSymbolId] {
+        &self.plan.properties
+    }
+
+    /// Looks up a named value property, keeping its original table identity.
+    pub(super) fn get_source(&self, name: &str) -> Option<SemanticSymbolId> {
+        self.plan
+            .exports
+            .iter()
+            .find(|entry| entry.value && entry.name.as_utf8() == Some(name))
+            .map(GlobalThisMember::table_symbol)
+    }
+
+    /// Reads a named value row by its original table identity, not a redirect.
+    pub(super) fn member(&self, symbol: SemanticSymbolId) -> Option<&GlobalThisMember> {
+        self.plan
+            .exports
+            .iter()
+            .find(|entry| entry.value && entry.table_symbol == symbol)
+    }
+
+    /// Includes type-only and filtered exports for type lookup and diagnostics.
+    pub(super) fn export_source(&self, name: &str) -> Option<&GlobalThisMember> {
+        self.plan
+            .exports
+            .iter()
+            .find(|entry| entry.export_name.as_utf8() == Some(name))
+    }
+
+    pub(super) fn validate(
+        &self,
+        store: &CanonicalTypeMapperStore,
+    ) -> Result<(), DeclaredTypeError> {
+        let identity = global_this_identity(store, self.plan.receiver)?;
+        if identity.members != Some(self.members_table)
+            || self.plan != global_this_member_plan(store, self.host, self.plan.receiver)?
+        {
+            return Err(invalid_global_this_members(self.plan.receiver));
+        }
+        validate_global_this_ready_members(store, &self.plan, self.members_table)
+    }
+}
+
+/// This is only a rejection or demand hint. It does not admit a type graph.
+pub(super) fn is_global_this_type_candidate(
+    store: &CanonicalTypeMapperStore,
+    globals: Option<&CanonicalGlobalTypes>,
+    receiver: TypeId,
+) -> bool {
+    globals.is_some_and(|globals| globals.global_this_value_type == receiver)
+        || store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+            store
+                .value_symbol_links(bootstrap.global_this_symbol)
+                .is_some_and(|links| links.resolved_type == Some(receiver))
+                || store
+                    .type_payload(receiver)
+                    .is_some_and(|record| record.symbol() == Some(bootstrap.global_this_symbol))
+        })
+}
+
+/// Recognizes the existing synthetic value after ordinary lexical resolution.
+pub(super) fn source_global_this_value_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    symbol: SemanticSymbolId,
+) -> Result<Option<TypeId>, DeclaredTypeError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized)?;
+    let canonical = store
+        .get_merged_symbol(symbol)
+        .ok_or(DeclaredTypeUnavailable::SymbolNotOwned(symbol))?;
+    if symbol != bootstrap.global_this_symbol && canonical != bootstrap.global_this_symbol {
+        return Ok(None);
+    }
+    if symbol != bootstrap.global_this_symbol {
+        return Err(DeclaredTypeUnavailable::InvalidGlobalThisSymbol(symbol).into());
+    }
+    let receiver = globals.global_this_value_type;
+    let identity = global_this_identity(store, receiver)?;
+    if let Some(members) = identity.members {
+        let plan = global_this_member_plan(store, host, receiver)?;
+        validate_global_this_ready_members(store, &plan, members)?;
+    }
+    Ok(Some(receiver))
+}
+
+/// Proves one original export without preparing members or value types.
+pub(super) fn source_global_this_export(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    receiver: TypeId,
+    name: &str,
+) -> Result<Option<GlobalThisMember>, DeclaredTypeError> {
+    if receiver != globals.global_this_value_type {
+        return Err(invalid_global_this_members(receiver));
+    }
+    let identity = global_this_identity(store, receiver)?;
+    let plan = global_this_member_plan(store, host, receiver)?;
+    if let Some(members) = identity.members {
+        validate_global_this_ready_members(store, &plan, members)?;
+    }
+    Ok(plan
+        .exports
+        .into_iter()
+        .find(|member| member.export_name.as_utf8() == Some(name)))
+}
+
+/// Publishes one complete filtered table on the existing synthetic type.
+pub(super) fn prepare_global_this_members<'host, 'arena>(
+    store: &mut CanonicalTypeMapperStore,
+    host: &'host DeclaredTypeHost<'arena>,
+    globals: &CanonicalGlobalTypes,
+    receiver: TypeId,
+) -> Result<Option<GlobalThisMembers<'host, 'arena>>, DeclaredTypeError> {
+    if !is_global_this_type_candidate(store, Some(globals), receiver) {
+        return Ok(None);
+    }
+    if receiver != globals.global_this_value_type {
+        return Err(invalid_global_this_members(receiver));
+    }
+    let identity = global_this_identity(store, receiver)?;
+    let plan = global_this_member_plan(store, host, receiver)?;
+    let members_table = if let Some(members) = identity.members {
+        validate_global_this_ready_members(store, &plan, members)?;
+        members
+    } else {
+        let capacity =
+            || DeclaredTypeError::from(DeclaredTypeUnavailable::GlobalThisCapacity(receiver));
+        let prepared = PreparedSymbolTable::new(plan.members.len()).ok_or_else(capacity)?;
+        let mut properties = Vec::new();
+        properties
+            .try_reserve_exact(plan.properties.len())
+            .map_err(|_| capacity())?;
+        properties.extend_from_slice(&plan.properties);
+        if !store.try_reserve_checker_symbol_allocations(0, 1) {
+            return Err(capacity());
+        }
+        let members = store.alloc_prepared_symbol_table(prepared);
+        for (name, symbol) in &plan.members {
+            assert_eq!(
+                store.insert_symbol(members, name.clone(), *symbol),
+                Some(None)
+            );
+        }
+        assert!(store.set_structured_type_members(
+            receiver,
+            Some(members),
+            Some(properties),
+            None,
+            None,
+            None,
+        ));
+        members
+    };
+    Ok(Some(GlobalThisMembers {
+        host,
+        plan,
+        members_table,
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct GlobalThisIdentity {
+    symbol: SemanticSymbolId,
+    globals: SymbolTableId,
+    members: Option<SymbolTableId>,
+}
+
+fn invalid_global_this_members(receiver: TypeId) -> DeclaredTypeError {
+    DeclaredTypeUnavailable::InvalidGlobalThisMembers(receiver).into()
+}
+
+fn invalid_global_this_member(receiver: TypeId, symbol: SemanticSymbolId) -> DeclaredTypeError {
+    DeclaredTypeUnavailable::InvalidGlobalThisMember { receiver, symbol }.into()
+}
+
+fn global_this_identity(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+) -> Result<GlobalThisIdentity, DeclaredTypeError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized)?;
+    let symbol = bootstrap.global_this_symbol;
+    let invalid_symbol =
+        || DeclaredTypeError::from(DeclaredTypeUnavailable::InvalidGlobalThisSymbol(symbol));
+    let record = store.symbol(symbol).ok_or_else(invalid_symbol)?;
+    let flags = SymbolFlags::MODULE | SymbolFlags::TRANSIENT;
+    let bindings = store.source_global_bindings().ok_or_else(invalid_symbol)?;
+    let binding = bindings
+        .get(EscapedNameRef::source("globalThis"))
+        .ok_or_else(invalid_symbol)?;
+    if store.get_merged_symbol(symbol) != Some(symbol)
+        || record.name().as_utf8() != Some("globalThis")
+        || record.flags() != flags
+        || record.check_flags() != CheckFlags::READONLY
+        || record.declarations().is_some()
+        || record.value_declaration().is_some()
+        || record.members().is_some()
+        || record.exports() != Some(bootstrap.globals)
+        || record.parent().is_some()
+        || record.export_symbol().is_some()
+        || bindings.table != bootstrap.globals
+        || binding.table_symbol != symbol
+        || binding.symbol != symbol
+        || binding.flags != flags
+        || binding.declarations().is_some()
+        || store
+            .symbol_table(bootstrap.globals)
+            .and_then(|table| table.get_source("globalThis"))
+            != Some(symbol)
+        || store.value_symbol_links(symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(receiver),
+                ..ValueSymbolLinks::default()
+            })
+        || store.module_symbol_links(symbol).is_some_and(|links| {
+            links
+                .resolved_exports
+                .is_some_and(|table| table != bootstrap.globals)
+                || links.type_only_export_star_map.is_some()
+                || links.exports_checked
+        })
+    {
+        return Err(invalid_symbol());
+    }
+    let invalid = || invalid_global_this_members(receiver);
+    let record = store.type_payload(receiver).ok_or_else(invalid)?;
+    let TypeData::Object(object) = record.data() else {
+        return Err(invalid());
+    };
+    if record.flags() != TypeFlags::OBJECT
+        || record.symbol() != Some(symbol)
+        || record.alias().is_some()
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != TypeCacheState::Unallocated
+    {
+        return Err(invalid());
+    }
+    let members = if record.object_flags() == ObjectFlags::ANONYMOUS {
+        if object.structured != StructuredTypeData::default() {
+            return Err(invalid());
+        }
+        None
+    } else if record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED {
+        let structured = &object.structured;
+        if structured.properties.is_none()
+            || structured.constrained != Default::default()
+            || structured.signatures.is_some()
+            || structured.call_signature_count != 0
+            || structured.index_infos.is_some()
+            || structured
+                .object_type_without_abstract_construct_signatures
+                .is_some()
+        {
+            return Err(invalid());
+        }
+        Some(structured.members.ok_or_else(invalid)?)
+    } else {
+        return Err(invalid());
+    };
+    Ok(GlobalThisIdentity {
+        symbol,
+        globals: bootstrap.globals,
+        members,
+    })
+}
+
+fn global_this_member_plan(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    receiver: TypeId,
+) -> Result<GlobalThisMemberPlan, DeclaredTypeError> {
+    let identity = global_this_identity(store, receiver)?;
+    let invalid = || invalid_global_this_members(receiver);
+    let order = host.program_file_order().ok_or(
+        DeclaredTypeUnavailable::GlobalThisProgramOrderUnavailable(receiver),
+    )?;
+    let mut files = HashSet::new();
+    if order
+        .iter()
+        .any(|file| !files.insert(*file) || !host.has_program_file(*file))
+    {
+        return Err(DeclaredTypeUnavailable::GlobalThisProgramOrderUnavailable(receiver).into());
+    }
+    let bindings = store.source_global_bindings().ok_or_else(invalid)?;
+    let table = store.symbol_table(identity.globals).ok_or_else(invalid)?;
+    if bindings.table != identity.globals || bindings.iter().count() != table.len() {
+        return Err(invalid());
+    }
+    let mut exports = Vec::new();
+    for (name, table_symbol) in table.iter() {
+        let binding = bindings.get(name).ok_or_else(invalid)?;
+        if binding.table_symbol != table_symbol
+            || store.get_merged_symbol(table_symbol) != Some(binding.symbol)
+        {
+            return Err(invalid_global_this_member(receiver, table_symbol));
+        }
+        exports.push(global_this_member(
+            store, host, order, receiver, name, binding,
+        )?);
+    }
+    exports.sort_by(|left, right| left.export_name.cmp(&right.export_name));
+    let mut members = exports
+        .iter()
+        .filter(|entry| entry.retained)
+        .map(|entry| (entry.name.clone(), entry.table_symbol))
+        .collect::<Vec<_>>();
+    members.sort_by(|left, right| left.0.cmp(&right.0));
+    if members.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(invalid());
+    }
+    let mut properties = exports
+        .iter()
+        .filter(|entry| entry.value)
+        .collect::<Vec<_>>();
+    properties.sort_by(|left, right| {
+        match (left.first_declaration, right.first_declaration) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| left.name.cmp(&right.name))
+        .then_with(|| left.table_symbol.cmp(&right.table_symbol))
+    });
+    let properties = properties
+        .into_iter()
+        .map(GlobalThisMember::table_symbol)
+        .collect();
+    Ok(GlobalThisMemberPlan {
+        store: store.id(),
+        receiver,
+        symbol: identity.symbol,
+        globals: identity.globals,
+        exports,
+        members,
+        properties,
+    })
+}
+
+fn validate_global_this_ready_members(
+    store: &CanonicalTypeMapperStore,
+    plan: &GlobalThisMemberPlan,
+    members: SymbolTableId,
+) -> Result<(), DeclaredTypeError> {
+    let invalid = || invalid_global_this_members(plan.receiver);
+    let table = store.symbol_table(members).ok_or_else(invalid)?;
+    if store.id() != plan.store
+        || members == plan.globals
+        || table.len() != plan.members.len()
+        || plan
+            .members
+            .iter()
+            .any(|(name, symbol)| table.get(name.as_ref()) != Some(*symbol))
+        || store
+            .type_payload(plan.receiver)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            != Some(plan.properties.as_slice())
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn global_this_member(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    order: &[FileId],
+    receiver: TypeId,
+    name: EscapedNameRef<'_>,
+    binding: &super::store::SourceGlobalBinding,
+) -> Result<GlobalThisMember, DeclaredTypeError> {
+    let symbol = binding.symbol;
+    let invalid = || invalid_global_this_member(receiver, symbol);
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
+    let table_record = store.symbol(binding.table_symbol).ok_or_else(invalid)?;
+    if store.get_merged_symbol(symbol) != Some(symbol)
+        || record.flags() != binding.flags
+        || record.declarations() != binding.declarations()
+        || record.name() != name
+        || table_record.name() != name
+        || table_record.check_flags() != record.check_flags()
+        || binding.table_symbol != symbol
+            && !store.source_raw_symbol_declarations_match(binding.table_symbol)
+    {
+        return Err(invalid());
+    }
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let builtin = if symbol == bootstrap.global_this_symbol {
+        global_this_identity(store, receiver)?;
+        Some(receiver)
+    } else if symbol == bootstrap.undefined_symbol {
+        let type_ = bootstrap.undefined_widening_type;
+        let expected_flags = if type_ == bootstrap.undefined_type {
+            ObjectFlags::NONE
+        } else {
+            ObjectFlags::CONTAINS_WIDENING_TYPE
+        };
+        if binding.table_symbol != symbol
+            || record.flags() != SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+            || record.check_flags() != CheckFlags::NONE
+            || record.name().as_utf8() != Some("undefined")
+            || record.declarations().is_some()
+            || record.value_declaration().is_some()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.parent().is_some()
+            || record.export_symbol().is_some()
+            || store.value_symbol_links(symbol) != Some(&ValueSymbolLinks {
+                resolved_type: Some(type_), ..ValueSymbolLinks::default()
+            })
+            || !store.type_payload(type_).is_some_and(|record| {
+                record.flags() == TypeFlags::UNDEFINED
+                    && record.object_flags() == expected_flags
+                    && record.symbol().is_none()
+                    && record.alias().is_none()
+                    && matches!(record.data(), TypeData::Intrinsic(data) if data.intrinsic_name == "undefined")
+            })
+        {
+            return Err(invalid());
+        }
+        Some(type_)
+    } else {
+        if record.flags().intersects(SymbolFlags::ALIAS) {
+            return Err(
+                DeclaredTypeUnavailable::UnsupportedGlobalThisMember { receiver, symbol }.into(),
+            );
+        }
+        let declarations = record
+            .declarations()
+            .filter(|declarations| !declarations.is_empty())
+            .ok_or_else(invalid)?;
+        if !store.source_merged_symbol_declarations_match(symbol)
+            || record.check_flags() != CheckFlags::NONE
+            || record.export_symbol().is_some()
+        {
+            return Err(invalid());
+        }
+        let mixed = if let Some(owner) = store.source_global_interface_value_owner(symbol)? {
+            owner.validate_current(store)?;
+            true
+        } else {
+            false
+        };
+        let mut selected = None;
+        let mut first_parent = None;
+        let mut raw_owners = HashSet::new();
+        for &declaration in declarations {
+            if !order.contains(&declaration.file)
+                || !host.symbol_matches(store, declaration, symbol)
+            {
+                return Err(invalid());
+            }
+            validate_global_this_declaration(store, host, receiver, declaration, symbol, name)?;
+            let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+            let raw = [bound.symbol(declaration), bound.local_symbol(declaration)]
+                .into_iter()
+                .flatten()
+                .find(|raw| store.get_merged_symbol(*raw) == Some(symbol))
+                .ok_or_else(invalid)?;
+            if !store.source_raw_symbol_declarations_match(raw) {
+                return Err(invalid());
+            }
+            let raw_record = store.symbol(raw).ok_or_else(invalid)?;
+            validate_global_this_source_parent(store, host, receiver, declaration, raw)?;
+            if raw_owners.is_empty() {
+                first_parent = raw_record.parent();
+            }
+            if raw_owners.insert(raw)
+                && !mixed
+                && let Some(incoming) = raw_record.value_declaration()
+                && selected.is_none_or(|current| {
+                    store
+                        .source_node_kind(current)
+                        .zip(store.source_node_kind(incoming))
+                        .is_some_and(|(current, incoming)| {
+                            should_replace_value_declaration(current, incoming)
+                        })
+                })
+            {
+                selected = Some(incoming);
+            }
+        }
+        if !mixed && (record.value_declaration() != selected || record.parent() != first_parent) {
+            return Err(invalid());
+        }
+        None
+    };
+    let declarations = record.declarations().unwrap_or_default().to_vec();
+    let first_declaration = table_record
+        .declarations()
+        .and_then(|declarations| declarations.first())
+        .map(|declaration| {
+            let file = order
+                .iter()
+                .position(|file| *file == declaration.file)
+                .ok_or_else(invalid)?;
+            let start = store.source_node_start(*declaration).ok_or_else(invalid)?;
+            Ok::<_, DeclaredTypeError>((file, start))
+        })
+        .transpose()?;
+    let all_ambient_modules = table_record.declarations().is_some_and(|declarations| {
+        !declarations.is_empty()
+            && declarations.iter().all(|declaration| {
+                host.node(*declaration).is_some_and(|node| {
+                    matches!(&node.data, NodeData::ModuleDeclaration(module)
+                    if module.keyword == SyntaxKind::GlobalKeyword
+                        || host.node(NodeRef::new(declaration.arena, declaration.file, module.name))
+                            .is_some_and(|name| name.kind == SyntaxKind::StringLiteral))
+                })
+            })
+    });
+    let retained = !table_record.flags().intersects(SymbolFlags::BLOCK_SCOPED)
+        && !(table_record.flags().intersects(SymbolFlags::VALUE_MODULE) && all_ambient_modules);
+    let value = retained
+        && !name.is_reserved_member_name()
+        && table_record.flags().intersects(SymbolFlags::VALUE);
+    Ok(GlobalThisMember {
+        export_name: name.to_owned(),
+        name: table_record.name().to_owned(),
+        table_symbol: binding.table_symbol,
+        symbol,
+        flags: table_record.flags(),
+        canonical_flags: record.flags(),
+        check_flags: table_record.check_flags(),
+        parent: record.parent(),
+        declarations,
+        value_declaration: record.value_declaration(),
+        builtin_value_type: builtin,
+        first_declaration,
+        retained,
+        value,
+    })
+}
+
+fn validate_global_this_source_node(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> bool {
+    host.node(node).is_some_and(|record| {
+        store.source_node_kind(node) == Some(record.kind)
+            && store.source_node_start(node) == Some(record.range.start.get())
+            && store.source_node_parent(node) == Some(record.parent.map_or(SourceNodeParent::Root, |parent| {
+                SourceNodeParent::Parent(NodeRef::new(node.arena, node.file, parent))
+            }))
+            && store.source_identifier_text(node).is_none_or(|text| {
+                matches!(&record.data, NodeData::Identifier(identifier) if identifier.text == text)
+            })
+    })
+}
+
+fn validate_global_this_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    receiver: TypeId,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    expected_name: EscapedNameRef<'_>,
+) -> Result<(), DeclaredTypeError> {
+    let invalid = || invalid_global_this_member(receiver, symbol);
+    let record = host.node(declaration).ok_or_else(invalid)?;
+    if !validate_global_this_source_node(store, host, declaration) {
+        return Err(invalid());
+    }
+    let name = match &record.data {
+        NodeData::ClassDeclaration(class) => class.name,
+        NodeData::InterfaceDeclaration(interface) => Some(interface.name),
+        NodeData::TypeAliasDeclaration(alias) => Some(alias.name),
+        NodeData::EnumDeclaration(enumeration) => Some(enumeration.name),
+        NodeData::ModuleDeclaration(module) => Some(module.name),
+        NodeData::FunctionDeclaration(function) => function.name,
+        NodeData::VariableDeclaration(variable) => Some(variable.name),
+        NodeData::BindingElement(binding) => binding.name,
+        _ => {
+            return Err(
+                DeclaredTypeUnavailable::UnsupportedGlobalThisMember { receiver, symbol }.into(),
+            );
+        }
+    }
+    .ok_or_else(invalid)?;
+    let name = NodeRef::new(declaration.arena, declaration.file, name);
+    let named = if matches!(&record.data, NodeData::ModuleDeclaration(module) if module.keyword == SyntaxKind::GlobalKeyword)
+    {
+        expected_name == InternalSymbolName::Global.as_ref()
+    } else {
+        match host.node(name).map(|node| &node.data) {
+            Some(NodeData::Identifier(identifier)) => {
+                expected_name.as_utf8() == Some(identifier.text.as_str())
+            }
+            Some(NodeData::StringLiteral(literal))
+                if record.kind == SyntaxKind::ModuleDeclaration =>
+            {
+                expected_name.as_utf8() == Some(format!("\"{}\"", literal.text).as_str())
+            }
+            _ => false,
+        }
+    };
+    if !named || store.source_node_parent(name) != Some(SourceNodeParent::Parent(declaration)) {
+        return Err(invalid());
+    }
+    let mut children = Vec::new();
+    record.for_each_child(|child| {
+        children.push(NodeRef::new(declaration.arena, declaration.file, child))
+    });
+    children.sort_unstable();
+    if store.source_direct_children(declaration).as_deref() != Some(children.as_slice())
+        || children
+            .iter()
+            .any(|child| !validate_global_this_source_node(store, host, *child))
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn validate_global_this_source_parent(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    receiver: TypeId,
+    declaration: NodeRef,
+    raw: SemanticSymbolId,
+) -> Result<(), DeclaredTypeError> {
+    let invalid = || invalid_global_this_member(receiver, raw);
+    let record = store.symbol(raw).ok_or_else(invalid)?;
+    let mut node = declaration;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(node) || !validate_global_this_source_node(store, host, node) {
+            return Err(invalid());
+        }
+        let parent = host
+            .node(node)
+            .and_then(|node| node.parent)
+            .ok_or_else(invalid)?;
+        node = NodeRef::new(node.arena, node.file, parent);
+        let parent = host.node(node).ok_or_else(invalid)?;
+        if !validate_global_this_source_node(store, host, node) {
+            return Err(invalid());
+        }
+        if parent.kind == SyntaxKind::SourceFile {
+            return if record.parent().is_none() {
+                Ok(())
+            } else {
+                Err(invalid())
+            };
+        }
+        if let NodeData::ModuleDeclaration(module) = &parent.data {
+            let bound = host.bound_file(node).ok_or_else(invalid)?;
+            let name = NodeRef::new(node.arena, node.file, module.name);
+            if module.keyword != SyntaxKind::GlobalKeyword
+                || !bound
+                    .module_augmentations()
+                    .iter()
+                    .any(|augmentation| augmentation.name() == name)
+                || record.parent() != bound.symbol(node)
+                || record.parent().is_none()
+            {
+                return Err(invalid());
+            }
+            return Ok(());
+        }
+        if matches!(
+            parent.kind,
+            SyntaxKind::FunctionDeclaration
+                | SyntaxKind::FunctionExpression
+                | SyntaxKind::ArrowFunction
+        ) {
+            return Err(invalid());
+        }
     }
 }
 

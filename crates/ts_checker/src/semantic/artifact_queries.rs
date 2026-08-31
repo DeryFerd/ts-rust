@@ -331,6 +331,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some((type_, _)) = self.source_alias_interface_heritage_artifact_target(node)? {
+            return Ok(type_);
+        }
+
         if let Some(type_) = self.checked_source_method_artifact_type(node)? {
             return self.validate_artifact_type(node, type_);
         }
@@ -479,6 +483,10 @@ impl CanonicalCheckerContext<'_> {
         }
 
         if let Some((_, symbol)) = self.class_super_artifact_target(node)? {
+            return Ok(Some(symbol));
+        }
+
+        if let Some((_, symbol)) = self.source_alias_interface_heritage_artifact_target(node)? {
             return Ok(Some(symbol));
         }
 
@@ -3805,10 +3813,197 @@ impl CanonicalCheckerContext<'_> {
         Ok(Some((type_, symbol)))
     }
 
+    /// Reads the written base slot and lexical symbol from current complete source proof.
+    /// Missing conditional query proof stays an error at this read-only entry.
+    #[allow(clippy::too_many_lines)] // Keep source eligibility, complete proof and both cache checks together.
+    fn source_alias_interface_heritage_artifact_target(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<(TypeId, SemanticSymbolId)>, CanonicalArtifactQueryError> {
+        let (_, bound, record) = self.validated_artifact_node(node)?;
+        if !matches!(record.data, NodeData::Identifier(_)) {
+            return Ok(None);
+        }
+        let Some(reference_id) = record.parent else {
+            return Ok(None);
+        };
+        let reference = NodeRef::new(node.arena, node.file, reference_id);
+        let (_, _, reference_record) = self.validated_artifact_node(reference)?;
+        let NodeData::ExpressionWithTypeArguments(expression) = &reference_record.data else {
+            return Ok(None);
+        };
+        if expression.expression != node.node || expression.type_arguments.is_some() {
+            return Ok(None);
+        }
+        let Some(clause_id) = reference_record.parent else {
+            return Ok(None);
+        };
+        let clause = NodeRef::new(node.arena, node.file, clause_id);
+        let (_, _, clause_record) = self.validated_artifact_node(clause)?;
+        let NodeData::HeritageClause(heritage) = &clause_record.data else {
+            return Ok(None);
+        };
+        let Some(owner_id) = clause_record.parent else {
+            return Ok(None);
+        };
+        let owner = NodeRef::new(node.arena, node.file, owner_id);
+        let (_, _, owner_record) = self.validated_artifact_node(owner)?;
+        let NodeData::InterfaceDeclaration(declaration) = &owner_record.data else {
+            return Ok(None);
+        };
+        if heritage.token != SyntaxKind::ExtendsKeyword || declaration.type_parameters.is_some() {
+            return Ok(None);
+        }
+        let Some(owner_symbol) = bound.symbol(owner) else {
+            return Ok(None);
+        };
+        let owner_symbol = self.merged_artifact_symbol(node, owner_symbol)?;
+        let store = self.store();
+        if !store.source_declaration_belongs_to_symbol(owner, owner_symbol)
+            || store
+                .symbol(owner_symbol)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .is_none_or(|declarations| {
+                    declarations.iter().filter(|node| **node == owner).count() != 1
+                })
+        {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                node: owner,
+                symbol: owner_symbol,
+            });
+        }
+        let owner_type = store
+            .declared_type_links(owner_symbol)
+            .and_then(|links| links.declared_type);
+        let invalid = || match owner_type {
+            Some(type_) => CanonicalArtifactQueryError::InvalidType { node, type_ },
+            None => CanonicalArtifactQueryError::MissingType {
+                node: owner,
+                kind: SyntaxKind::InterfaceDeclaration,
+            },
+        };
+        let host = self.declared_type_host()?;
+        let Some(header) = super::interface_heritage::plan_source_interface_heritage_header(
+            store,
+            &host,
+            owner_symbol,
+        )
+        .map_err(|_| invalid())?
+        else {
+            if owner_type.is_some_and(|owner_type| {
+                store
+                    .source_interface_heritage_header(owner_type)
+                    .is_some_and(|header| header.bases().iter().any(|base| base.alias().is_some()))
+            }) {
+                return Err(invalid());
+            }
+            return Ok(None);
+        };
+        let owner_type = owner_type.ok_or_else(invalid)?;
+        if record.kind != SyntaxKind::Identifier
+            || reference_record.kind != SyntaxKind::ExpressionWithTypeArguments
+            || clause_record.kind != SyntaxKind::HeritageClause
+            || owner_record.kind != SyntaxKind::InterfaceDeclaration
+            || declaration.heritage_clauses.as_ref().is_none_or(|clauses| {
+                clauses.nodes.iter().filter(|id| **id == clause_id).count() != 1
+            })
+            || heritage
+                .types
+                .nodes
+                .iter()
+                .filter(|id| **id == reference_id)
+                .count()
+                != 1
+            || header.owner_symbol() != owner_symbol
+            || !header.owner_declarations().contains(&owner)
+        {
+            return Err(invalid());
+        }
+        let targets =
+            Some(super::array_types::CanonicalArrayTargets::from_global_types(self.global_types()));
+        super::interface_heritage::validate_source_interface_heritage_header(
+            store, owner_type, &header, targets,
+        )
+        .map_err(|_| invalid())?;
+        let provenance = store
+            .direct_interface_heritage_provenance(owner_type)
+            .ok_or_else(invalid)?;
+        if provenance.owner_symbol != owner_symbol || provenance.source.as_ref() != Some(&header) {
+            return Err(invalid());
+        }
+        super::interface_heritage::validate_source_interface_heritage_complete_bases(
+            store,
+            owner_type,
+            &header,
+            &provenance.bases,
+            targets,
+            None,
+        )
+        .map_err(|_| invalid())?;
+        let Some(TypeData::Interface(interface)) =
+            store.type_payload(owner_type).map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        if !interface.base_types_resolved
+            || interface.resolved_base_types.as_ref().is_none_or(|bases| {
+                bases.len() != provenance.bases.len()
+                    || bases
+                        .iter()
+                        .zip(&provenance.bases)
+                        .any(|(base, (_, retained))| base != retained)
+            })
+        {
+            return Err(invalid());
+        }
+        let index = header
+            .bases()
+            .iter()
+            .position(|base| {
+                base.declaration() == owner
+                    && base.clause() == clause
+                    && base.node() == reference
+                    && base.expression() == node
+            })
+            .ok_or_else(invalid)?;
+        let &(symbol, type_) = provenance.bases.get(index).ok_or_else(invalid)?;
+        if header.bases()[index].symbol() != symbol {
+            return Err(invalid());
+        }
+        let symbol = self.merged_artifact_symbol(node, symbol)?;
+        for cached_node in [reference, node] {
+            if let Some(links) = store.type_node_links(cached_node)
+                && *links != TypeNodeLinks::default()
+                && *links
+                    != (TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        ..TypeNodeLinks::default()
+                    })
+            {
+                return Err(invalid());
+            }
+            if let Some(cached) = store
+                .symbol_node_links(cached_node)
+                .and_then(|links| links.resolved_symbol)
+                && self
+                    .merged_artifact_symbol(cached_node, cached)
+                    .map_err(|_| invalid())?
+                    != symbol
+            {
+                return Err(invalid());
+            }
+        }
+        self.validate_artifact_type(node, type_)?;
+        Ok(Some((type_, symbol)))
+    }
+
     fn heritage_artifact_target(
         &self,
         node: NodeRef,
     ) -> Result<Option<(TypeId, SemanticSymbolId)>, CanonicalArtifactQueryError> {
+        if let Some(target) = self.source_alias_interface_heritage_artifact_target(node)? {
+            return Ok(Some(target));
+        }
         let (arena, bound, record) = self.validated_artifact_node(node)?;
         let Some(reference_id) = record.parent else {
             return Ok(None);
@@ -4720,6 +4915,520 @@ fn supports_symbol_location(data: &NodeData) -> bool {
                 | NodeData::NamespaceImport(_)
                 | NodeData::SourceFile(_)
         )
+}
+
+#[cfg(test)]
+mod source_alias_heritage_tests {
+    use ts_ast::{FileId, NodeData, NodeRef};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName, SemanticSymbolId,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
+
+    use super::{CanonicalArtifactQueryError, CanonicalCheckerContext};
+    use crate::semantic::{CanonicalCheckerOptions, SymbolNodeLinks, TypeId, TypeNodeLinks};
+
+    const FILES: [FileId; 2] = [FileId::new(203_480), FileId::new(203_481)];
+
+    fn inputs() -> [ParseResult; 2] {
+        [
+            parse_source_file(concat!(
+                "interface Array<T> {} interface ReadonlyArray<T> {}\n",
+                "interface Root { root: number; }\n",
+                "interface Merged extends Root { own: boolean; }\n",
+            )),
+            parse_source_file(concat!(
+                "type Added = { value: string };\n",
+                "type EmptyOne = string extends string ? {} : { unusedOne: number };\n",
+                "type EmptyTwo = number extends number ? {} : { unusedTwo: string };\n",
+                "interface Merged extends Added {}\n",
+                "interface Merged extends Root {}\n",
+                "interface Merged extends EmptyOne, Added {}\n",
+                "interface Separate extends EmptyTwo { separate: number; }\n",
+            )),
+        ]
+    }
+
+    fn context(parsed: &[ParseResult; 2]) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        for (index, (file, parsed)) in FILES.into_iter().zip(parsed).enumerate() {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(if index == 0 {
+                            "\"/lib/lib.alias-base.d.ts\""
+                        } else {
+                            "\"/project/alias-base.d.ts\""
+                        }),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        index == 0,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            FILES
+                .into_iter()
+                .zip(parsed)
+                .map(|(file, parsed)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn owner(
+        checker: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        expected: &str,
+    ) -> (NodeRef, SemanticSymbolId) {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let name = match &record.data {
+                    NodeData::InterfaceDeclaration(data) => data.name,
+                    NodeData::TypeAliasDeclaration(data) => data.name,
+                    _ => return None,
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(name)?.data else {
+                    return None;
+                };
+                if name.text != expected {
+                    return None;
+                }
+                let declaration = NodeRef::new(parsed.arena.id(), file, node);
+                let symbol = checker.file(file)?.1.symbol(declaration)?;
+                Some((declaration, checker.store().get_merged_symbol(symbol)?))
+            })
+            .unwrap_or_else(|| panic!("missing source owner {expected}"))
+    }
+
+    fn references(parsed: &[ParseResult; 2], expected: &str) -> Vec<(NodeRef, NodeRef)> {
+        let mut references = Vec::new();
+        for (file, parsed) in FILES.into_iter().zip(parsed) {
+            let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+            else {
+                unreachable!()
+            };
+            for declaration in &source.statements.nodes {
+                let NodeData::InterfaceDeclaration(data) =
+                    &parsed.arena.get(*declaration).unwrap().data
+                else {
+                    continue;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(data.name).unwrap().data else {
+                    unreachable!()
+                };
+                if name.text != expected {
+                    continue;
+                }
+                for clause in &data.heritage_clauses.as_ref().unwrap().nodes {
+                    let NodeData::HeritageClause(data) = &parsed.arena.get(*clause).unwrap().data
+                    else {
+                        unreachable!()
+                    };
+                    for node in &data.types.nodes {
+                        let NodeData::ExpressionWithTypeArguments(data) =
+                            &parsed.arena.get(*node).unwrap().data
+                        else {
+                            unreachable!()
+                        };
+                        references.push((
+                            NodeRef::new(parsed.arena.id(), file, *node),
+                            NodeRef::new(parsed.arena.id(), file, data.expression),
+                        ));
+                    }
+                }
+            }
+        }
+        references
+    }
+
+    fn snapshot(checker: &CanonicalCheckerContext<'_>) -> String {
+        format!("{:#?}", (checker.store(), checker.diagnostics()))
+    }
+
+    fn assert_unavailable(
+        checker: &mut CanonicalCheckerContext<'_>,
+        references: &[(NodeRef, NodeRef)],
+        owner_type: TypeId,
+    ) {
+        let before = snapshot(checker);
+        for _ in 0..2 {
+            for &(_, name) in references {
+                let error = CanonicalArtifactQueryError::InvalidType {
+                    node: name,
+                    type_: owner_type,
+                };
+                assert_eq!(checker.heritage_artifact_target(name), Err(error));
+                assert_eq!(checker.get_symbol_at_location(name), Err(error));
+                assert_eq!(checker.get_type_at_location(name), Err(error));
+            }
+            assert_eq!(snapshot(checker), before);
+        }
+    }
+
+    fn assert_ready(
+        checker: &mut CanonicalCheckerContext<'_>,
+        rows: &[(NodeRef, SemanticSymbolId, TypeId)],
+    ) {
+        let before = snapshot(checker);
+        for type_first in [false, true] {
+            for &(name, symbol, type_) in rows {
+                assert_eq!(
+                    checker.heritage_artifact_target(name),
+                    Ok(Some((type_, symbol)))
+                );
+                if type_first {
+                    assert_eq!(checker.get_type_at_location(name), Ok(type_));
+                }
+                assert_eq!(checker.get_symbol_at_location(name), Ok(Some(symbol)));
+                assert_eq!(checker.get_type_at_location(name), Ok(type_));
+            }
+            assert_eq!(snapshot(checker), before);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep cold headers and complete answers on the same real owners.
+    fn source_alias_heritage_artifacts_keep_merged_slots_and_lexical_symbols() {
+        let parsed = inputs();
+        let merged_references = references(&parsed, "Merged");
+        let separate_references = references(&parsed, "Separate");
+        assert_eq!(merged_references.len(), 5);
+        assert_eq!(separate_references.len(), 1);
+        let mut checker = context(&parsed);
+        let (_, merged) = owner(&checker, &parsed[0], FILES[0], "Merged");
+        let (_, root) = owner(&checker, &parsed[0], FILES[0], "Root");
+        let (_, separate) = owner(&checker, &parsed[1], FILES[1], "Separate");
+        let aliases = ["Added", "EmptyOne", "EmptyTwo"]
+            .map(|name| owner(&checker, &parsed[1], FILES[1], name).1);
+        let derived = checker.get_declared_type_of_symbol(merged).unwrap();
+        let separate_type = checker.get_declared_type_of_symbol(separate).unwrap();
+        assert_ne!(derived, separate_type);
+        let header = checker
+            .store()
+            .source_interface_heritage_header(derived)
+            .unwrap();
+        assert_eq!(
+            header
+                .bases()
+                .iter()
+                .map(|base| (base.node(), base.expression()))
+                .collect::<Vec<_>>(),
+            merged_references
+        );
+        assert!(
+            checker
+                .store()
+                .direct_interface_heritage_provenance(derived)
+                .is_none()
+        );
+        assert_unavailable(&mut checker, &merged_references, derived);
+        assert_unavailable(&mut checker, &separate_references, separate_type);
+        for alias in aliases {
+            assert!(
+                checker
+                    .store()
+                    .type_alias_links(alias)
+                    .is_none_or(|links| links.declared_type.is_none())
+            );
+        }
+        for file in FILES {
+            checker.check_source_file(file).unwrap();
+        }
+        assert!(checker.diagnostics().is_empty());
+        let provenance = checker
+            .store()
+            .direct_interface_heritage_provenance(derived)
+            .unwrap();
+        let symbols = [root, aliases[0], root, aliases[1], aliases[0]];
+        assert_eq!(
+            provenance
+                .bases
+                .iter()
+                .map(|(symbol, _)| *symbol)
+                .collect::<Vec<_>>(),
+            symbols
+        );
+        let empty = checker
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .empty_type_literal_type;
+        assert_eq!(provenance.bases[3].1, empty);
+        let separate_provenance = checker
+            .store()
+            .direct_interface_heritage_provenance(separate_type)
+            .unwrap();
+        assert_eq!(separate_provenance.bases, [(aliases[2], empty)]);
+        assert_ne!(aliases[1], aliases[2]);
+        assert_ne!(provenance.bases[0].1, provenance.bases[1].1);
+        assert_eq!(provenance.bases[1], provenance.bases[4]);
+        assert_ne!(
+            checker
+                .store()
+                .type_payload(provenance.bases[1].1)
+                .unwrap()
+                .symbol(),
+            Some(aliases[0])
+        );
+        let mut rows = merged_references
+            .iter()
+            .zip(&provenance.bases)
+            .map(|((_, name), (symbol, type_))| (*name, *symbol, *type_))
+            .collect::<Vec<_>>();
+        rows.extend(
+            separate_references
+                .iter()
+                .zip(&separate_provenance.bases)
+                .map(|((_, name), (symbol, type_))| (*name, *symbol, *type_)),
+        );
+        assert_ready(&mut checker, &rows);
+        let reversed = rows.iter().rev().copied().collect::<Vec<_>>();
+        assert_ready(&mut checker, &reversed);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep each real proof mutation beside its rejection and restoration.
+    fn source_alias_heritage_artifacts_reject_stale_proof_and_cache_shortcuts() {
+        let parsed = inputs();
+        let merged_references = references(&parsed, "Merged");
+        let separate_references = references(&parsed, "Separate");
+        let mut checker = context(&parsed);
+        let (_, merged) = owner(&checker, &parsed[0], FILES[0], "Merged");
+        let (_, root_symbol) = owner(&checker, &parsed[0], FILES[0], "Root");
+        let (_, separate) = owner(&checker, &parsed[1], FILES[1], "Separate");
+        let (added, added_symbol) = owner(&checker, &parsed[1], FILES[1], "Added");
+        let (first_empty, first_empty_symbol) = owner(&checker, &parsed[1], FILES[1], "EmptyOne");
+        let (_, second_empty_symbol) = owner(&checker, &parsed[1], FILES[1], "EmptyTwo");
+        for file in FILES {
+            checker.check_source_file(file).unwrap();
+        }
+        assert!(checker.diagnostics().is_empty());
+        let derived = checker.get_declared_type_of_symbol(merged).unwrap();
+        let separate_type = checker.get_declared_type_of_symbol(separate).unwrap();
+        let provenance = checker
+            .store()
+            .direct_interface_heritage_provenance(derived)
+            .unwrap()
+            .clone();
+        let separate_provenance = checker
+            .store()
+            .direct_interface_heritage_provenance(separate_type)
+            .unwrap()
+            .clone();
+        let mut rows = merged_references
+            .iter()
+            .zip(&provenance.bases)
+            .map(|((_, name), (symbol, type_))| (*name, *symbol, *type_))
+            .collect::<Vec<_>>();
+        rows.extend(
+            separate_references
+                .iter()
+                .zip(&separate_provenance.bases)
+                .map(|((_, name), (symbol, type_))| (*name, *symbol, *type_)),
+        );
+        let bases = provenance
+            .bases
+            .iter()
+            .map(|(_, type_)| *type_)
+            .collect::<Vec<_>>();
+        assert_ready(&mut checker, &rows);
+
+        let mut swapped = bases.clone();
+        swapped.swap(0, 1);
+        for damaged in [Some(swapped), Some(bases[..bases.len() - 1].to_vec()), None] {
+            assert!(checker.store_mut_for_test().set_interface_base_resolution(
+                derived,
+                damaged.is_some(),
+                None,
+                damaged,
+            ));
+            assert_unavailable(&mut checker, &merged_references, derived);
+            assert!(checker.store_mut_for_test().set_interface_base_resolution(
+                derived,
+                true,
+                None,
+                Some(bases.clone()),
+            ));
+            assert_ready(&mut checker, &rows);
+        }
+
+        let original_alias = checker
+            .store()
+            .type_alias_links(added_symbol)
+            .unwrap()
+            .clone();
+        let mut changed_alias = original_alias.clone();
+        changed_alias.declared_type = Some(bases[0]);
+        assert!(
+            checker
+                .store_mut_for_test()
+                .set_type_alias_links(added_symbol, changed_alias)
+        );
+        assert_unavailable(&mut checker, &merged_references, derived);
+        assert!(
+            checker
+                .store_mut_for_test()
+                .set_type_alias_links(added_symbol, original_alias)
+        );
+        assert_ready(&mut checker, &rows);
+
+        for declaration in [added, first_empty] {
+            let NodeData::TypeAliasDeclaration(alias) =
+                &parsed[1].arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let root = NodeRef::new(declaration.arena, declaration.file, alias.type_);
+            let original = checker.store().type_node_links(root).unwrap().clone();
+            let mut changed = original.clone();
+            changed.resolved_type = Some(bases[0]);
+            assert!(
+                checker
+                    .store_mut_for_test()
+                    .set_type_node_links(root, changed)
+            );
+            assert_unavailable(&mut checker, &merged_references, derived);
+            assert!(
+                checker
+                    .store_mut_for_test()
+                    .set_type_node_links(root, original)
+            );
+            assert_ready(&mut checker, &rows);
+        }
+
+        let added_row = provenance
+            .source
+            .as_ref()
+            .unwrap()
+            .bases()
+            .iter()
+            .find(|base| base.symbol() == added_symbol)
+            .unwrap();
+        let added_reference = [(added_row.node(), added_row.expression())];
+        for node in [added_row.node(), added_row.expression()] {
+            let original = checker
+                .store()
+                .type_node_links(node)
+                .cloned()
+                .unwrap_or_default();
+            assert!(checker.store_mut_for_test().set_type_node_links(
+                node,
+                TypeNodeLinks {
+                    resolved_type: Some(bases[0]),
+                    ..original.clone()
+                },
+            ));
+            assert_unavailable(&mut checker, &added_reference, derived);
+            assert!(
+                checker
+                    .store_mut_for_test()
+                    .set_type_node_links(node, original)
+            );
+            assert_ready(&mut checker, &rows);
+
+            let original = checker
+                .store()
+                .symbol_node_links(node)
+                .cloned()
+                .unwrap_or_default();
+            assert!(checker.store_mut_for_test().set_symbol_node_links(
+                node,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(second_empty_symbol),
+                },
+            ));
+            assert_unavailable(&mut checker, &added_reference, derived);
+            assert!(
+                checker
+                    .store_mut_for_test()
+                    .set_symbol_node_links(node, original)
+            );
+            assert_ready(&mut checker, &rows);
+        }
+
+        let source = checker.source_file(FILES[1]).unwrap();
+        let locals = checker.file(FILES[1]).unwrap().1.locals(source).unwrap();
+        let original = checker
+            .store()
+            .symbol_table(locals)
+            .unwrap()
+            .get_source("EmptyOne")
+            .unwrap();
+        assert_eq!(
+            checker.store().get_merged_symbol(original),
+            Some(first_empty_symbol)
+        );
+        assert_eq!(bases[3], separate_provenance.bases[0].1);
+        assert_eq!(
+            checker.store_mut_for_test().insert_symbol(
+                locals,
+                EscapedName::source("EmptyOne"),
+                second_empty_symbol,
+            ),
+            Some(Some(original))
+        );
+        assert_unavailable(&mut checker, &merged_references, derived);
+        assert_eq!(
+            checker.store_mut_for_test().insert_symbol(
+                locals,
+                EscapedName::source("EmptyOne"),
+                original,
+            ),
+            Some(Some(second_empty_symbol))
+        );
+        assert_ready(&mut checker, &rows);
+
+        let written_owner = added_row.declaration();
+        let raw_owner = checker
+            .file(written_owner.file)
+            .unwrap()
+            .1
+            .symbol(written_owner)
+            .unwrap();
+        assert_ne!(raw_owner, merged);
+        assert_eq!(checker.store().get_merged_symbol(raw_owner), Some(merged));
+        assert_eq!(
+            checker
+                .store_mut_for_test()
+                .record_merged_symbol(root_symbol, raw_owner),
+            Ok(Some(merged))
+        );
+        let error = CanonicalArtifactQueryError::InvalidSymbol {
+            node: written_owner,
+            symbol: root_symbol,
+        };
+        let damaged = snapshot(&checker);
+        for _ in 0..2 {
+            let name = added_row.expression();
+            assert_eq!(checker.heritage_artifact_target(name), Err(error));
+            assert_eq!(checker.get_symbol_at_location(name), Err(error));
+            assert_eq!(checker.get_type_at_location(name), Err(error));
+            assert_eq!(snapshot(&checker), damaged);
+        }
+        assert_eq!(
+            checker
+                .store_mut_for_test()
+                .record_merged_symbol(merged, raw_owner),
+            Ok(Some(root_symbol))
+        );
+        assert_ready(&mut checker, &rows);
+    }
 }
 
 #[cfg(test)]

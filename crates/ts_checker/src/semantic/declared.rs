@@ -91,6 +91,7 @@ pub struct DeclaredTypeHost<'a> {
     sources: DeclaredTypeSources<'a>,
     name_resolution: DeclaredNameResolution,
     module_resolutions: Option<&'a CanonicalModuleResolutionManifest>,
+    program_file_order: Option<&'a [FileId]>,
 }
 
 /// A source rejected while constructing a [`DeclaredTypeHost`].
@@ -199,6 +200,7 @@ impl<'a> DeclaredTypeHost<'a> {
             sources: DeclaredTypeSources::Registry(sources),
             name_resolution: DeclaredNameResolution::GlobalsMerged(completion.name_resolution()),
             module_resolutions: None,
+            program_file_order: None,
         })
     }
 
@@ -252,6 +254,7 @@ impl<'a> DeclaredTypeHost<'a> {
             sources: DeclaredTypeSources::Retained(retained),
             name_resolution,
             module_resolutions: None,
+            program_file_order: None,
         })
     }
 
@@ -265,6 +268,20 @@ impl<'a> DeclaredTypeHost<'a> {
 
     pub(super) const fn module_resolutions(&self) -> Option<&'a CanonicalModuleResolutionManifest> {
         self.module_resolutions
+    }
+
+    /// Borrows the canonical context's original Program order.
+    pub(super) fn with_program_file_order(mut self, order: &'a [FileId]) -> Self {
+        self.program_file_order = Some(order);
+        self
+    }
+
+    pub(super) const fn program_file_order(&self) -> Option<&'a [FileId]> {
+        self.program_file_order
+    }
+
+    pub(super) fn has_program_file(&self, file: FileId) -> bool {
+        self.sources.get(file).is_some()
     }
 
     pub(super) fn alias_target_host<'host>(
@@ -385,6 +402,18 @@ pub enum DeclaredTypeUnavailable {
         symbol: SemanticSymbolId,
         declared_type: TypeId,
     },
+    InvalidGlobalThisSymbol(SemanticSymbolId),
+    GlobalThisProgramOrderUnavailable(TypeId),
+    InvalidGlobalThisMembers(TypeId),
+    InvalidGlobalThisMember {
+        receiver: TypeId,
+        symbol: SemanticSymbolId,
+    },
+    UnsupportedGlobalThisMember {
+        receiver: TypeId,
+        symbol: SemanticSymbolId,
+    },
+    GlobalThisCapacity(TypeId),
 }
 
 /// Exact declared-type failure domain for the currently installed cut.

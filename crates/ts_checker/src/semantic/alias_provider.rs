@@ -91,6 +91,121 @@ pub struct ProductionAliasTargetHost<'source, 'arena, 'manifest> {
     module_resolutions: &'manifest CanonicalModuleResolutionManifest,
 }
 
+/// Source and export proof only. The current query resolves aliases and demands types.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct OrdinaryImportTypeSource {
+    import_type: NodeRef,
+    argument: NodeRef,
+    specifier: NodeRef,
+    qualifier: NodeRef,
+    specifier_text: String,
+    export_name: String,
+    meaning: SymbolFlags,
+    resolution: CanonicalResolvedModule,
+    module: SemanticSymbolId,
+    export: Option<SemanticSymbolId>,
+}
+
+/// One source-derived alias edge. The alias kernel owns resolution and publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct OrdinaryImportAliasHop {
+    alias: SemanticSymbolId,
+    declaration: NodeRef,
+    immediate_target: SemanticSymbolId,
+    syntactic_type_only: Option<NodeRef>,
+}
+
+impl OrdinaryImportAliasHop {
+    pub(super) const fn alias(self) -> SemanticSymbolId {
+        self.alias
+    }
+
+    pub(super) const fn declaration(self) -> NodeRef {
+        self.declaration
+    }
+
+    pub(super) const fn immediate_target(self) -> SemanticSymbolId {
+        self.immediate_target
+    }
+
+    pub(super) const fn syntactic_type_only(self) -> Option<NodeRef> {
+        self.syntactic_type_only
+    }
+}
+
+impl OrdinaryImportTypeSource {
+    pub(super) const fn import_type(&self) -> NodeRef {
+        self.import_type
+    }
+
+    pub(super) const fn argument(&self) -> NodeRef {
+        self.argument
+    }
+
+    pub(super) const fn specifier(&self) -> NodeRef {
+        self.specifier
+    }
+
+    pub(super) const fn qualifier(&self) -> NodeRef {
+        self.qualifier
+    }
+
+    pub(super) fn export_name(&self) -> &str {
+        &self.export_name
+    }
+
+    pub(super) const fn meaning(&self) -> SymbolFlags {
+        self.meaning
+    }
+
+    pub(super) const fn resolution(&self) -> CanonicalResolvedModule {
+        self.resolution
+    }
+
+    pub(super) const fn module(&self) -> SemanticSymbolId {
+        self.module
+    }
+
+    /// The selected export can be an alias. It is not the resolved target.
+    pub(super) const fn export(&self) -> Option<SemanticSymbolId> {
+        self.export
+    }
+
+    pub(super) fn is_current(
+        &self,
+        store: &super::CanonicalTypeMapperStore,
+        host: &super::DeclaredTypeHost<'_>,
+        aliases: &ProductionAliasTargetHost<'_, '_, '_>,
+    ) -> Result<bool, OrdinaryImportTypeSourceError> {
+        aliases
+            .ordinary_import_type_source(store, host, self.import_type)
+            .map(|current| current == *self)
+    }
+}
+
+/// Only source diagnostics are distinct from unavailable or damaged providers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum OrdinaryImportTypeSourceError {
+    NonLiteralArgument(NodeRef),
+    UnsupportedSyntax(NodeRef),
+    Target(CanonicalAliasTargetUnavailable),
+    Exports(super::module_exports::CanonicalModuleExportQueryError),
+}
+
+impl From<CanonicalAliasTargetUnavailable> for OrdinaryImportTypeSourceError {
+    fn from(error: CanonicalAliasTargetUnavailable) -> Self {
+        Self::Target(error)
+    }
+}
+
+impl From<super::module_exports::CanonicalModuleExportQueryError>
+    for OrdinaryImportTypeSourceError
+{
+    fn from(error: super::module_exports::CanonicalModuleExportQueryError) -> Self {
+        Self::Exports(error)
+    }
+}
+
 /// Source proof for a named import of an ambient value's own declared method.
 /// Rebuilding it checks the manifest and bound declarations, not warm value caches.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1785,6 +1900,406 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             return Err(CanonicalAliasTargetUnavailable::InvalidAliasLinks(alias));
         }
         Ok(DisplayAliasTarget::Symbol(namespace))
+    }
+
+    /// Proves a literal TypeScript import request without resolving an alias or value.
+    #[allow(clippy::too_many_lines)] // Syntax, manifest identity, and the complete export graph share one proof.
+    pub(super) fn ordinary_import_type_source(
+        &self,
+        store: &super::CanonicalTypeMapperStore,
+        host: &super::DeclaredTypeHost<'_>,
+        import_type: NodeRef,
+    ) -> Result<OrdinaryImportTypeSource, OrdinaryImportTypeSourceError> {
+        if store.id() != self.store {
+            return Err(CanonicalAliasTargetUnavailable::ForeignStore {
+                expected: self.store,
+                actual: store.id(),
+            }
+            .into());
+        }
+        let invalid = || CanonicalAliasTargetUnavailable::MalformedDeclaration(import_type);
+        let checked = |node: NodeRef| {
+            let result = self.checked_node(store, node)?;
+            let current = result.0;
+            let parent = current
+                .parent
+                .map(|parent| {
+                    super::SourceNodeParent::Parent(NodeRef::new(node.arena, node.file, parent))
+                })
+                .unwrap_or(super::SourceNodeParent::Root);
+            if store.source_node_kind(node) != Some(current.kind)
+                || store.source_node_parent(node) != Some(parent)
+            {
+                return Err(invalid());
+            }
+            Ok(result)
+        };
+        let (record, source) = checked(import_type)?;
+        let NodeData::ImportTypeNode(import) = &record.data else {
+            return Err(invalid().into());
+        };
+        if record.kind != SyntaxKind::ImportType || record.flags.0 != 0 {
+            return Err(invalid().into());
+        }
+        if source
+            .bound
+            .source_facts()
+            .is_none_or(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
+        {
+            return Err(OrdinaryImportTypeSourceError::UnsupportedSyntax(
+                import_type,
+            ));
+        }
+        let argument = NodeRef::new(import_type.arena, import_type.file, import.argument);
+        let (argument_record, _) = checked(argument)?;
+        if argument_record.parent != Some(import_type.node)
+            || argument_record.flags.0 != 0
+            || argument_record.range.start < record.range.start
+            || argument_record.range.end > record.range.end
+        {
+            return Err(invalid().into());
+        }
+        let NodeData::LiteralTypeNode(literal) = &argument_record.data else {
+            return Err(OrdinaryImportTypeSourceError::NonLiteralArgument(argument));
+        };
+        let specifier = NodeRef::new(import_type.arena, import_type.file, literal.literal);
+        let (specifier_record, _) = checked(specifier)?;
+        if specifier_record.parent != Some(argument.node)
+            || specifier_record.flags.0 != 0
+            || specifier_record.range.start < argument_record.range.start
+            || specifier_record.range.end > argument_record.range.end
+        {
+            return Err(invalid().into());
+        }
+        let NodeData::StringLiteral(string) = &specifier_record.data else {
+            return Err(OrdinaryImportTypeSourceError::NonLiteralArgument(argument));
+        };
+        if string.token_flags.0 != 0 {
+            return Err(invalid().into());
+        }
+        if import.attributes.is_some() || import.type_arguments.is_some() {
+            return Err(OrdinaryImportTypeSourceError::UnsupportedSyntax(
+                import_type,
+            ));
+        }
+        let qualifier = import
+            .qualifier
+            .map(|node| NodeRef::new(import_type.arena, import_type.file, node))
+            .ok_or(OrdinaryImportTypeSourceError::UnsupportedSyntax(
+                import_type,
+            ))?;
+        let (qualifier_record, _) = checked(qualifier)?;
+        if qualifier_record.parent != Some(import_type.node)
+            || qualifier_record.flags.0 != 0
+            || qualifier_record.range.start < argument_record.range.end
+            || qualifier_record.range.end > record.range.end
+        {
+            return Err(invalid().into());
+        }
+        let NodeData::Identifier(name) = &qualifier_record.data else {
+            return Err(OrdinaryImportTypeSourceError::UnsupportedSyntax(
+                import_type,
+            ));
+        };
+        if name.text.is_empty() || name.flow_node.is_some() {
+            return Err(invalid().into());
+        }
+        let import_children = [argument, qualifier];
+        let argument_children = [specifier];
+        for (node, expected) in [
+            (import_type, import_children.as_slice()),
+            (argument, argument_children.as_slice()),
+            (specifier, [].as_slice()),
+            (qualifier, [].as_slice()),
+        ] {
+            if store.source_direct_children(node).is_none_or(|children| {
+                children.len() != expected.len()
+                    || expected.iter().any(|child| !children.contains(child))
+            }) {
+                return Err(invalid().into());
+            }
+        }
+        let resolution = self.resolved_module(import_type, specifier, store)?;
+        let module = self.direct_source_module(store, import_type, resolution, true)?;
+        let export = super::module_exports::get_module_export_by_name(
+            store, host, self, module, &name.text,
+        )?;
+        Ok(OrdinaryImportTypeSource {
+            import_type,
+            argument,
+            specifier,
+            qualifier,
+            specifier_text: string.text.clone(),
+            export_name: name.text.clone(),
+            meaning: if import.is_type_of {
+                SymbolFlags::VALUE
+            } else {
+                SymbolFlags::TYPE
+            },
+            resolution,
+            module,
+            export,
+        })
+    }
+
+    /// Reads one named alias edge without trusting its cached target or publishing links.
+    #[allow(clippy::too_many_lines)] // Source ownership and the exact import/export path form one proof.
+    pub(super) fn ordinary_import_alias_hop(
+        &self,
+        store: &super::CanonicalTypeMapperStore,
+        host: &super::DeclaredTypeHost<'_>,
+        alias: SemanticSymbolId,
+    ) -> Result<OrdinaryImportAliasHop, OrdinaryImportTypeSourceError> {
+        if store.id() != self.store {
+            return Err(CanonicalAliasTargetUnavailable::ForeignStore {
+                expected: self.store,
+                actual: store.id(),
+            }
+            .into());
+        }
+        let invalid = || CanonicalAliasTargetUnavailable::InvalidAliasLinks(alias);
+        let declaration = self.alias_declaration(store, alias)?;
+        let (record, source) = self.checked_node(store, declaration)?;
+        let source_file = source.bound.source_file();
+        if source.bound.source_facts().is_none_or(|facts| {
+            !facts.is_external_module() || facts.is_common_js_module() || facts.is_javascript_file()
+        }) {
+            return Err(
+                CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(declaration).into(),
+            );
+        }
+        let (name, imported_name, is_import) = match &record.data {
+            NodeData::ImportSpecifier(data)
+                if data.symbol.is_none() && data.local_symbol.is_none() && data.facts == 0 =>
+            {
+                (data.name, data.property_name.unwrap_or(data.name), true)
+            }
+            NodeData::ExportSpecifier(data)
+                if data.symbol.is_none() && data.local_symbol.is_none() && data.facts == 0 =>
+            {
+                (data.name, data.property_name.unwrap_or(data.name), false)
+            }
+            _ => {
+                return Err(
+                    CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(declaration)
+                        .into(),
+                );
+            }
+        };
+        let name_text = module_export_name(source.arena, name).ok_or_else(invalid)?;
+        let module = source.bound.symbol(source_file).ok_or_else(invalid)?;
+        let symbol = store.symbol(alias).ok_or_else(invalid)?;
+        if record.flags.0 != 0
+            || symbol.flags() != SymbolFlags::ALIAS
+            || symbol.check_flags() != CheckFlags::NONE
+            || symbol.declarations() != Some(&[declaration])
+            || symbol.value_declaration().is_some()
+            || symbol.members().is_some()
+            || symbol.exports().is_some()
+            || symbol.export_symbol().is_some()
+            || symbol.parent() != if is_import { None } else { Some(module) }
+            || symbol.name().as_utf8() != Some(name_text)
+            || source.bound.symbol(declaration) != Some(alias)
+            || source.bound.container(declaration) != Some(source_file)
+            || store.get_merged_symbol(alias) != Some(alias)
+            || !store.source_symbol_declarations_match(alias)
+        {
+            return Err(invalid().into());
+        }
+        for name in [name, imported_name] {
+            let name = NodeRef::new(declaration.arena, declaration.file, name);
+            let (name_record, _) = self.checked_node(store, name)?;
+            if name_record.parent != Some(declaration.node)
+                || store.source_node_parent(name)
+                    != Some(super::SourceNodeParent::Parent(declaration))
+                || store.source_node_kind(name) != Some(name_record.kind)
+                || name_record.flags.0 != 0
+                || name_record.range.start < record.range.start
+                || name_record.range.end > record.range.end
+                || !matches!(&name_record.data,
+                    NodeData::Identifier(data) if !data.text.is_empty() && data.flow_node.is_none())
+                    && !matches!(&name_record.data,
+                        NodeData::StringLiteral(data) if !data.text.is_empty() && data.token_flags.0 == 0)
+            {
+                return Err(invalid().into());
+            }
+        }
+        let mut current = declaration;
+        let statement = loop {
+            let (node, _) = self.checked_node(store, current)?;
+            let parent = node.parent.ok_or_else(invalid)?;
+            let parent = NodeRef::new(current.arena, current.file, parent);
+            let (parent_record, _) = self.checked_node(store, parent)?;
+            if store.source_node_kind(current) != Some(node.kind)
+                || store.source_node_parent(current)
+                    != Some(super::SourceNodeParent::Parent(parent))
+                || node.flags.0 != 0
+                || node.range.start < parent_record.range.start
+                || node.range.end > parent_record.range.end
+                || store.source_direct_children(parent).is_none_or(|children| {
+                    children.iter().filter(|child| **child == current).count() != 1
+                })
+            {
+                return Err(invalid().into());
+            }
+            if parent == source_file {
+                break node;
+            }
+            current = parent;
+        };
+        let valid_statement = match &statement.data {
+            NodeData::ImportDeclaration(data) if is_import => {
+                data.attributes.is_none()
+                    && data.modifiers.is_none()
+                    && data.facts == 0
+                    && data.flow_node.is_none()
+                    && data.symbol.is_none()
+            }
+            NodeData::ExportDeclaration(data) if !is_import => {
+                data.attributes.is_none()
+                    && data.modifiers.is_none()
+                    && data.facts == 0
+                    && data.flow_node.is_none()
+                    && data.symbol.is_none()
+            }
+            _ => false,
+        };
+        if !valid_statement {
+            return Err(
+                CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(declaration).into(),
+            );
+        }
+        let own_export =
+            super::module_exports::get_module_export_by_name(store, host, self, module, name_text)?;
+        if !is_import && own_export != Some(alias) {
+            return Err(invalid().into());
+        }
+        if is_import
+            && self.ordinary_import_local_binding(store, source, declaration, name)? != alias
+        {
+            return Err(invalid().into());
+        }
+        let supported = self.supported_declaration(store, declaration)?;
+        let (immediate_target, type_only) = match &supported {
+            SupportedAliasDeclaration::LocalModuleMember { target, type_only } if !is_import => {
+                if self.ordinary_import_local_binding(store, source, declaration, imported_name)?
+                    != *target
+                {
+                    return Err(invalid().into());
+                }
+                (*target, *type_only)
+            }
+            SupportedAliasDeclaration::NamedModuleMember {
+                specifier,
+                type_only,
+                ..
+            }
+            | SupportedAliasDeclaration::DefaultModuleMember {
+                specifier,
+                type_only,
+            } => {
+                let name = match &supported {
+                    SupportedAliasDeclaration::NamedModuleMember { name, .. } => name.as_str(),
+                    _ => "default",
+                };
+                let resolved = self.resolved_module(declaration, *specifier, store)?;
+                let module = self.direct_source_module(store, declaration, resolved, *type_only)?;
+                let target = super::module_exports::get_module_export_by_name(
+                    store, host, self, module, name,
+                )?
+                .ok_or(CanonicalAliasTargetUnavailable::MissingExport {
+                    declaration,
+                    module,
+                })?;
+                (target, *type_only)
+            }
+            _ => {
+                return Err(
+                    CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(declaration)
+                        .into(),
+                );
+            }
+        };
+        if store.alias_symbol_links(alias).is_some_and(|links| {
+            links
+                .immediate_target
+                .is_some_and(|cached| cached != immediate_target)
+        }) {
+            return Err(invalid().into());
+        }
+        Ok(OrdinaryImportAliasHop {
+            alias,
+            declaration,
+            immediate_target,
+            syntactic_type_only: type_only.then_some(declaration),
+        })
+    }
+
+    /// Checks a local table entry against its retained binder declarations before following it.
+    fn ordinary_import_local_binding(
+        &self,
+        store: &super::CanonicalTypeMapperStore,
+        source: ProductionAliasTargetSource<'_>,
+        declaration: NodeRef,
+        name: NodeId,
+    ) -> Result<SemanticSymbolId, CanonicalAliasTargetUnavailable> {
+        let invalid = || CanonicalAliasTargetUnavailable::UnsupportedLocalExport(declaration);
+        let Some(NodeData::Identifier(name)) = source.arena.get(name).map(|node| &node.data) else {
+            return Err(invalid());
+        };
+        let root = source.bound.source_file();
+        let local = source
+            .bound
+            .locals(root)
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get_source(&name.text))
+            .ok_or_else(invalid)?;
+        let record = store.symbol(local).ok_or_else(invalid)?;
+        if record.name().as_utf8() != Some(name.text.as_str())
+            || record.check_flags() != CheckFlags::NONE
+            || record.parent().is_some()
+            || store.get_merged_symbol(local) != Some(local)
+            || store.source_symbol_flags(local) != Some(record.flags())
+            || !store.source_symbol_declarations_match(local)
+        {
+            return Err(invalid());
+        }
+        let declarations = record
+            .declarations()
+            .filter(|nodes| !nodes.is_empty())
+            .ok_or_else(invalid)?;
+        let target = record.export_symbol().unwrap_or(local);
+        if store.get_merged_symbol(target) != Some(target) {
+            return Err(invalid());
+        }
+        for &node in declarations {
+            if source.bound.container(node) != Some(root)
+                || source.bound.symbol(node) != Some(local)
+                    && source.bound.local_symbol(node) != Some(local)
+                || record.export_symbol().is_some()
+                    && (source.bound.local_symbol(node) != Some(local)
+                        || source.bound.symbol(node) != Some(target))
+            {
+                return Err(invalid());
+            }
+            let (node_record, _) = self.checked_node(store, node)?;
+            let declared_name = match &node_record.data {
+                NodeData::VariableDeclaration(data) => Some(data.name),
+                NodeData::FunctionDeclaration(data) => data.name,
+                NodeData::ClassDeclaration(data) => data.name,
+                NodeData::InterfaceDeclaration(data) => Some(data.name),
+                NodeData::TypeAliasDeclaration(data) => Some(data.name),
+                NodeData::EnumDeclaration(data) => Some(data.name),
+                NodeData::ModuleDeclaration(data) => Some(data.name),
+                NodeData::ImportSpecifier(data) => Some(data.name),
+                _ => None,
+            }
+            .ok_or_else(invalid)?;
+            if module_export_name(source.arena, declared_name) != Some(name.text.as_str()) {
+                return Err(invalid());
+            }
+        }
+        Ok(target)
     }
 
     /// Resolves the exact string argument of a source-owned `JSDoc` import type.
@@ -5113,6 +5628,437 @@ mod tests {
             CanonicalAliasResolutionError::TargetUnavailable { reason, .. } => reason,
             other => panic!("expected unavailable target, got {other:?}"),
         }
+    }
+
+    fn ordinary_import_nodes(parsed: &ParseResult, file: FileId) -> Vec<(NodeRef, NodeRef)> {
+        let mut nodes = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::ImportTypeNode(import) = &record.data else {
+                    return None;
+                };
+                let NodeData::LiteralTypeNode(argument) = &parsed.arena.get(import.argument)?.data
+                else {
+                    return None;
+                };
+                Some((
+                    node_ref(parsed, file, node),
+                    node_ref(parsed, file, argument.literal),
+                ))
+            })
+            .collect::<Vec<_>>();
+        nodes.sort_unstable_by_key(|(node, _)| parsed.arena.get(node.node).unwrap().range.start);
+        nodes
+    }
+
+    fn ordinary_import_fixture(
+        files: &[(FileId, &ParseResult, CanonicalModuleState)],
+        input: CanonicalModuleResolutionManifestInput,
+    ) -> (
+        crate::semantic::CanonicalTypeMapperStore,
+        BTreeMap<FileId, BoundFile>,
+        CanonicalModuleResolutionManifest,
+    ) {
+        let (symbols, bound_files) = bindings(files);
+        let manifest = validate_module_resolution_manifest(
+            input,
+            &symbols,
+            files
+                .iter()
+                .map(|(file, parsed, _)| (*file, &parsed.arena, bound_files.get(file).unwrap())),
+        )
+        .unwrap();
+        let mut store = crate::semantic::CanonicalTypeMapperStore::from_symbol_store(symbols);
+        for &(file, parsed, _) in files {
+            assert!(
+                store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .is_some()
+            );
+        }
+        (store, bound_files, manifest)
+    }
+
+    #[test]
+    fn ordinary_import_source_keeps_per_node_resolution_and_meaning_without_writes() {
+        let importer = parsed(concat!(
+            "export type A = import('./target').Item; ",
+            "export type B = typeof import('./target').Item; ",
+            "export type C = import('./target').Item; ",
+            "export type D = import('./target').Item;",
+        ));
+        let target = parsed("export class Item {} ");
+        let importer_file = FileId::new(480);
+        let target_file = FileId::new(481);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (target_file, &target, CanonicalModuleState::External),
+        ];
+        let nodes = ordinary_import_nodes(&importer, importer_file);
+        assert_eq!(nodes.len(), 4);
+        let entries = [
+            CanonicalModuleResolutionEntry::resolved(nodes[0].1, esm(target_file)),
+            CanonicalModuleResolutionEntry::resolved(nodes[1].1, esm(target_file)),
+            CanonicalModuleResolutionEntry::unresolved(nodes[2].1),
+        ];
+        let (store, bound_files, manifest) =
+            ordinary_import_fixture(&files, CanonicalModuleResolutionManifestInput::new(entries));
+        let aliases =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let host = crate::semantic::DeclaredTypeHost::new(sources(&files, &bound_files)).unwrap();
+        let before = format!("{store:?}");
+        for (index, meaning) in [(0, SymbolFlags::TYPE), (1, SymbolFlags::VALUE)] {
+            let proof = aliases
+                .ordinary_import_type_source(&store, &host, nodes[index].0)
+                .unwrap();
+            assert_eq!(proof.import_type(), nodes[index].0);
+            assert_eq!(proof.specifier(), nodes[index].1);
+            assert_eq!(proof.meaning(), meaning);
+            assert_eq!(proof.export_name(), "Item");
+            assert_eq!(proof.module(), source_module(&bound_files, target_file));
+            assert_eq!(proof.resolution().target_file(), target_file);
+            assert_eq!(
+                proof.resolution().usage_mode(),
+                CanonicalModuleResolutionMode::Esm
+            );
+            assert_eq!(
+                proof.resolution().target_mode(),
+                CanonicalModuleResolutionMode::Esm
+            );
+            assert!(proof.export().is_some());
+            assert_eq!(proof.is_current(&store, &host, &aliases), Ok(true));
+        }
+        for (index, reason) in [
+            (
+                2,
+                CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(nodes[2].1),
+            ),
+            (
+                3,
+                CanonicalAliasTargetUnavailable::ModuleResolutionEntryAbsent(nodes[3].1),
+            ),
+        ] {
+            assert_eq!(
+                aliases.ordinary_import_type_source(&store, &host, nodes[index].0),
+                Err(OrdinaryImportTypeSourceError::Target(reason)),
+            );
+        }
+        let unavailable = CanonicalModuleResolutionManifest::unavailable();
+        let unavailable_aliases =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &unavailable)
+                .unwrap();
+        assert_eq!(
+            unavailable_aliases.ordinary_import_type_source(&store, &host, nodes[0].0),
+            Err(OrdinaryImportTypeSourceError::Target(
+                CanonicalAliasTargetUnavailable::ModuleResolutionCapabilityUnavailable(nodes[0].1),
+            )),
+        );
+        assert_eq!(format!("{store:?}"), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One retained proof covers the full graph through damage and restoration.
+    fn ordinary_import_source_rechecks_complete_exports_and_raw_alias_ownership() {
+        let importer = parsed(concat!(
+            "export type A = import('./barrel').Choice; ",
+            "export type B = typeof import('./barrel').Choice; ",
+            "export type C = import('./barrel').Missing;",
+        ));
+        let barrel = parsed("export * from './target';");
+        let target =
+            parsed("export class Item {} export { Item as Choice }; export const Other = 1;");
+        let importer_file = FileId::new(482);
+        let barrel_file = FileId::new(483);
+        let target_file = FileId::new(484);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (barrel_file, &barrel, CanonicalModuleState::External),
+            (target_file, &target, CanonicalModuleState::External),
+        ];
+        let nodes = ordinary_import_nodes(&importer, importer_file);
+        assert_eq!(nodes.len(), 3);
+        let mut entries = nodes
+            .iter()
+            .map(|(_, string)| CanonicalModuleResolutionEntry::resolved(*string, esm(barrel_file)))
+            .collect::<Vec<_>>();
+        entries.push(CanonicalModuleResolutionEntry::resolved(
+            node_ref(&barrel, barrel_file, module_specifiers(&barrel)[0]),
+            esm(target_file),
+        ));
+        let (mut store, bound_files, manifest) =
+            ordinary_import_fixture(&files, CanonicalModuleResolutionManifestInput::new(entries));
+        let aliases =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let host = crate::semantic::DeclaredTypeHost::new(sources(&files, &bound_files)).unwrap();
+        let raw_alias = alias(
+            &bound_files,
+            alias_declaration_named(&target, target_file, "Choice"),
+        );
+        let proofs = nodes
+            .iter()
+            .map(|(node, _)| {
+                aliases
+                    .ordinary_import_type_source(&store, &host, *node)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(proofs[0].export(), Some(raw_alias));
+        assert_eq!(proofs[1].export(), Some(raw_alias));
+        assert_eq!(proofs[2].export(), None);
+        assert_eq!(store.alias_symbol_links(raw_alias), None);
+        let target_module = source_module(&bound_files, target_file);
+        let table = store.symbol(target_module).unwrap().exports().unwrap();
+        let other = store
+            .symbol_table(table)
+            .unwrap()
+            .get_source("Other")
+            .unwrap();
+        let pristine = format!("{store:?}");
+        assert_eq!(
+            store.insert_symbol(table, EscapedName::source("Other"), raw_alias),
+            Some(Some(other)),
+        );
+        let damaged = format!("{store:?}");
+        for proof in &proofs {
+            for _ in 0..2 {
+                assert!(matches!(
+                    proof.is_current(&store, &host, &aliases),
+                    Err(OrdinaryImportTypeSourceError::Exports(_)),
+                ));
+                assert_eq!(format!("{store:?}"), damaged);
+            }
+        }
+        assert_eq!(
+            store.insert_symbol(table, EscapedName::source("Other"), other),
+            Some(Some(raw_alias)),
+        );
+        for proof in &proofs {
+            assert_eq!(proof.is_current(&store, &host, &aliases), Ok(true));
+        }
+        let raw = store.symbol(raw_alias).unwrap();
+        let (members, exports, parent, export_symbol) = (
+            raw.members(),
+            raw.exports(),
+            raw.parent(),
+            raw.export_symbol(),
+        );
+        assert_eq!(parent, Some(target_module));
+        assert!(store.set_symbol_relationships(
+            raw_alias,
+            members,
+            exports,
+            Some(source_module(&bound_files, barrel_file)),
+            export_symbol,
+        ));
+        let damaged = format!("{store:?}");
+        for proof in &proofs {
+            assert!(matches!(
+                proof.is_current(&store, &host, &aliases),
+                Err(OrdinaryImportTypeSourceError::Exports(_)),
+            ));
+            assert_eq!(format!("{store:?}"), damaged);
+        }
+        assert!(
+            store.set_symbol_relationships(raw_alias, members, exports, parent, export_symbol,)
+        );
+        for proof in &proofs {
+            assert_eq!(proof.is_current(&store, &host, &aliases), Ok(true));
+        }
+        assert_eq!(store.alias_symbol_links(raw_alias), None);
+        assert_eq!(format!("{store:?}"), pristine);
+    }
+
+    #[test]
+    fn ordinary_import_source_keeps_syntax_limits_separate_from_missing_capability() {
+        let importer = parsed(concat!(
+            "export type A = import(123).Item; ",
+            "export type B = import('./target').Item<number>; ",
+            "export type C = import('./target').Nested.Item; ",
+            "export type D = typeof import('./target');",
+        ));
+        let file = FileId::new(485);
+        let files = [(file, &importer, CanonicalModuleState::External)];
+        let (store, bound_files, _) =
+            ordinary_import_fixture(&files, CanonicalModuleResolutionManifestInput::new([]));
+        let manifest = CanonicalModuleResolutionManifest::unavailable();
+        let aliases =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let host = crate::semantic::DeclaredTypeHost::new(sources(&files, &bound_files)).unwrap();
+        let nodes = ordinary_import_nodes(&importer, file);
+        assert_eq!(nodes.len(), 4);
+        let before = format!("{store:?}");
+        for (index, (node, _)) in nodes.into_iter().enumerate() {
+            let NodeData::ImportTypeNode(import) = &importer.arena.get(node.node).unwrap().data
+            else {
+                unreachable!();
+            };
+            let expected = if index == 0 {
+                OrdinaryImportTypeSourceError::NonLiteralArgument(node_ref(
+                    &importer,
+                    file,
+                    import.argument,
+                ))
+            } else {
+                OrdinaryImportTypeSourceError::UnsupportedSyntax(node)
+            };
+            assert_eq!(
+                aliases.ordinary_import_type_source(&store, &host, node),
+                Err(expected),
+            );
+        }
+        assert_eq!(format!("{store:?}"), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Real cold and warm alias hops share the same damage and restore control.
+    fn ordinary_import_alias_hops_reject_wrong_caches_and_local_bindings_before_writes() {
+        let provider = parsed(concat!(
+            "export class Item {} export class Wrong {} ",
+            "export { Item as Choice }; export type { Item as TypeChoice };",
+        ));
+        let barrel = parsed(concat!(
+            "import { Choice as Local } from './provider'; ",
+            "export { Local as Forwarded }; ",
+            "export { Choice as Remote } from './provider'; ",
+            "export { TypeChoice as TypeRemote } from './provider';",
+        ));
+        let provider_file = FileId::new(486);
+        let barrel_file = FileId::new(487);
+        let files = [
+            (provider_file, &provider, CanonicalModuleState::External),
+            (barrel_file, &barrel, CanonicalModuleState::External),
+        ];
+        let entries = module_specifiers(&barrel).into_iter().map(|node| {
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&barrel, barrel_file, node),
+                esm(provider_file),
+            )
+        });
+        let (mut store, bound_files, manifest) =
+            ordinary_import_fixture(&files, CanonicalModuleResolutionManifestInput::new(entries));
+        let mut aliases =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let host = crate::semantic::DeclaredTypeHost::new(sources(&files, &bound_files)).unwrap();
+        let exported = |name| {
+            let module = source_module(&bound_files, provider_file);
+            let table = store.symbol(module).unwrap().exports().unwrap();
+            store.symbol_table(table).unwrap().get_source(name).unwrap()
+        };
+        let item = exported("Item");
+        let wrong = exported("Wrong");
+        let choice = exported("Choice");
+        let type_choice = exported("TypeChoice");
+        let local_declaration = alias_declaration_named(&barrel, barrel_file, "Local");
+        let local = alias(&bound_files, local_declaration);
+        let requests = [
+            (&provider, provider_file, "Choice", item, false),
+            (&provider, provider_file, "TypeChoice", item, true),
+            (&barrel, barrel_file, "Local", choice, false),
+            (&barrel, barrel_file, "Forwarded", local, false),
+            (&barrel, barrel_file, "Remote", choice, false),
+            (&barrel, barrel_file, "TypeRemote", type_choice, false),
+        ];
+        let cold = format!("{store:?}");
+        let proofs = requests.map(|(parsed, file, name, target, type_only)| {
+            let declaration = alias_declaration_named(parsed, file, name);
+            let alias = alias(&bound_files, declaration);
+            let proof = aliases
+                .ordinary_import_alias_hop(&store, &host, alias)
+                .unwrap();
+            assert_eq!(proof.alias(), alias);
+            assert_eq!(proof.declaration(), declaration);
+            assert_eq!(proof.immediate_target(), target);
+            assert_eq!(
+                proof.syntactic_type_only(),
+                type_only.then_some(declaration)
+            );
+            assert_eq!(store.alias_symbol_links(alias), None);
+            assert_eq!(format!("{store:?}"), cold);
+            proof
+        });
+        for proof in &proofs {
+            assert_eq!(
+                CanonicalAliasResolver::new(&mut store, &mut aliases)
+                    .get_immediate_aliased_symbol(proof.alias())
+                    .unwrap(),
+                Some(proof.immediate_target()),
+            );
+            let resolved = CanonicalAliasResolver::new(&mut store, &mut aliases)
+                .resolve_alias(proof.alias())
+                .unwrap();
+            assert_eq!(resolved.target, AliasTargetState::Resolved(item));
+            assert!(resolved.events.is_empty());
+        }
+        let type_marker = proofs[1].declaration();
+        assert_eq!(
+            store
+                .alias_symbol_links(proofs[5].alias())
+                .unwrap()
+                .type_only_declaration,
+            Some(type_marker),
+        );
+        let warm = format!("{store:?}");
+        for proof in &proofs {
+            assert_eq!(
+                aliases.ordinary_import_alias_hop(&store, &host, proof.alias()),
+                Ok(*proof)
+            );
+            assert_eq!(format!("{store:?}"), warm);
+            let saved = store.alias_symbol_links(proof.alias()).unwrap().clone();
+            let mut damaged_links = saved.clone();
+            damaged_links.immediate_target = Some(wrong);
+            assert!(store.set_alias_symbol_links(proof.alias(), damaged_links));
+            let damaged = format!("{store:?}");
+            for _ in 0..2 {
+                assert_eq!(
+                    aliases.ordinary_import_alias_hop(&store, &host, proof.alias()),
+                    Err(OrdinaryImportTypeSourceError::Target(
+                        CanonicalAliasTargetUnavailable::InvalidAliasLinks(proof.alias()),
+                    )),
+                );
+                assert_eq!(format!("{store:?}"), damaged);
+            }
+            assert!(store.set_alias_symbol_links(proof.alias(), saved));
+            assert_eq!(
+                aliases.ordinary_import_alias_hop(&store, &host, proof.alias()),
+                Ok(*proof)
+            );
+            assert_eq!(format!("{store:?}"), warm);
+        }
+        let bound = bound_files.get(&barrel_file).unwrap();
+        let locals = bound.locals(bound.source_file()).unwrap();
+        assert_eq!(
+            store.insert_symbol(locals, EscapedName::source("Local"), wrong),
+            Some(Some(local))
+        );
+        let damaged = format!("{store:?}");
+        for _ in 0..2 {
+            assert_eq!(
+                aliases.ordinary_import_alias_hop(&store, &host, proofs[3].alias()),
+                Err(OrdinaryImportTypeSourceError::Target(
+                    CanonicalAliasTargetUnavailable::UnsupportedLocalExport(
+                        proofs[3].declaration()
+                    ),
+                )),
+            );
+            assert_eq!(format!("{store:?}"), damaged);
+        }
+        assert_eq!(
+            store.insert_symbol(locals, EscapedName::source("Local"), local),
+            Some(Some(wrong))
+        );
+        for proof in &proofs {
+            assert_eq!(
+                aliases.ordinary_import_alias_hop(&store, &host, proof.alias()),
+                Ok(*proof)
+            );
+        }
+        assert_eq!(format!("{store:?}"), warm);
     }
 
     #[test]

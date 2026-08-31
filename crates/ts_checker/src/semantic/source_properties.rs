@@ -43,8 +43,8 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
     CanonicalCheckerRelatedInformation, CanonicalGlobalTypes, CanonicalTypeFormatFlags,
-    CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, SymbolNodeLinks,
-    TypeDisplayUnavailable, TypeId, TypeNodeLinks, ValueSymbolLinks,
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, RelationUnavailable,
+    SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks, ValueSymbolLinks,
     array_types::CanonicalArrayTargets,
     bootstrap::UnionReduction,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
@@ -55,9 +55,11 @@ use super::{
     declared::preflight_node,
     enums,
     formatter::type_to_string_with_host_global_types_and_flags,
+    global_types::GlobalThisMembers,
     instantiate::InstantiationSession,
+    interface_heritage::SourceInterfaceHeritageQueryContext,
     member_resolution::UnionPropertyError,
-    relater::ResolvedOwnProperty,
+    relater::{RelationKind, ResolvedOwnProperty, SourceRelationError},
     source::{PlannedExpression, PlannedExpressionKind, SourceCheckError},
     source_callables::{
         SourceCallableFamily, StoredSourceCallableValidation,
@@ -68,6 +70,7 @@ use super::{
     source_imports::{source_file_namespace_wrapper_member, validated_source_file_namespace_owner},
     spelling::get_spelling_suggestion,
     store::SourceNodeParent,
+    type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions, TypeNodeUnavailable},
     type_records::{StructuredTypeData, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -2809,6 +2812,33 @@ pub(super) fn source_property_type_for_effects(
     .map(|(checked, symbol)| (checked.type_, symbol))
 }
 
+/// Uses the current source query for member demand inside the existing relater.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn relate_source_types_with_global_this(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    source: TypeId,
+    target: TypeId,
+    relation: RelationKind,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<bool, SourceRelationError<DeclaredTypeError>> {
+    let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+    )
+    .map_err(SourceRelationError::Source)?;
+    query
+        .relate_source_types(source, target, relation)
+        .map(|result| result.related())
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn check_direct_source_property_with_source_mode(
     store: &mut CanonicalTypeMapperStore,
@@ -2837,6 +2867,93 @@ fn check_direct_source_property_with_source_mode(
         )
         .map(|checked| (checked, None))
         .map_err(SourcePropertyQueryError::Property);
+    }
+    if plan.class_access.is_none()
+        && !plan.optional
+        && plan.privacy == SourcePropertyPrivacy::Identifier
+        && receiver_type == global_types.global_this_value_type
+    {
+        let (arena, _) = host
+            .source(plan.node)
+            .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+        let syntax = plan_direct_source_property_syntax_at(arena, store, plan.node, plan.position)?;
+        if syntax.receiver != plan.receiver.node
+            || syntax.name_node != plan.name_node
+            || syntax.name != plan.name
+            || syntax.privacy != plan.privacy
+            || syntax.optional != plan.optional
+        {
+            return Err(SourcePropertyError::InvalidCache(plan.node).into());
+        }
+        let proof = super::global_types::prepare_global_this_members(
+            store,
+            host,
+            global_types,
+            receiver_type,
+        )
+        .map_err(|error| SourcePropertyQueryError::Source(error.into()))?
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+        let (type_, member, diagnostic) = if let Some(member) = proof.get_source(&plan.name) {
+            let value = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )
+            .and_then(|mut query| {
+                let value = query.resolve_global_this_member_value(&proof, member)?;
+                query.validate_global_this_member_value_proof(&value)?;
+                Ok(value)
+            })
+            .map_err(|error| SourcePropertyQueryError::Source(error.into()))?;
+            if value.receiver() != receiver_type || value.member() != member {
+                return Err(SourcePropertyError::InvalidCache(plan.node).into());
+            }
+            (value.type_id(), Some(member), None)
+        } else {
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )
+            .map_err(|error| SourcePropertyQueryError::Source(error.into()))?;
+            let diagnostic = query
+                .prepare_global_this_missing_member_diagnostic(&proof, plan.name_node)
+                .map_err(|error| match error {
+                    SourceRelationError::Relation(error) => SourcePropertyQueryError::from(error),
+                    SourceRelationError::Source(error) => {
+                        SourcePropertyQueryError::Source(error.into())
+                    }
+                })?;
+            let any = store
+                .intrinsic_bootstrap()
+                .ok_or(RelationUnavailable::MissingBootstrap)?
+                .any_type;
+            (any, None, diagnostic)
+        };
+        proof
+            .validate(store)
+            .map_err(|error| SourcePropertyQueryError::Source(error.into()))?;
+        if publish {
+            publish_property_links(store, plan.node, member, type_)?;
+        } else {
+            validate_property_link_targets(store, plan.node, member, type_)?;
+        }
+        if let Some(diagnostic) = diagnostic {
+            super::source::merge_retry_diagnostic(diagnostics, diagnostic);
+        }
+        return Ok((
+            CheckedSourceProperty {
+                type_,
+                diagnostics: Vec::new(),
+            },
+            member,
+        ));
     }
     check_direct_source_property_worker(
         store,
@@ -6288,6 +6405,85 @@ fn global_object_affects_missing_property(
     .is_some())
 }
 
+/// Builds only the recovery diagnostic for a proved missing global value member.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_global_this_missing_member_diagnostic(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalTypeQueryOptions,
+    proof: &GlobalThisMembers<'_, '_>,
+    name_node: NodeRef,
+    session: &mut InstantiationSession,
+    heritage: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Result<Option<CanonicalCheckerDiagnostic>, SourceRelationError<DeclaredTypeError>> {
+    let invalid = || {
+        SourceRelationError::Source(DeclaredTypeError::from(
+            TypeNodeUnavailable::InvalidPreparedTypeQuery,
+        ))
+    };
+    proof.validate(store).map_err(SourceRelationError::Source)?;
+    let record = preflight_node(store, host, name_node).map_err(SourceRelationError::Source)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Err(invalid());
+    };
+    if record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || proof.get_source(&identifier.text).is_some()
+    {
+        return Err(invalid());
+    }
+    if store
+        .global_object_property_symbol_with_query_context(
+            EscapedNameRef::source(&identifier.text),
+            global_types,
+            Some(options.strict_function_types),
+            session,
+            heritage,
+        )
+        .map_err(SourceRelationError::Relation)?
+        .is_some()
+    {
+        return Err(SourceRelationError::Source(DeclaredTypeError::from(
+            TypeNodeUnavailable::UnsupportedSyntax {
+                node: name_node,
+                kind: record.kind,
+            },
+        )));
+    }
+    proof.validate(store).map_err(SourceRelationError::Source)?;
+    let blocked = proof
+        .export_source(&identifier.text)
+        .is_some_and(|member| member.flags().intersects(SymbolFlags::BLOCK_SCOPED));
+    if !blocked && !options.no_implicit_any {
+        return Ok(None);
+    }
+    let owner_name = store
+        .symbol(proof.symbol())
+        .and_then(|symbol| symbol.name().as_utf8())
+        .ok_or_else(invalid)?;
+    let receiver = format!("typeof {owner_name}");
+    let (message, arguments) = if blocked {
+        (
+            message_by_code(2339).expect("TS2339 is in the diagnostic catalog"),
+            vec![identifier.text.clone(), receiver],
+        )
+    } else {
+        (
+            message_by_code(7017).expect("TS7017 is in the diagnostic catalog"),
+            vec![receiver],
+        )
+    };
+    Ok(Some(CanonicalCheckerDiagnostic {
+        node: Some(name_node),
+        range_override: None,
+        diagnostic: Diagnostic::with_arguments(message, arguments),
+        related_information: Vec::new(),
+    }))
+}
+
 /// Renders exact public or private property diagnostics after recursive
 /// expression execution reaches the source-owned diagnostic staging boundary.
 pub(super) fn prepare_source_property_diagnostic(
@@ -6918,6 +7114,175 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn cold_global_property_plans_reject_changed_names_before_membership_publication() {
+        let parsed = parsed(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "declare var selected: number; globalThis.selected;",
+        ));
+        let file = FileId::new(202_704);
+        let mut context = class_body_context(&parsed, file);
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let order = context.file_order().to_vec();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap()
+        .with_program_file_order(&order);
+        let access = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PropertyAccessExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let syntax =
+            plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+        let receiver = syntax.receiver();
+        let empty = std::collections::HashSet::new();
+        let crate::semantic::variables::VariablePlanError::Unsupported(
+            crate::semantic::VariableUnsupported::NonVariableSymbol { node, symbol, .. },
+        ) = crate::semantic::variables::plan_identifier_read(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            &empty,
+            &empty,
+            receiver,
+            "globalThis",
+        )
+        .unwrap_err()
+        else {
+            panic!("the actual global identifier must use its non-variable owner");
+        };
+        assert_eq!(node, receiver);
+        assert_eq!(
+            crate::semantic::global_types::source_global_this_value_type(
+                context.store(),
+                &host,
+                &globals,
+                symbol,
+            ),
+            Ok(Some(globals.global_this_value_type)),
+        );
+        let plan = finish_direct_source_property_plan(
+            &syntax,
+            PlannedExpression::new(
+                receiver,
+                PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                    resolved_symbol: symbol,
+                    value_symbol: symbol,
+                    kind: PlannedIdentifierReadKind::DeclaredValue,
+                }),
+            ),
+        )
+        .unwrap();
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::VariableDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let selected = bound.symbol(declaration).unwrap();
+        assert_eq!(context.store().get_merged_symbol(selected), Some(selected));
+        let global_record = context
+            .store()
+            .type_payload(globals.global_this_value_type)
+            .unwrap();
+        assert!(
+            !global_record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        assert!(global_record.data().structured().unwrap().members.is_none());
+        assert!(
+            global_record
+                .data()
+                .structured()
+                .unwrap()
+                .properties
+                .is_none()
+        );
+        assert!(context.store().value_symbol_links(selected).is_none());
+        assert!(context.store().type_node_links(access).is_none());
+        assert!(context.store().symbol_node_links(access).is_none());
+        let mut damaged = plan.clone();
+        damaged.name = "different".to_owned();
+        let before = format!("{:?}", context.store());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut caller = InstantiationSession::new(InstantiationLimits::default());
+        for _ in 0..2 {
+            assert!(matches!(
+                check_direct_source_property_with_source(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &damaged,
+                    globals.global_this_value_type,
+                    &mut caller,
+                    &mut diagnostics,
+                ),
+                Err(SourcePropertyQueryError::Property(SourcePropertyError::InvalidCache(node)))
+                    if node == access
+            ));
+            assert_eq!(format!("{:?}", context.store()), before);
+            assert!(diagnostics.is_empty());
+        }
+        let checked = check_direct_source_property_with_source(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &plan,
+            globals.global_this_value_type,
+            &mut caller,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(checked.type_, number);
+        assert!(checked.diagnostics.is_empty());
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .unwrap()
+                .resolved_symbol,
+            Some(selected),
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(selected)
+                .unwrap()
+                .resolved_type,
+            Some(number),
+        );
+        assert!(
+            context
+                .store()
+                .type_payload(globals.global_this_value_type)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
     }
 
     #[test]

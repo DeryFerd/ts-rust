@@ -25275,4 +25275,435 @@ export function create() { return new M.Value(); }"#,
             "../maps/%E2%91%A0%20file%5Bone%5D.js.map"
         );
     }
+
+    mod interface_condition_headers {
+        use ts_ast::NodeRef;
+        use ts_binder::{SemanticSymbolId, SymbolFlags};
+        use ts_checker::semantic::{
+            CanonicalCheckerDiagnostics, NodeLinks, RelationStateSnapshot, SignatureLinks,
+            SourceFileLinks, SymbolNodeLinks, TypeData, TypeId, TypeNodeLinks,
+        };
+
+        use super::{
+            CanonicalProgramQueries, Category, CompilerOptions, FileSystem, MemoryFileSystem,
+            NodeData, Program, ScriptTarget, SourceFile, SyntaxKind,
+        };
+        use crate::ProgramDiagnostic;
+
+        const PROVIDER: &str = concat!(
+            "interface DeferredCallback { new (); }\n",
+            "interface Error {\n",
+            "  untyped;\n",
+            "  callback: DeferredCallback;\n",
+            "  inspect(): void;\n",
+            "}\n",
+        );
+        const CONSUMER: &str = concat!(
+            "class Holder {\n",
+            "  value?: Error;\n",
+            "  observe(): void {\n",
+            "    const before = this.value;\n",
+            "    if (this.value) { const present = this.value; }\n",
+            "    else { const absent = this.value; }\n",
+            "    const after = this.value;\n",
+            "  }\n",
+            "}\n",
+        );
+
+        fn only_node(source: &SourceFile, kind: SyntaxKind) -> NodeRef {
+            let nodes = source
+                .parse
+                .arena
+                .iter()
+                .filter(|(_, node)| node.kind == kind)
+                .map(|(id, _)| source.node_ref(id).unwrap())
+                .collect::<Vec<_>>();
+            let [node] = nodes.as_slice() else {
+                panic!("expected one {kind:?}")
+            };
+            *node
+        }
+
+        fn property(source: &SourceFile, expected: &str) -> (NodeRef, Option<NodeRef>) {
+            source
+                .parse
+                .arena
+                .iter()
+                .find_map(|(_, node)| {
+                    let NodeData::PropertyDeclaration(data) = &node.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &source.parse.arena.get(data.name)?.data
+                    else {
+                        return None;
+                    };
+                    (name.text == expected).then(|| {
+                        (
+                            source.node_ref(data.name).unwrap(),
+                            data.type_.and_then(|id| source.node_ref(id)),
+                        )
+                    })
+                })
+                .unwrap_or_else(|| panic!("missing property {expected}"))
+        }
+
+        fn local_read(source: &SourceFile, expected: &str) -> NodeRef {
+            source
+                .parse
+                .arena
+                .iter()
+                .find_map(|(_, node)| {
+                    let NodeData::VariableDeclaration(data) = &node.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &source.parse.arena.get(data.name)?.data
+                    else {
+                        return None;
+                    };
+                    (name.text == expected)
+                        .then(|| source.node_ref(data.initializer.unwrap()).unwrap())
+                })
+                .unwrap_or_else(|| panic!("missing local {expected}"))
+        }
+
+        fn raw_type(queries: &CanonicalProgramQueries<'_>, node: NodeRef) -> TypeId {
+            queries
+                .context
+                .store()
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type)
+                .unwrap_or_else(|| panic!("missing checked type at {node:?}"))
+        }
+
+        fn assert_merged_error_owner(
+            program: &Program,
+            queries: &CanonicalProgramQueries<'_>,
+            owner: SemanticSymbolId,
+        ) {
+            let provider = program.source_file("/project/provider.d.ts").unwrap();
+            let library = program
+                .source_files()
+                .iter()
+                .find(|source| {
+                    source.is_default_library && source.file_name.ends_with("/lib.es5.d.ts")
+                })
+                .unwrap();
+            assert_eq!(
+                library.source_text,
+                include_str!("../../ts_bundled/libs/lib.es5.d.ts")
+            );
+            let record = queries.context.store().symbol(owner).unwrap();
+            assert!(record.flags().contains(
+                SymbolFlags::INTERFACE
+                    | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    | SymbolFlags::TRANSIENT
+            ));
+            let [original, value, added] = record.declarations().unwrap() else {
+                panic!("expected the real merged Error declarations")
+            };
+            for (declaration, source, kind) in [
+                (original, library, SyntaxKind::InterfaceDeclaration),
+                (value, library, SyntaxKind::VariableDeclaration),
+                (added, provider, SyntaxKind::InterfaceDeclaration),
+            ] {
+                assert!(declaration.is_for(source.parse.arena.id(), source.id));
+                let node = source.parse.arena.get(declaration.node).unwrap();
+                assert_eq!(node.kind, kind);
+                let name = match &node.data {
+                    NodeData::InterfaceDeclaration(data) => data.name,
+                    NodeData::VariableDeclaration(data) => data.name,
+                    _ => unreachable!(),
+                };
+                let NodeData::Identifier(identifier) = &source.parse.arena.get(name).unwrap().data
+                else {
+                    unreachable!()
+                };
+                assert_eq!(identifier.text, "Error");
+                let raw = queries
+                    .context
+                    .file(source.id)
+                    .unwrap()
+                    .1
+                    .symbol(*declaration)
+                    .unwrap();
+                assert_eq!(
+                    queries.context.store().get_merged_symbol(raw).unwrap(),
+                    owner
+                );
+            }
+            assert_eq!(record.value_declaration(), Some(*value));
+            assert_eq!(
+                queries
+                    .context
+                    .store()
+                    .symbol_table(queries.context.globals())
+                    .unwrap()
+                    .get_source("Error"),
+                Some(owner)
+            );
+        }
+
+        fn assert_condition_reads(program: &Program, queries: &CanonicalProgramQueries<'_>) {
+            let source = program.source_file("/project/condition.ts").unwrap();
+            let provider = program.source_file("/project/provider.d.ts").unwrap();
+            assert_eq!(source.source_text, CONSUMER);
+            assert_eq!(provider.source_text, PROVIDER);
+            let (name, annotation) = property(source, "value");
+            let type_ = raw_type(queries, annotation.unwrap());
+            let record = queries.context.store().type_payload(type_).unwrap();
+            assert!(matches!(record.data(), TypeData::Interface(_)));
+            assert_merged_error_owner(program, queries, record.symbol().unwrap());
+            let undefined = queries
+                .context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .undefined_type;
+            let optional = raw_type(queries, local_read(source, "before"));
+            let TypeData::Union(union) = queries
+                .context
+                .store()
+                .type_payload(optional)
+                .unwrap()
+                .data()
+            else {
+                panic!("expected the optional field read")
+            };
+            let mut members = union.union.types.clone();
+            members.sort_unstable();
+            let mut expected = [type_, undefined];
+            expected.sort_unstable();
+            assert_eq!(members, expected);
+            assert_eq!(raw_type(queries, local_read(source, "present")), type_);
+            assert_eq!(raw_type(queries, local_read(source, "absent")), undefined);
+            assert_eq!(raw_type(queries, local_read(source, "after")), optional);
+            let field = source
+                .node_ref(source.parse.arena.get(name.node).unwrap().parent.unwrap())
+                .unwrap();
+            let symbol = queries
+                .context
+                .file(source.id)
+                .unwrap()
+                .1
+                .symbol(field)
+                .unwrap();
+            assert_eq!(
+                queries
+                    .context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .unwrap()
+                    .resolved_type,
+                Some(type_)
+            );
+        }
+
+        fn assert_diagnostics(
+            program: &Program,
+            queries: &CanonicalProgramQueries<'_>,
+            skip: bool,
+        ) -> Vec<ProgramDiagnostic> {
+            let cold = queries.cold_diagnostic_snapshot();
+            assert_eq!(queries.has_diagnostics(), !skip);
+            if skip {
+                assert!(cold.is_empty(), "{cold:?}");
+                assert!(queries.context.diagnostics().is_empty());
+                return cold;
+            }
+            let provider = program.source_file("/project/provider.d.ts").unwrap();
+            let expected = [
+                (
+                    only_node(provider, SyntaxKind::ConstructSignature),
+                    7013,
+                    "new ();",
+                    "Construct signature, which lacks return-type annotation, implicitly has an 'any' return type.",
+                ),
+                (
+                    property(provider, "untyped").0,
+                    7008,
+                    "untyped",
+                    "Member 'untyped' implicitly has an 'any' type.",
+                ),
+            ];
+            assert_eq!(cold.len(), expected.len(), "{cold:?}");
+            let raw = queries.context.diagnostics().as_slice();
+            assert_eq!(raw.len(), expected.len());
+            for ((diagnostic, raw), (node, code, text, message)) in
+                cold.iter().zip(raw).zip(expected)
+            {
+                let range = provider.parse.arena.get(node.node).unwrap().range;
+                assert_eq!(
+                    &PROVIDER[range.start.get() as usize..range.end.get() as usize],
+                    text
+                );
+                assert_eq!(
+                    diagnostic.file_name.as_deref(),
+                    Some("/project/provider.d.ts")
+                );
+                assert_eq!(diagnostic.range, Some(range));
+                assert_eq!(diagnostic.code, Some(code));
+                assert_eq!(diagnostic.category, Category::Error);
+                assert_eq!(diagnostic.message, message);
+                assert!(diagnostic.related_information.is_empty());
+                assert_eq!(raw.node, Some(node));
+                assert_eq!(raw.range_override, None);
+                assert_eq!(raw.diagnostic.code(), code);
+                assert_eq!(raw.diagnostic.render().unwrap(), message);
+                assert!(raw.related_information.is_empty());
+            }
+            cold
+        }
+
+        type NodePublication = (
+            NodeRef,
+            Option<NodeLinks>,
+            Option<TypeNodeLinks>,
+            Option<SymbolNodeLinks>,
+            Option<SignatureLinks>,
+        );
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct Publication {
+            counts: [usize; 9],
+            relation: RelationStateSnapshot,
+            nodes: Vec<NodePublication>,
+            sources: Vec<Option<SourceFileLinks>>,
+            diagnostics: CanonicalCheckerDiagnostics,
+        }
+
+        fn publication(program: &Program, queries: &CanonicalProgramQueries<'_>) -> Publication {
+            let store = queries.context.store();
+            Publication {
+                counts: [
+                    store.type_len(),
+                    store.type_alias_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.type_predicate_len(),
+                    store.index_info_len(),
+                    store.type_resolution_len(),
+                    store.symbol_store().symbol_table_len(),
+                ],
+                relation: store.relation_state_snapshot(),
+                nodes: program
+                    .source_files()
+                    .iter()
+                    .flat_map(|source| {
+                        source.parse.arena.iter().map(move |(id, _)| {
+                            let node = source.node_ref(id).unwrap();
+                            (
+                                node,
+                                store.node_links(node).cloned(),
+                                store.type_node_links(node).cloned(),
+                                store.symbol_node_links(node).cloned(),
+                                store.signature_links(node).cloned(),
+                            )
+                        })
+                    })
+                    .collect(),
+                sources: program
+                    .source_files()
+                    .iter()
+                    .map(|source| {
+                        store
+                            .source_file_links(queries.context.source_file(source.id).unwrap())
+                            .cloned()
+                    })
+                    .collect(),
+                diagnostics: queries.context.diagnostics().clone(),
+            }
+        }
+
+        fn run_case(skip: bool, provider_first: bool) {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/provider.d.ts", PROVIDER).unwrap();
+            fs.write_file("/project/condition.ts", CONSUMER).unwrap();
+            let roots = if provider_first {
+                ["provider.d.ts".to_owned(), "condition.ts".to_owned()]
+            } else {
+                ["condition.ts".to_owned(), "provider.d.ts".to_owned()]
+            };
+            let (program, cold) = Program::try_new_with_canonical_checker_and_queries(
+                &fs,
+                "/project",
+                &roots,
+                CompilerOptions {
+                    lib: Some(vec!["es5".to_owned()]),
+                    target: ScriptTarget::Es2022,
+                    strict: true,
+                    no_emit: true,
+                    skip_lib_check: skip,
+                    ..CompilerOptions::default()
+                },
+                |program, queries| {
+                    let provider = program.source_file("/project/provider.d.ts").unwrap();
+                    let consumer = program.source_file("/project/condition.ts").unwrap();
+                    let actual = queries
+                        .checked_sources
+                        .iter()
+                        .map(|checked| checked.source.file_name.clone())
+                        .collect::<Vec<_>>();
+                    let expected = roots
+                        .iter()
+                        .filter(|name| !skip || !name.ends_with(".d.ts"))
+                        .map(|name| format!("/project/{name}"))
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual, expected);
+                    let provider_links = queries
+                        .context
+                        .store()
+                        .source_file_links(queries.context.source_file(provider.id).unwrap());
+                    assert_eq!(
+                        provider_links.is_some_and(|links| links.type_checked),
+                        !skip
+                    );
+                    assert!(
+                        queries
+                            .context
+                            .store()
+                            .source_file_links(queries.context.source_file(consumer.id).unwrap())
+                            .unwrap()
+                            .type_checked
+                    );
+                    let callback = property(provider, "callback").1.unwrap();
+                    if skip {
+                        assert_eq!(provider_links, None);
+                        assert_eq!(queries.context.store().type_node_links(callback), None);
+                        assert_eq!(
+                            queries.context.store().signature_links(only_node(
+                                provider,
+                                SyntaxKind::ConstructSignature
+                            )),
+                            None
+                        );
+                    }
+                    assert_condition_reads(program, queries);
+                    let cold = assert_diagnostics(program, queries, skip);
+                    let before = publication(program, queries);
+                    for _ in 0..2 {
+                        assert_eq!(queries.replay_sources().unwrap(), cold);
+                        assert_eq!(queries.cold_diagnostic_snapshot(), cold);
+                        assert_condition_reads(program, queries);
+                        assert_eq!(publication(program, queries), before);
+                    }
+                    if skip {
+                        assert_eq!(queries.context.store().type_node_links(callback), None);
+                    }
+                    cold
+                },
+            )
+            .unwrap();
+            assert_eq!(cold.as_deref(), Some(program.diagnostics()));
+        }
+
+        #[test]
+        fn skip_lib_check_keeps_lazy_condition_headers_and_provider_diagnostic_owners() {
+            for skip in [false, true] {
+                for provider_first in [false, true] {
+                    run_case(skip, provider_first);
+                }
+            }
+        }
+    }
 }
