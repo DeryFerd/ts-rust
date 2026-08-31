@@ -66,6 +66,22 @@ The historical cause remains unproved. Do not assign every recovered test to
 the two source repairs. These runs overlap and must not be added together as
 unique passing tests.
 
+A later generic-class-body run exposed a build-cache problem. The intended
+source has 5,162 library tests, but Cargo ran the previous candidate's 5,143
+test inventory. All 22 new private controls were absent. The saved service
+record confirms the correct working directory and command. The old executable
+and dependency records remained in the shared target. That run does not verify
+the new class-body code. The [full result](../target/wave202-demo-generic-class-bodies-focused-1-report.md)
+keeps the failed validation and all original evidence.
+
+The next Hono build will use a new, empty source-specific target. It will check
+the actual Cargo artifact records before the project run. We will not copy or
+delete old build caches. Cargo uses relative source paths and modification
+times for freshness. Those rules make cross-worktree cache reuse unsafe for
+this workflow. The exact local cache decision remains under review.
+[Cargo's fingerprint documentation](https://doc.rust-lang.org/stable/nightly-rustc/cargo/core/compiler/fingerprint/index.html)
+describes these rules. This finding does not prove that every older run is wrong.
+
 The Query contextual-arrow candidate ran all 5,114 selected checker and public
 tests. It passed 5,064 and failed 50. Five failures are in the new controls.
 Their diagnosis found three test-helper failures and two missing calls to
@@ -116,8 +132,8 @@ The library passed 4,899 of 4,900. The public harness passed its complete Hono
 negative control. Its three positive controls stop in a test helper. The full
 diagnosis found two test-only assumptions that need correction: scalar
 annotations need not have node-cache rows, and one damaged base-table entry
-has a different exact error. The corrections are under review. The later
-assertions still need to run. Optional named fields
+has a different exact error. The corrections are committed at `c3136bbe`.
+Their later assertions still need to run. Optional named fields
 and imported conditional class annotations are also committed and reviewed,
 but not runtime-verified.
 One first project failure does not tell us how many remain.
@@ -128,11 +144,15 @@ the two previously failing local exported-constructor tests. Its complete
 library run passed 5,115 of 5,143 tests. The remaining 28 library failures stay
 visible. This result is not a Hono project pass.
 
-One worker combines the eight reviewed Hono dependencies. A separate worker
-prepares a fresh reporter build and full original-project check. Further source
+The eight reviewed Hono dependencies are combined at `27347713`. The complete
+source integration is reviewed, but it has not run. A separate worker prepares
+the isolated reporter build and full original-project check. Further source
 audits found named method return annotations, property truthiness flow and
 ambient `Response` construction restrictions in the original `getResponse`
-method. Five independent pairs now check the required implementation paths.
+method. Five independent pairs now implement the reviewed changes in one new
+tree, with one owner for each source file. Separate pairs plan six missing
+global and library queries, generic class methods, class-field initializers,
+and the remaining condition check.
 These are source findings, not the next measured project error.
 
 The Query source audit identifies missing contextual typing for the first
@@ -149,11 +169,15 @@ and branching callback bodies. Query is not one or two fixes from a proved
 complete pass. Separate workers now implement the shared source features.
 Generic class methods, generic class bodies, optional calls, branching arrow
 bodies and generic function-type aliases are committed and source-reviewed.
-Their runtime checks remain pending. The first generic function-alias run
-stopped before tests because of a missing Rust import. The reviewed import-only
-fix is committed, and a new run is being prepared. Executable class imports
-have a separate implementation team. Generic construction now has five workers
-using the committed class-body provider and exported-constructor repair.
+Their runtime checks are not complete. The generic-class-body run above is
+invalid. The first two generic function-alias runs stopped on missing Rust
+imports. Both import-only corrections are committed. The third run executed
+all 5,080 selected tests and failed 70, including all 17 new controls. A pair
+is tracing those failures before any repair or integration claim.
+Executable class imports are committed and reviewed at `c295104c`, with eight
+new private and eight new public tests. Generic construction is committed and
+reviewed at `d2a6a8a3`, with 16 new private and four new public tests. Neither
+feature has a valid runtime result yet.
 These audit findings do not predict the next runtime failure.
 
 Pinned project commits:
@@ -205,6 +229,10 @@ independent source, class, inference, relation, or library failures needed by
 these projects. Give each writer a fixed worktree and file list before edits.
 Keep review and reference checks in parallel with implementation. Keep the
 existing build limits. Forty agent slots do not authorize forty Cargo builds.
+The latest roster check showed all 40 subagents active. This is a worker count,
+not a speedup measurement. New builds must not reuse another source worktree's
+target directory. Keep one owner for each target and at most three compiler
+services at once.
 
 Judge progress by whole-project checks and resolved old failures, not lines
 ported, new test counts, or the number of active agents. Each project report
