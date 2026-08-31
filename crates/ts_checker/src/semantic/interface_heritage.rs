@@ -315,7 +315,10 @@ pub(super) fn source_interface_alias_base_request(
     if store.source_node_kind(root) == Some(SyntaxKind::TypeLiteral)
         && store.source_direct_children(root).is_none_or(|children| {
             children.iter().any(|member| {
-                store.source_node_kind(*member) != Some(SyntaxKind::PropertySignature)
+                !matches!(
+                    store.source_node_kind(*member),
+                    Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+                )
             })
         })
     {
