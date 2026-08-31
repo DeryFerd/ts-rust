@@ -6194,74 +6194,8 @@ fn object_literal_has_const_assertion(
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
 ) -> Result<bool, PropertyObjectError> {
-    let invalid = || PropertyObjectError::InvalidObjectLiteral(node);
-    let mut operand = node;
-    loop {
-        let Some(parent) = preflight_node(store, host, operand)
-            .map_err(|_| invalid())?
-            .parent
-        else {
-            return Ok(false);
-        };
-        let parent = NodeRef::new(operand.arena, operand.file, parent);
-        let record = preflight_node(store, host, parent).map_err(|_| invalid())?;
-        let type_node = match (&record.data, record.kind) {
-            (
-                NodeData::ParenthesizedExpression(parenthesized),
-                SyntaxKind::ParenthesizedExpression,
-            ) if parenthesized.expression == operand.node => {
-                operand = parent;
-                continue;
-            }
-            (NodeData::PropertyAssignment(property), SyntaxKind::PropertyAssignment)
-                if property.initializer == operand.node =>
-            {
-                let owner = record.parent.ok_or_else(invalid)?;
-                let owner = NodeRef::new(parent.arena, parent.file, owner);
-                let owner_record = preflight_node(store, host, owner).map_err(|_| invalid())?;
-                let NodeData::ObjectLiteralExpression(object) = &owner_record.data else {
-                    return Err(invalid());
-                };
-                if owner_record.kind != SyntaxKind::ObjectLiteralExpression
-                    || !object.properties.nodes.contains(&parent.node)
-                {
-                    return Err(invalid());
-                }
-                operand = owner;
-                continue;
-            }
-            (NodeData::AsExpression(assertion), SyntaxKind::AsExpression)
-                if assertion.expression == operand.node =>
-            {
-                assertion.type_
-            }
-            (NodeData::TypeAssertion(assertion), SyntaxKind::TypeAssertionExpression)
-                if assertion.expression == operand.node =>
-            {
-                assertion.type_
-            }
-            _ => return Ok(false),
-        };
-        let type_node = NodeRef::new(parent.arena, parent.file, type_node);
-        let type_record = preflight_node(store, host, type_node).map_err(|_| invalid())?;
-        if type_record.parent != Some(parent.node) {
-            return Err(invalid());
-        }
-        let NodeData::TypeReferenceNode(reference) = &type_record.data else {
-            return Ok(false);
-        };
-        if type_record.kind != SyntaxKind::TypeReference || reference.type_arguments.is_some() {
-            return Ok(false);
-        }
-        let name = NodeRef::new(type_node.arena, type_node.file, reference.type_name);
-        let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
-        let NodeData::Identifier(identifier) = &name_record.data else {
-            return Ok(false);
-        };
-        return Ok(name_record.kind == SyntaxKind::Identifier
-            && name_record.parent == Some(type_node.node)
-            && identifier.text == "const");
-    }
+    super::type_nodes::source_expression_has_const_assertion_context(store, host, node)
+        .map_err(|_| PropertyObjectError::InvalidObjectLiteral(node))
 }
 
 pub(super) fn plan_type_literal(

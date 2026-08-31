@@ -67,6 +67,10 @@ pub(super) enum PreparedExpression {
     Template(Option<TypeId>),
     Parenthesized(Box<PreparedExpression>),
     Array(Vec<PreparedExpression>),
+    ConstArray {
+        elements: Vec<PreparedExpression>,
+        readonly: bool,
+    },
     Object(Vec<PreparedObjectMember>),
     Property(Box<PreparedExpression>),
     Arrow(Option<TypeId>),
@@ -583,6 +587,13 @@ fn prepare_expression(
             mutable_result: location == ExpressionLocation::Mutable,
         },
         PlannedExpressionKind::Array(elements) => {
+            // Source-free contextual plans keep the ordinary array path.
+            let const_context = host.node(expression.node).is_some()
+                && super::type_nodes::source_expression_has_const_assertion_context(
+                    store,
+                    host,
+                    expression.node,
+                )?;
             let element_context = match (global_types, contextual_type) {
                 (Some(global_types), Some(contextual_type)) => {
                     store.canonical_array_element_type(global_types, contextual_type)?
@@ -681,10 +692,25 @@ fn prepare_expression(
                     state,
                     element,
                     positional_context.or(element_context),
-                    ExpressionLocation::Mutable,
+                    if const_context {
+                        ExpressionLocation::Cached
+                    } else {
+                        ExpressionLocation::Mutable
+                    },
                 )?);
             }
-            PreparedExpression::Array(prepared)
+            if const_context {
+                PreparedExpression::ConstArray {
+                    elements: prepared,
+                    readonly: !const_array_context_is_mutable(
+                        store,
+                        global_types,
+                        contextual_type,
+                    )?,
+                }
+            } else {
+                PreparedExpression::Array(prepared)
+            }
         }
         PlannedExpressionKind::Object { plan, properties } => {
             debug_assert_eq!(plan.properties.len(), properties.len());
@@ -771,6 +797,43 @@ fn prepare_expression(
         }
     };
     Ok(prepared)
+}
+
+/// Const arrays keep literal elements but can receive a mutable array or tuple context.
+fn const_array_context_is_mutable(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    contextual_type: Option<TypeId>,
+) -> Result<bool, SourceCheckError> {
+    let mut pending = contextual_type.into_iter().collect::<Vec<_>>();
+    let mut visited = HashSet::new();
+    while let Some(type_) = pending.pop() {
+        if !visited.insert(type_) {
+            continue;
+        }
+        let record = store
+            .type_payload(type_)
+            .ok_or(RelationUnavailable::Type(type_))?;
+        if let TypeData::Union(union) = record.data() {
+            validate_contextual_union(store, global_types, type_)?;
+            pending.extend_from_slice(&union.union.types);
+            continue;
+        }
+        if let Some(tuple) = store
+            .canonical_tuple_shape(type_)
+            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_))?
+            && !tuple.is_readonly()
+        {
+            return Ok(true);
+        }
+        if let Some(global_types) = global_types
+            && let Some(array) = store.canonical_array_reference(global_types, type_)?
+            && !array.readonly
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn contextual_objects(

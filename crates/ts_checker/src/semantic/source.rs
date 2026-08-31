@@ -340,6 +340,7 @@ use super::{
         CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget, TypeNodeUnavailable,
         authenticated_active_recursive_arrow_query, authenticated_recovered_recursive_arrow_return,
         normalize_bigint_literal, normalize_numeric_separators,
+        source_expression_has_const_assertion_context,
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -26334,6 +26335,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 | PlannedExpressionKind::Number { .. }
                 | PlannedExpressionKind::BigInt { .. }
                 | PlannedExpressionKind::Boolean(_)
+                | PlannedExpressionKind::Array(_)
                 | PlannedExpressionKind::Object { .. }
         );
         if const_assertion
@@ -30399,6 +30401,7 @@ fn prepare_const_object_property(
             Ok(PreparedExpression::ClassReceiver)
         }
         (PlannedExpressionKind::Object { .. }, PreparedExpression::Object(_))
+        | (PlannedExpressionKind::Array(_), PreparedExpression::ConstArray { .. })
         | (PlannedExpressionKind::Property(_), PreparedExpression::Property(_))
         | (PlannedExpressionKind::Template(_), PreparedExpression::Template(_))
         | (
@@ -30624,8 +30627,19 @@ where
         (PlannedExpressionKind::Template(_), PreparedExpression::Template(contextual_type)) => {
             check_nested_expression(store, session, expression, *contextual_type, None)
         }
-        (PlannedExpressionKind::Array(elements), PreparedExpression::Array(prepared_elements)) => {
+        (
+            PlannedExpressionKind::Array(elements),
+            PreparedExpression::Array(prepared_elements)
+            | PreparedExpression::ConstArray {
+                elements: prepared_elements,
+                ..
+            },
+        ) => {
             debug_assert_eq!(elements.len(), prepared_elements.len());
+            let const_readonly = match prepared {
+                PreparedExpression::ConstArray { readonly, .. } => Some(*readonly),
+                _ => None,
+            };
             let global_types = global_types.ok_or(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Syntax {
                     node: expression.node,
@@ -30637,7 +30651,7 @@ where
             let mut element_types = Vec::with_capacity(elements.len());
             let mut element_infos = Vec::with_capacity(elements.len());
             for (index, (element, prepared)) in elements.iter().zip(prepared_elements).enumerate() {
-                let checked = execute_expression_types(
+                let mut checked = execute_expression_types(
                     store,
                     Some(global_types),
                     session,
@@ -30648,6 +30662,14 @@ where
                     property_diagnostics,
                     check_nested_expression,
                 )?;
+                if const_readonly.is_some() {
+                    checked.result = prepared_fresh_literal_union_type(
+                        store,
+                        global_types,
+                        checked.raw,
+                        LiteralTreatment::Regular,
+                    )?;
+                }
                 if let Some(spread) = expression.array_spread_node(index) {
                     if let Some(array) =
                         store.canonical_array_reference(global_types, checked.result)?
@@ -30695,7 +30717,16 @@ where
                 }
                 checked_elements.push(checked);
             }
-            let base = if let Some(contextual_tuple) = tuple_contexts.get(&expression.node) {
+            let base = if let Some(readonly) = const_readonly {
+                store
+                    .create_canonical_tuple_type(
+                        CanonicalTupleTypeRequest::new(&element_types, &element_infos, readonly)
+                            .with_array_targets(CanonicalArrayTargets::from_global_types(
+                                global_types,
+                            )),
+                    )
+                    .map_err(|error| source_const_tuple_error(expression.node, error))?
+            } else if let Some(contextual_tuple) = tuple_contexts.get(&expression.node) {
                 let shape = store
                     .canonical_tuple_shape(*contextual_tuple)
                     .map_err(|_| RelationUnavailable::InvalidStructuredMembers(*contextual_tuple))?
@@ -31188,6 +31219,20 @@ fn source_contextual_tuple_error(contextual: TypeId, error: TupleTypeError) -> S
         | TupleTypeError::InvalidPreparedQuery => SourceCheckError::RelationUnavailable(
             RelationUnavailable::InvalidStructuredMembers(contextual),
         ),
+    }
+}
+
+fn source_const_tuple_error(node: NodeRef, error: TupleTypeError) -> SourceCheckError {
+    match error {
+        TupleTypeError::BootstrapUninitialized => {
+            SourceCheckError::LiteralCache(SourceLiteralCacheError::BootstrapUninitialized)
+        }
+        TupleTypeError::ArrayType(error) => SourceCheckError::ArrayType(error),
+        TupleTypeError::LengthType(error) => error.into(),
+        TupleTypeError::Capacity => {
+            SourceCheckError::LiteralCache(SourceLiteralCacheError::Capacity)
+        }
+        error => super::type_nodes::tuple_type_error(error, node).into(),
     }
 }
 
@@ -33357,7 +33402,7 @@ fn check_expression_type_with_capture_context(
                                 | TypeFlags::INTERSECTION,
                         )
                     })
-                }) || template_expression_is_const_asserted(host, expression.node)
+                }) || source_expression_has_const_assertion_context(store, host, expression.node)?
                     || substitutions.iter().all(|substitution| {
                         store.type_payload(*substitution).is_some_and(|record| {
                             record
@@ -35409,7 +35454,11 @@ fn check_expression_type_with_capture_context(
                 current_flow_types,
                 type_import_execution,
                 operand,
-                literal_target,
+                if *const_assertion {
+                    contextual_type
+                } else {
+                    literal_target
+                },
                 deferred,
                 class_flow.as_deref_mut(),
                 arrow_capture,
@@ -35449,6 +35498,26 @@ fn check_expression_type_with_capture_context(
                             PlannedExpressionKind::Object { .. }
                         ) =>
                     {
+                        operand_types.result
+                    }
+                    TypeData::TypeReference(_)
+                        if matches!(
+                            &operand.unparenthesized().kind,
+                            PlannedExpressionKind::Array(_)
+                        ) && record.object_flags().contains(ObjectFlags::ARRAY_LITERAL) =>
+                    {
+                        if store
+                            .canonical_array_reference(global_types, operand_types.result)?
+                            .is_none()
+                            && store
+                                .canonical_tuple_shape(operand_types.result)
+                                .map_err(|error| source_const_tuple_error(operand.node, error))?
+                                .is_none()
+                        {
+                            return Err(SourceCheckError::LiteralCache(
+                                SourceLiteralCacheError::InvalidCachedLiteral(operand_types.result),
+                            ));
+                        }
                         operand_types.result
                     }
                     TypeData::Intrinsic(_)
@@ -39286,63 +39355,6 @@ fn check_uncached_conditional_scalar(
             },
         )),
     }
-}
-
-fn template_expression_is_const_asserted(host: &DeclaredTypeHost<'_>, node: NodeRef) -> bool {
-    let mut current = node;
-    let mut visited = HashSet::new();
-    while visited.insert(current) {
-        let Some(parent) = host
-            .node(current)
-            .and_then(|record| record.parent)
-            .map(|parent| NodeRef::new(current.arena, current.file, parent))
-        else {
-            return false;
-        };
-        let Some(parent_record) = host.node(parent) else {
-            return false;
-        };
-        let annotation = match &parent_record.data {
-            NodeData::AsExpression(assertion) if assertion.expression == current.node => {
-                assertion.type_
-            }
-            NodeData::TypeAssertion(assertion) if assertion.expression == current.node => {
-                assertion.type_
-            }
-            NodeData::ParenthesizedExpression(parenthesized)
-                if parenthesized.expression == current.node =>
-            {
-                current = parent;
-                continue;
-            }
-            NodeData::PropertyAssignment(property) if property.initializer == current.node => {
-                current = parent;
-                continue;
-            }
-            NodeData::ObjectLiteralExpression(object)
-                if object.properties.nodes.contains(&current.node) =>
-            {
-                current = parent;
-                continue;
-            }
-            _ => return false,
-        };
-        let annotation = NodeRef::new(parent.arena, parent.file, annotation);
-        let Some(NodeData::TypeReferenceNode(reference)) =
-            host.node(annotation).map(|record| &record.data)
-        else {
-            return false;
-        };
-        if reference.type_arguments.is_some() {
-            return false;
-        }
-        let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
-        return matches!(
-            host.node(name).map(|record| &record.data),
-            Some(NodeData::Identifier(identifier)) if identifier.text == "const"
-        );
-    }
-    false
 }
 
 fn source_template_expression_error(node: NodeRef, error: &TemplateTypeError) -> SourceCheckError {
