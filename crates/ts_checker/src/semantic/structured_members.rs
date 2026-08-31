@@ -3581,7 +3581,12 @@ mod tests {
                 .source_direct_children(annotation)
                 .unwrap()
                 .into_iter()
-                .find(|node| store.source_node_kind(*node) == Some(SyntaxKind::PropertySignature))
+                .find(|node| {
+                    matches!(
+                        store.source_node_kind(*node),
+                        Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+                    )
+                })
                 .unwrap();
             store.source_direct_type_annotation(member).unwrap()
         });

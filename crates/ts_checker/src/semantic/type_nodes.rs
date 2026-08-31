@@ -98,7 +98,8 @@ use super::{
         resolve_nongeneric_keyof_type,
     },
     links::{
-        ResolvedSignatureState, SignatureLinks, SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks,
+        ResolvedSignatureState, SignatureLinks, SymbolNodeLinks, TypeAliasLinks, TypeNodeLinks,
+        ValueSymbolLinks,
     },
     mapped_types::{
         MappedTypeDeclarationPlan, MappedTypeError, MappedTypeKeys, MappedTypeModifiers,
@@ -21260,16 +21261,40 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         let (arena, bound) = self.host.source(receiver).ok_or_else(invalid)?;
         let mut callback = self.host.name_resolver_host(self.store)?;
-        let symbol =
-            CanonicalNameResolver::new(arena, bound, self.store.symbol_store(), &mut callback)?
-                .resolve(
+        let mut name_lookup =
+            CanonicalNameResolver::new(arena, bound, self.store.symbol_store(), &mut callback)?;
+        let value_meaning = SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE;
+        // Namespace handlers prove their own targets, including cold alias links.
+        let mut symbol = name_lookup.resolve(
+            Some(CanonicalResolutionLocation::Bound(receiver)),
+            &identifier.text,
+            value_meaning | SymbolFlags::ALIAS,
+            None,
+            false,
+            false,
+        )?;
+        if let Some(candidate) = symbol {
+            let candidate = self
+                .store
+                .get_merged_symbol(candidate)
+                .ok_or_else(invalid)?;
+            let candidate_record = self.store.symbol(candidate).ok_or_else(invalid)?;
+            let namespace_import = candidate_record.declarations().is_some_and(|declarations| {
+                declarations.iter().any(|declaration| {
+                    self.store.source_node_kind(*declaration) == Some(SyntaxKind::NamespaceImport)
+                })
+            });
+            if candidate_record.flags().intersects(SymbolFlags::ALIAS) && !namespace_import {
+                symbol = name_lookup.resolve(
                     Some(CanonicalResolutionLocation::Bound(receiver)),
                     &identifier.text,
-                    SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+                    value_meaning,
                     None,
                     false,
                     false,
                 )?;
+            }
+        }
         let Some(symbol) = symbol else {
             return Ok(false);
         };
@@ -35894,13 +35919,20 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         symbol: SemanticSymbolId,
         result: TypeId,
         plan: &TypeQueryPlan,
+        pending_links: Option<TypeAliasLinks>,
     ) -> Result<(), DeclaredTypeError> {
-        let Some(alias) = plan.aliases.get(&symbol) else {
-            return Ok(());
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(symbol));
+        let Some(alias) = plan
+            .aliases
+            .get(&symbol)
+            .filter(|_| self.global_types.is_some())
+        else {
+            return if pending_links.is_some() {
+                Err(invalid())
+            } else {
+                Ok(())
+            };
         };
-        if self.global_types.is_none() {
-            return Ok(());
-        }
         let mut rhs = alias.type_node;
         while let NodeData::ParenthesizedTypeNode(parenthesized) =
             &preflight_node(self.store, self.host, rhs)?.data
@@ -35918,9 +35950,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .find(|proof| proof.key() == key)
             .cloned()
         else {
-            return Ok(());
+            return if pending_links.is_some() {
+                Err(invalid())
+            } else {
+                Ok(())
+            };
         };
-        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(symbol));
         let Some([declaration]) = self
             .store
             .symbol(symbol)
@@ -35937,9 +35972,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         {
             return Err(invalid());
         }
-        let parameters = self
-            .store
-            .type_alias_links(symbol)
+        if let Some(links) = &pending_links {
+            self.validate_pending_source_alias_links(symbol, result, links)?;
+        }
+        let parameters = pending_links
+            .as_ref()
+            .or_else(|| self.store.type_alias_links(symbol))
             .and_then(|links| links.type_parameters.clone())
             .unwrap_or_default();
         let context = self.source_query_context()?;
@@ -35954,9 +35992,43 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             &completed,
             &context.globals,
             &context,
+            pending_links,
         )
         .map_err(|_| invalid())?;
         self.retain_source_conditional_result(proof)
+    }
+
+    fn validate_pending_source_alias_links(
+        &self,
+        symbol: SemanticSymbolId,
+        result: TypeId,
+        links: &TypeAliasLinks,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(symbol));
+        let expected =
+            cached_alias_parameter_symbols(self.store, self.host, symbol)?.ok_or_else(invalid)?;
+        let parameters = links.type_parameters.as_deref().unwrap_or_default();
+        let owners = parameters
+            .iter()
+            .map(|parameter| cached_ordinary_type_parameter_owner(self.store, *parameter))
+            .collect::<Option<Vec<_>>>();
+        let identity = match &links.instantiations {
+            Some(instantiations) if !parameters.is_empty() => {
+                instantiations.len() == 1
+                    && instantiations.get(&type_list_key(parameters)) == Some(&result)
+            }
+            None => parameters.is_empty(),
+            Some(_) => false,
+        };
+        if links.declared_type != Some(result)
+            || links.is_constructor_declared_property
+            || links.type_parameters.as_ref().is_some_and(Vec::is_empty)
+            || owners.as_deref() != Some(expected.as_slice())
+            || !identity
+        {
+            return Err(invalid());
+        }
+        Ok(())
     }
 
     fn record_source_reference_result(
@@ -41970,6 +42042,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .try_reserve(tuple_preflight.length_values().len())
             .map_err(|_| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         numbers.extend_from_slice(tuple_preflight.length_values());
+        // Source-query and defaulted unions consume prepared operations on warm replay.
         let unions = plan
             .unions
             .iter()
@@ -41978,6 +42051,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .type_node_links(**node)
                     .and_then(|links| links.resolved_type)
                     .is_none()
+                    || plan.defaulted_interface_unions.contains(*node)
+                    || plan.source_query_unions.contains(*node)
             })
             .map(|(_, union)| union)
             .collect::<Vec<_>>();
@@ -43207,7 +43282,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     ));
                 }
             }
-            self.record_source_alias_result(symbol, cached.declared_type, plan)?;
+            self.record_source_alias_result(symbol, cached.declared_type, plan, None)?;
             return Ok(cached.declared_type);
         }
         let alias = plan.aliases.get(&symbol).cloned().ok_or_else(|| {
@@ -43323,6 +43398,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             && self
                 .direct_conditional_type_plan_node(alias.type_node, plan)
                 .is_some_and(|node| plan.source_conditionals.contains(&node));
+        if source_conditional
+            && matches!(
+                self.store.type_payload(published).map(TypeRecord::data),
+                Some(TypeData::Conditional(_))
+            )
+        {
+            // Validate the node proof before its alias cache becomes visible.
+            self.record_source_alias_result(symbol, published, plan, Some(links))?;
+            return Ok(published);
+        }
         if !source_conditional
             && matches!(
                 self.store.type_payload(published).map(TypeRecord::data),
@@ -43371,7 +43456,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::InvalidTypeAliasSymbol(symbol),
             ));
         }
-        self.record_source_alias_result(symbol, published, plan)?;
+        self.record_source_alias_result(symbol, published, plan, None)?;
         Ok(published)
     }
 
@@ -54886,6 +54971,181 @@ export type Env = {
             );
             assert!(context.diagnostics().is_empty());
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One real node result covers incomplete publication, repair, and warm replay.
+    fn source_conditional_alias_publication_rejects_missing_warm_receipts() {
+        let library = parse_source_file(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let source = parse_source_file(
+            "type AliasReceipt<Value> = Value extends string ? number : boolean;",
+        );
+        let (mut context, library_file, file) =
+            native_method_parameter_context(&library, &source, true);
+        let alias = native_global_parameter_symbol(&context, "AliasReceipt");
+        let rhs = library_query_alias_node(&source, file, "AliasReceipt");
+        let NodeData::ConditionalTypeNode(conditional) = &source.arena.get(rhs.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let branches = [conditional.true_type, conditional.false_type]
+            .map(|node| NodeRef::new(rhs.arena, rhs.file, node));
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let order = context.file_order().to_vec();
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap()
+        .with_program_file_order(&order);
+        let mut caller = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut caller,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let expected = query.get_type_from_type_node(rhs).unwrap();
+        let node_key = ConditionalQueryKey::Node(rhs);
+        let alias_key = ConditionalQueryKey::AliasDeclaration(alias);
+        let node_receipt = query
+            .store
+            .conditional_query_production(node_key)
+            .unwrap()
+            .clone();
+        let TypeData::Conditional(data) = query.store.type_payload(expected).unwrap().data() else {
+            panic!("the real parameter must keep the conditional deferred")
+        };
+        let root = data.root;
+        let parameters = query
+            .store
+            .conditional_root(root)
+            .unwrap()
+            .outer_type_parameters()
+            .unwrap()
+            .to_vec();
+        assert_eq!(parameters, [data.check_type]);
+        assert_eq!(node_receipt.result(), expected);
+        assert!(
+            query
+                .store
+                .conditional_query_production(alias_key)
+                .is_none()
+        );
+        assert!(
+            query
+                .store
+                .type_alias_links(alias)
+                .is_none_or(|links| links == &TypeAliasLinks::default())
+        );
+        for branch in branches {
+            assert!(query.store.type_node_links(branch).is_none());
+        }
+        let links = TypeAliasLinks {
+            declared_type: Some(expected),
+            type_parameters: Some(parameters.clone()),
+            instantiations: Some(HashMap::from([(type_list_key(&parameters), expected)])),
+            ..TypeAliasLinks::default()
+        };
+
+        // Forge only the visible alias cache. Its required receipt remains absent.
+        assert!(query.store.set_type_alias_links(alias, links.clone()));
+        let snapshot = |query: &CanonicalTypeQuery<'_, '_, '_, '_>| {
+            let caller = query.instantiation_session.as_deref().unwrap();
+            (
+                function_store_state(query.store),
+                library_query_source_links(&source, file, query.store),
+                query.store.type_alias_links(alias).cloned(),
+                query.store.conditional_production_lengths(),
+                (
+                    query.store.conditional_query_production(node_key).cloned(),
+                    query.store.conditional_query_production(alias_key).cloned(),
+                    query
+                        .store
+                        .conditional_root(root)
+                        .unwrap()
+                        .instantiations()
+                        .clone(),
+                ),
+                query.diagnostics.clone(),
+                (
+                    caller.query_count(),
+                    caller.total_count(),
+                    caller.limit_event_mark(),
+                ),
+                query.store.type_resolution_is_empty(),
+            )
+        };
+        let damaged = snapshot(&query);
+        for _ in 0..2 {
+            assert_eq!(
+                query.get_declared_type_of_symbol(alias),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(alias)
+                ))
+            );
+            assert_eq!(snapshot(&query), damaged);
+        }
+
+        // Clear the damaged cache through the existing empty-link state.
+        assert!(
+            query
+                .store
+                .set_type_alias_links(alias, TypeAliasLinks::default())
+        );
+        let production_lengths = query.store.conditional_production_lengths();
+        assert_eq!(query.get_declared_type_of_symbol(alias), Ok(expected));
+        assert_eq!(query.store.type_alias_links(alias), Some(&links));
+        assert_eq!(
+            query.store.conditional_query_production(node_key),
+            Some(&node_receipt)
+        );
+        let alias_receipt = query.store.conditional_query_production(alias_key).unwrap();
+        assert_eq!(alias_receipt.key(), alias_key);
+        assert_eq!(alias_receipt.root(), node_receipt.root());
+        assert_eq!(alias_receipt.result(), expected);
+        assert_eq!(
+            query.store.conditional_production_lengths(),
+            (production_lengths.0, production_lengths.1 + 1)
+        );
+        let arrays = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let request = super::super::conditional_types::conditional_source_query_request(
+            query.store,
+            alias_key,
+            arrays,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(request.source_node(), rhs);
+        assert_eq!(request.type_arguments(), parameters);
+        assert_eq!(request.retained_result(), expected);
+        let warm = snapshot(&query);
+        for _ in 0..2 {
+            assert_eq!(query.get_declared_type_of_symbol(alias), Ok(expected));
+            assert_eq!(query.get_type_from_type_node(rhs), Ok(expected));
+            assert_eq!(snapshot(&query), warm);
+            for branch in branches {
+                assert!(query.store.type_node_links(branch).is_none());
+            }
+            let TypeData::Conditional(data) = query.store.type_payload(expected).unwrap().data()
+            else {
+                unreachable!()
+            };
+            assert!(data.resolved_true_type.is_none());
+            assert!(data.resolved_false_type.is_none());
+        }
+        assert!(query.store.type_resolution_is_empty());
+        assert!(query.diagnostics.is_empty());
     }
 
     #[test]

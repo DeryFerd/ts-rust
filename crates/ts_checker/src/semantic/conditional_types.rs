@@ -25,6 +25,7 @@ use super::{
         instantiate_type_with_vector_and_session,
     },
     interface_heritage::SourceInterfaceHeritageQueryContext,
+    links::TypeAliasLinks,
     mapper::CanonicalTypeMapperStore,
     object_members::{StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
     relater::{
@@ -4051,6 +4052,7 @@ pub(super) fn record_conditional_alias_declaration_with_source(
     completed: &ConditionalSourceResultProof,
     globals: &CanonicalGlobalTypes,
     source: &dyn ConditionalBranchSource,
+    pending_links: Option<TypeAliasLinks>,
 ) -> Result<ConditionalSourceResultProof, ConditionalTypeError> {
     validate_source_conditional_result(store, completed, globals, source)?;
     let rhs = store.source_direct_type_annotation(declaration.declaration());
@@ -4073,6 +4075,47 @@ pub(super) fn record_conditional_alias_declaration_with_source(
     proof.production.source_declaration = Some(declaration.declaration());
     proof.production.for_constraint = false;
     proof.nested.push(completed.clone());
+    if let Some(links) = pending_links {
+        let symbol = declaration.symbol();
+        let invalid = || ConditionalTypeError::InvalidAliasSymbol(symbol);
+        if store
+            .type_alias_links(symbol)
+            .is_some_and(|current| current != &TypeAliasLinks::default())
+            || store
+                .conditional_query_production(proof.production.key)
+                .is_some()
+            || links.declared_type != Some(proof.result())
+            || links.type_parameters.as_deref().unwrap_or_default() != declaration.type_parameters()
+            || links.instantiations.as_ref().is_some_and(|instantiations| {
+                instantiations
+                    .values()
+                    .any(|type_| store.type_payload(*type_).is_none())
+            })
+        {
+            return Err(invalid());
+        }
+        let arrays = Some(CanonicalArrayTargets::from_global_types(globals));
+        validate_alias_identity_worker(
+            store,
+            ConditionalAliasIdentity {
+                symbol,
+                type_arguments: declaration.type_parameters(),
+            },
+            &mut HashSet::new(),
+            arrays,
+            ConditionalValidation::Operational(Some(source)),
+        )?;
+        validate_query_operands_with_source(store, &proof.production, arrays, Some(source))?;
+        if !store.try_reserve_conditional_productions(0, 1) {
+            return Err(ConditionalTypeError::Capacity);
+        }
+        // Both setters were prechecked. No source callback can see half of the pair.
+        if !store.publish_conditional_query_production(proof.production.clone())
+            || !store.set_type_alias_links(symbol, links)
+        {
+            return Err(invalid());
+        }
+    }
     publish_source_query_production(store, &proof, globals, source)?;
     Ok(proof)
 }
