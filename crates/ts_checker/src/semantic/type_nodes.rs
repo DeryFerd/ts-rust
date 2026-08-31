@@ -32148,6 +32148,49 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .global_types
             .as_ref()
             .map(CanonicalArrayTargets::from_global_types);
+        let contextual_object_binding = provenance.family == SourceCallableFamily::ArrowFunction
+            && provenance.contextual_target.is_some()
+            && provenance.contextual_variable.is_some()
+            && self.host.node(declaration).is_some_and(|record| {
+                let NodeData::ArrowFunction(arrow) = &record.data else {
+                    return false;
+                };
+                record.kind == SyntaxKind::ArrowFunction && record.parent.is_some_and(|parent| {
+                    matches!(
+                        self.host.node(NodeRef::new(declaration.arena, declaration.file, parent)),
+                        Some(record)
+                            if record.kind == SyntaxKind::VariableDeclaration
+                                && matches!(&record.data, NodeData::VariableDeclaration(variable)
+                                    if variable.initializer == Some(declaration.node)
+                                        && variable.type_.is_some())
+                    )
+                }) && arrow.parameters.nodes.iter().any(|parameter| {
+                    let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+                    let Some(NodeData::ParameterDeclaration(parameter)) =
+                        self.host.node(parameter).map(|record| &record.data)
+                    else {
+                        return false;
+                    };
+                    self.host
+                        .node(NodeRef::new(
+                            declaration.arena,
+                            declaration.file,
+                            parameter.name,
+                        ))
+                        .is_some_and(|record| {
+                            record.kind == SyntaxKind::ObjectBindingPattern
+                                && matches!(record.data, NodeData::BindingPattern(_))
+                        })
+                })
+            });
+        if contextual_object_binding {
+            if retained.is_some() {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                ));
+            }
+            return self.get_return_type_of_contextual_object_binding_arrow(signature, declaration);
+        }
         let callable = source_callables::plan_source_callable(
             self.store,
             self.host,
@@ -32539,6 +32582,81 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             );
             Ok(return_type)
         }
+    }
+
+    fn get_return_type_of_contextual_object_binding_arrow(
+        &self,
+        signature: SignatureId,
+        declaration: NodeRef,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        self.reject_type_reference_alias_capabilities()?;
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature));
+        let variable = preflight_node(self.store, self.host, declaration)?
+            .parent
+            .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            .ok_or_else(invalid)?;
+        let array_targets = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types);
+        let arrow = super::source_arrows::plan_contextual_source_arrow(
+            self.store,
+            self.host,
+            variable,
+            array_targets,
+        )
+        .map_err(|_| invalid())?;
+        if arrow.declaration != declaration
+            || !arrow
+                .parameters
+                .iter()
+                .any(|parameter| parameter.object_bindings.is_some())
+        {
+            return Err(invalid());
+        }
+        // Replay cached annotation syntax without executing a new query or body.
+        let mut planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            array_targets,
+            self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
+        );
+        planner.replay_cached_annotations = true;
+        for annotation in std::iter::once(arrow.contextual_type.type_node).chain(
+            arrow
+                .parameters
+                .iter()
+                .filter_map(|parameter| parameter.annotation),
+        ) {
+            if self
+                .store
+                .type_node_links(annotation)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+            {
+                return Err(invalid());
+            }
+            planner.plan_type_node(annotation).map_err(|_| invalid())?;
+        }
+        super::source::checked_contextual_object_binding_arrow_return(
+            self.store,
+            self.host,
+            &arrow,
+            signature,
+            array_targets,
+        )
+        .map_err(|error| match error {
+            super::source::SourceCheckError::Unsupported(_) => {
+                type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                    node: declaration,
+                    kind: SyntaxKind::ArrowFunction,
+                })
+            }
+            _ => invalid(),
+        })
     }
 
     /// Alias admission uses the same planner, options, and source capabilities as execution.
@@ -100056,6 +100174,399 @@ mod tests {
             counts
         );
         assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn contextual_object_binding_return_queries_keep_body_results_and_cache_proofs() {
+        let library = parse_source_file(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        for (source, mismatched_return) in [
+            (
+                "const read: (input: { value: number }) => number = ({ [\"value\"]: value }) => value;",
+                false,
+            ),
+            (
+                "const read: (input: { value: string }) => number = ({ value }) => value;",
+                true,
+            ),
+            (
+                "const read: (input: { value: number }, choice: 'left') => number = ({ [\"value\"]: value }, choice: 'left') => value;",
+                false,
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let (mut context, library_file, file) =
+                native_method_parameter_context(&library, &parsed, true);
+            let bound = context.file(file).unwrap().1.clone();
+            let library_bound = context.file(library_file).unwrap().1.clone();
+            let globals = context.global_types().clone();
+            let options = context.options();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&library.arena, &library_bound), (&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+            let variable = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::VariableDeclaration).then_some(reference(node))
+                })
+                .unwrap();
+            let arrow = super::super::source_arrows::plan_contextual_source_arrow(
+                context.store(),
+                &host,
+                variable,
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+            )
+            .unwrap();
+            let parameter = arrow.parameters.first().unwrap();
+            let [binding] = parameter.object_bindings.as_deref().unwrap() else {
+                panic!("the original source has one bound property")
+            };
+            assert!(context.store().signature_links(arrow.declaration).is_none());
+            if let Some(key) = binding.computed_key {
+                context.get_type_at_location(key).unwrap();
+            } else {
+                context.check_source_file(file).unwrap();
+            }
+            let signature = function_signature(context.store(), arrow.declaration);
+            let callable = context
+                .store()
+                .source_callable_type_for_signature(signature)
+                .unwrap();
+            let provenance = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let number = bootstrap.number_type;
+            let string = bootstrap.string_type;
+            let returned = if mismatched_return { string } else { number };
+            let wrong = if mismatched_return { number } else { string };
+            let target_signature =
+                function_signature(context.store(), arrow.contextual_type.type_node);
+            assert_ne!(signature, target_signature);
+            assert_ne!(callable, provenance.contextual_target.unwrap());
+            assert_eq!(
+                context
+                    .store()
+                    .signature(target_signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(number)
+            );
+            assert_eq!(
+                context.store().signature(signature).unwrap().parameters(),
+                arrow
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.symbol)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .checked_source_callable_return_type(signature),
+                Some(returned)
+            );
+            if mismatched_return {
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("the real string body must still fail the contextual number return")
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 2322);
+                assert_eq!(diagnostic.node, Some(arrow.declaration));
+            } else {
+                assert!(context.diagnostics().is_empty());
+            }
+            let source_diagnostics = context.diagnostics().clone();
+            let source_file = context.source_file(file).unwrap();
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                (
+                    function_store_state(store),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.source_callable_provenance_lengths(),
+                    store.source_callable_provenance(callable),
+                    store.checked_source_callable_return_type(signature),
+                    store.signature(signature).unwrap().resolved_return_type(),
+                    store
+                        .callable_signature_parameter_types(signature)
+                        .map(<[TypeId]>::to_vec),
+                    store.source_file_links(source_file).cloned(),
+                    parsed
+                        .arena
+                        .iter()
+                        .map(|(node, _)| {
+                            let node = reference(node);
+                            (
+                                store.type_node_links(node).cloned(),
+                                store.symbol_node_links(node).cloned(),
+                                store.signature_links(node).cloned(),
+                                bound.symbol(node).map(|symbol| {
+                                    (symbol, store.value_symbol_links(symbol).cloned())
+                                }),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let warm = snapshot(context.store());
+            assert_eq!(
+                context.get_return_type_of_signature(signature),
+                Ok(returned)
+            );
+            assert_eq!(snapshot(context.store()), warm);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut session = InstantiationSession::new(InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            });
+            {
+                let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                )
+                .unwrap();
+                let invalid =
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature));
+                for _ in 0..2 {
+                    assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+                    assert_eq!(snapshot(query.store), warm);
+                }
+                for node in std::iter::once(arrow.contextual_type.type_node)
+                    .chain(
+                        arrow
+                            .parameters
+                            .iter()
+                            .filter_map(|parameter| parameter.annotation),
+                    )
+                    .chain(binding.computed_key)
+                {
+                    let original = query.store.type_node_links(node).unwrap().clone();
+                    for changed in [None, Some(wrong)] {
+                        assert!(query.store.set_type_node_links(
+                            node,
+                            TypeNodeLinks {
+                                resolved_type: changed,
+                                ..original.clone()
+                            }
+                        ));
+                        let before = snapshot(query.store);
+                        for _ in 0..2 {
+                            assert_eq!(query.get_return_type_of_signature(signature), Err(invalid));
+                            assert_eq!(snapshot(query.store), before);
+                        }
+                        assert!(query.store.set_type_node_links(node, original.clone()));
+                        assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+                        assert_eq!(snapshot(query.store), warm);
+                    }
+                }
+                for symbol in [parameter.symbol, binding.symbol] {
+                    let original = query.store.value_symbol_links(symbol).unwrap().clone();
+                    for changed in [None, Some(wrong)] {
+                        assert!(query.store.set_value_symbol_links(
+                            symbol,
+                            ValueSymbolLinks {
+                                resolved_type: changed,
+                                ..original.clone()
+                            }
+                        ));
+                        let before = snapshot(query.store);
+                        assert_eq!(query.get_return_type_of_signature(signature), Err(invalid));
+                        assert_eq!(snapshot(query.store), before);
+                        assert!(query.store.set_value_symbol_links(symbol, original.clone()));
+                        assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+                        assert_eq!(snapshot(query.store), warm);
+                    }
+                }
+                for changed in [None, Some(wrong)] {
+                    assert!(
+                        query
+                            .store
+                            .set_signature_resolved_return_type(signature, changed)
+                    );
+                    let before = snapshot(query.store);
+                    assert_eq!(query.get_return_type_of_signature(signature), Err(invalid));
+                    assert_eq!(snapshot(query.store), before);
+                    assert_eq!(
+                        query.store.checked_source_callable_return_type(signature),
+                        Some(returned)
+                    );
+                    assert!(
+                        query
+                            .store
+                            .set_signature_resolved_return_type(signature, Some(returned))
+                    );
+                    assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+                    assert_eq!(snapshot(query.store), warm);
+                }
+                let damaged = super::super::store::SourceCallableProvenance {
+                    contextual_variable: Some(binding.symbol),
+                    ..provenance
+                };
+                assert_eq!(
+                    query
+                        .store
+                        .replace_source_callable_provenance_for_test(callable, Some(&damaged)),
+                    Some(provenance)
+                );
+                let before = snapshot(query.store);
+                assert_eq!(query.get_return_type_of_signature(signature), Err(invalid));
+                assert_eq!(snapshot(query.store), before);
+                assert_eq!(
+                    query
+                        .store
+                        .replace_source_callable_provenance_for_test(callable, Some(&provenance)),
+                    Some(damaged)
+                );
+                assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+                assert_eq!(snapshot(query.store), warm);
+                assert!(query.type_reference_alias_targets.is_empty());
+                assert!(query.resolving_instantiated_signatures.is_empty());
+            }
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+            assert!(diagnostics.is_empty());
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                context.get_return_type_of_signature(signature),
+                Ok(returned)
+            );
+            assert_eq!(snapshot(context.store()), warm);
+            assert_eq!(context.diagnostics(), &source_diagnostics);
+        }
+    }
+
+    #[test]
+    fn contextual_object_binding_return_queries_keep_the_callers_array_authority() {
+        let library = parse_source_file(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let parsed = parse_source_file(
+            "const read: (input: { value: number; values: number[] }) => number = ({ [\"value\"]: value }) => value;",
+        );
+        let (mut context, library_file, file) =
+            native_method_parameter_context(&library, &parsed, true);
+        let bound = context.file(file).unwrap().1.clone();
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, &library_bound), (&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let signature = function_signature(context.store(), declaration);
+        let returned = context
+            .store()
+            .checked_source_callable_return_type(signature)
+            .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(returned, number);
+        let array_node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrayType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let array = context
+            .store()
+            .type_node_links(array_node)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .canonical_array_element_type(&globals, array),
+            Ok(Some(number))
+        );
+        let before = function_store_state(context.store());
+        let source_links = context.store().signature_links(declaration).cloned();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_count: 0,
+            ..InstantiationLimits::default()
+        });
+        {
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+            let mut foreign = globals.clone();
+            std::mem::swap(&mut foreign.array_type, &mut foreign.readonly_array_type);
+            query.array_type = Some(foreign.array_type);
+            query.global_types = Some(foreign);
+            let invalid =
+                type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature));
+            for _ in 0..2 {
+                assert_eq!(query.get_return_type_of_signature(signature), Err(invalid));
+                assert_eq!(function_store_state(query.store), before);
+                assert_eq!(
+                    query.store.signature_links(declaration).cloned(),
+                    source_links
+                );
+                assert_eq!(
+                    query.store.checked_source_callable_return_type(signature),
+                    Some(returned)
+                );
+            }
+            query.array_type = Some(globals.array_type);
+            query.global_types = Some(globals.clone());
+            assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+            assert_eq!(function_store_state(query.store), before);
+        }
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            (0, 0, 0)
+        );
+        assert!(diagnostics.is_empty());
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            context.get_return_type_of_signature(signature),
+            Ok(returned)
+        );
+        assert_eq!(function_store_state(context.store()), before);
+        assert_eq!(
+            context.store().signature_links(declaration).cloned(),
+            source_links
+        );
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

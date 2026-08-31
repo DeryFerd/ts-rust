@@ -115,7 +115,7 @@ use super::{
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callables::{
         CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
-        validate_stored_single_callable,
+        validate_stored_single_callable, validate_stored_single_callable_with_array_targets,
     },
     classes::{
         ClassBodyAccessToken, ClassBodyKind, ClassBodyPlan, ClassConstructorVisibility,
@@ -54699,6 +54699,242 @@ fn preflight_contextual_source_publication(
         }
     }
     Ok(())
+}
+
+/// Reads a checked contextual binding arrow without running its body or publishing caches.
+pub(super) fn checked_contextual_object_binding_arrow_return(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    arrow: &SourceContextualArrowPlan,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<TypeId, SourceCheckError> {
+    let invalid = || SourceCheckError::Arrow(arrow.declaration);
+    let type_ = store
+        .source_callable_type_for_signature(signature)
+        .ok_or_else(invalid)?;
+    let provenance = store
+        .source_callable_provenance(type_)
+        .ok_or_else(invalid)?;
+    let target = provenance.contextual_target.ok_or_else(invalid)?;
+    if provenance.signature != signature
+        || provenance.declaration != arrow.declaration
+        || store
+            .type_node_links(arrow.contextual_type.type_node)
+            .and_then(|links| links.resolved_type)
+            != Some(target)
+    {
+        return Err(invalid());
+    }
+    preflight_contextual_source_publication(store, arrow, Some(target))?;
+    let StoredSingleCallableValidation::Valid {
+        callable, edges, ..
+    } = validate_stored_single_callable_with_array_targets(store, type_, array_targets)
+    else {
+        return Err(invalid());
+    };
+    let StoredSingleCallableValidation::Valid {
+        callable: target_callable,
+        edges: target_edges,
+        ..
+    } = validate_stored_single_callable_with_array_targets(store, target, array_targets)
+    else {
+        return Err(invalid());
+    };
+    for edge in edges.into_iter().chain(target_edges) {
+        store.validate_cached_array_capability_with_pending_functions(array_targets, edge, &[])?;
+    }
+    let target_signature = store
+        .signature(target_callable.signature)
+        .ok_or_else(invalid)?;
+    let shape = SourceContextualSignatureShape {
+        call_signature_count: 1,
+        type_parameter_count: target_signature.type_parameters().len(),
+        parameter_count: target_callable.parameters.len(),
+        has_effective_rest: target_signature.has_rest_parameter(),
+    };
+    if shape != arrow.contextual_signature_shape || callable.signature != signature {
+        return Err(invalid());
+    }
+    let resolved = resolve_contextual_arrow_parameter_origins(arrow, shape)
+        .map_err(SourcePlanner::contextual_arrow_plan_error)?;
+    if resolved.parameters.len() != callable.parameters.len() {
+        return Err(invalid());
+    }
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    for ((parameter, syntax), actual) in resolved
+        .parameters
+        .iter()
+        .zip(&arrow.parameters)
+        .zip(&callable.parameters)
+    {
+        let base = match parameter.origin {
+            SourceContextualParameterOrigin::ExplicitAnnotation { type_node } => store
+                .type_node_links(type_node)
+                .and_then(|links| links.resolved_type)
+                .ok_or_else(invalid)?,
+            SourceContextualParameterOrigin::ContextualPosition { index } => {
+                *target_callable.parameters.get(index).ok_or_else(invalid)?
+            }
+            SourceContextualParameterOrigin::ImplicitAny { .. } => bootstrap.any_type,
+            SourceContextualParameterOrigin::ContextualEmptyRestTail { .. } => {
+                store
+                    .validate_canonical_empty_tuple_type(*actual)
+                    .map_err(|_| invalid())?;
+                *actual
+            }
+        };
+        let expected = if bootstrap.options.strict_null_checks
+            && parameter.optional
+            && base != bootstrap.any_type
+        {
+            store
+                .cached_literal_union_type_with_alias(
+                    &[base, bootstrap.undefined_type],
+                    None,
+                    array_targets,
+                )?
+                .ok_or_else(invalid)?
+        } else {
+            base
+        };
+        if *actual != expected {
+            return Err(invalid());
+        }
+        preflight_source_expression_cache(store, syntax.declaration, expected)?;
+        preflight_source_expression_cache(store, syntax.name, expected)?;
+        checked_contextual_object_binding_leaves(store, host, syntax, expected, array_targets)?;
+    }
+    let returned = store
+        .checked_source_callable_return_type(signature)
+        .ok_or_else(invalid)?;
+    if callable.return_type != Some(returned) {
+        return Err(invalid());
+    }
+    Ok(returned)
+}
+
+fn checked_contextual_object_binding_leaves(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    parameter: &super::source_arrows::SourceContextualParameterPlan,
+    parent: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), SourceCheckError> {
+    let Some(bindings) = &parameter.object_bindings else {
+        return Ok(());
+    };
+    let invalid = || SourceCheckError::Arrow(parameter.declaration);
+    if !matches!(
+        validate_resolved_declared_property_object(store, parent),
+        DeclaredPropertyObjectValidation::Valid(_)
+    ) {
+        return Err(invalid());
+    }
+    let fields = store
+        .type_payload(parent)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(invalid)?;
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    for binding in bindings {
+        let name = if let Some(key) = binding.computed_key {
+            checked_contextual_binding_literal_key(store, host, key, binding.property)?
+        } else {
+            binding.property_name.clone()
+        };
+        let property = fields
+            .members
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|members| members.get_source(&name))
+            .ok_or_else(invalid)?;
+        if !fields
+            .properties
+            .as_deref()
+            .unwrap_or_default()
+            .contains(&property)
+        {
+            return Err(invalid());
+        }
+        let record = store.symbol(property).ok_or_else(invalid)?;
+        let property_type = store
+            .value_symbol_links(property)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(invalid)?;
+        let expected = if record.flags().contains(SymbolFlags::OPTIONAL)
+            && bootstrap.options.strict_null_checks
+        {
+            store
+                .cached_literal_union_type_with_alias(
+                    &[property_type, bootstrap.undefined_or_missing_type],
+                    None,
+                    array_targets,
+                )?
+                .ok_or_else(invalid)?
+        } else {
+            property_type
+        };
+        if store.value_symbol_links(binding.symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(expected),
+                ..ValueSymbolLinks::default()
+            })
+        {
+            return Err(invalid());
+        }
+        for node in [binding.element, binding.name] {
+            preflight_source_expression_cache(store, node, expected)?;
+            if store.symbol_node_links(node).is_some_and(|links| {
+                links != &SymbolNodeLinks::default()
+                    && links
+                        != &SymbolNodeLinks {
+                            resolved_symbol: Some(binding.symbol),
+                            ..SymbolNodeLinks::default()
+                        }
+            }) {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn checked_contextual_binding_literal_key(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    key: NodeRef,
+    computed_name: NodeRef,
+) -> Result<String, SourceCheckError> {
+    let invalid = || SourceCheckError::Arrow(key);
+    let (arena, bound) = host.source(key).ok_or_else(invalid)?;
+    let source = SourceFileRef::new(store.id(), bound.source_file());
+    let mut planner = SourcePlanner::new_semantic(arena, bound, source, store, host);
+    if !planner.store_source_shape_matches() {
+        return Err(invalid());
+    }
+    // Captured identifier and call keys need their source-flow proof, not only a saved type.
+    if !matches!(
+        planner.node(key)?.kind,
+        SyntaxKind::StringLiteral
+            | SyntaxKind::NumericLiteral
+            | SyntaxKind::NoSubstitutionTemplateLiteral
+    ) {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Arrow(key),
+        ));
+    }
+    let expression = planner.plan_computed_binding_key(key, computed_name)?;
+    let regular =
+        cached_source_scalar_regular_literal_type(store, &expression)?.ok_or_else(invalid)?;
+    let fresh = store.fresh_type_of_literal_type(regular)?;
+    if store.type_node_links(key)
+        != Some(&TypeNodeLinks {
+            resolved_type: Some(fresh),
+            ..TypeNodeLinks::default()
+        })
+    {
+        return Err(invalid());
+    }
+    literal_computed_property_name(store, regular).ok_or_else(invalid)
 }
 
 fn contextual_arrow_flow_error(node: NodeRef, error: SourceFlowError) -> SourceCheckError {
