@@ -47387,7 +47387,7 @@ export type Env = {
                         Damage::ExportEntry => assert_eq!(
                             fixture.store.insert_symbol(
                                 exports,
-                                alias_record.name().clone(),
+                                alias_record.name().to_owned(),
                                 other
                             ),
                             Some(Some(alias))
@@ -47452,7 +47452,7 @@ export type Env = {
                         Damage::ExportEntry => assert_eq!(
                             fixture.store.insert_symbol(
                                 exports,
-                                alias_record.name().clone(),
+                                alias_record.name().to_owned(),
                                 alias
                             ),
                             Some(Some(other))
