@@ -1007,6 +1007,7 @@ fn declared_type_unavailable_is_unsupported(error: &DeclaredTypeUnavailable) -> 
     match error {
         DeclaredTypeUnavailable::UnsupportedDeclaredType(_)
         | DeclaredTypeUnavailable::UnsupportedInterfaceHeritageResolution(_)
+        | DeclaredTypeUnavailable::UnsupportedGlobalThisMember { .. }
         | DeclaredTypeUnavailable::UnsupportedOuterTypeParameterContext { .. } => true,
         DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized
         | DeclaredTypeUnavailable::SymbolNotOwned(_)
@@ -1020,6 +1021,11 @@ fn declared_type_unavailable_is_unsupported(error: &DeclaredTypeUnavailable) -> 
         | DeclaredTypeUnavailable::PostGlobalNameResolutionUnavailable
         | DeclaredTypeUnavailable::InvalidTypeParameterSymbol(_)
         | DeclaredTypeUnavailable::InvalidTypeParameterDeclaration(_)
+        | DeclaredTypeUnavailable::InvalidGlobalThisSymbol(_)
+        | DeclaredTypeUnavailable::GlobalThisProgramOrderUnavailable(_)
+        | DeclaredTypeUnavailable::InvalidGlobalThisMembers(_)
+        | DeclaredTypeUnavailable::InvalidGlobalThisMember { .. }
+        | DeclaredTypeUnavailable::GlobalThisCapacity(_)
         | DeclaredTypeUnavailable::InvalidCachedDeclaredType { .. } => false,
     }
 }
@@ -1027,6 +1033,9 @@ fn declared_type_unavailable_is_unsupported(error: &DeclaredTypeUnavailable) -> 
 fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
     match error {
         TypeNodeUnavailable::NamespaceAlias { error, .. } => alias_error_is_unsupported(*error),
+        TypeNodeUnavailable::OrdinaryImportTarget { reason, .. } => {
+            alias_target_error_is_unsupported(*reason)
+        }
         TypeNodeUnavailable::UnsupportedSyntax { .. }
         | TypeNodeUnavailable::JsDoc(_)
         | TypeNodeUnavailable::QualifiedTypeReference(_)
@@ -1134,6 +1143,11 @@ fn relation_error_is_unsupported(error: &RelationUnavailable) -> bool {
         | RelationUnavailable::UnresolvedPropertyType(_)
         | RelationUnavailable::StrictOptionalProperty(_)
         | RelationUnavailable::UnresolvedGlobalObject(_)
+        | RelationUnavailable::GlobalThisMembersDemand { .. }
+        | RelationUnavailable::GlobalThisValueDemand { .. }
+        | RelationUnavailable::SourceInterfaceHeaderDemand { .. }
+        | RelationUnavailable::SourceInterfaceAliasDemand { .. }
+        | RelationUnavailable::SourceSignatureReturnDemand { .. }
         | RelationUnavailable::StructuralRelation { .. } => true,
         RelationUnavailable::CanonicalGlobalType(error) => {
             global_type_initialization_error_is_unsupported(error)
@@ -13280,6 +13294,159 @@ mod tests {
             }
         );
         assert!(!class_error.is_unsupported_boundary());
+    }
+
+    #[test]
+    fn canonical_program_classifies_global_this_failures_and_relation_demands() {
+        let parsed = parse_source_file("const value: number = 1;");
+        let node = ts_ast::NodeRef::new(parsed.arena.id(), FileId::new(7), parsed.source_file);
+        let mut store = CanonicalTypeMapperStore::new();
+        let bootstrap = store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let receiver = bootstrap.empty_object_type;
+        let symbol = bootstrap.undefined_symbol;
+        let signature = bootstrap.any_signature;
+        let source_error = |error| CanonicalProgramCheckError::SourceCheck {
+            file_name: "/project/input.ts".to_owned(),
+            error,
+        };
+        for (reason, unsupported) in [
+            (
+                DeclaredTypeUnavailable::InvalidGlobalThisSymbol(symbol),
+                false,
+            ),
+            (
+                DeclaredTypeUnavailable::GlobalThisProgramOrderUnavailable(receiver),
+                false,
+            ),
+            (
+                DeclaredTypeUnavailable::InvalidGlobalThisMembers(receiver),
+                false,
+            ),
+            (
+                DeclaredTypeUnavailable::InvalidGlobalThisMember { receiver, symbol },
+                false,
+            ),
+            (
+                DeclaredTypeUnavailable::UnsupportedGlobalThisMember { receiver, symbol },
+                true,
+            ),
+            (DeclaredTypeUnavailable::GlobalThisCapacity(receiver), false),
+        ] {
+            let error = source_error(SourceCheckError::DeclaredType(
+                DeclaredTypeError::Unavailable(reason),
+            ));
+            assert_eq!(
+                error.failure_class(),
+                if unsupported {
+                    CanonicalProgramCheckFailureClass::Unsupported {
+                        capability_code: "T05.DECLARED_TYPE",
+                    }
+                } else {
+                    CanonicalProgramCheckFailureClass::Fatal {
+                        invariant_code: "INV.SOURCE.DECLARED_TYPE",
+                    }
+                },
+                "{reason:?}",
+            );
+            assert_eq!(error.is_unsupported_boundary(), unsupported);
+        }
+        for demand in [
+            RelationUnavailable::GlobalThisMembersDemand { receiver },
+            RelationUnavailable::GlobalThisValueDemand {
+                receiver,
+                member: symbol,
+            },
+            RelationUnavailable::SourceInterfaceHeaderDemand { receiver },
+            RelationUnavailable::SourceInterfaceAliasDemand {
+                receiver,
+                alias: symbol,
+                root: node,
+            },
+            RelationUnavailable::SourceSignatureReturnDemand {
+                source: receiver,
+                source_signature: signature,
+                target: receiver,
+                target_signature: signature,
+                signature,
+                global_member: Some((receiver, symbol, receiver)),
+            },
+        ] {
+            let error = source_error(SourceCheckError::RelationUnavailable(demand));
+            assert_eq!(
+                error.failure_class(),
+                CanonicalProgramCheckFailureClass::Unsupported {
+                    capability_code: "R01.RELATION",
+                },
+                "{error:?}",
+            );
+            assert!(error.is_unsupported_boundary());
+        }
+    }
+
+    #[test]
+    fn canonical_program_ordinary_import_classification_keeps_the_target_reason() {
+        use ts_checker::semantic::alias::CanonicalAliasTargetUnavailable;
+
+        let parsed = parse_source_file("import type { T } from './target';");
+        let node = ts_ast::NodeRef::new(parsed.arena.id(), FileId::new(7), parsed.source_file);
+        let mut store = CanonicalTypeMapperStore::new();
+        let symbol = store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap()
+            .undefined_symbol;
+        for (reason, unsupported) in [
+            (
+                CanonicalAliasTargetUnavailable::UnsupportedDeclarationFamily,
+                true,
+            ),
+            (
+                CanonicalAliasTargetUnavailable::TargetProviderUnavailable,
+                true,
+            ),
+            (
+                CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(node),
+                true,
+            ),
+            (
+                CanonicalAliasTargetUnavailable::InvalidAliasLinks(symbol),
+                false,
+            ),
+            (
+                CanonicalAliasTargetUnavailable::ForeignDeclaration(node),
+                false,
+            ),
+            (
+                CanonicalAliasTargetUnavailable::MalformedDeclaration(node),
+                false,
+            ),
+        ] {
+            let error = CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::OrdinaryImportTarget { node, reason },
+                )),
+            };
+            assert_eq!(
+                super::alias_target_error_is_unsupported(reason),
+                unsupported
+            );
+            assert_eq!(
+                error.failure_class(),
+                if unsupported {
+                    CanonicalProgramCheckFailureClass::Unsupported {
+                        capability_code: "T06.TYPE_NODE",
+                    }
+                } else {
+                    CanonicalProgramCheckFailureClass::Fatal {
+                        invariant_code: "INV.SOURCE.DECLARED_TYPE",
+                    }
+                },
+                "{reason:?}",
+            );
+            assert_eq!(error.is_unsupported_boundary(), unsupported);
+        }
     }
 
     #[test]
