@@ -1,9 +1,9 @@
-//! Exact local and ambient-namespace function overload groups.
+//! Source function overload groups.
 //!
 //! The binder owns declaration grouping and order. This provider retains that
-//! order, publishes one anonymous callable object with one signature per
-//! declaration, and validates the complete reverse-map/cache graph before the
-//! shared call resolver may observe it.
+//! order and publishes one anonymous callable object. An implementation has its
+//! own signature and checked body but is excluded from the public call list.
+//! The shared call resolver reads the complete reverse-map/cache proof.
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -26,8 +26,8 @@ use super::{
     source_callables::{
         CallableTypePredicatePlan, SourceCallableBodyMode, SourceCallableError, SourceCallablePlan,
         SourceCallableReturnPlan, cached_annotation_identity, plan_callable_type_predicate,
-        plan_source_ambient_overload_declaration, plan_source_jsdoc_overload_declaration,
-        valid_optional_type,
+        plan_source_ambient_overload_declaration, plan_source_exported_overload_declaration,
+        plan_source_jsdoc_overload_declaration, valid_optional_type,
     },
     store::{
         PreparedSourceOverloadParameter, PreparedSourceOverloadPublication,
@@ -723,6 +723,48 @@ pub(super) fn plan_source_jsdoc_overload_group(
     )
 }
 
+pub(super) fn plan_source_exported_overload_group(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner_symbol: SemanticSymbolId,
+    declarations: &[NodeRef],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceOverloadPlan, SourceOverloadError> {
+    let declaration = declarations
+        .last()
+        .copied()
+        .ok_or(SourceOverloadError::Invariant(
+            SourceOverloadInvariant::EmptyGroup,
+        ))?;
+    if store
+        .source_exported_overload_local(owner_symbol, declarations)
+        .is_none()
+    {
+        return Err(SourceOverloadError::Unsupported(declaration));
+    }
+    let Some(NodeData::FunctionDeclaration(function)) =
+        host.node(declaration).map(|node| &node.data)
+    else {
+        return Err(SourceOverloadError::Invariant(
+            SourceOverloadInvariant::Group(declaration),
+        ));
+    };
+    let body = function
+        .body
+        .ok_or(SourceOverloadError::Unsupported(declaration))?;
+    plan_source_overload_group(
+        store,
+        host,
+        owner_symbol,
+        declarations,
+        Some(SourceOverloadImplementation {
+            declaration,
+            body: NodeRef::new(declaration.arena, declaration.file, body),
+        }),
+        array_targets,
+    )
+}
+
 fn plan_source_overload_group(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -757,11 +799,19 @@ fn plan_source_overload_group(
         .ok_or(SourceOverloadError::Invariant(
             SourceOverloadInvariant::Group(first),
         ))?;
+    let export_local = implementation
+        .and_then(|_| store.source_exported_overload_local(owner_symbol, declarations));
     if owner.flags() != SymbolFlags::FUNCTION
         || owner.declarations() != Some(declarations)
         || owner.value_declaration() != Some(first)
         || owner.exports().is_some()
-        || owner.parent().is_some()
+        || owner.parent().is_some() && export_local.is_none()
+        || export_local.is_none()
+            && declarations.iter().any(|declaration| {
+                store
+                    .source_child_with_kind(*declaration, SyntaxKind::ExportKeyword)
+                    .is_some()
+            })
         || owner.export_symbol().is_some()
     {
         return Err(SourceOverloadError::Unsupported(first));
@@ -787,10 +837,23 @@ fn plan_source_overload_group(
                 SourceOverloadInvariant::Group(*declaration),
             ));
         }
-        if bound.local_symbol(*declaration).is_some() {
+        if bound.local_symbol(*declaration) != export_local {
             return Err(SourceOverloadError::Unsupported(*declaration));
         }
-        let planner = if implementation.is_some() {
+        if let Some(local) = export_local
+            && bound
+                .locals(bound.source_file())
+                .and_then(|table| store.symbol_table(table))
+                .and_then(|table| table.get(owner.name()))
+                != Some(local)
+        {
+            return Err(SourceOverloadError::Invariant(
+                SourceOverloadInvariant::Group(*declaration),
+            ));
+        }
+        let planner = if export_local.is_some() {
+            plan_source_exported_overload_declaration
+        } else if implementation.is_some() {
             plan_source_jsdoc_overload_declaration
         } else {
             plan_source_ambient_overload_declaration
@@ -935,20 +998,42 @@ pub(super) fn prepare_source_overload_publication(
                 SourceOverloadInvariant::Publication(declaration.declaration),
             ));
         }
-        let Some((return_annotation, return_null_literal_identity)) =
-            declaration.return_type.annotation_identity()
-        else {
-            return Err(SourceOverloadError::Invariant(
-                SourceOverloadInvariant::Publication(declaration.declaration),
-            ));
-        };
-        if cached_annotation_identity(store, return_annotation, return_null_literal_identity)
-            != Some(resolved.return_type)
-        {
-            return Err(SourceOverloadError::Invariant(
-                SourceOverloadInvariant::Cache(return_annotation),
-            ));
-        }
+        let (return_annotation, return_null_literal_identity) =
+            match declaration.return_type.annotation_identity() {
+                Some((annotation, null_literal_identity)) => {
+                    if cached_annotation_identity(store, annotation, null_literal_identity)
+                        != Some(resolved.return_type)
+                    {
+                        return Err(SourceOverloadError::Invariant(
+                            SourceOverloadInvariant::Cache(annotation),
+                        ));
+                    }
+                    (Some(annotation), null_literal_identity)
+                }
+                None if declaration.return_type.is_inferred()
+                    && declaration.body_mode == SourceCallableBodyMode::Present
+                    && declaration.type_parameters.is_empty()
+                    && !declaration.is_async
+                    && plan.implementation.is_some_and(|implementation| {
+                        implementation.declaration == declaration.declaration
+                            && implementation.body == declaration.body
+                            && store.source_empty_overload_implementation_is_exact(
+                                plan.owner_symbol,
+                                implementation,
+                            )
+                    })
+                    && store
+                        .intrinsic_bootstrap()
+                        .is_some_and(|bootstrap| resolved.return_type == bootstrap.void_type) =>
+                {
+                    (None, false)
+                }
+                None => {
+                    return Err(SourceOverloadError::Invariant(
+                        SourceOverloadInvariant::Publication(declaration.declaration),
+                    ));
+                }
+            };
         let mut parameters = Vec::with_capacity(declaration.parameters.len());
         for (parameter, base_type) in declaration.parameters.iter().zip(&resolved.parameter_types) {
             let (annotation, annotation_null_literal_identity) = parameter.annotation_identity();
@@ -1028,7 +1113,7 @@ pub(super) fn publish_source_overload_batch(
     }
     let mut cold = Vec::new();
     for (plan, publication) in plans.iter().zip(prepared) {
-        if !prepared_matches_plan(plan, publication) {
+        if !prepared_matches_plan(store, plan, publication) {
             return Err(SourceOverloadError::Invariant(
                 SourceOverloadInvariant::Publication(first.declaration),
             ));
@@ -1095,14 +1180,28 @@ fn source_overload_state(
             .declarations
             .iter()
             .enumerate()
-            .any(|(index, declaration)| match plan.implementation {
-                Some(implementation) if index + 1 == plan.declarations.len() => {
-                    declaration.declaration != implementation.declaration
-                        || declaration.body != implementation.body
-                        || declaration.body_mode != SourceCallableBodyMode::Present
-                }
-                Some(_) => declaration.body_mode != SourceCallableBodyMode::OverloadDeclaration,
-                None => declaration.body_mode != SourceCallableBodyMode::AmbientDeclaration,
+            .any(|(index, declaration)| {
+                let invalid_body = match plan.implementation {
+                    Some(implementation) if index + 1 == plan.declarations.len() => {
+                        declaration.declaration != implementation.declaration
+                            || declaration.body != implementation.body
+                            || declaration.body_mode != SourceCallableBodyMode::Present
+                    }
+                    Some(_) => declaration.body_mode != SourceCallableBodyMode::OverloadDeclaration,
+                    None => declaration.body_mode != SourceCallableBodyMode::AmbientDeclaration,
+                };
+                invalid_body
+                    || declaration.return_type.is_inferred()
+                        && (declaration.is_async
+                            || !declaration.type_parameters.is_empty()
+                            || plan.implementation.is_none_or(|implementation| {
+                                implementation.declaration != declaration.declaration
+                                    || implementation.body != declaration.body
+                                    || !store.source_empty_overload_implementation_is_exact(
+                                        plan.owner_symbol,
+                                        implementation,
+                                    )
+                            }))
             })
     {
         return Err(SourceOverloadError::Invariant(
@@ -1187,17 +1286,23 @@ fn source_overload_state(
         ));
     }
     for (declaration, row) in plan.declarations.iter().zip(&provenance.signatures) {
-        let Some((return_annotation, return_null_literal_identity)) =
-            declaration.return_type.annotation_identity()
-        else {
-            return Err(SourceOverloadError::Invariant(
-                SourceOverloadInvariant::Cache(declaration.declaration),
-            ));
-        };
+        let return_annotation = declaration.return_type.annotation_identity();
         if row.declaration != declaration.declaration
             || row.flags != declaration.flags
-            || row.return_annotation != return_annotation
-            || row.return_annotation_null_literal_identity != return_null_literal_identity
+            || row
+                .return_annotation
+                .map(|annotation| (annotation, row.return_annotation_null_literal_identity))
+                != return_annotation
+            || return_annotation.is_none()
+                && (!declaration.return_type.is_inferred()
+                    || plan.implementation.is_none_or(|implementation| {
+                        implementation.declaration != declaration.declaration
+                            || implementation.body != declaration.body
+                            || !store.source_empty_overload_implementation_is_exact(
+                                plan.owner_symbol,
+                                implementation,
+                            )
+                    }))
             || row.parameters.len() != declaration.parameters.len()
             || row.type_parameters.len() != declaration.type_parameters.len()
             || store
@@ -1235,14 +1340,15 @@ fn source_overload_state(
 }
 
 fn prepared_matches_plan(
-    plan: &SourceOverloadPlan,
+    store: &CanonicalTypeMapperStore,
+    group: &SourceOverloadPlan,
     prepared: &PreparedSourceOverloadPublication,
 ) -> bool {
-    plan.owner_symbol == prepared.owner_symbol
-        && plan.implementation == prepared.implementation
-        && plan.array_targets == prepared.array_targets
-        && plan.declarations.len() == prepared.signatures.len()
-        && plan
+    group.owner_symbol == prepared.owner_symbol
+        && group.implementation == prepared.implementation
+        && group.array_targets == prepared.array_targets
+        && group.declarations.len() == prepared.signatures.len()
+        && group
             .declarations
             .iter()
             .zip(&prepared.signatures)
@@ -1270,7 +1376,29 @@ fn prepared_matches_plan(
                                     == prepared.annotation_null_literal_identity
                                 && plan.optional == prepared.optional
                         })
-                    && matches!(plan.return_type, SourceCallableReturnPlan::Annotated { .. })
+                    && match prepared.return_annotation {
+                        Some(_) => {
+                            matches!(plan.return_type, SourceCallableReturnPlan::Annotated { .. })
+                        }
+                        None => {
+                            plan.return_type.is_inferred()
+                                && plan.body_mode == SourceCallableBodyMode::Present
+                                && plan.type_parameters.is_empty()
+                                && !plan.is_async
+                                && !prepared.return_annotation_null_literal_identity
+                                && group.implementation.is_some_and(|implementation| {
+                                    implementation.declaration == plan.declaration
+                                        && implementation.body == plan.body
+                                        && store.source_empty_overload_implementation_is_exact(
+                                            group.owner_symbol,
+                                            implementation,
+                                        )
+                                })
+                                && store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+                                    prepared.return_type == bootstrap.void_type
+                                })
+                        }
+                    }
             })
 }
 
@@ -1315,6 +1443,9 @@ pub(super) fn validate_stored_source_overload(
     let public_count = signatures
         .len()
         .saturating_sub(usize::from(provenance.implementation.is_some()));
+    let export_local = provenance
+        .implementation
+        .and_then(|_| store.source_exported_overload_local(owner_symbol, &declarations));
     let TypeData::Object(object) = record.data() else {
         return StoredSourceOverloadValidation::Malformed;
     };
@@ -1326,7 +1457,13 @@ pub(super) fn validate_stored_source_overload(
         || owner.value_declaration() != declarations.first().copied()
         || owner.members().is_some()
         || owner.exports().is_some()
-        || owner.parent().is_some()
+        || owner.parent().is_some() && export_local.is_none()
+        || export_local.is_none()
+            && declarations.iter().any(|declaration| {
+                store
+                    .source_child_with_kind(*declaration, SyntaxKind::ExportKeyword)
+                    .is_some()
+            })
         || owner.export_symbol().is_some()
         || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
         || store.source_overload_type_for_owner(owner_symbol) != Some(type_)
@@ -1387,15 +1524,33 @@ pub(super) fn validate_stored_source_overload(
                     decorator_signature: DecoratorSignatureState::Unresolved,
                 })
             || store.function_signature_return_annotation(row.signature)
-                != Some((
-                    row.return_annotation,
-                    row.return_annotation_null_literal_identity,
-                ))
-            || cached_annotation_identity(
-                store,
-                row.return_annotation,
-                row.return_annotation_null_literal_identity,
-            ) != Some(row.return_type)
+                != row
+                    .return_annotation
+                    .map(|annotation| (annotation, row.return_annotation_null_literal_identity))
+            || match row.return_annotation {
+                Some(annotation) => {
+                    cached_annotation_identity(
+                        store,
+                        annotation,
+                        row.return_annotation_null_literal_identity,
+                    ) != Some(row.return_type)
+                }
+                None => {
+                    row.return_annotation_null_literal_identity
+                        || !row.type_parameters.is_empty()
+                        || store.signature_has_circular_return_type(row.signature)
+                        || provenance.implementation.is_none_or(|implementation| {
+                            implementation.declaration != row.declaration
+                                || !store.source_empty_overload_implementation_is_exact(
+                                    owner_symbol,
+                                    implementation,
+                                )
+                        })
+                        || store
+                            .intrinsic_bootstrap()
+                            .is_none_or(|bootstrap| row.return_type != bootstrap.void_type)
+                }
+            }
         {
             return StoredSourceOverloadValidation::Malformed;
         }
@@ -1464,8 +1619,8 @@ pub(super) fn validate_stored_source_overload(
                 || plan.family != SourceCallableFamily::FunctionDeclaration
                 || plan.declaration != row.declaration
                 || plan.owner_symbol != owner_symbol
-                || plan.owner_parent.is_some()
-                || plan.export_local.is_some()
+                || plan.owner_parent != owner.parent()
+                || plan.export_local != export_local
                 || plan.body != body
                 || plan.body_mode != body_mode
                 || plan.is_async
@@ -1481,10 +1636,9 @@ pub(super) fn validate_stored_source_overload(
                     .source_callable_type_for_signature(row.signature)
                     .is_some()
                 || plan.return_type.annotation_identity()
-                    != Some((
-                        row.return_annotation,
-                        row.return_annotation_null_literal_identity,
-                    ))
+                    != row
+                        .return_annotation
+                        .map(|annotation| (annotation, row.return_annotation_null_literal_identity))
                 || !evidence.is_exact(store)
                 || store.source_callable_type_parameters(row.signature)
                     != Some(row.type_parameters.as_ref())
@@ -1508,7 +1662,7 @@ pub(super) fn validate_stored_source_overload(
                 if parameter.declaration != planned.declaration
                     || parameter.symbol != planned.symbol
                     || parameter.optional != planned.optional
-                    || planned.optional
+                    || planned.optional && export_local.is_none()
                     || planned.rest
                     || planned.initializer.is_some()
                     || planned.explicit_type_node().is_none()
@@ -1579,6 +1733,65 @@ pub(super) fn validate_stored_source_overload(
         edges.push(row.return_type);
     }
     StoredSourceOverloadValidation::Valid(edges)
+}
+
+/// Rechecks the inferred return after the normal checker visits an empty implementation.
+pub(super) fn source_overload_inferred_implementation_return(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceCallablePlan,
+    signature: SignatureId,
+) -> Option<TypeId> {
+    let type_ = store.source_overload_type_for_signature(signature)?;
+    if !matches!(
+        validate_stored_source_overload(store, type_),
+        StoredSourceOverloadValidation::Valid(_)
+    ) {
+        return None;
+    }
+    let provenance = store.source_overload_provenance(type_)?;
+    let implementation = provenance.implementation?;
+    let row = provenance.signatures.last()?;
+    let owner = store.symbol(provenance.owner_symbol)?;
+    let declarations = owner.declarations()?;
+    if row.signature != signature
+        || row.declaration != plan.declaration
+        || row.return_annotation.is_some()
+        || implementation.declaration != plan.declaration
+        || implementation.body != plan.body
+        || !store.source_empty_overload_implementation_is_exact(plan.owner_symbol, implementation)
+        || plan.family != SourceCallableFamily::FunctionDeclaration
+        || plan.body_mode != SourceCallableBodyMode::Present
+        || !plan.return_type.is_inferred()
+        || !plan.type_parameters.is_empty()
+        || plan.owner_symbol != provenance.owner_symbol
+        || plan.owner_parent != owner.parent()
+        || plan.export_local
+            != store.source_exported_overload_local(plan.owner_symbol, declarations)
+        || plan.is_async
+        || plan.this_parameter.is_some()
+        || plan.type_predicate.is_some()
+        || plan.flags != row.flags
+        || plan.min_argument_count != store.signature(signature)?.min_argument_count()
+        || plan.array_targets != provenance.array_targets
+        || plan.parameters.len() != row.parameters.len()
+        || plan
+            .parameters
+            .iter()
+            .zip(&row.parameters)
+            .any(|(planned, stored)| {
+                planned.declaration != stored.declaration
+                    || planned.symbol != stored.symbol
+                    || planned.annotation_identity()
+                        != (stored.annotation, stored.annotation_null_literal_identity)
+                    || planned.optional != stored.optional
+                    || planned.rest
+                    || planned.initializer.is_some()
+                    || planned.is_implicit_any()
+            })
+    {
+        return None;
+    }
+    Some(row.return_type)
 }
 
 /// Reads a real generic row's query proof, including the hidden implementation.

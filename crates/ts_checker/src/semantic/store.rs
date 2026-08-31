@@ -594,7 +594,7 @@ pub(super) struct SourceOverloadSignatureProvenance {
     pub(super) flags: SignatureFlags,
     pub(super) type_parameters: Box<[SourceCallableTypeParameterProvenance]>,
     pub(super) parameters: Box<[SourceOverloadParameterProvenance]>,
-    pub(super) return_annotation: NodeRef,
+    pub(super) return_annotation: Option<NodeRef>,
     pub(super) return_annotation_null_literal_identity: bool,
     pub(super) return_type: TypeId,
 }
@@ -606,7 +606,7 @@ pub(super) struct SourceOverloadImplementation {
     pub(super) body: NodeRef,
 }
 
-/// Immutable source/binder provenance for one local overload value.
+/// Immutable source/binder provenance for one source overload value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceOverloadProvenance {
     pub(super) owner_symbol: SemanticSymbolId,
@@ -635,7 +635,7 @@ pub(super) struct PreparedSourceOverloadSignature {
     pub(super) parameters: Vec<PreparedSourceOverloadParameter>,
     pub(super) flags: SignatureFlags,
     pub(super) min_argument_count: i32,
-    pub(super) return_annotation: NodeRef,
+    pub(super) return_annotation: Option<NodeRef>,
     pub(super) return_annotation_null_literal_identity: bool,
     pub(super) return_type: TypeId,
 }
@@ -1329,6 +1329,177 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .source_file_facts
                 .get(&node.file)
                 .is_some_and(|facts| !facts.is_javascript_file())
+    }
+
+    /// Reads the real local/export pair for a consecutive implementation overload group.
+    pub(super) fn source_exported_overload_local(
+        &self,
+        owner: SemanticSymbolId,
+        declarations: &[NodeRef],
+    ) -> Option<SemanticSymbolId> {
+        let first = *declarations.first()?;
+        let record = self.symbol(owner)?;
+        let SourceNodeParent::Parent(source) = self.source_node_parent(first)? else {
+            return None;
+        };
+        let facts = self.source_file_facts.get(&first.file)?;
+        let module = record.parent()?;
+        let module_record = self.symbol(module)?;
+        if declarations.len() < 2
+            || facts.is_declaration_file()
+            || facts.is_javascript_file()
+            || !facts.is_external_module()
+            || record.flags() != SymbolFlags::FUNCTION
+            || record.check_flags() != CheckFlags::NONE
+            || record.declarations() != Some(declarations)
+            || record.value_declaration() != Some(first)
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || self.get_merged_symbol(owner) != Some(owner)
+            || !self.source_symbol_declarations_match(owner)
+            || self.source_symbol_flags(owner) != Some(SymbolFlags::FUNCTION)
+            || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || self
+                .source_files
+                .get(&first.file)
+                .map(|file| file.node_ref())
+                != Some(source)
+            || !module_record.flags().intersects(SymbolFlags::MODULE)
+            || module_record.check_flags() != CheckFlags::NONE
+            || module_record.declarations() != Some(&[source])
+            || module_record.parent().is_some()
+            || module_record.export_symbol().is_some()
+            || self.get_merged_symbol(module) != Some(module)
+            || !self.source_symbol_declarations_match(module)
+            || self.source_symbol_flags(module) != Some(module_record.flags())
+            || !self.source_symbol_export_table_matches(module)
+            || module_record
+                .exports()
+                .and_then(|table| self.symbol_table(table))
+                .and_then(|table| table.get(record.name()))
+                != Some(owner)
+        {
+            return None;
+        }
+        if !self.source_exported_overload_declarations_are_exact(
+            source,
+            declarations,
+            record.name().as_utf8()?,
+        ) {
+            return None;
+        }
+        let mut locals = self
+            .source_declaration_owners
+            .get(&first)?
+            .iter()
+            .copied()
+            .filter(|local| {
+                self.symbol(*local).is_some_and(|local_record| {
+                    local_record.flags() == SymbolFlags::EXPORT_VALUE
+                        && local_record.check_flags() == CheckFlags::NONE
+                        && local_record.name() == record.name()
+                        && local_record.declarations() == Some(declarations)
+                        && local_record.value_declaration().is_none()
+                        && local_record.members().is_none()
+                        && local_record.exports().is_none()
+                        && local_record.parent().is_none()
+                        && local_record.export_symbol() == Some(owner)
+                        && self.get_merged_symbol(*local) == Some(*local)
+                        && self.source_symbol_declarations_match(*local)
+                        && self.source_symbol_flags(*local) == Some(SymbolFlags::EXPORT_VALUE)
+                        && self
+                            .value_symbol_links(*local)
+                            .is_none_or(|links| links == &ValueSymbolLinks::default())
+                })
+            });
+        let local = locals.next()?;
+        locals.next().is_none().then_some(local)
+    }
+
+    fn source_exported_overload_declarations_are_exact(
+        &self,
+        source: NodeRef,
+        declarations: &[NodeRef],
+        name: &str,
+    ) -> bool {
+        for (index, declaration) in declarations.iter().copied().enumerate() {
+            let Some(children) = self.source_direct_children(declaration) else {
+                return false;
+            };
+            let bodies = children
+                .iter()
+                .filter(|child| self.source_node_kind(**child) == Some(SyntaxKind::Block))
+                .count();
+            if declarations[..index].contains(&declaration)
+                || !declaration.is_for(source.arena, source.file)
+                || self.source_node_kind(declaration) != Some(SyntaxKind::FunctionDeclaration)
+                || self.source_node_parent(declaration) != Some(SourceNodeParent::Parent(source))
+                || self
+                    .source_child_with_kind(declaration, SyntaxKind::ExportKeyword)
+                    .is_none()
+                || bodies != usize::from(index + 1 == declarations.len())
+                || children.iter().any(|child| {
+                    matches!(
+                        self.source_node_kind(*child),
+                        Some(
+                            SyntaxKind::DeclareKeyword
+                                | SyntaxKind::DefaultKeyword
+                                | SyntaxKind::AsyncKeyword
+                                | SyntaxKind::AsteriskToken
+                        )
+                    )
+                })
+                || self
+                    .source_child_with_kind(declaration, SyntaxKind::Identifier)
+                    .and_then(|name| self.source_identifier_text(name))
+                    != Some(name)
+            {
+                return false;
+            }
+        }
+        let Some(mut statements) = self.source_direct_children(source) else {
+            return false;
+        };
+        statements.sort_by_key(|node| (self.source_node_start(*node), node.node.index()));
+        statements
+            .windows(declarations.len())
+            .any(|window| window == declarations)
+    }
+
+    /// An absent overload annotation means this exact empty implementation, never an unknown return.
+    pub(super) fn source_empty_overload_implementation_is_exact(
+        &self,
+        owner: SemanticSymbolId,
+        implementation: SourceOverloadImplementation,
+    ) -> bool {
+        let Some(declarations) = self.symbol(owner).and_then(|owner| owner.declarations()) else {
+            return false;
+        };
+        self.source_exported_overload_local(owner, declarations)
+            .is_some()
+            && declarations.last().copied() == Some(implementation.declaration)
+            && self.source_node_kind(implementation.body) == Some(SyntaxKind::Block)
+            && self.source_node_parent(implementation.body)
+                == Some(SourceNodeParent::Parent(implementation.declaration))
+            && self
+                .source_direct_children(implementation.body)
+                .is_some_and(|children| children.is_empty())
+            && self
+                .source_direct_children(implementation.declaration)
+                .is_some_and(|children| {
+                    children.iter().all(|child| {
+                        self.source_node_kind(*child).is_some_and(|kind| {
+                            matches!(
+                                kind,
+                                SyntaxKind::ExportKeyword
+                                    | SyntaxKind::Identifier
+                                    | SyntaxKind::Parameter
+                                    | SyntaxKind::Block
+                            )
+                        })
+                    })
+                })
     }
 
     /// Checks immutable binder ownership, including canonical merged-symbol redirects.
@@ -11078,6 +11249,9 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             let common_parent = declaration_order
                 .first()
                 .and_then(|declaration| self.source_node_parent(*declaration));
+            let export_local = group.implementation.and_then(|_| {
+                self.source_exported_overload_local(group.owner_symbol, &declaration_order)
+            });
             if group.signatures.len() < 2
                 || group.implementation.is_some_and(|implementation| {
                     declaration_order.last().copied() != Some(implementation.declaration)
@@ -11092,7 +11266,12 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                 || owner.value_declaration() != declaration_order.first().copied()
                 || owner.members().is_some()
                 || owner.exports().is_some()
-                || owner.parent().is_some()
+                || owner.parent().is_some() && export_local.is_none()
+                || export_local.is_none()
+                    && declaration_order.iter().any(|declaration| {
+                        self.source_child_with_kind(*declaration, SyntaxKind::ExportKeyword)
+                            .is_some()
+                    })
                 || owner.export_symbol().is_some()
                 || self.get_merged_symbol(group.owner_symbol) != Some(group.owner_symbol)
                 || common_parent.is_none()
@@ -11139,7 +11318,23 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                     || usize::try_from(signature.min_argument_count)
                         .map_or(true, |minimum| minimum > signature.parameters.len())
                     || self.type_payload(signature.return_type).is_none()
-                    || !self.contains_node_ref(signature.return_annotation)
+                    || match signature.return_annotation {
+                        Some(annotation) => !self.contains_node_ref(annotation),
+                        None => {
+                            signature.return_annotation_null_literal_identity
+                                || signature.query_evidence.is_some()
+                                || group.implementation.is_none_or(|implementation| {
+                                    implementation.declaration != signature.declaration
+                                        || !self.source_empty_overload_implementation_is_exact(
+                                            group.owner_symbol,
+                                            implementation,
+                                        )
+                                })
+                                || self.intrinsic_bootstrap().is_none_or(|bootstrap| {
+                                    signature.return_type != bootstrap.void_type
+                                })
+                        }
+                    }
                 {
                     return None;
                 }
@@ -11176,10 +11371,12 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                         })
                         || plan.parameters.len() != signature.parameters.len()
                         || plan.return_type.annotation_identity()
-                            != Some((
-                                signature.return_annotation,
-                                signature.return_annotation_null_literal_identity,
-                            ))
+                            != signature.return_annotation.map(|annotation| {
+                                (
+                                    annotation,
+                                    signature.return_annotation_null_literal_identity,
+                                )
+                            })
                     {
                         return None;
                     }
@@ -11417,11 +11614,13 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                         ..SignatureLinks::default()
                     },
                 ));
-                assert!(self.set_function_signature_return_annotation(
-                    *signature_id,
-                    signature.return_annotation,
-                    signature.return_annotation_null_literal_identity,
-                ));
+                if let Some(annotation) = signature.return_annotation {
+                    assert!(self.set_function_signature_return_annotation(
+                        *signature_id,
+                        annotation,
+                        signature.return_annotation_null_literal_identity,
+                    ));
+                }
             }
             assert!(
                 self.set_callable_signature_parameter_types_batch(

@@ -372,8 +372,11 @@ pub(super) fn plan_function_identifier_read(
             .into());
         }
         validate_target_parent(bound, store, routed.target, routed.export_local.is_some())?;
-    } else if declarations.len() >= 2 && routed.export_local.is_none() {
+    } else if declarations.len() >= 2 {
         validate_function_overload_read_target(store, node, name, routed.target, declarations)?;
+        if let Some(local) = routed.export_local {
+            validate_export_local(store, local, declarations[0], routed.target, name)?;
+        }
         for declaration in declarations {
             if declaration.file != node.file || declaration.arena != node.arena {
                 return Err(SourceFunctionPlanError::Unsupported(
@@ -384,16 +387,16 @@ pub(super) fn plan_function_identifier_read(
                 ));
             }
             validate_function_read_declaration_symbol(bound, store, *declaration, routed.target)?;
-            if bound.local_symbol(*declaration).is_some() {
+            if bound.local_symbol(*declaration) != routed.export_local {
                 return Err(SourceFunctionInvariant::LocalExportSymbolMismatch {
                     declaration: *declaration,
-                    expected: None,
+                    expected: routed.export_local,
                     actual: bound.local_symbol(*declaration),
                 }
                 .into());
             }
         }
-        validate_target_parent(bound, store, routed.target, false)?;
+        validate_target_parent(bound, store, routed.target, routed.export_local.is_some())?;
     } else {
         return Err(SourceFunctionPlanError::Unsupported(
             SourceFunctionUnsupported::NonUniqueDeclaration {
@@ -467,6 +470,9 @@ fn validate_function_overload_read_target(
         || record.members().is_some()
         || record.exports().is_some()
         || record.parent().is_some()
+            && store
+                .source_exported_overload_local(symbol, declarations)
+                .is_none()
         || record.export_symbol().is_some()
         || declarations.len() < 2
         || declarations.iter().any(|declaration| {
@@ -499,6 +505,11 @@ fn route_value_symbol(
         if record.flags() != SymbolFlags::EXPORT_VALUE
             || record.check_flags() != CheckFlags::NONE
             || !matches!(record.declarations(), Some([_]))
+                && !record.export_symbol().is_some_and(|target| {
+                    record.declarations().is_some_and(|declarations| {
+                        store.source_exported_overload_local(target, declarations) == Some(resolved)
+                    })
+                })
             || record.value_declaration().is_some()
             || record.members().is_some()
             || record.exports().is_some()
@@ -809,6 +820,10 @@ fn validate_export_local(
         || record.check_flags() != CheckFlags::NONE
         || record.name().as_bytes() != name.as_bytes()
         || record.declarations() != Some(&[declaration])
+            && !record.declarations().is_some_and(|declarations| {
+                declarations.contains(&declaration)
+                    && store.source_exported_overload_local(target, declarations) == Some(local)
+            })
         || record.value_declaration().is_some()
         || record.members().is_some()
         || record.exports().is_some()

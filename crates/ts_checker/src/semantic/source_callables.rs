@@ -51,6 +51,7 @@ use super::{
         PreparedSourceGenericCallablePublication, ResolvedSourceCallableTypeParameter,
         SemanticStore, SourceCallableInferredReturnCycle, SourceCallableProvenance,
         SourceCallableReturnProvenance, SourceCallableTypeParameterProvenance, SourceNodeParent,
+        SourceOverloadImplementation,
     },
     type_nodes::SourceCallableTypeQueryEvidence,
     type_records::{
@@ -1155,6 +1156,7 @@ enum SourceCallableOwnerShape<'a> {
     Unique,
     AmbientOverload(&'a [NodeRef]),
     JavaScriptOverload(&'a [NodeRef]),
+    ExportedImplementationOverload(&'a [NodeRef]),
     JavaScriptDuplicateImplementation,
 }
 
@@ -2836,6 +2838,20 @@ pub(super) fn plan_enclosing_source_callable_annotation(
                     &group.declarations,
                     array_targets,
                 )?
+            } else if let Some(declarations) =
+                store.symbol(owner).and_then(|owner| owner.declarations())
+                && store
+                    .source_exported_overload_local(owner, declarations)
+                    .is_some()
+            {
+                plan_source_exported_overload_declaration(
+                    store,
+                    host,
+                    current,
+                    owner,
+                    declarations,
+                    array_targets,
+                )?
             } else {
                 plan_source_callable(store, host, current, owner, array_targets)?
             };
@@ -2887,6 +2903,33 @@ pub(super) fn plan_source_jsdoc_overload_declaration(
         owner_symbol,
         array_targets,
         SourceCallableOwnerShape::JavaScriptOverload(declarations),
+    )
+}
+
+/// Plans one real exported overload row, including its separate implementation.
+pub(super) fn plan_source_exported_overload_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    declarations: &[NodeRef],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceCallablePlan, SourceCallableError> {
+    if store
+        .source_exported_overload_local(owner_symbol, declarations)
+        .is_none()
+    {
+        return Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::OverloadDeclaration(declaration),
+        ));
+    }
+    plan_source_callable_with_owner_shape(
+        store,
+        host,
+        declaration,
+        owner_symbol,
+        array_targets,
+        SourceCallableOwnerShape::ExportedImplementationOverload(declarations),
     )
 }
 
@@ -3067,7 +3110,13 @@ fn plan_source_callable_with_owner_shape(
         ));
     }
     let mut body_mode = validate_modifiers(store, host, declaration, record.range, &view)?;
-    if javascript_jsdoc_overload && view.body.is_none() {
+    if (javascript_jsdoc_overload
+        || matches!(
+            owner_shape,
+            SourceCallableOwnerShape::ExportedImplementationOverload(_)
+        ) && body_mode == SourceCallableBodyMode::Present)
+        && view.body.is_none()
+    {
         body_mode = SourceCallableBodyMode::OverloadDeclaration;
     }
     let is_async = view.is_async(store, declaration);
@@ -3118,6 +3167,11 @@ fn plan_source_callable_with_owner_shape(
                 && owner.value_declaration() == declarations.first().copied()
                 && owner.parent().is_none()
                 && export_local.is_none()
+        }
+        SourceCallableOwnerShape::ExportedImplementationOverload(declarations) => {
+            declarations.contains(&declaration)
+                && export_local.is_some()
+                && store.source_exported_overload_local(owner_symbol, declarations) == export_local
         }
         SourceCallableOwnerShape::JavaScriptDuplicateImplementation => {
             javascript_duplicate_owner
@@ -4163,6 +4217,46 @@ fn plan_source_callable_with_owner_shape(
                         || parameter.optional
                         || parameter.initializer.is_some()
                         || parameter.is_implicit_any()
+                })
+            {
+                return Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::OverloadDeclaration(declaration),
+                ));
+            }
+        }
+        SourceCallableOwnerShape::ExportedImplementationOverload(_) => {
+            let inferred_empty = plan.return_type.is_inferred()
+                && plan.body_mode == SourceCallableBodyMode::Present
+                && store.source_empty_overload_implementation_is_exact(
+                    owner_symbol,
+                    SourceOverloadImplementation {
+                        declaration,
+                        body: plan.body,
+                    },
+                )
+                && host.node(plan.body).is_some_and(|record| {
+                    matches!(&record.data, NodeData::Block(block)
+                        if record.flags.0 == 0 && block.statements.nodes.is_empty()
+                            && !block.statements.has_trailing_comma && block.facts == 0
+                            && block.flow_node.is_none() && block.next_container.is_none())
+                });
+            if plan.family != SourceCallableFamily::FunctionDeclaration
+                || !matches!(
+                    plan.body_mode,
+                    SourceCallableBodyMode::Present | SourceCallableBodyMode::OverloadDeclaration
+                )
+                || plan.type_parameters.len() > 1
+                || plan.type_parameters.iter().any(|parameter| {
+                    parameter.constraint.is_some() || parameter.default_type.is_some()
+                })
+                || plan.return_type.type_node().is_none() && !inferred_empty
+                || plan.type_predicate.is_some()
+                || plan.this_parameter.is_some()
+                || plan.export_local.is_none()
+                || plan.owner_parent.is_none()
+                || plan.is_async
+                || plan.parameters.iter().any(|parameter| {
+                    parameter.rest || parameter.initializer.is_some() || parameter.is_implicit_any()
                 })
             {
                 return Err(SourceCallableError::Unsupported(
@@ -10247,6 +10341,12 @@ fn validate_owner_name_and_export_route(
                         || local_record.check_flags() != CheckFlags::NONE
                         || local_record.name().as_bytes() != identifier.text.as_bytes()
                         || local_record.declarations() != Some(&[declaration])
+                            && !bound.symbol(declaration).is_some_and(|symbol| {
+                                owner.declarations().is_some_and(|declarations| {
+                                    store.source_exported_overload_local(symbol, declarations)
+                                        == Some(local)
+                                })
+                            })
                         || local_record.value_declaration().is_some()
                         || local_record.members().is_some()
                         || local_record.exports().is_some()
@@ -13120,6 +13220,20 @@ pub(super) fn validate_inferred_source_callable_return(
         return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
             plan.declaration,
         )));
+    }
+    if store
+        .source_overload_type_for_signature(signature)
+        .is_some()
+    {
+        return super::source_overloads::source_overload_inferred_implementation_return(
+            store, plan, signature,
+        )
+        .map(Some)
+        .ok_or_else(|| {
+            invariant(SourceCallableInvariant::InvalidSignatureCache(
+                plan.declaration,
+            ))
+        });
     }
     match source_callable_state(store, plan, false)? {
         SourceCallableState::AwaitingInferredReturn {

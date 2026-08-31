@@ -36025,21 +36025,40 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 callable.declaration,
             ))
         };
-        let group = self
-            .host
-            .source(callable.declaration)
-            .and_then(|(arena, _)| {
-                super::jsdoc::authenticated_jsdoc_overload_group(arena, callable.declaration)
-            })
-            .ok_or_else(invalid)?;
-        let actual = source_callables::plan_source_jsdoc_overload_declaration(
-            self.store,
-            self.host,
-            callable.declaration,
-            callable.owner_symbol,
-            &group.declarations,
-            callable.array_targets,
-        )
+        let actual = if let Some(declarations) = self
+            .store
+            .symbol(callable.owner_symbol)
+            .and_then(|owner| owner.declarations())
+            && self
+                .store
+                .source_exported_overload_local(callable.owner_symbol, declarations)
+                .is_some()
+        {
+            source_callables::plan_source_exported_overload_declaration(
+                self.store,
+                self.host,
+                callable.declaration,
+                callable.owner_symbol,
+                declarations,
+                callable.array_targets,
+            )
+        } else {
+            let group = self
+                .host
+                .source(callable.declaration)
+                .and_then(|(arena, _)| {
+                    super::jsdoc::authenticated_jsdoc_overload_group(arena, callable.declaration)
+                })
+                .ok_or_else(invalid)?;
+            source_callables::plan_source_jsdoc_overload_declaration(
+                self.store,
+                self.host,
+                callable.declaration,
+                callable.owner_symbol,
+                &group.declarations,
+                callable.array_targets,
+            )
+        }
         .map_err(|error| source_callable_error(error, callable.family))?;
         if actual != *callable || !callable.requires_type_query_evidence() {
             return Err(invalid());

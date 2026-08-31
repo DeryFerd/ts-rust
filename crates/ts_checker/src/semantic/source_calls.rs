@@ -6525,12 +6525,12 @@ fn prepare_legacy_source_call_diagnostic(
         && let Some(type_) = store
             .value_symbol_links(symbol)
             .and_then(|links| links.resolved_type)
-        && let Some(overloads) = super::classes::source_class_method_overloads(store, type_)
-            .map_err(|error| class_call_error(plan.node, error))?
-        && overloads
-            .signatures
-            .iter()
-            .any(|callable| callable.signature == diagnostic_resolution.signature)
+        && let Some(implementation) = source_call_overload_implementation(
+            store,
+            plan.node,
+            type_,
+            diagnostic_resolution.signature,
+        )?
         && super::calls::class_overload_implementation_accepts_arguments(
             store,
             global_types,
@@ -6543,13 +6543,13 @@ fn prepare_legacy_source_call_diagnostic(
                 callee: type_,
                 arguments: argument_types,
             },
-            &overloads.implementation,
+            &implementation,
             session,
         )
         .map_err(|error| direct_class_call_error(plan.node, error))?
     {
         let declaration = store
-            .signature(overloads.implementation.signature)
+            .signature(implementation.signature)
             .and_then(super::signatures::Signature::declaration)
             .ok_or(SourceCheckError::Call(plan.node))?;
         for diagnostic in &mut result {
@@ -6564,6 +6564,52 @@ fn prepare_legacy_source_call_diagnostic(
         }
     }
     Ok(result)
+}
+
+fn source_call_overload_implementation(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    type_: TypeId,
+    public_signature: SignatureId,
+) -> Result<Option<super::callables::ValidatedSingleCallable>, SourceCheckError> {
+    if let Some(overloads) = super::classes::source_class_method_overloads(store, type_)
+        .map_err(|error| class_call_error(node, error))?
+    {
+        return Ok(overloads
+            .signatures
+            .iter()
+            .any(|callable| callable.signature == public_signature)
+            .then_some(overloads.implementation));
+    }
+    let Some(provenance) = store.source_overload_provenance(type_) else {
+        return Ok(None);
+    };
+    let Some(implementation) = provenance.implementation else {
+        return Ok(None);
+    };
+    let owner = store
+        .symbol(provenance.owner_symbol)
+        .ok_or(SourceCheckError::Call(node))?;
+    if owner.parent().is_none() {
+        return Ok(None);
+    }
+    let row = provenance
+        .signatures
+        .last()
+        .ok_or(SourceCheckError::Call(node))?;
+    if row.declaration != implementation.declaration {
+        return Err(SourceCheckError::Call(node));
+    }
+    if !row.type_parameters.is_empty()
+        || !provenance.signatures[..provenance.signatures.len() - 1]
+            .iter()
+            .any(|row| row.signature == public_signature)
+    {
+        return Ok(None);
+    }
+    super::source_overloads::source_overload_signature_projection(store, type_, row.signature)
+        .map(Some)
+        .ok_or(SourceCheckError::Call(node))
 }
 
 #[allow(clippy::too_many_arguments)]
