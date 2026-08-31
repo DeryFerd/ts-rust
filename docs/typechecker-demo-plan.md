@@ -31,7 +31,19 @@ result review confirms every outcome. The [complete result](../target/wave202-co
 and [independent review](../target/wave202-core-corpus-3-repair-full-4-quality-runtime-review.md)
 retain all test names and build evidence. This is a Rust test-suite result,
 not a full-project pass or full TypeScript compatibility. The original corpus
-comparison is now running on this same source. It has no result yet.
+comparison has also completed on this source. Diagnostics remain 423 exact
+results in 511 executions. Exact semantic results improved from 60 to 62 in
+95 executions, with 31 unsupported results and two supported mismatches.
+There are no fatal or unknown outcomes. Every earlier exact result remains
+unchanged. The [complete corpus result](../target/wave202-core-corpus-3-repair-corpus-4-preparation-runtime.md)
+and [independent review](../target/wave202-core-corpus-3-repair-corpus-4-preparation-runtime-review.md)
+are closed. The corpus is still red, so this source is not accepted.
+
+The two remaining supported mismatches concern a namespace-qualified symbol
+name and an extra `undefined` in a printed optional parameter. Separate
+workers are checking their production causes. The original expected artifacts
+will not change. A first differing line does not prove that all later lines
+are correct.
 
 The latest Hono run on `33ebb2f0` built in 70 seconds, then failed construction
 after 5 seconds. It does not return a diagnostic set. The trace identifies the
@@ -120,7 +132,8 @@ remain intact. The complete 6,422-test check now passes on `57e743da`. The
 and [review](../target/wave202-core-full3-symbol-display-failure-review.md)
 record the scope. No production fix is proposed for this failure. The corrected
 full check, separate cleanup and independent result review are complete. The
-original corpus comparison is running under its separately reviewed packet.
+original corpus comparison has also closed. It preserves all earlier exact
+results, but the two supported artifact mismatches above prevent acceptance.
 
 The newer combined core/class source is
 `aea8d39c730a2db79e4d2fae965f5b164d1240bf`. Its full checker run passed 5,981
@@ -335,8 +348,11 @@ are closed. Seven workers completed separate failure reports. The coordinator
 is checking their combined census.
 The current shared class-reference repair targets a reader that accepts an
 applied class reference, then incorrectly requires an interface payload.
-Source work is paused because its validation paths extend beyond the proposed
-file list. The scope review must close before edits resume.
+Twelve writers are completing a reviewed 24-file refactor of its read-only
+validation paths. Each writer owns separate files. Current entry points keep
+their existing behavior. This first phase passes one validation context through
+the existing readers. It does not yet admit applied class references.
+That second phase still needs a correct rule for recursive validation.
 The [closed result](../target/wave202-demo-generic-project-integration-focused-1-runtime.md)
 retains the full compiler error. The two later generic-class plans use the
 actual `4cab980e` APIs and share file ownership. Their implementation is not
@@ -516,8 +532,11 @@ including all 16 new controls, in a fresh target. Complete artifact checks,
 separate cleanup and independent review also passed. The [result](../target/wave202-project-first-failure-census-focused-2-runtime.md)
 and [review](../target/wave202-project-first-failure-census-focused-2-runtime-review.md)
 preserve all outcomes. The old failed result remains unchanged. This reporter
-test pass does not mean that Hono passes. Its original-project census is being
-prepared with all 188 roots and a fixed time limit.
+test pass does not mean that Hono passes. Its original-project census packet
+has passed independent preparation review with all 188 roots. The fixed limits
+are 600 seconds for a fresh build and 1,800 seconds for the census. A soft stop
+at 1,500 seconds preserves completed events. These limits do not promise that
+every root will finish. Activation is in progress. No census result exists yet.
 
 The reporter loads the complete original Program, runs the ordinary-order
 control first, and checks each root in a fresh checker context. It records
