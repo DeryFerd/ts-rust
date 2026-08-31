@@ -44,7 +44,7 @@ use super::{
         ClassBodyAccessToken, ClassBodyCallable, ClassBodyIdentities, ClassError,
         ClassMemberOrigin, ClassPropertySide, class_body_identities, class_body_method_callable,
         class_body_super_constructor_callable, class_member_source,
-        validate_class_instance_super_view,
+        prepare_class_body_super_constructor_callable, validate_class_instance_super_view,
     },
     contextual::source_keyof_contextual_type_parameter,
     declared::{cached_ordinary_type_parameter_owner, execute_type_parameter, type_list_key},
@@ -7528,10 +7528,12 @@ fn preflight_class_call_expression_type(
 }
 
 fn source_super_call_target(
-    store: &CanonicalTypeMapperStore,
+    store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
     plan: &SourceSuperCallPlan,
     access: &ClassBodyAccessToken,
+    session: &mut InstantiationSession,
 ) -> Result<ClassBodyCallable, SourceCheckError> {
     let node = plan.node();
     let (arena, _) = host.source(node).ok_or(SourceCheckError::Call(node))?;
@@ -7550,22 +7552,37 @@ fn source_super_call_target(
     let base = identities.base.ok_or(SourceCheckError::Unsupported(
         UnsupportedSourceSyntax::Call(node),
     ))?;
-    let target = class_body_super_constructor_callable(store, host, access)
-        .map_err(|error| class_call_error(node, error))?;
-    if target.kind() != SignatureKind::Construct
-        || target.class_symbol() != base.symbol()
-        || target.callable().owner != base.value_type()
-        || target.callable().return_type != Some(base.instance_type())
-        || target.pending_return_body().is_some()
-    {
-        return Err(SourceCheckError::Call(node));
-    }
     preflight_class_call_expression_type(store, syntax.callee(), base.value_type(), false)?;
     if store
         .symbol_node_links(syntax.callee)
         .is_some_and(|links| links.resolved_symbol.is_some())
-        || preflight_call_cache_state(store, node)?
-            .is_some_and(|(_, signature)| signature != target.callable().signature)
+    {
+        return Err(SourceCheckError::Call(node));
+    }
+    if let Some((_, signature)) = preflight_call_cache_state(store, node)? {
+        let retained = class_body_super_constructor_callable(store, host, access)
+            .map_err(|error| class_call_error(node, error))?;
+        if signature != retained.callable().signature {
+            return Err(SourceCheckError::Call(node));
+        }
+    }
+    let target =
+        prepare_class_body_super_constructor_callable(store, host, globals, access, session)
+            .map_err(|error| class_call_error(node, error))?;
+    if class_body_super_constructor_callable(store, host, access)
+        .map_err(|error| class_call_error(node, error))?
+        != target
+        || target.kind() != SignatureKind::Construct
+        || target.class_symbol() != base.symbol()
+        || base.applied_instance_type() == base.instance_type()
+            && target.callable().owner != base.value_type()
+        || target.callable().return_type != Some(base.applied_instance_type())
+        || target.pending_return_body().is_some()
+    {
+        return Err(SourceCheckError::Call(node));
+    }
+    if preflight_call_cache_state(store, node)?
+        .is_some_and(|(_, signature)| signature != target.callable().signature)
     {
         return Err(SourceCheckError::Call(node));
     }
@@ -7814,8 +7831,9 @@ pub(super) fn source_super_call_argument_contextual_type(
     plan: &SourceSuperCallPlan,
     argument_index: usize,
     access: &ClassBodyAccessToken,
+    session: &mut InstantiationSession,
 ) -> Result<Option<TypeId>, SourceCheckError> {
-    let target = source_super_call_target(store, host, plan, access)?;
+    let target = source_super_call_target(store, host, globals, plan, access, session)?;
     class_call_argument_contextual_type(
         store,
         globals,
@@ -8007,7 +8025,7 @@ pub(super) fn prepare_source_constructor_argument_diagnostics(
     )
 }
 
-/// Publishes the real base signature while only the super call expression is void.
+/// Publishes the selected base signature while only the super call expression is void.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_source_super_call(
     store: &mut CanonicalTypeMapperStore,
@@ -8024,7 +8042,7 @@ pub(super) fn check_source_super_call(
     if plan.arguments().len() != argument_types.len() {
         return Err(SourceCheckError::Call(node));
     }
-    let target = source_super_call_target(store, host, plan, access)?;
+    let target = source_super_call_target(store, host, globals, plan, access, session)?;
     let void = store
         .intrinsic_bootstrap()
         .ok_or(SourceCheckError::Call(node))?
@@ -8066,7 +8084,11 @@ pub(super) fn check_source_super_call(
         argument_types,
         legacy_class_call_resolution(&resolution),
     )?;
-    let current = source_super_call_target(store, host, plan, access)?;
+    let current = source_super_call_target(store, host, globals, plan, access, session)?;
+    let base_value = validate_class_call_access(store, host, &plan.syntax.context, access)?
+        .base
+        .ok_or(SourceCheckError::Call(node))?
+        .value_type();
     if !same_class_call_target(&target, &current)
         || resolution.projection.signature != target.callable().signature
         || !store.try_reserve_type_node_links(2)
@@ -8078,7 +8100,7 @@ pub(super) fn check_source_super_call(
     if !store.set_type_node_links(
         plan.syntax.callee,
         TypeNodeLinks {
-            resolved_type: Some(target.callable().owner),
+            resolved_type: Some(base_value),
             ..TypeNodeLinks::default()
         },
     ) {
@@ -9540,6 +9562,123 @@ mod tests {
             checked_class_constructor(&context, "Base"),
             (instance, value, signature)
         );
+    }
+
+    #[test]
+    fn generic_base_super_calls_keep_callee_and_applied_signature_separate() {
+        let source = parsed(concat!(
+            "class Base<T> { constructor(value: T) {} } ",
+            "class Child extends Base<string> { ",
+            "constructor(value: string) { super(value); } }",
+        ));
+        let file = FileId::new(202_1802);
+        let mut context = context(&source, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let call_nodes = calls(&source, file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("the derived constructor must retain one super call")
+        };
+        let call = *call;
+        let NodeData::CallExpression(syntax) = &source.arena.get(call.node).unwrap().data else {
+            unreachable!()
+        };
+        let callee = NodeRef::new(source.arena.id(), file, syntax.expression);
+        let (base_instance, base_value, base_signature) =
+            checked_class_constructor(&context, "Base");
+        let selected = context
+            .store()
+            .signature_links(call)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        assert_ne!(selected, base_signature);
+        let selected_record = context.store().signature(selected).unwrap();
+        let source_record = context.store().signature(base_signature).unwrap();
+        assert_eq!(selected_record.target(), Some(base_signature));
+        assert_eq!(selected_record.declaration(), source_record.declaration());
+        assert!(selected_record.type_parameters().is_empty());
+        let [formal] = source_record.type_parameters() else {
+            panic!("the base constructor must retain its written class parameter")
+        };
+        let formal = *formal;
+        let [original_parameter] = source_record.parameters() else {
+            panic!("the base constructor has one body parameter")
+        };
+        let original_parameter = *original_parameter;
+        let [copied_parameter] = selected_record.parameters() else {
+            panic!("the applied constructor must copy the actual parameter")
+        };
+        let copied_parameter = *copied_parameter;
+        assert_ne!(copied_parameter, original_parameter);
+        let applied = selected_record.resolved_return_type().unwrap();
+        assert_ne!(applied, base_instance);
+        let TypeData::TypeReference(reference) =
+            context.store().type_payload(applied).unwrap().data()
+        else {
+            panic!("the copied signature must return the applied base reference")
+        };
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let void = bootstrap.void_type;
+        assert_eq!(reference.object.target, Some(base_instance));
+        assert_eq!(
+            reference.resolved_type_arguments.as_deref(),
+            Some([string].as_slice())
+        );
+        assert_eq!(source_record.resolved_return_type(), Some(base_instance));
+        let copied_links = context
+            .store()
+            .value_symbol_links(copied_parameter)
+            .unwrap();
+        assert_eq!(copied_links.target, Some(original_parameter));
+        assert!(copied_links.mapper.is_some());
+        assert_eq!(copied_links.resolved_type, Some(string));
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(original_parameter)
+                .unwrap()
+                .resolved_type,
+            Some(formal)
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(callee)
+                .unwrap()
+                .resolved_type,
+            Some(base_value)
+        );
+        assert_eq!(
+            context.store().type_node_links(call).unwrap().resolved_type,
+            Some(void)
+        );
+        let warm = call_publication_state(&context, call);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(call_publication_state(&context, call), warm);
+        }
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(selected, Some(base_instance))
+        );
+        mark_source_unchecked(&mut context, file);
+        let poisoned = call_publication_state(&context, call);
+        for _ in 0..2 {
+            assert!(context.check_source_file(file).is_err());
+            assert_eq!(call_publication_state(&context, call), poisoned);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(selected, Some(applied))
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(call_publication_state(&context, call), warm);
     }
 
     #[test]

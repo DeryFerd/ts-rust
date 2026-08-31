@@ -1382,14 +1382,14 @@ fn unsupported_new_forms_stop_at_typed_boundaries() {
     let parsed = parse_source_file(source);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(1_804);
+    let construction = first_new_expression(&parsed, file);
+    let boundary = constructor(&parsed, construction);
     let mut context = checker_context(&parsed, file);
-    assert!(
-        matches!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Class(_)
-            ))
-        ),
+    assert_eq!(
+        context.check_source_file(file),
+        Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+            boundary
+        ))),
         "{source}"
     );
     assert!(context.diagnostics().is_empty());

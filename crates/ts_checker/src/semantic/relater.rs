@@ -57,8 +57,8 @@ use super::{
     instantiate::{InstantiationLimits, InstantiationSession},
     instantiated_members::{
         GenericInterfaceMemberError, class_reference_field_target,
-        demand_instantiated_property_type, resolve_members_with_array_targets_and_session,
-        validate_generic_interface_members,
+        completed_source_class_origin_member_mapping, demand_instantiated_property_type,
+        resolve_members_with_array_targets_and_session, validate_generic_interface_members,
         validate_property_object_alias_members_with_array_targets,
     },
     intersection_types::IntersectionTypeProjection,
@@ -935,7 +935,7 @@ pub(super) fn validated_synthetic_structural_property(
 enum ObjectPropertyOrigin {
     Declared,
     InterfaceHeritage(TypeId),
-    ValidatedClass,
+    ValidatedClass(TypeId),
     SyntheticStructural(TypeId),
     FiniteMappedRecord(TypeId),
     Mapped(TypeId),
@@ -954,10 +954,17 @@ impl ObjectPropertyOrigin {
         matches!(
             self,
             Self::Declared
-                | Self::ValidatedClass
+                | Self::ValidatedClass(_)
                 | Self::InterfaceHeritage(_)
                 | Self::PropertyObjectAlias(_)
         )
+    }
+
+    fn same_class_receiver(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::ValidatedClass(left), Self::ValidatedClass(right)) => left == right,
+            _ => true,
+        }
     }
 }
 
@@ -1758,7 +1765,7 @@ impl<'store> RelaterSession<'store> {
                 property.check_flags().contains(CheckFlags::READONLY),
             )
         };
-        let target_type = self.property_type(*target_property)?;
+        let target_type = self.property_type(*target_property, target_members.property_origin)?;
         if !self.canonical_array_target_has_required_own_property(array_target)? {
             return Ok(None);
         }
@@ -3639,13 +3646,13 @@ impl<'store> RelaterSession<'store> {
         }
         self.observe_symbol_table(members);
         for property in &properties {
-            self.property_symbol(*property, ObjectPropertyOrigin::ValidatedClass)?;
+            self.property_symbol(*property, ObjectPropertyOrigin::ValidatedClass(type_))?;
         }
         Ok(ResolvedObjectMembers {
             members: Some(members),
             properties,
             index_infos: Vec::new(),
-            property_origin: ObjectPropertyOrigin::ValidatedClass,
+            property_origin: ObjectPropertyOrigin::ValidatedClass(type_),
             call_signatures: Vec::new(),
             exact_callable: false,
         })
@@ -4267,24 +4274,24 @@ impl<'store> RelaterSession<'store> {
                     self.property_symbol(*source_property, source_members.property_origin)?;
                 (
                     record.name().to_owned(),
-                    self.property_type(*source_property)?,
+                    self.property_type(*source_property, source_members.property_origin)?,
                 )
             };
             let mut property_types = Vec::new();
             let mut property_symbols = Vec::new();
             for (_, members, _) in &targets {
-                let Some(members) = members.members else {
+                let Some(table) = members.members else {
                     continue;
                 };
                 let Some(property) = self
                     .store
-                    .symbol_table(members)
+                    .symbol_table(table)
                     .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?
                     .get(name.as_ref())
                 else {
                     continue;
                 };
-                property_types.push(self.property_type(property)?);
+                property_types.push(self.property_type(property, members.property_origin)?);
                 property_symbols.push(property);
             }
             let non_uniform = property_types
@@ -4310,18 +4317,18 @@ impl<'store> RelaterSession<'store> {
                 if !*included {
                     continue;
                 }
-                let Some(members) = members.members else {
+                let Some(table) = members.members else {
                     continue;
                 };
                 let Some(property) = self
                     .store
-                    .symbol_table(members)
+                    .symbol_table(table)
                     .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?
                     .get(name.as_ref())
                 else {
                     continue;
                 };
-                let target_type = self.property_type(property)?;
+                let target_type = self.property_type(property, members.property_origin)?;
                 if self.property_types_related(&[source_type], &[target_type])? == Ternary::False {
                     mismatched.push(index);
                 } else {
@@ -4341,7 +4348,7 @@ impl<'store> RelaterSession<'store> {
                     self.property_symbol(*source_property, source_members.property_origin)?;
                 (
                     record.name().to_owned(),
-                    self.property_type(*source_property)?,
+                    self.property_type(*source_property, source_members.property_origin)?,
                 )
             };
             let mut target_types = Vec::new();
@@ -4360,7 +4367,7 @@ impl<'store> RelaterSession<'store> {
                         .property_symbol(property, members.property_origin)?
                         .flags()
                         .contains(SymbolFlags::OPTIONAL);
-                    let property_type = self.property_type(property)?;
+                    let property_type = self.property_type(property, members.property_origin)?;
                     target_types.extend(self.effective_property_types(property_type, optional)?);
                 } else {
                     target_types.push(self.bootstrap.undefined_type);
@@ -4492,7 +4499,7 @@ impl<'store> RelaterSession<'store> {
                 )
             };
             let visibility = |origin, declaration: Option<NodeRef>| {
-                if matches!(origin, ObjectPropertyOrigin::ValidatedClass) {
+                if matches!(origin, ObjectPropertyOrigin::ValidatedClass(_)) {
                     declaration.map_or(ClassConstructorVisibility::Public, |declaration| {
                         class_member_visibility(self.store, declaration)
                     })
@@ -4511,11 +4518,17 @@ impl<'store> RelaterSession<'store> {
             if source_optional != target_optional || source_readonly != target_readonly {
                 return Ok(Ternary::False);
             }
-            if *source_property == target_property {
+            if *source_property == target_property
+                && source_members
+                    .property_origin
+                    .same_class_receiver(target_members.property_origin)
+            {
                 continue;
             }
-            let source_type = self.property_type(*source_property)?;
-            let target_type = self.property_type(target_property)?;
+            let source_type =
+                self.property_type(*source_property, source_members.property_origin)?;
+            let target_type =
+                self.property_type(target_property, target_members.property_origin)?;
             let related = self.is_related_to_ex(
                 source_type,
                 target_type,
@@ -4542,7 +4555,7 @@ impl<'store> RelaterSession<'store> {
             RelationKind::Subtype | RelationKind::StrictSubtype
         ) && matches!(
             source_members.property_origin,
-            ObjectPropertyOrigin::ValidatedClass
+            ObjectPropertyOrigin::ValidatedClass(_)
         );
         // Preserve upstream's unmatched-property pass before comparing any
         // property types. This ordering is observable through relation caches.
@@ -4603,13 +4616,17 @@ impl<'store> RelaterSession<'store> {
             else {
                 continue;
             };
-            if source_property == *target_property {
+            if source_property == *target_property
+                && source_members
+                    .property_origin
+                    .same_class_receiver(target_members.property_origin)
+            {
                 continue;
             }
             let source_origin = if source_members.properties.contains(&source_property) {
                 source_members.property_origin
             } else {
-                self.property_type(source_property)?;
+                self.property_type(source_property, ObjectPropertyOrigin::Declared)?;
                 ObjectPropertyOrigin::Declared
             };
             let related = self.property_related_to(
@@ -4737,7 +4754,8 @@ impl<'store> RelaterSession<'store> {
                 if !self.index_signature_accepts_name(target, &[*target_index], name.as_ref())? {
                     continue;
                 }
-                let property_type = self.property_type(*property)?;
+                let property_type =
+                    self.property_type(*property, source_members.property_origin)?;
                 let related = self.is_related_to_ex(
                     property_type,
                     target_value,
@@ -6039,7 +6057,7 @@ impl<'store> RelaterSession<'store> {
             )
         };
         let visibility = |origin, declaration: Option<NodeRef>| {
-            if matches!(origin, ObjectPropertyOrigin::ValidatedClass) {
+            if matches!(origin, ObjectPropertyOrigin::ValidatedClass(_)) {
                 declaration.map_or(ClassConstructorVisibility::Public, |declaration| {
                     class_member_visibility(self.store, declaration)
                 })
@@ -6057,7 +6075,7 @@ impl<'store> RelaterSession<'store> {
             }
         } else if target_visibility == ClassConstructorVisibility::Protected {
             let Some(source_owner) = source_owner
-                .filter(|_| matches!(source_origin, ObjectPropertyOrigin::ValidatedClass))
+                .filter(|_| matches!(source_origin, ObjectPropertyOrigin::ValidatedClass(_)))
             else {
                 return Ok(Ternary::False);
             };
@@ -6089,7 +6107,7 @@ impl<'store> RelaterSession<'store> {
         if self.relation == RelationKind::StrictSubtype && source_readonly && !target_readonly {
             return Ok(Ternary::False);
         }
-        let target_type = self.property_type(target_property)?;
+        let target_type = self.property_type(target_property, target_origin)?;
         let target_types = self.effective_property_types(
             target_type,
             target_flags.intersects(SymbolFlags::OPTIONAL),
@@ -6106,7 +6124,7 @@ impl<'store> RelaterSession<'store> {
         }) {
             Ternary::True
         } else {
-            let source_type = self.property_type(source_property)?;
+            let source_type = self.property_type(source_property, source_origin)?;
             let source_types = self.effective_property_types(
                 source_type,
                 source_flags.intersects(SymbolFlags::OPTIONAL)
@@ -6232,7 +6250,46 @@ impl<'store> RelaterSession<'store> {
         Ok(result)
     }
 
-    fn property_type(&mut self, symbol: SemanticSymbolId) -> Result<TypeId, RelationUnavailable> {
+    #[allow(clippy::too_many_lines)] // Keep each receiver with the existing caller-owned property demand.
+    fn property_type(
+        &mut self,
+        symbol: SemanticSymbolId,
+        origin: ObjectPropertyOrigin,
+    ) -> Result<TypeId, RelationUnavailable> {
+        if let ObjectPropertyOrigin::ValidatedClass(receiver) = origin
+            && completed_source_class_origin_member_mapping(
+                self.store,
+                receiver,
+                symbol,
+                self.global_types.map(|globals| globals.array_targets),
+            )
+            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(receiver))?
+            .is_some()
+        {
+            self.observe_type_surface(receiver);
+            let owned = matches!(
+                self.instantiation_session,
+                RelationInstantiationSession::Owned(_)
+            );
+            let limit_mark = self.instantiation_session.as_mut().limit_event_mark();
+            let type_ = demand_instantiated_property_type(
+                self.store,
+                receiver,
+                symbol,
+                self.global_types.map(|globals| globals.array_targets),
+                self.instantiation_session.as_mut(),
+            )
+            .map_err(|_| RelationUnavailable::UnsupportedProperty(symbol))?;
+            if owned
+                && self
+                    .instantiation_session
+                    .as_mut()
+                    .limit_event_occurred_since(limit_mark)
+            {
+                return Err(RelationUnavailable::UnsupportedProperty(symbol));
+            }
+            return Ok(type_);
+        }
         if self.store.object_literal_getter_origin(symbol).is_some() {
             return self.validated_object_literal_getter(symbol)?.require_type();
         }
@@ -6531,7 +6588,7 @@ impl<'store> RelaterSession<'store> {
                 .and_then(|members| self.store.symbol_table(members))
                 .and_then(|members| members.get(name.as_ref()));
             if required && let Some(source_property) = source_property {
-                self.property_type(source_property)?;
+                self.property_type(source_property, ObjectPropertyOrigin::Declared)?;
                 if self.property_related_to(
                     source_property,
                     ObjectPropertyOrigin::Declared,
@@ -6886,10 +6943,10 @@ impl<'store> RelaterSession<'store> {
             }
             ObjectPropertyOrigin::Declared
             | ObjectPropertyOrigin::InterfaceHeritage(_)
-            | ObjectPropertyOrigin::ValidatedClass
+            | ObjectPropertyOrigin::ValidatedClass(_)
             | ObjectPropertyOrigin::GenericReference(_) => {}
         }
-        if matches!(origin, ObjectPropertyOrigin::ValidatedClass)
+        if matches!(origin, ObjectPropertyOrigin::ValidatedClass(_))
             && record.flags() == SymbolFlags::METHOD
         {
             self.validated_class_method_callable_set(symbol)?;
@@ -6927,7 +6984,7 @@ impl<'store> RelaterSession<'store> {
                 .symbol(parent)
                 .ok_or(RelationUnavailable::Symbol(parent))?;
             let allowed_parent_flags = match origin {
-                ObjectPropertyOrigin::ValidatedClass => SymbolFlags::CLASS,
+                ObjectPropertyOrigin::ValidatedClass(_) => SymbolFlags::CLASS,
                 ObjectPropertyOrigin::GenericReference(reference)
                     if self.class_field_reference_target(reference)?.is_some() =>
                 {
@@ -8151,7 +8208,7 @@ impl<'store> RelaterSession<'store> {
             return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
         }
         if class_members == ClassHeritageMembersValidation::Valid {
-            property_origin = ObjectPropertyOrigin::ValidatedClass;
+            property_origin = ObjectPropertyOrigin::ValidatedClass(type_id);
         }
         let heritage_members = if property_origin.is_declared()
             && class_members == ClassHeritageMembersValidation::NotClass
@@ -8968,7 +9025,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     || record.flags() == SymbolFlags::GET_ACCESSOR,
             )
         };
-        let type_ = session.property_type(property)?;
+        let type_ = session.property_type(property, resolved.property_origin)?;
         Ok(Some(ResolvedOwnProperty {
             symbol: property,
             type_,
@@ -9052,7 +9109,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 {
                     return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                 }
-                let type_ = session.property_type(symbol)?;
+                let type_ = session.property_type(symbol, resolved.property_origin)?;
                 let index = properties.len();
                 if by_name.insert(planned.name.clone(), index).is_some() {
                     return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
@@ -9278,7 +9335,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     };
                     let name = record.name().to_owned();
                     let optional = record.flags().contains(SymbolFlags::OPTIONAL);
-                    let type_ = session.property_type(property)?;
+                    let type_ = session.property_type(property, resolved.property_origin)?;
                     let index = properties.len();
                     if by_name.insert(name.clone(), index).is_some() {
                         return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
@@ -13582,6 +13639,273 @@ mod tests {
             Err(RelationUnavailable::InvalidStructuredMembers(target_type))
         );
         assert_eq!(fixture.store.relation_state_snapshot(), stale);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Three receivers share the same fields and method declarations.
+    fn completed_class_origin_relations_keep_each_inherited_receiver() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parse_source_file(concat!(
+            "class Base<T> { value: T; constructor(value: T) { this.value = value; } ",
+            "read(value: T): T { return value; } self(): this { return this; } } ",
+            "class TextBox extends Base<string> { constructor(value: string) { super(value); } } ",
+            "class CountBox extends Base<number> { constructor(value: number) { super(value); } } ",
+            "class Wrapped<U> extends Base<U> { constructor(value: U) { super(value); } }",
+        ));
+        let file = FileId::new(203_123);
+        let mut context = source_relation_context(
+            &library,
+            &source,
+            file,
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let globals = context.global_types().clone();
+        let relation_globals = RelationGlobalTypes::from_global_types(&globals);
+        let read = query_method_relation_member(&mut context, "Base", "read");
+        let self_method = query_method_relation_member(&mut context, "Base", "self");
+        let [text, count, wrapped] = ["TextBox", "CountBox", "Wrapped"].map(|name| {
+            let owner = context
+                .store()
+                .symbol_table(context.store().intrinsic_bootstrap().unwrap().globals)
+                .unwrap()
+                .get_source(name)
+                .unwrap();
+            context.get_declared_type_of_symbol(owner).unwrap()
+        });
+        let store = context.store_mut_for_test();
+        let TypeData::Interface(base) = store.type_payload(read.owner_type).unwrap().data() else {
+            unreachable!()
+        };
+        let base_formal = base.reference.resolved_type_arguments.as_ref().unwrap()[0];
+        let base_this = base.this_type.unwrap();
+        let field = store
+            .symbol_table(base.reference.object.structured.members.unwrap())
+            .unwrap()
+            .get_source("value")
+            .unwrap();
+        let TypeData::Interface(wrapper) = store.type_payload(wrapped).unwrap().data() else {
+            unreachable!()
+        };
+        let wrapper_formal = wrapper.reference.resolved_type_arguments.as_ref().unwrap()[0];
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let receivers = [
+            (text, bootstrap.string_type),
+            (count, bootstrap.number_type),
+            (wrapped, wrapper_formal),
+        ];
+        let original_links = [field, read.symbol, self_method.symbol]
+            .map(|symbol| (symbol, store.value_symbol_links(symbol).unwrap().clone()));
+        let mut copies = Vec::new();
+        let mut warm_counts = None;
+        for order in [[0, 1, 2], [2, 1, 0], [0, 1, 2]] {
+            let facts = store.relation_bootstrap_facts().unwrap();
+            let mut relation = super::RelaterSession::new_with_global_types_and_options(
+                store,
+                RelationKind::Assignable,
+                facts,
+                Some(relation_globals),
+                Some(true),
+            );
+            for index in order {
+                let (receiver, expected) = receivers[index];
+                let origin = super::ObjectPropertyOrigin::ValidatedClass(receiver);
+                let members = relation.resolved_object_members(receiver, false).unwrap();
+                for member in [field, read.symbol, self_method.symbol] {
+                    assert!(members.properties.contains(&member));
+                }
+                assert_eq!(relation.property_type(field, origin), Ok(expected));
+                let mut receiver_copies = Vec::new();
+                for (method, source_signature, returned) in [
+                    (read.symbol, read.signatures[0], expected),
+                    (self_method.symbol, self_method.signatures[0], receiver),
+                ] {
+                    let copied = relation.property_type(method, origin).unwrap();
+                    let super::StoredCallableSetValidation::Valid { projection, .. } =
+                        super::validate_stored_callable_set_with_array_targets(
+                            relation.store,
+                            copied,
+                            Some(relation_globals.array_targets),
+                        )
+                    else {
+                        panic!("the relation must retain the completed class method proof")
+                    };
+                    let [callable] = projection.call_signatures.as_ref() else {
+                        unreachable!()
+                    };
+                    assert_eq!(callable.return_type, Some(returned));
+                    assert_eq!(
+                        callable.parameters,
+                        if method == read.symbol {
+                            vec![expected]
+                        } else {
+                            Vec::new()
+                        }
+                    );
+                    let signature = relation.store.signature(callable.signature).unwrap();
+                    assert_eq!(signature.target(), Some(source_signature));
+                    assert!(signature.type_parameters().is_empty());
+                    let mapper = signature.mapper().unwrap();
+                    assert_eq!(relation.store.map_type(mapper, base_formal), Some(expected));
+                    assert_eq!(relation.store.map_type(mapper, base_this), Some(receiver));
+                    receiver_copies.push(copied);
+                }
+                if copies.len() < receivers.len() {
+                    copies.push(receiver_copies);
+                } else {
+                    assert_eq!(receiver_copies, copies[index]);
+                }
+            }
+            drop(relation);
+            for (symbol, links) in &original_links {
+                assert_eq!(store.value_symbol_links(*symbol), Some(links));
+            }
+            let counts = method_relation_counts(store);
+            if let Some(warm) = warm_counts {
+                assert_eq!(counts, warm);
+            } else {
+                warm_counts = Some(counts);
+            }
+        }
+        assert_ne!(copies[0], copies[1]);
+        assert_ne!(copies[1], copies[2]);
+        let mut warm = None;
+        for _ in 0..2 {
+            for (left, right) in [(text, count), (count, text)] {
+                assert_eq!(
+                    store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                        left, right, &globals, true,
+                    ),
+                    Ok(false)
+                );
+                assert_eq!(
+                    store.is_type_identical_to_with_global_types_and_strict_function_types(
+                        left, right, &globals, true,
+                    ),
+                    Ok(false)
+                );
+            }
+            let current = (
+                method_relation_counts(store),
+                store.relation_state_snapshot(),
+            );
+            if let Some(warm) = &warm {
+                assert_eq!(&current, warm);
+            } else {
+                warm = Some(current);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // A spent caller cannot publish the own-this copy or lose its captured class formal.
+    fn completed_class_origin_method_relations_keep_the_spent_caller() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parse_source_file("class Origin<T> { self(value: T): this { return this; } }");
+        let file = FileId::new(203_124);
+        let mut context =
+            source_relation_context(&library, &source, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let method = query_method_relation_member(&mut context, "Origin", "self");
+        let globals = RelationGlobalTypes::from_global_types(context.global_types());
+        let store = context.store_mut_for_test();
+        let TypeData::Interface(class) = store.type_payload(method.owner_type).unwrap().data()
+        else {
+            unreachable!()
+        };
+        let this_type = class.this_type.unwrap();
+        let formal = class.reference.resolved_type_arguments.as_ref().unwrap()[0];
+        let mapper = store
+            .new_simple_type_mapper(this_type, method.owner_type)
+            .unwrap();
+        let mut caller = super::InstantiationSession::new(super::InstantiationLimits {
+            max_depth: 100,
+            max_count: 1,
+        });
+        assert_eq!(
+            crate::semantic::instantiate::instantiate_type_with_session(
+                store,
+                this_type,
+                mapper,
+                Some(globals.array_targets),
+                &mut caller,
+            ),
+            Ok(method.owner_type)
+        );
+        assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+        let before = (store.type_len(), store.symbol_len(), store.signature_len());
+        let source_links = store.value_symbol_links(method.symbol).cloned().unwrap();
+        let facts = store.relation_bootstrap_facts().unwrap();
+        let caller_address = std::ptr::from_ref(&caller);
+        {
+            let mut relation = super::RelaterSession::new_with_global_types_options_and_session(
+                store,
+                RelationKind::Assignable,
+                facts,
+                Some(globals),
+                Some(false),
+                Some(&mut caller),
+            );
+            assert!(std::ptr::eq(
+                relation.instantiation_session.as_mut(),
+                caller_address
+            ));
+            assert_eq!(
+                relation.property_type(
+                    method.symbol,
+                    super::ObjectPropertyOrigin::ValidatedClass(method.owner_type),
+                ),
+                Err(RelationUnavailable::UnsupportedProperty(method.symbol))
+            );
+        }
+        assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+        assert_eq!(caller.limit_event_count(), 1);
+        assert_eq!(
+            (store.type_len(), store.symbol_len(), store.signature_len()),
+            before
+        );
+        assert_eq!(store.value_symbol_links(method.symbol), Some(&source_links));
+        let mut fresh = super::InstantiationSession::new(super::InstantiationLimits::default());
+        let facts = store.relation_bootstrap_facts().unwrap();
+        let mut relation = super::RelaterSession::new_with_global_types_options_and_session(
+            store,
+            RelationKind::Assignable,
+            facts,
+            Some(globals),
+            Some(false),
+            Some(&mut fresh),
+        );
+        let copied = relation
+            .property_type(
+                method.symbol,
+                super::ObjectPropertyOrigin::ValidatedClass(method.owner_type),
+            )
+            .unwrap();
+        let super::StoredSingleCallableValidation::Valid { callable, .. } =
+            super::validate_stored_single_callable_with_array_targets(
+                relation.store,
+                copied,
+                Some(globals.array_targets),
+            )
+        else {
+            panic!("a fresh caller must obtain the receiver-bound ordinary method")
+        };
+        assert_eq!(callable.return_type, Some(method.owner_type));
+        assert_eq!(callable.parameters, vec![formal]);
+        let signature = relation.store.signature(callable.signature).unwrap();
+        assert_eq!(signature.target(), Some(method.signatures[0]));
+        assert!(signature.type_parameters().is_empty());
+        let mapper = signature.mapper().unwrap();
+        assert_eq!(relation.store.map_type(mapper, formal), Some(formal));
+        assert_eq!(
+            relation.store.map_type(mapper, this_type),
+            Some(method.owner_type)
+        );
     }
 
     struct MethodRelationMember {

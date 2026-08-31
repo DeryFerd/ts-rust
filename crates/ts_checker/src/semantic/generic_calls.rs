@@ -660,6 +660,12 @@ fn declared_method_signature_callee(
     store
         .interface_method_linked_type(signature)
         .or_else(|| store.type_literal_method_linked_type(signature))
+        .or_else(|| {
+            store
+                .signature(signature)
+                .filter(|signature| signature.type_parameters().is_empty())?;
+            super::callable_sets::completed_source_class_method_signature_type(store, signature)
+        })
 }
 
 /// Finds the actual method owner. The candidate provider still validates its graph.
@@ -1940,9 +1946,23 @@ fn validate_generic_call_instantiated_method(
         return Ok(None);
     };
     let record = store.signature(signature).ok_or_else(invalid)?;
+    let class_method =
+        store.source_node_kind(method.declaration) == Some(SyntaxKind::MethodDeclaration);
     if method.owner != callee
         || record.target() != Some(method.source)
-        || store.source_node_kind(method.declaration) != Some(SyntaxKind::MethodSignature)
+        || if class_method {
+            !record.type_parameters().is_empty()
+                || store
+                    .signature(method.source)
+                    .is_none_or(|source| !source.type_parameters().is_empty())
+                || super::callable_sets::completed_source_class_method_signature_type(
+                    store,
+                    method.source,
+                )
+                .is_none()
+        } else {
+            store.source_node_kind(method.declaration) != Some(SyntaxKind::MethodSignature)
+        }
     {
         return Err(invalid().into());
     }
@@ -1966,8 +1986,28 @@ fn validate_generic_method_type_parameter_view(
         return Ok(None);
     }
     let invalid = || GenericCallVectorInvariant::CallableSignatureMismatch(signature);
-    let original = instantiated.map_or(signature, |method| method.source);
-    let original = store.signature(original).ok_or_else(invalid)?;
+    let original_id = instantiated.map_or(signature, |method| method.source);
+    let original = store.signature(original_id).ok_or_else(invalid)?;
+    if store.source_node_kind(original.declaration().ok_or_else(invalid)?)
+        == Some(SyntaxKind::MethodDeclaration)
+    {
+        if !original.type_parameters().is_empty()
+            || store
+                .signature(signature)
+                .is_none_or(|signature| !signature.type_parameters().is_empty())
+            || super::callable_sets::completed_source_class_method_signature_type(
+                store,
+                original_id,
+            )
+            .is_none()
+        {
+            return Err(invalid().into());
+        }
+        return Ok(Some(GenericCallMethodTypeParameters {
+            instantiated,
+            parameters: Vec::new(),
+        }));
+    }
     let mut parameters = declared_method_type_parameter_view(
         store,
         original,

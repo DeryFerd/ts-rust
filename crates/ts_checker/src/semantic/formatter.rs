@@ -2686,6 +2686,27 @@ fn display_validated_class_type(
     if !owner.flags().contains(SymbolFlags::CLASS) {
         return Ok(None);
     }
+    if matches!(
+        record.data(),
+        TypeData::Interface(_) | TypeData::TypeReference(_)
+    ) && let Some(members) = super::classes::completed_source_class_members(store, host, symbol)
+        .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
+    {
+        let instance = members.shells().instance_type();
+        let has_type_parameters = store.type_payload(instance).is_some_and(|record| {
+            matches!(record.data(), TypeData::Interface(interface)
+                if interface.reference.resolved_type_arguments.as_ref()
+                    .is_some_and(|parameters| !parameters.is_empty()))
+        });
+        if has_type_parameters {
+            let reference = validate_direct_generic_reference(store, type_id)
+                .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+            if reference.target != instance {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            }
+            return Ok(None);
+        }
+    }
     if let Some(side) = super::classes::class_query_type_side(store, host, type_id)
         .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
     {
@@ -14691,6 +14712,140 @@ mod tests {
             .resolved_type
             .unwrap();
         (method, callable, declarations)
+    }
+
+    #[test]
+    fn completed_generic_class_display_keeps_arguments_without_changing_state_twice() {
+        let parsed = parse_source_file(concat!(
+            "class Box<T> { value: T; ",
+            "constructor(value: T) { this.value = value; } ",
+            "read(): T { return this.value; } } ",
+            "declare const numeric: Box<number>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(202_1805);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (owner, declaration) = source_class_display_owner(&context, &parsed, file);
+        let [instance, value] = source_class_display_types(&context, owner);
+        let numeric = context
+            .store()
+            .symbol_table(context.globals())
+            .unwrap()
+            .get_source("numeric")
+            .unwrap();
+        let reference = context
+            .store()
+            .value_symbol_links(numeric)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        for (type_, expected) in [(instance, "Box<T>"), (reference, "Box<number>")] {
+            let before = format!("{:?}", context.store());
+            let mut state = DisplayState {
+                approximate_length: 11,
+                ..DisplayState::default()
+            };
+            for _ in 0..2 {
+                assert_eq!(
+                    display_validated_class_type(
+                        context.store(),
+                        &host,
+                        type_,
+                        context.store().type_payload(type_).unwrap(),
+                        &mut state,
+                    ),
+                    Ok(None)
+                );
+                assert_eq!(state.approximate_length, 11);
+                assert!(!state.truncating);
+                assert!(state.method_type_parameters.is_empty());
+                assert!(state.location.is_none());
+                assert_eq!(state.format_flags, CanonicalTypeFormatFlags::default());
+                assert_eq!(format!("{:?}", context.store()), before);
+            }
+            let mut visiting = HashSet::new();
+            assert_eq!(
+                display_type_worker(
+                    context.store(),
+                    Some(&host),
+                    Some(context.global_types()),
+                    type_,
+                    CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                    &mut state,
+                    &mut visiting,
+                )
+                .unwrap(),
+                expected
+            );
+            assert_eq!(state.approximate_length, 11 + expected.len());
+            assert!(visiting.is_empty());
+            assert_eq!(format!("{:?}", context.store()), before);
+            assert_source_class_display_without_writes(
+                &mut context,
+                type_,
+                declaration,
+                Ok(expected),
+            );
+        }
+        assert_source_class_display_without_writes(
+            &mut context,
+            value,
+            declaration,
+            Ok("typeof Box"),
+        );
+        let field = context
+            .store()
+            .symbol(owner)
+            .unwrap()
+            .members()
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let original = context.store().value_symbol_links(field).unwrap().clone();
+        let mut damaged = original.clone();
+        damaged.resolved_type = Some(context.store().intrinsic_bootstrap().unwrap().string_type);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(field, damaged)
+        );
+        for type_ in [instance, reference] {
+            assert_source_class_display_without_writes(
+                &mut context,
+                type_,
+                declaration,
+                Err(TypeDisplayUnavailable::MalformedType(type_)),
+            );
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(field, original)
+        );
+        for (type_, expected) in [
+            (instance, "Box<T>"),
+            (reference, "Box<number>"),
+            (value, "typeof Box"),
+        ] {
+            assert_source_class_display_without_writes(
+                &mut context,
+                type_,
+                declaration,
+                Ok(expected),
+            );
+        }
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

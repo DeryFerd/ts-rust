@@ -759,6 +759,26 @@ fn validate_direct_target_and_cache(
 
     let mut validated = HashSet::new();
     for (key, reference) in instantiations {
+        if store.class_instance_super_view(*reference).is_some() {
+            let invalid = || DirectGenericReferenceError::InvalidCachedReference {
+                target: shape.target,
+                reference: *reference,
+            };
+            let arguments = super::classes::source_class_super_reference_cache_entry(
+                store,
+                shape.target,
+                *reference,
+            )
+            .ok_or_else(invalid)?;
+            if *key != type_list_key(&arguments) {
+                return Err(invalid());
+            }
+            let mut active = vec![*reference];
+            for argument in arguments {
+                validate_reference_argument_graph(store, argument, &mut active, &mut validated)?;
+            }
+            continue;
+        }
         validate_cached_reference_shell(store, shape, *key, *reference)?;
         if *reference != shape.target {
             validate_reference_argument_graph(store, *reference, &mut Vec::new(), &mut validated)?;
@@ -1413,6 +1433,190 @@ mod tests {
             store.signature_len(),
             store.symbol_store().symbol_table_len(),
         ]
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One real base cache checks valid views, damage, and ordinary arity.
+    fn source_class_super_rows_keep_ordinary_references_and_exact_receiver_endpoints() {
+        let parsed = parse_source_file(concat!(
+            "class Base<T> { value: T; constructor(value: T) { this.value = value; } } ",
+            "class TextBox extends Base<string> { constructor(value: string) { super(value); } } ",
+            "class NumberBox extends Base<number> { constructor(value: number) { super(value); } } ",
+            "declare const ordinary: Base<string>;",
+        ));
+        let file = FileId::new(9_426);
+        let mut context = tuple_array_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(file).unwrap().1.clone();
+        let class = |name| {
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::ClassDeclaration(data) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) =
+                        &parsed.arena.get(data.name?).unwrap().data
+                    else {
+                        return None;
+                    };
+                    (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let owner = bound.symbol(declaration).unwrap();
+            let instance = context
+                .store()
+                .declared_type_links(owner)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            let TypeData::Interface(data) = context.store().type_payload(instance).unwrap().data()
+            else {
+                panic!("the parsed class keeps its actual origin")
+            };
+            (instance, data.this_type.unwrap())
+        };
+        let (base, _) = class("Base");
+        let (text, text_this) = class("TextBox");
+        let (numeric, numeric_this) = class("NumberBox");
+        let annotation = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(data) = &record.data else {
+                    return None;
+                };
+                data.type_
+                    .map(|node| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let ordinary = context.get_type_from_type_node(annotation).unwrap();
+        let store = context.store_mut_for_test();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let text_view = store
+            .class_instance_super_view_for_instance(text)
+            .unwrap()
+            .receiver_type();
+        let numeric_view = store
+            .class_instance_super_view_for_instance(numeric)
+            .unwrap()
+            .receiver_type();
+        assert_ne!(text_view, numeric_view);
+        assert_eq!(
+            super::super::classes::source_class_super_reference_cache_entry(store, base, text_view),
+            Some(vec![string, text_this]),
+        );
+        assert_eq!(
+            super::super::classes::source_class_super_reference_cache_entry(
+                store,
+                base,
+                numeric_view
+            ),
+            Some(vec![number, numeric_this]),
+        );
+        let expected = DirectGenericReference {
+            target: base,
+            type_arguments: vec![string],
+        };
+        let warm = reference_store_counts(store);
+        for _ in 0..2 {
+            assert_eq!(
+                validate_direct_generic_reference(store, ordinary),
+                Ok(expected.clone())
+            );
+            assert_eq!(
+                create_direct_generic_reference(store, base, &[string], ObjectFlags::NONE),
+                Ok(ordinary),
+            );
+            assert_eq!(
+                create_direct_generic_reference(
+                    store,
+                    base,
+                    &[string, text_this],
+                    ObjectFlags::NONE
+                ),
+                Err(DirectGenericReferenceError::TypeArgumentArity {
+                    target: base,
+                    expected: 1,
+                    actual: 2
+                }),
+            );
+            assert_eq!(reference_store_counts(store), warm);
+        }
+        let mapper = store
+            .new_simple_type_mapper(text_this, numeric_this)
+            .unwrap();
+        for damage in 0..3 {
+            match damage {
+                0 => assert!(store.set_type_reference_resolution(
+                    text_view,
+                    None,
+                    Some(vec![string, numeric_this])
+                )),
+                1 => assert!(store.set_type_parameter_resolution(
+                    text_this,
+                    Some(text),
+                    None,
+                    Some(mapper),
+                    None
+                )),
+                2 => assert!(store.set_object_target_and_mapper(text_view, Some(numeric), None)),
+                _ => unreachable!(),
+            }
+            let damaged = reference_store_counts(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    super::super::classes::source_class_super_reference_cache_entry(
+                        store, base, text_view
+                    ),
+                    None,
+                );
+                assert_eq!(
+                    validate_direct_generic_reference(store, ordinary),
+                    Err(DirectGenericReferenceError::InvalidCachedReference {
+                        target: base,
+                        reference: text_view
+                    }),
+                );
+                assert_eq!(reference_store_counts(store), damaged);
+            }
+            assert!(store.set_type_reference_resolution(
+                text_view,
+                None,
+                Some(vec![string, text_this])
+            ));
+            assert!(store.set_type_parameter_resolution(text_this, Some(text), None, None, None));
+            assert!(store.set_object_target_and_mapper(text_view, Some(base), None));
+            assert_eq!(
+                validate_direct_generic_reference(store, ordinary),
+                Ok(expected.clone())
+            );
+        }
+        let wrong_receiver_key = type_list_key(&[string, numeric_this]);
+        assert!(store.try_reserve_object_instantiations(base, 1));
+        assert_eq!(
+            store.insert_object_instantiation(base, wrong_receiver_key, text_view),
+            Some(text_view)
+        );
+        // The original view is still valid. Only the extra row has the wrong full key.
+        assert_eq!(
+            super::super::classes::source_class_super_reference_cache_entry(store, base, text_view),
+            Some(vec![string, text_this]),
+        );
+        let damaged = reference_store_counts(store);
+        for _ in 0..2 {
+            assert_eq!(
+                validate_direct_generic_reference(store, ordinary),
+                Err(DirectGenericReferenceError::InvalidCachedReference {
+                    target: base,
+                    reference: text_view
+                }),
+            );
+            assert_eq!(reference_store_counts(store), damaged);
+        }
     }
 
     #[test]

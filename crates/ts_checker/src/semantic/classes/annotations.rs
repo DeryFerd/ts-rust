@@ -7,7 +7,8 @@ use super::{
     StructuredTypeData, SymbolFlags, SyntaxKind, TypeData, TypeId, TypeRecord, ValueSymbolLinks,
     bound_symbol, class_property_modifiers, exact_class_instance_identity, invariant,
     preflight_class_or_interface_reference, preflight_source_class_annotation,
-    source_class_binding, source_class_plan_is_current, validate_class_heritage_members,
+    source_class_binding, source_class_plan_is_current, source_class_type_owner_declaration,
+    source_class_type_parameter_plans, validate_class_heritage_members,
     validate_source_class_header, validate_source_class_stored_header,
 };
 
@@ -18,12 +19,374 @@ pub(in crate::semantic) struct SourceClassAnnotationScope {
     targets: CanonicalArrayTargets,
 }
 
+/// Each expanded annotation keeps its actual class declaration role.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::semantic) enum SourceClassAnnotationRole {
+    TypeParameterConstraint {
+        parameter: NodeRef,
+    },
+    TypeParameterDefault {
+        parameter: NodeRef,
+    },
+    Field {
+        declaration: NodeRef,
+    },
+    ConstructorParameter {
+        constructor: NodeRef,
+        parameter: NodeRef,
+    },
+    MethodParameter {
+        method: NodeRef,
+        parameter: NodeRef,
+    },
+    MethodReturn {
+        method: NodeRef,
+    },
+    HeritageArgument {
+        heritage: NodeRef,
+        index: usize,
+    },
+}
+
+fn source_annotation_instance_member(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    member: NodeRef,
+) -> Result<bool, ClassError> {
+    let invalid = || invariant(ClassInvariant::InvalidPropertySymbol(member));
+    let class_record = super::preflight_node(store, host, declaration)?;
+    let NodeData::ClassDeclaration(class) = &class_record.data else {
+        return Err(invalid());
+    };
+    let record = super::preflight_node(store, host, member)?;
+    if record.parent != Some(declaration.node) {
+        return Ok(false);
+    }
+    if record.flags.0 != 0
+        || class
+            .members
+            .nodes
+            .iter()
+            .filter(|&&node| node == member.node)
+            .count()
+            != 1
+    {
+        return Err(invalid());
+    }
+    let (name, modifiers, flags) = match &record.data {
+        NodeData::PropertyDeclaration(data) => {
+            (data.name, data.modifiers.as_ref(), SymbolFlags::PROPERTY)
+        }
+        NodeData::MethodDeclaration(data) if data.type_parameters.is_none() => {
+            (data.name, data.modifiers.as_ref(), SymbolFlags::METHOD)
+        }
+        NodeData::ConstructorDeclaration(data) if data.type_parameters.is_none() => {
+            let symbol = bound_symbol(store, host, member).ok_or_else(invalid)?;
+            let record = store.symbol(symbol).ok_or_else(invalid)?;
+            if record.flags() != SymbolFlags::CONSTRUCTOR
+                || record.parent() != Some(owner)
+                || !record
+                    .declarations()
+                    .is_some_and(|declarations| declarations.contains(&member))
+                || record.value_declaration().is_some()
+                || store.get_merged_symbol(symbol) != Some(symbol)
+                || store
+                    .symbol(owner)
+                    .and_then(|owner| owner.members())
+                    .and_then(|members| store.symbol_table(members))
+                    .and_then(|members| members.get(record.name()))
+                    != Some(symbol)
+            {
+                return Err(invalid());
+            }
+            return Ok(true);
+        }
+        _ => return Ok(false),
+    };
+    let (side, _) = class_property_modifiers(
+        store,
+        host,
+        member,
+        NodeRef::new(member.arena, member.file, name),
+        modifiers,
+        None,
+    )?;
+    if side != ClassPropertySide::Instance {
+        return Ok(false);
+    }
+    let symbol = bound_symbol(store, host, member).ok_or_else(invalid)?;
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
+    if record.flags().without(SymbolFlags::OPTIONAL) != flags
+        || record.parent() != Some(owner)
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || !record
+            .declarations()
+            .is_some_and(|declarations| declarations.contains(&member))
+        || store
+            .symbol(owner)
+            .and_then(|owner| owner.members())
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(record.name()))
+            != Some(symbol)
+    {
+        return Err(invalid());
+    }
+    Ok(true)
+}
+
+/// Proves an annotation root without demanding the containing class's bodies.
+#[allow(clippy::too_many_lines)] // Every accepted root keeps its own syntax and binder role.
+pub(in crate::semantic) fn source_class_annotation_role(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    annotation: NodeRef,
+) -> Result<Option<SourceClassAnnotationRole>, ClassError> {
+    let declaration = source_class_type_owner_declaration(store, host, owner)?;
+    if !annotation.is_for(declaration.arena, declaration.file) {
+        return Ok(None);
+    }
+    let record = super::preflight_node(store, host, annotation)?;
+    let Some(parent) = record
+        .parent
+        .map(|node| NodeRef::new(annotation.arena, annotation.file, node))
+    else {
+        return Ok(None);
+    };
+    let parent_record = super::preflight_node(store, host, parent)?;
+    let invalid = || invariant(ClassInvariant::InvalidPropertyTypeCache(annotation));
+    if record.flags.0 != 0
+        || record.range.start < parent_record.range.start
+        || record.range.end > parent_record.range.end
+    {
+        return Err(invalid());
+    }
+    match &parent_record.data {
+        NodeData::TypeParameterDeclaration(_) => {
+            let plans = source_class_type_parameter_plans(store, host, owner)?;
+            Ok(plans.iter().find_map(|parameter| {
+                if parameter.declaration != parent {
+                    None
+                } else if parameter.constraint == Some(annotation) {
+                    Some(SourceClassAnnotationRole::TypeParameterConstraint { parameter: parent })
+                } else if parameter.default_type == Some(annotation) {
+                    Some(SourceClassAnnotationRole::TypeParameterDefault { parameter: parent })
+                } else {
+                    None
+                }
+            }))
+        }
+        NodeData::PropertyDeclaration(property) if property.type_ == Some(annotation.node) => Ok(
+            source_annotation_instance_member(store, host, owner, declaration, parent)?.then_some(
+                SourceClassAnnotationRole::Field {
+                    declaration: parent,
+                },
+            ),
+        ),
+        NodeData::MethodDeclaration(method) if method.type_ == Some(annotation.node) => Ok(
+            source_annotation_instance_member(store, host, owner, declaration, parent)?
+                .then_some(SourceClassAnnotationRole::MethodReturn { method: parent }),
+        ),
+        NodeData::ParameterDeclaration(parameter) if parameter.type_ == Some(annotation.node) => {
+            let Some(member) = parent_record
+                .parent
+                .map(|node| NodeRef::new(parent.arena, parent.file, node))
+            else {
+                return Ok(None);
+            };
+            if !source_annotation_instance_member(store, host, owner, declaration, member)? {
+                return Ok(None);
+            }
+            let member_record = super::preflight_node(store, host, member)?;
+            let (parameters, role) = match &member_record.data {
+                NodeData::ConstructorDeclaration(data) => (
+                    &data.parameters,
+                    SourceClassAnnotationRole::ConstructorParameter {
+                        constructor: member,
+                        parameter: parent,
+                    },
+                ),
+                NodeData::MethodDeclaration(data) => (
+                    &data.parameters,
+                    SourceClassAnnotationRole::MethodParameter {
+                        method: member,
+                        parameter: parent,
+                    },
+                ),
+                _ => return Ok(None),
+            };
+            if parameters
+                .nodes
+                .iter()
+                .filter(|&&node| node == parent.node)
+                .count()
+                != 1
+            {
+                return Err(invalid());
+            }
+            let name = NodeRef::new(parent.arena, parent.file, parameter.name);
+            let name_record = super::preflight_node(store, host, name)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Ok(None);
+            };
+            let bound = host.bound_file(member).ok_or_else(invalid)?;
+            let local = bound
+                .locals(member)
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(&identifier.text))
+                .ok_or_else(invalid)?;
+            let local_record = store.symbol(local).ok_or_else(invalid)?;
+            if name_record.parent != Some(parent.node)
+                || name_record.flags.0 != 0
+                || identifier.flow_node.is_some()
+                || local_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                || local_record.declarations() != Some(&[parent])
+                || local_record.value_declaration() != Some(parent)
+                || local_record.parent().is_some()
+                || store.get_merged_symbol(local) != Some(local)
+            {
+                return Err(invalid());
+            }
+            Ok(Some(role))
+        }
+        NodeData::ExpressionWithTypeArguments(base) => {
+            let Some(arguments) = base.type_arguments.as_ref() else {
+                return Ok(None);
+            };
+            let Some(index) = arguments
+                .nodes
+                .iter()
+                .position(|&node| node == annotation.node)
+            else {
+                return Ok(None);
+            };
+            let Some(clause) = parent_record
+                .parent
+                .map(|node| NodeRef::new(parent.arena, parent.file, node))
+            else {
+                return Ok(None);
+            };
+            let clause_record = super::preflight_node(store, host, clause)?;
+            let NodeData::HeritageClause(heritage) = &clause_record.data else {
+                return Ok(None);
+            };
+            let class_record = super::preflight_node(store, host, declaration)?;
+            let NodeData::ClassDeclaration(class) = &class_record.data else {
+                return Err(invalid());
+            };
+            if parent_record.kind != SyntaxKind::ExpressionWithTypeArguments
+                || parent_record.flags.0 != 0
+                || base.facts != 0
+                || arguments
+                    .nodes
+                    .iter()
+                    .filter(|&&node| node == annotation.node)
+                    .count()
+                    != 1
+                || clause_record.kind != SyntaxKind::HeritageClause
+                || clause_record.flags.0 != 0
+                || clause_record.parent != Some(declaration.node)
+                || heritage.token != SyntaxKind::ExtendsKeyword
+                || heritage.types.nodes.as_slice() != [parent.node]
+                || class.heritage_clauses.as_ref().is_none_or(|clauses| {
+                    clauses
+                        .nodes
+                        .iter()
+                        .filter(|&&node| node == clause.node)
+                        .count()
+                        != 1
+                })
+            {
+                return Err(invalid());
+            }
+            Ok(Some(SourceClassAnnotationRole::HeritageArgument {
+                heritage: parent,
+                index,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Class formals remain lexical. Static members and other class owners gain no scope.
+pub(in crate::semantic) fn source_class_type_parameter_reference_is_owned(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<bool, ClassError> {
+    let Some(parameter) = store
+        .symbol(symbol)
+        .filter(|parameter| parameter.flags() == SymbolFlags::TYPE_PARAMETER)
+    else {
+        return Ok(false);
+    };
+    let Some(owner) = parameter.parent().filter(|owner| {
+        store
+            .symbol(*owner)
+            .is_some_and(|owner| owner.flags() == SymbolFlags::CLASS)
+    }) else {
+        return Ok(false);
+    };
+    let plans = source_class_type_parameter_plans(store, host, owner)?;
+    let Some(parameter_index) = plans
+        .iter()
+        .position(|parameter| parameter.symbol == symbol)
+    else {
+        return Ok(false);
+    };
+    let declaration = source_class_type_owner_declaration(store, host, owner)?;
+    let record = super::preflight_node(store, host, node)?;
+    let NodeData::TypeReferenceNode(reference) = &record.data else {
+        return Ok(false);
+    };
+    let name = NodeRef::new(node.arena, node.file, reference.type_name);
+    let name_record = super::preflight_node(store, host, name)?;
+    if reference.type_arguments.is_some()
+        || name_record.parent != Some(node.node)
+        || !matches!(&name_record.data, NodeData::Identifier(name) if parameter.name().as_utf8() == Some(name.text.as_str()) && name.flow_node.is_none())
+    {
+        return Ok(false);
+    }
+    let mut current = node;
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(current) && current != declaration {
+        if let Some(role) = source_class_annotation_role(store, host, owner, current)? {
+            return Ok(match role {
+                SourceClassAnnotationRole::TypeParameterDefault { parameter } => plans
+                    .iter()
+                    .position(|planned| planned.declaration == parameter)
+                    .is_some_and(|index| parameter_index < index),
+                _ => true,
+            });
+        }
+        let record = super::preflight_node(store, host, current)?;
+        if record.parent == Some(declaration.node) {
+            return source_annotation_instance_member(store, host, owner, declaration, current);
+        }
+        let Some(parent) = record.parent else {
+            break;
+        };
+        current = NodeRef::new(current.arena, current.file, parent);
+    }
+    Ok(false)
+}
+
 pub(in crate::semantic) fn source_class_annotation_is_owned(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     owner: SemanticSymbolId,
     annotation: NodeRef,
 ) -> bool {
+    if source_class_annotation_role(store, host, owner, annotation)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return true;
+    }
     if source_class_method_annotation_is_owned(store, host, owner, annotation) {
         return true;
     }

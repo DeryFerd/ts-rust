@@ -1,8 +1,8 @@
 //! Atomic canonical checking for the first source-statement slice.
 //!
 //! This module deliberately supports only unmodified type aliases and simple
-//! interfaces, top-level nongeneric classes with primitive annotated fields
-//! and at most one exact direct preceding local nongeneric base, exported
+//! interfaces, top-level classes checked under their declaration type parameters
+//! and at most one completed direct preceding local base, exported
 //! generic ambient declaration-file classes, empty exported classes,
 //! exact construction of preceding admitted classes, imported ambient classes,
 //! and declared constructors inside top-level values, assignments, property
@@ -73,6 +73,7 @@
 //! Static class elements retain their exact class and lexical `this` captures.
 //! Source class bodies use checked receiver tokens and binder flow. Inferred
 //! member types finish only after their expressions or bodies have been checked.
+//! Class formals belong to constructor signatures, not ordinary method signatures.
 //! Class bodies retain local truthiness branches and plain object destructuring.
 //! Deferred arrows keep lexical class receivers without constructor flow.
 //! Exported namespace classes retain lexical `this` in async static arrows.
@@ -122,12 +123,12 @@ use super::{
         ClassGrammarDiagnostic, ClassGrammarDiagnosticPlan, ClassHeritageMembersValidation,
         ClassMemberPlan, ClassMemberQueryPlan, ClassTypeQueryContext, ExportedJsxArrowClassPlan,
         PreparedSourceClass, SourceClassPlan, check_class_heritage_compatibility,
-        check_class_implementation_compatibility, complete_source_class_body,
-        execute_exported_jsx_arrow_class, execute_nongeneric_class_member_query,
-        finish_source_class_members, plan_anonymous_abstract_class_expression_grammar,
-        plan_class_grammar_diagnostics, plan_exported_jsx_arrow_class,
-        plan_exported_static_member_name_grammar_diagnostics, plan_nongeneric_class_member_query,
-        plan_nongeneric_class_member_query_with_type_context,
+        check_class_heritage_compatibility_with_session, check_class_implementation_compatibility,
+        complete_source_class_body, execute_exported_jsx_arrow_class,
+        execute_nongeneric_class_member_query, finish_source_class_members,
+        plan_anonymous_abstract_class_expression_grammar, plan_class_grammar_diagnostics,
+        plan_exported_jsx_arrow_class, plan_exported_static_member_name_grammar_diagnostics,
+        plan_nongeneric_class_member_query, plan_nongeneric_class_member_query_with_type_context,
         preflight_nongeneric_class_member_query, prepare_source_class_members_with_type_queries,
         validate_class_heritage_members,
     },
@@ -34435,6 +34436,7 @@ fn check_expression_type_with_capture_context(
                     call,
                     index,
                     &access,
+                    session,
                 )?;
                 arguments.push(
                     check_expression_type_with_capture_context(
@@ -35399,6 +35401,17 @@ fn check_planned_source_class(
         super::classes::begin_source_class_annotations(store, host, global_types, &class.source)
             .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
     let result = (|| {
+        if !class.source.type_parameters().is_empty() {
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .resolve_source_class_type_parameters(class.source.symbol())?;
+        }
         for &annotation in class.source.annotation_nodes() {
             session.reset_query();
             let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
@@ -35524,12 +35537,13 @@ fn check_planned_source_class(
                 return Err(SourceCheckError::Class(implementation));
             }
         }
-        check_class_heritage_compatibility(
+        check_class_heritage_compatibility_with_session(
             store,
             host,
             global_types,
             options,
             diagnostics,
+            session,
             declaration,
             &members,
         )?;
@@ -36700,6 +36714,7 @@ fn check_class_statements(
                         property,
                         receiver.result,
                         &mut context.flow,
+                        session,
                     )
                     .map_err(|error| {
                         SourcePlanner::property_plan_error(property.property(), error)
@@ -36784,6 +36799,7 @@ fn check_class_statements(
                         property,
                         receiver.result,
                         &mut context.flow,
+                        session,
                     )
                     .map_err(|error| {
                         SourcePlanner::property_plan_error(property.property(), error)
@@ -123459,6 +123475,133 @@ class Foo2 {
             let warm = observable_state(&context, file);
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn generic_class_bodies_keep_origin_formals_and_signature_roles() {
+        let source = parsed(concat!(
+            "class Box<T> { value: T; ",
+            "constructor(value: T) { this.value = value; } ",
+            "read(): T { return this.value; } ",
+            "replace(value: T): T { const next: T = value; ",
+            "this.value = next; return this.read(); } }",
+        ));
+        let file = FileId::new(202_1801);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                strict_property_initialization: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let class_symbol = global_symbol(&context, "Box");
+        let declaration = context
+            .store()
+            .symbol(class_symbol)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let NodeData::ClassDeclaration(class) = &source.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("Box must retain its real class declaration")
+        };
+        let [parameter] = class.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+            panic!("Box has one written type parameter")
+        };
+        let parameter = NodeRef::new(source.arena.id(), file, *parameter);
+        let parameter_symbol = context.file(file).unwrap().1.symbol(parameter).unwrap();
+        let formal = context
+            .store()
+            .declared_type_links(parameter_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let instance = context
+            .store()
+            .declared_type_links(class_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Interface(origin) = context.store().type_payload(instance).unwrap().data()
+        else {
+            panic!("the source body must retain the class origin")
+        };
+        assert_eq!(
+            origin.reference.resolved_type_arguments.as_deref(),
+            Some([formal].as_slice())
+        );
+        assert_ne!(origin.this_type, Some(formal));
+        let field = declared_object_property_symbol(&context, instance, "value");
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(field)
+                .unwrap()
+                .resolved_type,
+            Some(formal)
+        );
+        for member in &class.members.nodes {
+            let declaration = NodeRef::new(source.arena.id(), file, *member);
+            let record = source.arena.get(*member).unwrap();
+            if !matches!(
+                record.kind,
+                SyntaxKind::Constructor | SyntaxKind::MethodDeclaration
+            ) {
+                continue;
+            }
+            let signature = context
+                .store()
+                .signature_links(declaration)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            let signature = context.store().signature(signature).unwrap();
+            if record.kind == SyntaxKind::Constructor {
+                assert_eq!(signature.type_parameters(), [formal]);
+                assert_eq!(signature.resolved_return_type(), Some(instance));
+            } else {
+                assert!(signature.type_parameters().is_empty());
+                assert_eq!(signature.resolved_return_type(), Some(formal));
+            }
+            for &parameter in signature.parameters() {
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(parameter)
+                        .unwrap()
+                        .resolved_type,
+                    Some(formal)
+                );
+            }
+        }
+        assert_eq!(variable_value_type(&context, &source, file, "next"), formal);
+        let call = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(resolved_node_type(&context, call), formal);
+        let warm = observable_state(&context, file);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+            assert_eq!(resolved_node_type(&context, call), formal);
         }
     }
 
