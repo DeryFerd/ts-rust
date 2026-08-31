@@ -30,6 +30,7 @@ use super::{
     bootstrap::LiteralTypeCacheError,
     callable_sets::{
         CallableSetProjection, StoredCallableSetValidation, validate_stored_callable_set,
+        validated_method_annotation_type,
     },
     callables::{
         CallableFamily, SingleCallableDisplayError, StoredSingleCallableValidation,
@@ -2037,13 +2038,21 @@ fn display_declared_method_signatures(
                 .copied()
                 .chain(callable.rest_parameter)
                 .collect::<Vec<_>>();
+            let display_parameters = declared_method_parameter_display_types(
+                store,
+                host,
+                type_id,
+                callable.signature,
+                &parameter_types,
+                state,
+            )?;
             append_validated_signature_parameters(
                 store,
                 host,
                 global_types,
                 type_id,
                 callable.signature,
-                &parameter_types,
+                display_parameters.as_deref().unwrap_or(&parameter_types),
                 flags,
                 state,
                 visiting,
@@ -2081,6 +2090,201 @@ fn display_declared_method_signatures(
     state.method_type_parameters.truncate(scope_length);
     visiting.remove(&type_id);
     result
+}
+
+/// Reuse a proved optional keyword annotation without changing its value type.
+#[allow(clippy::too_many_lines)] // Keep the source slot and optional-wrapper proof together.
+fn declared_method_parameter_display_types(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: TypeId,
+    signature: SignatureId,
+    parameter_types: &[TypeId],
+    state: &DisplayState,
+) -> Result<Option<Vec<TypeId>>, TypeDisplayUnavailable> {
+    let invalid = || TypeDisplayUnavailable::MalformedType(owner);
+    if state.location.is_none() {
+        return Ok(None);
+    }
+    let signature_record = store.signature(signature).ok_or_else(invalid)?;
+    if signature_record.target().is_some()
+        || signature_record.mapper().is_some()
+        || !signature_record.type_parameters().is_empty()
+    {
+        return Ok(None);
+    }
+    let method = signature_record.declaration().ok_or_else(invalid)?;
+    let method_node = host.node(method).ok_or_else(invalid)?;
+    let source_parameters = match &method_node.data {
+        NodeData::MethodSignatureDeclaration(data) if data.type_parameters.is_none() => {
+            &data.parameters
+        }
+        NodeData::MethodDeclaration(data) if data.type_parameters.is_none() => &data.parameters,
+        NodeData::MethodSignatureDeclaration(_) | NodeData::MethodDeclaration(_) => {
+            return Ok(None);
+        }
+        _ => return Err(invalid()),
+    };
+    if source_parameters.nodes.len() != signature_record.parameters().len()
+        || parameter_types.len() != signature_record.parameters().len()
+    {
+        return Err(invalid());
+    }
+    // These signatures keep their existing display path, including other parameters.
+    for parameter in &source_parameters.nodes {
+        let declaration = NodeRef::new(method.arena, method.file, *parameter);
+        let Some(NodeData::ParameterDeclaration(data)) =
+            host.node(declaration).map(|node| &node.data)
+        else {
+            return Err(invalid());
+        };
+        if data.initializer.is_some()
+            || data.dot_dot_dot_token.is_some()
+            || data.modifiers.is_some()
+        {
+            return Ok(None);
+        }
+    }
+
+    let mut display_parameters = None;
+    for (index, (parameter, value_type)) in signature_record
+        .parameters()
+        .iter()
+        .zip(parameter_types)
+        .enumerate()
+    {
+        let declaration = NodeRef::new(
+            method.arena,
+            method.file,
+            *source_parameters.nodes.get(index).ok_or_else(invalid)?,
+        );
+        let node = host.node(declaration).ok_or_else(invalid)?;
+        let NodeData::ParameterDeclaration(data) = &node.data else {
+            return Err(invalid());
+        };
+        let (Some(question), Some(annotation)) = (data.question_token, data.type_) else {
+            continue;
+        };
+        let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
+        let annotation_node = host.node(annotation).ok_or_else(invalid)?;
+        if !annotation_node.kind.is_keyword_type() {
+            continue;
+        }
+        let question = NodeRef::new(declaration.arena, declaration.file, question);
+        let question_node = host.node(question).ok_or_else(invalid)?;
+        let name = NodeRef::new(declaration.arena, declaration.file, data.name);
+        let name_node = host.node(name).ok_or_else(invalid)?;
+        let NodeData::Identifier(identifier) = &name_node.data else {
+            return Err(invalid());
+        };
+        let parameter_record = store.symbol(*parameter).ok_or_else(invalid)?;
+        let method_symbol = store
+            .type_payload(owner)
+            .and_then(TypeRecord::symbol)
+            .ok_or_else(invalid)?;
+        let owner_symbol = store
+            .symbol(method_symbol)
+            .and_then(|record| record.parent())
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(invalid)?;
+        let source_owner = NodeRef::new(
+            method.arena,
+            method.file,
+            method_node.parent.ok_or_else(invalid)?,
+        );
+        let owner_node = host.node(source_owner).ok_or_else(invalid)?;
+        let source_children = store.source_direct_children(method).ok_or_else(invalid)?;
+        if !host.symbol_matches(store, method, method_symbol)
+            || !host.symbol_matches(store, source_owner, owner_symbol)
+            || store.source_node_kind(source_owner) != Some(owner_node.kind)
+            || store.source_node_kind(method) != Some(method_node.kind)
+            || store.source_node_parent(method) != Some(SourceNodeParent::Parent(source_owner))
+            || method_node.range.start < owner_node.range.start
+            || method_node.range.end > owner_node.range.end
+            || source_parameters.range.start < method_node.range.start
+            || source_parameters.range.end > method_node.range.end
+            || !source_children
+                .into_iter()
+                .filter(|child| store.source_node_kind(*child) == Some(SyntaxKind::Parameter))
+                .map(|child| child.node)
+                .eq(source_parameters.nodes.iter().copied())
+            || node.kind != SyntaxKind::Parameter
+            || node.flags.0 != 0
+            || node.parent != Some(method.node)
+            || store.source_node_kind(declaration) != Some(SyntaxKind::Parameter)
+            || store.source_node_parent(declaration) != Some(SourceNodeParent::Parent(method))
+            || node.range.start < source_parameters.range.start
+            || node.range.end > source_parameters.range.end
+            || data.symbol.is_some()
+            || data.facts != 0
+            || !host.symbol_matches(store, declaration, *parameter)
+            || store.get_merged_symbol(*parameter) != Some(*parameter)
+            || parameter_record.declarations() != Some(&[declaration])
+            || parameter_record.value_declaration() != Some(declaration)
+            || parameter_record.name().as_utf8() != Some(identifier.text.as_str())
+            || store.value_symbol_links(*parameter)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(*value_type),
+                    ..ValueSymbolLinks::default()
+                })
+            || store
+                .callable_signature_parameter_types(signature)
+                .is_some_and(|cached| cached != parameter_types)
+            || name_node.kind != SyntaxKind::Identifier
+            || name_node.flags.0 != 0
+            || name_node.parent != Some(declaration.node)
+            || store.source_node_kind(name) != Some(SyntaxKind::Identifier)
+            || store.source_node_parent(name) != Some(SourceNodeParent::Parent(declaration))
+            || store.source_identifier_text(name) != Some(identifier.text.as_str())
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || identifier.text == "this"
+            || name_node.range.start < node.range.start
+            || name_node.range.end > node.range.end
+            || question_node.kind != SyntaxKind::QuestionToken
+            || question_node.flags.0 != 0
+            || question_node.parent != Some(declaration.node)
+            || !matches!(question_node.data, NodeData::Token(_))
+            || store.source_node_kind(question) != Some(SyntaxKind::QuestionToken)
+            || store.source_node_parent(question) != Some(SourceNodeParent::Parent(declaration))
+            || store.source_child_with_kind(declaration, SyntaxKind::QuestionToken)
+                != Some(question)
+            || question_node.range.start < name_node.range.end
+            || question_node.range.end > annotation_node.range.start
+            || annotation_node.flags.0 != 0
+            || annotation_node.parent != Some(declaration.node)
+            || !matches!(annotation_node.data, NodeData::KeywordTypeNode(_))
+            || store.source_node_kind(annotation) != Some(annotation_node.kind)
+            || store.source_node_parent(annotation) != Some(SourceNodeParent::Parent(declaration))
+            || store.source_direct_type_annotation(declaration) != Some(annotation)
+            || annotation_node.range.start < name_node.range.end
+            || annotation_node.range.end > node.range.end
+        {
+            return Err(invalid());
+        }
+        let annotation_type =
+            validated_method_annotation_type(store, annotation).ok_or_else(invalid)?;
+        if !store.source_direct_type_annotation_is_exact(annotation, annotation_type) {
+            return Err(invalid());
+        }
+        if store
+            .intrinsic_bootstrap()
+            .ok_or_else(invalid)?
+            .options
+            .strict_null_checks
+        {
+            store
+                .validate_optional_parameter_type_metadata(annotation_type, *value_type)
+                .map_err(|_| invalid())?;
+        } else if annotation_type != *value_type {
+            return Err(invalid());
+        }
+        if annotation_type != *value_type {
+            display_parameters.get_or_insert_with(|| parameter_types.to_vec())[index] =
+                annotation_type;
+        }
+    }
+    Ok(display_parameters)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Check source names before admitting fresh parameters.
@@ -8291,6 +8495,10 @@ fn truncate_display(
     truncated.push_str(ELLIPSIS);
     Ok(truncated)
 }
+
+#[cfg(test)]
+#[path = "formatter_optional_declared_method_tests.rs"]
+mod formatter_optional_declared_method_tests;
 
 #[cfg(test)]
 mod tests {
