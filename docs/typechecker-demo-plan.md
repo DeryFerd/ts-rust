@@ -6,7 +6,9 @@ Updated 2026-08-31. The full port goal remains active.
 
 Make Hono the next complete-project demo target. Keep TanStack Query core as
 the second target. The latest Hono trace exposed an exact annotation-role bug.
-Its narrow repair is committed and under test, separate from the larger class batches.
+Its repair passes the existing invalid-constructor-default control. The full
+test run timed out, so the repair is not accepted. It is now combined with
+the project observer for the next full Hono run.
 Query still needs more source-language features before its next complete check.
 This changes the work order, not the acceptance criteria.
 Use their existing production typecheck configurations, not a new app
@@ -24,9 +26,10 @@ The latest Hono run still stops during construction. It builds correctly, but
 does not return a diagnostic set. Two source audits prove that its imported
 constructor annotation fails a node-adjacency assumption when the parameter
 has a default value. The immediate task is to retain the actual annotation
-field. That repair is committed at `e7e58fd8`. Its fresh test run includes
-the unchanged valid and invalid default-value controls. The next project run
-will use the same original Hono configuration and dependencies.
+field. That repair is committed at `e7e58fd8`. Its fresh test run completed
+the library and one public test, then timed out during the second public test.
+The next project source, `f5b684b5`, combines the whole repair and the existing
+observer. It keeps the original Hono configuration and dependencies.
 
 The accepted original test subset has 423 exact diagnostic results in 511
 executed variants and 60 exact semantic results in 95 variants. These are not
@@ -70,6 +73,12 @@ checker tests, two fixture-library tests and one baseline CLI integration
 test. All 729 public checker tests and 285 compiler tests passed. Separate
 cleanup is complete. The original corpus did not run because the full check
 failed. This candidate is not accepted.
+
+The eight failures now have source diagnoses. A five-file repair batch is
+under review. It keeps the original fixture diagnostics and type/symbol
+expectations. Eighteen of the nineteen new controls passed in the failed run,
+but seven old tests changed from pass to failure. Those regressions must be
+cleared before the original corpus comparison can run again.
 
 The newer combined core/class source is
 `aea8d39c730a2db79e4d2fae965f5b164d1240bf`. Its full checker run passed 5,981
@@ -157,12 +166,27 @@ and [independent predicate audit](../target/wave202-demo-hono-probe-4-validate-c
 agree. The repair at `e7e58fd8` retains the actual parameter/property annotation
 role and changes this one validator. It does not warm imports early, remove a
 guard, or change Hono. Four private controls were added. Existing valid and
-invalid default-value tests stay unchanged. The fresh focused run selects all
-5,174 tests and ten required controls. It has no result yet. The
+invalid default-value tests stay unchanged. The fresh focused run listed all
+5,174 tests. It completed 5,172, with 5,138 passes and 34 failures. The public
+constructor-default test passed with all four excluded status codes unchanged.
+The run reached its 900-second limit during the second public test. The third
+never started. One new private test has a proved holder-count setup error.
+The other 33 failures have no same-base before result. The
+[closed runtime review](../target/wave202-demo-class-annotation-roles-focused-1-runtime-review.md)
+keeps the incomplete result and separate cleanup evidence. The
 [commit review](../target/wave202-demo-class-annotation-roles-commit-review.md)
-records the exact source. The next diagnostic Hono source combines that whole
-repair with the unchanged error observer.
+records the exact source. The next diagnostic Hono source, `f5b684b5`, combines
+that whole repair with the unchanged error observer. Its fresh project probe
+has conditional release after the final packet review.
 A repaired first failure will not establish that the rest of Hono passes.
+
+The saved Cargo records show optimization level zero. A separate manifest-only
+candidate, `7ca0e571`, sets development and test optimization to level one.
+It keeps debug assertions and overflow checks enabled. Every checker and test
+source byte remains exact relative to `e7e58fd8`, including its known failure.
+The next test packet keeps all 5,174 tests and the same deadline. No speedup
+has been measured. The incomplete earlier run cannot supply a full-run speed
+ratio.
 
 The Query contextual-arrow candidate ran all 5,114 selected checker and public
 tests. It passed 5,064 and failed 50. Five failures are in the new controls.
@@ -177,7 +201,7 @@ retains every failed test. No result from this run is added to another run.
 
 | Target | Complete upstream scope | Why use it | Last project-stage result |
 | --- | --- | --- | --- |
-| Hono | `tsconfig.build.json`, 188 roots | Strict library build with ES2022 target. Dependencies are prepared. Saved Go cold diagnostics are empty. | Imported constructor annotation fails a proved source-role check. Repair committed and under test. |
+| Hono | `tsconfig.build.json`, 188 roots | Strict library build with ES2022 target. Dependencies are prepared. Saved Go cold diagnostics are empty. | Annotation-role repair passes the constructor-default control. Complete focused run timed out. Full project probe is next. |
 | TanStack Query core | `packages/query-core/tsconfig.prod.json`, 23 roots | Strict ESNext/Bundler package. Dependencies and declaration outputs are prepared. Saved Go cold and warm diagnostics are empty. | Unsupported arrow in `timeoutManager.ts`. |
 
 Roots are not the complete dependency graph. The saved Go runs load 186 files
@@ -249,7 +273,9 @@ The class-only batch is committed and independently reviewed at `4cab980e`.
 Its first build failed because a relation helper reads a field that is not on
 the current session type. All 6,149 selected tests, including 72 additions,
 remain unrun. Separate cleanup and evidence review are complete. The narrow
-correction will pass the session's existing optional global Array targets.
+correction is committed and reviewed at `3e5383d1`. It passes the session's
+existing optional global Array targets. A fresh full checker packet is in
+review, with all previous controls retained.
 The [closed result](../target/wave202-demo-generic-project-integration-focused-1-runtime.md)
 retains the full compiler error. The two later generic-class plans use the
 actual `4cab980e` APIs and share file ownership. Their implementation is not
@@ -257,9 +283,15 @@ part of this gate.
 
 The first named-bounds build on `3f32cc52` stopped on one test-helper type
 mismatch before any of its 5,176 tests ran. Its one-site correction is now
-committed and independently reviewed at `0e1b34e6`. A new focused packet
-keeps the full selection and all nine required controls. Neither candidate
-has a passing runtime result yet.
+committed and independently reviewed at `0e1b34e6`. Its next run completed all
+5,176 tests, with 5,108 passes and 68 failures. All nine new controls failed.
+Eight first stops come from a retained reader that rejects the parser's valid
+property kind. The ninth comes from an exported-alias owner check. Two workers
+are repairing those checks in separate files. All original controls stay
+unchanged. Of the other 59 failures, 21 match prior source and failure paths.
+The remaining 38 have separate current-source diagnosis tasks. The
+[complete census](../target/wave202-named-bounds-failure-census.md) keeps these
+groups separate. No pass gain is predicted.
 
 The first class-field check stopped with six Rust compile errors. No test ran.
 The errors came from one missing import and four reads of a private field.
@@ -284,9 +316,13 @@ setup helper before the later field assertions. The helper assumes that the
 real ES5 Array owner has only interface flags. Its actual merged owner also
 has a variable declaration. One new private replay control failed as well.
 The [complete result](../target/wave202-demo-class-field-initializers-focused-3-result-receipt.md)
-retains every failure. Twelve read-only groups now cover all 74 failures
-exactly once. These failures include earlier class defects. They are not
-74 proved regressions caused by field support.
+retains every failure. The completed twelve-group census covers all 74 exactly
+once. It records 39 proved production first stops, 16 setup errors, seven
+expectation conflicts and 12 unresolved causes. These are first stops, not
+predicted recovered tests. The two field-control setup corrections are
+committed and reviewed at `1f418c8a`. They have no new runtime result. These
+failures include earlier class defects. They are not 74 proved regressions
+caused by field support.
 
 The Query source audit identifies missing contextual typing for the first
 two-parameter object-property arrow. Its declared `TimeoutProvider` property
@@ -321,10 +357,12 @@ All 53 other failures now have indexed failure reports. Twenty-one share the
 generic-call replay path, and eight share exported function-alias ownership.
 Those two repairs are committed and reviewed at `ea201924` and `27ee97f1`.
 The direct alias-context repair is committed and reviewed at `7427a715`.
-Their combined source and test plan is being checked before integration.
-These are repairs for first failing operations, not new passing test results.
-Four separate test-setup corrections are also approved. They preserve the
-original TypeScript, options, semantic assertions and query order.
+Those three complete repairs and the four test-setup corrections are now
+combined in clean commit `8912d642`. Final independent source closure is in
+progress. The next focused packet will keep all 5,093 tests and 34 required
+controls. These are repairs for first failing operations, not new passing
+test results. The setup corrections preserve the original TypeScript,
+options, semantic assertions and query order.
 Executable class imports are committed and reviewed at `c295104c`, with eight
 new private and eight new public tests. Generic construction is committed and
 reviewed at `d2a6a8a3`, with 16 new private and four new public tests. Neither
@@ -368,6 +406,12 @@ moving without changing the original inputs or the full completion criteria.
 The demo still needs a complete ordinary diagnostic check and the separate
 deliberate-error check. An unsupported report is never a successful demo.
 
+A separate diagnostic reporter is being implemented to measure the failures
+hidden behind the first project stop. It will load the complete original
+Program and check each root in a fresh checker context. It must record every
+root, incomplete attempt and failure. These isolated-root results will guide
+parallel repairs. They will not count as a normal complete-project pass.
+
 The existing development entry point is `tsgo --check-canonical PROJECT`.
 It fails if construction is unsupported or canonical checking did not run.
 A project reporter can exit successfully after writing an unsupported result.
@@ -380,8 +424,8 @@ independent source, class, inference, relation, or library failures needed by
 these projects. Give each writer a fixed worktree and file list before edits.
 Keep review and reference checks in parallel with implementation. Keep the
 existing build limits. Forty agent slots do not authorize forty Cargo builds.
-The team has reached 40 active subagents. This is a worker count,
-not a speedup measurement. New builds must not reuse another source worktree's
+The target is up to 40 useful parallel workers. A worker count is not a
+speedup measurement. New builds must not reuse another source worktree's
 target directory. Keep one owner for each target and at most three compiler
 services at once.
 
