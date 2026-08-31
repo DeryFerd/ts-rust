@@ -28,19 +28,46 @@ The latest interface run passed 5,177 of 5,202 test executions. It cleared 28
 old failures and retained 25 failures, including one regression. One of those
 28 improvements includes an approved test setup correction. The JSDoc run
 passed all 88 selected public tests, but seven checker tests still failed.
+The latest combined run disagrees with that JSDoc run on unchanged parsing
+controls. The cause is under review.
 These runs overlap and must not be added together as unique passing tests.
 
-A separate full core check passed 6,393 of 6,395 tests in 133 harnesses at
-`713a5211c21dd1dfd654cb612a23f5b585fca048`. Formatting, strict Clippy and both
-binary builds passed. The failures are an invalid literal-cache test setup
-and a missing union-type route for class method parameters. Both fixes are
-combined at `88fae170a9f422b2fb109abf4e8fb9553c60a0e0`. The next full run expects
-6,399 tests, including four new private controls. It has not run yet. This
-result does not replace the accepted original test subset.
+A newer full core check passed 6,398 of 6,399 tests in 133 harnesses at
+`5b0127b6e5613f5161dda18cddee644c6be5ea41`. All eleven stages ran. Formatting,
+strict Clippy, all 4,886 checker units, parser and compiler tests, fixture
+tests, and both tool builds passed. One public class-method test failed its
+full-store snapshot after a repeated source check. Independent review found
+two expected bookkeeping changes. The semantic and display assertions before
+that snapshot passed. The exact test-only correction is committed at
+`4f7397046c08de663fede5e5281884bbbc092092`. Its next full run is being prepared.
+The
+[complete result](../target/wave202-next-full-core-gate-6-report.md) does not
+replace the accepted original test subset.
 
-Combined core/interface source `3571142fc7fb7f6e3e23346370e668c2b90b4939`
-passes the complete workspace all-target compile check. One unused-method
-warning remains. This result does not prove that tests or projects pass.
+The combined core/class source `ad8e06a85d01631c027d25a1e4c0cef776b34798`
+passes the complete workspace all-target compile check with no errors or
+warnings. Its separate full checker run is complete. It passed 5,926 of 6,040
+tests in 171 harnesses. The library harness passed 5,081 and failed 59. Public
+tests passed 845 and failed 55. No tests were ignored or filtered. All runtime
+services closed and the source stayed unchanged. The
+[complete result](../target/wave202-demo-core-class-focused-1-result.md) records
+all 114 failures. Forty-five match previously diagnosed private cases. Thirteen
+separate review groups cover the other 69 cases.
+
+Two shared repairs are committed and being combined for the next run. One
+keeps saved generic call signatures on the existing generic validation path
+during replay. The other makes warm numeric-intersection queries build their
+complete operand plan. All old tests remain unchanged. Neither repair has a
+runtime result yet.
+
+The Query contextual-arrow candidate ran all 5,114 selected checker and public
+tests. It passed 5,064 and failed 50. Five failures are in the new controls.
+Their diagnosis found three test-helper failures and two missing calls to
+existing checker code. The other 45 failures now have source diagnoses.
+Several share a generic-call validation error during repeated checking. This
+is a measured integration result, not fifty separate missing language features.
+The [full failure report](../target/wave202-demo-contextual-arrow-focused-2-report.md)
+retains every failed test. No result from this run is added to another run.
 
 ## Selected projects
 
@@ -69,22 +96,34 @@ supersedes the old generic-setter trace for this compiler. The
 [Hono result](../target/wave202-demo-hono-current-probe-1-report.md) identifies
 the class but not its inner rejecting guard. A separate source audit proves
 missing constructor-valued heritage and ordinary annotated constructor
-defaults. Those repairs are committed but not yet runtime-verified. The first
-heritage test run failed to compile its tests. That test API repair is now
-committed. One first failure does not tell us how many remain.
+defaults. Those repairs have separate source commits. The heritage test run now
+reaches both test harnesses. It passed 4,889 of 4,897 tests. All four new private
+heritage controls passed, but four old checker controls and all four public
+controls failed. The repair is committed at
+`2ea6843ab6a5169dfe7344528d90f6e2aa22fc99`. It fixes inherited member ownership,
+keeps the actual caller for property diagnostic details, and corrects proved
+test setup errors. The next focused run is being prepared. Optional named fields
+and imported conditional class annotations are also committed and reviewed,
+but not runtime-verified.
+One first project failure does not tell us how many remain.
 
 The Query source audit identifies missing contextual typing for the first
 two-parameter object-property arrow. Its declared `TimeoutProvider` property
 must supply both parameter types before the normal body check. The repair
 uses that general rule. It does not change the timer code or assume its return.
-The repair is committed with four private and five public tests. It is being
-combined with the newer checker before its first test run.
+The repair is committed with four private and five public tests. Its first
+complete test run is recorded above. The follow-up patch preserves the actual
+arrow return, source property identities, parameter order and body diagnostics.
 
 A wider source audit covers all 23 Query roots. It finds more missing behavior,
 including generic class bodies, optional calls, generic function-type aliases,
 and branching callback bodies. Query is not one or two fixes from a proved
 complete pass. Separate workers now implement the shared source features.
-These audit findings do not predict the next runtime failure.
+Generic class methods, optional calls and branching arrow bodies are committed
+and source-reviewed. Their runtime checks remain pending. Generic class bodies
+and generic function-type aliases are still in progress. Executable class
+imports and generic construction have separate reviewed designs. These audit
+findings do not predict the next runtime failure.
 
 Pinned project commits:
 
@@ -116,6 +155,13 @@ these reports to claim stable replay or complete artifact parity.
 6. Complete type and symbol comparison and resolve the replay limitation as
    separate steps toward the full port goal.
 
+Use a compiled diagnostic candidate to find the next whole-project blocker
+while unrelated artifact or replay repairs continue. Record its known test
+failures and do not promote it as accepted. This keeps project measurement
+moving without changing the original inputs or the full completion criteria.
+The demo still needs a complete ordinary diagnostic check and the separate
+deliberate-error check. An unsupported report is never a successful demo.
+
 The existing development entry point is `tsgo --check-canonical PROJECT`.
 It fails if construction is unsupported or canonical checking did not run.
 A project reporter can exit successfully after writing an unsupported result.
@@ -143,12 +189,20 @@ end. Its app also has diagnostics with the pinned Go version.
 
 ts-pattern is a useful strict type-system test, but its unchanged configuration
 has a recorded TS5011 diagnostic. A new audit also checked sourcemap-codec,
-UFO, pathes and RailwaySDK. Sourcemap-codec has a strict four-file build config,
+UFO, pathe and RailwaySDK. Sourcemap-codec has a strict four-file build config,
 but its dependencies are not prepared and its typed-array field initializer
 hits a current class-planning guard. The others have dependency or configuration
 limits. None is a measured short path to a complete strict project pass. The
 [smaller-project assessment](../target/wave202-demo-small-project-alternatives.md)
 records the exact limits. No project input was changed for that assessment.
+
+Two additional source audits checked tiny-invariant and Mitt. Tiny-invariant's
+unchanged strict config has five roots, including its tests. It needs mixed
+early-exit function bodies, annotated async arrows and its full dependency
+graph. Mitt has three roots and needs generic callback aliases, generic object
+methods, dependency types and generated declarations. Neither has run through
+the Rust checker or proved a shorter route to a complete demo. Their small
+implementation files are not substitutes for their full configurations.
 
 The local [project assessment](../target/wave202-demo-prepared-project-assessment.md)
 contains the exact input and result hashes. This plan changes scheduling. It
