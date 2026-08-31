@@ -1763,7 +1763,7 @@ fn validate_property_interface_worker(
     if heritage_provenance.is_some_and(|provenance| provenance.source.is_some()) {
         for &property in &declared.properties {
             let own = store.symbol(property)?;
-            let Some(&base_property) = inherited_by_name.get(own.name()) else {
+            let Some(&base_property) = inherited_by_name.get(own.name().as_bytes()) else {
                 continue;
             };
             let base = store.symbol(base_property)?;
@@ -3646,7 +3646,7 @@ mod tests {
                     .collect::<Vec<_>>(),
             )
         };
-        let plan = |store| {
+        let plan = |store: &CanonicalTypeMapperStore| {
             object_members::plan_merged_global_interface(store, &host, owner, targets)
                 .map(|plan| plan.map(|plan| (plan.symbol, plan.declarations)))
         };

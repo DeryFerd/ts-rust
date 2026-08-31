@@ -15318,8 +15318,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .and_then(|type_| self.store.type_payload(type_))
         {
             let target = match record.data() {
-                TypeData::TypeReference(reference) => reference.target,
-                TypeData::Interface(interface) => interface.reference.target,
+                TypeData::TypeReference(reference) => reference.object.target,
+                TypeData::Interface(interface) => interface.reference.object.target,
                 _ => None,
             };
             let target_owner = target
@@ -51418,7 +51418,7 @@ mod tests {
         else {
             unreachable!()
         };
-        let annotation = NodeRef::new(rhs.arena, rhs.file, property_data.type_.unwrap());
+        let annotation = NodeRef::new(rhs.arena, rhs.file, property_data.type_);
         let options = context.options();
         let globals = context.global_types().clone();
         let order = context.file_order().to_vec();
@@ -53714,7 +53714,7 @@ mod tests {
                         query.store,
                         proof,
                         &globals,
-                        options.strict_function_types
+                        Some(options.strict_function_types)
                     ),
                     Ok(())
                 );
@@ -53776,7 +53776,7 @@ mod tests {
                             query.store,
                             &returns[1],
                             &globals,
-                            options.strict_function_types
+                            Some(options.strict_function_types)
                         )
                         .is_err()
                 );
@@ -53798,7 +53798,7 @@ mod tests {
                     query.store,
                     &returns[1],
                     &globals,
-                    options.strict_function_types
+                    Some(options.strict_function_types)
                 ),
                 Ok(())
             );
@@ -53839,7 +53839,7 @@ mod tests {
                     query.store,
                     world_return,
                     &globals,
-                    options.strict_function_types
+                    Some(options.strict_function_types)
                 ),
                 Ok(())
             );
@@ -53866,7 +53866,7 @@ mod tests {
                         query.store,
                         world_return,
                         &globals,
-                        options.strict_function_types
+                        Some(options.strict_function_types)
                     )
                     .is_err()
             );
@@ -53882,7 +53882,7 @@ mod tests {
                     query.store,
                     world_return,
                     &globals,
-                    options.strict_function_types
+                    Some(options.strict_function_types)
                 ),
                 Ok(())
             );

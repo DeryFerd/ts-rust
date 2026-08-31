@@ -5363,7 +5363,12 @@ mod source_alias_heritage_tests {
         }
 
         let source = checker.source_file(FILES[1]).unwrap();
-        let locals = checker.file(FILES[1]).unwrap().1.locals(source).unwrap();
+        let locals = checker
+            .file(FILES[1])
+            .unwrap()
+            .1
+            .locals(source.node_ref())
+            .unwrap();
         let original = checker
             .store()
             .symbol_table(locals)

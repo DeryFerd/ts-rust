@@ -59,7 +59,8 @@ use super::{
     instantiate::InstantiationSession,
     interface_heritage::SourceInterfaceHeritageQueryContext,
     member_resolution::UnionPropertyError,
-    relater::{RelationKind, ResolvedOwnProperty, SourceRelationError},
+    relater::{ResolvedOwnProperty, SourceRelationError},
+    relation::RelationKind,
     source::{PlannedExpression, PlannedExpressionKind, SourceCheckError},
     source_callables::{
         SourceCallableFamily, StoredSourceCallableValidation,
@@ -6439,7 +6440,7 @@ pub(super) fn prepare_global_this_missing_member_diagnostic(
         .global_object_property_symbol_with_query_context(
             EscapedNameRef::source(&identifier.text),
             global_types,
-            Some(options.strict_function_types),
+            options.strict_function_types,
             session,
             heritage,
         )

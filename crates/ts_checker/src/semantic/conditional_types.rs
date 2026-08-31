@@ -1956,14 +1956,7 @@ fn validate_source_input_recovery_production(
             } else {
                 ConditionalQueryKey::Instantiation(
                     definition.root,
-                    conditional_type_key_with_source(
-                        store,
-                        type_arguments,
-                        None,
-                        for_constraint,
-                        arrays,
-                        Some(source),
-                    )?,
+                    conditional_type_key_parts(type_arguments, None, for_constraint),
                 )
             };
             definition == &production.definition
@@ -11512,7 +11505,7 @@ mod tests {
         let cache = root.instantiations().clone();
         let before = conditional_callable_counts(store);
         assert!(matches!(
-            structured_inference_shape(store, reference, None),
+            structured_inference_shape(store, reference, None, None),
             Err(ConditionalTypeError::Relation(RelationUnavailable::UnresolvedStructuredMembers(type_))) if type_ == reference
         ));
         assert_eq!(conditional_callable_counts(store), before);

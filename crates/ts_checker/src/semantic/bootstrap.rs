@@ -8110,6 +8110,7 @@ mod tests {
     use crate::semantic::{
         AliasSymbolLinks, AliasTargetState, CanonicalCheckerContext, CanonicalCheckerOptions,
         DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
+        SymbolNodeLinks,
         declared::type_list_key,
         instantiate::canonical_anonymous_union,
         object_aliases::property_object_alias_projection,

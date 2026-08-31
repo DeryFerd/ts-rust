@@ -1553,8 +1553,32 @@ mod tests {
                     .declarations()
                     .map(<[_]>::to_vec),
                 store.symbol(owner).unwrap().value_declaration(),
-                store.type_payload(argument).cloned(),
-                store.type_payload(this_type).cloned(),
+                store.type_payload(argument).map(|record| {
+                    let TypeData::Interface(data) = record.data() else {
+                        panic!("the declared owner keeps its interface record");
+                    };
+                    (
+                        record.id(),
+                        record.flags(),
+                        record.object_flags(),
+                        record.symbol(),
+                        record.alias(),
+                        data.clone(),
+                    )
+                }),
+                store.type_payload(this_type).map(|record| {
+                    let TypeData::TypeParameter(data) = record.data() else {
+                        panic!("the this type keeps its type-parameter record");
+                    };
+                    (
+                        record.id(),
+                        record.flags(),
+                        record.object_flags(),
+                        record.symbol(),
+                        record.alias(),
+                        data.clone(),
+                    )
+                }),
                 annotations
                     .iter()
                     .map(|node| store.type_node_links(*node).cloned())
@@ -1652,7 +1676,19 @@ mod tests {
         let warm = (
             reference_store_counts(store),
             store.checker_link_allocated_lengths(),
-            store.type_payload(argument).cloned(),
+            store.type_payload(argument).map(|record| {
+                let TypeData::Interface(data) = record.data() else {
+                    panic!("the declared owner keeps its interface record");
+                };
+                (
+                    record.id(),
+                    record.flags(),
+                    record.object_flags(),
+                    record.symbol(),
+                    record.alias(),
+                    data.clone(),
+                )
+            }),
         );
         for _ in 0..2 {
             assert_eq!(
@@ -1663,7 +1699,19 @@ mod tests {
                 (
                     reference_store_counts(store),
                     store.checker_link_allocated_lengths(),
-                    store.type_payload(argument).cloned()
+                    store.type_payload(argument).map(|record| {
+                        let TypeData::Interface(data) = record.data() else {
+                            panic!("the declared owner keeps its interface record");
+                        };
+                        (
+                            record.id(),
+                            record.flags(),
+                            record.object_flags(),
+                            record.symbol(),
+                            record.alias(),
+                            data.clone(),
+                        )
+                    })
                 ),
                 warm
             );

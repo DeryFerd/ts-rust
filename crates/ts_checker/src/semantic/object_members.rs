@@ -26923,7 +26923,19 @@ mod selected_source_member_tests {
                     .declared_type_links(owner)
                     .and_then(|links| links.declared_type)
                     .and_then(|type_| store.type_payload(type_))
-                    .cloned(),
+                    .map(|record| {
+                        let TypeData::Interface(data) = record.data() else {
+                            panic!("the declared owner keeps its interface record");
+                        };
+                        (
+                            record.id(),
+                            record.flags(),
+                            record.object_flags(),
+                            record.symbol(),
+                            record.alias(),
+                            data.clone(),
+                        )
+                    }),
                 store.type_node_links(value_annotation).cloned(),
                 context.diagnostics().clone(),
             )

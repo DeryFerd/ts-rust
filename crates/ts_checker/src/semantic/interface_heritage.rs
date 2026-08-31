@@ -4742,7 +4742,19 @@ mod tests {
                 store.mapper_len(),
                 store.symbol_store().symbol_table_len(),
                 store.checker_link_allocated_lengths(),
-                store.type_payload(type_).cloned(),
+                store.type_payload(type_).map(|record| {
+                    let TypeData::Interface(data) = record.data() else {
+                        panic!("the declared owner keeps its interface record");
+                    };
+                    (
+                        record.id(),
+                        record.flags(),
+                        record.object_flags(),
+                        record.symbol(),
+                        record.alias(),
+                        data.clone(),
+                    )
+                }),
                 store.type_node_links(left_rhs).cloned(),
                 store.type_alias_links(left).cloned(),
                 store.symbol_node_links(expression).cloned(),
@@ -4895,7 +4907,19 @@ mod tests {
                 store.symbol_store().symbol_table_len(),
                 store.checker_link_allocated_lengths(),
                 store.declared_type_links(base).cloned(),
-                store.type_payload(type_).cloned(),
+                store.type_payload(type_).map(|record| {
+                    let TypeData::Interface(data) = record.data() else {
+                        panic!("the declared owner keeps its interface record");
+                    };
+                    (
+                        record.id(),
+                        record.flags(),
+                        record.object_flags(),
+                        record.symbol(),
+                        record.alias(),
+                        data.clone(),
+                    )
+                }),
                 store.source_interface_heritage_header(type_).cloned(),
                 store.direct_interface_heritage_provenance(type_).cloned(),
             )
@@ -4964,7 +4988,19 @@ mod tests {
                 store.mapper_len(),
                 store.symbol_store().symbol_table_len(),
                 store.checker_link_allocated_lengths(),
-                store.type_payload(type_).cloned(),
+                store.type_payload(type_).map(|record| {
+                    let TypeData::Interface(data) = record.data() else {
+                        panic!("the declared owner keeps its interface record");
+                    };
+                    (
+                        record.id(),
+                        record.flags(),
+                        record.object_flags(),
+                        record.symbol(),
+                        record.alias(),
+                        data.clone(),
+                    )
+                }),
                 store.type_node_links(rhs).cloned(),
                 store.type_alias_links(alias).cloned(),
                 store.direct_interface_heritage_provenance(type_).cloned(),
@@ -5333,7 +5369,19 @@ mod tests {
                     store.mapper_len(),
                     store.symbol_store().symbol_table_len(),
                     store.checker_link_allocated_lengths(),
-                    store.type_payload(type_).cloned(),
+                    store.type_payload(type_).map(|record| {
+                        let TypeData::Interface(data) = record.data() else {
+                            panic!("the declared owner keeps its interface record");
+                        };
+                        (
+                            record.id(),
+                            record.flags(),
+                            record.object_flags(),
+                            record.symbol(),
+                            record.alias(),
+                            data.clone(),
+                        )
+                    }),
                     store.value_symbol_links(property.symbol).cloned(),
                     store.source_interface_heritage_header(type_).cloned(),
                     store.direct_interface_heritage_provenance(type_).cloned(),

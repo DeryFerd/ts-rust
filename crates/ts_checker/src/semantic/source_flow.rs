@@ -11024,12 +11024,14 @@ mod tests {
         assert!(
             matches!(validate_class_property_condition(context.store(), &host, &bound, body, changed), Err(SourceFlowError::Invariant(SourceFlowInvariant::InvalidClassProperty(node))) if node == condition.access)
         );
-        let flags = context.store().symbol(member.symbol).unwrap().flags();
-        assert!(
-            context
-                .store_mut_for_test()
-                .set_symbol_flags(member.symbol, flags.without(SymbolFlags::OPTIONAL))
-        );
+        let symbol = context.store().symbol(member.symbol).unwrap();
+        let flags = symbol.flags();
+        let check_flags = symbol.check_flags();
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            member.symbol,
+            flags.without(SymbolFlags::OPTIONAL),
+            check_flags
+        ));
         let before = format!("{:?}", context.store());
         assert_eq!(
             plan_class_property_truthiness(context.store(), &host, body, condition.access),
@@ -11039,7 +11041,7 @@ mod tests {
         assert!(
             context
                 .store_mut_for_test()
-                .set_symbol_flags(member.symbol, flags)
+                .set_symbol_flags(member.symbol, flags, check_flags)
         );
     }
 

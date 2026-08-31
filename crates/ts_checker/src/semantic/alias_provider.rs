@@ -29,6 +29,7 @@ use super::{
         CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
     },
     links::ExportTypeLinks,
+    store::SourceNodeParent,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -1923,10 +1924,8 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             let current = result.0;
             let parent = current
                 .parent
-                .map(|parent| {
-                    super::SourceNodeParent::Parent(NodeRef::new(node.arena, node.file, parent))
-                })
-                .unwrap_or(super::SourceNodeParent::Root);
+                .map(|parent| SourceNodeParent::Parent(NodeRef::new(node.arena, node.file, parent)))
+                .unwrap_or(SourceNodeParent::Root);
             if store.source_node_kind(node) != Some(current.kind)
                 || store.source_node_parent(node) != Some(parent)
             {
@@ -2110,8 +2109,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             let name = NodeRef::new(declaration.arena, declaration.file, name);
             let (name_record, _) = self.checked_node(store, name)?;
             if name_record.parent != Some(declaration.node)
-                || store.source_node_parent(name)
-                    != Some(super::SourceNodeParent::Parent(declaration))
+                || store.source_node_parent(name) != Some(SourceNodeParent::Parent(declaration))
                 || store.source_node_kind(name) != Some(name_record.kind)
                 || name_record.flags.0 != 0
                 || name_record.range.start < record.range.start
@@ -2131,8 +2129,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             let parent = NodeRef::new(current.arena, current.file, parent);
             let (parent_record, _) = self.checked_node(store, parent)?;
             if store.source_node_kind(current) != Some(node.kind)
-                || store.source_node_parent(current)
-                    != Some(super::SourceNodeParent::Parent(parent))
+                || store.source_node_parent(current) != Some(SourceNodeParent::Parent(parent))
                 || node.flags.0 != 0
                 || node.range.start < parent_record.range.start
                 || node.range.end > parent_record.range.end
