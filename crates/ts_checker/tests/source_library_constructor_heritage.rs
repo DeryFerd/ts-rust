@@ -570,11 +570,15 @@ fn assert_constructor_signature(
             unreachable!()
         };
         assert_eq!(data.question_token.is_some(), optional);
-        let annotation = cached_type(
-            context,
-            reference(context, source.file, data.type_.unwrap()),
-        );
         let intrinsic = context.store().intrinsic_bootstrap().unwrap();
+        let annotation = match arena.get(data.type_.unwrap()).unwrap().kind {
+            SyntaxKind::StringKeyword => intrinsic.string_type,
+            SyntaxKind::NumberKeyword => intrinsic.number_type,
+            _ => cached_type(
+                context,
+                reference(context, source.file, data.type_.unwrap()),
+            ),
+        };
         match arena.get(data.type_.unwrap()).unwrap().kind {
             SyntaxKind::StringKeyword => assert_eq!(annotation, intrinsic.string_type),
             SyntaxKind::NumberKeyword => assert_eq!(annotation, intrinsic.number_type),
