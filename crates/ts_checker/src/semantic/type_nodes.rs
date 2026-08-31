@@ -449,6 +449,7 @@ fn preflight_type_annotation_worker(
         source_class.is_some_and(|owner| {
             super::classes::source_class_method_annotation_is_owned(store, host, owner, node)
         }),
+        None,
     );
     if supported {
         for &reference in &references {
@@ -886,6 +887,29 @@ impl ConstructorAnnotationProof {
         host: &DeclaredTypeHost<'_>,
         global_types: Option<&CanonicalGlobalTypes>,
     ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        // A cold root must not hide a changed child or conditional request.
+        if !self.plan.conditionals.is_empty() {
+            if self.bindings().any(|(node, symbol)| {
+                store
+                    .constructor_annotation_binding(node)
+                    .is_some_and(|actual| actual != symbol)
+            }) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(self.node),
+                ));
+            }
+            for node in &self.plan.nodes {
+                self.plan.cached_type_query_result(
+                    store,
+                    global_types.map(CanonicalArrayTargets::from_global_types),
+                    None,
+                    &[],
+                    *node,
+                    SourceCallableTypeReplay::Operational,
+                    &mut HashSet::new(),
+                )?;
+            }
+        }
         self.plan.cached_annotation_type(
             store,
             host,
@@ -1526,7 +1550,20 @@ impl TypeQueryPlan {
             .and_then(|links| links.resolved_type);
         let mut needs_node_cache = true;
         let expected = if let Some(reference) = self.references.get(&node) {
-            let cold_property_import = if let Some(body) = &reference.alias_body_import {
+            let cold_property_import = if let Some(class) = &reference.class_annotation_import {
+                if class.reference() != node
+                    || Some(class.alias_symbol()) != reference.import_alias
+                    || class.target_symbol() != reference.symbol
+                    || class.arguments() != reference.type_arguments
+                    || reference.property_import.is_some()
+                    || reference.alias_body_import.is_some()
+                {
+                    return Err(invalid());
+                }
+                !class
+                    .validate_current(store)
+                    .map_err(|error| property_type_import_error(node, error))?
+            } else if let Some(body) = &reference.alias_body_import {
                 if body.reference() != node
                     || Some(body.alias_symbol()) != reference.import_alias
                     || body.target_symbol() != reference.symbol
@@ -2553,6 +2590,38 @@ impl TypeQueryPlan {
         active: &mut HashSet<NodeRef>,
     ) -> Result<Option<TypeId>, DeclaredTypeError> {
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        if let Some(class) = self
+            .references
+            .get(&node)
+            .and_then(|reference| reference.class_annotation_import.as_ref())
+            && source_imports::plan_source_class_annotation_type_import(store, host, node)
+                .map_err(|error| property_type_import_error(node, error))?
+                .as_ref()
+                != Some(class)
+        {
+            return Err(invalid());
+        }
+        if self.references.get(&node).is_some_and(|reference| {
+            self.aliases
+                .get(&reference.symbol)
+                .is_some_and(|alias| !alias.type_parameters.is_empty())
+        }) {
+            if store
+                .constructor_annotation_binding(node)
+                .is_some_and(|symbol| symbol != self.references[&node].symbol)
+            {
+                return Err(invalid());
+            }
+            return self.cached_type_query_result(
+                store,
+                array_targets,
+                None,
+                &[],
+                node,
+                SourceCallableTypeReplay::Operational,
+                active,
+            );
+        }
         if !active.insert(node) {
             return Err(invalid());
         }
@@ -2565,6 +2634,18 @@ impl TypeQueryPlan {
                 .type_node_links(node)
                 .and_then(|links| links.resolved_type)
                 .is_some();
+            if let Some(class) = &reference.class_annotation_import {
+                if class.reference() != node
+                    || class.target_symbol() != reference.symbol
+                    || Some(class.alias_symbol()) != reference.import_alias
+                    || class.arguments() != reference.type_arguments
+                {
+                    return Err(invalid());
+                }
+                class
+                    .validate_current(store)
+                    .map_err(|error| property_type_import_error(node, error))?;
+            }
             if (published_type || cached_symbol.is_some())
                 && cached_symbol != Some(reference.symbol)
                 || store
@@ -2838,6 +2919,7 @@ fn planned_constructor_annotation_shape(
     references: &mut Vec<NodeRef>,
     source_class: bool,
     source_method: bool,
+    conditional_alias: Option<SemanticSymbolId>,
 ) -> bool {
     if !active.insert(node) {
         return false;
@@ -2853,6 +2935,7 @@ fn planned_constructor_annotation_shape(
                 references,
                 source_class,
                 source_method,
+                conditional_alias,
             )
         })
     } else if source_class && let Some(array) = plan.arrays.get(&node) {
@@ -2865,6 +2948,7 @@ fn planned_constructor_annotation_shape(
             references,
             true,
             source_method,
+            conditional_alias,
         )
     } else if source_method && let Some(object) = plan.type_literals.get(&node) {
         object.kind == object_members::PropertyObjectKind::TypeLiteral
@@ -2886,11 +2970,65 @@ fn planned_constructor_annotation_shape(
                     references,
                     source_class,
                     true,
+                    conditional_alias,
                 )
             })
+    } else if source_class && let Some(conditional) = plan.conditionals.get(&node) {
+        conditional_alias.is_some_and(|owner| {
+            plan.aliases.get(&owner).is_some_and(|alias| {
+                conditional.alias_symbol == Some(owner)
+                    && conditional.infer_parameters.is_empty()
+                    && conditional.outer_parameters.as_deref()
+                        == Some(
+                            alias
+                                .type_parameters
+                                .iter()
+                                .map(|parameter| parameter.symbol)
+                                .collect::<Vec<_>>()
+                                .as_slice(),
+                        )
+                    && [
+                        conditional.check_type,
+                        conditional.extends_type,
+                        conditional.true_type,
+                        conditional.false_type,
+                    ]
+                    .into_iter()
+                    .all(|child| {
+                        planned_constructor_annotation_shape(
+                            store,
+                            host,
+                            plan,
+                            child,
+                            active,
+                            references,
+                            true,
+                            source_method,
+                            Some(owner),
+                        )
+                    })
+            })
+        })
     } else if let Some(reference) = plan.references.get(&node) {
         references.push(node);
-        if source_class && reference.global_array_target.is_some() {
+        if source_class
+            && conditional_alias.is_some_and(|owner| {
+                plan.aliases.get(&owner).is_some_and(|alias| {
+                    alias.type_parameters.iter().any(|parameter| {
+                        parameter.symbol == reference.symbol
+                            && store.source_declaration_belongs_to_symbol(
+                                parameter.declaration,
+                                reference.symbol,
+                            )
+                    })
+                })
+            })
+        {
+            reference.type_arguments.is_empty()
+                && store
+                    .symbol(reference.symbol)
+                    .is_some_and(|symbol| symbol.flags() == SymbolFlags::TYPE_PARAMETER)
+        } else if source_class && reference.global_array_target.is_some() {
             reference.type_arguments.len() == 1
                 && planned_constructor_annotation_shape(
                     store,
@@ -2901,6 +3039,55 @@ fn planned_constructor_annotation_shape(
                     references,
                     true,
                     source_method,
+                    conditional_alias,
+                )
+        } else if source_class
+            && let Some(alias) = plan.aliases.get(&reference.symbol)
+            && !alias.type_parameters.is_empty()
+        {
+            reference.arity == PlannedTypeReferenceArity::Valid
+                && class_annotation_conditional_body(plan, host, alias.type_node)
+                && reference.type_arguments.iter().all(|argument| {
+                    planned_constructor_annotation_shape(
+                        store,
+                        host,
+                        plan,
+                        *argument,
+                        active,
+                        references,
+                        true,
+                        source_method,
+                        conditional_alias,
+                    )
+                })
+                && alias
+                    .type_parameters
+                    .iter()
+                    .flat_map(|parameter| [parameter.constraint, parameter.default_type])
+                    .flatten()
+                    .all(|annotation| {
+                        planned_constructor_annotation_shape(
+                            store,
+                            host,
+                            plan,
+                            annotation,
+                            active,
+                            references,
+                            true,
+                            source_method,
+                            Some(reference.symbol),
+                        )
+                    })
+                && planned_constructor_annotation_shape(
+                    store,
+                    host,
+                    plan,
+                    alias.type_node,
+                    active,
+                    references,
+                    true,
+                    source_method,
+                    Some(reference.symbol),
                 )
         } else {
             reference.type_arguments.is_empty()
@@ -2917,6 +3104,7 @@ fn planned_constructor_annotation_shape(
                                     references,
                                     source_class,
                                     source_method,
+                                    conditional_alias,
                                 )
                         })
                     } else if source_class
@@ -2973,6 +3161,7 @@ fn planned_constructor_annotation_shape(
                     references,
                     source_class,
                     source_method,
+                    conditional_alias,
                 )
             }
             Some(NodeData::TypeOperatorNode(operator))
@@ -2987,6 +3176,7 @@ fn planned_constructor_annotation_shape(
                     references,
                     true,
                     source_method,
+                    conditional_alias,
                 )
             }
             _ => false,
@@ -2994,6 +3184,26 @@ fn planned_constructor_annotation_shape(
     };
     active.remove(&node);
     result
+}
+
+fn class_annotation_conditional_body(
+    plan: &TypeQueryPlan,
+    host: &DeclaredTypeHost<'_>,
+    mut node: NodeRef,
+) -> bool {
+    let mut seen = HashSet::new();
+    while seen.insert(node) {
+        if plan.conditionals.contains_key(&node) {
+            return true;
+        }
+        let Some(NodeData::ParenthesizedTypeNode(parenthesized)) =
+            host.node(node).map(|record| &record.data)
+        else {
+            return false;
+        };
+        node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+    }
+    false
 }
 
 // Exact declared identities and their union members need no relation writes.
@@ -4173,6 +4383,7 @@ struct PlannedTypeReference {
     import_alias: Option<SemanticSymbolId>,
     property_import: Option<SourcePropertyTypeImportPlan>,
     alias_body_import: Option<SourceAliasBodyTypeImportPlan>,
+    class_annotation_import: Option<source_imports::SourceClassAnnotationTypeImportPlan>,
     type_arguments: Vec<NodeRef>,
     alias_owner: Option<SemanticSymbolId>,
     arity: PlannedTypeReferenceArity,
@@ -4780,6 +4991,10 @@ impl SourceCallableTypeQueryEvidence {
                         .alias_body_import
                         .as_ref()
                         .is_some_and(|body| body.validate_retained(store).is_err())
+                    || reference
+                        .class_annotation_import
+                        .as_ref()
+                        .is_some_and(|class| class.validate_current(store) != Ok(true))
             })
         {
             return false;
@@ -6878,6 +7093,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     self.store, self.host, owner, node,
                 )
             }),
+            None,
         ) {
             if let Some(reference) = self.plan.references.get(&node)
                 && reference.arity == PlannedTypeReferenceArity::Valid
@@ -6929,6 +7145,16 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
     }
 
     fn plan_type_node(&mut self, node: NodeRef) -> Result<(), DeclaredTypeError> {
+        if self.source_class_annotation.is_none()
+            && let Some(class) = source_imports::plan_source_class_annotation_type_import(
+                self.store, self.host, node,
+            )
+            .map_err(|error| property_type_import_error(node, error))?
+            && class.root() == node
+        {
+            self.source_class_annotation = Some(class.owner());
+            self.replay_cached_annotations = true;
+        }
         if let Some(alias) = self.direct_type_alias_owner(node)? {
             self.plan_type_alias(alias, false).map(|_| ())
         } else {
@@ -7026,7 +7252,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         union_constituent: bool,
     ) -> Result<(), DeclaredTypeError> {
         let record = preflight_node(self.store, self.host, node)?;
-        if self.source_callable_scope.is_some() || self.checking_imported_arguments {
+        if self.source_callable_scope.is_some()
+            || self.checking_imported_arguments
+            || self.source_class_annotation.is_some()
+        {
             self.plan.nodes.insert(node);
         }
         if self.checking_imported_arguments {
@@ -18722,16 +18951,24 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             source_imports::plan_source_property_type_import(self.store, self.host, node)
                 .map_err(|error| property_type_import_error(node, error))?
         };
-        let (alias_body_import, lexical_resolution) =
-            if qualified || record_heritage || property_import.is_some() {
-                (None, None)
-            } else {
-                let probe = source_imports::probe_source_alias_body_type_import(
-                    self.store, self.host, node,
-                )
-                .map_err(|error| property_type_import_error(node, error))?;
-                (probe.plan, probe.lexical_resolution)
-            };
+        let class_annotation_import = if qualified || record_heritage || property_import.is_some() {
+            None
+        } else {
+            source_imports::plan_source_class_annotation_type_import(self.store, self.host, node)
+                .map_err(|error| property_type_import_error(node, error))?
+        };
+        let (alias_body_import, lexical_resolution) = if qualified
+            || record_heritage
+            || property_import.is_some()
+            || class_annotation_import.is_some()
+        {
+            (None, None)
+        } else {
+            let probe =
+                source_imports::probe_source_alias_body_type_import(self.store, self.host, node)
+                    .map_err(|error| property_type_import_error(node, error))?;
+            (probe.plan, probe.lexical_resolution)
+        };
         let cached_symbol = self
             .store
             .symbol_node_links(node)
@@ -18757,6 +18994,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && exact_import.is_none()
             && property_import.is_none()
             && alias_body_import.is_none()
+            && class_annotation_import.is_none()
             && (cached_type.is_some() || cached_symbol.is_some())
         {
             match lexical_resolution {
@@ -18823,6 +19061,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && exact_import.is_none()
             && property_import.is_none()
             && alias_body_import.is_none()
+            && class_annotation_import.is_none()
             && let Some(cached) = cached_type
             && !cached_array_capability_missing
             && !cached_pending_function
@@ -18865,7 +19104,24 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let possible_global_array_name = !qualified
             && self.array_targets.is_some()
             && matches!(name_text, "Array" | "ReadonlyArray");
-        let symbol = if let Some(body) = &alias_body_import {
+        let symbol = if let Some(class) = &class_annotation_import {
+            if class.reference() != node
+                || class.arguments() != type_arguments
+                || self
+                    .source_class_annotation
+                    .is_some_and(|owner| owner != class.owner())
+                || exact_import.is_some_and(|capability| !class.matches_capability(&capability))
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidImportAliasTarget {
+                        node,
+                        alias: class.alias_symbol(),
+                        target: class.target_symbol(),
+                    },
+                ));
+            }
+            class.target_symbol()
+        } else if let Some(body) = &alias_body_import {
             if body.reference() != node
                 || body.arguments() != type_arguments
                 || exact_import.is_some_and(|capability| !body.matches_capability(&capability))
@@ -19164,7 +19420,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if global_array_target.is_none() || type_arguments.len() == 1 {
             let previous_replay = self.replay_cached_annotations;
             let previous_arguments = self.checking_imported_arguments;
-            if alias_body_import.is_some() {
+            if alias_body_import.is_some() || class_annotation_import.is_some() {
                 self.replay_cached_annotations = true;
                 self.checking_imported_arguments = true;
             }
@@ -19572,7 +19828,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         .as_ref()
                         .map(SourceAliasBodyTypeImportPlan::alias_symbol)
                 })
+                .or_else(|| {
+                    class_annotation_import
+                        .as_ref()
+                        .map(|class| class.alias_symbol())
+                })
                 .or_else(|| exact_import.map(|capability| capability.alias)),
+            class_annotation_import,
             property_import,
             alias_body_import,
             type_arguments,
@@ -27409,6 +27671,24 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         &self,
         node: NodeRef,
     ) -> Result<SemanticSymbolId, DeclaredTypeError> {
+        if let Some(class) =
+            source_imports::plan_source_class_annotation_type_import(self.store, self.host, node)
+                .map_err(|error| property_type_import_error(node, error))?
+        {
+            if self
+                .source_class_annotation
+                .is_some_and(|owner| owner != class.owner())
+                || self.plan.references.get(&node).is_some_and(|reference| {
+                    reference.class_annotation_import.as_ref() != Some(&class)
+                        || reference.symbol != class.target_symbol()
+                })
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+            return Ok(class.target_symbol());
+        }
         let record = preflight_node(self.store, self.host, node)?;
         let name_id = match &record.data {
             NodeData::TypeReferenceNode(reference) if record.kind == SyntaxKind::TypeReference => {
@@ -33416,6 +33696,25 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .iter()
             .filter(|parameter| self.store.declared_type_links(**parameter).is_none())
             .count();
+        if plan
+            .references
+            .values()
+            .any(|reference| reference.class_annotation_import.is_some())
+        {
+            for node in &plan.nodes {
+                plan.cached_type_query_result(
+                    self.store,
+                    self.global_types
+                        .as_ref()
+                        .map(CanonicalArrayTargets::from_global_types),
+                    None,
+                    &[],
+                    *node,
+                    SourceCallableTypeReplay::Operational,
+                    &mut HashSet::new(),
+                )?;
+            }
+        }
         // Check each dependency separately. A cold child must not hide a later bad cache.
         for node in &plan.imported_argument_nodes {
             plan.cached_type_query_result(
@@ -33432,6 +33731,24 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
         // Validate every declaration-owned route before publishing cold import links.
         for (&node, reference) in &plan.references {
+            if let Some(class) = &reference.class_annotation_import {
+                let current = source_imports::plan_source_class_annotation_type_import(
+                    self.store, self.host, node,
+                )
+                .map_err(|error| property_type_import_error(node, error))?;
+                if class.reference() != node
+                    || Some(class.alias_symbol()) != reference.import_alias
+                    || class.target_symbol() != reference.symbol
+                    || class.arguments() != reference.type_arguments
+                    || reference.property_import.is_some()
+                    || reference.alias_body_import.is_some()
+                    || current.as_ref() != Some(class)
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(node),
+                    ));
+                }
+            }
             if let Some(body) = &reference.alias_body_import {
                 let current =
                     source_imports::plan_source_alias_body_type_import(self.store, self.host, node)
@@ -33466,6 +33783,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
         }
         for (&node, reference) in &plan.references {
+            if let Some(class) = &reference.class_annotation_import {
+                source_imports::prepare_source_class_annotation_type_import(
+                    self.store, self.host, class,
+                )
+                .map_err(|error| property_type_import_error(node, error))?;
+            }
             if let Some(body) = &reference.alias_body_import {
                 source_imports::prepare_source_alias_body_type_import(self.store, self.host, body)
                     .map_err(|error| property_type_import_error(node, error))?;
@@ -34042,6 +34365,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 import_alias: None,
                 property_import: None,
                 alias_body_import: None,
+                class_annotation_import: None,
                 type_arguments: supplied.to_vec(),
                 alias_owner: None,
                 arity: PlannedTypeReferenceArity::Valid,
@@ -45710,6 +46034,851 @@ mod tests {
         )
         .unwrap();
         (context, source_file, target_file)
+    }
+
+    const CLASS_CONDITIONAL_FILES: [FileId; 3] = [
+        FileId::new(98_340),
+        FileId::new(98_341),
+        FileId::new(98_342),
+    ];
+    const CLASS_CONDITIONAL_SOURCE: &str = "import type { Status } from './status'; export class Reply { constructor(status: Status = 500) {} } export class Other { constructor(status: Status = 500) {} }";
+    const CLASS_CONDITIONAL_PROVIDER: &str = "export type All = 100 | 500 | -1; export type Empty = 100; export type Status = Exclude<All, Empty>; export type Other = Exclude<All, 500>;";
+
+    fn class_conditional_import_context(
+        sources: [&ParseResult; 3],
+    ) -> (
+        CanonicalCheckerContext<'_>,
+        [BoundFile; 3],
+        super::super::module_resolution::CanonicalModuleResolutionManifest,
+    ) {
+        use super::super::module_resolution::{
+            CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+            CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
+            validate_module_resolution_manifest,
+        };
+        let mut binder = CanonicalBinder::new();
+        for (index, (parsed, file)) in sources.into_iter().zip(CLASS_CONDITIONAL_FILES).enumerate()
+        {
+            assert!(parsed.diagnostics.is_empty());
+            let library = index == 0;
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/class-conditional-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        library,
+                        library,
+                        if library {
+                            CanonicalModuleState::Script
+                        } else {
+                            CanonicalModuleState::External
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+        for (parsed, file) in sources.into_iter().zip(CLASS_CONDITIONAL_FILES) {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let specifier = sources[1]
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::ImportDeclaration(import) => Some(NodeRef::new(
+                    sources[1].arena.id(),
+                    CLASS_CONDITIONAL_FILES[1],
+                    import.module_specifier,
+                )),
+                _ => None,
+            })
+            .unwrap();
+        let input = || {
+            CanonicalModuleResolutionManifestInput::new([CanonicalModuleResolutionEntry::resolved(
+                specifier,
+                CanonicalResolvedModuleInput::new(
+                    CLASS_CONDITIONAL_FILES[2],
+                    CanonicalModuleResolutionMode::Esm,
+                    CanonicalModuleResolutionMode::Esm,
+                ),
+            )])
+        };
+        let context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            sources
+                .into_iter()
+                .zip(CLASS_CONDITIONAL_FILES)
+                .map(|(parsed, file)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+            input(),
+        )
+        .unwrap();
+        let bounds = CLASS_CONDITIONAL_FILES.map(|file| context.file(file).unwrap().1.clone());
+        let manifest = validate_module_resolution_manifest(
+            input(),
+            context.store().symbol_store(),
+            sources
+                .into_iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (bound.file_id(), &parsed.arena, bound)),
+        )
+        .unwrap();
+        (context, bounds, manifest)
+    }
+
+    fn class_conditional_import_annotation(
+        source: &ParseResult,
+        bound: &BoundFile,
+    ) -> (NodeRef, SemanticSymbolId) {
+        let (parameter, annotation) = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::ParameterDeclaration(parameter) => {
+                    Some((record, parameter.type_.unwrap()))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let constructor = source.arena.get(parameter.parent.unwrap()).unwrap();
+        assert_eq!(constructor.kind, SyntaxKind::Constructor);
+        let declaration = NodeRef::new(
+            source.arena.id(),
+            bound.file_id(),
+            constructor.parent.unwrap(),
+        );
+        assert_eq!(
+            source.arena.get(declaration.node).unwrap().kind,
+            SyntaxKind::ClassDeclaration
+        );
+        (
+            NodeRef::new(source.arena.id(), bound.file_id(), annotation),
+            bound.symbol(declaration).unwrap(),
+        )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Recheck cold and warm source, manifest, and class ownership before publication.
+    fn imported_class_conditionals_reject_wrong_manifest_owner_and_cold_child_caches() {
+        use super::super::module_resolution::{
+            CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+            CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
+            validate_module_resolution_manifest,
+        };
+        let library = parse_source_file(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let source = parse_source_file(CLASS_CONDITIONAL_SOURCE);
+        let provider = parse_source_file(CLASS_CONDITIONAL_PROVIDER);
+        let sources = [&library, &source, &provider];
+        let (mut context, bounds, manifest) = class_conditional_import_context(sources);
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources
+                .into_iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (&parsed.arena, bound)),
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap()
+        .with_module_resolutions(&manifest);
+        let (annotation, owner) = class_conditional_import_annotation(&source, &bounds[1]);
+        let other = source
+            .arena
+            .iter()
+            .find_map(|(id, record)| match &record.data {
+                NodeData::ClassDeclaration(class)
+                    if class.name.is_some_and(|name| {
+                        identifier_text(&source.arena, name) == Some("Other")
+                    }) =>
+                {
+                    bounds[1].symbol(NodeRef::new(
+                        source.arena.id(),
+                        CLASS_CONDITIONAL_FILES[1],
+                        id,
+                    ))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let import = source_imports::plan_source_class_annotation_type_import(
+            context.store(),
+            &host,
+            annotation,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(import.owner(), owner);
+        assert_eq!(import.root(), annotation);
+        assert_eq!(import.reference(), annotation);
+        assert_eq!(import.validate_current(context.store()), Ok(false));
+        let specifier = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::ImportDeclaration(import) => Some(NodeRef::new(
+                    source.arena.id(),
+                    CLASS_CONDITIONAL_FILES[1],
+                    import.module_specifier,
+                )),
+                _ => None,
+            })
+            .unwrap();
+        let wrong_manifest = validate_module_resolution_manifest(
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    specifier,
+                    CanonicalResolvedModuleInput::new(
+                        CLASS_CONDITIONAL_FILES[1],
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::Esm,
+                    ),
+                ),
+            ]),
+            context.store().symbol_store(),
+            sources
+                .into_iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (bound.file_id(), &parsed.arena, bound)),
+        )
+        .unwrap();
+        let missing_host = DeclaredTypeHost::new_after_global_merge(
+            sources
+                .into_iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (&parsed.arena, bound)),
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let wrong_host = DeclaredTypeHost::new_after_global_merge(
+            sources
+                .into_iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (&parsed.arena, bound)),
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap()
+        .with_module_resolutions(&wrong_manifest);
+        let proof = preflight_source_class_annotation(
+            context.store(),
+            &host,
+            &globals,
+            options.into(),
+            annotation,
+            owner,
+        )
+        .unwrap();
+        assert_eq!(
+            proof.cached_type(context.store(), &host, Some(&globals)),
+            Ok(None)
+        );
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut result = None;
+        for warm in [false, true] {
+            let before = format!("{:?}", context.store());
+            for invalid_host in [&missing_host, &wrong_host] {
+                let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    invalid_host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                )
+                .unwrap();
+                assert!(
+                    query
+                        .get_type_from_source_class_annotation(annotation, owner)
+                        .is_err()
+                );
+                assert!(query.get_type_from_type_node(annotation).is_err());
+                assert_eq!(format!("{:?}", query.store), before);
+            }
+            assert_eq!(
+                preflight_source_class_annotation(
+                    context.store(),
+                    &host,
+                    &globals,
+                    options.into(),
+                    annotation,
+                    other
+                )
+                .err(),
+                Some(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(annotation)
+                ))
+            );
+            assert_eq!(format!("{:?}", context.store()), before);
+            if !warm {
+                let literal = provider
+                    .arena
+                    .iter()
+                    .find_map(|(id, record)| {
+                        (record.kind == SyntaxKind::LiteralType).then_some(NodeRef::new(
+                            provider.arena.id(),
+                            CLASS_CONDITIONAL_FILES[2],
+                            id,
+                        ))
+                    })
+                    .unwrap();
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    literal,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        outer_type_parameters: None
+                    }
+                ));
+                let damaged = format!("{:?}", context.store());
+                for _ in 0..2 {
+                    assert!(
+                        preflight_source_class_annotation(
+                            context.store(),
+                            &host,
+                            &globals,
+                            options.into(),
+                            annotation,
+                            owner
+                        )
+                        .is_err()
+                    );
+                    assert_eq!(format!("{:?}", context.store()), damaged);
+                    assert!(
+                        context
+                            .store()
+                            .alias_symbol_links(import.alias_symbol())
+                            .is_none()
+                    );
+                    assert!(context.store().type_node_links(annotation).is_none());
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(literal, TypeNodeLinks::default())
+                );
+            }
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap();
+            let actual = query
+                .get_type_from_source_class_annotation(annotation, owner)
+                .unwrap();
+            if let Some(expected) = result {
+                assert_eq!(actual, expected);
+            }
+            result = Some(actual);
+            assert_eq!(query.get_type_from_type_node(annotation), Ok(actual));
+            assert_eq!(
+                proof.cached_type(query.store, &host, Some(&globals)),
+                Ok(Some(actual))
+            );
+            assert!(
+                proof
+                    .cached_type(query.store, &wrong_host, Some(&globals))
+                    .is_err()
+            );
+            assert_eq!(import.validate_current(query.store), Ok(true));
+        }
+        let other_annotation = source
+            .arena
+            .iter()
+            .filter_map(|(_, record)| match &record.data {
+                NodeData::ParameterDeclaration(parameter) => parameter
+                    .type_
+                    .map(|node| NodeRef::new(source.arena.id(), CLASS_CONDITIONAL_FILES[1], node)),
+                _ => None,
+            })
+            .find(|node| *node != annotation)
+            .unwrap();
+        let other_import = source_imports::plan_source_class_annotation_type_import(
+            context.store(),
+            &host,
+            other_annotation,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(other_import.owner(), other);
+        let binding = property_type_import_named_node(
+            &source,
+            CLASS_CONDITIONAL_FILES[1],
+            SyntaxKind::ImportSpecifier,
+            "Status",
+        );
+        let wrong_root = CanonicalTypeReferenceAliasTarget::new(
+            other_annotation,
+            annotation,
+            binding,
+            import.alias_symbol(),
+            import.target_symbol(),
+            import.target_symbol(),
+        );
+        let before = format!("{:?}", context.store());
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .with_type_reference_alias_targets([wrong_root])
+        .unwrap();
+        assert_eq!(
+            query.get_type_from_type_node(annotation),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::ImportAliasCapabilityUnsupported(annotation)
+            ))
+        );
+        assert_eq!(format!("{:?}", query.store), before);
+        drop(query);
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            query.get_type_from_source_class_annotation(annotation, owner),
+            Ok(result.unwrap())
+        );
+        assert_eq!(format!("{:?}", query.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Restore each exact conditional request and result in the same class query.
+    fn imported_class_conditionals_reject_and_restore_warm_alias_root_and_request_caches() {
+        let library = parse_source_file(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let source = parse_source_file(CLASS_CONDITIONAL_SOURCE);
+        let provider = parse_source_file(CLASS_CONDITIONAL_PROVIDER);
+        let sources = [&library, &source, &provider];
+        let (mut context, bounds, manifest) = class_conditional_import_context(sources);
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources
+                .into_iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (&parsed.arena, bound)),
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap()
+        .with_module_resolutions(&manifest);
+        let (annotation, owner) = class_conditional_import_annotation(&source, &bounds[1]);
+        let import = source_imports::plan_source_class_annotation_type_import(
+            context.store(),
+            &host,
+            annotation,
+        )
+        .unwrap()
+        .unwrap();
+        let named_alias = |parsed: &ParseResult, bound: &BoundFile, name| {
+            let declaration = property_type_import_named_node(
+                parsed,
+                bound.file_id(),
+                SyntaxKind::TypeAliasDeclaration,
+                name,
+            );
+            let NodeData::TypeAliasDeclaration(alias) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            (
+                bound.symbol(declaration).unwrap(),
+                NodeRef::new(parsed.arena.id(), bound.file_id(), alias.type_),
+            )
+        };
+        let (exclude, conditional_node) = named_alias(&library, &bounds[0], "Exclude");
+        let (_, request) = named_alias(&provider, &bounds[2], "Status");
+        let (other, _) = named_alias(&provider, &bounds[2], "Other");
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let result = query
+            .get_type_from_source_class_annotation(annotation, owner)
+            .unwrap();
+        assert_eq!(
+            union_alias_symbol(query.store, result),
+            Some(import.target_symbol())
+        );
+        let leaves = union_types(query.store, result);
+        assert_eq!(leaves.len(), 2);
+        for value in [500.0, -1.0] {
+            assert!(
+                leaves.contains(
+                    &query
+                        .store
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .cached_number_literal_type(Number::new(value))
+                        .unwrap()
+                )
+            );
+        }
+        let original_alias = query
+            .store
+            .alias_symbol_links(import.alias_symbol())
+            .cloned()
+            .unwrap();
+        let original_node = query.store.type_node_links(annotation).cloned().unwrap();
+        let original_request = query.store.type_node_links(request).cloned().unwrap();
+        let original_generic = query.store.type_alias_links(exclude).cloned().unwrap();
+        let NodeData::TypeReferenceNode(written) = &provider.arena.get(request.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let arguments = written
+            .type_arguments
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|node| {
+                query
+                    .store
+                    .type_node_links(NodeRef::new(request.arena, request.file, *node))
+                    .unwrap()
+                    .resolved_type
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(arguments.len(), 2);
+        let global = query
+            .store
+            .symbol_store()
+            .assigned_global_symbol_id(import.target_symbol())
+            .unwrap();
+        let key = type_alias_instantiation_cache_key(&arguments, Some((global, &[])));
+        assert_eq!(
+            original_generic.instantiations.as_ref().unwrap().get(&key),
+            Some(&result)
+        );
+        let conditional = query
+            .store
+            .type_node_links(conditional_node)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let TypeData::Conditional(data) = query.store.type_payload(conditional).unwrap().data()
+        else {
+            panic!("the real Exclude owns the conditional root");
+        };
+        let root = data.root;
+        let original_root_alias = query.store.conditional_root(root).unwrap().alias();
+        let original_root_cache = query
+            .store
+            .conditional_root(root)
+            .unwrap()
+            .instantiations()
+            .clone();
+        let TypeCacheState::Allocated(cache) = &original_root_cache else {
+            unreachable!()
+        };
+        assert_eq!(cache.get(&key), Some(&result));
+        let number = query.store.intrinsic_bootstrap().unwrap().number_type;
+        for damage in 0..6 {
+            match damage {
+                0 => assert!(query.store.set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..original_node.clone()
+                    }
+                )),
+                1 => assert!(query.store.set_type_node_links(
+                    request,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..original_request.clone()
+                    }
+                )),
+                2 => assert!(query.store.set_conditional_root_alias(root, None)),
+                3 => {
+                    let TypeCacheState::Allocated(mut cache) = original_root_cache.clone() else {
+                        panic!("the conditional retains the real request");
+                    };
+                    let value = cache.get_mut(&key).unwrap();
+                    *value = number;
+                    assert!(query.store.set_conditional_root_instantiations(
+                        root,
+                        TypeCacheState::Allocated(cache)
+                    ));
+                }
+                4 => {
+                    let mut links = original_generic.clone();
+                    let cache = links.instantiations.as_mut().unwrap();
+                    assert_eq!(cache.remove(&key), Some(result));
+                    assert!(query.store.set_type_alias_links(exclude, links));
+                }
+                5 => {
+                    let mut links = original_alias.clone();
+                    links.alias_target = super::super::AliasTargetState::Resolved(other);
+                    links.immediate_target = Some(other);
+                    assert!(
+                        query
+                            .store
+                            .set_alias_symbol_links(import.alias_symbol(), links)
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let damaged = format!("{:?}", query.store);
+            let counts = (
+                query
+                    .instantiation_session
+                    .as_deref()
+                    .unwrap()
+                    .query_count(),
+                query
+                    .instantiation_session
+                    .as_deref()
+                    .unwrap()
+                    .total_count(),
+            );
+            for _ in 0..2 {
+                assert!(
+                    query
+                        .get_type_from_source_class_annotation(annotation, owner)
+                        .is_err(),
+                    "damage {damage}"
+                );
+                assert!(
+                    query.get_type_from_type_node(annotation).is_err(),
+                    "damage {damage}"
+                );
+                assert_eq!(format!("{:?}", query.store), damaged, "damage {damage}");
+                assert_eq!(
+                    (
+                        query
+                            .instantiation_session
+                            .as_deref()
+                            .unwrap()
+                            .query_count(),
+                        query
+                            .instantiation_session
+                            .as_deref()
+                            .unwrap()
+                            .total_count()
+                    ),
+                    counts
+                );
+            }
+            assert!(
+                query
+                    .store
+                    .set_type_node_links(annotation, original_node.clone())
+            );
+            assert!(
+                query
+                    .store
+                    .set_type_node_links(request, original_request.clone())
+            );
+            assert!(
+                query
+                    .store
+                    .set_type_alias_links(exclude, original_generic.clone())
+            );
+            assert!(
+                query
+                    .store
+                    .set_conditional_root_alias(root, original_root_alias)
+            );
+            assert!(
+                query
+                    .store
+                    .set_conditional_root_instantiations(root, original_root_cache.clone())
+            );
+            assert!(
+                query
+                    .store
+                    .set_alias_symbol_links(import.alias_symbol(), original_alias.clone())
+            );
+            assert_eq!(
+                query.get_type_from_source_class_annotation(annotation, owner),
+                Ok(result)
+            );
+            let warm = format!("{:?}", query.store);
+            assert_eq!(query.get_type_from_type_node(annotation), Ok(result));
+            assert_eq!(format!("{:?}", query.store), warm);
+        }
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The real Array parameter spends the caller before the class conditional query.
+    fn imported_class_conditionals_keep_the_spent_caller_for_cold_and_warm_queries() {
+        let library = parse_source_file(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let source = parse_source_file(CLASS_CONDITIONAL_SOURCE);
+        let provider = parse_source_file(CLASS_CONDITIONAL_PROVIDER);
+        let sources = [&library, &source, &provider];
+        for limit in [1, 100_000] {
+            let (mut context, bounds, manifest) = class_conditional_import_context(sources);
+            let options = context.options();
+            let globals = context.global_types().clone();
+            let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+            let host = DeclaredTypeHost::new_after_global_merge(
+                sources
+                    .into_iter()
+                    .zip(&bounds)
+                    .map(|(parsed, bound)| (&parsed.arena, bound)),
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap()
+            .with_module_resolutions(&manifest);
+            let (annotation, owner) = class_conditional_import_annotation(&source, &bounds[1]);
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let TypeData::Interface(array) = context
+                .store()
+                .type_payload(globals.array_type)
+                .unwrap()
+                .data()
+            else {
+                panic!("use the real ES5 Array target");
+            };
+            let [parameter] = array.reference.resolved_type_arguments.as_deref().unwrap() else {
+                unreachable!()
+            };
+            let parameter = *parameter;
+            assert!(cached_ordinary_type_parameter_owner(context.store(), parameter).is_some());
+            let mut session = InstantiationSession::new(InstantiationLimits {
+                max_depth: 100,
+                max_count: limit,
+            });
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    context.store_mut_for_test(),
+                    parameter,
+                    &[parameter],
+                    &[number],
+                    targets,
+                    &mut session
+                ),
+                Ok(number)
+            );
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (1, 1, 0)
+            );
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap();
+            let result = query.get_type_from_source_class_annotation(annotation, owner);
+            let caller = query.instantiation_session.as_deref().unwrap();
+            if limit == 1 {
+                assert!(result.is_err());
+                assert_eq!(caller.query_count(), 1);
+                assert_eq!(caller.total_count(), 1);
+                assert!(caller.limit_event_count() > 0);
+                assert!(
+                    query
+                        .store
+                        .type_node_links(annotation)
+                        .and_then(|links| links.resolved_type)
+                        .is_none()
+                );
+                let events = caller.limit_event_count();
+                assert!(
+                    query
+                        .get_type_from_source_class_annotation(annotation, owner)
+                        .is_err()
+                );
+                let caller = query.instantiation_session.as_deref().unwrap();
+                assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+                assert!(caller.limit_event_count() > events);
+                assert!(
+                    query
+                        .store
+                        .type_node_links(annotation)
+                        .and_then(|links| links.resolved_type)
+                        .is_none()
+                );
+                drop(query);
+                let mut healthy = InstantiationSession::new(InstantiationLimits::default());
+                let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut healthy,
+                    &mut diagnostics,
+                )
+                .unwrap();
+                let result = query
+                    .get_type_from_source_class_annotation(annotation, owner)
+                    .unwrap();
+                assert_eq!(union_types(query.store, result).len(), 2);
+                let warm = format!("{:?}", query.store);
+                for _ in 0..2 {
+                    assert_eq!(
+                        query.get_type_from_source_class_annotation(annotation, owner),
+                        Ok(result)
+                    );
+                    assert_eq!(query.get_type_from_type_node(annotation), Ok(result));
+                    assert_eq!(format!("{:?}", query.store), warm);
+                }
+                assert!(query.diagnostics.is_empty());
+                continue;
+            }
+            let result = result.unwrap();
+            assert!(caller.query_count() > 1);
+            assert_eq!(caller.query_count(), caller.total_count());
+            assert_eq!(caller.limit_event_count(), 0);
+            let counts = (caller.query_count(), caller.total_count());
+            let warm = format!("{:?}", query.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    query.get_type_from_source_class_annotation(annotation, owner),
+                    Ok(result)
+                );
+                assert_eq!(query.get_type_from_type_node(annotation), Ok(result));
+                assert_eq!(format!("{:?}", query.store), warm);
+                let caller = query.instantiation_session.as_deref().unwrap();
+                assert_eq!((caller.query_count(), caller.total_count()), counts);
+                assert_eq!(caller.limit_event_count(), 0);
+            }
+            assert!(query.diagnostics.is_empty());
+        }
     }
 
     const PROPERTY_IMPORT_FILES: [FileId; 3] = [
