@@ -343,7 +343,8 @@ use super::{
         plan_source_for_of_statement_syntax, plan_source_for_statement_syntax,
         plan_source_function_for_in_statement_syntax, plan_source_function_for_of_statement_syntax,
         plan_source_function_statements_syntax, plan_source_joined_function_statements_syntax,
-        plan_source_labeled_for_in_statement_syntax, plan_source_linear_function_statements_syntax,
+        plan_source_labeled_for_in_statement_syntax, plan_source_lexical_for_of_statement_syntax,
+        plan_source_linear_function_statements_syntax,
         plan_source_linear_logical_statement_syntax, plan_source_loop_function_statements_syntax,
         plan_source_switch_function_statements_syntax,
         plan_source_typeof_switch_function_statements_syntax,
@@ -2650,6 +2651,7 @@ enum PlannedStatement {
     For(Box<PlannedTopLevelFor>),
     ForIn(Box<PlannedLexicalIteration>),
     ForOf(Box<PlannedTopLevelForOf>),
+    LexicalForOf(Box<PlannedLexicalIteration>),
     UnusedIteration(Box<PlannedUnusedIteration>),
     CapturedIteration(Box<PlannedCapturedIteration>),
     CapturedBlockLoop(Box<PlannedCapturedBlockLoop>),
@@ -3556,7 +3558,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                 }
                 SyntaxKind::ForOfStatement => {
-                    if self.no_unused_locals
+                    let lexical = match self.plan_top_level_lexical_for_of(statement) {
+                        Ok(iteration) => Some(iteration),
+                        Err(SourceCheckError::Unsupported(_)) => None,
+                        Err(error) => return Err(error),
+                    };
+                    if let Some(iteration) = lexical {
+                        statements.push(PlannedStatement::LexicalForOf(Box::new(iteration)));
+                    } else if self.no_unused_locals
                         && let Some(iteration) = self.plan_top_level_unused_iteration(statement)?
                     {
                         statements.push(PlannedStatement::UnusedIteration(Box::new(iteration)));
@@ -5856,6 +5865,35 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         self.readable_variables = readable_variables;
         self.assignable_mutable_variables = assignable_mutable_variables;
         result
+    }
+
+    fn plan_top_level_lexical_for_of(
+        &mut self,
+        statement: NodeRef,
+    ) -> Result<PlannedLexicalIteration, SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Err(self.unsupported(
+                statement,
+                SyntaxKind::ForOfStatement,
+                SourceSyntaxRole::Statement,
+            ));
+        };
+        let syntax =
+            plan_source_lexical_for_of_statement_syntax(self.arena, self.bound, store, statement)
+                .map_err(|error| match error {
+                    SourceFunctionStatementsError::Unsupported(_) => self.unsupported(
+                        statement,
+                        SyntaxKind::ForOfStatement,
+                        SourceSyntaxRole::Statement,
+                    ),
+                    SourceFunctionStatementsError::Variable(error) => {
+                        Self::variable_plan_error(error)
+                    }
+                    SourceFunctionStatementsError::Invariant(_) => {
+                        SourceCheckError::Function(SourceFunctionInvariant::Callable(statement))
+                    }
+                })?;
+        self.finish_for_in_statement(syntax)
     }
 
     fn plan_top_level_for_of(
@@ -74989,7 +75027,7 @@ pub(super) fn check_source_file(
                     issue_node_diagnostic(diagnostics, statement, 1116)?;
                 }
             }
-            PlannedStatement::ForIn(iteration) => {
+            PlannedStatement::ForIn(iteration) | PlannedStatement::LexicalForOf(iteration) => {
                 check_planned_lexical_iteration(
                     store,
                     host,

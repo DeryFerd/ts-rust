@@ -1511,6 +1511,43 @@ pub(super) fn plan_source_for_of_statement_syntax(
     })
 }
 
+/// Proves a source-owned flat array binding and its direct body expressions.
+pub(super) fn plan_source_lexical_for_of_statement_syntax(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+) -> Result<SourceForInStatementSyntax, SourceFunctionStatementsError> {
+    let source = bound.source_file();
+    let header = plan_source_scoped_iteration_header_syntax(
+        arena,
+        bound,
+        store,
+        statement,
+        (source, source),
+        SourceControlLoopKind::ForOf,
+    )?;
+    if header
+        .bindings
+        .first()
+        .is_none_or(|binding| binding.declaration == header.declaration)
+    {
+        return Err(unsupported_control_statement(
+            statement,
+            SyntaxKind::ForOfStatement,
+        ));
+    }
+    plan_source_scoped_iteration_statement_syntax(
+        arena,
+        bound,
+        store,
+        statement,
+        (source, source),
+        SourceControlLoopKind::ForOf,
+        None,
+    )
+}
+
 /// Proves one top-level string key and every direct expression in its body.
 pub(super) fn plan_source_for_in_statement_syntax(
     arena: &NodeArena,
