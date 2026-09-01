@@ -3000,6 +3000,43 @@ pub(super) fn validate_generic_interface_callable(
     Some(validated.unwrap_or(StoredCallableSetValidation::Malformed { family }))
 }
 
+/// Finds an exact declared or copied call in a generic interface's complete call set.
+pub(super) fn generic_interface_call_signature_return(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    let Some(owner) = store.declared_call_set_type_for_signature(signature) else {
+        return Ok(None);
+    };
+    let Some(validation) = validate_generic_interface_callable(store, owner, array_targets) else {
+        return Ok(None);
+    };
+    let invalid = || GenericInterfaceMemberError::InvalidCachedMembers(owner);
+    let StoredCallableSetValidation::Valid { projection, .. } = validation else {
+        return Err(invalid());
+    };
+    let callable = projection
+        .call_signatures
+        .iter()
+        .find(|callable| callable.signature == signature)
+        .ok_or_else(invalid)?;
+    let record = store.signature(signature).ok_or_else(invalid)?;
+    let source = record.target().unwrap_or(signature);
+    let original = store.signature(source).ok_or_else(invalid)?;
+    let declaration = original.declaration().ok_or_else(invalid)?;
+    if store.source_node_kind(declaration) != Some(SyntaxKind::CallSignature) {
+        return Err(invalid());
+    }
+    Ok(Some(PublishedInterfaceMethodSignatureReturn {
+        owner,
+        source,
+        declaration,
+        source_return: original.resolved_return_type().ok_or_else(invalid)?,
+        return_type: callable.return_type.ok_or_else(invalid)?,
+    }))
+}
+
 /// Returns argument and member type edges without resolving cold tables or values.
 pub(super) fn validated_generic_interface_type_edges(
     store: &CanonicalTypeMapperStore,
@@ -3116,6 +3153,18 @@ fn append_validated_generic_interface_type_edges(
                         shape.reference,
                     ))?,
             );
+        }
+        for &parameter in record.type_parameters() {
+            let Some(TypeData::TypeParameter(data)) =
+                store.type_payload(parameter).map(super::TypeRecord::data)
+            else {
+                return Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                    shape.reference,
+                ));
+            };
+            edges.push(parameter);
+            edges.extend(data.constraint);
+            edges.extend(data.resolved_default_type);
         }
         edges.push(return_type);
     }
@@ -9701,6 +9750,25 @@ fn validate_nested_reference_targets(
     Ok(())
 }
 
+/// Gets the enclosing mapper without treating the call's fresh formals as owner arguments.
+fn generic_interface_call_owner_mapper(
+    store: &CanonicalTypeMapperStore,
+    original: SignatureId,
+    signature: SignatureId,
+) -> Option<TypeMapperId> {
+    let source = store.signature(original)?;
+    let mapper = store.signature(signature)?.mapper()?;
+    let Some(&parameter) = source.type_parameters().first() else {
+        return Some(mapper);
+    };
+    let TypeMapperApplication::Composite { second, .. } =
+        store.mapper_application(mapper, parameter)?
+    else {
+        return None;
+    };
+    Some(second)
+}
+
 /// Proves copied call signatures with the same mapper and parameter checks as
 /// generic methods. The target keeps its original signature and binder symbols.
 fn generic_interface_call_projections(
@@ -9750,12 +9818,20 @@ fn generic_interface_call_projections(
             continue;
         }
         let mapper = actual.mapper().ok_or_else(invalid)?;
+        let owner_mapper =
+            generic_interface_call_owner_mapper(store, original, signature).ok_or_else(invalid)?;
         let return_type = actual.resolved_return_type().ok_or_else(invalid)?;
         if signature == original
-            || store.type_mapper_has_exact_endpoints(mapper, &sources, &targets) != Some(true)
+            || store.type_mapper_has_exact_endpoints(owner_mapper, &sources, &targets) != Some(true)
+            || validated_instantiated_method_mapper(
+                store,
+                source,
+                actual,
+                owner_mapper,
+                array_targets,
+            ) != Some(mapper)
             || actual.flags() != (source.flags() & SignatureFlags::PROPAGATING_FLAGS)
             || actual.declaration() != source.declaration()
-            || !actual.type_parameters().is_empty()
             || actual.this_parameter().is_some()
             || actual.min_argument_count() != source.min_argument_count()
             || actual.resolved_min_argument_count() != -1
@@ -9781,7 +9857,7 @@ fn generic_interface_call_projections(
             store,
             signature,
             &template,
-            mapper,
+            owner_mapper,
             array_targets,
         )
         .ok_or_else(invalid)?;
@@ -9941,8 +10017,10 @@ fn validate_warm_members(
         .or_else(|| {
             callables
                 .first()
-                .and_then(|callable| store.signature(callable.signature))
-                .and_then(super::signatures::Signature::mapper)
+                .zip(shape.call_signatures.first())
+                .and_then(|(callable, &original)| {
+                    generic_interface_call_owner_mapper(store, original, callable.signature)
+                })
         });
     if mapper.is_none()
         && shape
@@ -9953,12 +10031,13 @@ fn validate_warm_members(
             store.type_mapper_has_exact_endpoints(mapper, &all_parameters, &mapper_targets)
                 != Some(true)
         })
-        || callables.iter().any(|callable| {
-            store
-                .signature(callable.signature)
-                .and_then(super::signatures::Signature::mapper)
-                .is_some_and(|call_mapper| Some(call_mapper) != mapper)
-        })
+        || callables
+            .iter()
+            .zip(&shape.call_signatures)
+            .any(|(callable, &original)| {
+                generic_interface_call_owner_mapper(store, original, callable.signature)
+                    .is_some_and(|call_mapper| Some(call_mapper) != mapper)
+            })
     {
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(
             shape.reference,
@@ -11458,6 +11537,177 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each mutation must fail without publishing or changing a cache.
+    fn generic_interface_call_copies_reject_changed_formals_and_owner_mappers() {
+        let parsed = parse_source_file(concat!(
+            "interface Callable<A> { <B extends A = A>(value: B): B; } ",
+            "declare const text: Callable<string>; ",
+            "declare const numeric: Callable<number>;",
+        ));
+        let file = FileId::new(202_986);
+        for corruption in ["constraint", "default", "target", "mapper", "signature"] {
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let text = property_object_alias_variable_type(&parsed, file, &mut context, "text");
+            let numeric =
+                property_object_alias_variable_type(&parsed, file, &mut context, "numeric");
+            let store = context.store_mut_for_test();
+            for reference in [text, numeric] {
+                resolve_members_with_array_targets(store, reference, None).unwrap();
+            }
+            let signature = |store: &CanonicalTypeMapperStore, reference| {
+                let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+                    validate_generic_interface_callable(store, reference, None)
+                else {
+                    panic!("the interface must retain its complete copied call signature")
+                };
+                projection.call_signatures[0].signature
+            };
+            let copied = signature(store, text);
+            let other = signature(store, numeric);
+            let original = store.signature(copied).unwrap().target().unwrap();
+            let mapper = store.signature(copied).unwrap().mapper().unwrap();
+            let other_mapper = store.signature(other).unwrap().mapper().unwrap();
+            let fresh = store.signature(copied).unwrap().type_parameters()[0];
+            let source = store.signature(original).unwrap().type_parameters()[0];
+            assert_ne!(fresh, store.signature(other).unwrap().type_parameters()[0]);
+            assert_ne!(mapper, other_mapper);
+            let TypeData::TypeParameter(data) = store.type_payload(fresh).unwrap().data() else {
+                panic!("the copied call must keep its own fresh parameter")
+            };
+            let data = data.clone();
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            match corruption {
+                "signature" => assert!(store.set_signature_type_parameters(copied, vec![source])),
+                "mapper" => assert!(store.set_signature_target_and_mapper(
+                    copied,
+                    Some(original),
+                    Some(other_mapper),
+                )),
+                _ => assert!(store.set_type_parameter_resolution(
+                    fresh,
+                    if corruption == "constraint" {
+                        Some(number)
+                    } else {
+                        data.constraint
+                    },
+                    if corruption == "target" {
+                        Some(fresh)
+                    } else {
+                        data.target
+                    },
+                    data.mapper,
+                    if corruption == "default" {
+                        Some(number)
+                    } else {
+                        data.resolved_default_type
+                    },
+                )),
+            }
+            let counts = |store: &CanonicalTypeMapperStore| {
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.checker_link_allocated_lengths(),
+                )
+            };
+            let warm = counts(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_generic_interface_callable(store, text, None),
+                    Some(StoredCallableSetValidation::Malformed {
+                        family: CallableFamily::DeclaredCallSignatures,
+                    }),
+                    "{corruption}",
+                );
+                assert_eq!(
+                    generic_interface_call_signature_return(store, copied, None),
+                    Err(GenericInterfaceMemberError::InvalidCachedMembers(text)),
+                );
+                assert_eq!(
+                    resolve_members_with_array_targets(store, text, None),
+                    Err(GenericInterfaceMemberError::InvalidCachedMembers(text)),
+                );
+                assert_eq!(counts(store), warm);
+            }
+            assert!(store.set_signature_type_parameters(copied, vec![fresh]));
+            assert!(store.set_signature_target_and_mapper(copied, Some(original), Some(mapper)));
+            assert!(store.set_type_parameter_resolution(
+                fresh,
+                data.constraint,
+                data.target,
+                data.mapper,
+                data.resolved_default_type,
+            ));
+            assert_eq!(signature(store, text), copied);
+            assert_eq!(signature(store, numeric), other);
+            assert_eq!(counts(store), warm);
+        }
+    }
+
+    #[test]
+    fn generic_interface_call_owned_parameters_keep_caller_limits() {
+        let parsed = parse_source_file(concat!(
+            "interface Callable<A> { <B extends A = A>(value: B): B; } ",
+            "declare const callable: Callable<string>;",
+        ));
+        let file = FileId::new(202_987);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let reference =
+            property_object_alias_variable_type(&parsed, file, &mut context, "callable");
+        let store = context.store_mut_for_test();
+        let error_type = store.intrinsic_bootstrap().unwrap().error_type;
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            error_type,
+        )
+        .unwrap();
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            resolve_members_with_array_targets_and_session(store, reference, None, &mut session),
+            Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                reference
+            )),
+        );
+        assert!(session.limit_event_occurred_since(mark));
+        assert!(!store.type_has_declared_call_set_provenance(reference));
+        assert_eq!(
+            store.type_payload(reference).unwrap().data().structured(),
+            Some(&StructuredTypeData::default()),
+        );
+        assert_eq!(
+            validate_generic_interface_callable(store, reference, None),
+            Some(StoredCallableSetValidation::Pending {
+                family: CallableFamily::DeclaredCallSignatures,
+            }),
+        );
+        resolve_members_with_array_targets(store, reference, None).unwrap();
+        let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+            validate_generic_interface_callable(store, reference, None)
+        else {
+            panic!("a fresh session must resolve the unchanged source signature")
+        };
+        let copied = store
+            .signature(projection.call_signatures[0].signature)
+            .unwrap();
+        assert_eq!(
+            projection.call_signatures[0].parameters,
+            copied.type_parameters()
+        );
+        assert_eq!(
+            copied.resolved_return_type(),
+            Some(copied.type_parameters()[0])
+        );
     }
 
     #[test]

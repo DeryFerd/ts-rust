@@ -4687,10 +4687,12 @@ pub(super) fn generic_declared_call_signature_edges(
         .map(|signature| {
             let record = store.signature(*signature)?;
             let declaration = record.declaration()?;
-            (record.type_parameters().is_empty()
-                && !record.has_rest_parameter()
+            (!record.has_rest_parameter()
                 && record.resolved_type_predicate().is_none()
-                && store.source_declaration_belongs_to_symbol(declaration, symbol))
+                && store.source_declaration_belongs_to_symbol(declaration, symbol)
+                && (record.type_parameters().is_empty()
+                    || declared_interface_call_type_parameter_view(store, record, declaration)
+                        .is_some()))
             .then_some(declaration)
         })
         .collect::<Option<Vec<_>>>()?;
@@ -10945,7 +10947,8 @@ pub(super) fn plan_generic_interface(
 }
 
 /// The enclosing interface supplies one mapper for its ordered call signatures.
-/// Call-owned generics, constructors, and inherited calls remain unsupported.
+/// The signature copier gives each call's own formals a separate mapper.
+/// Constructors and inherited calls remain unsupported.
 fn supported_generic_interface_calls(plan: &PropertyObjectPlan) -> bool {
     plan.kind == PropertyObjectKind::Interface
         && plan.declarations.len() == 1
@@ -10955,8 +10958,7 @@ fn supported_generic_interface_calls(plan: &PropertyObjectPlan) -> bool {
         && plan.indexes.is_empty()
         && !plan.call_signatures.is_empty()
         && plan.call_signatures.iter().all(|call| {
-            call.type_parameters.is_empty()
-                && call.type_predicate.is_none()
+            call.type_predicate.is_none()
                 && !call.implicit_any_return
                 && !call.is_construct()
                 && !call.flags.contains(SignatureFlags::HAS_REST_PARAMETER)
@@ -22036,6 +22038,22 @@ pub(super) fn declared_method_type_parameter_view(
     declaration: NodeRef,
 ) -> Option<Vec<DeclaredMethodTypeParameterView>> {
     if store.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature) {
+        return None;
+    }
+    declared_method_type_parameter_view_worker(store, signature, declaration)
+}
+
+/// Reads a call's own formals without confusing them with its interface's formals.
+pub(super) fn declared_interface_call_type_parameter_view(
+    store: &CanonicalTypeMapperStore,
+    signature: &super::signatures::Signature,
+    declaration: NodeRef,
+) -> Option<Vec<DeclaredMethodTypeParameterView>> {
+    if store.source_interface_call_owner(declaration).is_none()
+        || signature.declaration() != Some(declaration)
+        || signature.target().is_some()
+        || signature.mapper().is_some()
+    {
         return None;
     }
     declared_method_type_parameter_view_worker(store, signature, declaration)
