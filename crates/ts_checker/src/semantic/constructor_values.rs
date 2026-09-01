@@ -1,10 +1,11 @@
-//! Source-owned identities for nongeneric declared constructor values.
+//! Source-owned identities for declared constructor values.
 //!
 //! A value, its constructor object, and each construct signature's return have
 //! separate identities. Consumers own overload selection and heritage checks.
 //! The named-interface path prepares one signature and keeps other members lazy.
 //! Its generic annotations require complete explicit arguments and a stored proof.
 //! The global `TypeLiteral` path uses the full canonical annotation query.
+//! Generic global constructors keep the full named interface publication.
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
@@ -19,7 +20,9 @@ use super::{
     array_types::CanonicalArrayTargets,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
     declared::preflight_class_or_interface_reference,
-    declared_values::{plan_global_type_literal_value, publish_declared_value},
+    declared_values::{
+        plan_global_named_constructor_value, plan_global_type_literal_value, publish_declared_value,
+    },
     instantiate::InstantiationSession,
     object_members::{
         self, PlannedCallSignature, PropertyObjectError, PropertyObjectPlan, PropertyObjectState,
@@ -148,9 +151,14 @@ pub(super) struct GlobalConstructorValuePlan {
     construct_indexes: Box<[usize]>,
     options: CanonicalCheckerOptions,
     array_targets: CanonicalArrayTargets,
+    named_interface: bool,
 }
 
 impl GlobalConstructorValuePlan {
+    pub(super) const fn is_named_generic(&self) -> bool {
+        self.named_interface
+    }
+
     pub(super) const fn value_symbol(&self) -> SemanticSymbolId {
         self.value_symbol
     }
@@ -252,9 +260,68 @@ pub(super) fn plan_global_constructor_value(
         construct_indexes: construct_indexes.into_boxed_slice(),
         options,
         array_targets: CanonicalArrayTargets::from_global_types(globals),
+        named_interface: false,
     };
     validate_global_annotation_caches(store, host, &plan)?;
     let ready = read_global_constructor_literal(store, &plan)?;
+    if value.cached_type.is_some_and(|cached| {
+        ready
+            .as_ref()
+            .is_none_or(|ready| ready.value.constructor_type != cached)
+    }) {
+        return Err(invalid());
+    }
+    Ok(Some(plan))
+}
+
+/// Keeps the global value owner separate from its named constructor interface.
+pub(super) fn plan_global_generic_constructor_value(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    value_symbol: SemanticSymbolId,
+) -> Result<Option<GlobalConstructorValuePlan>, DeclaredConstructorValueError> {
+    let Some(value) = plan_global_named_constructor_value(store, host, value_symbol)? else {
+        return Ok(None);
+    };
+    let declared = plan_declared_constructor_value_worker(store, host, value_symbol, true)?;
+    if !declared
+        .owner
+        .call_signatures
+        .iter()
+        .any(|signature| signature.is_construct() && !signature.type_parameters.is_empty())
+    {
+        return Ok(None);
+    }
+    let invalid = || DeclaredConstructorValueError::InvalidValue(value_symbol);
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    if value.annotation != declared.value_annotation
+        || options.intrinsic != bootstrap.options
+        || store.claimed_strict_builtin_iterator_return()
+            != Some(options.strict_builtin_iterator_return)
+        || store
+            .claimed_strict_function_types()
+            .is_some_and(|claimed| claimed != options.strict_function_types)
+        || store
+            .value_symbol_links(bootstrap.global_this_symbol)
+            .and_then(|links| links.resolved_type)
+            != Some(globals.global_this_value_type)
+    {
+        return Err(invalid());
+    }
+    let plan = GlobalConstructorValuePlan {
+        value_symbol,
+        value_declaration: declared.value_declaration,
+        value_annotation: declared.value_annotation,
+        owner: declared.owner,
+        construct_indexes: declared.construct_indexes,
+        options,
+        array_targets: CanonicalArrayTargets::from_global_types(globals),
+        named_interface: true,
+    };
+    validate_global_annotation_caches(store, host, &plan)?;
+    let ready = read_global_named_constructor(store, &plan)?;
     if value.cached_type.is_some_and(|cached| {
         ready
             .as_ref()
@@ -272,9 +339,12 @@ fn validate_global_plan(
     options: CanonicalCheckerOptions,
     plan: &GlobalConstructorValuePlan,
 ) -> Result<(), DeclaredConstructorValueError> {
-    if plan_global_constructor_value(store, host, globals, options, plan.value_symbol())?.as_ref()
-        != Some(plan)
-    {
+    let current = if plan.named_interface {
+        plan_global_generic_constructor_value(store, host, globals, options, plan.value_symbol())?
+    } else {
+        plan_global_constructor_value(store, host, globals, options, plan.value_symbol())?
+    };
+    if current.as_ref() != Some(plan) {
         return Err(DeclaredConstructorValueError::InvalidValue(
             plan.value_symbol,
         ));
@@ -333,6 +403,9 @@ fn read_global_constructor_literal(
     store: &CanonicalTypeMapperStore,
     plan: &GlobalConstructorValuePlan,
 ) -> Result<Option<GlobalConstructorCandidates>, DeclaredConstructorValueError> {
+    if plan.named_interface {
+        return read_global_named_constructor(store, plan);
+    }
     let invalid = || DeclaredConstructorValueError::InvalidValue(plan.value_symbol);
     if store
         .symbol_node_links(plan.value_annotation)
@@ -423,6 +496,89 @@ fn read_global_constructor_literal(
     }))
 }
 
+/// A named value uses its interface's full member and signature publication.
+fn read_global_named_constructor(
+    store: &CanonicalTypeMapperStore,
+    plan: &GlobalConstructorValuePlan,
+) -> Result<Option<GlobalConstructorCandidates>, DeclaredConstructorValueError> {
+    let invalid = || DeclaredConstructorValueError::InvalidValue(plan.value_symbol);
+    let Some(constructor_type) = store
+        .declared_type_links(plan.owner_symbol())
+        .and_then(|links| links.declared_type)
+    else {
+        return Ok(None);
+    };
+    let state = interface_state(store, &plan.owner, constructor_type)?;
+    if state.is_none() {
+        return Err(invalid());
+    }
+    if !matches!(state, Some(PropertyObjectState::Resolved(actual)) if actual == constructor_type) {
+        return Ok(None);
+    }
+    let Some(annotation_type) = store
+        .type_node_links(plan.value_annotation)
+        .and_then(|links| links.resolved_type)
+    else {
+        return Ok(None);
+    };
+    if annotation_type != constructor_type
+        || store
+            .type_payload(constructor_type)
+            .and_then(super::TypeRecord::symbol)
+            != Some(plan.owner_symbol())
+        || !store.source_direct_type_annotation_is_exact(plan.value_annotation, constructor_type)
+    {
+        return Err(invalid());
+    }
+    let StoredCallableSetValidation::Valid { projection, .. } =
+        validate_stored_callable_set_with_array_targets(
+            store,
+            constructor_type,
+            Some(plan.array_targets),
+        )
+    else {
+        return Err(invalid());
+    };
+    if projection.owner != constructor_type
+        || projection.construct_signatures.len() != plan.construct_indexes.len()
+    {
+        return Err(invalid());
+    }
+    let value = DeclaredConstructorValue {
+        value_symbol: plan.value_symbol,
+        constructor_type,
+    };
+    let mut signatures = Vec::with_capacity(plan.construct_indexes.len());
+    for (&index, &signature) in plan
+        .construct_indexes
+        .iter()
+        .zip(&projection.construct_signatures)
+    {
+        let planned = &plan.owner.call_signatures[index];
+        if object_members::validate_resolved_call_signature(store, planned) != Some(signature) {
+            return Err(DeclaredConstructorValueError::InvalidSignature(
+                planned.declaration,
+            ));
+        }
+        let return_type = store
+            .signature(signature)
+            .and_then(|record| record.resolved_return_type())
+            .ok_or(DeclaredConstructorValueError::InvalidSignature(
+                planned.declaration,
+            ))?;
+        signatures.push(DeclaredConstructSignature {
+            value,
+            declaration: planned.declaration,
+            signature,
+            return_type,
+        });
+    }
+    Ok(Some(GlobalConstructorCandidates {
+        value,
+        signatures: signatures.into_boxed_slice(),
+    }))
+}
+
 /// Reads complete candidates only after the ordinary value publication is current.
 pub(super) fn resolve_global_constructor_candidates(
     store: &CanonicalTypeMapperStore,
@@ -451,7 +607,7 @@ pub(super) fn resolve_global_constructor_candidates(
     Ok(Some(ready))
 }
 
-/// Uses the full literal query and the caller's existing instantiation session.
+/// Uses the full declared query and the caller's existing instantiation session.
 #[allow(clippy::too_many_arguments)] // The provider must retain the complete caller context.
 pub(super) fn prepare_global_constructor_candidates(
     store: &mut CanonicalTypeMapperStore,
@@ -467,21 +623,28 @@ pub(super) fn prepare_global_constructor_candidates(
         return Ok(ready);
     }
     if read_global_constructor_literal(store, plan)?.is_none() {
-        CanonicalTypeQuery::new_with_global_types_and_session(
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,
             globals,
             options,
             session,
             diagnostics,
-        )?
-        .get_type_from_type_node(plan.value_annotation())?;
+        )?;
+        if plan.named_interface {
+            query.get_declared_interface_for_source_check(plan.owner_symbol())?;
+        }
+        query.get_type_from_type_node(plan.value_annotation())?;
     }
     validate_global_plan(store, host, globals, options, plan)?;
     let invalid = || DeclaredConstructorValueError::InvalidValue(plan.value_symbol);
     let ready = read_global_constructor_literal(store, plan)?.ok_or_else(invalid)?;
-    let value =
-        plan_global_type_literal_value(store, host, plan.value_symbol)?.ok_or_else(invalid)?;
+    let value = if plan.named_interface {
+        plan_global_named_constructor_value(store, host, plan.value_symbol)?
+    } else {
+        plan_global_type_literal_value(store, host, plan.value_symbol)?
+    }
+    .ok_or_else(invalid)?;
     if !store.try_reserve_value_symbol_links(1) || !store.try_reserve_declared_value_provenance(1) {
         return Err(DeclaredConstructorValueError::Capacity(
             plan.value_declaration(),
@@ -496,6 +659,15 @@ pub(super) fn plan_declared_constructor_value(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     value_symbol: SemanticSymbolId,
+) -> Result<DeclaredConstructorValuePlan, DeclaredConstructorValueError> {
+    plan_declared_constructor_value_worker(store, host, value_symbol, false)
+}
+
+fn plan_declared_constructor_value_worker(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    value_symbol: SemanticSymbolId,
+    allow_generic: bool,
 ) -> Result<DeclaredConstructorValuePlan, DeclaredConstructorValueError> {
     let invalid = || DeclaredConstructorValueError::InvalidValue(value_symbol);
     let value = store.symbol(value_symbol).ok_or_else(invalid)?;
@@ -655,7 +827,7 @@ pub(super) fn plan_declared_constructor_value(
     let mut construct_indexes = Vec::new();
     for (index, signature) in owner.call_signatures.iter().enumerate() {
         if signature.is_construct() {
-            if !signature.type_parameters.is_empty()
+            if !allow_generic && !signature.type_parameters.is_empty()
                 || signature.implicit_any_return
                 || signature.type_predicate.is_some()
                 || signature.parameters.iter().any(|parameter| parameter.implicit_any_rest)

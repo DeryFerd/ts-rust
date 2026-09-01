@@ -21,6 +21,7 @@ use super::{
         GenericCallVectorError, GenericCallVectorRequest, GenericCallVectorResolution,
         check_generic_call_candidate_with_session, finish_generic_call_candidate_with_session,
         generic_class_constructor_candidates, generic_class_constructor_type_argument_bounds,
+        generic_named_constructor_candidates,
         generic_method_signature_callee, generic_method_type_argument_bounds,
         preflight_generic_class_constructor_signature, validate_generic_call_vector_request,
         validate_generic_class_constructor_request,
@@ -50,6 +51,7 @@ pub(super) enum GenericMethodCallDiagnostic {
         expected: usize,
         actual: usize,
     },
+    ConstructorOverload(Box<GenericMethodCallDiagnostic>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,6 +96,7 @@ enum CheckedMethodCandidate {
 enum GenericCandidateFamily {
     Call(CallableFamily),
     ClassConstruct,
+    NamedConstruct,
 }
 
 impl CheckedMethodCandidate {
@@ -186,6 +189,9 @@ fn candidate_type_argument_bounds(
         GenericCandidateFamily::ClassConstruct => {
             generic_class_constructor_type_argument_bounds(store, callable, array_targets)
                 .map_err(Into::into)
+        }
+        GenericCandidateFamily::NamedConstruct => {
+            generic_method_type_argument_bounds(store, callable, array_targets).map_err(Into::into)
         }
     }
 }
@@ -417,14 +423,22 @@ pub(super) fn resolve_generic_class_constructor(
         return Ok(None);
     }
     let array_targets = Some(CanonicalArrayTargets::from_global_types(globals));
-    let Some(constructors) =
-        generic_class_constructor_candidates(store, request.callee, array_targets)?
-    else {
+    let class = generic_class_constructor_candidates(store, request.callee, array_targets)?;
+    let named = if class.is_none() {
+        generic_named_constructor_candidates(store, request.callee, array_targets)?
+    } else {
+        None
+    };
+    let (candidates, family) = if let Some(class) = &class {
+        if class.type_parameters().is_empty() {
+            return Ok(None);
+        }
+        (class.signatures(), GenericCandidateFamily::ClassConstruct)
+    } else if let Some(named) = &named {
+        (named.as_ref(), GenericCandidateFamily::NamedConstruct)
+    } else {
         return Ok(None);
     };
-    if constructors.type_parameters().is_empty() {
-        return Ok(None);
-    }
     validate_generic_class_constructor_request(store, request, array_targets)?;
     if let Some(signature) = existing_new_signature {
         preflight_generic_class_constructor_signature(
@@ -440,8 +454,8 @@ pub(super) fn resolve_generic_class_constructor(
         globals,
         strict_function_types,
         request,
-        constructors.signatures(),
-        GenericCandidateFamily::ClassConstruct,
+        candidates,
+        family,
         existing_new_signature,
         session,
     )?;
@@ -534,6 +548,15 @@ fn resolve_generic_candidates(
         argument_errors
             .pop()
             .expect("the sole argument error is present")
+    } else if !argument_errors.is_empty()
+        && matches!(family, GenericCandidateFamily::NamedConstruct)
+    {
+        // Go reports the last failed overload, but chooses recovery independently.
+        GenericMethodCallDiagnostic::ConstructorOverload(Box::new(
+            argument_errors
+                .pop()
+                .expect("the last overload error is present"),
+        ))
     } else if !argument_errors.is_empty() {
         // TS2769 chains and overload implementation notes remain a separate boundary.
         return Err(GenericMethodCallError::Unsupported(request.callee));

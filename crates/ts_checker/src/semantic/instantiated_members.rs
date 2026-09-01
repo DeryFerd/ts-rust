@@ -8639,6 +8639,19 @@ fn declared_target_header(
         | ObjectFlags::MEMBERS_RESOLVED
         | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
         | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED;
+    let mixed_owner = if owner_record
+        .flags()
+        .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+        != SymbolFlags::NONE
+        || owner_record.value_declaration().is_some()
+    {
+        store
+            .source_global_interface_value_owner(owner)
+            .map_err(|_| GenericInterfaceMemberError::InvalidTarget(target))?
+            .filter(|mixed| mixed.symbol() == owner)
+    } else {
+        None
+    };
     if record.flags() != TypeFlags::OBJECT
         || record.object_flags().contains(ObjectFlags::CLASS)
         || record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK
@@ -8646,12 +8659,13 @@ fn declared_target_header(
         || !(record.object_flags() & !allowed_target_flags).is_empty()
         || record.alias().is_some()
         || !owner_record.flags().contains(SymbolFlags::INTERFACE)
-        || owner_record
+        || (owner_record
             .flags()
             .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
             != SymbolFlags::NONE
+            && mixed_owner.is_none())
         || owner_record.check_flags() != CheckFlags::NONE
-        || owner_record.value_declaration().is_some()
+        || owner_record.value_declaration().is_some() && mixed_owner.is_none()
         || owner_record.exports().is_some()
         || owner_record.export_symbol().is_some()
         || store.get_merged_symbol(owner) != Some(owner)
@@ -8720,7 +8734,15 @@ fn declared_target_header(
     else {
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     };
-    if owner_declarations
+    let interface_declarations = if let Some(mixed) = &mixed_owner {
+        if mixed.declarations() != owner_declarations {
+            return Err(GenericInterfaceMemberError::InvalidTarget(target));
+        }
+        mixed.interfaces()
+    } else {
+        owner_declarations
+    };
+    if interface_declarations
         .iter()
         .any(|declaration| !valid_generic_interface_declaration_owner(store, owner, *declaration))
     {

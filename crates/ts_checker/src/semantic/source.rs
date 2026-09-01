@@ -3015,6 +3015,18 @@ enum PlannedVariableStatement {
     Object(Box<PlannedObjectVariable>),
 }
 
+#[derive(Clone, Copy)]
+struct PlannedArrowConstructorReturn {
+    variable_declaration: NodeRef,
+    variable_name: NodeRef,
+    variable_symbol: SemanticSymbolId,
+    arrow: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    block: NodeRef,
+    statement: NodeRef,
+    expression: NodeRef,
+}
+
 #[allow(clippy::struct_excessive_bools)] // Checker options and source-state flags are independent.
 struct SourcePlanner<'arena, 'semantic, 'sources> {
     arena: &'arena NodeArena,
@@ -3072,6 +3084,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     nullish_member_writes: HashSet<(NodeRef, SemanticSymbolId)>,
     /// Exact roots minted only by assignment and direct-call syntax owners.
     primitive_binary_position_roots: HashSet<NodeRef>,
+    arrow_constructor_return: Option<PlannedArrowConstructorReturn>,
 }
 
 impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
@@ -3128,6 +3141,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             assigned_variables: HashSet::new(),
             nullish_member_writes: HashSet::new(),
             primitive_binary_position_roots: HashSet::new(),
+            arrow_constructor_return: None,
         }
     }
 
@@ -3189,6 +3203,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             assigned_variables: HashSet::new(),
             nullish_member_writes: HashSet::new(),
             primitive_binary_position_roots: HashSet::new(),
+            arrow_constructor_return: None,
         }
     }
 
@@ -9423,11 +9438,154 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
+    fn is_direct_planned_arrow_constructor_return(
+        &self,
+        expression: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let Some(proof) = self.arrow_constructor_return else {
+            return Ok(false);
+        };
+        let Some((store, _)) = self.semantic else {
+            return Ok(false);
+        };
+        if self.bound.node_arena_id() != self.arena.id()
+            || self.bound.node_arena_revision() != self.arena.revision()
+            || [
+                expression,
+                proof.variable_declaration,
+                proof.variable_name,
+                proof.arrow,
+                proof.block,
+                proof.statement,
+                proof.expression,
+            ]
+            .into_iter()
+            .any(|node| {
+                !node.is_for(self.arena.id(), self.bound.file_id()) || !self.bound.contains(node)
+            })
+            || [expression, proof.block, proof.statement, proof.expression]
+                .into_iter()
+                .any(|node| {
+                    self.bound.container(node) != Some(proof.arrow)
+                        || self.bound.block_scope_container(node) != Some(proof.arrow)
+                        || self
+                            .bound
+                            .flow_container(node)
+                            .is_some_and(|container| container != proof.arrow)
+                })
+            || self
+                .bound
+                .symbol(proof.variable_declaration)
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(proof.variable_symbol)
+            || self.bound.symbol(proof.arrow) != Some(proof.owner_symbol)
+            || proof.owner_symbol == proof.variable_symbol
+        {
+            return Ok(false);
+        }
+        let variable_record = self.node(proof.variable_declaration)?;
+        let NodeData::VariableDeclaration(variable) = &variable_record.data else {
+            return Ok(false);
+        };
+        let arrow_record = self.node(proof.arrow)?;
+        let NodeData::ArrowFunction(arrow) = &arrow_record.data else {
+            return Ok(false);
+        };
+        let block_record = self.node(proof.block)?;
+        let NodeData::Block(block) = &block_record.data else {
+            return Ok(false);
+        };
+        let statement_record = self.node(proof.statement)?;
+        let NodeData::ReturnStatement(statement) = &statement_record.data else {
+            return Ok(false);
+        };
+        if variable_record.kind != SyntaxKind::VariableDeclaration
+            || variable_record.flags.0 != 0
+            || variable.name != proof.variable_name.node
+            || variable.initializer != Some(proof.arrow.node)
+            || self.node(proof.variable_name)?.kind != SyntaxKind::Identifier
+            || arrow_record.kind != SyntaxKind::ArrowFunction
+            || arrow.body != proof.block.node
+            || block_record.kind != SyntaxKind::Block
+            || block_record.flags.0 != 0
+            || block.statements.nodes.as_slice() != [proof.statement.node]
+            || statement_record.kind != SyntaxKind::ReturnStatement
+            || statement_record.flags.0 != 0
+            || statement.expression != Some(proof.expression.node)
+            || statement.flow_node.is_some()
+            || statement.facts != 0
+            || self.node(expression)?.kind != SyntaxKind::NewExpression
+        {
+            return Ok(false);
+        }
+        for (child, parent) in [
+            (proof.variable_name, proof.variable_declaration),
+            (proof.arrow, proof.variable_declaration),
+            (proof.block, proof.arrow),
+            (proof.statement, proof.block),
+            (proof.expression, proof.statement),
+        ] {
+            let child_record = self.node(child)?;
+            let parent_record = self.node(parent)?;
+            if child_record.parent != Some(parent.node)
+                || child_record.range.start < parent_record.range.start
+                || child_record.range.end > parent_record.range.end
+            {
+                return Ok(false);
+            }
+        }
+        let mut current = expression;
+        let mut visited = HashSet::new();
+        while current != proof.expression {
+            if !visited.insert(current) {
+                return Ok(false);
+            }
+            let child = self.node(current)?;
+            let Some(parent) = child.parent.map(|node| self.reference(node)) else {
+                return Ok(false);
+            };
+            let record = self.node(parent)?;
+            if record.flags.0 != 0
+                || child.range.start < record.range.start
+                || child.range.end > record.range.end
+                || self.bound.container(parent) != Some(proof.arrow)
+                || self.bound.block_scope_container(parent) != Some(proof.arrow)
+                || self
+                    .bound
+                    .flow_container(parent)
+                    .is_some_and(|container| container != proof.arrow)
+            {
+                return Ok(false);
+            }
+            let wraps_child = match (&record.data, record.kind) {
+                (
+                    NodeData::ParenthesizedExpression(wrapper),
+                    SyntaxKind::ParenthesizedExpression,
+                ) => wrapper.expression == current.node,
+                (NodeData::TypeAssertion(wrapper), SyntaxKind::TypeAssertionExpression) => {
+                    wrapper.expression == current.node
+                }
+                (NodeData::AsExpression(wrapper), SyntaxKind::AsExpression) => {
+                    wrapper.expression == current.node
+                }
+                _ => false,
+            };
+            if !wraps_child {
+                return Ok(false);
+            }
+            current = parent;
+        }
+        Ok(true)
+    }
+
     /// Proves that constructor evaluation remains inside an admitted source expression.
     fn is_top_level_constructor_expression(
         &self,
         expression: NodeRef,
     ) -> Result<bool, SourceCheckError> {
+        if self.is_direct_planned_arrow_constructor_return(expression)? {
+            return Ok(true);
+        }
         let mut current = expression;
         let mut visited = HashSet::new();
         loop {
@@ -18469,6 +18627,33 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     }
 
     fn plan_arrow_body(
+        &mut self,
+        source: SourceArrowPlan,
+    ) -> Result<PlannedArrow, SourceCheckError> {
+        let current = match source.body {
+            SourceArrowBodyPlan::ReturnExpression {
+                block,
+                statement,
+                expression,
+            } => Some(PlannedArrowConstructorReturn {
+                variable_declaration: source.variable_declaration,
+                variable_name: source.variable_name,
+                variable_symbol: source.variable_symbol,
+                arrow: source.callable.declaration,
+                owner_symbol: source.callable.owner_symbol,
+                block,
+                statement,
+                expression,
+            }),
+            _ => None,
+        };
+        let previous = std::mem::replace(&mut self.arrow_constructor_return, current);
+        let result = self.plan_arrow_body_with_constructor_return(source);
+        self.arrow_constructor_return = previous;
+        result
+    }
+
+    fn plan_arrow_body_with_constructor_return(
         &mut self,
         source: SourceArrowPlan,
     ) -> Result<PlannedArrow, SourceCheckError> {
@@ -37403,8 +37588,9 @@ fn check_expression_type_with_capture_context(
                 construction,
             )
             .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
-            let generic = construction.is_generic_source_class();
-            let access = if generic {
+            let generic = construction.is_generic_source_class()
+                || construction.is_generic_library_constructor();
+            let access = if construction.is_generic_source_class() {
                 class_flow
                     .as_ref()
                     .map(|context| context.flow.access_token().clone())
@@ -37438,8 +37624,7 @@ fn check_expression_type_with_capture_context(
             }
             if let Some(arguments) = construction.checked_expression_arguments() {
                 let mut argument_types = Vec::with_capacity(arguments.len());
-                let mut library_arguments = construction
-                    .is_library_constructor()
+                let mut library_arguments = (construction.is_library_constructor() && !generic)
                     .then(|| Vec::with_capacity(arguments.len()));
                 for (index, argument) in arguments.iter().enumerate() {
                     let contextual = if !generic

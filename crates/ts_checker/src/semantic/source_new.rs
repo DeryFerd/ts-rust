@@ -2,8 +2,8 @@
 //!
 //! This includes `new Model()`, `new Model`, literal overload arguments, and
 //! checked expression arguments for an explicit source constructor or an
-//! authenticated default-library TypeLiteral construct value. Generic source classes
-//! use the common Construct selector, ordered defaults, and concrete inference.
+//! authenticated default-library construct value. Generic source classes and
+//! named library constructors use the common Construct selector and inference.
 //! It follows pinned TypeScript-Go `checkCallExpression`,
 //! `getResolvedSignature`, `resolveNewExpression`, and `resolveCall`.
 //! An admitted constructor belongs to one preceding local class, an imported
@@ -47,6 +47,7 @@ use super::{
     },
     constructor_values::{
         GlobalConstructorValuePlan, plan_global_constructor_value,
+        plan_global_generic_constructor_value,
         prepare_global_constructor_candidates, resolve_global_constructor_candidates,
     },
     declared::{execute_type_parameter, preflight_class_or_interface_reference},
@@ -213,6 +214,7 @@ enum SourceNewTarget {
     ConstructorOverloads(Box<super::classes::SourceClassPlan>),
     SourceClass(Box<SourceClassPlan>),
     GenericSourceClass(SourceGenericClassNewPlan),
+    GenericLibrary(SourceGenericLibraryNewPlan),
     ImportedClass(Box<SourceImportBindingPlan>),
     Declared(SourceDeclaredConstructorPlan),
     ClassUnion(SourceClassUnionConstructorPlan),
@@ -227,6 +229,12 @@ enum SourceNewTarget {
 #[derive(Clone, Debug)]
 struct SourceGenericClassNewPlan {
     class: Box<SourceClassPlan>,
+    type_argument_nodes: Option<Vec<NodeRef>>,
+}
+
+#[derive(Clone, Debug)]
+struct SourceGenericLibraryNewPlan {
+    library: Box<GlobalConstructorValuePlan>,
     type_argument_nodes: Option<Vec<NodeRef>>,
 }
 
@@ -382,7 +390,10 @@ struct SourceNewParameter {
 
 impl SourceDefaultNewPlan {
     pub(super) fn is_library_constructor(&self) -> bool {
-        matches!(&self.target, SourceNewTarget::Library(_))
+        matches!(
+            &self.target,
+            SourceNewTarget::Library(_) | SourceNewTarget::GenericLibrary(_)
+        )
     }
 
     pub(super) fn expression_argument_nodes(&self) -> Option<&[NodeRef]> {
@@ -450,9 +461,14 @@ impl SourceDefaultNewPlan {
         matches!(self.target, SourceNewTarget::GenericSourceClass(_))
     }
 
+    pub(super) fn is_generic_library_constructor(&self) -> bool {
+        matches!(self.target, SourceNewTarget::GenericLibrary(_))
+    }
+
     pub(super) fn written_type_argument_nodes(&self) -> Option<&[NodeRef]> {
         match &self.target {
             SourceNewTarget::GenericSourceClass(generic) => generic.type_argument_nodes.as_deref(),
+            SourceNewTarget::GenericLibrary(generic) => generic.type_argument_nodes.as_deref(),
             _ => None,
         }
     }
@@ -1113,9 +1129,6 @@ fn plan_direct_default_new_with_context(
         && prior_source_classes
             .get(&symbol)
             .is_some_and(SourceClassPlan::has_checked_constructor_arguments);
-    if has_expression_arguments && !(source_arguments || library.is_some()) {
-        return Err(unsupported(SourceNewUnsupported::Arguments(node)));
-    }
     let expression_arguments =
         (source_arguments || library.is_some()).then(|| SourceNewExpressionArguments {
             nodes: new_expression
@@ -1173,6 +1186,32 @@ fn plan_direct_default_new_with_context(
             .and_then(|globals| globals.get_source("Promise"))
             .and_then(|global| store.get_merged_symbol(global))
             == Some(symbol);
+    if !(source_arguments
+        || library.is_some()
+        || global_wrapper
+        || global_array
+        || global_date
+        || global_promise)
+        && let Some((globals, options)) = source_context
+        && let Some(library) =
+            plan_global_generic_constructor_value(store, host, globals, options, symbol)
+                .map_err(|error| global_error::provider_error(constructor, symbol, error))?
+    {
+        return plan_generic_library_new(
+            store,
+            host,
+            globals,
+            options,
+            node,
+            constructor,
+            resolved_symbol,
+            library,
+            early_preparation,
+        );
+    }
+    if has_expression_arguments && !(source_arguments || library.is_some()) {
+        return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+    }
     if executor.is_some() && !global_promise {
         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
     }
@@ -1551,6 +1590,56 @@ fn plan_generic_source_class_new(
         }),
     };
     preflight_direct_default_new(store, host, &plan)?;
+    Ok(plan)
+}
+
+/// Keeps written type arguments and checked value arguments on the named owner.
+#[allow(clippy::too_many_arguments)]
+fn plan_generic_library_new(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    node: NodeRef,
+    constructor: NodeRef,
+    resolved_symbol: SemanticSymbolId,
+    library: GlobalConstructorValuePlan,
+    early_preparation: bool,
+) -> Result<SourceDefaultNewPlan, SourceNewError> {
+    let type_argument_nodes = generic_source_class_type_argument_nodes(host, node, constructor)?;
+    let Some(NodeData::NewExpression(expression)) = host.node(node).map(|record| &record.data)
+    else {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(node)));
+    };
+    let plan = SourceDefaultNewPlan {
+        node,
+        constructor,
+        resolved_symbol,
+        target: SourceNewTarget::GenericLibrary(SourceGenericLibraryNewPlan {
+            library: Box::new(library),
+            type_argument_nodes,
+        }),
+        early_preparation,
+        type_arguments: Vec::new(),
+        argument: None,
+        additional_arguments: Vec::new(),
+        parameter: None,
+        executor: None,
+        expression_arguments: Some(SourceNewExpressionArguments {
+            nodes: expression
+                .arguments
+                .as_ref()
+                .map_or_else(Vec::new, |arguments| {
+                    arguments
+                        .nodes
+                        .iter()
+                        .map(|&argument| NodeRef::new(node.arena, node.file, argument))
+                        .collect()
+                }),
+            expressions: None,
+        }),
+    };
+    preflight_direct_default_new_with_source_context(store, host, globals, options, &plan)?;
     Ok(plan)
 }
 
@@ -4178,7 +4267,7 @@ fn preflight_direct_default_new_with_context(
         }
     }
     match &plan.target {
-        SourceNewTarget::Library(_) => {
+        SourceNewTarget::Library(_) | SourceNewTarget::GenericLibrary(_) => {
             let (globals, options) = source_context.ok_or_else(|| {
                 invariant(SourceNewInvariant::InvalidConstructorCache(
                     plan.constructor,
@@ -4426,7 +4515,8 @@ pub(super) fn prepare_direct_default_news(
 
     for plan in plans {
         match &plan.target {
-            SourceNewTarget::Library(library) => {
+            SourceNewTarget::Library(library)
+            | SourceNewTarget::GenericLibrary(SourceGenericLibraryNewPlan { library, .. }) => {
                 prepare_global_constructor_candidates(
                     store,
                     host,
@@ -5574,7 +5664,7 @@ pub(super) fn check_direct_default_new(
     preflight_direct_default_new(store, host, plan)?;
     preflight_prepared_default_new_cache(store, host, plan)?;
     let selected = match &plan.target {
-        SourceNewTarget::Library(_) => {
+        SourceNewTarget::Library(_) | SourceNewTarget::GenericLibrary(_) => {
             return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
                 plan.node,
             )));
@@ -6131,6 +6221,23 @@ pub(super) fn preflight_source_generic_class_new_with_context(
     plan: &SourceDefaultNewPlan,
     access: Option<&ClassBodyAccessToken>,
 ) -> Result<(), SourceNewError> {
+    if plan.is_generic_library_constructor() {
+        preflight_direct_default_new_with_source_context(store, host, globals, options, plan)?;
+        let candidates = resolve_library_new_candidates(store, host, globals, options, plan)?
+            .ok_or_else(|| unsupported(SourceNewUnsupported::Constructor(plan.constructor)))?;
+        if let Some(signature) = exact_signature_cache(store, plan.node)
+            .map_err(|()| invariant(SourceNewInvariant::InvalidExpressionCache(plan.node)))?
+        {
+            preflight_generic_class_constructor_signature(
+                store,
+                candidates.value_type,
+                signature,
+                Some(CanonicalArrayTargets::from_global_types(globals)),
+            )
+            .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+        }
+        return Ok(());
+    }
     preflight_direct_default_new(store, host, plan)?;
     let SourceNewTarget::GenericSourceClass(generic) = &plan.target else {
         return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
@@ -6307,6 +6414,18 @@ pub(super) fn check_source_generic_class_new(
     argument_types: &[TypeId],
     explicit_type_arguments: Option<&[TypeId]>,
 ) -> Result<PreparedSourceGenericNew, SourceNewError> {
+    if plan.is_generic_library_constructor() {
+        return check_source_generic_library_new(
+            store,
+            host,
+            globals,
+            options,
+            session,
+            plan,
+            argument_types,
+            explicit_type_arguments,
+        );
+    }
     preflight_source_generic_class_new_with_context(store, host, globals, options, plan, access)?;
     preflight_prepared_default_new_cache(store, host, plan)?;
     preflight_generic_new_arguments(store, plan, argument_types, explicit_type_arguments)?;
@@ -6405,6 +6524,18 @@ pub(super) fn publish_source_generic_class_new(
     explicit_type_arguments: Option<&[TypeId]>,
     prepared: PreparedSourceGenericNew,
 ) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    if plan.is_generic_library_constructor() {
+        return publish_source_generic_library_new(
+            store,
+            host,
+            globals,
+            options,
+            plan,
+            argument_types,
+            explicit_type_arguments,
+            prepared,
+        );
+    }
     preflight_source_generic_class_new_with_context(store, host, globals, options, plan, access)?;
     preflight_generic_new_arguments(store, plan, argument_types, explicit_type_arguments)?;
     let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
@@ -6472,6 +6603,147 @@ pub(super) fn publish_source_generic_class_new(
     Ok(checked)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn check_source_generic_library_new(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    plan: &SourceDefaultNewPlan,
+    argument_types: &[TypeId],
+    explicit_type_arguments: Option<&[TypeId]>,
+) -> Result<PreparedSourceGenericNew, SourceNewError> {
+    preflight_source_generic_class_new_with_context(store, host, globals, options, plan, None)?;
+    preflight_prepared_default_new_cache_with_context(store, host, plan, Some((globals, options)))?;
+    preflight_generic_new_arguments(store, plan, argument_types, explicit_type_arguments)?;
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+    let candidates =
+        resolve_library_new_candidates(store, host, globals, options, plan)?.ok_or_else(invalid)?;
+    let existing_signature = exact_signature_cache(store, plan.node).map_err(|()| invalid())?;
+    let limit_mark = session.limit_event_mark();
+    let resolution = resolve_generic_class_constructor(
+        store,
+        globals,
+        options.strict_function_types,
+        GenericCallVectorRequest {
+            form: super::calls::DirectCallForm::New,
+            optional_chain: false,
+            explicit_type_arguments,
+            has_spread_argument: false,
+            callee: candidates.value_type,
+            arguments: argument_types,
+        },
+        existing_signature,
+        session,
+    )
+    .map_err(|error| generic_constructor_error(plan.node, error))?
+    .ok_or_else(|| unsupported(SourceNewUnsupported::Arguments(plan.node)))?;
+    let (signature, instance_type) = match &resolution.selected {
+        GenericMethodCallSelection::Generic(selected) => {
+            let materialized =
+                materialize_generic_call_vector_source(store, selected, existing_signature)
+                    .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+            let result = demand_generic_call_vector_return_with_session(store, selected, session)
+                .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+            (materialized.call_signature, result)
+        }
+        GenericMethodCallSelection::Fixed {
+            signature,
+            return_type,
+        } => (*signature, *return_type),
+    };
+    if session.limit_event_occurred_since(limit_mark) {
+        return Err(unsupported(SourceNewUnsupported::Arguments(plan.node)));
+    }
+    preflight_generic_class_constructor_signature(
+        store,
+        candidates.value_type,
+        signature,
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+    )
+    .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+    Ok(PreparedSourceGenericNew {
+        checked: CheckedSourceDefaultNew {
+            value_type: candidates.value_type,
+            instance_type,
+            signature,
+        },
+        resolution: Some(resolution),
+        access_diagnostic: None,
+        existing_signature,
+        argument_types: argument_types.to_vec(),
+        explicit_type_arguments: explicit_type_arguments.map(<[TypeId]>::to_vec),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_source_generic_library_new(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceDefaultNewPlan,
+    argument_types: &[TypeId],
+    explicit_type_arguments: Option<&[TypeId]>,
+    prepared: PreparedSourceGenericNew,
+) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    preflight_source_generic_class_new_with_context(store, host, globals, options, plan, None)?;
+    preflight_generic_new_arguments(store, plan, argument_types, explicit_type_arguments)?;
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+    let candidates =
+        resolve_library_new_candidates(store, host, globals, options, plan)?.ok_or_else(invalid)?;
+    if prepared.argument_types != argument_types
+        || prepared.explicit_type_arguments.as_deref() != explicit_type_arguments
+        || prepared.existing_signature
+            != exact_signature_cache(store, plan.node).map_err(|()| invalid())?
+        || prepared.access_diagnostic.is_some()
+        || prepared.checked.value_type != candidates.value_type
+    {
+        return Err(invalid());
+    }
+    let resolution = prepared.resolution.as_ref().ok_or_else(invalid)?;
+    let signature = match &resolution.selected {
+        GenericMethodCallSelection::Generic(selected) => {
+            materialize_generic_call_vector_source(store, selected, prepared.existing_signature)
+                .map_err(|error| generic_constructor_error(plan.node, error.into()))?
+                .call_signature
+        }
+        GenericMethodCallSelection::Fixed {
+            signature,
+            return_type,
+        } => {
+            if *return_type != prepared.checked.instance_type {
+                return Err(invalid());
+            }
+            *signature
+        }
+    };
+    if signature != prepared.checked.signature
+        || store
+            .signature(signature)
+            .and_then(Signature::resolved_return_type)
+            != Some(prepared.checked.instance_type)
+    {
+        return Err(invalid());
+    }
+    preflight_generic_class_constructor_signature(
+        store,
+        candidates.value_type,
+        signature,
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+    )
+    .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+    publish_default_new_links_with_context(
+        store,
+        host,
+        plan,
+        prepared.checked,
+        argument_types,
+        Some((globals, options)),
+    )
+}
+
 fn preflight_source_class_expression_arguments(
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
@@ -6492,7 +6764,8 @@ fn preflight_source_class_expression_arguments(
         || record.flags.0 != 0
         || expression.facts != 0
         || expression.expression != plan.constructor.node
-        || expression.type_arguments.is_some() && !plan.is_generic_source_class()
+        || expression.type_arguments.is_some()
+            && !(plan.is_generic_source_class() || plan.is_generic_library_constructor())
         || actual.len() != arguments.nodes.len()
         || actual
             .iter()
@@ -6551,8 +6824,18 @@ fn resolve_library_new_candidates(
             plan.constructor,
         ))
     };
-    let SourceNewTarget::Library(library) = &plan.target else {
-        return Err(invalid());
+    let library = match &plan.target {
+        SourceNewTarget::Library(library) => library,
+        SourceNewTarget::GenericLibrary(generic) => {
+            if !generic.library.is_named_generic()
+                || generic_source_class_type_argument_nodes(host, plan.node, plan.constructor)?
+                    != generic.type_argument_nodes
+            {
+                return Err(invalid());
+            }
+            &generic.library
+        }
+        _ => return Err(invalid()),
     };
     if plan.argument.is_some()
         || !plan.additional_arguments.is_empty()
@@ -6628,11 +6911,12 @@ fn resolve_library_new_candidates(
     {
         return Err(invalid());
     }
-    let current =
+    let current = if library.is_named_generic() {
+        plan_global_generic_constructor_value(store, host, globals, options, plan.resolved_symbol)
+    } else {
         plan_global_constructor_value(store, host, globals, options, plan.resolved_symbol)
-            .map_err(|error| {
-                global_error::provider_error(plan.constructor, plan.resolved_symbol, error)
-            })?;
+    }
+    .map_err(|error| global_error::provider_error(plan.constructor, plan.resolved_symbol, error))?;
     if current.as_ref() != Some(library.as_ref()) {
         return Err(invalid());
     }
@@ -6674,7 +6958,7 @@ fn resolve_library_new_candidates(
             || record.declaration() != Some(declaration)
             || !record.flags().contains(SignatureFlags::CONSTRUCT)
             || record.flags().contains(SignatureFlags::ABSTRACT)
-            || !record.type_parameters().is_empty()
+            || !library.is_named_generic() && !record.type_parameters().is_empty()
             || record.target().is_some()
             || record.mapper().is_some()
             || record.resolved_return_type() != Some(signature.return_type())
@@ -8328,13 +8612,44 @@ fn preflight_default_new_cache_with_context(
     }
 
     match &plan.target {
-        SourceNewTarget::Library(_) => {
+        SourceNewTarget::Library(_) | SourceNewTarget::GenericLibrary(_) => {
             let (globals, options) = source_context.ok_or_else(|| {
                 invariant(SourceNewInvariant::InvalidConstructorCache(
                     plan.constructor,
                 ))
             })?;
             let candidates = resolve_library_new_candidates(store, host, globals, options, plan)?;
+            if plan.is_generic_library_constructor() {
+                let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+                if constructor_type.is_some_and(|type_| {
+                    candidates
+                        .as_ref()
+                        .is_none_or(|candidates| candidates.value_type != type_)
+                }) {
+                    return Err(invalid());
+                }
+                if let Some(signature) = signature {
+                    let candidates = candidates.as_ref().ok_or_else(invalid)?;
+                    if constructor_symbol != Some(plan.resolved_symbol)
+                        || constructor_type != Some(candidates.value_type)
+                        || store
+                            .signature(signature)
+                            .and_then(Signature::resolved_return_type)
+                            != result_type
+                    {
+                        return Err(invalid());
+                    }
+                    preflight_generic_class_constructor_signature(
+                        store,
+                        candidates.value_type,
+                        signature,
+                        Some(CanonicalArrayTargets::from_global_types(globals)),
+                    )
+                    .map_err(|error| generic_constructor_error(plan.node, error.into()))?;
+                }
+                preflight_library_argument_caches(store, host, globals, options, plan)?;
+                return Ok(());
+            }
             if constructor_type.is_some_and(|type_| {
                 candidates
                     .as_ref()

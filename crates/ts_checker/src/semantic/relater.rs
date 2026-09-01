@@ -22,7 +22,7 @@ use ts_binder::{
 use super::{
     CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, DeclaredTypeHost,
     ResolvedSignatureState, SignatureLinks,
-    array_types::{ArrayTypeError, CanonicalArrayTargets},
+    array_types::{ArrayTypeError, CanonicalArrayReference, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
     callable_sets::{
         CallableSetProjection, StoredCallableSetValidation, validate_stored_callable_set,
@@ -2122,6 +2122,15 @@ impl<'store> RelaterSession<'store> {
         type_id: TypeId,
         target: TypeId,
     ) -> Result<TypeId, RelationUnavailable> {
+        self.canonical_array_reference(type_id, target)
+            .map(|reference| reference.element_type)
+    }
+
+    fn canonical_array_reference(
+        &mut self,
+        type_id: TypeId,
+        target: TypeId,
+    ) -> Result<CanonicalArrayReference, RelationUnavailable> {
         let global_types =
             self.global_types
                 .ok_or(RelationUnavailable::MalformedCanonicalArrayReference(
@@ -2162,7 +2171,45 @@ impl<'store> RelaterSession<'store> {
                 type_id,
             ));
         }
-        Ok(reference.element_type)
+        Ok(reference)
+    }
+
+    /// Reads members from the canonical base without changing the relation endpoints.
+    fn canonical_array_member_reference(
+        &mut self,
+        type_id: TypeId,
+    ) -> Result<Option<TypeId>, RelationUnavailable> {
+        let Some(target) = self.configured_array_reference_target(type_id)? else {
+            return Ok(None);
+        };
+        let reference = self.canonical_array_reference(type_id, target)?;
+        let owner = self
+            .store
+            .type_payload(reference.base_type)
+            .and_then(TypeRecord::symbol)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+        let owner_flags = self
+            .store
+            .symbol(owner)
+            .ok_or(RelationUnavailable::Symbol(owner))?
+            .flags();
+        if !owner_flags.contains(SymbolFlags::INTERFACE) {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+        }
+        if owner_flags.without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+            != SymbolFlags::NONE
+        {
+            let proof = self
+                .store
+                .source_global_interface_value_owner(owner)
+                .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?
+                .ok_or(RelationUnavailable::UnsupportedStructuredType(type_id))?;
+            self.observe_symbol_table(proof.globals_table());
+            self.observe_symbol(proof.table_symbol());
+        }
+        self.observe_symbol(owner);
+        self.observe_type_surface(reference.base_type);
+        Ok(Some(reference.base_type))
     }
 
     fn canonical_array_reference_arguments(
@@ -2487,11 +2534,7 @@ impl<'store> RelaterSession<'store> {
             {
                 return Ok(Some(related));
             }
-            return Err(RelationUnavailable::StructuralRelation {
-                source,
-                target,
-                relation: self.relation,
-            });
+            return Ok(None);
         }
         Ok(Some(result))
     }
@@ -8477,6 +8520,8 @@ impl<'store> RelaterSession<'store> {
         type_id: TypeId,
         allow_fresh_literal: bool,
     ) -> Result<(), RelationUnavailable> {
+        let canonical_array = self.canonical_array_member_reference(type_id)?;
+        let type_id = canonical_array.unwrap_or(type_id);
         source_interface_heritage_relation_edges(
             self.store,
             type_id,
@@ -8563,13 +8608,17 @@ impl<'store> RelaterSession<'store> {
                     matches!(target.data(), TypeData::Interface(_))
                         && target.object_flags().contains(ObjectFlags::INTERFACE)
                         && !target.object_flags().intersects(ObjectFlags::CLASS)
-                        && target
-                            .symbol()
-                            .and_then(|owner| self.store.symbol(owner))
-                            .is_some_and(|owner| owner.flags() == SymbolFlags::INTERFACE)
+                        && (canonical_array.is_some()
+                            || target
+                                .symbol()
+                                .and_then(|owner| self.store.symbol(owner))
+                                .is_some_and(|owner| owner.flags() == SymbolFlags::INTERFACE))
                 });
-            if !configured_array && (interface_target || class_reference) {
-                let source_declared_target = class_reference
+            if (canonical_array.is_some() || !configured_array)
+                && (interface_target || class_reference)
+            {
+                let source_declared_target = canonical_array.is_some()
+                    || class_reference
                     || reference_target
                         .and_then(|target| self.store.type_payload(target))
                         .and_then(TypeRecord::symbol)
@@ -9120,6 +9169,8 @@ impl<'store> RelaterSession<'store> {
         type_id: TypeId,
         allow_fresh_literal: bool,
     ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
+        let canonical_array = self.canonical_array_member_reference(type_id)?;
+        let type_id = canonical_array.unwrap_or(type_id);
         if self.global_this_hint == Some(type_id)
             || is_global_this_type_candidate(
                 self.store,
@@ -9372,7 +9423,8 @@ impl<'store> RelaterSession<'store> {
                 ObjectPropertyOrigin::InterfaceHeritage(type_id)
             }
             DerivedObjectLiteralValidation::NotDerived
-                if class_reference
+                if canonical_array.is_some()
+                    || class_reference
                     || record_object_flags.intersects(ObjectFlags::REFERENCE)
                         && !record_object_flags.intersects(ObjectFlags::CLASS)
                         && record_symbol

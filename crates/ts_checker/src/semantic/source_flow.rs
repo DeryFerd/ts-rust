@@ -6369,13 +6369,6 @@ impl SourceFlowFrame<'_, '_> {
                     )
                     .map_err(|error| SourceFlowError::Join { flow, error })?;
                 store.create_evolving_array_type(element)?
-            } else if let Some(candidate) = candidates
-                .iter()
-                .copied()
-                .find(|candidate| *candidate == then_type || *candidate == else_type)
-                .filter(|_| self.reference.is_none())
-            {
-                candidate
             } else {
                 let anonymous = store
                     .expression_union_type_with_global_types(

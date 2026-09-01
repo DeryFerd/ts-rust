@@ -6540,36 +6540,7 @@ fn prepare_legacy_source_call_diagnostic(
         diagnostic_resolution,
     )?;
     if let Some(signature) = overload_note {
-        let declaration = store
-            .signature(signature)
-            .and_then(super::signatures::Signature::declaration)
-            .ok_or(SourceCheckError::Call(plan.node))?;
-        for diagnostic in &mut result {
-            let message = diagnostic
-                .diagnostic
-                .render()
-                .map_err(|_| SourceCheckError::Call(plan.node))?;
-            let detail = Diagnostic::new(
-                message_by_code(2770).ok_or(SourceCheckError::MissingDiagnostic(2770))?,
-            )
-            .render()
-            .map_err(|_| SourceCheckError::Call(plan.node))?;
-            diagnostic.diagnostic = Diagnostic::new(
-                message_by_code(2769).ok_or(SourceCheckError::MissingDiagnostic(2769))?,
-            )
-            .with_details(
-                std::iter::once(format!("  {detail}"))
-                    .chain(message.lines().map(|line| format!("    {line}"))),
-            );
-            diagnostic
-                .related_information
-                .push(CanonicalCheckerRelatedInformation {
-                    node: Some(declaration),
-                    diagnostic: Diagnostic::new(
-                        message_by_code(2771).ok_or(SourceCheckError::MissingDiagnostic(2771))?,
-                    ),
-                });
-        }
+        append_last_overload_diagnostic(store, plan.node, signature, &mut result)?;
     }
     if matches!(
         diagnostic_resolution.applicability,
@@ -6622,6 +6593,46 @@ fn prepare_legacy_source_call_diagnostic(
         }
     }
     Ok(result)
+}
+
+/// The error comes from the last overload. Its signature need not be the recovery signature.
+fn append_last_overload_diagnostic(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    signature: SignatureId,
+    result: &mut [CanonicalCheckerDiagnostic],
+) -> Result<(), SourceCheckError> {
+    let declaration = store
+        .signature(signature)
+        .and_then(super::signatures::Signature::declaration)
+        .ok_or(SourceCheckError::Call(node))?;
+    for diagnostic in result {
+        let message = diagnostic
+            .diagnostic
+            .render()
+            .map_err(|_| SourceCheckError::Call(node))?;
+        let detail = Diagnostic::new(
+            message_by_code(2770).ok_or(SourceCheckError::MissingDiagnostic(2770))?,
+        )
+        .render()
+        .map_err(|_| SourceCheckError::Call(node))?;
+        diagnostic.diagnostic = Diagnostic::new(
+            message_by_code(2769).ok_or(SourceCheckError::MissingDiagnostic(2769))?,
+        )
+        .with_details(
+            std::iter::once(format!("  {detail}"))
+                .chain(message.lines().map(|line| format!("    {line}"))),
+        );
+        diagnostic
+            .related_information
+            .push(CanonicalCheckerRelatedInformation {
+                node: Some(declaration),
+                diagnostic: Diagnostic::new(
+                    message_by_code(2771).ok_or(SourceCheckError::MissingDiagnostic(2771))?,
+                ),
+            });
+    }
+    Ok(())
 }
 
 fn source_call_overload_implementation(
@@ -7136,6 +7147,64 @@ fn prepare_generic_candidate_diagnostic(
                 .arguments
                 .get(index)
                 .ok_or(SourceCheckError::Call(plan.node))?;
+            let named_constructor = if plan.form == DirectCallForm::New {
+                store
+                    .declared_call_set_type_for_signature(signature)
+                    .map(|callee| {
+                        super::generic_calls::generic_named_constructor_candidates(
+                            store,
+                            callee,
+                            Some(CanonicalArrayTargets::from_global_types(global_types)),
+                        )
+                    })
+                    .transpose()
+                    .map_err(|_| SourceCheckError::Call(plan.node))?
+                    .flatten()
+                    .is_some_and(|candidates| {
+                        candidates
+                            .iter()
+                            .any(|candidate| candidate.signature == signature)
+                    })
+            } else {
+                false
+            };
+            // The relation removes null and undefined from this diagnostic target.
+            // Keep the full parameter type in applicability and signature caches.
+            let diagnostic_parameter = if named_constructor
+                && store.type_payload(argument_type).is_some_and(|record| {
+                    record
+                        .flags()
+                        .intersects(TypeFlags::DEFINITELY_NON_NULLABLE)
+                }) {
+                store
+                    .type_payload(parameter_type)
+                    .and_then(|record| match record.data() {
+                        TypeData::Union(union)
+                            if record.alias().is_none()
+                                && union.origin.is_none()
+                                && matches!(union.union.types.len(), 2 | 3)
+                                && store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+                                    bootstrap.cached_union_type(&union.union.types)
+                                        == Some(parameter_type)
+                                }) =>
+                        {
+                            let (last, nullable) = union.union.types.split_last()?;
+                            let nullable_flags = TypeFlags::NULL | TypeFlags::UNDEFINED;
+                            (nullable.iter().all(|type_| {
+                                store
+                                    .type_payload(*type_)
+                                    .is_some_and(|record| record.flags().intersects(nullable_flags))
+                            }) && store
+                                .type_payload(*last)
+                                .is_some_and(|record| !record.flags().intersects(nullable_flags)))
+                            .then_some(*last)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(parameter_type)
+            } else {
+                parameter_type
+            };
             return prepare_source_argument_mismatch_diagnostics(
                 store,
                 host,
@@ -7145,7 +7214,7 @@ fn prepare_generic_candidate_diagnostic(
                 diagnostics,
                 argument,
                 argument_type,
-                parameter_type,
+                diagnostic_parameter,
             );
         }
     };
@@ -8379,7 +8448,18 @@ pub(super) fn prepare_source_generic_constructor_diagnostics(
         arguments,
         receiver: None,
     };
-    match &resolution.diagnostic {
+    let (diagnostic, overload_note) = match &resolution.diagnostic {
+        Some(GenericMethodCallDiagnostic::ConstructorOverload(last)) => {
+            let signature = match last.as_ref() {
+                GenericMethodCallDiagnostic::Fixed(candidate) => candidate.projection.signature,
+                GenericMethodCallDiagnostic::Generic { signature, .. } => *signature,
+                _ => return Err(SourceCheckError::Call(node)),
+            };
+            (Some(last.as_ref()), Some(signature))
+        }
+        diagnostic => (diagnostic.as_ref(), None),
+    };
+    let mut result = match diagnostic {
         None => Ok(Vec::new()),
         Some(GenericMethodCallDiagnostic::Fixed(candidate)) => {
             prepare_fixed_source_call_diagnostic(
@@ -8424,7 +8504,14 @@ pub(super) fn prepare_source_generic_constructor_diagnostics(
                 *expected,
             )?])
         }
+        Some(GenericMethodCallDiagnostic::ConstructorOverload(_)) => {
+            return Err(SourceCheckError::Call(node));
+        }
+    }?;
+    if let Some(signature) = overload_note {
+        append_last_overload_diagnostic(store, node, signature, &mut result)?;
     }
+    Ok(result)
 }
 
 /// Publishes the selected base signature while only the super call expression is void.
@@ -9044,6 +9131,9 @@ pub(super) fn check_direct_source_call(
                         *expected,
                         *expected,
                     )?]
+                }
+                Some(GenericMethodCallDiagnostic::ConstructorOverload(_)) => {
+                    return Err(SourceCheckError::Call(plan.node));
                 }
             };
             let (signature, return_type) = match &resolution.selected {

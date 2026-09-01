@@ -308,11 +308,29 @@ pub(super) fn plan_declared_value_cache(
 
 /// Reads the selected library value without removing any global augmentation.
 /// The saved declaration order, not the mutable value selector, admits this route.
-#[allow(clippy::too_many_lines)] // The complete merge and selected source form one proof.
 pub(super) fn plan_global_type_literal_value(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
+) -> Result<Option<DeclaredValuePlan>, DeclaredTypeError> {
+    plan_global_annotated_value(store, host, symbol, SyntaxKind::TypeLiteral)
+}
+
+/// A named constructor keeps the same selected value and complete global merge.
+pub(super) fn plan_global_named_constructor_value(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Option<DeclaredValuePlan>, DeclaredTypeError> {
+    plan_global_annotated_value(store, host, symbol, SyntaxKind::TypeReference)
+}
+
+#[allow(clippy::too_many_lines)] // The complete merge and selected source form one proof.
+fn plan_global_annotated_value(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    annotation_kind: SyntaxKind,
 ) -> Result<Option<DeclaredValuePlan>, DeclaredTypeError> {
     let invalid = || invalid_value(symbol);
     let Some(globals) = store.source_global_bindings() else {
@@ -333,7 +351,7 @@ pub(super) fn plan_global_type_literal_value(
         return Ok(None);
     };
     if !store.source_is_default_library_declaration(selected)
-        || store.source_node_kind(annotation) != Some(SyntaxKind::TypeLiteral)
+        || store.source_node_kind(annotation) != Some(annotation_kind)
     {
         return Ok(None);
     }

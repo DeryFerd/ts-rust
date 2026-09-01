@@ -4080,6 +4080,7 @@ pub(super) fn validate_stored_declared_call_set(
         return StoredDeclaredCallSetValidation::Malformed;
     };
     let merged_interface_owner = nongeneric_constructor_interface_owner(store, owner)
+        || generic_named_constructor_interface_owner(store, owner)
         || nongeneric_call_interface_owner(store, owner);
     let owner_declarations = owner_record.declarations().unwrap_or_default();
     let (owner_declaration, structured, members, exact_owner, inherited_base, own_signature_count) =
@@ -5180,6 +5181,43 @@ fn nongeneric_constructor_interface_owner(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
 ) -> bool {
+    constructor_interface_owner(store, owner, false)
+}
+
+/// Construct formals belong to each signature, not to the enclosing interface.
+pub(super) fn generic_named_constructor_interface_owner(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+) -> bool {
+    constructor_interface_owner(store, owner, true)
+}
+
+/// Uses the same source formal proof as declared methods and calls.
+pub(super) fn declared_named_constructor_type_parameter_view(
+    store: &CanonicalTypeMapperStore,
+    signature: &super::signatures::Signature,
+    declaration: NodeRef,
+) -> Option<Vec<DeclaredMethodTypeParameterView>> {
+    let SourceNodeParent::Parent(parent) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    let owner = store.source_declaration_symbol(parent)?;
+    if store.source_node_kind(declaration) != Some(SyntaxKind::ConstructSignature)
+        || !generic_named_constructor_interface_owner(store, owner)
+        || signature.declaration() != Some(declaration)
+        || signature.target().is_some()
+        || signature.mapper().is_some()
+    {
+        return None;
+    }
+    declared_method_type_parameter_view_worker(store, signature, declaration)
+}
+
+fn constructor_interface_owner(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    generic: bool,
+) -> bool {
     let Some(record) = store.symbol(owner) else {
         return false;
     };
@@ -5218,11 +5256,17 @@ fn nongeneric_constructor_interface_owner(
         && store.get_parent_of_symbol(constructs) == Some(owner)
         && store.source_merged_symbol_declarations_match(constructs)
         && signatures.declarations().is_some_and(|signatures| {
-            !signatures.is_empty() && signatures.iter().all(|&signature| {
+            !signatures.is_empty()
+                && (!generic || signatures.iter().any(|&signature| {
+                    store.source_direct_children(signature).is_some_and(|children| {
+                        children.iter().any(|&child| store.source_node_kind(child) == Some(SyntaxKind::TypeParameter))
+                    })
+                }))
+                && signatures.iter().all(|&signature| {
                 store.source_node_kind(signature) == Some(SyntaxKind::ConstructSignature)
                     && matches!(store.source_node_parent(signature), Some(SourceNodeParent::Parent(parent)) if declarations.contains(&parent))
                     && store.source_direct_children(signature).is_some_and(|children| {
-                        children.iter().all(|&child| store.source_node_kind(child) != Some(SyntaxKind::TypeParameter))
+                        generic || children.iter().all(|&child| store.source_node_kind(child) != Some(SyntaxKind::TypeParameter))
                     })
             })
         })
@@ -5299,7 +5343,7 @@ fn signature_uses_constructor_interface_optional_types(
     let Some(owner) = store.source_declaration_symbol(owner_declaration) else {
         return false;
     };
-    matches!(
+    let nongeneric = matches!(
         store.source_node_kind(declaration),
         Some(SyntaxKind::ConstructSignature | SyntaxKind::CallSignature)
     ) && store.source_node_kind(owner_declaration) == Some(SyntaxKind::InterfaceDeclaration)
@@ -5310,7 +5354,11 @@ fn signature_uses_constructor_interface_optional_types(
                 children
                     .iter()
                     .all(|&node| store.source_node_kind(node) != Some(SyntaxKind::TypeParameter))
-            })
+            });
+    nongeneric
+        || store.source_node_kind(declaration) == Some(SyntaxKind::ConstructSignature)
+            && store.source_node_kind(owner_declaration) == Some(SyntaxKind::InterfaceDeclaration)
+            && generic_named_constructor_interface_owner(store, owner)
 }
 
 /// Optional inline constructs keep their real literal and signature owners.
@@ -16167,10 +16215,14 @@ pub(super) fn plan_call_signature(
     let constructor_interface = store.source_node_kind(owner)
         == Some(SyntaxKind::InterfaceDeclaration)
         && nongeneric_constructor_interface_owner(store, owner_symbol);
+    let generic_constructor_interface = is_construct
+        && store.source_node_kind(owner) == Some(SyntaxKind::InterfaceDeclaration)
+        && generic_named_constructor_interface_owner(store, owner_symbol);
     let ordinary_interface_call = !is_construct
         && declared_type_parameters.is_none()
         && store.source_interface_call_owner(declaration) == Some(owner_symbol);
-    let merged_interface_owner = constructor_interface || ordinary_interface_call;
+    let merged_interface_owner =
+        constructor_interface || generic_constructor_interface || ordinary_interface_call;
     if (!merged_interface_owner && call_symbol != raw_call_symbol)
         || if merged_interface_owner {
             call_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::SIGNATURE
@@ -16372,6 +16424,7 @@ pub(super) fn plan_call_signature(
                 )
                 .is_some();
             let constructor_parameter = constructor_interface && type_parameters.is_empty()
+                || generic_constructor_interface
                 || signature_uses_type_literal_construct_optional_types(store, declaration);
             let interface_parameter = ordinary_interface_call && type_parameters.is_empty();
             if !is_construct
