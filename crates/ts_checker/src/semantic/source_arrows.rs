@@ -5672,11 +5672,46 @@ mod tests {
         assert!(rest.callable.parameters[1].rest);
 
         let predicate = Fixture::new("const f = (x: unknown): x is string => true;");
-        assert!(matches!(
-            predicate.plan(0),
-            Err(SourceArrowError::Unsupported(
-                SourceArrowUnsupported::Callable(SourceCallableUnsupported::TypePredicate(_))
-            ))
-        ));
+        let plan = predicate.plan(0).unwrap();
+        assert_eq!(plan.callable.family, SourceCallableFamily::ArrowFunction);
+        assert_ne!(plan.variable_symbol, plan.callable.owner_symbol);
+        assert_eq!(
+            predicate.bound.symbol(plan.callable.declaration),
+            Some(plan.callable.owner_symbol),
+        );
+        let written = plan.callable.return_type.type_node().unwrap();
+        let narrowing = plan.callable.type_predicate.unwrap();
+        assert_eq!(narrowing.owner, plan.callable.declaration);
+        assert_eq!(narrowing.node, written);
+        assert_eq!(plan.callable.return_type.annotation_identity(), Some((written, false)));
+        assert_eq!(narrowing.parameter_index, 0);
+        assert_eq!(narrowing.parameter_symbol, plan.callable.parameters[0].symbol);
+        assert_eq!(
+            predicate.bound.symbol(plan.callable.parameters[0].declaration),
+            Some(narrowing.parameter_symbol),
+        );
+        assert_eq!(
+            narrowing.kind,
+            super::super::signatures::TypePredicateKind::Identifier,
+        );
+        let host = predicate.host();
+        let NodeData::TypePredicateNode(annotation) = &host.node(written).unwrap().data
+        else {
+            panic!("the return plan must retain the written predicate");
+        };
+        assert!(annotation.asserts_modifier.is_none());
+        assert_eq!(annotation.type_, narrowing.narrowed_type.map(|node| node.node));
+        assert_eq!(
+            predicate
+                .host()
+                .node(narrowing.narrowed_type.unwrap())
+                .unwrap()
+                .kind,
+            SyntaxKind::StringKeyword,
+        );
+        let SourceArrowBodyPlan::ConciseExpression { expression } = plan.body else {
+            panic!("the predicate must retain its boolean expression body");
+        };
+        assert_eq!(predicate.host().node(expression).unwrap().kind, SyntaxKind::TrueKeyword);
     }
 }

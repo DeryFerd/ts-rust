@@ -55620,8 +55620,104 @@ fn materialize_checked_source_callable(
         .and_then(|mut query| query.get_return_type_of_signature(signature));
         merge_retry_diagnostics(diagnostics, return_diagnostics);
         return_result?;
+        check_stored_arrow_type_predicate(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            callable,
+            signature,
+        )?;
     }
     Ok(MaterializedSourceCallable { type_, signature })
+}
+
+/// Checks the written narrowing against the actual stored arrow parameter.
+#[allow(clippy::too_many_arguments)] // Predicate relations keep the source caller's session.
+fn check_stored_arrow_type_predicate(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    callable: &SourceCallablePlan,
+    signature: SignatureId,
+) -> Result<(), SourceCheckError> {
+    let Some(predicate) = callable.type_predicate else {
+        return Ok(());
+    };
+    if callable.family != SourceCallableFamily::ArrowFunction
+        || source_array_filter_predicate_arrow_is_exact(store, host, callable.declaration)
+            .map_err(SourcePlanner::callable_plan_error)?
+    {
+        return Ok(());
+    }
+    let invalid = || SourceCheckError::Arrow(callable.declaration);
+    let narrowed = predicate.narrowed_type.ok_or_else(invalid)?;
+    let parameter_index = usize::try_from(predicate.parameter_index).map_err(|_| invalid())?;
+    let record = store.signature(signature).ok_or_else(invalid)?;
+    if predicate.owner != callable.declaration
+        || predicate.kind != TypePredicateKind::Identifier
+        || record.declaration() != Some(predicate.owner)
+        || record.parameters().get(parameter_index) != Some(&predicate.parameter_symbol)
+        || !super::source_callables::valid_planned_callable_type_predicate(
+            store,
+            record,
+            callable.return_type.type_node(),
+            Some(predicate),
+        )
+    {
+        return Err(invalid());
+    }
+    let narrowed_type = record
+        .resolved_type_predicate()
+        .and_then(|predicate| store.type_predicate(predicate))
+        .and_then(super::signatures::TypePredicate::type_id)
+        .ok_or_else(invalid)?;
+    let parameter_type = store
+        .value_symbol_links(predicate.parameter_symbol)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    let limit_mark = session.limit_event_mark();
+    let assignable = source_type_is_assignable_to(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        narrowed_type,
+        parameter_type,
+    )?;
+    let assignability_diagnostic = if assignable {
+        None
+    } else {
+        let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+        if options.no_error_truncation {
+            flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+        }
+        Some(super::object_diagnostics::type_predicate_assignability_diagnostic(
+            store,
+            host,
+            global_types,
+            narrowed_type,
+            parameter_type,
+            narrowed,
+            flags,
+            options,
+            session,
+        )?)
+    };
+    if session.limit_event_occurred_since(limit_mark) {
+        issue_node_diagnostic(diagnostics, narrowed, 2589)?;
+    }
+    if let Some(diagnostic) = assignability_diagnostic {
+        merge_retry_diagnostic(diagnostics, diagnostic);
+    }
+    Ok(())
 }
 
 fn source_callable_type_import_capabilities(
@@ -76734,6 +76830,264 @@ mod tests {
         assert_eq!(adequate.query_count(), 0);
         assert_eq!(observable_state(&context, file), warm);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the same lazy predicate relation under both caller modes.
+    fn stored_arrow_predicate_relations_keep_spent_callers_arrays_and_recovery() {
+        use crate::semantic::instantiate::instantiate_type_with_vector_and_session;
+
+        for recovering in [false, true] {
+            let library = parsed(concat!(
+                "interface Array<T> {} interface ReadonlyArray<T> {} ",
+                "interface Base<T> { value: T; [index: number]: Array<number>; }",
+            ));
+            let source = parsed(concat!(
+                "interface Derived extends Base<number> {} ",
+                "interface Plain { value: number; } ",
+                "const guard = (value: Plain): value is Derived => true;",
+            ));
+            let library_file = FileId::new(203_182);
+            let file = FileId::new(203_183);
+            let mut context = context_with_cross_file_global(
+                library_file,
+                &library,
+                file,
+                &source,
+                CanonicalModuleState::Script,
+                CanonicalModuleState::Script,
+                false,
+            );
+            let library_bound = context.file(library_file).unwrap().1.clone();
+            let bound = context.file(file).unwrap().1.clone();
+            let options = context.options();
+            let globals = context.global_types().clone();
+            let arrays = Some(CanonicalArrayTargets::from_global_types(&globals));
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&library.arena, &library_bound), (&source.arena, &bound)],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let declaration = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction)
+                        .then_some(NodeRef::new(source.arena.id(), file, node))
+                })
+                .unwrap();
+            let owner = bound.symbol(declaration).unwrap();
+            let callable =
+                plan_source_callable(context.store(), &host, declaration, owner, arrays).unwrap();
+            let predicate = callable.type_predicate.unwrap();
+            let narrowed = predicate.narrowed_type.unwrap();
+            let (boolean, number, error_type) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (bootstrap.boolean_type, bootstrap.number_type, bootstrap.error_type)
+            };
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut prepared = InstantiationSession::new(InstantiationLimits::default());
+            let callable_type = CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut prepared,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_of_source_callable(declaration, owner)
+            .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable_type)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut prepared,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_return_type_of_signature(signature),
+                Ok(boolean),
+            );
+            let predicate_id = context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_type_predicate()
+                .unwrap();
+            let derived = context
+                .store()
+                .type_predicate(predicate_id)
+                .unwrap()
+                .type_id()
+                .unwrap();
+            let TypeData::Interface(data) = context.store().type_payload(derived).unwrap().data()
+            else {
+                panic!("the predicate must retain its actual inherited interface");
+            };
+            let proxy = context
+                .store()
+                .symbol_table(data.reference.object.structured.members.unwrap())
+                .unwrap()
+                .get_source("value")
+                .unwrap();
+            let array = context
+                .store()
+                .index_info(data.reference.object.structured.index_infos.as_ref().unwrap()[0])
+                .unwrap()
+                .value_type();
+            assert_eq!(
+                context.store().canonical_array_element_type(&globals, array),
+                Ok(Some(number)),
+            );
+            assert!(
+                context.store().value_symbol_links(proxy).unwrap().resolved_type.is_none()
+            );
+            let base = context
+                .store()
+                .declared_type_links(global_symbol(&context, "Base"))
+                .unwrap()
+                .declared_type
+                .unwrap();
+            let TypeData::Interface(base_data) = context.store().type_payload(base).unwrap().data()
+            else {
+                unreachable!();
+            };
+            let parameter = base_data.reference.resolved_type_arguments.as_ref().unwrap()[0];
+            let limits = InstantiationLimits {
+                max_count: 1,
+                ..InstantiationLimits::default()
+            };
+            let mut spent = if recovering {
+                InstantiationSession::new_recovering(context.store(), limits, error_type).unwrap()
+            } else {
+                InstantiationSession::new(limits)
+            };
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    context.store_mut_for_test(),
+                    parameter,
+                    &[parameter],
+                    &[number],
+                    arrays,
+                    &mut spent,
+                ),
+                Ok(number),
+            );
+            let mark = spent.limit_event_mark();
+            let result = check_stored_arrow_type_predicate(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut spent,
+                &mut diagnostics,
+                &callable,
+                signature,
+            );
+            assert!(spent.limit_event_occurred_since(mark));
+            assert_eq!(
+                (spent.query_count(), spent.total_count(), spent.limit_event_count()),
+                (1, 1, 1),
+            );
+            assert_eq!(spent.recovery_error_type(), recovering.then_some(error_type));
+            let mut adequate = InstantiationSession::new(InstantiationLimits::default());
+            let replay_session = if recovering {
+                assert_eq!(result, Ok(()));
+                assert_eq!(
+                    context.store().value_symbol_links(proxy).unwrap().resolved_type,
+                    Some(error_type),
+                );
+                let [diagnostic] = diagnostics.as_slice() else {
+                    panic!("the recovered relation must issue one limit diagnostic");
+                };
+                assert_eq!(diagnostic.node, Some(narrowed));
+                assert_eq!(diagnostic.range_override, None);
+                assert_eq!(diagnostic.diagnostic.code(), 2589);
+                assert!(diagnostic.related_information.is_empty());
+                &mut spent
+            } else {
+                assert_eq!(
+                    result,
+                    Err(SourceCheckError::RelationUnavailable(
+                        RelationUnavailable::UnsupportedProperty(proxy),
+                    )),
+                );
+                assert!(
+                    context.store().value_symbol_links(proxy).unwrap().resolved_type.is_none()
+                );
+                assert!(diagnostics.is_empty());
+                check_stored_arrow_type_predicate(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut adequate,
+                    &mut diagnostics,
+                    &callable,
+                    signature,
+                )
+                .unwrap();
+                assert!(adequate.total_count() > 0);
+                assert_eq!(adequate.limit_event_count(), 0);
+                assert_eq!(
+                    context.store().value_symbol_links(proxy).unwrap().resolved_type,
+                    Some(number),
+                );
+                &mut adequate
+            };
+            assert_eq!(context.store().type_resolution_len(), 0);
+            assert!(!is_type_checked(&context, file));
+            let record = context.store().signature(signature).unwrap();
+            assert_eq!(record.resolved_return_type(), Some(boolean));
+            assert_eq!(record.resolved_type_predicate(), Some(predicate_id));
+            assert!(super::super::source_callables::valid_planned_callable_type_predicate(
+                context.store(),
+                record,
+                callable.return_type.type_node(),
+                Some(predicate),
+            ));
+            let warm = (observable_state(&context, file), context.store().type_predicate_len());
+            let work = (
+                replay_session.query_count(),
+                replay_session.total_count(),
+                replay_session.limit_event_count(),
+                replay_session.recovery_error_type(),
+            );
+            let issued = diagnostics.clone();
+            check_stored_arrow_type_predicate(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                replay_session,
+                &mut diagnostics,
+                &callable,
+                signature,
+            )
+            .unwrap();
+            assert_eq!(
+                (observable_state(&context, file), context.store().type_predicate_len()),
+                warm,
+            );
+            assert_eq!(
+                (
+                    replay_session.query_count(),
+                    replay_session.total_count(),
+                    replay_session.limit_event_count(),
+                    replay_session.recovery_error_type(),
+                ),
+                work,
+            );
+            assert_eq!(diagnostics, issued);
+        }
     }
 
     #[test]
