@@ -256,10 +256,11 @@ use super::{
         SourceFlowCallEffect, SourceFlowCapturedArrayMutation, SourceFlowCapturedAssignment,
         SourceFlowCondition, SourceFlowError, SourceFlowFrame, SourceFlowInvariant,
         SourceFlowParameterAssignment, SourceFlowPlan, SourceFlowUnsupported, SourceFlowUpdate,
-        SourceTruthinessCondition, SourceTypeofComparison, SourceTypeofCondition, SourceTypeofTag,
-        captured_variables_with_later_writes, narrow_by_equality, narrow_by_typeof,
-        plan_source_captured_local, source_block_scoped_use_before_declaration,
-        source_typeof_narrowing_type_is_supported, validate_source_captured_local,
+        SourceInCondition, SourceTruthinessCondition, SourceTypeofComparison,
+        SourceTypeofCondition, SourceTypeofTag, captured_variables_with_later_writes,
+        narrow_by_equality, narrow_by_typeof, plan_source_captured_local,
+        source_block_scoped_use_before_declaration, source_typeof_narrowing_type_is_supported,
+        validate_source_captured_local,
     },
     source_functions::{
         PlannedFunctionRead, SourceFunctionInvariant, SourceFunctionPlanError,
@@ -1790,6 +1791,9 @@ impl PlannedCallableStatementList {
                             PlannedSourceCondition::Equality(condition) => {
                                 expressions.extend([&condition.operand, &condition.value])
                             }
+                            PlannedSourceCondition::In(condition) => {
+                                expressions.push(&condition.expression)
+                            }
                         }
                     }
                 }
@@ -2134,6 +2138,14 @@ enum PlannedSourceCondition {
     },
     Typeof(Box<PlannedTypeofCondition>),
     Equality(Box<PlannedEqualityCondition>),
+    In(Box<PlannedInCondition>),
+}
+
+#[derive(Clone, Debug)]
+struct PlannedInCondition {
+    expression: PlannedExpression,
+    flow_point: NodeRef,
+    flow: SourceInCondition,
 }
 
 #[derive(Clone, Debug)]
@@ -2170,6 +2182,7 @@ impl PlannedSourceCondition {
             Self::Truthiness { expression, .. } => expression.unparenthesized().node,
             Self::Typeof(condition) => condition.identifier.node,
             Self::Equality(condition) => condition.identifier,
+            Self::In(condition) => condition.flow_point,
         }
     }
 
@@ -2197,6 +2210,7 @@ impl PlannedSourceCondition {
                 strict: condition.strict,
                 discriminant: condition.discriminant,
             }),
+            Self::In(condition) => SourceFlowCondition::In(condition.flow),
         })
     }
 
@@ -2241,6 +2255,7 @@ impl PlannedSourceCondition {
             }
             Self::Typeof(condition) => condition.expression,
             Self::Equality(condition) => condition.expression,
+            Self::In(condition) => condition.expression.node,
         }
     }
 }
@@ -17018,6 +17033,32 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         self.primitive_binary_position_roots.insert(expression);
         let expression = self.plan_expression(expression)?;
+        if let PlannedExpressionKind::Binary(binary) = &expression.unparenthesized().kind
+            && binary.operator == SyntaxKind::InKeyword
+            && let PlannedExpressionKind::Identifier(read) = &binary.right.unparenthesized().kind
+            && read.kind == PlannedIdentifierReadKind::Variable
+        {
+            let flow = SourceInCondition {
+                expression: expression.node,
+                receiver: binary.right.unparenthesized().node,
+                key: binary.left.node,
+                symbol: read.value_symbol,
+            };
+            let right_entry = self.condition_expression_flow_point(&binary.right, entry);
+            let flow_point = self.condition_expression_flow_point(&binary.left, right_entry);
+            return Ok(PlannedSourceCondition::In(Box::new(PlannedInCondition {
+                expression,
+                flow_point,
+                flow,
+            })));
+        }
+        if matches!(
+            &expression.unparenthesized().kind,
+            PlannedExpressionKind::Binary(binary) if binary.operator == SyntaxKind::InKeyword
+        ) {
+            // Property receivers need a checked property-reference flow fact.
+            return Err(Self::unsupported_function_body(callable));
+        }
         if let PlannedExpressionKind::Identifier(read) = &expression.unparenthesized().kind
             && read.kind == PlannedIdentifierReadKind::Variable
         {
@@ -26309,18 +26350,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceCheckError::PrimitiveOperator(operator)
             });
         }
-        if membership
-            && (!self.is_direct_top_level_variable_initializer(expression)?
-                || left_kind != SyntaxKind::StringLiteral
-                || right_kind != SyntaxKind::ObjectLiteralExpression)
-        {
-            return Err(self.unsupported(
-                expression,
-                SyntaxKind::BinaryExpression,
-                SourceSyntaxRole::BinaryExpression,
-            ));
-        }
-
         let top_level_chain = self.is_direct_top_level_variable_initializer(expression)?
             || self
                 .node(expression)?
@@ -26373,39 +26402,36 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
         }
         if membership {
-            let PlannedExpressionKind::String(_) = &left_plan.kind else {
-                return Err(self.unsupported(left, left_kind, SourceSyntaxRole::BinaryOperand));
-            };
-            let PlannedExpressionKind::Object { plan, properties } = &right_plan.kind else {
-                return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
-            };
-            let [property] = plan.properties.as_slice() else {
-                return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
-            };
-            let [PlannedObjectMember::Eager(initializer)] = properties.as_slice() else {
-                return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
-            };
-            if plan.kind != super::object_members::PropertyObjectKind::ObjectLiteral
-                || property.optional
-                || property.readonly
-                || !plan.methods.is_empty()
-                || !plan.accessors.is_empty()
-                || !plan.spreads.is_empty()
-                || !plan.indexes.is_empty()
-                || !plan.call_signatures.is_empty()
-                || plan.alias_symbol.is_some()
-                || plan.heritage.is_some()
-                || !matches!(initializer.kind, PlannedExpressionKind::Number { .. })
-            {
-                return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
-            }
-            let boolean = store
+            let bootstrap = store
                 .intrinsic_bootstrap()
-                .map(|bootstrap| bootstrap.boolean_type)
                 .ok_or(SourceCheckError::LiteralCache(
                     SourceLiteralCacheError::BootstrapUninitialized,
                 ))?;
-            preflight_source_expression_cache(store, expression, boolean)?;
+            let cached_silent_never = store
+                .type_node_links(expression)
+                .and_then(|links| links.resolved_type)
+                == Some(bootstrap.silent_never_type);
+            if cached_silent_never
+                && ![left_plan.node, right_plan.node]
+                    .into_iter()
+                    .any(|operand| {
+                        store
+                            .type_node_links(operand)
+                            .and_then(|links| links.resolved_type)
+                            == Some(bootstrap.silent_never_type)
+                    })
+            {
+                return Err(SourceCheckError::PrimitiveOperator(expression));
+            }
+            preflight_source_expression_cache(
+                store,
+                expression,
+                if cached_silent_never {
+                    bootstrap.silent_never_type
+                } else {
+                    bootstrap.boolean_type
+                },
+            )?;
         }
         let parent = DirectBinaryParent {
             left: left_plan.node,
@@ -30687,6 +30713,9 @@ fn preflight_inferred_function_return_dependencies(
                 expression_is_closed(&condition.operand, parameters, locals, functions)
                     && expression_is_closed(&condition.value, parameters, locals, functions)
             }
+            PlannedSourceCondition::In(condition) => {
+                expression_is_closed(&condition.expression, parameters, locals, functions)
+            }
         }
     }
 
@@ -31094,6 +31123,12 @@ fn preflight_inferred_function_return_dependencies(
                             functions,
                         )
                     }
+                    PlannedSourceCondition::In(condition) => expression_is_closed(
+                        &condition.expression,
+                        &function.callable.parameters,
+                        &locals,
+                        functions,
+                    ),
                 } && [&statements.then_branch, &statements.else_branch]
                     .into_iter()
                     .all(|branch| {
@@ -35731,65 +35766,41 @@ fn check_expression_type_with_capture_context(
                     publish_expression_type(store, node, right.raw)?;
                     left = CheckedExpressionTypes::leaf(right.raw, right.result);
                 } else if operator == SyntaxKind::InKeyword {
-                    let PlannedExpressionKind::String(_) = &binary.left.kind else {
-                        return Err(SourceCheckError::PrimitiveOperator(node));
-                    };
-                    let PlannedExpressionKind::Object { plan, properties } = &right_expression.kind
-                    else {
-                        return Err(SourceCheckError::PrimitiveOperator(node));
-                    };
-                    let [property] = plan.properties.as_slice() else {
-                        return Err(SourceCheckError::PrimitiveOperator(node));
-                    };
-                    if binary.node != node || !binary.prefix.is_empty() || properties.len() != 1 {
+                    if binary.node != node || !binary.prefix.is_empty() {
                         return Err(SourceCheckError::PrimitiveOperator(node));
                     }
-                    let bootstrap =
-                        store
-                            .intrinsic_bootstrap()
-                            .ok_or(SourceCheckError::LiteralCache(
-                                SourceLiteralCacheError::BootstrapUninitialized,
-                            ))?;
-                    let boolean = bootstrap.boolean_type;
-                    let number = bootstrap.number_type;
-                    let Some(left_record) = store.type_payload(left.result) else {
-                        return Err(SourceCheckError::PrimitiveOperator(node));
-                    };
-                    let Some(right_record) = store.type_payload(right.result) else {
-                        return Err(SourceCheckError::PrimitiveOperator(node));
-                    };
-                    let TypeData::Object(object) = right_record.data() else {
-                        return Err(SourceCheckError::PrimitiveOperator(node));
-                    };
-                    let Some([published_property]) = object.structured.properties.as_deref() else {
-                        return Err(SourceCheckError::PrimitiveOperator(node));
-                    };
-                    let Some(property_record) = store.symbol(*published_property) else {
-                        return Err(SourceCheckError::PrimitiveOperator(node));
-                    };
-                    if !left_record.flags().intersects(TypeFlags::STRING_LITERAL)
-                        || right_record.flags() != TypeFlags::OBJECT
-                        || right_record.symbol() != Some(plan.symbol)
-                        || super::object_members::object_literal_state(store, plan)
-                            .map_err(source_object_execution_error)?
-                            .is_none_or(|state| state.type_id() != right.result)
-                        || object
-                            .structured
-                            .members
-                            .and_then(|members| store.symbol_table(members))
-                            .and_then(|members| members.get(property_record.name()))
-                            != Some(*published_property)
-                        || store.value_symbol_links(*published_property)
-                            != Some(&ValueSymbolLinks {
-                                resolved_type: Some(number),
-                                target: Some(property.symbol),
-                                ..ValueSymbolLinks::default()
-                            })
-                    {
-                        return Err(SourceCheckError::PrimitiveOperator(node));
+                    let mut display_flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+                    if options.no_error_truncation {
+                        display_flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
                     }
-                    publish_expression_type(store, node, boolean)?;
-                    left = CheckedExpressionTypes::leaf(boolean, boolean);
+                    let resolution = super::in_operators::check_in_binary_with_session(
+                        store,
+                        host,
+                        global_types,
+                        options.strict_function_types,
+                        display_flags,
+                        session,
+                        PrimitiveBinaryRequest {
+                            expression: node,
+                            left: left_node,
+                            operator,
+                            right: right_expression.node,
+                            left_type: left.result,
+                            right_type: right.result,
+                            left_recovery: left.primitive_binary_recovery,
+                            right_recovery: right.primitive_binary_recovery,
+                            bigint_exponentiation_target: bigint_exponentiation_target(options),
+                        },
+                    )
+                    .map_err(|error| primitive_binary_check_error(host, node, &error))?;
+                    for diagnostic in resolution.diagnostics {
+                        merge_retry_diagnostic(diagnostics, diagnostic);
+                    }
+                    publish_expression_type(store, node, resolution.result_type)?;
+                    left = CheckedExpressionTypes::primitive_binary(
+                        resolution.result_type,
+                        resolution.recovery,
+                    );
                 } else {
                     if node == binary.node
                         && let Some(result) = conditional_nullish_equality_result(
@@ -50147,6 +50158,42 @@ fn check_planned_source_condition_with_capture_context(
             callable,
             condition,
         ),
+        PlannedSourceCondition::In(condition) => {
+            let snapshot = frame
+                .snapshot_at(store, global_types, condition.flow_point)
+                .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+            let checked = check_expression_type_with_capture_context(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                snapshot.types(),
+                type_import_execution,
+                &condition.expression,
+                None,
+                deferred,
+                None,
+                arrow_capture,
+            )?;
+            if store
+                .intrinsic_bootstrap()
+                .is_none_or(|bootstrap| checked.result != bootstrap.boolean_type)
+            {
+                return Err(SourcePlanner::unsupported_function_body(callable));
+            }
+            let input =
+                snapshot
+                    .type_of(condition.flow.symbol)
+                    .ok_or(SourceCheckError::Variable(
+                        VariableInvariant::MissingCurrentFlowType(condition.flow.symbol),
+                    ))?;
+            frame
+                .complete_in_condition(store, host, global_types, session, condition.flow, input)
+                .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))
+        }
     }
 }
 
@@ -56178,6 +56225,9 @@ fn check_callable_statement_condition_effects(
         PlannedSourceCondition::Equality(condition) => {
             check_callable_statement_expression_effects(store, callable, &condition.operand)?;
             check_callable_statement_expression_effects(store, callable, &condition.value)
+        }
+        PlannedSourceCondition::In(condition) => {
+            check_callable_statement_expression_effects(store, callable, &condition.expression)
         }
     }
 }

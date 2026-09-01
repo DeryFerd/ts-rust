@@ -10010,6 +10010,75 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    /// Returns the possible present and absent outcomes of an `in` property check.
+    pub(super) fn in_operator_property_presence(
+        &mut self,
+        type_id: TypeId,
+        name: EscapedNameRef<'_>,
+        globals: &CanonicalGlobalTypes,
+        instantiation_session: &mut InstantiationSession,
+    ) -> Result<[bool; 2], RelationUnavailable> {
+        let bootstrap = self.relation_bootstrap_facts()?;
+        let limit_mark = instantiation_session.limit_event_mark();
+        let result = (|| {
+            let mut session = RelaterSession::new_with_global_types_options_and_session(
+                self,
+                RelationKind::Assignable,
+                bootstrap,
+                Some(RelationGlobalTypes::from_global_types(globals)),
+                None,
+                Some(&mut *instantiation_session),
+            )
+            .with_global_this_hint(Some(globals.global_this_value_type));
+            let resolved = session.resolved_object_members(type_id, true)?;
+            let property = resolved
+                .members
+                .map(|members| {
+                    session
+                        .store
+                        .symbol_table(members)
+                        .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))
+                        .map(|members| members.get(name))
+                })
+                .transpose()?
+                .flatten();
+            if let Some(property) = property {
+                if !resolved.properties.contains(&property) {
+                    return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                }
+                let record = session.property_symbol(property, resolved.property_origin)?;
+                return Ok([
+                    true,
+                    record.flags().contains(SymbolFlags::OPTIONAL)
+                        || record.check_flags().intersects(CheckFlags::PARTIAL),
+                ]);
+            }
+            if let Some(property) = session.global_object_property(name)? {
+                let record = session
+                    .store
+                    .symbol(property)
+                    .ok_or(RelationUnavailable::Symbol(property))?;
+                return Ok([
+                    true,
+                    record.flags().contains(SymbolFlags::OPTIONAL)
+                        || record.check_flags().intersects(CheckFlags::PARTIAL),
+                ]);
+            }
+            if resolved.exact_callable || !resolved.call_signatures.is_empty() {
+                // Function-interface members need their own apparent-member proof.
+                return Err(RelationUnavailable::StructuredSignatures(type_id));
+            }
+            Ok([
+                session.index_signature_accepts_name(type_id, &resolved.index_infos, name)?,
+                true,
+            ])
+        })();
+        if instantiation_session.limit_event_occurred_since(limit_mark) {
+            return Err(RelationUnavailable::UnresolvedStructuredMembers(type_id));
+        }
+        result
+    }
+
     pub(super) fn resolved_own_property_by_key_with_optional_context(
         &mut self,
         type_id: TypeId,

@@ -35,6 +35,7 @@ mod generic_method_calls;
 mod global_types;
 mod helper_signatures;
 pub mod ids;
+mod in_operators;
 mod indexed_access_types;
 mod inference;
 mod instantiate;
