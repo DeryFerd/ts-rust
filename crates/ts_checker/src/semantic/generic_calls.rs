@@ -59,7 +59,9 @@ use super::{
         cached_instantiation_with_vector, instantiate_type_with_session,
         instantiate_type_with_vector_and_session,
     },
-    instantiated_members::instantiated_interface_method_signature_return,
+    instantiated_members::{
+        generic_interface_call_signature_return, instantiated_interface_method_signature_return,
+    },
     keyof_types::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
         validate_generic_keyof_index_type,
@@ -68,7 +70,7 @@ use super::{
     object_aliases::property_object_alias_nonempty_projection,
     object_members::{
         DeclaredMethodTypeParameterView, declared_class_method_type_parameter_view,
-        declared_method_type_parameter_view,
+        declared_interface_call_type_parameter_view, declared_method_type_parameter_view,
     },
     reference_types::{DirectGenericReference, validate_direct_generic_reference},
     relation::RelationKind,
@@ -699,6 +701,11 @@ pub(super) fn generic_method_signature_callee(
 ) -> Result<Option<TypeId>, GenericCallVectorError> {
     if let Some(callee) = declared_method_signature_callee(store, signature, array_targets) {
         return Ok(Some(callee));
+    }
+    if let Some(call) = generic_interface_call_signature_return(store, signature, array_targets)
+        .map_err(|_| GenericCallVectorInvariant::CallableSignatureMismatch(signature))?
+    {
+        return Ok(Some(call.owner));
     }
     if let Some(callee) =
         super::classes::source_class_generic_method_callee(store, signature, array_targets)
@@ -2139,6 +2146,21 @@ fn validate_generic_call_instantiated_method(
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<GenericCallInstantiatedMethod>, GenericCallVectorError> {
     let invalid = || GenericCallVectorInvariant::CallableSignatureMismatch(signature);
+    if let Some(call) = generic_interface_call_signature_return(store, signature, array_targets)
+        .map_err(|_| invalid())?
+    {
+        if call.owner != callee {
+            return Err(invalid().into());
+        }
+        if call.source == signature {
+            return Ok(None);
+        }
+        let record = store.signature(signature).ok_or_else(invalid)?;
+        return Ok(Some(GenericCallInstantiatedMethod {
+            source: call.source,
+            mapper: record.mapper().ok_or_else(invalid)?,
+        }));
+    }
     let Some(method) =
         instantiated_interface_method_signature_return(store, signature, array_targets)
             .map_err(|_| invalid())?
@@ -2185,6 +2207,9 @@ fn validate_generic_method_type_parameter_view(
     let invalid = || GenericCallVectorInvariant::CallableSignatureMismatch(signature);
     if instantiated.is_none()
         && declared_method_signature_callee(store, signature, array_targets) != Some(callee)
+        && generic_interface_call_signature_return(store, signature, array_targets)
+            .map_err(|_| invalid())?
+            .is_none_or(|call| call.owner != callee)
     {
         if super::classes::source_class_generic_method_callee(store, signature, array_targets)
             .map_err(|_| invalid())?
@@ -2227,12 +2252,14 @@ fn validate_generic_method_type_parameter_view(
             parameters: Vec::new(),
         }));
     }
-    let mut parameters = declared_method_type_parameter_view(
-        store,
-        original,
-        original.declaration().ok_or_else(invalid)?,
-    )
-    .ok_or_else(invalid)?;
+    let declaration = original.declaration().ok_or_else(invalid)?;
+    let mut parameters =
+        if store.source_node_kind(declaration) == Some(SyntaxKind::CallSignature) {
+            declared_interface_call_type_parameter_view(store, original, declaration)
+        } else {
+            declared_method_type_parameter_view(store, original, declaration)
+        }
+        .ok_or_else(invalid)?;
     if let Some(method) = instantiated {
         let copied = store.signature(signature).ok_or_else(invalid)?;
         if copied.type_parameters().len() != parameters.len() {

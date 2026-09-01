@@ -4,8 +4,7 @@ use ts_binder::{
     EscapedName, InternalSymbolName, SemanticSymbolId,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, SignatureId, SourceCheckError,
-    SourceSyntaxRole, TypeData, TypeId, UnsupportedSourceSyntax,
+    CanonicalCheckerContext, CanonicalCheckerOptions, SignatureId, TypeData, TypeId,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -457,7 +456,8 @@ fn generic_interface_void_calls_keep_the_missing_argument_declaration() {
 }
 
 #[test]
-fn call_owned_type_parameters_stay_unsupported_without_signature_publication() {
+#[allow(clippy::too_many_lines)] // Keep the original source case and check both levels of signature mapping.
+fn call_owned_type_parameters_keep_signature_owners_and_replay() {
     let parsed = parse_source_file(concat!(
         "interface Callable<T> { <U>(value: U): T; }\n",
         "declare const callable: Callable<number>;\n",
@@ -466,32 +466,142 @@ fn call_owned_type_parameters_stay_unsupported_without_signature_publication() {
     let declaration = nodes(&parsed, SyntaxKind::CallSignature)[0];
     let call = nodes(&parsed, SyntaxKind::CallExpression)[0];
     let mut context = context(&parsed);
+    context.check_source_file(FILE).unwrap();
+    assert!(context.diagnostics().is_empty());
     let parameters = nodes(&parsed, SyntaxKind::TypeParameter)
         .into_iter()
         .map(|parameter| symbol(&context, parameter))
         .collect::<Vec<_>>();
-    let before = counts(&context);
-    for _ in 0..2 {
-        assert_eq!(
-            context.check_source_file(FILE),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Syntax {
-                    node: declaration,
-                    kind: SyntaxKind::CallSignature,
-                    role: SourceSyntaxRole::InterfaceDeclaration,
-                }
-            )),
-        );
-        assert_eq!(counts(&context), before);
-        assert!(context.diagnostics().is_empty());
-        for node in [declaration, call] {
-            assert!(context.store().signature_links(node).is_none());
-            assert!(context.store().type_node_links(node).is_none());
-        }
-        assert!(
-            parameters
-                .iter()
-                .all(|parameter| context.store().declared_type_links(*parameter).is_none())
-        );
-    }
+    assert_eq!(parameters.len(), 2);
+    assert_ne!(parameters[0], parameters[1]);
+    let outer = context.get_declared_type_of_symbol(parameters[0]).unwrap();
+    let inner = context.get_declared_type_of_symbol(parameters[1]).unwrap();
+    assert_ne!(outer, inner);
+    let interface = nodes(&parsed, SyntaxKind::InterfaceDeclaration)[0];
+    let owner = symbol(&context, interface);
+    let target = context.get_declared_type_of_symbol(owner).unwrap();
+    let declared = signature(&context, declaration);
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    let number = bootstrap.number_type;
+    let string = bootstrap.string_type;
+    assert_eq!(context.get_return_type_of_signature(declared), Ok(outer));
+    assert_eq!(context.get_type_at_location(call), Ok(number));
+    let instance = context.get_type_at_location(callee(&parsed, call)).unwrap();
+    let TypeData::TypeReference(reference) = context.store().type_payload(instance).unwrap().data()
+    else {
+        panic!("the callable must retain its generic interface instance")
+    };
+    assert_eq!(reference.object.target, Some(target));
+    assert_eq!(
+        reference.resolved_type_arguments.as_deref(),
+        Some(&[number][..])
+    );
+    assert_eq!(reference.object.structured.call_signature_count, 1);
+    let [copied] = reference.object.structured.signatures.as_deref().unwrap() else {
+        panic!("the instance must retain its one copied call signature")
+    };
+    let copied = *copied;
+    assert_ne!(copied, declared);
+    assert_eq!(context.get_return_type_of_signature(copied), Ok(number));
+    let selected = signature(&context, call);
+    assert_ne!(selected, copied);
+    assert_eq!(context.get_return_type_of_signature(selected), Ok(number));
+    let NodeData::CallSignatureDeclaration(call_data) =
+        &parsed.arena.get(declaration.node).unwrap().data
+    else {
+        panic!("expected the original call declaration")
+    };
+    let parameter = NodeRef::new(parsed.arena.id(), FILE, call_data.parameters.nodes[0]);
+    let parameter_owner = symbol(&context, parameter);
+    let NodeData::ParameterDeclaration(parameter_data) =
+        &parsed.arena.get(parameter.node).unwrap().data
+    else {
+        panic!("expected the original value parameter")
+    };
+    let annotations = [parameter_data.type_.unwrap(), call_data.type_.unwrap()]
+        .map(|node| NodeRef::new(parsed.arena.id(), FILE, node));
+    assert_eq!(context.get_type_from_type_node(annotations[0]), Ok(inner));
+    assert_eq!(context.get_type_from_type_node(annotations[1]), Ok(outer));
+    let store = context.store();
+    let original = store.signature(declared).unwrap();
+    assert_eq!(original.declaration(), Some(declaration));
+    assert_eq!(original.type_parameters(), [inner]);
+    assert_eq!(original.parameters(), [parameter_owner]);
+    assert_eq!(original.target(), None);
+    assert_eq!(original.mapper(), None);
+    let copy = store.signature(copied).unwrap();
+    assert_eq!(copy.target(), Some(declared));
+    assert_eq!(copy.declaration(), Some(declaration));
+    assert_eq!(copy.min_argument_count(), 1);
+    let [fresh] = copy.type_parameters() else {
+        panic!("owner substitution must retain a fresh call-owned parameter")
+    };
+    let fresh = *fresh;
+    assert_ne!(fresh, inner);
+    assert_ne!(fresh, outer);
+    let copy_mapper = copy.mapper().unwrap();
+    let TypeData::TypeParameter(data) = store.type_payload(fresh).unwrap().data() else {
+        panic!("the copied type parameter must retain its source identity")
+    };
+    assert_eq!(
+        store.type_payload(fresh).unwrap().symbol(),
+        Some(parameters[1])
+    );
+    assert_eq!(data.target, Some(inner));
+    assert_eq!(data.mapper, Some(copy_mapper));
+    let copied_parameter = copy.parameters()[0];
+    assert_ne!(copied_parameter, parameter_owner);
+    let links = store.value_symbol_links(copied_parameter).unwrap();
+    assert_eq!(links.target, Some(parameter_owner));
+    assert_eq!(links.mapper, Some(copy_mapper));
+    assert_eq!(links.resolved_type, Some(fresh));
+    let instantiated = store.signature(selected).unwrap();
+    assert_eq!(instantiated.target(), Some(copied));
+    assert_eq!(instantiated.declaration(), Some(declaration));
+    assert!(instantiated.type_parameters().is_empty());
+    let call_mapper = instantiated.mapper().unwrap();
+    assert_ne!(call_mapper, copy_mapper);
+    assert_eq!(store.map_type(call_mapper, fresh), Some(string));
+    assert_eq!(store.map_type(call_mapper, inner), Some(inner));
+    assert_eq!(store.map_type(call_mapper, outer), Some(outer));
+    let selected_parameter = instantiated.parameters()[0];
+    assert_ne!(selected_parameter, copied_parameter);
+    assert_ne!(selected_parameter, parameter_owner);
+    let links = store.value_symbol_links(selected_parameter).unwrap();
+    assert_eq!(links.target, Some(parameter_owner));
+    assert_eq!(links.resolved_type, Some(string));
+    let snapshot = |context: &CanonicalCheckerContext<'_>| {
+        let store = context.store();
+        (
+            [outer, inner, fresh].map(|type_| {
+                let TypeData::TypeParameter(data) = store.type_payload(type_).unwrap().data()
+                else {
+                    panic!("source and copied type parameters must stay present")
+                };
+                (
+                    type_,
+                    store.type_payload(type_).unwrap().symbol(),
+                    data.clone(),
+                )
+            }),
+            [declared, copied, selected].map(|signature| {
+                let record = store.signature(signature).unwrap();
+                (
+                    record.type_parameters().to_vec(),
+                    record.target(),
+                    record.mapper(),
+                    record.resolved_return_type(),
+                    record
+                        .parameters()
+                        .iter()
+                        .map(|&parameter| (parameter, store.value_symbol_links(parameter).cloned()))
+                        .collect::<Vec<_>>(),
+                )
+            }),
+        )
+    };
+    let warm = snapshot(&context);
+    assert_replay(&mut context, &parsed, &[call], &annotations);
+    assert_eq!(snapshot(&context), warm);
+    assert!(context.store().type_resolution_is_empty());
 }
