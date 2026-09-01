@@ -187,6 +187,20 @@ const fn invariant(reason: SourceNewInvariant) -> SourceNewError {
     SourceNewError::Invariant(reason)
 }
 
+fn trace_constructor_failure(
+    stage: &'static str,
+    expression: NodeRef,
+    constructor: NodeRef,
+    details: std::fmt::Arguments<'_>,
+) {
+    let _ = std::io::Write::write_fmt(
+        &mut std::io::stderr().lock(),
+        format_args!(
+            "ts-rust-constructor-error stage={stage} expression={expression:?} constructor={constructor:?} {details}\n"
+        ),
+    );
+}
+
 /// Opaque syntax, resolver, and provider proof for one direct construction.
 #[derive(Clone, Debug)]
 pub(super) struct SourceDefaultNewPlan {
@@ -1121,7 +1135,15 @@ fn plan_direct_default_new_with_context(
     let library = source_context
         .map(|(globals, options)| {
             plan_global_constructor_value(store, host, globals, options, symbol)
-                .map_err(|error| global_error::provider_error(constructor, symbol, error))
+                .map_err(|error| {
+                    trace_constructor_failure(
+                        "provider_plan_literal",
+                        node,
+                        constructor,
+                        format_args!("provider={symbol:?} raw_error={error:?}"),
+                    );
+                    global_error::provider_error(constructor, symbol, error)
+                })
         })
         .transpose()?
         .flatten();
@@ -1195,7 +1217,15 @@ fn plan_direct_default_new_with_context(
         && let Some((globals, options)) = source_context
         && let Some(library) =
             plan_global_generic_constructor_value(store, host, globals, options, symbol)
-                .map_err(|error| global_error::provider_error(constructor, symbol, error))?
+                .map_err(|error| {
+                    trace_constructor_failure(
+                        "provider_plan_named",
+                        node,
+                        constructor,
+                        format_args!("provider={symbol:?} raw_error={error:?}"),
+                    );
+                    global_error::provider_error(constructor, symbol, error)
+                })?
     {
         return plan_generic_library_new(
             store,
@@ -4527,6 +4557,12 @@ pub(super) fn prepare_direct_default_news(
                     library,
                 )
                 .map_err(|error| {
+                    trace_constructor_failure(
+                        "provider_prepare",
+                        plan.node,
+                        plan.constructor,
+                        format_args!("provider={:?} raw_error={error:?}", plan.resolved_symbol),
+                    );
                     global_error::provider_error(plan.constructor, plan.resolved_symbol, error)
                 })?;
                 resolve_library_new_candidates(store, host, global_types, options, plan)?
@@ -6222,9 +6258,36 @@ pub(super) fn preflight_source_generic_class_new_with_context(
     access: Option<&ClassBodyAccessToken>,
 ) -> Result<(), SourceNewError> {
     if plan.is_generic_library_constructor() {
-        preflight_direct_default_new_with_source_context(store, host, globals, options, plan)?;
-        let candidates = resolve_library_new_candidates(store, host, globals, options, plan)?
-            .ok_or_else(|| unsupported(SourceNewUnsupported::Constructor(plan.constructor)))?;
+        preflight_direct_default_new_with_source_context(store, host, globals, options, plan)
+            .map_err(|error| {
+                trace_constructor_failure(
+                    "required_preflight_error",
+                    plan.node,
+                    plan.constructor,
+                    format_args!("error={error:?}"),
+                );
+                error
+            })?;
+        let candidates = resolve_library_new_candidates(store, host, globals, options, plan)
+            .map_err(|error| {
+                trace_constructor_failure(
+                    "required_read_error",
+                    plan.node,
+                    plan.constructor,
+                    format_args!("error={error:?}"),
+                );
+                error
+            })?
+            .ok_or_else(|| {
+                let error = unsupported(SourceNewUnsupported::Constructor(plan.constructor));
+                trace_constructor_failure(
+                    "required_candidates_missing",
+                    plan.node,
+                    plan.constructor,
+                    format_args!("candidate_state=missing error={error:?}"),
+                );
+                error
+            })?;
         if let Some(signature) = exact_signature_cache(store, plan.node)
             .map_err(|()| invariant(SourceNewInvariant::InvalidExpressionCache(plan.node)))?
         {
@@ -6993,12 +7056,26 @@ fn resolve_library_new_candidates(
     } else {
         plan_global_constructor_value(store, host, globals, options, plan.resolved_symbol)
     }
-    .map_err(|error| global_error::provider_error(plan.constructor, plan.resolved_symbol, error))?;
+    .map_err(|error| {
+        trace_constructor_failure(
+            "provider_revalidate",
+            plan.node,
+            plan.constructor,
+            format_args!("provider={:?} raw_error={error:?}", plan.resolved_symbol),
+        );
+        global_error::provider_error(plan.constructor, plan.resolved_symbol, error)
+    })?;
     if current.as_ref() != Some(library.as_ref()) {
         return Err(invalid());
     }
     let Some(ready) = resolve_global_constructor_candidates(store, host, globals, options, library)
         .map_err(|error| {
+            trace_constructor_failure(
+                "provider_read",
+                plan.node,
+                plan.constructor,
+                format_args!("provider={:?} raw_error={error:?}", plan.resolved_symbol),
+            );
             global_error::provider_error(plan.constructor, plan.resolved_symbol, error)
         })?
     else {
@@ -8695,7 +8772,18 @@ fn preflight_default_new_cache_with_context(
                     plan.constructor,
                 ))
             })?;
-            let candidates = resolve_library_new_candidates(store, host, globals, options, plan)?;
+            let candidates = resolve_library_new_candidates(store, host, globals, options, plan)
+                .map_err(|error| {
+                    trace_constructor_failure(
+                        "cache_read_error",
+                        plan.node,
+                        plan.constructor,
+                        format_args!(
+                            "cached_constructor_symbol={constructor_symbol:?} cached_constructor_type={constructor_type:?} cached_result_type={result_type:?} cached_signature={signature:?} error={error:?}"
+                        ),
+                    );
+                    error
+                })?;
             if plan.is_generic_library_constructor() {
                 let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
                 if constructor_type.is_some_and(|type_| {
