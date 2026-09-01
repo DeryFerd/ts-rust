@@ -13254,7 +13254,11 @@ pub(super) fn authenticated_object_method_contextual_target(
         if store.type_payload(callable)?.symbol() == Some(owner_symbol) {
             return None;
         }
-        if let Some(alias) = record.alias() {
+        let alias = match record.alias() {
+            Some(alias) => Some(store.type_alias_payload(alias)?),
+            None => None,
+        };
+        if let Some(alias) = alias {
             store
                 .validate_union_alias_identity(
                     target,
@@ -13264,7 +13268,7 @@ pub(super) fn authenticated_object_method_contextual_target(
                 .ok()?;
         }
         store
-            .validate_cached_union_result(target, record.alias().and_then(|alias| alias.symbol()))
+            .validate_cached_union_result(target, alias.and_then(|alias| alias.symbol()))
             .ok()?;
         callable
     } else {
