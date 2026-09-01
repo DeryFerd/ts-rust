@@ -1120,10 +1120,25 @@ fn local_callbacks_keep_mutable_entry_types_deferred_writes_and_narrowed_const_r
 
 #[test]
 fn statement_composition_keeps_unreleased_headers_statements_and_call_effects_rejected() {
+    {
+        let source = "const run = (flag: boolean): void => { const entry = flag; if (entry) {} try {} catch {} };";
+        let parsed = parse_source_file(source);
+        let run = callable(&parsed, "run");
+        let mut checker = context(&parsed);
+        checker.check_source_file(FILE).unwrap();
+        assert!(checked(&checker));
+        assert!(checker.diagnostics().is_empty());
+        let state = callable_state(&mut checker, &parsed, &run);
+        assert_eq!(
+            state.returned,
+            checker.store().intrinsic_bootstrap().unwrap().void_type
+        );
+        replay(&mut checker, &parsed, &[&run], &[]);
+        assert!(checked(&checker));
+    }
     for source in [
         "const run = (flag: boolean): void => { const entry = flag; while (entry) {} };",
         "const run = (flag: boolean): void => { const entry = flag; if (entry); };",
-        "const run = (flag: boolean): void => { const entry = flag; if (entry) {} try {} catch {} };",
         "const run = <T>(flag: boolean, value: T): T => { const entry = flag; if (entry) { return value; } return value; };",
         "const run = async (flag: boolean) => { const entry = flag; if (entry) { return; } };",
         "const run = (flag: boolean) => { return 1; const later = flag; };",
