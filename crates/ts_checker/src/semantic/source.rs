@@ -26658,6 +26658,93 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             {
                 (false, false)
             }
+            NodeData::TemplateSpan(span)
+                if owner_record.kind == SyntaxKind::TemplateSpan
+                    && span.expression == root.node =>
+            {
+                let unsupported = || {
+                    self.unsupported(
+                        expression,
+                        SyntaxKind::ConditionalExpression,
+                        SourceSyntaxRole::VariableInitializer,
+                    )
+                };
+                let template = owner_record
+                    .parent
+                    .map(|node| self.reference(node))
+                    .ok_or_else(unsupported)?;
+                let template_record = self.node(template)?;
+                let NodeData::TemplateExpression(template_data) = &template_record.data else {
+                    return Err(unsupported());
+                };
+                let span_index = template_data
+                    .template_spans
+                    .nodes
+                    .iter()
+                    .position(|node| *node == owner.node)
+                    .ok_or_else(unsupported)?;
+                let root_record = self.node(root)?;
+                let literal = self.reference(span.literal);
+                let literal_record = self.node(literal)?;
+                let valid_literal = match (&literal_record.data, literal_record.kind) {
+                    (NodeData::TemplateMiddle(data), SyntaxKind::TemplateMiddle) => {
+                        span_index + 1 < template_data.template_spans.nodes.len()
+                            && data.token_flags.0 == 0
+                            && data.template_flags.0 == 0
+                    }
+                    (NodeData::TemplateTail(data), SyntaxKind::TemplateTail) => {
+                        span_index + 1 == template_data.template_spans.nodes.len()
+                            && data.token_flags.0 == 0
+                            && data.template_flags.0 == 0
+                    }
+                    _ => false,
+                };
+                let container = self.bound.container(template);
+                let block_scope = self.bound.block_scope_container(template);
+                if self.bound.node_arena_id() != self.arena.id()
+                    || self.bound.node_arena_revision() != self.arena.revision()
+                    || container.is_none()
+                    || block_scope.is_none()
+                    || [root, owner, template, literal].into_iter().any(|node| {
+                        !node.is_for(self.arena.id(), self.bound.file_id())
+                            || !self.bound.contains(node)
+                            || self.bound.container(node) != container
+                            || self.bound.block_scope_container(node) != block_scope
+                    })
+                    || owner_record.flags.0 != 0
+                    || template_record.kind != SyntaxKind::TemplateExpression
+                    || template_record.flags.0 != 0
+                    || template_data.facts != 0
+                    || template_data.template_spans.has_trailing_comma
+                    || template_data
+                        .template_spans
+                        .nodes
+                        .iter()
+                        .filter(|node| **node == owner.node)
+                        .count()
+                        != 1
+                    || template_data.template_spans.range.start < template_record.range.start
+                    || template_data.template_spans.range.end > template_record.range.end
+                    || owner_record.range.start < template_data.template_spans.range.start
+                    || owner_record.range.end > template_record.range.end
+                    || root_record.parent != Some(owner.node)
+                    || root_record.range.start != owner_record.range.start
+                    || literal_record.parent != Some(owner.node)
+                    || literal_record.flags.0 != 0
+                    || literal_record.range.start < root_record.range.end
+                    || literal_record.range.end != owner_record.range.end
+                    || !valid_literal
+                {
+                    return Err(unsupported());
+                }
+                if let Some(parent) = template_record.parent {
+                    let parent_record = self.node(self.reference(parent))?;
+                    if parent_record.kind == SyntaxKind::TaggedTemplateExpression {
+                        return Err(unsupported());
+                    }
+                }
+                (false, false)
+            }
             NodeData::ReturnStatement(return_statement)
                 if owner_record.kind == SyntaxKind::ReturnStatement
                     && return_statement.expression == Some(root.node) =>
