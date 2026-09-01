@@ -657,7 +657,7 @@ struct SourceFlowRegion {
     unreachable_incrementor: Option<NodeRef>,
 }
 
-/// A direct identifier whose current type is narrowed on an `if` edge.
+/// An identifier narrowed on an `if` edge, including enclosing `!` operators.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceTruthinessCondition {
     /// The exact AST payload carried by both binder condition nodes.
@@ -8669,15 +8669,31 @@ fn retained_linear_truthiness_conditions(
         }
         let mut reference = expression;
         let mut wrappers = HashSet::new();
-        while let Some(NodeData::ParenthesizedExpression(parenthesized)) =
-            arena.get(reference.node).map(|record| &record.data)
-        {
+        let mut negated = false;
+        loop {
             if !wrappers.insert(reference) {
                 return Err(SourceFlowInvariant::UnknownCondition(expression).into());
             }
-            reference = NodeRef::new(reference.arena, reference.file, parenthesized.expression);
+            let inner = match arena
+                .get(reference.node)
+                .map(|record| (&record.kind, &record.data))
+            {
+                Some((
+                    SyntaxKind::ParenthesizedExpression,
+                    NodeData::ParenthesizedExpression(parenthesized),
+                )) => parenthesized.expression,
+                Some((
+                    SyntaxKind::PrefixUnaryExpression,
+                    NodeData::PrefixUnaryExpression(prefix),
+                )) if prefix.operator == SyntaxKind::ExclamationToken => {
+                    negated = !negated;
+                    prefix.operand
+                }
+                _ => break,
+            };
+            reference = NodeRef::new(reference.arena, reference.file, inner);
         }
-        if condition.negated
+        if condition.negated != negated
             || !arena.get(reference.node).is_some_and(|record| {
                 record.kind == SyntaxKind::Identifier
                     && matches!(record.data, NodeData::Identifier(_))

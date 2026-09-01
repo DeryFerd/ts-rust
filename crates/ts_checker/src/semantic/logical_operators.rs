@@ -1,7 +1,7 @@
-//! Canonical result types for `&&`, `||`, and `??`.
+//! Canonical result types for `!`, `&&`, `||`, and `??`.
 //!
 //! This ports the dependency-closed portion of typescript-go
-//! `checkBinaryLikeExpression`, `getTypeFacts`,
+//! `checkPrefixUnaryExpression`, `checkBinaryLikeExpression`, `getTypeFacts`,
 //! `removeDefinitelyFalsyTypes`, and `extractDefinitelyFalsyTypes`. Syntax
 //! diagnostics and source-link publication remain source-dispatch concerns.
 
@@ -16,7 +16,7 @@ use super::{
     enums::canonical_enum_type_owner,
     instantiate::InstantiationSession,
     type_records::{LiteralValue, TypeData, TypeRecord},
-    types::TypeFlags,
+    types::{ObjectFlags, TypeFlags},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +86,25 @@ impl LogicalTypeFacts {
         self.falsy |= other.falsy;
         self.nullish |= other.nullish;
     }
+}
+
+/// Uses the checked operand's truthiness facts for the result of `!`.
+pub(super) fn check_logical_not(
+    store: &CanonicalTypeMapperStore,
+    operand: TypeId,
+) -> Result<TypeId, LogicalBinaryError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(LogicalBinaryInvariant::MissingBootstrap)?;
+    if operand == bootstrap.silent_never_type {
+        return Ok(operand);
+    }
+    let facts = logical_type_facts(store, operand, bootstrap.options.strict_null_checks)?;
+    Ok(match (facts.truthy, facts.falsy) {
+        (true, false) => bootstrap.false_type,
+        (false, true) => bootstrap.true_type,
+        _ => bootstrap.boolean_type,
+    })
 }
 
 /// Computes the pinned result after both operands have been checked.
@@ -414,9 +433,32 @@ fn logical_type_facts_worker(
     } else if flags
         .intersects(TypeFlags::OBJECT | TypeFlags::NON_PRIMITIVE | TypeFlags::ES_SYMBOL_LIKE)
     {
+        let mut empty_anonymous = false;
+        if flags.intersects(TypeFlags::OBJECT)
+            && record.object_flags().intersects(ObjectFlags::ANONYMOUS)
+            && store
+                .intrinsic_bootstrap()
+                .is_none_or(|bootstrap| type_ != bootstrap.any_function_type)
+        {
+            if !record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+            {
+                return Err(LogicalBinaryError::Unsupported(
+                    LogicalBinaryUnsupported::Type(type_),
+                ));
+            }
+            let structured = record
+                .data()
+                .structured()
+                .ok_or(LogicalBinaryInvariant::InvalidType(type_))?;
+            empty_anonymous = structured.properties.as_ref().is_none_or(Vec::is_empty)
+                && structured.signatures.as_ref().is_none_or(Vec::is_empty)
+                && structured.index_infos.as_ref().is_none_or(Vec::is_empty);
+        }
         LogicalTypeFacts {
             truthy: true,
-            falsy: false,
+            falsy: empty_anonymous,
             nullish: false,
         }
     } else {

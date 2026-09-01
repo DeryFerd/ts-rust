@@ -308,3 +308,374 @@ fn parenthesized_prefix_unary_artifacts_keep_operand_identity_on_replay() {
         ],
     );
 }
+
+#[derive(Clone, Copy, Debug)]
+enum CheckedType {
+    Boolean,
+    True,
+    False,
+    String,
+    Undefined,
+    Object,
+    Void,
+    Never,
+    Error,
+    EmptyObject,
+    StringOrUndefined,
+    ObjectOrUndefined,
+    EmptyObjectOrNull,
+}
+
+fn only_node(parsed: &ParseResult, kind: SyntaxKind) -> NodeRef {
+    let nodes = parsed
+        .arena
+        .iter()
+        .filter_map(|(node, record)| {
+            (record.kind == kind).then_some(NodeRef::new(parsed.arena.id(), FILE, node))
+        })
+        .collect::<Vec<_>>();
+    let [node] = nodes.as_slice() else {
+        panic!("expected one {kind:?}, found {nodes:?}")
+    };
+    *node
+}
+
+fn assert_checked_type(
+    context: &mut CanonicalCheckerContext<'_>,
+    node: NodeRef,
+    expected: CheckedType,
+) -> TypeId {
+    let actual = context.get_type_at_location(node).unwrap();
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    let (identity, display) = match expected {
+        CheckedType::Boolean => (Some(bootstrap.boolean_type), "boolean"),
+        CheckedType::True => (Some(bootstrap.true_type), "true"),
+        CheckedType::False => (Some(bootstrap.false_type), "false"),
+        CheckedType::String => (Some(bootstrap.string_type), "string"),
+        CheckedType::Undefined => (Some(bootstrap.undefined_type), "undefined"),
+        CheckedType::Object => (Some(bootstrap.non_primitive_type), "object"),
+        CheckedType::Void => (Some(bootstrap.void_type), "void"),
+        CheckedType::Never => (Some(bootstrap.never_type), "never"),
+        CheckedType::Error => (Some(bootstrap.error_type), "any"),
+        CheckedType::EmptyObject => (Some(bootstrap.empty_type_literal_type), "{}"),
+        CheckedType::StringOrUndefined
+        | CheckedType::ObjectOrUndefined
+        | CheckedType::EmptyObjectOrNull => {
+            let (present, absent, display) = match expected {
+                CheckedType::StringOrUndefined => (
+                    bootstrap.string_type,
+                    bootstrap.undefined_type,
+                    "string | undefined",
+                ),
+                CheckedType::ObjectOrUndefined => (
+                    bootstrap.non_primitive_type,
+                    bootstrap.undefined_type,
+                    "object | undefined",
+                ),
+                CheckedType::EmptyObjectOrNull => (
+                    bootstrap.empty_type_literal_type,
+                    bootstrap.null_type,
+                    "{} | null",
+                ),
+                _ => unreachable!(),
+            };
+            let TypeData::Union(union) = context.store().type_payload(actual).unwrap().data()
+            else {
+                panic!("expected the declared nullable union, got {actual:?}")
+            };
+            let mut constituents = [present, absent];
+            constituents.sort_unstable();
+            assert_eq!(union.union.types, constituents);
+            (None, display)
+        }
+    };
+    if let Some(identity) = identity {
+        assert_eq!(actual, identity, "{node:?}: {expected:?}");
+    }
+    assert_eq!(context.type_to_string(actual).unwrap(), display);
+    assert_eq!(
+        context
+            .store()
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type),
+        Some(actual),
+    );
+    actual
+}
+
+fn assert_checked_negation_queries(
+    parsed: &ParseResult,
+    queries: &[(NodeRef, CheckedType)],
+    expected_diagnostics: &[(NodeRef, u32, &[&str], &str)],
+) {
+    let parameter = only_node(parsed, SyntaxKind::Parameter);
+    for source_first in [false, true] {
+        for reverse in [false, true] {
+            let mut context = context(parsed);
+            let parameter_symbol = context.file(FILE).unwrap().1.symbol(parameter).unwrap();
+            let mut queries = queries.to_vec();
+            if reverse {
+                queries.reverse();
+            }
+            if source_first {
+                context.check_source_file(FILE).unwrap();
+            }
+            let observed = queries
+                .iter()
+                .map(|&(node, expected)| {
+                    let type_ = assert_checked_type(&mut context, node, expected);
+                    let symbol = if let NodeData::Identifier(name) =
+                        &parsed.arena.get(node.node).unwrap().data
+                    {
+                        assert_eq!(name.text, "value");
+                        Some(parameter_symbol)
+                    } else {
+                        None
+                    };
+                    assert_eq!(context.get_symbol_at_location(node), Ok(symbol));
+                    (type_, symbol)
+                })
+                .collect::<Vec<_>>();
+            context.check_source_file(FILE).unwrap();
+            let diagnostics = context.diagnostics().as_slice();
+            assert_eq!(
+                diagnostics.len(),
+                expected_diagnostics.len(),
+                "{diagnostics:?}"
+            );
+            for (diagnostic, &(node, code, arguments, message)) in
+                diagnostics.iter().zip(expected_diagnostics)
+            {
+                assert_eq!(diagnostic.node, Some(node));
+                assert_eq!(diagnostic.range_override, None);
+                assert_eq!(diagnostic.diagnostic.code(), code);
+                assert_eq!(diagnostic.diagnostic.arguments, arguments);
+                assert_eq!(diagnostic.diagnostic.render().unwrap(), message);
+                assert!(diagnostic.related_information.is_empty());
+            }
+            assert!(
+                context
+                    .store()
+                    .source_file_links(context.source_file(FILE).unwrap())
+                    .unwrap()
+                    .type_checked
+            );
+            let diagnostics = diagnostics.to_vec();
+            let warm = snapshot(&context, parsed);
+            for _ in 0..2 {
+                for (&(node, expected), &(type_, symbol)) in queries.iter().zip(&observed).rev() {
+                    assert_eq!(assert_checked_type(&mut context, node, expected), type_);
+                    assert_eq!(context.get_symbol_at_location(node), Ok(symbol));
+                }
+                context.check_source_file(FILE).unwrap();
+                context.recheck_source_file(FILE).unwrap();
+                assert_eq!(context.diagnostics().as_slice(), diagnostics);
+                assert_eq!(snapshot(&context, parsed), warm);
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_boolean_negation_checks_real_operands_and_exact_result_types() {
+    for (source, result, operand) in [
+        (
+            "function absent(value: string | undefined): boolean { return !value; }",
+            CheckedType::Boolean,
+            CheckedType::StringOrUndefined,
+        ),
+        (
+            "function present(value: object): false { return !value; }",
+            CheckedType::False,
+            CheckedType::Object,
+        ),
+        (
+            "function absent(value: undefined): true { return !value; }",
+            CheckedType::True,
+            CheckedType::Undefined,
+        ),
+        (
+            "function empty(value: {}): boolean { return !value; }",
+            CheckedType::Boolean,
+            CheckedType::EmptyObject,
+        ),
+        (
+            "function empty(value: {} | null): boolean { return !value; }",
+            CheckedType::Boolean,
+            CheckedType::EmptyObjectOrNull,
+        ),
+    ] {
+        let parsed = parse_source_file(source);
+        let negation = only_node(&parsed, SyntaxKind::PrefixUnaryExpression);
+        let value = prefix_operand(&parsed, negation, SyntaxKind::ExclamationToken);
+        assert_checked_negation_queries(&parsed, &[(negation, result), (value, operand)], &[]);
+    }
+
+    let parsed = parse_source_file("function twice(value: boolean): boolean { return !!value; }");
+    let returned = only_node(&parsed, SyntaxKind::ReturnStatement);
+    let NodeData::ReturnStatement(statement) = &parsed.arena.get(returned.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let outer = NodeRef::new(parsed.arena.id(), FILE, statement.expression.unwrap());
+    let inner = prefix_operand(&parsed, outer, SyntaxKind::ExclamationToken);
+    let value = prefix_operand(&parsed, inner, SyntaxKind::ExclamationToken);
+    assert_checked_negation_queries(
+        &parsed,
+        &[
+            (outer, CheckedType::Boolean),
+            (inner, CheckedType::Boolean),
+            (value, CheckedType::Boolean),
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn ordinary_boolean_negation_keeps_return_type_errors_and_replay() {
+    let parsed =
+        parse_source_file("function absent(value: string | undefined): number { return !value; }");
+    let negation = only_node(&parsed, SyntaxKind::PrefixUnaryExpression);
+    let value = prefix_operand(&parsed, negation, SyntaxKind::ExclamationToken);
+    assert_checked_negation_queries(
+        &parsed,
+        &[
+            (negation, CheckedType::Boolean),
+            (value, CheckedType::StringOrUndefined),
+        ],
+        &[(
+            only_node(&parsed, SyntaxKind::ReturnStatement),
+            2322,
+            &["boolean", "number"],
+            "Type 'boolean' is not assignable to type 'number'.",
+        )],
+    );
+}
+
+#[test]
+fn ordinary_boolean_negation_inverts_branch_facts_without_losing_empty_strings() {
+    for (source, operand, when_true, when_false) in [
+        (
+            concat!(
+                "function choose(value: object | undefined): object | undefined {\n",
+                "  if (!value) { const thenValue: undefined = value; return thenValue; }\n",
+                "  else { const elseValue: object = value; return elseValue; }\n",
+                "}\n",
+            ),
+            CheckedType::ObjectOrUndefined,
+            CheckedType::Undefined,
+            CheckedType::Object,
+        ),
+        (
+            concat!(
+                "function choose(value: string | undefined): string | undefined {\n",
+                "  if (!value) { const thenValue: string | undefined = value; return thenValue; }\n",
+                "  else { const elseValue: string = value; return elseValue; }\n",
+                "}\n",
+            ),
+            CheckedType::StringOrUndefined,
+            CheckedType::StringOrUndefined,
+            CheckedType::String,
+        ),
+    ] {
+        let parsed = parse_source_file(source);
+        let negation = only_node(&parsed, SyntaxKind::PrefixUnaryExpression);
+        let value = prefix_operand(&parsed, negation, SyntaxKind::ExclamationToken);
+        assert_checked_negation_queries(
+            &parsed,
+            &[
+                (negation, CheckedType::Boolean),
+                (value, operand),
+                (initializer(&parsed, "thenValue"), when_true),
+                (initializer(&parsed, "elseValue"), when_false),
+            ],
+            &[],
+        );
+    }
+}
+
+#[test]
+fn ordinary_boolean_negation_keeps_operand_diagnostics_before_its_boolean_result() {
+    let parsed = parse_source_file(
+        "function invalid(value: { present: string }): boolean { return !value.missing; }",
+    );
+    let negation = only_node(&parsed, SyntaxKind::PrefixUnaryExpression);
+    let access = prefix_operand(&parsed, negation, SyntaxKind::ExclamationToken);
+    let NodeData::PropertyAccessExpression(property) = &parsed.arena.get(access.node).unwrap().data
+    else {
+        panic!("the negation must check the missing property read")
+    };
+    let name = NodeRef::new(parsed.arena.id(), FILE, property.name);
+    assert_checked_negation_queries(
+        &parsed,
+        &[
+            (negation, CheckedType::Boolean),
+            (access, CheckedType::Error),
+        ],
+        &[(
+            name,
+            2339,
+            &["missing", "{ present: string; }"],
+            "Property 'missing' does not exist on type '{ present: string; }'.",
+        )],
+    );
+
+    let parsed = parse_source_file("function invalid(value: void): true { return !value; }");
+    let negation = only_node(&parsed, SyntaxKind::PrefixUnaryExpression);
+    let value = prefix_operand(&parsed, negation, SyntaxKind::ExclamationToken);
+    assert_checked_negation_queries(
+        &parsed,
+        &[(negation, CheckedType::True), (value, CheckedType::Void)],
+        &[(
+            value,
+            1345,
+            &[],
+            "An expression of type 'void' cannot be tested for truthiness.",
+        )],
+    );
+}
+
+#[test]
+fn ordinary_boolean_negation_combines_opposite_short_circuit_facts() {
+    for (source, expected_operand, expected_negation) in [
+        (
+            concat!(
+                "function choose(value: object | undefined): false | undefined {\n",
+                "  const combined = (value && !value) && value;\n",
+                "  return combined;\n",
+                "}\n",
+            ),
+            CheckedType::Object,
+            CheckedType::False,
+        ),
+        (
+            concat!(
+                "function choose(value: object | undefined): object | true {\n",
+                "  const combined = (value || !value) || value;\n",
+                "  return combined;\n",
+                "}\n",
+            ),
+            CheckedType::Undefined,
+            CheckedType::True,
+        ),
+    ] {
+        let parsed = parse_source_file(source);
+        let combined = initializer(&parsed, "combined");
+        let NodeData::BinaryExpression(binary) = &parsed.arena.get(combined.node).unwrap().data
+        else {
+            panic!("the combined condition must keep both short-circuit operations")
+        };
+        let final_read = NodeRef::new(parsed.arena.id(), FILE, binary.right);
+        let negation = only_node(&parsed, SyntaxKind::PrefixUnaryExpression);
+        let operand = prefix_operand(&parsed, negation, SyntaxKind::ExclamationToken);
+        assert_checked_negation_queries(
+            &parsed,
+            &[
+                (negation, expected_negation),
+                (operand, expected_operand),
+                (final_read, CheckedType::Never),
+            ],
+            &[],
+        );
+    }
+}

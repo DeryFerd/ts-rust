@@ -181,7 +181,7 @@ use super::{
     },
     logical_operators::{
         LogicalBinaryError, LogicalBinaryInvariant, LogicalBinaryRequest, LogicalBinaryUnsupported,
-        TruthinessAssumption, check_logical_binary, narrow_by_truthiness,
+        TruthinessAssumption, check_logical_binary, check_logical_not, narrow_by_truthiness,
         narrow_logical_right_operand,
     },
     object_members::{
@@ -762,6 +762,34 @@ impl PlannedExpression {
             .find_map(|(position, node)| (*position == index).then_some(*node))
     }
 
+    /// Keeps the real variable read and the parity of its enclosing `!` operators.
+    fn truthiness_reference(&self) -> Option<(&Self, bool)> {
+        let mut expression = self;
+        let mut negated = false;
+        loop {
+            expression = expression.unparenthesized();
+            if expression.non_null_assertion
+                || expression.awaited
+                || expression.promise_call.is_some()
+                || expression.jsdoc_type.is_some()
+            {
+                return None;
+            }
+            match &expression.kind {
+                PlannedExpressionKind::LogicalNot(operand) => {
+                    expression = operand;
+                    negated = !negated;
+                }
+                PlannedExpressionKind::Identifier(read)
+                    if read.kind == PlannedIdentifierReadKind::Variable =>
+                {
+                    return Some((expression, negated));
+                }
+                _ => return None,
+            }
+        }
+    }
+
     /// Lists retained eager children for constructor cache preflight, without evaluating them.
     pub(super) fn new_argument_children<'expression>(
         &'expression self,
@@ -784,6 +812,7 @@ impl PlannedExpression {
     fn eager_children<'expression>(&'expression self, pending: &mut Vec<&'expression Self>) {
         match &self.kind {
             PlannedExpressionKind::Parenthesized(inner)
+            | PlannedExpressionKind::LogicalNot(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => pending.push(inner),
             PlannedExpressionKind::Array(elements) => pending.extend(elements),
             PlannedExpressionKind::Object { properties, .. } => {
@@ -1000,6 +1029,7 @@ pub(super) enum PlannedExpressionKind {
         unary_operand: Option<PseudoBigInt>,
     },
     Boolean(bool),
+    LogicalNot(Box<PlannedExpression>),
     GlobalUndefined,
     Identifier(PlannedIdentifierRead),
     ClassReceiver(ClassAccessContext),
@@ -2167,7 +2197,9 @@ impl PlannedSourceCondition {
         match self {
             Self::Logical { left, .. } => left.flow_point(),
             Self::Expression { flow_point, .. } => *flow_point,
-            Self::Truthiness { expression, .. } => expression.unparenthesized().node,
+            Self::Truthiness { expression, .. } => expression
+                .truthiness_reference()
+                .map_or(expression.node, |(reference, _)| reference.node),
             Self::Typeof(condition) => condition.identifier.node,
             Self::Equality(condition) => condition.identifier,
         }
@@ -2177,10 +2209,11 @@ impl PlannedSourceCondition {
         Some(match self {
             Self::Logical { .. } | Self::Expression { .. } => return None,
             Self::Truthiness { expression, symbol } => {
+                let (_, negated) = expression.truthiness_reference()?;
                 SourceFlowCondition::Truthiness(SourceTruthinessCondition {
                     expression: expression.node,
                     symbol: *symbol,
-                    negated: false,
+                    negated,
                 })
             }
             Self::Typeof(condition) => SourceFlowCondition::Typeof(SourceTypeofCondition {
@@ -17018,8 +17051,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         self.primitive_binary_position_roots.insert(expression);
         let expression = self.plan_expression(expression)?;
-        if let PlannedExpressionKind::Identifier(read) = &expression.unparenthesized().kind
-            && read.kind == PlannedIdentifierReadKind::Variable
+        if let Some((reference, _)) = expression.truthiness_reference()
+            && let PlannedExpressionKind::Identifier(read) = &reference.kind
         {
             return Ok(PlannedSourceCondition::Truthiness {
                 symbol: read.value_symbol,
@@ -17048,7 +17081,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             PlannedExpressionKind::Property(property) => {
                 self.condition_expression_flow_point(&property.receiver, entry)
             }
-            PlannedExpressionKind::Parenthesized(inner) => {
+            PlannedExpressionKind::Parenthesized(inner)
+            | PlannedExpressionKind::LogicalNot(inner) => {
                 self.condition_expression_flow_point(inner, entry)
             }
             _ => entry,
@@ -27631,6 +27665,31 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 PlannedExpressionKind::Boolean(value),
             ));
         }
+        if operator == SyntaxKind::ExclamationToken {
+            let prefix = self.node(expression)?;
+            if prefix.flags.0 != 0 {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::InvalidPrefixUnaryOperator {
+                        node: expression,
+                        operator,
+                    },
+                ));
+            }
+            let operand = self.reference(operand_id);
+            let record = self.node(operand)?;
+            if record.parent != Some(expression.node) {
+                return Err(self.unsupported(
+                    operand,
+                    record.kind,
+                    SourceSyntaxRole::PrefixUnaryOperand,
+                ));
+            }
+            self.primitive_binary_position_roots.insert(operand);
+            return Ok(PlannedExpression::new(
+                expression,
+                PlannedExpressionKind::LogicalNot(Box::new(self.plan_expression(operand)?)),
+            ));
+        }
         if operator != SyntaxKind::MinusToken {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::InvalidPrefixUnaryOperator {
@@ -29268,6 +29327,7 @@ fn class_expression_nodes(
         nodes.push(expression);
         match &expression.kind {
             PlannedExpressionKind::Parenthesized(inner)
+            | PlannedExpressionKind::LogicalNot(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => pending.push(inner),
             PlannedExpressionKind::Property(property) => pending.push(&property.receiver),
             PlannedExpressionKind::Element(element) => {
@@ -29617,6 +29677,7 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
+        | PlannedExpressionKind::LogicalNot(_)
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::Call(_)
         | PlannedExpressionKind::ImportCall(_)
@@ -29684,6 +29745,7 @@ fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) 
         | PlannedExpressionKind::Arrow(_)
         | PlannedExpressionKind::New(_)
         | PlannedExpressionKind::Binary(_)
+        | PlannedExpressionKind::LogicalNot(_)
         | PlannedExpressionKind::Logical(_) => false,
     }
 }
@@ -29734,18 +29796,13 @@ fn collect_eager_logical_truthiness_conditions(
                     SyntaxKind::AmpersandAmpersandToken | SyntaxKind::BarBarToken
                 ) {
                     for operand in [&binary.left, &binary.right] {
-                        let reference = operand.unparenthesized();
-                        if !reference.non_null_assertion
-                            && !reference.awaited
-                            && reference.promise_call.is_none()
-                            && reference.jsdoc_type.is_none()
+                        if let Some((reference, negated)) = operand.truthiness_reference()
                             && let PlannedExpressionKind::Identifier(read) = &reference.kind
-                            && read.kind == PlannedIdentifierReadKind::Variable
                         {
                             conditions.push(SourceTruthinessCondition {
                                 expression: operand.node,
                                 symbol: read.value_symbol,
-                                negated: false,
+                                negated,
                             });
                         }
                     }
@@ -29754,6 +29811,7 @@ fn collect_eager_logical_truthiness_conditions(
                 pending.push(&binary.left);
             }
             PlannedExpressionKind::Parenthesized(inner)
+            | PlannedExpressionKind::LogicalNot(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => pending.push(inner),
             PlannedExpressionKind::Array(elements) => pending.extend(elements),
             PlannedExpressionKind::Object { properties, .. } => {
@@ -29834,6 +29892,7 @@ fn expression_has_deferred_object_members(expression: &PlannedExpression) -> boo
             elements.iter().any(expression_has_deferred_object_members)
         }
         PlannedExpressionKind::Parenthesized(inner)
+        | PlannedExpressionKind::LogicalNot(inner)
         | PlannedExpressionKind::Assertion { operand: inner, .. } => {
             expression_has_deferred_object_members(inner)
         }
@@ -29927,6 +29986,7 @@ fn comma_left_is_side_effect_free(expression: &PlannedExpression) -> bool {
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
         | PlannedExpressionKind::Arrow(_) => true,
+        PlannedExpressionKind::LogicalNot(operand) => comma_left_is_side_effect_free(operand),
         PlannedExpressionKind::Binary(binary) => {
             !binary.operator.is_assignment_operator()
                 && comma_left_is_side_effect_free(&binary.left)
@@ -30387,6 +30447,7 @@ fn preflight_inferred_function_return_dependencies(
                 }
             }
             PlannedExpressionKind::Parenthesized(inner)
+            | PlannedExpressionKind::LogicalNot(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => {
                 expression_is_closed(inner, parameters, locals, functions)
             }
@@ -31346,7 +31407,8 @@ fn prepare_source_property_diagnostic_sink(
 ) -> Result<Vec<SourcePropertyDiagnostic>, SourceCheckError> {
     fn capacity(expression: &PlannedExpression) -> Option<usize> {
         match &expression.kind {
-            PlannedExpressionKind::Parenthesized(inner) => capacity(inner),
+            PlannedExpressionKind::Parenthesized(inner)
+            | PlannedExpressionKind::LogicalNot(inner) => capacity(inner),
             PlannedExpressionKind::Array(elements) => {
                 elements.iter().try_fold(0usize, |count, element| {
                     count.checked_add(capacity(element)?)
@@ -31380,7 +31442,8 @@ fn prepare_const_object_property(
             PlannedExpressionKind::String(_)
             | PlannedExpressionKind::Number { .. }
             | PlannedExpressionKind::BigInt { .. }
-            | PlannedExpressionKind::Boolean(_),
+            | PlannedExpressionKind::Boolean(_)
+            | PlannedExpressionKind::LogicalNot(_),
             PreparedExpression::Literal(_),
         ) => Ok(PreparedExpression::Literal(LiteralTreatment::Regular)),
         (PlannedExpressionKind::Identifier(_), PreparedExpression::Identifier(_)) => {
@@ -31496,6 +31559,20 @@ where
                     SourceLiteralCacheError::BootstrapUninitialized,
                 ))?;
             checked_literal_types(store, regular, widened, *treatment)
+        }
+        (PlannedExpressionKind::LogicalNot(_), PreparedExpression::Literal(treatment)) => {
+            let mut checked = check_nested_expression(store, session, expression, None, None)?;
+            if let Some(TypeData::Literal(literal)) =
+                store.type_payload(checked.raw).map(TypeRecord::data)
+            {
+                let boolean = store
+                    .intrinsic_bootstrap()
+                    .ok_or(SourceCheckError::LogicalOperator(expression.node))?
+                    .boolean_type;
+                checked.result =
+                    prepared_literal_type(store, literal.regular_type, boolean, *treatment)?;
+            }
+            Ok(checked)
         }
         (
             PlannedExpressionKind::GlobalUndefined,
@@ -33149,6 +33226,7 @@ fn emit_uninitialized_variable_read_diagnostics(
             );
         }
         PlannedExpressionKind::Parenthesized(inner)
+        | PlannedExpressionKind::LogicalNot(inner)
         | PlannedExpressionKind::Assertion { operand: inner, .. } => {
             emit_uninitialized_variable_read_diagnostics(
                 store,
@@ -33510,6 +33588,7 @@ fn emit_enum_use_before_declaration_diagnostics(
             }
         }
         PlannedExpressionKind::Parenthesized(inner)
+        | PlannedExpressionKind::LogicalNot(inner)
         | PlannedExpressionKind::Assertion { operand: inner, .. } => {
             emit_enum_use_before_declaration_diagnostics(store, host, options, diagnostics, inner)?;
         }
@@ -35368,6 +35447,54 @@ fn check_expression_type_with_capture_context(
                 merge_retry_diagnostic(diagnostics, diagnostic);
             }
             Ok(CheckedExpressionTypes::leaf(checked.type_, checked.type_))
+        }
+        PlannedExpressionKind::LogicalNot(operand) => {
+            let checked = check_expression_type_with_capture_context(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                current_flow_types,
+                type_import_execution,
+                operand,
+                None,
+                deferred,
+                class_flow.as_deref_mut(),
+                arrow_capture,
+            )?;
+            let result = check_logical_not(store, checked.result).map_err(|error| match error {
+                LogicalBinaryError::Literal(error) => error.into(),
+                LogicalBinaryError::Unsupported(_) => {
+                    SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                        node: operand.node,
+                        kind: host
+                            .node(operand.node)
+                            .map_or(SyntaxKind::Unknown, |record| record.kind),
+                        role: SourceSyntaxRole::PrefixUnaryOperand,
+                    })
+                }
+                LogicalBinaryError::Invariant(_) => {
+                    SourceCheckError::LogicalOperator(expression.node)
+                }
+            })?;
+            if store
+                .intrinsic_bootstrap()
+                .is_none_or(|bootstrap| checked.result != bootstrap.silent_never_type)
+            {
+                emit_truthiness_operand_diagnostics(
+                    store,
+                    host,
+                    diagnostics,
+                    operand,
+                    checked.result,
+                    expression.node,
+                )?;
+            }
+            publish_expression_type(store, expression.node, result)?;
+            Ok(CheckedExpressionTypes::leaf(result, result))
         }
         PlannedExpressionKind::Logical(binary) => {
             let left_contextual_type = match binary.operator {
@@ -41155,14 +41282,23 @@ fn narrow_logical_right_flow_types(
     fn collect<'a>(
         expression: &'a PlannedExpression,
         operator: SyntaxKind,
-        reads: &mut Vec<&'a PlannedIdentifierRead>,
+        reads: &mut Vec<(&'a PlannedIdentifierRead, bool)>,
     ) {
         let expression = expression.unparenthesized();
+        if matches!(
+            operator,
+            SyntaxKind::AmpersandAmpersandToken | SyntaxKind::BarBarToken
+        ) && let Some((reference, negated)) = expression.truthiness_reference()
+            && let PlannedExpressionKind::Identifier(read) = &reference.kind
+        {
+            reads.push((read, negated));
+            return;
+        }
         match &expression.kind {
             PlannedExpressionKind::Identifier(read)
                 if read.kind == PlannedIdentifierReadKind::Variable =>
             {
-                reads.push(read);
+                reads.push((read, false));
             }
             PlannedExpressionKind::Logical(logical) if logical.operator == operator => {
                 collect(&logical.left, operator, reads);
@@ -41179,19 +41315,26 @@ fn narrow_logical_right_flow_types(
     }
     let mut narrowed = current_flow_types.clone();
     let mut seen = HashSet::new();
-    for read in reads {
-        if !seen.insert(read.value_symbol) {
+    for (read, negated) in reads {
+        if !seen.insert((read.value_symbol, negated)) {
             continue;
         }
-        let current =
-            *current_flow_types
-                .get(&read.value_symbol)
-                .ok_or(SourceCheckError::Variable(
-                    VariableInvariant::MissingCurrentFlowType(read.value_symbol),
-                ))?;
-        let type_ =
-            narrow_logical_right_operand(store, Some(global_types), binary.operator, current)
-                .map_err(|error| logical_binary_check_error(host, binary, &error))?;
+        let current = *narrowed
+            .get(&read.value_symbol)
+            .ok_or(SourceCheckError::Variable(
+                VariableInvariant::MissingCurrentFlowType(read.value_symbol),
+            ))?;
+        let operator = if negated {
+            match binary.operator {
+                SyntaxKind::AmpersandAmpersandToken => SyntaxKind::BarBarToken,
+                SyntaxKind::BarBarToken => SyntaxKind::AmpersandAmpersandToken,
+                _ => return Err(SourceCheckError::LogicalOperator(binary.node)),
+            }
+        } else {
+            binary.operator
+        };
+        let type_ = narrow_logical_right_operand(store, Some(global_types), operator, current)
+            .map_err(|error| logical_binary_check_error(host, binary, &error))?;
         narrowed.insert(read.value_symbol, type_);
     }
     Ok(Some(narrowed))
@@ -41353,7 +41496,7 @@ fn issue_invalid_const_enum_value_diagnostic(
             }
             return Ok(());
         }
-        PlannedExpressionKind::Parenthesized(inner) => {
+        PlannedExpressionKind::Parenthesized(inner) | PlannedExpressionKind::LogicalNot(inner) => {
             return issue_invalid_const_enum_value_diagnostic(store, host, diagnostics, inner);
         }
         PlannedExpressionKind::Identifier(read) => read,
@@ -41630,6 +41773,7 @@ fn syntactic_truthiness(
             syntactic_truthiness(host, &conditional.when_false),
         ),
         PlannedExpressionKind::Boolean(_)
+        | PlannedExpressionKind::LogicalNot(_)
         | PlannedExpressionKind::Template(_)
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::TypeImportValueUse(_)
@@ -41713,6 +41857,7 @@ fn syntactic_nullishness(
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
+        | PlannedExpressionKind::LogicalNot(_)
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
         | PlannedExpressionKind::Arrow(_)
@@ -50166,8 +50311,11 @@ fn check_planned_truthiness_condition(
     condition: &PlannedExpression,
     condition_symbol: SemanticSymbolId,
 ) -> Result<(), SourceCheckError> {
+    let (reference, _) = condition
+        .truthiness_reference()
+        .ok_or_else(|| SourcePlanner::unsupported_function_body(callable))?;
     let condition_flow = frame
-        .snapshot_at(store, global_types, condition.unparenthesized().node)
+        .snapshot_at(store, global_types, reference.node)
         .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
     let checked = check_expression_type(
         store,
@@ -50183,15 +50331,21 @@ fn check_planned_truthiness_condition(
         None,
         deferred,
     )?;
+    let reference_type = store
+        .type_node_links(reference.node)
+        .and_then(|links| links.resolved_type)
+        .ok_or(SourceCheckError::LogicalOperator(reference.node))?;
+    let checked_reference = CheckedExpressionTypes::leaf(reference_type, reference_type);
     let flow_matches = if let Some(current) = condition_flow.type_of(condition_symbol) {
-        checked_identifier_flow_type(store, host, condition, current, &checked)? == current
+        checked_identifier_flow_type(store, host, reference, current, &checked_reference)?
+            == current
     } else {
         false
     };
     if !flow_matches
         || !source_truthiness_condition_type_is_supported(
             store,
-            checked.result,
+            reference_type,
             condition.node,
             &mut HashSet::new(),
         )?
@@ -56990,6 +57144,7 @@ fn validate_getter_capture_entries(
                 }
             }
             PlannedExpressionKind::Parenthesized(inner)
+            | PlannedExpressionKind::LogicalNot(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => pending.push(inner),
             PlannedExpressionKind::Array(elements) => pending.extend(elements),
             PlannedExpressionKind::Object { properties, .. } => {
