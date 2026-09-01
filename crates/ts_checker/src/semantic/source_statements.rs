@@ -9992,7 +9992,6 @@ impl SyntaxPlanner<'_> {
                     | SyntaxKind::ExclamationEqualsToken
                     | SyntaxKind::EqualsEqualsEqualsToken
                     | SyntaxKind::ExclamationEqualsEqualsToken
-                    | SyntaxKind::InKeyword
                     | SyntaxKind::InstanceOfKeyword
             )),
             _ => Ok(false),

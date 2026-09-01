@@ -27,7 +27,7 @@ use ts_ast::{
 };
 use ts_binder::{
     BoundFile, BoundFlowGraph, CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags,
-    InternalSymbolName, SemanticSymbolId, SymbolFlags,
+    EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags,
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
 
@@ -715,6 +715,15 @@ pub(super) struct SourceEqualityCondition {
     pub(super) discriminant: Option<NodeRef>,
 }
 
+/// The exact receiver and key of a checked membership condition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceInCondition {
+    pub(super) expression: NodeRef,
+    pub(super) receiver: NodeRef,
+    pub(super) key: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+}
+
 /// One cold-proven condition executable by the invocation-local flow frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceFlowCondition {
@@ -723,6 +732,7 @@ pub(super) enum SourceFlowCondition {
     ClassPropertyTruthiness(SourceClassPropertyTruthinessCondition),
     Typeof(SourceTypeofCondition),
     Equality(SourceEqualityCondition),
+    In(SourceInCondition),
 }
 
 impl SourceFlowCondition {
@@ -733,6 +743,7 @@ impl SourceFlowCondition {
             Self::ClassPropertyTruthiness(condition) => condition.expression,
             Self::Typeof(condition) => condition.expression,
             Self::Equality(condition) => condition.expression,
+            Self::In(condition) => condition.expression,
         }
     }
 
@@ -742,6 +753,7 @@ impl SourceFlowCondition {
             Self::Truthiness(condition) => condition.symbol,
             Self::Typeof(condition) => condition.symbol,
             Self::Equality(condition) => condition.symbol,
+            Self::In(condition) => condition.symbol,
         })
     }
 }
@@ -1880,6 +1892,7 @@ pub(super) enum SourceFlowUnsupported {
     FlowKind { flow: FlowRef, flags: FlowFlags },
     Call(NodeRef),
     PropertyWrite(NodeRef),
+    InNarrowing { condition: NodeRef, type_: TypeId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3558,6 +3571,7 @@ impl SourceFlowPlan {
                 .collect(),
             call_effects: HashMap::new(),
             condition_values: HashMap::new(),
+            in_conditions: HashMap::new(),
             memo: HashMap::new(),
             visiting: HashSet::new(),
             loop_snapshots: HashMap::new(),
@@ -3786,10 +3800,19 @@ pub(super) struct SourceFlowFrame<'plan, 'graph> {
     assignment_states: HashMap<NodeRef, SourceFlowAssignmentState>,
     call_effects: HashMap<NodeRef, SourceFlowCallEffect>,
     condition_values: HashMap<NodeRef, TypeId>,
+    in_conditions: HashMap<NodeRef, CompletedInCondition>,
     memo: HashMap<(FlowRef, Option<SemanticSymbolId>), SourceFlowSnapshot>,
     visiting: HashSet<(FlowRef, Option<SemanticSymbolId>)>,
     loop_snapshots: HashMap<(FlowRef, Option<SemanticSymbolId>), SourceFlowSnapshot>,
     reference: Option<SemanticSymbolId>,
+}
+
+/// Membership results checked with the source caller's instantiation session.
+struct CompletedInCondition {
+    input: TypeId,
+    key: TypeId,
+    when_true: TypeId,
+    when_false: TypeId,
 }
 
 /// Keeps class initialization queries tied to one prepared body and binder graph.
@@ -4916,6 +4939,54 @@ impl SourceFlowFrame<'_, '_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // Keep the binder proof and the source caller together.
+    pub(super) fn complete_in_condition(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        globals: &CanonicalGlobalTypes,
+        session: &mut InstantiationSession,
+        condition: SourceInCondition,
+        input: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        let invalid = || SourceFlowInvariant::UnknownCondition(condition.expression);
+        let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+        if self.plan.conditions.get(&condition.expression)
+            != Some(&SourceFlowCondition::In(condition))
+            || self.in_conditions.contains_key(&condition.expression)
+            || store.type_node_links(condition.expression)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(bootstrap.boolean_type),
+                    ..TypeNodeLinks::default()
+                })
+            || store
+                .type_node_links(condition.receiver)
+                .and_then(|links| links.resolved_type)
+                != Some(input)
+            || own_class_flow_reference_symbol(store, host, self.bound, condition.receiver)?
+                != Some(condition.symbol)
+        {
+            return Err(invalid().into());
+        }
+        let key = store
+            .type_node_links(condition.key)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(invalid)?;
+        let [when_true, when_false] =
+            narrow_source_in_type(store, globals, session, condition.expression, input, key)?;
+        self.in_conditions.insert(
+            condition.expression,
+            CompletedInCondition {
+                input,
+                key,
+                when_true,
+                when_false,
+            },
+        );
+        self.memo.clear();
+        Ok(())
+    }
+
     pub(super) fn complete_source_declaration(
         &mut self,
         host: &DeclaredTypeHost<'_>,
@@ -5460,6 +5531,33 @@ impl SourceFlowFrame<'_, '_> {
                             ),
                         })?
                     }
+                    SourceFlowCondition::In(condition) => {
+                        let completed = self.in_conditions.get(&condition.expression).ok_or(
+                            SourceFlowInvariant::UnreachedCondition(condition.expression),
+                        )?;
+                        if completed.input != current {
+                            return Err(SourceFlowUnsupported::InNarrowing {
+                                condition: condition.expression,
+                                type_: current,
+                            }
+                            .into());
+                        }
+                        if store
+                            .type_node_links(condition.key)
+                            .and_then(|links| links.resolved_type)
+                            != Some(completed.key)
+                        {
+                            return Err(SourceFlowInvariant::UnknownCondition(
+                                condition.expression,
+                            )
+                            .into());
+                        }
+                        if assume_true {
+                            completed.when_true
+                        } else {
+                            completed.when_false
+                        }
+                    }
                 };
                 Ok(prior.with_type(symbol, narrowed))
             }
@@ -5794,6 +5892,103 @@ enum SourceEqualityValueKind {
     Null,
     Undefined,
     Literal(TypeId),
+}
+
+/// Checks both membership edges before the flow frame records either result.
+fn narrow_source_in_type(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    condition: NodeRef,
+    input: TypeId,
+    key: TypeId,
+) -> Result<[TypeId; 2], SourceFlowError> {
+    let invalid = || SourceFlowInvariant::UnknownCondition(condition);
+    let unavailable = |type_| SourceFlowUnsupported::InNarrowing { condition, type_ };
+    let cache_error = |error| SourceFlowError::Narrowing {
+        condition,
+        error: LogicalBinaryError::Literal(error),
+    };
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let (any, error, never) = (
+        bootstrap.any_type,
+        bootstrap.error_type,
+        bootstrap.never_type,
+    );
+    store
+        .validate_union_constituent_with_global_types(globals, input)
+        .map_err(cache_error)?;
+    store
+        .validate_union_constituent_with_global_types(globals, key)
+        .map_err(cache_error)?;
+    let key_record = store.type_payload(key).ok_or_else(invalid)?;
+    let name = match key_record.data() {
+        TypeData::Literal(literal) => match &literal.value {
+            LiteralValue::String(value)
+                if key_record.flags().intersects(TypeFlags::STRING_LITERAL) =>
+            {
+                EscapedName::source(value)
+            }
+            LiteralValue::Number(value)
+                if key_record.flags().intersects(TypeFlags::NUMBER_LITERAL) =>
+            {
+                EscapedName::source(&value.to_string())
+            }
+            _ => return Ok([input, input]),
+        },
+        TypeData::UniqueEsSymbol(_) => return Err(unavailable(key).into()),
+        _ => return Ok([input, input]),
+    };
+    if input == any || input == error || input == never {
+        return Ok([input, input]);
+    }
+    let (leaves, has_origin) = match store.type_payload(input).ok_or_else(invalid)?.data() {
+        TypeData::Union(union) => (union.union.types.clone(), union.origin.is_some()),
+        _ => (vec![input], false),
+    };
+    let mut present = Vec::with_capacity(leaves.len());
+    let mut absent = Vec::with_capacity(leaves.len());
+    for &leaf in &leaves {
+        if store.type_payload(leaf).ok_or_else(invalid)?.flags() != TypeFlags::OBJECT {
+            return Err(unavailable(leaf).into());
+        }
+        let [can_be_present, can_be_absent] = store
+            .in_operator_property_presence(leaf, name.as_ref(), globals, session)
+            .map_err(SourceFlowError::Relation)?;
+        if can_be_present {
+            present.push(leaf);
+        }
+        if can_be_absent {
+            absent.push(leaf);
+        }
+    }
+    if present.is_empty() {
+        // Unknown properties need the real Record<K, unknown> intersection.
+        return Err(unavailable(input).into());
+    }
+    if has_origin && (present != leaves || absent != leaves) {
+        // A changed subset must retain the source union's nested alias origin.
+        return Err(unavailable(input).into());
+    }
+    let mut branches = [input, input];
+    for (branch, retained) in branches.iter_mut().zip([present, absent]) {
+        if retained == leaves {
+            continue;
+        }
+        *branch = match retained.as_slice() {
+            [] => never,
+            [only] => *only,
+            _ => store
+                .expression_union_type_with_global_types_and_session(
+                    globals,
+                    &retained,
+                    UnionReduction::Literal,
+                    session,
+                )
+                .map_err(cache_error)?,
+        };
+    }
+    Ok(branches)
 }
 
 /// Narrows exact nullable or literal comparisons without synthesizing facts.
