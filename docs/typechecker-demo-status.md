@@ -4,6 +4,76 @@ Updated 2026-09-01. No complete real-world project has passed in Rust yet.
 
 ## Current result
 
+The compiler builds, but the Pathe demo is not ready. The latest full-project
+run still completes zero of nine roots. It gets past some earlier failures,
+but that has not increased complete-project coverage.
+
+| Measurement | Latest result |
+| --- | --- |
+| [Pathe census 6](../target/wave202-pathe-demo-census-6-result.md), `5f7ad5e3` | All nine original roots attempted. Zero complete, eight unsupported, one internal checker error. All 277 loaded files parse. The ordinary project check also fails. The measured stage took 22.903 seconds. |
+| [Ordinary compiler build 7](../target/wave202-pathe-demo-bin-7-result.md), `65612688` | Build passed in 77.257 seconds. This includes the logical-condition registry repair. A build is not a TypeScript project pass. |
+| [Focused condition tests](../target/wave202-pathe-logical-condition-registry-focus-5-result.md), `65612688` | Compile and listing passed. All eight tests ran. Seven pass, including the new condition test. The original Pathe normalizer still fails with `FunctionBody`. |
+| [Combined tests 5](../target/wave202-pathe-demo-tests-5-result.md), `5f7ad5e3` | Compilation stopped on one test-only enum name error. All 464 tests remain unrun. |
+| [Test API repair](../target/wave202-pathe-method-test-api-repair-handoff.md), `7d2a40ae` | The enum name is fixed. No assertion or production code changed. The next selection retains all 464 tests and adds the condition test, for 465 total. Source capture passed. Tests have not run yet. |
+
+The focused result has a closed [independent review](../target/wave202-pathe-logical-condition-registry-focus-5-result-review.md).
+Its original seven tests still have six passes and one failure. The new eighth
+test passes. Do not describe that addition as a fixed original test.
+
+The latest project run retains the same original roots, all 277 loaded-file
+records, and all 13 explicit compiler options. The apparent const-enum option
+difference is [stored versus effective reporting](../target/wave202-pathe-preserve-const-enums-diagnosis.md).
+Both compilers derive preservation as true. Complete effective-option and final
+module-resolution parity still need separate evidence.
+
+## Demo targets
+
+| Project | Decision and remaining work |
+| --- | --- |
+| Pathe | First target. Its original config selects five source files and four test files, with 4,843 lines in total. Dependencies and a successful pinned Go reference are available. Every Rust failure now has a separate recorded root attempt. Fix these measured failures first. |
+| UFO | Second candidate. Its original source selection has seven files and 1,571 lines. Dependency setup is incomplete, so there is no paired Rust and Go baseline yet. Do not describe it as close to passing until that measurement exists. |
+
+Keep both projects unchanged. Do not remove tests, replace declarations, change
+compiler options, or supply permissive stub types to produce a demo.
+
+## Current fix priorities
+
+Seven investigations now run in parallel. Each has its own report and source
+scope. Implementation workers will use separate worktrees and paired tests.
+
+| Failure | Next action |
+| --- | --- |
+| Proxy handler in `src/index.ts` | Add authenticated object-method ownership to the shared statement-list planner. The current planner excludes methods before it checks their bodies. |
+| `throw new Error(...)` in `test/glob.spec.ts` | Fix the [constructor position check](../target/wave202-pathe-c6-error-constructor-diagnosis.md). It accepts this throw in a function declaration but rejects it in an arrow, before constructor lookup. |
+| Counted loop in `src/_glob.ts` | Port counted loops into callable statement checking, including the header, update, body and flow checks. The existing standalone loop path is not a safe direct replacement. |
+| `new Set(...)` in `src/utils.ts` | Check real constructor preparation and signature readiness. The saved outer error does not yet prove the inner cause. |
+| Variable reference in `src/_path.ts` | Add the missing [typed error location](../target/wave202-pathe-c6-prior-identifier-diagnosis.md), then measure again. Do not assume that the reference is an invalid forward use. |
+| Import aliases in three test files | Record the actual alias state and declaration at the terminal failure. Distinguish missing preparation from cycles before changing resolution. |
+| Original normalizer | Use one [failure-only diagnostic run](../target/wave202-pathe-normalizer-function-body-diagnosis.md) to select the exact remaining state, flow or call-effect guard. Keep the original function and all eight tests intact. |
+
+Run the retained 465-test selection before accepting the combined repairs.
+Use at most three Cargo lanes. Source work, test design and reference checks
+can run in more workers. Measure progress by completed checks and retained
+diagnostics, not by worker count or the number of commits.
+
+## Demo pass conditions
+
+- The unchanged project completes ordinary typechecking with its original
+  options, roots, dependencies and library declarations.
+- Rust and the reference compiler check the same intended project and produce
+  matching complete diagnostics. Partial empty diagnostics are not a pass.
+- A separate project copy with a deliberate type error reports the expected
+  error and source location. The original project stays unchanged.
+- The retained regression tests pass, and a repeat run gives the same result.
+
+There is no reliable completion date yet. The next useful milestone is a
+complete Pathe root, followed by the complete ordinary project check.
+
+## Earlier checkpoint at 5f7ad5e3
+
+The remaining sections are retained history from before the results above.
+Their pending states and proposed runs are not the current status.
+
 The demo is not ready. The combined source `21df31a3` failed Rust
 compilation at three alias API calls. All 464 selected tests remain unrun.
 The one-function repair is committed and reviewed at `5f7ad5e3`. It retains
