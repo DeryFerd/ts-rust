@@ -15,9 +15,25 @@ project-checking tool is built and its cleanup is closed. The first Rust Pathe
 run stopped at `E00.SOURCE_SYNTAX`, an unsupported arrow in `src/_glob.ts`.
 It returned no complete Rust graph or diagnostics. The main process exited 0,
 but the project check is incomplete. Independent result review and separate
-post-close verification are closed. No typed source location is available for
-the arrow. Pathe's original build and project-pinned compiler check remain
-separate requirements.
+post-close verification are closed.
+
+The later file-by-file run attempted all nine roots. None completed source
+checking. Eight stopped at unsupported operations and one at an internal
+checker error. It supplied typed locations for all eight unsupported cases.
+The loader also reported 35 parser diagnostics in Node's `http2.d.ts`.
+All 277 loaded files match the saved Go file list and bytes. This is not full
+module-resolution or diagnostic parity.
+The [census result](../target/wave202-pathe-root-census-1-result.md) and
+[independent review](../target/wave202-pathe-root-census-1-result-review.md)
+retain every failure and the closed resource checks.
+
+The census reader failed because it sorted JSON keys that the Rust serializer
+preserves in order. Separate saved-data checks reproduce both emitted digests.
+The original failed result stays unchanged. A separate offline readback timed
+out while hashing the executable, before census validation. It created no new
+result. This reporting defect is separate from the nine checker failures.
+Pathe is not one fix away from a demonstrated pass. Its original build and
+project-pinned compiler check also remain separate requirements.
 
 The latest core check passed 6,557 of 6,559 tests. All 19 earlier failures now
 pass, but two old passes regressed. The latest alias check passed 5,103 of 5,108
@@ -242,10 +258,13 @@ private validator call. The TypeScript inputs and assertions stay unchanged.
 
 ## Next work
 
-1. Locate Pathe's unsupported arrow through a typed source location, then fix the
-   measured cause and repeat the original nine-root check. Do not infer a source
-   range from the report's internal node number. Complete Rust graph and
-   diagnostic comparison with the closed Go reference remains required.
+1. Fix Pathe's measured first stops in parallel. Reuse existing throw and
+   computed-key work. Add default-parameter inference, multi-statement
+   function-expression bodies, ordinary property operands and source-file
+   destructuring loops.
+   Fix keyword-named tuple labels in the parser. Locate the remaining internal
+   error through a typed reporter mapping, not its printed node number.
+   Repeat all nine roots with the original config and dependencies.
 2. Run Pathe's original build and project-pinned typecheck separately. Compare
    its loaded files before and after the build. Obtain approval for UFO's install
    and verify its dependencies, then check its seven source roots and separate
@@ -264,6 +283,24 @@ private validator call. The TypeScript inputs and assertions stay unchanged.
 The next demo must show a complete ordinary project check, not just cold-root
 coverage. Missing diagnostics, unchecked declarations and unsupported operations
 must remain visible. The source-only repair count is not the demo's pass count.
+
+The current Pathe first stops are:
+
+| Original files | First stop | Next action |
+| --- | --- | --- |
+| `src/_glob.ts`, `test/glob.spec.ts` | Arrow bodies containing `throw` | Integrate the existing shared throw checker. |
+| `src/_internal.ts`, `src/utils.ts` | Untyped parameters with string defaults | Infer the parameter type through the existing initializer checker. |
+| `src/_path.ts` | Function-expression body with a parameter | Connect its existing callable owner to shared body checking. |
+| `src/index.ts` | Ordinary property used in a binary expression | Remove the class-only operand restriction without bypassing property checks. |
+| `test/index.spec.ts` | Computed object key containing a call | Integrate the existing computed-key checker. |
+| `test/node-glob.spec.ts` | Source-file destructuring `for...of` | Reuse existing binding and iterator checks with the real callback owners. |
+| `test/utils.spec.ts` | Internal callable error, location unavailable | Add the exact typed error-to-node mapping, then measure again. |
+| Installed Node `http2.d.ts` | Parser rejects keyword tuple labels | Use the existing identifier-name parser for tuple labels. |
+
+These are first stops, not a complete list of remaining failures. The six-feature
+integration and its 79 focused tests remain separate from the next demo binary
+build. The full checker suite must not delay a useful diagnostic measurement.
+Source review does not turn any of these repairs into a passing test result.
 
 The diagnosis coordinator read all 16 project reports. Of 181 assigned failure
 rows, 160 have a located source cause, 18 remain unresolved and three overlap
