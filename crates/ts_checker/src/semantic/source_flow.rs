@@ -3535,6 +3535,13 @@ impl SourceFlowPlan {
                 self.validate_flow_paths(bound)?;
             }
         }
+        if self
+            .statement_list
+            .as_ref()
+            .is_some_and(SourceCallableStatementListSyntax::contains_for_of)
+        {
+            self.validate_flow_paths(bound)?;
+        }
         Ok(SourceFlowFrame {
             plan: self,
             bound,
@@ -4847,6 +4854,91 @@ fn class_type_has_uninitialized_value(
 }
 
 impl SourceFlowFrame<'_, '_> {
+    fn uses_callable_for_of_queries(&self) -> bool {
+        self.plan
+            .statement_list
+            .as_ref()
+            .is_some_and(SourceCallableStatementListSyntax::contains_for_of)
+    }
+
+    fn callable_for_of_symbol_is_visible(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        point: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<bool, SourceFlowError> {
+        let record = store
+            .symbol(symbol)
+            .ok_or(SourceFlowInvariant::MissingCurrentType(symbol))?;
+        let Some(declaration) = record.value_declaration() else {
+            return Ok(true);
+        };
+        if !record.flags().intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+            || self.bound.container(declaration) != Some(self.plan.container)
+        {
+            return Ok(true);
+        }
+        let expected = self
+            .bound
+            .block_scope_container(declaration)
+            .ok_or(SourceFlowInvariant::InvalidParameterAssignment(declaration))?;
+        let mut scope = self.bound.block_scope_container(point);
+        let mut seen = HashSet::new();
+        while let Some(current) = scope {
+            if current == expected {
+                return Ok(true);
+            }
+            if current == self.plan.container {
+                return Ok(false);
+            }
+            if !seen.insert(current) {
+                return Err(SourceFlowInvariant::InvalidParameterAssignment(declaration).into());
+            }
+            scope = self.bound.block_scope_container(current);
+        }
+        Err(SourceFlowInvariant::InvalidParameterAssignment(declaration).into())
+    }
+
+    /// Query existing visible entries separately so unrelated pending loop locals are not demands.
+    fn snapshot_callable_for_of_at(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        point: NodeRef,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        let mut symbols = self.base.types().keys().copied().collect::<Vec<_>>();
+        for (declaration, state) in &self.assignment_states {
+            if matches!(state, SourceFlowAssignmentState::Resolved(_)) {
+                symbols.push(
+                    self.plan
+                        .assignments
+                        .get(declaration)
+                        .ok_or(SourceFlowInvariant::UnknownAssignment(*declaration))?
+                        .symbol,
+                );
+            }
+        }
+        symbols.sort_unstable();
+        symbols.dedup();
+        let mut visible = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            if self.callable_for_of_symbol_is_visible(store, point, symbol)? {
+                visible.push(symbol);
+            }
+        }
+        let snapshot = self.snapshot_for_symbols_at(store, globals, point, visible.iter().copied())?;
+        let types = snapshot
+            .types()
+            .iter()
+            .filter(|(symbol, _)| visible.binary_search(symbol).is_ok())
+            .map(|(&symbol, &type_)| (symbol, type_))
+            .collect();
+        Ok(SourceFlowSnapshot {
+            types: Arc::new(types),
+            ..snapshot
+        })
+    }
+
     /// Keeps a local's declared type and initial flow type without an assignment node.
     pub(super) fn enter_uninitialized_local(
         &mut self,
@@ -4912,6 +5004,9 @@ impl SourceFlowFrame<'_, '_> {
             matches!(condition, SourceFlowCondition::Equality(condition) if condition.value == node)
         }) || self.condition_values.insert(node, type_).is_some() {
             return Err(SourceFlowInvariant::UnknownCondition(node).into());
+        }
+        if self.uses_callable_for_of_queries() {
+            self.memo.clear();
         }
         Ok(())
     }
@@ -5053,6 +5148,9 @@ impl SourceFlowFrame<'_, '_> {
         globals: &CanonicalGlobalTypes,
         node: NodeRef,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        if self.uses_callable_for_of_queries() {
+            return self.snapshot_callable_for_of_at(store, globals, node);
+        }
         let flow = self
             .plan
             .points
@@ -5150,6 +5248,9 @@ impl SourceFlowFrame<'_, '_> {
         match state {
             SourceFlowAssignmentState::Pending => {
                 *state = SourceFlowAssignmentState::Resolved(current_type);
+                if self.uses_callable_for_of_queries() {
+                    self.memo.clear();
+                }
                 Ok(())
             }
             SourceFlowAssignmentState::Resolved(_)
@@ -5244,6 +5345,23 @@ impl SourceFlowFrame<'_, '_> {
                     .assignments
                     .get(&declaration)
                     .ok_or(SourceFlowInvariant::UnknownAssignment(declaration))?;
+                if self.uses_callable_for_of_queries()
+                    && self.reference == Some(assignment.symbol)
+                    && source_flow_kind(flow, node.flags)? == SourceFlowKind::Assignment
+                    && let Some(SourceFlowAssignmentState::Resolved(current_type)) =
+                        self.assignment_states.get(&declaration)
+                {
+                    // This source path rejects unreachable statements and effect-changing calls.
+                    // A checked simple assignment already has its assignment-reduced current type.
+                    if source_flow_kind(antecedent, flow_node(self.graph, antecedent)?.flags)?
+                        == SourceFlowKind::Unreachable
+                    {
+                        return Err(
+                            SourceFlowInvariant::InvalidParameterAssignment(declaration).into()
+                        );
+                    }
+                    return Ok(self.query_base().with_type(assignment.symbol, *current_type));
+                }
                 let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
                 if self
                     .reference
@@ -5499,6 +5617,18 @@ impl SourceFlowFrame<'_, '_> {
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         let antecedents = label_antecedents(flow, node)?;
         let mut current = self.resolve_flow(store, globals, antecedents[0], depth + 1)?;
+        let declared = self
+            .reference
+            .filter(|_| self.uses_callable_for_of_queries())
+            .and_then(|symbol| {
+                self.declared_types
+                    .get(&symbol)
+                    .copied()
+                    .map(|type_| (symbol, type_))
+            });
+        if declared.is_some_and(|(symbol, type_)| current.type_of(symbol) == Some(type_)) {
+            return Ok(current);
+        }
         let first_incomplete = current.incomplete;
         let key = (flow, self.reference);
         let previous = self.loop_snapshots.insert(key, current.clone());
@@ -5517,6 +5647,9 @@ impl SourceFlowFrame<'_, '_> {
                 }?;
                 current = self.join_snapshots(store, globals, flow, &current, &next)?;
                 self.loop_snapshots.insert(key, current.clone());
+                if declared.is_some_and(|(symbol, type_)| current.type_of(symbol) == Some(type_)) {
+                    break;
+                }
             }
             current.incomplete = first_incomplete;
             Ok(current)
@@ -7444,6 +7577,7 @@ fn validate_annotated_local_assignment(
         }
         syntax
             .linear_statement_scope(statement_ref)
+            .or_else(|| syntax.for_of_statement_scope(statement_ref))
             .ok_or_else(invalid)?
     } else {
         if statement.parent != Some(body.node) {
