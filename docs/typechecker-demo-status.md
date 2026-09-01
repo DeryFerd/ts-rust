@@ -4,6 +4,10 @@ Updated 2026-09-01. No complete real-world project has passed in Rust yet.
 
 ## Current result
 
+The demo is not ready. The combined build failed with four Rust errors, so
+all 454 selected tests remain unrun. Fix those compile errors, then build and
+check unchanged Pathe. Use its next typed failures to choose the next fixes.
+
 Pathe is the first demo target. The latest census checked the same original
 inputs in 21.862 seconds. All 277 loaded files parse without errors, but none
 of the nine roots completes typechecking: eight stop as unsupported and one
@@ -12,15 +16,28 @@ and [independent review](../target/wave202-pathe-first-error-census-3-result-rev
 include the completed resource check. Source and evidence stayed unchanged.
 This diagnostic build does not include the newer combined repairs.
 
-The focused local-write tests improved. These runs used separate source
-branches, not one accepted combined compiler.
+The focused local-write tests improved to six passes out of seven. That run
+used a separate source branch. It does not establish a combined compiler pass.
 
 | Check | Actual result |
 | --- | --- |
+| [Combined repairs 3](../target/wave202-pathe-combined-repairs-3-result.md), `9c1a7cbf` | Binder and parser harnesses compiled. Checker and fixture compilation failed with four distinct Rust errors. No list or run phase started. All 454 tests are unrun. |
 | [Local-write trace focus 2](../target/wave202-pathe-local-write-trace-focus-2-result.md), `38101730` | Compiled and ran all seven unchanged tests. Six passed and one failed, up from four passes and three failures. |
 | [Generic constructor focus](../target/wave202-pathe-generic-constructors-focus-1-result.md), `5373bc05` | Compilation failed after 38.598 seconds with two Rust enum API errors. All five tests remain unrun. |
 | [Rust API preflight](../target/wave202-pathe-checker-compile-preflight-1-result.md), `38b8e0f1` | Failed after 32.463 seconds with exit 101. Four Rust errors across three of 19 targets. The other 16 emitted check metadata. No tests ran. |
 | [Diagnostic CLI build](../target/wave202-pathe-first-error-trace-bin-1-result.md), `68067fca` | Passed in 77.775 seconds. Census 3 then used this unchanged binary without a rebuild. |
+
+The [combined result review](../target/wave202-pathe-combined-repairs-3-result-review.md)
+is closed. Cleanup remains pending. The four diagnostics report missing
+`SignatureLinks` and `SourceNodeParent` names, an unknown closure parameter
+type in `source.rs`, and an `Option<EscapedNameRef>` versus `Option<&str>`
+comparison in `source_callables.rs`. Fixture compilation repeats the same
+checker errors. These are four error sites, not eight separate defects.
+
+The [combined CLI build 4](../target/wave202-pathe-combined-core-bin-4-outcome.md)
+never launched. Approval timed out before process creation. It was not retried
+because the test build had already failed on the same source. It produced no
+executable or project result.
 
 Both branch-join type identity failures now pass. The original 519-byte
 `normalizeWindowsPath` function still stops at `Function(Callable)`. Its new
@@ -32,10 +49,15 @@ remain unchanged. The normalizer and the project still do not pass.
 
 The constructor run found two API errors in `constructor_values.rs`, lines
 512 and 515: code treated `PropertyObjectState` as an `Option`. The two-line
-repair is in progress, pending source review and compilation. These are
-compile failures, not five failed TypeScript tests. The [local-write result review](../target/wave202-pathe-local-write-trace-focus-2-result-review.md)
+[repair](../target/wave202-pathe-constructor-api-fix-handoff.md) and
+[source review](../target/wave202-pathe-constructor-api-fix-review.md) are closed
+at `9c1a7cbf`. The combined compile did not report those two errors, but failed
+at the four sites above. The five constructor tests remain unrun.
+The [local-write result review](../target/wave202-pathe-local-write-trace-focus-2-result-review.md)
 and [constructor result review](../target/wave202-pathe-generic-constructors-focus-1-result-review.md)
-are closed. Cleanup audits for both runs remain pending.
+are closed. The [local-write cleanup](../target/wave202-pathe-local-write-trace-focus-2-cleanup-closure-review.md)
+and [constructor cleanup](../target/wave202-pathe-generic-constructors-focus-1-cleanup-closure-review.md)
+are also closed. Neither audit changed the test results.
 
 The preflight checked 18 public test targets and the ordinary checker library.
 It did not link or run tests, or check the private unit-test library. Its
@@ -49,14 +71,15 @@ selected test unrun. Their
 [rerun result](../target/wave202-pathe-focused-repairs-2-result.md) and
 [review](../target/wave202-pathe-focused-repairs-2-result-review.md) stay unchanged.
 
-The combined source is signed and independently reviewed at `2cc8d38d`, with
+The combined source checkpoint `2cc8d38d` is signed and independently reviewed, with
 894 files. It includes all five local-write, parameter-write, object-binding,
 computed-key and callback donors, both public API repairs, and the complete
 branch-join, generic-constructor and stored-arrow repairs. The
 [source handoff](../target/wave202-pathe-next-three-source-join-handoff.md) and
 [review](../target/wave202-pathe-next-three-source-join-review.md) are closed.
 The [API integration review](../target/wave202-pathe-five-source-api-join-review.md)
-preserves all four test API fixes. No combined build or test has run.
+preserves all four test API fixes. Its follow-up enum repair is `9c1a7cbf`,
+the source used by the failed combined compile. No combined test has run.
 
 | Work | Pathe code it addresses | Source state |
 | --- | --- | --- |
@@ -67,22 +90,26 @@ preserves all four test API fixes. No combined build or test has run.
 | Contextual callback parameters and bodies | Local `Register` and nested `Assert` callbacks | Included in `2cc8d38d`. Six tests unrun. |
 | Computed keys and their stored type evidence | Literal keys and contextual property order | Included in `2cc8d38d`. Tests unrun. |
 
-The next [combined test template](../target/wave202-pathe-combined-repairs-3-template-review.md)
-retains all 408 earlier cases, adds 39 feature cases and seven constructor
-and stored-arrow cases, for 454 total. These are selected tests, not passes.
-The template remains disabled while the enum API repair and final source
-binding are pending. No failed test was removed.
+The [combined selection](../target/wave202-pathe-combined-repairs-3-template-review.md)
+retains all 408 earlier cases, 39 feature cases and seven constructor and
+stored-arrow cases, for 454 total. Compilation stopped before any ran.
+No failed test was removed.
 
 Census 3 exposed a conditional expression rejected inside the lexical loop
 body. The [source diagnosis](../target/wave202-pathe-for-of-conditional-initializer-diagnosis.md)
 locates its ternary inside a template substitution: the conditional planner
-does not accept a `TemplateSpan` parent. A separate
-[implementation and test pair](../target/wave202-pathe-template-conditionals-handoff.md)
-is in progress. It is not in the combined source and has not run. No callable
-trace appeared in the census, so the callback invariant remains unexplained.
-Proxy constructor, method and real `String.raw` composition designs remain
-read-only plans, not implemented fixes. Diagnostic-only source stays out of
-the production port.
+does not accept a `TemplateSpan` parent. The separate
+[template join](../target/wave202-pathe-template-join-handoff.md) is now closed
+at `b102fdcc`, with [independent review](../target/wave202-pathe-template-join-review.md).
+The [contextual method change](../target/wave202-pathe-contextual-method-prefix-handoff.md)
+is also closed at `4ee8330f`, with [independent review](../target/wave202-pathe-contextual-method-prefix-review.md).
+Each adds three tests. Neither change was in the measured combined compile,
+and all six new tests are unrun. They are separate commits, not one verified
+combined result. The method change does not complete the Proxy constructor.
+Real `String.raw` composition also remains separate work.
+
+No callable trace appeared in census 3, so the callback invariant remains
+unexplained. Diagnostic-only source stays out of the production port.
 
 Resource checks are separate from these results. Both the
 [preflight cleanup](../target/wave202-pathe-checker-compile-preflight-1-closure-review.md)
@@ -437,11 +464,11 @@ private validator call. The TypeScript inputs and assertions stay unchanged.
 
 ## Next work
 
-1. Fix the two constructor enum API errors, then build and run the combined
-   454-test selection. Finish and test the separate template-substitution fix.
-   Locate the normalizer and callback causes that produced no trace. Repeat
-   all nine Pathe roots with the original config and dependencies after the
-   source passes its focused checks. Keep diagnostic-only source out of production.
+1. Fix the four combined-build diagnostics and rerun compilation. Build the
+   project-checking executable, then check unchanged Pathe and fix its next
+   typed stops. Run the retained tests and verify the separate template and
+   method changes. Keep the normalizer and callback failures visible until
+   their causes are found. Keep diagnostic-only source out of production.
 2. Run Pathe's original build and project-pinned typecheck separately. Compare
    its loaded files before and after the build. Obtain approval for UFO's install
    and verify its dependencies, then check its seven source roots and separate
@@ -470,10 +497,10 @@ source, not the newer combined source:
 | `src/_internal.ts` | Function body | Keep the normalizer's callable failure separate from the branch-join repair. |
 | `src/_path.ts` | Function-expression initializer | Measure again after the combined body repairs. |
 | `src/index.ts` | New expression | Measure the integrated stored-arrow guard and check Proxy's handler separately. |
-| `src/utils.ts` | New expression | Fix the constructor compile errors and run its five tests. |
+| `src/utils.ts` | New expression | Clear the combined compile errors and run the five constructor tests. |
 | `test/glob.spec.ts` | Arrow parameter | Test the integrated contextual callback donor. |
 | `test/index.spec.ts` | Computed object key containing a call | Check real `String.raw` and imported-helper composition. |
-| `test/node-glob.spec.ts` | `for...of` statement, with an inner conditional failure | Finish the `TemplateSpan` owner fix and measure again. |
+| `test/node-glob.spec.ts` | `for...of` statement, with an inner conditional failure | Test the committed `TemplateSpan` owner fix and measure again. |
 | `test/utils.spec.ts` | Internal callable error with a typed arrow location | Locate its cause. Census 3 emitted no callable trace. |
 
 These are first stops, not a complete list of remaining failures. The six-feature
