@@ -256,6 +256,15 @@ pub(super) struct SourceIterationBindingSyntax {
     pub(super) symbol: SemanticSymbolId,
 }
 
+/// The existing lexical iteration header, before either body grammar is checked.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceIterationHeaderSyntax {
+    pub(super) control: SourceControlLoopSyntax,
+    pub(super) declaration: NodeRef,
+    pub(super) binding: VariableBindingKind,
+    pub(super) bindings: Vec<SourceIterationBindingSyntax>,
+}
+
 /// One lexical `for...in` or callable-owned `for...of` iteration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceForInStatementSyntax {
@@ -494,6 +503,7 @@ pub(super) enum SourceCallableStatementSyntax {
     },
     If(Box<SourceCallableIfSyntax>),
     Try(Box<SourceCallableTrySyntax>),
+    ForOf(Box<SourceCallableForOfSyntax>),
     Return {
         statement: NodeRef,
         expression: Option<NodeRef>,
@@ -533,6 +543,13 @@ pub(super) struct SourceCallableCatchBindingSyntax {
     pub(super) block_redeclaration: Option<NodeRef>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableForOfSyntax {
+    pub(super) header: SourceIterationHeaderSyntax,
+    pub(super) statements: Vec<SourceCallableStatementSyntax>,
+    pub(super) binding_flow: Option<FlowRef>,
+}
+
 impl SourceCallableStatementListSyntax {
     pub(super) fn catch_bindings(&self) -> Vec<&SourceCallableCatchBindingSyntax> {
         let mut pending = self.statements.iter().collect::<Vec<_>>();
@@ -559,21 +576,53 @@ impl SourceCallableStatementListSyntax {
 
     /// Returns only the lexical scope retained by the complete source walk.
     pub(super) fn statement_scope(&self, wanted: NodeRef) -> Option<NodeRef> {
-        self.find_statement_scope(wanted, true)
+        self.find_statement_scope(wanted, true, false)
     }
 
     /// Local writes remain limited to the list and its unconditional blocks.
     pub(super) fn linear_statement_scope(&self, wanted: NodeRef) -> Option<NodeRef> {
-        self.find_statement_scope(wanted, false)
+        self.find_statement_scope(wanted, false, false)
     }
 
-    fn find_statement_scope(&self, wanted: NodeRef, include_branches: bool) -> Option<NodeRef> {
+    /// Conditional own-local writes require an authenticated for-of body.
+    pub(super) fn for_of_statement_scope(&self, wanted: NodeRef) -> Option<NodeRef> {
+        self.find_statement_scope(wanted, true, true)
+    }
+
+    pub(super) fn contains_for_of(&self) -> bool {
+        let mut pending = self.statements.iter().collect::<Vec<_>>();
+        while let Some(statement) = pending.pop() {
+            match statement {
+                SourceCallableStatementSyntax::ForOf(_) => return true,
+                SourceCallableStatementSyntax::Block { statements, .. } => {
+                    pending.extend(statements)
+                }
+                SourceCallableStatementSyntax::If(branch) => {
+                    pending.extend(&branch.then_statements);
+                    pending.extend(&branch.else_statements);
+                }
+                SourceCallableStatementSyntax::Try(tried) => {
+                    pending.extend(&tried.try_statements);
+                    pending.extend(&tried.catch_statements);
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn find_statement_scope(
+        &self,
+        wanted: NodeRef,
+        include_branches: bool,
+        require_for_of: bool,
+    ) -> Option<NodeRef> {
         let mut pending = self
             .statements
             .iter()
-            .map(|statement| (statement, self.callable.declaration))
+            .map(|statement| (statement, self.callable.declaration, false))
             .collect::<Vec<_>>();
-        while let Some((statement, scope)) = pending.pop() {
+        while let Some((statement, scope, in_for_of)) = pending.pop() {
             let node = match statement {
                 SourceCallableStatementSyntax::Leaf(
                     SourceLinearFunctionStatementSyntax::Local(local),
@@ -585,7 +634,11 @@ impl SourceCallableStatementListSyntax {
                 | SourceCallableStatementSyntax::Return { statement, .. } => *statement,
                 SourceCallableStatementSyntax::Empty(node) => *node,
                 SourceCallableStatementSyntax::Block { block, statements } => {
-                    pending.extend(statements.iter().map(|statement| (statement, *block)));
+                    pending.extend(
+                        statements
+                            .iter()
+                            .map(|statement| (statement, *block, in_for_of)),
+                    );
                     *block
                 }
                 SourceCallableStatementSyntax::If(branch) => {
@@ -594,13 +647,13 @@ impl SourceCallableStatementListSyntax {
                             branch
                                 .then_statements
                                 .iter()
-                                .map(|statement| (statement, scope)),
+                                .map(|statement| (statement, scope, in_for_of)),
                         );
                         pending.extend(
                             branch
                                 .else_statements
                                 .iter()
-                                .map(|statement| (statement, scope)),
+                                .map(|statement| (statement, scope, in_for_of)),
                         );
                     }
                     branch.control.statement
@@ -608,17 +661,25 @@ impl SourceCallableStatementListSyntax {
                 SourceCallableStatementSyntax::Try(tried) => {
                     if include_branches {
                         pending.extend(
-                            tried.try_statements.iter().map(|statement| (statement, scope)),
+                            tried.try_statements.iter().map(|statement| (statement, scope, in_for_of)),
                         );
                         pending.extend(tried.catch_statements.iter().map(|statement| {
-                            (statement, tried.catch_clause)
+                            (statement, tried.catch_clause, in_for_of)
                         }));
                     }
                     tried.statement
                 }
+                SourceCallableStatementSyntax::ForOf(iteration) => {
+                    if include_branches {
+                        pending.extend(iteration.statements.iter().map(|statement| {
+                            (statement, iteration.header.control.statement, true)
+                        }));
+                    }
+                    iteration.header.control.statement
+                }
                 SourceCallableStatementSyntax::Leaf(_) => return None,
             };
-            if node == wanted {
+            if node == wanted && (!require_for_of || in_for_of) {
                 return Some(scope);
             }
         }
@@ -645,6 +706,9 @@ impl SourceCallableStatementListSyntax {
                 SourceCallableStatementSyntax::Try(tried) => {
                     pending.extend(&tried.try_statements);
                     pending.extend(&tried.catch_statements);
+                }
+                SourceCallableStatementSyntax::ForOf(iteration) => {
+                    pending.extend(&iteration.statements)
                 }
                 _ => {}
             }
@@ -1514,6 +1578,43 @@ pub(super) fn plan_source_for_of_statement_syntax(
     })
 }
 
+/// Proves a source-owned flat array binding and its direct body expressions.
+pub(super) fn plan_source_lexical_for_of_statement_syntax(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+) -> Result<SourceForInStatementSyntax, SourceFunctionStatementsError> {
+    let source = bound.source_file();
+    let header = plan_source_scoped_iteration_header_syntax(
+        arena,
+        bound,
+        store,
+        statement,
+        (source, source),
+        SourceControlLoopKind::ForOf,
+    )?;
+    if header
+        .bindings
+        .first()
+        .is_none_or(|binding| binding.declaration == header.declaration)
+    {
+        return Err(unsupported_control_statement(
+            statement,
+            SyntaxKind::ForOfStatement,
+        ));
+    }
+    plan_source_scoped_iteration_statement_syntax(
+        arena,
+        bound,
+        store,
+        statement,
+        (source, source),
+        SourceControlLoopKind::ForOf,
+        None,
+    )
+}
+
 /// Proves one top-level string key and every direct expression in its body.
 pub(super) fn plan_source_for_in_statement_syntax(
     arena: &NodeArena,
@@ -1586,16 +1687,15 @@ pub(super) fn plan_source_function_for_of_statement_syntax(
     .plan_for_of()
 }
 
-#[allow(clippy::too_many_lines)] // The loop, binding, body, and flow share one binder contract.
-fn plan_source_scoped_iteration_statement_syntax(
+#[allow(clippy::too_many_lines)] // Both body grammars use the same declaration and scope proof.
+fn plan_source_scoped_iteration_header_syntax(
     arena: &NodeArena,
     bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
     statement: NodeRef,
     parent_and_container: (NodeRef, NodeRef),
     expected_kind: SourceControlLoopKind,
-    callable: Option<&SourceCallablePlan>,
-) -> Result<SourceForInStatementSyntax, SourceFunctionStatementsError> {
+) -> Result<SourceIterationHeaderSyntax, SourceFunctionStatementsError> {
     let (parent, container) = parent_and_container;
     let control = plan_source_control_loop_syntax(arena, bound, statement, parent)?;
     if control.kind != expected_kind
@@ -1815,6 +1915,38 @@ fn plan_source_scoped_iteration_statement_syntax(
         }
         _ => return Err(unsupported_control_statement(pattern, pattern_record.kind)),
     };
+    Ok(SourceIterationHeaderSyntax {
+        control,
+        declaration,
+        binding,
+        bindings,
+    })
+}
+
+#[allow(clippy::too_many_lines)] // The standalone body and flow keep their existing contract.
+fn plan_source_scoped_iteration_statement_syntax(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+    parent_and_container: (NodeRef, NodeRef),
+    expected_kind: SourceControlLoopKind,
+    callable: Option<&SourceCallablePlan>,
+) -> Result<SourceForInStatementSyntax, SourceFunctionStatementsError> {
+    let (_, container) = parent_and_container;
+    let SourceIterationHeaderSyntax {
+        control,
+        declaration,
+        binding,
+        bindings,
+    } = plan_source_scoped_iteration_header_syntax(
+        arena,
+        bound,
+        store,
+        statement,
+        parent_and_container,
+        expected_kind,
+    )?;
     let first_binding = bindings
         .first()
         .copied()
@@ -4949,6 +5081,42 @@ impl SyntaxPlanner<'_> {
         let body = self.callable.body;
         self.validate_range(body, declaration)?;
         let nodes = self.plan_body(body, declaration)?;
+        // Keep existing standalone loops. Only new flat-array bodies use this route.
+        if let Some(&first) = nodes.first()
+            && self.node(self.reference(first))?.kind == SyntaxKind::ForOfStatement
+        {
+            let first = self.reference(first);
+            let header = plan_source_scoped_iteration_header_syntax(
+                self.arena,
+                self.bound,
+                self.store,
+                first,
+                (body, declaration),
+                SourceControlLoopKind::ForOf,
+            )?;
+            if header
+                .bindings
+                .first()
+                .is_none_or(|binding| binding.declaration == header.declaration)
+            {
+                return Err(self.unsupported(
+                    first,
+                    SyntaxKind::ForOfStatement,
+                    SourceFunctionStatementsRole::BodyStatement,
+                ));
+            }
+            match self.plan_for_of() {
+                Ok(_) => {
+                    return Err(self.unsupported(
+                        first,
+                        SyntaxKind::ForOfStatement,
+                        SourceFunctionStatementsRole::BodyStatement,
+                    ));
+                }
+                Err(SourceFunctionStatementsError::Unsupported(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let statements = self.plan_callable_list(&nodes, body, declaration, 0)?;
         let flow = self.bound.flow_graph();
         if flow.container_is_complete(declaration) != Some(true) {
@@ -5101,6 +5269,9 @@ impl SyntaxPlanner<'_> {
             )),
             SyntaxKind::TryStatement => SourceCallableStatementSyntax::Try(Box::new(
                 self.plan_callable_try(statement, parent, scope, depth)?,
+            )),
+            SyntaxKind::ForOfStatement => SourceCallableStatementSyntax::ForOf(Box::new(
+                self.plan_callable_for_of(statement, parent, scope, depth)?,
             )),
             _ => {
                 return Err(self.unsupported(
@@ -5322,6 +5493,104 @@ impl SyntaxPlanner<'_> {
             equality_condition: condition.and_then(|condition| condition.equality_condition),
             then_statements,
             else_statements,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep the header, body scopes and first assignment together.
+    fn plan_callable_for_of(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        scope: NodeRef,
+        depth: usize,
+    ) -> Result<SourceCallableForOfSyntax, SourceFunctionStatementsError> {
+        let container = self.callable.declaration;
+        self.validate_block_scope_container(statement, scope)?;
+        let header = plan_source_scoped_iteration_header_syntax(
+            self.arena,
+            self.bound,
+            self.store,
+            statement,
+            (parent, container),
+            SourceControlLoopKind::ForOf,
+        )?;
+        let binding = header
+            .bindings
+            .last()
+            .ok_or(SourceFunctionStatementsInvariant::MissingLocals(statement))?;
+        if self.node(header.control.body)?.kind != SyntaxKind::Block {
+            return Err(unsupported_control_statement(
+                statement,
+                SyntaxKind::ForOfStatement,
+            ));
+        }
+        let statements = self.plan_callable_list(
+            &[header.control.body.node],
+            statement,
+            statement,
+            depth + 1,
+        )?;
+        let mut first = None;
+        let mut pending = statements.iter().rev().collect::<Vec<_>>();
+        while let Some(node) = pending.pop() {
+            let point = match node {
+                SourceCallableStatementSyntax::Block { statements, .. } => {
+                    pending.extend(statements.iter().rev());
+                    None
+                }
+                SourceCallableStatementSyntax::If(branch) => {
+                    pending.extend(branch.else_statements.iter().rev());
+                    pending.extend(branch.then_statements.iter().rev());
+                    Some(branch.control.statement)
+                }
+                SourceCallableStatementSyntax::Leaf(
+                    SourceLinearFunctionStatementSyntax::Local(local),
+                ) if local.binding != VariableBindingKind::Var => Some(local.name),
+                SourceCallableStatementSyntax::Leaf(
+                    SourceLinearFunctionStatementSyntax::Expression { statement, .. },
+                )
+                | SourceCallableStatementSyntax::Return { statement, .. } => Some(*statement),
+                SourceCallableStatementSyntax::Empty(statement) => Some(*statement),
+                _ => {
+                    return Err(unsupported_control_statement(
+                        statement,
+                        SyntaxKind::ForOfStatement,
+                    ));
+                }
+            };
+            if first.is_none() {
+                first = point;
+            }
+        }
+        let binding_flow = first
+            .map(|first| {
+                let invalid = || SourceFunctionStatementsInvariant::InvalidFlowContainer {
+                    node: first,
+                    expected: container,
+                    actual: self.bound.flow_container(first),
+                };
+                let flow = self.bound.flow_at(first).ok_or_else(invalid)?;
+                let assignment = self
+                    .bound
+                    .flow_graph()
+                    .nodes()
+                    .get(flow)
+                    .ok_or_else(invalid)?;
+                if joined_semantic_flow_flags(assignment.flags) != FlowFlags::ASSIGNMENT.bits()
+                    || assignment.payload != Some(FlowNodePayload::Ast(binding.declaration))
+                    || assignment.antecedent.is_none()
+                    || !assignment.antecedents.is_empty()
+                    || self.bound.flow_container(first) != Some(container)
+                {
+                    return Err(invalid());
+                }
+                Ok(flow)
+            })
+            .transpose()?;
+        Ok(SourceCallableForOfSyntax {
+            header,
+            statements,
+            binding_flow,
         })
     }
 
@@ -12633,6 +12902,116 @@ mod joined_tests {
                 locals
                     .iter()
                     .any(|local| local.binding == VariableBindingKind::Var)
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the retained header and its changed-table control together.
+    fn callable_for_of_header_keeps_real_scope_and_rejects_changed_binding() {
+        for (index, keyword) in ["const", "let"].into_iter().enumerate() {
+            let source = format!(
+                "function choose(values: string, flag: boolean): string | undefined {{ let best: string | undefined; if (flag) {{}} for ({keyword} item of values) {{ if (flag) {{ best = item; }} }} return best; }}"
+            );
+            let mut fixture = JoinedFixture::new(
+                &source,
+                FileId::new(58_720 + u32::try_from(index).unwrap()),
+            );
+            let callable = fixture.callable();
+            let plan = plan_source_callable_statement_list_syntax(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                &callable,
+            )
+            .unwrap();
+            let SourceCallableStatementSyntax::ForOf(iteration) = &plan.statements[2] else {
+                panic!("the mixed list must retain its actual loop");
+            };
+            let binding = iteration.header.bindings[0];
+            let statement = iteration.header.control.statement;
+            assert_eq!(binding.declaration, iteration.header.declaration);
+            assert_eq!(
+                fixture.bound.block_scope_container(binding.declaration),
+                Some(statement)
+            );
+            let flow = fixture
+                .bound
+                .flow_graph()
+                .nodes()
+                .get(iteration.binding_flow.unwrap())
+                .unwrap();
+            assert_eq!(
+                joined_semantic_flow_flags(flow.flags),
+                FlowFlags::ASSIGNMENT.bits()
+            );
+            assert_eq!(flow.payload, Some(FlowNodePayload::Ast(binding.declaration)));
+            let write = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(record.data, NodeData::ExpressionStatement(_))
+                        .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+                })
+                .unwrap();
+            assert_eq!(
+                plan.statement_scope(write),
+                fixture.bound.block_scope_container(write)
+            );
+            assert_eq!(plan.for_of_statement_scope(write), plan.statement_scope(write));
+            assert_eq!(plan.linear_statement_scope(write), None);
+            let SourceCallableStatementSyntax::Return {
+                statement: returned,
+                ..
+            } = &plan.statements[3]
+            else {
+                panic!("the original return must remain after the loop");
+            };
+            assert_eq!(plan.for_of_statement_scope(*returned), None);
+            assert!(plan.contains_for_of());
+
+            let table = fixture.bound.locals(statement).unwrap();
+            let foreign = callable.parameters[1].symbol;
+            assert_eq!(
+                fixture
+                    .store
+                    .insert_symbol(table, EscapedName::source("item"), foreign),
+                Some(Some(binding.symbol))
+            );
+            let damaged = format!("{:#?}", fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    plan_source_callable_statement_list_syntax(
+                        &fixture.parsed.arena,
+                        &fixture.bound,
+                        &fixture.store,
+                        &callable,
+                    ),
+                    Err(SourceFunctionStatementsInvariant::LocalTableMismatch {
+                        declaration: binding.declaration,
+                        scope: statement,
+                        expected: binding.symbol,
+                        actual: Some(foreign),
+                    }
+                    .into())
+                );
+                assert_eq!(format!("{:#?}", fixture.store), damaged);
+            }
+            assert_eq!(
+                fixture
+                    .store
+                    .insert_symbol(table, EscapedName::source("item"), binding.symbol),
+                Some(Some(foreign))
+            );
+            assert_eq!(
+                plan_source_callable_statement_list_syntax(
+                    &fixture.parsed.arena,
+                    &fixture.bound,
+                    &fixture.store,
+                    &callable,
+                ),
+                Ok(plan)
             );
         }
     }

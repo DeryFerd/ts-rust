@@ -330,6 +330,7 @@ use super::{
         SourceForStatementSyntax, SourceFunctionStatementsError, SourceFunctionStatementsInvariant,
         SourceFunctionStatementsSyntax, SourceJoinedFunctionStatementsError,
         SourceJoinedFunctionStatementsInvariant, SourceJoinedFunctionStatementsSyntax,
+        SourceIterationHeaderSyntax,
         SourceLinearFunctionStatementSyntax, SourceLinearFunctionStatementsSyntax,
         SourceLocalDeclarationSyntax, SourceLoopFunctionStatementSyntax,
         SourceLoopFunctionStatementsSyntax, SourceReturnBranchSyntax,
@@ -345,7 +346,8 @@ use super::{
         plan_source_for_of_statement_syntax, plan_source_for_statement_syntax,
         plan_source_function_for_in_statement_syntax, plan_source_function_for_of_statement_syntax,
         plan_source_function_statements_syntax, plan_source_joined_function_statements_syntax,
-        plan_source_labeled_for_in_statement_syntax, plan_source_linear_function_statements_syntax,
+        plan_source_labeled_for_in_statement_syntax, plan_source_lexical_for_of_statement_syntax,
+        plan_source_linear_function_statements_syntax,
         plan_source_linear_logical_statement_syntax, plan_source_loop_function_statements_syntax,
         plan_source_switch_function_statements_syntax,
         plan_source_typeof_switch_function_statements_syntax,
@@ -1795,6 +1797,11 @@ enum PlannedCallableStatement {
         statement: NodeRef,
         expression: Box<PlannedExpression>,
     },
+    ForOf {
+        header: SourceIterationHeaderSyntax,
+        iterable: Box<PlannedExpression>,
+        statements: Vec<Self>,
+    },
     Return {
         statement: NodeRef,
         expression: Option<Box<PlannedExpression>>,
@@ -1815,6 +1822,13 @@ struct PlannedCallableTryStatement {
 struct PlannedCallableCatchBinding {
     syntax: SourceCallableCatchBindingSyntax,
     initializer: Option<PlannedExpression>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CallableLocalWrites {
+    Linear,
+    ForOf,
+    Unavailable,
 }
 
 impl PlannedCallableStatementList {
@@ -1849,6 +1863,7 @@ impl PlannedCallableStatementList {
                         binding.initializer.as_ref()
                     }));
                 }
+                PlannedCallableStatement::ForOf { iterable, .. } => expressions.push(iterable),
                 PlannedCallableStatement::If { condition, .. } => {
                     let mut conditions = vec![condition.as_ref()];
                     while let Some(condition) = conditions.pop() {
@@ -1888,7 +1903,10 @@ fn callable_statement_nodes(
     while let Some(statement) = pending.pop() {
         result.push(statement);
         match statement {
-            PlannedCallableStatement::Block(statements) => pending.extend(statements.iter().rev()),
+            PlannedCallableStatement::Block(statements)
+            | PlannedCallableStatement::ForOf { statements, .. } => {
+                pending.extend(statements.iter().rev())
+            }
             PlannedCallableStatement::If {
                 then_statements,
                 else_statements,
@@ -2731,6 +2749,7 @@ enum PlannedStatement {
     For(Box<PlannedTopLevelFor>),
     ForIn(Box<PlannedLexicalIteration>),
     ForOf(Box<PlannedTopLevelForOf>),
+    LexicalForOf(Box<PlannedLexicalIteration>),
     UnusedIteration(Box<PlannedUnusedIteration>),
     CapturedIteration(Box<PlannedCapturedIteration>),
     CapturedBlockLoop(Box<PlannedCapturedBlockLoop>),
@@ -3641,7 +3660,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                 }
                 SyntaxKind::ForOfStatement => {
-                    if self.no_unused_locals
+                    let lexical = match self.plan_top_level_lexical_for_of(statement) {
+                        Ok(iteration) => Some(iteration),
+                        Err(SourceCheckError::Unsupported(_)) => None,
+                        Err(error) => return Err(error),
+                    };
+                    if let Some(iteration) = lexical {
+                        statements.push(PlannedStatement::LexicalForOf(Box::new(iteration)));
+                    } else if self.no_unused_locals
                         && let Some(iteration) = self.plan_top_level_unused_iteration(statement)?
                     {
                         statements.push(PlannedStatement::UnusedIteration(Box::new(iteration)));
@@ -5941,6 +5967,35 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         self.readable_variables = readable_variables;
         self.assignable_mutable_variables = assignable_mutable_variables;
         result
+    }
+
+    fn plan_top_level_lexical_for_of(
+        &mut self,
+        statement: NodeRef,
+    ) -> Result<PlannedLexicalIteration, SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Err(self.unsupported(
+                statement,
+                SyntaxKind::ForOfStatement,
+                SourceSyntaxRole::Statement,
+            ));
+        };
+        let syntax =
+            plan_source_lexical_for_of_statement_syntax(self.arena, self.bound, store, statement)
+                .map_err(|error| match error {
+                    SourceFunctionStatementsError::Unsupported(_) => self.unsupported(
+                        statement,
+                        SyntaxKind::ForOfStatement,
+                        SourceSyntaxRole::Statement,
+                    ),
+                    SourceFunctionStatementsError::Variable(error) => {
+                        Self::variable_plan_error(error)
+                    }
+                    SourceFunctionStatementsError::Invariant(_) => {
+                        SourceCheckError::Function(SourceFunctionInvariant::Callable(statement))
+                    }
+                })?;
+        self.finish_for_in_statement(syntax)
     }
 
     fn plan_top_level_for_of(
@@ -14999,8 +15054,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     ) -> Result<PlannedCallableStatementList, SourceCheckError> {
         let callable = &syntax.callable;
         let mut locals = Vec::new();
-        let statements =
-            self.finish_callable_statements(callable, &syntax.statements, &mut locals, true)?;
+        let statements = self.finish_callable_statements(
+            callable,
+            &syntax.statements,
+            &mut locals,
+            CallableLocalWrites::Linear,
+        )?;
         let nodes = callable_statement_nodes(&statements);
         let mut points = Vec::new();
         let mut conditions = Vec::new();
@@ -15010,6 +15069,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let mut captures = Vec::new();
         let mut mutations = Vec::new();
         let mut catch_initializers = Vec::new();
+        let mut iteration_assignments = Vec::new();
         let (store, host) = self
             .semantic
             .ok_or_else(|| Self::unsupported_function_body(callable))?;
@@ -15056,6 +15116,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 PlannedCallableStatement::If { condition, .. } => {
                     points.extend(condition.flow_points());
                     conditions.extend(condition.flow_conditions());
+                }
+                PlannedCallableStatement::ForOf {
+                    header, iterable, ..
+                } => {
+                    points.push(header.control.statement);
+                    for binding in &header.bindings {
+                        points.push(binding.name);
+                        iteration_assignments.push(SourceFlowAssignment {
+                            declaration: binding.declaration,
+                            symbol: binding.symbol,
+                        });
+                    }
+                    collect_eager_logical_truthiness_conditions(
+                        iterable,
+                        &mut logical_conditions,
+                    );
                 }
                 PlannedCallableStatement::Return {
                     statement,
@@ -15152,7 +15228,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     declaration: local.declaration,
                     symbol: local.symbol,
                 })
-                .chain(catch_initializers),
+                .chain(catch_initializers)
+                .chain(iteration_assignments),
             parameters,
             calls,
             captures,
@@ -15169,13 +15246,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         })
     }
 
-    #[allow(clippy::too_many_lines)] // Keep the ordered list and its local-write boundary together.
+    #[allow(clippy::too_many_lines)] // Keep statement order, lexical entry and write permissions together.
     fn finish_callable_statements(
         &mut self,
         callable: &SourceCallablePlan,
         syntax: &[SourceCallableStatementSyntax],
         locals: &mut Vec<PlannedVariable>,
-        linear_local_writes: bool,
+        local_writes: CallableLocalWrites,
     ) -> Result<Vec<PlannedCallableStatement>, SourceCheckError> {
         let mut statements = Vec::new();
         for statement in syntax {
@@ -15194,7 +15271,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         expression,
                     },
                 ) => {
-                    let local_assignment = if linear_local_writes {
+                    let local_assignment = if local_writes != CallableLocalWrites::Unavailable {
                         self.plan_linear_annotated_local_assignment(
                             callable,
                             locals,
@@ -15239,7 +15316,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         callable,
                         statements,
                         locals,
-                        linear_local_writes,
+                        local_writes,
+                        true,
                     )?)
                 }
                 SourceCallableStatementSyntax::If(branch) => {
@@ -15258,16 +15336,23 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             branch.control.statement,
                         )?
                     };
+                    let branch_writes = if local_writes == CallableLocalWrites::ForOf {
+                        CallableLocalWrites::ForOf
+                    } else {
+                        CallableLocalWrites::Unavailable
+                    };
                     let then_statements = self.finish_callable_statement_scope(
                         callable,
                         &branch.then_statements,
                         locals,
+                        branch_writes,
                         false,
                     )?;
                     let else_statements = self.finish_callable_statement_scope(
                         callable,
                         &branch.else_statements,
                         locals,
+                        branch_writes,
                         false,
                     )?;
                     PlannedCallableStatement::If {
@@ -15280,6 +15365,42 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     PlannedCallableStatement::Try(Box::new(
                         self.finish_callable_try(callable, tried, locals)?,
                     ))
+                }
+                SourceCallableStatementSyntax::ForOf(iteration) => {
+                    let header = &iteration.header;
+                    let iterable = self.plan_expression(
+                        header
+                            .control
+                            .iterable
+                            .ok_or_else(|| Self::unsupported_function_body(callable))?,
+                    )?;
+                    let prior = self.prior_variables.clone();
+                    let readable = self.readable_variables.clone();
+                    let result = (|| {
+                        for binding in &header.bindings {
+                            if !self.prior_variables.insert(binding.symbol)
+                                || !self.readable_variables.insert(binding.symbol)
+                            {
+                                return Err(SourceCheckError::Variable(
+                                    VariableInvariant::InvalidSymbolShape(binding.symbol),
+                                ));
+                            }
+                        }
+                        self.finish_callable_statement_scope(
+                            callable,
+                            &iteration.statements,
+                            locals,
+                            CallableLocalWrites::ForOf,
+                            false,
+                        )
+                    })();
+                    self.prior_variables = prior;
+                    self.readable_variables = readable;
+                    PlannedCallableStatement::ForOf {
+                        header: header.clone(),
+                        iterable: Box::new(iterable),
+                        statements: result?,
+                    }
                 }
                 SourceCallableStatementSyntax::Return {
                     statement,
@@ -15303,7 +15424,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         locals: &mut Vec<PlannedVariable>,
     ) -> Result<PlannedCallableTryStatement, SourceCheckError> {
         let try_statements = self.finish_callable_statement_scope(
-            callable, &syntax.try_statements, locals, false,
+            callable, &syntax.try_statements, locals, CallableLocalWrites::Unavailable, false,
         )?;
         let prior = self.prior_variables.clone();
         let readable = self.readable_variables.clone();
@@ -15328,7 +15449,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 Ok(PlannedCallableCatchBinding { syntax: binding, initializer })
             }).transpose()?;
             let catch_statements = self.finish_callable_statement_scope(
-                callable, &syntax.catch_statements, locals, false,
+                callable, &syntax.catch_statements, locals, CallableLocalWrites::Unavailable, false,
             )?;
             Ok(PlannedCallableTryStatement {
                 try_block: syntax.try_block,
@@ -15363,21 +15484,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         callable: &SourceCallablePlan,
         syntax: &[SourceCallableStatementSyntax],
         locals: &mut Vec<PlannedVariable>,
-        linear_local_writes: bool,
+        local_writes: CallableLocalWrites,
+        carry_assignments: bool,
     ) -> Result<Vec<PlannedCallableStatement>, SourceCheckError> {
         let prior = self.prior_variables.clone();
         let readable = self.readable_variables.clone();
         let uninitialized = self.assignable_uninitialized_variables.clone();
         let assigned = self.assigned_variables.clone();
         let first_local = locals.len();
-        let result = self.finish_callable_statements(callable, syntax, locals, linear_local_writes);
+        let result = self.finish_callable_statements(callable, syntax, locals, local_writes);
         let completed_assignments = std::mem::replace(&mut self.assigned_variables, assigned);
         self.prior_variables = prior;
         self.readable_variables = readable;
         self.assignable_uninitialized_variables = uninitialized;
         if result.is_ok() {
             // Only unconditional blocks carry real writes to surviving outer locals.
-            if linear_local_writes {
+            if carry_assignments {
                 self.assigned_variables.extend(
                     completed_assignments
                         .iter()
@@ -15394,7 +15516,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         PlannedVariableInitializer::AbsentAnnotated
                     ) {
                         self.assignable_uninitialized_variables.insert(local.symbol);
-                        if linear_local_writes && completed_assignments.contains(&local.symbol) {
+                        if carry_assignments && completed_assignments.contains(&local.symbol) {
                             self.assigned_variables.insert(local.symbol);
                         }
                     }
@@ -17941,7 +18063,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             let (linear_body, body) = match (source.body, statements) {
                 (
                     SourceArrowBodyPlan::LinearBlock { .. }
-                    | SourceArrowBodyPlan::StatementBlock { .. },
+                    | SourceArrowBodyPlan::StatementBlock { .. }
+                    | SourceArrowBodyPlan::ForOfBlock { .. },
                     PlannedFunctionBody::StatementList(body),
                 ) => (None, PlannedArrowBody::StatementList(body)),
                 (SourceArrowBodyPlan::LinearBlock { .. }, PlannedFunctionBody::Linear(linear)) => {
@@ -23409,7 +23532,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let (linear_body, body) = match (body, statements) {
                     (
                         SourceArrowBodyPlan::LinearBlock { .. }
-                        | SourceArrowBodyPlan::StatementBlock { .. },
+                        | SourceArrowBodyPlan::StatementBlock { .. }
+                        | SourceArrowBodyPlan::ForOfBlock { .. },
                         PlannedFunctionBody::StatementList(body),
                     ) => (None, PlannedArrowBody::StatementList(body)),
                     (
@@ -31402,6 +31526,18 @@ fn preflight_inferred_function_return_dependencies(
             }
             PlannedCallableStatement::Throw { expression, .. } => {
                 expression_is_closed(expression, parameters, locals, functions)
+            }
+            PlannedCallableStatement::ForOf {
+                header,
+                iterable,
+                statements,
+            } => {
+                if !expression_is_closed(iterable, parameters, locals, functions) {
+                    return false;
+                }
+                let mut scoped = locals.clone();
+                scoped.extend(header.bindings.iter().map(|binding| binding.symbol));
+                statement_list_is_closed(body, statements, parameters, &mut scoped, functions)
             }
             PlannedCallableStatement::Return { expression, .. } => {
                 expression.as_ref().is_none_or(|expression| {
@@ -52585,6 +52721,130 @@ fn check_callable_statement_nodes(
                     None, capture,
                 )?;
                 check_callable_statement_expression_effects(store, callable, expression)?;
+            }
+            PlannedCallableStatement::ForOf {
+                header,
+                iterable,
+                statements,
+            } => {
+                let snapshot = frame
+                    .snapshot_at(store, global_types, header.control.statement)
+                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                let checked = check_expression_type_with_capture_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    snapshot.types(),
+                    type_import_execution,
+                    iterable,
+                    None,
+                    deferred,
+                    None,
+                    capture,
+                )?;
+                check_callable_statement_expression_effects(store, callable, iterable)?;
+                let iteration_type = check_source_for_of_iteration(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    iterable.node,
+                    checked.result,
+                )?;
+                let destructured = header
+                    .bindings
+                    .first()
+                    .is_some_and(|binding| binding.declaration != header.declaration);
+                let binding_iteration_type = if destructured {
+                    let declaration = header.bindings[0].declaration;
+                    let pattern = host
+                        .node(declaration)
+                        .and_then(|record| record.parent)
+                        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+                        .filter(|pattern| {
+                            host.node(*pattern)
+                                .is_some_and(|record| record.kind == SyntaxKind::ArrayBindingPattern)
+                        })
+                        .ok_or(SourceCheckError::Variable(
+                            VariableInvariant::InvalidBindingPattern(declaration),
+                        ))?;
+                    source_array_binding_iteration_type(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        pattern,
+                        iteration_type,
+                    )?
+                } else {
+                    iteration_type
+                };
+                let entries = returned.declared_entries.clone();
+                for binding in &header.bindings {
+                    let type_ = if destructured {
+                        let checked = check_source_array_binding_element(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            diagnostics,
+                            binding.declaration,
+                            iteration_type,
+                            binding_iteration_type,
+                        )?;
+                        if let Some(diagnostic) = checked.diagnostic {
+                            merge_retry_diagnostic(diagnostics, diagnostic);
+                        }
+                        checked.type_
+                    } else {
+                        iteration_type
+                    };
+                    let current =
+                        inferred_variable_type(store, global_types, header.binding, type_)?;
+                    stage_value_type(
+                        store,
+                        staged_value_types,
+                        value_order,
+                        binding.symbol,
+                        current,
+                    )?;
+                    frame
+                        .complete_assignment(binding.declaration, binding.symbol, current)
+                        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                    if !header.binding.is_const() {
+                        returned.declared_entries.insert(binding.symbol, current);
+                    }
+                }
+                let result = check_callable_statement_nodes(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    frame,
+                    type_import_execution,
+                    deferred,
+                    body,
+                    statements,
+                    expected,
+                    returned,
+                    staged_value_types,
+                    value_order,
+                    outer_capture,
+                );
+                returned.declared_entries = entries;
+                result?;
             }
             PlannedCallableStatement::Return {
                 statement,
@@ -76568,7 +76828,7 @@ pub(super) fn check_source_file(
                     issue_node_diagnostic(diagnostics, statement, 1116)?;
                 }
             }
-            PlannedStatement::ForIn(iteration) => {
+            PlannedStatement::ForIn(iteration) | PlannedStatement::LexicalForOf(iteration) => {
                 check_planned_lexical_iteration(
                     store,
                     host,
@@ -79298,6 +79558,305 @@ mod tests {
                 work,
             );
             assert_eq!(diagnostics, issued);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check pending writes and the zero-entry edge in the real callable frame.
+    fn callable_for_of_flow_requires_checked_writes_and_keeps_zero_entry() {
+        use super::super::source_flow::SourceFlowInvariant;
+
+        let source = parsed(concat!(
+            "function select(values: string, flag: boolean): string | undefined { ",
+            "const entry = values; let best: string | undefined; if (flag) {} ",
+            "for (const item of entry) { const selected: string = item; ",
+            "if (flag) { best = selected; const afterWrite = best; } } ",
+            "const afterLoop = best; return afterLoop; }",
+        ));
+        let file = FileId::new(58_723);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let plan = SourcePlanner::new_semantic_with_global_types(
+            &source.arena,
+            &bound,
+            context.source_file(file).unwrap(),
+            context.store(),
+            &host,
+            &globals,
+            context.options(),
+        )
+        .finish()
+        .unwrap();
+        let [function] = plan.functions.as_slice() else {
+            panic!("expected one ordinary callable");
+        };
+        let PlannedFunctionBody::StatementList(body) = &function.body else {
+            panic!("the mixed body must use the shared statement frame");
+        };
+        let local = |name| {
+            body.locals
+                .iter()
+                .find(|local| context.store().source_identifier_text(local.name) == Some(name))
+                .unwrap()
+        };
+        let (entry, best, selected, after_write, after_loop) = (
+            local("entry"),
+            local("best"),
+            local("selected"),
+            local("afterWrite"),
+            local("afterLoop"),
+        );
+        let header = callable_statement_nodes(&body.statements)
+            .into_iter()
+            .find_map(|statement| match statement {
+                PlannedCallableStatement::ForOf { header, .. } => Some(header),
+                _ => None,
+            })
+            .unwrap();
+        let item = header.bindings[0];
+        let write = callable_statement_nodes(&body.statements)
+            .into_iter()
+            .find_map(|statement| match statement {
+                PlannedCallableStatement::Leaf(
+                    PlannedLinearFunctionStatement::ParameterAssignment(write),
+                ) => Some(write),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(write.flow.symbol, best.symbol);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let declared = context
+            .store()
+            .value_symbol_links(best.symbol)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(context.type_to_string(declared).unwrap(), "string | undefined");
+        let entries =
+            source_arrow_parameter_entry_types(context.store(), &function.callable).unwrap();
+        let mut frame = body
+            .flow
+            .frame_with_captured_locals(context.store(), &host, &bound, entries)
+            .unwrap();
+        frame
+            .complete_assignment(entry.declaration, entry.symbol, string)
+            .unwrap();
+        frame
+            .enter_uninitialized_local(
+                context.store(),
+                &host,
+                best.declaration,
+                best.symbol,
+                declared,
+                declared,
+            )
+            .unwrap();
+        frame
+            .complete_assignment(item.declaration, item.symbol, string)
+            .unwrap();
+        let entry_snapshot = frame
+            .snapshot_at(context.store_mut_for_test(), &globals, selected.name)
+            .unwrap();
+        assert_eq!(entry_snapshot.type_of(item.symbol), Some(string));
+        assert_eq!(entry_snapshot.type_of(best.symbol), Some(declared));
+        assert_eq!(entry_snapshot.type_of(selected.symbol), None);
+        frame
+            .complete_assignment(selected.declaration, selected.symbol, string)
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                frame.snapshot_at(context.store_mut_for_test(), &globals, after_write.name),
+                Err(SourceFlowError::Invariant(SourceFlowInvariant::PendingAssignment(
+                    write.flow.target
+                )))
+            );
+        }
+        frame
+            .complete_assignment(write.flow.target, best.symbol, string)
+            .unwrap();
+        let written = frame
+            .snapshot_at(context.store_mut_for_test(), &globals, after_write.name)
+            .unwrap();
+        assert_eq!(written.type_of(best.symbol), Some(string));
+        let exit = frame
+            .snapshot_at(context.store_mut_for_test(), &globals, after_loop.name)
+            .unwrap();
+        assert_eq!(exit.type_of(best.symbol), Some(declared));
+        assert_eq!(exit.type_of(item.symbol), None);
+        assert_eq!(exit.type_of(selected.symbol), None);
+        let before = observable_state(&context, file);
+        for _ in 0..2 {
+            assert_eq!(
+                frame.snapshot_at(context.store_mut_for_test(), &globals, after_loop.name),
+                Ok(exit.clone())
+            );
+            assert_eq!(
+                frame.complete_assignment(write.flow.target, best.symbol, string),
+                Err(SourceFlowError::Invariant(SourceFlowInvariant::AssignmentAlreadyCompleted(
+                    write.flow.target
+                )))
+            );
+            assert_eq!(observable_state(&context, file), before);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep write permission, scope exit and retained owner checks together.
+    fn callable_for_of_write_proof_separates_branch_and_loop_exit_state() {
+        for header in [
+            "function select(values: string, flag: boolean): string | undefined",
+            "const select = (values: string, flag: boolean): string | undefined =>",
+        ] {
+            let source = parsed(&format!(
+                "{header} {{ let conditional: string | undefined; let direct: string | undefined; if (flag) {{}} for (const item of values) {{ if (flag) {{ conditional = item; const inBranch = conditional; }} const afterBranch = conditional; {{ direct = item; }} const inIteration = direct; }} const afterLoop = direct; return conditional; }};"
+            ));
+            let file = FileId::new(58_722);
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, &bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let before = observable_state(&context, file);
+            let plan = SourcePlanner::new_semantic_with_global_types(
+                &source.arena,
+                &bound,
+                context.source_file(file).unwrap(),
+                context.store(),
+                &host,
+                context.global_types(),
+                context.options(),
+            )
+            .finish()
+            .unwrap();
+            assert_eq!(observable_state(&context, file), before);
+            let body = match (plan.functions.as_slice(), plan.arrows.as_slice()) {
+                ([function], []) => {
+                    let PlannedFunctionBody::StatementList(body) = &function.body else {
+                        panic!("the function must keep the mixed statement list");
+                    };
+                    body
+                }
+                ([], [arrow]) => {
+                    let PlannedArrowBody::StatementList(body) = &arrow.body else {
+                        panic!("the stored arrow must keep the same statement grammar");
+                    };
+                    body
+                }
+                _ => panic!("expected one actual source callable"),
+            };
+            for (name, unassigned) in [
+                ("inBranch", false),
+                ("afterBranch", true),
+                ("inIteration", false),
+                ("afterLoop", true),
+            ] {
+                let local = body
+                    .locals
+                    .iter()
+                    .find(|local| context.store().source_identifier_text(local.name) == Some(name))
+                    .unwrap();
+                let PlannedVariableInitializer::Expression(read) = &local.initializer else {
+                    panic!("the control must keep its actual local read");
+                };
+                assert_eq!(read.used_before_assignment, unassigned, "{name}");
+            }
+            let writes = callable_statement_nodes(&body.statements)
+                .into_iter()
+                .filter_map(|statement| match statement {
+                    PlannedCallableStatement::Leaf(
+                        PlannedLinearFunctionStatement::ParameterAssignment(write),
+                    ) => Some(write),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(writes.len(), 2);
+            for write in writes {
+                assert_eq!(body.syntax.linear_statement_scope(write.statement), None);
+                assert_eq!(
+                    body.syntax.for_of_statement_scope(write.statement),
+                    bound.block_scope_container(write.statement)
+                );
+                assert_eq!(
+                    bound.container(write.flow.target),
+                    Some(body.syntax.callable.declaration)
+                );
+            }
+            let iteration = callable_statement_nodes(&body.statements)
+                .into_iter()
+                .find_map(|statement| match statement {
+                    PlannedCallableStatement::ForOf { header, .. } => Some(header),
+                    _ => None,
+                })
+                .unwrap();
+            let binding = iteration.bindings[0];
+            let original = context.store().symbol(binding.symbol).unwrap().clone();
+            for warm in [false, true] {
+                if warm {
+                    context.check_source_file(file).unwrap();
+                }
+                assert!(
+                    body.flow
+                        .frame_with_captured_locals(context.store(), &host, &bound, HashMap::new())
+                        .is_ok()
+                );
+                assert!(context.store_mut_for_test().set_symbol_declarations(
+                    binding.symbol,
+                    original.declarations().map(<[NodeRef]>::to_vec),
+                    Some(body.syntax.callable.declaration),
+                ));
+                let damaged = observable_state(&context, file);
+                for _ in 0..2 {
+                    assert!(matches!(
+                        body.flow.frame_with_captured_locals(
+                            context.store(),
+                            &host,
+                            &bound,
+                            HashMap::new()
+                        ),
+                        Err(SourceFlowError::Invariant(
+                            super::super::source_flow::SourceFlowInvariant::InvalidCall(node)
+                        )) if node == body.syntax.callable.declaration
+                    ));
+                    assert_eq!(observable_state(&context, file), damaged);
+                }
+                assert!(context.store_mut_for_test().set_symbol_declarations(
+                    binding.symbol,
+                    original.declarations().map(<[NodeRef]>::to_vec),
+                    original.value_declaration(),
+                ));
+            }
+            let ready = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), ready);
+            assert!(context.diagnostics().is_empty());
         }
     }
 
