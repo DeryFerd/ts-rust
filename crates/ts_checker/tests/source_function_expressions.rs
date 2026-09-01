@@ -1292,7 +1292,7 @@ fn contextual_function_expression_statement_list_keeps_literal_returns() {
         unreachable!();
     };
     let annotation = NodeRef::new(parsed.arena.id(), FILE, variable_data.type_.unwrap());
-    let NodeData::FunctionType(target) = &parsed.arena.get(annotation.node).unwrap().data else {
+    let NodeData::FunctionTypeNode(target) = &parsed.arena.get(annotation.node).unwrap().data else {
         unreachable!();
     };
     let return_annotation = NodeRef::new(parsed.arena.id(), FILE, target.type_.unwrap());

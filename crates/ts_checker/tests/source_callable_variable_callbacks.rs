@@ -457,7 +457,7 @@ fn check_program(
             let record = parsed.arena.get(argument.node).unwrap();
             assert_eq!(record.kind, SyntaxKind::NumericLiteral);
             assert_eq!(
-                &source[record.range.start as usize..record.range.end as usize],
+                &source[record.range.start.get() as usize..record.range.end.get() as usize],
                 "123"
             );
             let [diagnostic] = checker.diagnostics().as_slice() else {

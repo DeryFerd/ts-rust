@@ -729,8 +729,15 @@ fn compile_parameters(
     else {
         unreachable!();
     };
-    assert!(data.question_token.is_some());
-    let annotation = child(parsed, partial, data.type_.unwrap());
+    assert_eq!(
+        parsed
+            .arena
+            .get(data.postfix_token.expect("the property must remain optional"))
+            .unwrap()
+            .kind,
+        SyntaxKind::QuestionToken
+    );
+    let annotation = child(parsed, partial, data.type_);
     let boolean = checker.store().intrinsic_bootstrap().unwrap().boolean_type;
     assert_eq!(checker.get_type_from_type_node(annotation), Ok(boolean));
     assert!(matches!(
