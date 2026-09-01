@@ -11114,7 +11114,15 @@ mod tests {
         let before = format!("{store:?}");
         for _ in 0..2 {
             assert_eq!(
-                validate_captured_flow_origin(&parsed.arena, &bound, store, &host, append, origin),
+                validate_captured_flow_origin(
+                    &parsed.arena,
+                    &bound,
+                    store,
+                    &host,
+                    append,
+                    origin,
+                    None,
+                ),
                 Err(SourceFlowInvariant::InvalidArrayMutation(call).into())
             );
             assert_eq!(format!("{store:?}"), before);

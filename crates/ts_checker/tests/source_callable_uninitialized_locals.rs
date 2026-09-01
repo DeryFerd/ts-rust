@@ -3,10 +3,11 @@ use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
     EscapedName, SemanticSymbolId, SymbolFlags,
 };
+use ts_checker::semantic::artifact_queries::CanonicalArtifactQueryError;
 use ts_checker::semantic::{
-    CanonicalArtifactQueryError, CanonicalCheckerContext, CanonicalCheckerOptions,
-    IntrinsicBootstrapOptions, SignatureId, SourceCheckError, SourceFunctionUnsupported,
-    SourceSyntaxRole, TypeData, TypeId, UnsupportedSourceSyntax,
+    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SignatureId,
+    SourceCheckError, SourceFunctionUnsupported, SourceSyntaxRole, TypeData, TypeId,
+    UnsupportedSourceSyntax,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
