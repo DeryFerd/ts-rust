@@ -39,6 +39,8 @@
 //! ordinary object-literal methods with checked parameters and linear bodies,
 //! parenthesized standalone closures, lexical captures, immediate invocation,
 //! stored void block arrows checked after their enclosing linear local scope,
+//! shared synchronous function and arrow statement lists with initialized locals,
+//! nested conditionals, early returns, and reachable later statements,
 //! and contextually typed class prototype method implementations,
 //! authenticated shorthand object-assignment defaults inside bounded function bodies
 //! and variable initializer expressions,
@@ -315,6 +317,7 @@ use super::{
         source_property_type_for_effects,
     },
     source_statements::{
+        SourceCallableStatementListSyntax, SourceCallableStatementSyntax,
         SourceCapturedBlockLoopSyntax, SourceCapturedIterationBodySyntax,
         SourceCapturedIterationStatementSyntax, SourceCapturedIterationSyntax,
         SourceConditionalEnumFunctionStatementsSyntax, SourceControlIfSyntax,
@@ -330,7 +333,8 @@ use super::{
         SourceSwitchObjectBindingSyntax, SourceTypeofConditionSyntax,
         SourceTypeofSwitchFunctionStatementsSyntax, SourceUnusedIterationDeclarationKind,
         SourceUnusedIterationStatementSyntax, SourceVoidSwitchCallSyntax,
-        SourceVoidSwitchFunctionStatementsSyntax, plan_source_captured_block_loop_statement_syntax,
+        SourceVoidSwitchFunctionStatementsSyntax, plan_source_callable_statement_list_syntax,
+        plan_source_captured_block_loop_statement_syntax,
         plan_source_captured_iteration_statement_syntax,
         plan_source_conditional_enum_function_statements_syntax, plan_source_control_if_syntax,
         plan_source_control_loop_syntax, plan_source_for_in_statement_syntax,
@@ -1607,6 +1611,7 @@ struct PlannedContextualComputedKey {
 #[allow(clippy::large_enum_variant)] // Keeps ordinary arrow return expressions inline.
 enum PlannedArrowBody {
     Empty,
+    StatementList(Box<PlannedCallableStatementList>),
     ForOf(Box<PlannedLexicalIteration>),
     Return {
         diagnostic_node: NodeRef,
@@ -1647,6 +1652,7 @@ enum PlannedFunctionBody {
     EffectIf(Box<PlannedEffectIfFunctionStatements>),
     AsyncCapturedLoop(Box<PlannedAsyncCapturedLoop>),
     Linear(Box<PlannedLinearFunctionStatements>),
+    StatementList(Box<PlannedCallableStatementList>),
     ForIn(Box<PlannedLexicalIteration>),
     ForOf(Box<PlannedLexicalIteration>),
     Loop(Box<PlannedLoopFunctionStatements>),
@@ -1711,6 +1717,108 @@ struct PlannedLinearFunctionStatements {
     flow: SourceFlowPlan,
     capture_assignments: Vec<SourceFlowAssignment>,
     captured_array_mutations: Vec<SourceFlowCapturedArrayMutation>,
+}
+
+/// Functions and arrows use the same statement tree and binder flow proof.
+#[derive(Clone, Debug)]
+struct PlannedCallableStatementList {
+    syntax: SourceCallableStatementListSyntax,
+    locals: Vec<PlannedVariable>,
+    statements: Vec<PlannedCallableStatement>,
+    flow: SourceFlowPlan,
+    capture_assignments: Vec<SourceFlowAssignment>,
+}
+
+#[derive(Clone, Debug)]
+enum PlannedCallableStatement {
+    Leaf(PlannedLinearFunctionStatement),
+    Block(Vec<Self>),
+    If {
+        condition: Box<PlannedSourceCondition>,
+        then_statements: Vec<Self>,
+        else_statements: Vec<Self>,
+    },
+    Return {
+        statement: NodeRef,
+        expression: Option<Box<PlannedExpression>>,
+    },
+}
+
+impl PlannedCallableStatementList {
+    fn expressions(&self) -> Vec<&PlannedExpression> {
+        let mut expressions = self
+            .locals
+            .iter()
+            .filter_map(|local| match &local.initializer {
+                PlannedVariableInitializer::Expression(expression) => Some(expression),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for node in callable_statement_nodes(&self.statements) {
+            match node {
+                PlannedCallableStatement::Leaf(PlannedLinearFunctionStatement::Expression {
+                    expression,
+                    ..
+                }) => expressions.push(expression),
+                PlannedCallableStatement::Leaf(
+                    PlannedLinearFunctionStatement::CapturedAssignment(assignment),
+                ) => expressions.push(&assignment.right),
+                PlannedCallableStatement::Leaf(
+                    PlannedLinearFunctionStatement::ParameterAssignment(assignment),
+                ) => expressions.push(&assignment.right),
+                PlannedCallableStatement::Return {
+                    expression: Some(expression),
+                    ..
+                } => expressions.push(expression),
+                PlannedCallableStatement::If { condition, .. } => {
+                    let mut conditions = vec![condition.as_ref()];
+                    while let Some(condition) = conditions.pop() {
+                        match condition {
+                            PlannedSourceCondition::Logical { left, right, .. } => {
+                                conditions.push(right);
+                                conditions.push(left);
+                            }
+                            PlannedSourceCondition::Expression { expression, .. }
+                            | PlannedSourceCondition::Truthiness { expression, .. } => {
+                                expressions.push(expression)
+                            }
+                            PlannedSourceCondition::Typeof(condition) => {
+                                expressions.extend([&condition.identifier, &condition.literal])
+                            }
+                            PlannedSourceCondition::Equality(condition) => {
+                                expressions.extend([&condition.operand, &condition.value])
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        expressions
+    }
+}
+
+fn callable_statement_nodes(
+    statements: &[PlannedCallableStatement],
+) -> Vec<&PlannedCallableStatement> {
+    let mut pending = statements.iter().rev().collect::<Vec<_>>();
+    let mut result = Vec::new();
+    while let Some(statement) = pending.pop() {
+        result.push(statement);
+        match statement {
+            PlannedCallableStatement::Block(statements) => pending.extend(statements.iter().rev()),
+            PlannedCallableStatement::If {
+                then_statements,
+                else_statements,
+                ..
+            } => {
+                pending.extend(else_statements.iter().rev());
+                pending.extend(then_statements.iter().rev());
+            }
+            _ => {}
+        }
+    }
+    result
 }
 
 #[derive(Clone, Debug)]
@@ -14559,6 +14667,36 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 )),
             ));
         };
+        match plan_source_callable_statement_list_syntax(self.arena, self.bound, store, callable) {
+            Ok(syntax) => {
+                // The established deferred-local route alone can expose later locals.
+                let mut deferred = callable.family == SourceCallableFamily::ArrowFunction
+                    && callable.parameters.is_empty()
+                    && callable.return_type.is_inferred()
+                    && syntax.statements.iter().all(|statement| {
+                        matches!(
+                            statement,
+                            SourceCallableStatementSyntax::Leaf(_)
+                                | SourceCallableStatementSyntax::Empty(_)
+                        )
+                    });
+                for statement in &syntax.statements {
+                    if let SourceCallableStatementSyntax::Leaf(
+                        SourceLinearFunctionStatementSyntax::Local(local),
+                    ) = statement
+                    {
+                        deferred |= self.can_defer_local_arrow_body(callable, *local)?;
+                    }
+                }
+                if !deferred {
+                    return self
+                        .finish_callable_statement_list(syntax)
+                        .map(|body| PlannedFunctionBody::StatementList(Box::new(body)));
+                }
+            }
+            Err(SourceFunctionStatementsError::Unsupported(_)) => {}
+            Err(error) => return Err(Self::function_statements_plan_error(callable, error)),
+        }
         match plan_source_linear_function_statements_syntax(self.arena, self.bound, store, callable)
         {
             Ok(syntax) => {
@@ -14685,6 +14823,285 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
+    fn finish_callable_statement_list(
+        &mut self,
+        syntax: SourceCallableStatementListSyntax,
+    ) -> Result<PlannedCallableStatementList, SourceCheckError> {
+        let callable = &syntax.callable;
+        let mut locals = Vec::new();
+        let statements =
+            self.finish_callable_statements(callable, &syntax.statements, &mut locals, true)?;
+        let nodes = callable_statement_nodes(&statements);
+        let mut points = Vec::new();
+        let mut conditions = Vec::new();
+        let mut logical_conditions = Vec::new();
+        let mut calls = Vec::new();
+        let mut parameters = Vec::new();
+        let mut captures = Vec::new();
+        let mut mutations = Vec::new();
+        let (store, host) = self
+            .semantic
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        for local in &locals {
+            if let PlannedVariableInitializer::Expression(expression) = &local.initializer {
+                collect_eager_logical_truthiness_conditions(expression, &mut logical_conditions);
+            }
+        }
+        for node in nodes {
+            match node {
+                PlannedCallableStatement::Leaf(leaf) => {
+                    points.extend(leaf.flow_point(&locals));
+                    if let PlannedLinearFunctionStatement::Expression { expression, .. } = leaf
+                        && matches!(&expression.kind, PlannedExpressionKind::Call(call)
+                            if !matches!(call.callee.unparenthesized().kind, PlannedExpressionKind::Arrow(_)))
+                    {
+                        calls.push(expression.node);
+                    }
+                    mutations.extend(leaf.array_mutation(store, host)?);
+                    match leaf {
+                        PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
+                            parameters.push(assignment.flow);
+                            collect_eager_logical_truthiness_conditions(
+                                &assignment.right,
+                                &mut logical_conditions,
+                            );
+                        }
+                        PlannedLinearFunctionStatement::CapturedAssignment(assignment) => {
+                            captures.push(assignment.flow);
+                            collect_eager_logical_truthiness_conditions(
+                                &assignment.right,
+                                &mut logical_conditions,
+                            );
+                        }
+                        PlannedLinearFunctionStatement::Expression { expression, .. } => {
+                            collect_eager_logical_truthiness_conditions(
+                                expression,
+                                &mut logical_conditions,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                PlannedCallableStatement::If { condition, .. } => {
+                    points.extend(condition.flow_points());
+                    conditions.extend(condition.flow_conditions());
+                }
+                PlannedCallableStatement::Return {
+                    statement,
+                    expression,
+                } => {
+                    points.push(*statement);
+                    if let Some(expression) = expression {
+                        collect_eager_logical_truthiness_conditions(
+                            expression,
+                            &mut logical_conditions,
+                        );
+                    }
+                }
+                PlannedCallableStatement::Block(_) => {}
+            }
+        }
+        let capture_assignments = collect_callable_capture_assignments(
+            store,
+            host,
+            callable.declaration,
+            &self.identifier_reads,
+        )?;
+        let flow = SourceFlowPlan::preflight_statement_list(
+            self.arena,
+            self.bound,
+            store,
+            host,
+            &syntax,
+            points,
+            conditions,
+            logical_conditions,
+            locals
+                .iter()
+                .filter(|local| {
+                    matches!(local.initializer, PlannedVariableInitializer::Expression(_))
+                })
+                .map(|local| SourceFlowAssignment {
+                    declaration: local.declaration,
+                    symbol: local.symbol,
+                }),
+            parameters,
+            calls,
+            captures,
+            mutations,
+        )
+        .map_err(|error| Self::source_flow_plan_error(callable, error))?;
+        Ok(PlannedCallableStatementList {
+            syntax,
+            locals,
+            statements,
+            flow,
+            capture_assignments,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep the ordered list and its local-write boundary together.
+    fn finish_callable_statements(
+        &mut self,
+        callable: &SourceCallablePlan,
+        syntax: &[SourceCallableStatementSyntax],
+        locals: &mut Vec<PlannedVariable>,
+        linear_local_writes: bool,
+    ) -> Result<Vec<PlannedCallableStatement>, SourceCheckError> {
+        let mut statements = Vec::new();
+        for statement in syntax {
+            let statement = match statement {
+                SourceCallableStatementSyntax::Empty(_) => continue,
+                SourceCallableStatementSyntax::Leaf(
+                    SourceLinearFunctionStatementSyntax::Local(local),
+                ) => {
+                    let index = locals.len();
+                    locals.push(self.finish_local_declaration_with_array_flow(*local, true)?);
+                    PlannedCallableStatement::Leaf(PlannedLinearFunctionStatement::Local(index))
+                }
+                SourceCallableStatementSyntax::Leaf(
+                    SourceLinearFunctionStatementSyntax::Expression {
+                        statement,
+                        expression,
+                    },
+                ) => {
+                    let local_assignment = if linear_local_writes {
+                        self.plan_linear_annotated_local_assignment(
+                            callable,
+                            locals,
+                            *statement,
+                            *expression,
+                        )?
+                    } else {
+                        None
+                    };
+                    let leaf = if let Some(assignment) = local_assignment {
+                        PlannedLinearFunctionStatement::ParameterAssignment(Box::new(assignment))
+                    } else if let Some(assignment) = self.plan_linear_captured_local_assignment(
+                        callable,
+                        *statement,
+                        *expression,
+                    )? {
+                        PlannedLinearFunctionStatement::CapturedAssignment(Box::new(assignment))
+                    } else if let Some(assignment) =
+                        self.plan_linear_parameter_assignment(callable, *statement, *expression)?
+                    {
+                        PlannedLinearFunctionStatement::ParameterAssignment(Box::new(assignment))
+                    } else {
+                        self.primitive_binary_position_roots.insert(*expression);
+                        PlannedLinearFunctionStatement::Expression {
+                            statement: *statement,
+                            expression: Box::new(self.plan_expression(*expression)?),
+                        }
+                    };
+                    PlannedCallableStatement::Leaf(leaf)
+                }
+                SourceCallableStatementSyntax::Leaf(_) => {
+                    return Err(Self::unsupported_function_body(callable));
+                }
+                SourceCallableStatementSyntax::Block { statements, .. } => {
+                    PlannedCallableStatement::Block(self.finish_callable_statement_scope(
+                        callable,
+                        statements,
+                        locals,
+                        linear_local_writes,
+                    )?)
+                }
+                SourceCallableStatementSyntax::If(branch) => {
+                    let condition = if let Some(identifier) = branch.condition_identifier {
+                        self.finish_source_condition(
+                            callable,
+                            branch.control.condition,
+                            identifier,
+                            branch.typeof_condition,
+                            branch.equality_condition,
+                        )?
+                    } else {
+                        self.finish_general_source_condition(
+                            callable,
+                            branch.control.condition,
+                            branch.control.statement,
+                        )?
+                    };
+                    let then_statements = self.finish_callable_statement_scope(
+                        callable,
+                        &branch.then_statements,
+                        locals,
+                        false,
+                    )?;
+                    let else_statements = self.finish_callable_statement_scope(
+                        callable,
+                        &branch.else_statements,
+                        locals,
+                        false,
+                    )?;
+                    PlannedCallableStatement::If {
+                        condition: Box::new(condition),
+                        then_statements,
+                        else_statements,
+                    }
+                }
+                SourceCallableStatementSyntax::Return {
+                    statement,
+                    expression,
+                } => PlannedCallableStatement::Return {
+                    statement: *statement,
+                    expression: expression
+                        .map(|expression| self.plan_expression(expression).map(Box::new))
+                        .transpose()?,
+                },
+            };
+            statements.push(statement);
+        }
+        Ok(statements)
+    }
+
+    fn finish_callable_statement_scope(
+        &mut self,
+        callable: &SourceCallablePlan,
+        syntax: &[SourceCallableStatementSyntax],
+        locals: &mut Vec<PlannedVariable>,
+        linear_local_writes: bool,
+    ) -> Result<Vec<PlannedCallableStatement>, SourceCheckError> {
+        let prior = self.prior_variables.clone();
+        let readable = self.readable_variables.clone();
+        let uninitialized = self.assignable_uninitialized_variables.clone();
+        let assigned = self.assigned_variables.clone();
+        let first_local = locals.len();
+        let result = self.finish_callable_statements(callable, syntax, locals, linear_local_writes);
+        let completed_assignments = std::mem::replace(&mut self.assigned_variables, assigned);
+        self.prior_variables = prior;
+        self.readable_variables = readable;
+        self.assignable_uninitialized_variables = uninitialized;
+        if result.is_ok() {
+            // Only unconditional blocks carry real writes to surviving outer locals.
+            if linear_local_writes {
+                self.assigned_variables.extend(
+                    completed_assignments
+                        .iter()
+                        .copied()
+                        .filter(|symbol| self.prior_variables.contains(symbol)),
+                );
+            }
+            for local in &locals[first_local..] {
+                if local.binding == VariableBindingKind::Var {
+                    self.prior_variables.insert(local.symbol);
+                    self.readable_variables.insert(local.symbol);
+                    if matches!(
+                        local.initializer,
+                        PlannedVariableInitializer::AbsentAnnotated
+                    ) {
+                        self.assignable_uninitialized_variables.insert(local.symbol);
+                        if linear_local_writes && completed_assignments.contains(&local.symbol) {
+                            self.assigned_variables.insert(local.symbol);
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
     fn finish_linear_function_statements(
         &mut self,
         callable: &SourceCallablePlan,
@@ -14796,6 +15213,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             | PlannedFunctionBody::Return { .. }
                             | PlannedFunctionBody::EffectIf(_)
                             | PlannedFunctionBody::Linear(_)
+                            | PlannedFunctionBody::StatementList(_)
                             | PlannedFunctionBody::ForIn(_)
                             | PlannedFunctionBody::ForOf(_)
                             | PlannedFunctionBody::Loop(_)
@@ -17128,6 +17546,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     ) -> Result<PlannedArrow, SourceCheckError> {
         self.plan_callable_type_import_annotation_roots(&source.callable)?;
         if let SourceArrowBodyPlan::LinearBlock { block }
+        | SourceArrowBodyPlan::StatementBlock { block }
         | SourceArrowBodyPlan::ForOfBlock { block } = source.body
         {
             let (parameter_initializers, object_parameter_bindings, statements) =
@@ -17136,6 +17555,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 return Err(SourceCheckError::Arrow(source.callable.declaration));
             }
             let (linear_body, body) = match (source.body, statements) {
+                (
+                    SourceArrowBodyPlan::LinearBlock { .. }
+                    | SourceArrowBodyPlan::StatementBlock { .. },
+                    PlannedFunctionBody::StatementList(body),
+                ) => (None, PlannedArrowBody::StatementList(body)),
                 (SourceArrowBodyPlan::LinearBlock { .. }, PlannedFunctionBody::Linear(linear)) => {
                     (Some(linear), PlannedArrowBody::Empty)
                 }
@@ -17191,7 +17615,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             SourceArrowBodyPlan::ConciseExpression { expression } => {
                 self.plan_arrow_return_expression(expression, expression)
             }
-            SourceArrowBodyPlan::LinearBlock { .. } | SourceArrowBodyPlan::ForOfBlock { .. } => {
+            SourceArrowBodyPlan::LinearBlock { .. }
+            | SourceArrowBodyPlan::StatementBlock { .. }
+            | SourceArrowBodyPlan::ForOfBlock { .. } => {
                 unreachable!("statement bodies were planned above")
             }
         };
@@ -22585,6 +23011,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         self.nested_arrow_depth += 1;
         let result = (|| {
             if let SourceArrowBodyPlan::LinearBlock { block }
+            | SourceArrowBodyPlan::StatementBlock { block }
             | SourceArrowBodyPlan::ForOfBlock { block } = body
             {
                 if expression_statement.is_some() {
@@ -22596,6 +23023,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     return Err(SourceCheckError::Arrow(declaration));
                 }
                 let (linear_body, body) = match (body, statements) {
+                    (
+                        SourceArrowBodyPlan::LinearBlock { .. }
+                        | SourceArrowBodyPlan::StatementBlock { .. },
+                        PlannedFunctionBody::StatementList(body),
+                    ) => (None, PlannedArrowBody::StatementList(body)),
                     (
                         SourceArrowBodyPlan::LinearBlock { .. },
                         PlannedFunctionBody::Linear(linear),
@@ -22654,6 +23086,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     self.plan_arrow_return_expression(expression, expression)
                 }
                 SourceArrowBodyPlan::LinearBlock { .. }
+                | SourceArrowBodyPlan::StatementBlock { .. }
                 | SourceArrowBodyPlan::ForOfBlock { .. } => {
                     unreachable!("statement arrow bodies were planned above")
                 }
@@ -29386,6 +29819,8 @@ fn expression_has_deferred_object_members(expression: &PlannedExpression) -> boo
 fn arrow_has_deferred_object_members(arrow: &PlannedArrow) -> bool {
     matches!(&arrow.body, PlannedArrowBody::Return { expression, .. }
         if expression_has_deferred_object_members(expression))
+        || matches!(&arrow.body, PlannedArrowBody::StatementList(body)
+            if body.expressions().into_iter().any(expression_has_deferred_object_members))
         || arrow
             .expression_statement
             .as_ref()
@@ -29959,7 +30394,7 @@ fn preflight_inferred_function_return_dependencies(
                             PlannedArrowBody::Return { expression, .. } => {
                                 expression_is_closed(expression, parameters, locals, functions)
                             }
-                            PlannedArrowBody::ForOf(_) | PlannedArrowBody::ReturnJsx { .. } => false,
+                            PlannedArrowBody::StatementList(_) | PlannedArrowBody::ForOf(_) | PlannedArrowBody::ReturnJsx { .. } => false,
                         }
                     }
                     _ => false,
@@ -30074,6 +30509,94 @@ fn preflight_inferred_function_return_dependencies(
             }
             _ => false,
         })
+    }
+
+    fn statement_list_is_closed(
+        body: &PlannedCallableStatementList,
+        statements: &[PlannedCallableStatement],
+        parameters: &[SourceCallableParameterPlan],
+        locals: &mut HashSet<SemanticSymbolId>,
+        functions: FunctionDependencies<'_, '_>,
+    ) -> bool {
+        statements.iter().all(|statement| match statement {
+            PlannedCallableStatement::Leaf(PlannedLinearFunctionStatement::CapturedAssignment(
+                assignment,
+            )) => {
+                locals.contains(&assignment.flow.local.symbol())
+                    && expression_is_closed(&assignment.right, parameters, locals, functions)
+            }
+            PlannedCallableStatement::Leaf(
+                PlannedLinearFunctionStatement::ParameterAssignment(assignment),
+            ) => {
+                (parameters
+                    .iter()
+                    .any(|parameter| parameter.symbol == assignment.flow.symbol)
+                    || body.locals.iter().any(|local| {
+                        locals.contains(&local.symbol)
+                            && local.symbol == assignment.flow.symbol
+                            && local.declaration == assignment.flow.parameter
+                            && matches!(
+                                local.initializer,
+                                PlannedVariableInitializer::AbsentAnnotated
+                            )
+                    }))
+                    && expression_is_closed(&assignment.right, parameters, locals, functions)
+            }
+            PlannedCallableStatement::Leaf(statement) => statement_prefix_is_closed(
+                &body.locals,
+                std::slice::from_ref(statement),
+                parameters,
+                locals,
+                functions,
+            ),
+            PlannedCallableStatement::Block(statements) => {
+                statement_scope_is_closed(body, statements, parameters, locals, functions)
+            }
+            PlannedCallableStatement::If {
+                condition,
+                then_statements,
+                else_statements,
+            } => {
+                condition_is_closed(condition, parameters, locals, functions)
+                    && statement_scope_is_closed(
+                        body,
+                        then_statements,
+                        parameters,
+                        locals,
+                        functions,
+                    )
+                    && statement_scope_is_closed(
+                        body,
+                        else_statements,
+                        parameters,
+                        locals,
+                        functions,
+                    )
+            }
+            PlannedCallableStatement::Return { expression, .. } => {
+                expression.as_ref().is_none_or(|expression| {
+                    expression_is_closed(expression, parameters, locals, functions)
+                })
+            }
+        })
+    }
+
+    fn statement_scope_is_closed(
+        body: &PlannedCallableStatementList,
+        statements: &[PlannedCallableStatement],
+        parameters: &[SourceCallableParameterPlan],
+        locals: &mut HashSet<SemanticSymbolId>,
+        functions: FunctionDependencies<'_, '_>,
+    ) -> bool {
+        let mut scoped = locals.clone();
+        if !statement_list_is_closed(body, statements, parameters, &mut scoped, functions) {
+            return false;
+        }
+        locals.extend(body.locals.iter().filter_map(|local| {
+            (local.binding == VariableBindingKind::Var && scoped.contains(&local.symbol))
+                .then_some(local.symbol)
+        }));
+        true
     }
 
     fn condition_is_closed(
@@ -30193,9 +30716,9 @@ fn preflight_inferred_function_return_dependencies(
                                 &HashSet::new(),
                                 functions,
                             ),
-                            PlannedArrowBody::ForOf(_) | PlannedArrowBody::ReturnJsx { .. } => {
-                                false
-                            }
+                            PlannedArrowBody::StatementList(_)
+                            | PlannedArrowBody::ForOf(_)
+                            | PlannedArrowBody::ReturnJsx { .. } => false,
                         }
                     }
                     _ => false,
@@ -30275,6 +30798,13 @@ fn preflight_inferred_function_return_dependencies(
                         PlannedAsyncCapturedLoopEnding::Return { .. }
                     )
             }
+            PlannedFunctionBody::StatementList(body) => statement_list_is_closed(
+                body,
+                &body.statements,
+                &function.callable.parameters,
+                &mut locals,
+                functions,
+            ),
             PlannedFunctionBody::Linear(statements) => {
                 locals.extend(statements.statements.iter().filter_map(|statement| {
                     if let PlannedLinearFunctionStatement::Enum(enumeration) = statement {
@@ -38555,25 +39085,27 @@ fn check_planned_arrow_argument(
         })
         && store
             .source_object_literal_method_owner_is_exact(expression, arrow.callable.owner_symbol);
-    if matches!(arrow.body, PlannedArrowBody::ForOf(_))
-        && (arrow.callable.is_async
-            || arrow.expression_statement.is_some()
-            || arrow.linear_body.is_some()
-            || arrow.loop_body.is_some()
-            || arrow.prototype_this.is_some()
-            || arrow
-                .callable
-                .parameters
-                .iter()
-                .any(|parameter| parameter.is_implicit_any())
-            || host.node(expression).is_none_or(|record| {
-                record.kind != SyntaxKind::ArrowFunction
-                    || !matches!(record.data, NodeData::ArrowFunction(_))
-            })
-            || host
-                .bound_file(expression)
-                .and_then(BoundFile::source_facts)
-                .is_none_or(ts_binder::CanonicalSourceFileFacts::is_javascript_file))
+    if matches!(
+        arrow.body,
+        PlannedArrowBody::StatementList(_) | PlannedArrowBody::ForOf(_)
+    ) && (arrow.callable.is_async
+        || arrow.expression_statement.is_some()
+        || arrow.linear_body.is_some()
+        || arrow.loop_body.is_some()
+        || arrow.prototype_this.is_some()
+        || arrow
+            .callable
+            .parameters
+            .iter()
+            .any(|parameter| parameter.is_implicit_any())
+        || host.node(expression).is_none_or(|record| {
+            record.kind != SyntaxKind::ArrowFunction
+                || !matches!(record.data, NodeData::ArrowFunction(_))
+        })
+        || host
+            .bound_file(expression)
+            .and_then(BoundFile::source_facts)
+            .is_none_or(ts_binder::CanonicalSourceFileFacts::is_javascript_file))
     {
         return Err(SourceCheckError::Arrow(expression));
     }
@@ -38790,7 +39322,9 @@ fn check_planned_arrow_argument(
             let body = match &arrow.body {
                 PlannedArrowBody::Empty => None,
                 PlannedArrowBody::Return { expression, .. } => Some(expression),
-                PlannedArrowBody::ForOf(_) => return Err(SourceCheckError::Arrow(expression)),
+                PlannedArrowBody::StatementList(_) | PlannedArrowBody::ForOf(_) => {
+                    return Err(SourceCheckError::Arrow(expression));
+                }
                 PlannedArrowBody::ReturnJsx { .. } => unreachable!("JSX returns were handled"),
             };
             publish_checked_source_callable_return_with_capture_context(
@@ -39082,7 +39616,24 @@ fn check_planned_arrow_argument(
         }
     }
 
-    if arrow.callable.return_type.is_inferred() {
+    if let PlannedArrowBody::StatementList(body) = &arrow.body {
+        check_planned_callable_statement_list(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            flow_types.clone(),
+            type_import_execution,
+            deferred,
+            body,
+            &mut linear_values,
+            &mut linear_value_order,
+            outer_capture,
+        )?;
+    } else if arrow.callable.return_type.is_inferred() {
         if arrow
             .expression_statement
             .as_ref()
@@ -39120,6 +39671,9 @@ fn check_planned_arrow_argument(
                     .as_ref()
                     .and_then(|statements| statements.return_expression.as_ref()),
                 PlannedArrowBody::Return { expression, .. } => Some(expression),
+                PlannedArrowBody::StatementList(_) => {
+                    unreachable!("the statement list was checked above")
+                }
                 PlannedArrowBody::ForOf(_) => None,
                 PlannedArrowBody::ReturnJsx { .. } => {
                     return Err(SourceCheckError::Arrow(expression));
@@ -39172,6 +39726,9 @@ fn check_planned_arrow_argument(
             .type_node()
             .ok_or(SourceCheckError::Arrow(expression))?;
         match &arrow.body {
+            PlannedArrowBody::StatementList(_) => {
+                unreachable!("the statement list was checked above")
+            }
             PlannedArrowBody::Empty | PlannedArrowBody::ForOf(_) => {}
             PlannedArrowBody::Return {
                 diagnostic_node,
@@ -39245,7 +39802,12 @@ fn check_planned_arrow_argument(
         }
     }
 
-    if arrow.linear_body.is_some() || matches!(arrow.body, PlannedArrowBody::ForOf(_)) {
+    if arrow.linear_body.is_some()
+        || matches!(
+            arrow.body,
+            PlannedArrowBody::StatementList(_) | PlannedArrowBody::ForOf(_)
+        )
+    {
         publish_staged_variable_state(
             store,
             source.node_ref(),
@@ -39780,7 +40342,9 @@ fn check_contextual_direct_call_arrow(
             let widened = widened_fresh_literal_type(store, checked.result)?;
             store.get_widened_type_with_global_types(widened, global_types)?
         }
-        PlannedArrowBody::ForOf(_) | PlannedArrowBody::ReturnJsx { .. } => {
+        PlannedArrowBody::StatementList(_)
+        | PlannedArrowBody::ForOf(_)
+        | PlannedArrowBody::ReturnJsx { .. } => {
             return Err(unsupported());
         }
     };
@@ -48629,6 +49193,25 @@ fn check_planned_linear_function_statements_with_capture_entries(
                 let mut nested_capture_entries =
                     source_arrow_parameter_entry_types(store, &function.callable)?;
                 let (expression, return_flow_types) = match &function.body {
+                    PlannedFunctionBody::StatementList(body) => {
+                        check_planned_callable_statement_list(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            flow_types,
+                            type_import_execution,
+                            deferred,
+                            body,
+                            staged_value_types,
+                            value_order,
+                            arrow_capture,
+                        )?;
+                        continue;
+                    }
                     PlannedFunctionBody::Empty => (None, flow_types),
                     PlannedFunctionBody::Return { expression, .. } => {
                         (Some(expression), flow_types)
@@ -48765,16 +49348,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
                 issue_source_enum_diagnostics(diagnostics, enumeration)?;
             }
             PlannedLinearFunctionStatement::CapturedAssignment(assignment) => {
-                let local = assignment.flow.local;
-                let snapshot = frame
-                    .snapshot_at(store, global_types, assignment.flow.statement)
-                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-                let declared_type = arrow_capture
-                    .ok_or(SourceCheckError::Variable(
-                        VariableInvariant::MissingStagedValueType(local.symbol()),
-                    ))?
-                    .declared_type(store, host, local)?;
-                let checked = check_assignment_to_type_with_capture_context(
+                let current_type = check_planned_captured_assignment(
                     store,
                     host,
                     global_types,
@@ -48782,53 +49356,17 @@ fn check_planned_linear_function_statements_with_capture_entries(
                     options,
                     session,
                     diagnostics,
-                    snapshot.types(),
+                    &mut frame,
                     type_import_execution,
                     deferred,
-                    declared_type,
-                    None,
-                    &assignment.right,
-                    local.target(),
-                    Some(assignment.flow.expression),
-                    None,
+                    callable,
+                    assignment,
                     arrow_capture,
                 )?;
-                let current_type = current_flow_type_after_assignment(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    diagnostics,
-                    checked,
-                )?;
-                frame
-                    .complete_assignment(local.target(), local.symbol(), current_type)
-                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-                nested_flow_types.insert(local.symbol(), current_type);
+                nested_flow_types.insert(assignment.flow.local.symbol(), current_type);
             }
             PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
-                let snapshot = frame
-                    .snapshot_at(store, global_types, assignment.statement)
-                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-                let declared_type = if statements.locals.iter().any(|local| {
-                    local.declaration == assignment.flow.parameter
-                        && local.symbol == assignment.flow.symbol
-                        && matches!(
-                            local.initializer,
-                            PlannedVariableInitializer::AbsentAnnotated
-                        )
-                }) {
-                    staged_value_types.get(&assignment.flow.symbol).copied()
-                } else {
-                    store
-                        .value_symbol_links(assignment.flow.symbol)
-                        .and_then(|links| links.resolved_type)
-                }
-                .ok_or(SourceCheckError::Variable(
-                    VariableInvariant::MissingCurrentFlowType(assignment.flow.symbol),
-                ))?;
-                let checked = check_assignment_to_type_with_capture_context(
+                let current_type = check_planned_parameter_assignment(
                     store,
                     host,
                     global_types,
@@ -48836,33 +49374,15 @@ fn check_planned_linear_function_statements_with_capture_entries(
                     options,
                     session,
                     diagnostics,
-                    snapshot.types(),
+                    &mut frame,
                     type_import_execution,
                     deferred,
-                    declared_type,
-                    None,
-                    &assignment.right,
-                    assignment.flow.target,
-                    Some(assignment.expression),
-                    None,
+                    callable,
+                    assignment,
+                    &statements.locals,
+                    staged_value_types,
                     arrow_capture,
                 )?;
-                let current_type = current_flow_type_after_assignment(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    diagnostics,
-                    checked,
-                )?;
-                frame
-                    .complete_assignment(
-                        assignment.flow.target,
-                        assignment.flow.symbol,
-                        current_type,
-                    )
-                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
                 nested_flow_types.insert(assignment.flow.symbol, current_type);
             }
             PlannedLinearFunctionStatement::Expression {
@@ -49381,6 +49901,39 @@ fn check_planned_source_condition(
     callable: &SourceCallablePlan,
     condition: &PlannedSourceCondition,
 ) -> Result<(), SourceCheckError> {
+    check_planned_source_condition_with_capture_context(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        frame,
+        type_import_execution,
+        deferred,
+        callable,
+        condition,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_planned_source_condition_with_capture_context(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    frame: &mut SourceFlowFrame<'_, '_>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    condition: &PlannedSourceCondition,
+    arrow_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<(), SourceCheckError> {
     match condition {
         PlannedSourceCondition::Logical {
             expression,
@@ -49389,7 +49942,7 @@ fn check_planned_source_condition(
             right,
         } => {
             for operand in [left, right] {
-                check_planned_source_condition(
+                check_planned_source_condition_with_capture_context(
                     store,
                     host,
                     global_types,
@@ -49402,6 +49955,7 @@ fn check_planned_source_condition(
                     deferred,
                     callable,
                     operand,
+                    arrow_capture,
                 )?;
             }
             let left_type = store
@@ -49439,7 +49993,7 @@ fn check_planned_source_condition(
             let snapshot = frame
                 .snapshot_at(store, global_types, *flow_point)
                 .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-            let checked = check_expression_type(
+            let checked = check_expression_type_with_capture_context(
                 store,
                 host,
                 global_types,
@@ -49452,6 +50006,8 @@ fn check_planned_source_condition(
                 expression,
                 None,
                 deferred,
+                None,
+                arrow_capture,
             )?;
             if let PlannedExpressionKind::Call(_) = &expression.unparenthesized().kind
                 && store
@@ -50024,6 +50580,530 @@ fn check_planned_function_statement_prefix(
     staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
     value_order: &mut Vec<SemanticSymbolId>,
 ) -> Result<(), SourceCheckError> {
+    check_planned_function_statement_prefix_with_capture_context(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        frame,
+        type_import_execution,
+        type_import_capabilities,
+        deferred,
+        callable,
+        locals,
+        statements,
+        staged_value_types,
+        value_order,
+        None,
+    )
+}
+
+#[derive(Default)]
+struct CallableStatementReturns {
+    declared_entries: HashMap<SemanticSymbolId, TypeId>,
+    values: Vec<TypeId>,
+    has_bare_return: bool,
+    has_return: bool,
+}
+
+fn restore_callable_statement_entries(
+    body: &PlannedCallableStatementList,
+    returned: &mut CallableStatementReturns,
+    mut outer: HashMap<SemanticSymbolId, TypeId>,
+    completed: bool,
+) {
+    if completed {
+        for local in &body.locals {
+            if local.binding == VariableBindingKind::Var
+                && let Some(&declared) = returned.declared_entries.get(&local.symbol)
+            {
+                outer.insert(local.symbol, declared);
+            }
+        }
+    }
+    returned.declared_entries = outer;
+}
+
+/// Replays every statement before publishing the callable's own return type.
+#[allow(clippy::too_many_arguments)]
+fn check_planned_callable_statement_list(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: HashMap<SemanticSymbolId, TypeId>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    body: &PlannedCallableStatementList,
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+    outer_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<TypeId, SourceCheckError> {
+    let callable = &body.syntax.callable;
+    if !body.flow.statement_list_is_exact(&body.syntax) {
+        return Err(SourceCheckError::Function(
+            SourceFunctionInvariant::Callable(callable.declaration),
+        ));
+    }
+    let signature = if callable.return_type.is_inferred() {
+        use super::source_callables::SourceCallableState;
+        let state = super::source_callables::source_callable_state(store, callable, false)
+            .map_err(SourcePlanner::callable_plan_error)?;
+        let (SourceCallableState::AwaitingInferredReturn { signature, .. }
+        | SourceCallableState::Resolved { signature, .. }) = state
+        else {
+            return Err(SourcePlanner::unsupported_function_body(callable));
+        };
+        super::source_callables::validate_inferred_source_callable_return(
+            store, callable, signature,
+        )
+        .map_err(SourcePlanner::callable_plan_error)?;
+        if !store
+            .push_type_resolution(
+                TypeResolutionTarget::Signature(signature),
+                TypeSystemPropertyName::ResolvedReturnType,
+            )
+            .map_err(DeclaredTypeError::from)?
+        {
+            return Err(SourceCheckError::Arrow(callable.declaration));
+        }
+        Some(signature)
+    } else {
+        None
+    };
+    let checked = (|| {
+        let bound = host
+            .bound_file(callable.declaration)
+            .ok_or(SourceCheckError::Arrow(callable.declaration))?;
+        let mut frame = body
+            .flow
+            .frame_with_captured_locals(store, host, bound, flow_types)
+            .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+        let expected = callable
+            .return_type
+            .type_node()
+            .map(|annotation| {
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                )?
+                .with_type_reference_alias_targets(
+                    type_import_execution
+                        .annotation_capabilities
+                        .get(&annotation)
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                )?
+                .get_type_from_type_node(annotation)
+            })
+            .transpose()?;
+        let mut returned = CallableStatementReturns {
+            declared_entries: source_arrow_parameter_entry_types(store, callable)?,
+            has_bare_return: body.syntax.has_implicit_return,
+            ..CallableStatementReturns::default()
+        };
+        check_callable_statement_nodes(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            &mut frame,
+            type_import_execution,
+            deferred,
+            body,
+            &body.statements,
+            expected,
+            &mut returned,
+            staged_value_types,
+            value_order,
+            outer_capture,
+        )?;
+        if let Some(expected) = expected {
+            if body.syntax.has_implicit_return {
+                check_callable_statement_return_exit(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    callable,
+                    returned.has_return,
+                    expected,
+                )?;
+            }
+            Ok(expected)
+        } else {
+            infer_callable_statement_return(
+                store,
+                global_types,
+                session,
+                &returned.values,
+                returned.has_bare_return,
+                None,
+            )
+        }
+    })();
+    let Some(signature) = signature else {
+        return checked;
+    };
+    let cycle_free = store
+        .pop_type_resolution()
+        .ok_or(SourceCheckError::Arrow(callable.declaration))?;
+    let checked = checked?;
+    if !cycle_free {
+        return Err(SourceCheckError::Arrow(callable.declaration));
+    }
+    publish_inferred_source_callable_return(store, callable, signature, checked)
+        .map_err(SourcePlanner::callable_plan_error)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn check_callable_statement_nodes(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    frame: &mut SourceFlowFrame<'_, '_>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    body: &PlannedCallableStatementList,
+    statements: &[PlannedCallableStatement],
+    expected: Option<TypeId>,
+    returned: &mut CallableStatementReturns,
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+    outer_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<(), SourceCheckError> {
+    let callable = &body.syntax.callable;
+    for statement in statements {
+        let capture = Some(SourceArrowCaptureContext {
+            declared_types: &returned.declared_entries,
+            mutable_symbols: None,
+            outer: outer_capture.as_ref(),
+            flow: Some(&body.flow),
+            assignments: &body.capture_assignments,
+            value_exports: &[],
+        });
+        match statement {
+            PlannedCallableStatement::Leaf(leaf) => {
+                check_planned_function_statement_prefix_with_capture_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    frame,
+                    type_import_execution,
+                    type_import_execution.annotation_capabilities,
+                    deferred,
+                    callable,
+                    &body.locals,
+                    std::slice::from_ref(leaf),
+                    staged_value_types,
+                    value_order,
+                    capture,
+                )?;
+                match leaf {
+                    PlannedLinearFunctionStatement::Local(index) => {
+                        let local = body
+                            .locals
+                            .get(*index)
+                            .ok_or_else(|| SourcePlanner::unsupported_function_body(callable))?;
+                        if let PlannedVariableInitializer::Expression(expression) =
+                            &local.initializer
+                        {
+                            check_callable_statement_expression_effects(
+                                store, callable, expression,
+                            )?;
+                        }
+                        let shared_parameter = callable
+                            .parameters
+                            .iter()
+                            .any(|parameter| parameter.symbol == local.symbol);
+                        let declared = if shared_parameter {
+                            store
+                                .value_symbol_links(local.symbol)
+                                .and_then(|links| links.resolved_type)
+                        } else {
+                            staged_value_types.get(&local.symbol).copied()
+                        }
+                        .ok_or(SourceCheckError::Variable(
+                            VariableInvariant::MissingStagedValueType(local.symbol),
+                        ))?;
+                        if !local.binding.is_const() {
+                            returned.declared_entries.insert(local.symbol, declared);
+                        }
+                    }
+                    PlannedLinearFunctionStatement::Expression { expression, .. } => {
+                        check_callable_statement_expression_effects(store, callable, expression)?
+                    }
+                    PlannedLinearFunctionStatement::CapturedAssignment(assignment) => {
+                        check_callable_statement_expression_effects(
+                            store,
+                            callable,
+                            &assignment.right,
+                        )?
+                    }
+                    PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
+                        check_callable_statement_expression_effects(
+                            store,
+                            callable,
+                            &assignment.right,
+                        )?
+                    }
+                    _ => return Err(SourcePlanner::unsupported_function_body(callable)),
+                }
+            }
+            PlannedCallableStatement::Block(statements) => {
+                let entries = returned.declared_entries.clone();
+                let result = check_callable_statement_nodes(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    frame,
+                    type_import_execution,
+                    deferred,
+                    body,
+                    statements,
+                    expected,
+                    returned,
+                    staged_value_types,
+                    value_order,
+                    outer_capture,
+                );
+                restore_callable_statement_entries(body, returned, entries, result.is_ok());
+                result?;
+            }
+            PlannedCallableStatement::If {
+                condition,
+                then_statements,
+                else_statements,
+            } => {
+                check_planned_source_condition_with_capture_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    frame,
+                    type_import_execution,
+                    deferred,
+                    callable,
+                    condition,
+                    capture,
+                )?;
+                check_callable_statement_condition_effects(store, callable, condition)?;
+                for branch in [then_statements, else_statements] {
+                    let entries = returned.declared_entries.clone();
+                    let result = check_callable_statement_nodes(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        frame,
+                        type_import_execution,
+                        deferred,
+                        body,
+                        branch,
+                        expected,
+                        returned,
+                        staged_value_types,
+                        value_order,
+                        outer_capture,
+                    );
+                    restore_callable_statement_entries(body, returned, entries, result.is_ok());
+                    result?;
+                }
+            }
+            PlannedCallableStatement::Return {
+                statement,
+                expression,
+            } => {
+                let snapshot = frame
+                    .snapshot_at(store, global_types, *statement)
+                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                returned.has_return = true;
+                let Some(expression) = expression else {
+                    returned.has_bare_return = true;
+                    if let Some(target) = expected {
+                        let undefined = store
+                            .intrinsic_bootstrap()
+                            .ok_or(DerivedTypeError::BootstrapUninitialized)?
+                            .undefined_type;
+                        check_callable_statement_bare_return(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            diagnostics,
+                            *statement,
+                            undefined,
+                            target,
+                        )?;
+                    }
+                    continue;
+                };
+                let actual = if let Some(target) = expected {
+                    check_assignment_to_type_with_capture_context(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        snapshot.types(),
+                        type_import_execution,
+                        deferred,
+                        target,
+                        None,
+                        expression,
+                        *statement,
+                        None,
+                        None,
+                        capture,
+                    )?
+                    .assigned_type
+                } else {
+                    check_expression_type_with_capture_context(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        snapshot.types(),
+                        type_import_execution,
+                        expression,
+                        None,
+                        deferred,
+                        None,
+                        capture,
+                    )?
+                    .result
+                };
+                check_callable_statement_expression_effects(store, callable, expression)?;
+                returned.values.push(actual);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_callable_statement_return_exit(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    callable: &SourceCallablePlan,
+    has_return: bool,
+    expected: TypeId,
+) -> Result<(), SourceCheckError> {
+    let record = store
+        .type_payload(expected)
+        .ok_or(RelationUnavailable::Type(expected))?;
+    let includes_void = record
+        .flags()
+        .intersects(TypeFlags::VOID | TypeFlags::ANY | TypeFlags::UNDEFINED)
+        || matches!(record.data(), TypeData::Union(union) if union.union.types.iter().any(|type_| store.type_payload(*type_).is_some_and(|record| record.flags().intersects(TypeFlags::VOID))));
+    if includes_void {
+        return Ok(());
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(DerivedTypeError::BootstrapUninitialized)?;
+    let strict = bootstrap.options.strict_null_checks;
+    let undefined = bootstrap.undefined_type;
+    let code = if record.flags().intersects(TypeFlags::NEVER) {
+        Some(2534)
+    } else if !has_return {
+        Some(2355)
+    } else if strict
+        && !source_type_is_assignable_to(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            undefined,
+            expected,
+        )?
+    {
+        Some(2366)
+    } else {
+        None
+    };
+    if let Some(code) = code {
+        merge_retry_diagnostic(
+            diagnostics,
+            CanonicalCheckerDiagnostic {
+                node: callable.return_type.type_node(),
+                range_override: None,
+                diagnostic: Diagnostic::new(
+                    message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
+                ),
+                related_information: Vec::new(),
+            },
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_planned_function_statement_prefix_with_capture_context(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    frame: &mut SourceFlowFrame<'_, '_>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    locals: &[PlannedVariable],
+    statements: &[PlannedLinearFunctionStatement],
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+    arrow_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<(), SourceCheckError> {
     for statement in statements {
         match statement {
             PlannedLinearFunctionStatement::Local(index) => {
@@ -50044,7 +51124,7 @@ fn check_planned_function_statement_prefix(
                     deferred,
                     callable,
                     std::slice::from_ref(local),
-                    None,
+                    arrow_capture,
                     staged_value_types,
                     value_order,
                 )?;
@@ -50076,7 +51156,7 @@ fn check_planned_function_statement_prefix(
                     // Mutation targets use canonical any[] while their elements keep evolving.
                     types.insert(mutation.symbol, global_types.any_array_type);
                 }
-                check_expression_type(
+                check_expression_type_with_capture_context(
                     store,
                     host,
                     global_types,
@@ -50089,6 +51169,8 @@ fn check_planned_function_statement_prefix(
                     expression,
                     None,
                     deferred,
+                    None,
+                    arrow_capture,
                 )?;
                 if let (Some(mutation), Some(prior)) = (mutation, prior) {
                     let current = if evolving {
@@ -50118,10 +51200,179 @@ fn check_planned_function_statement_prefix(
                         .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
                 }
             }
+            PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
+                check_planned_parameter_assignment(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    frame,
+                    type_import_execution,
+                    deferred,
+                    callable,
+                    assignment,
+                    locals,
+                    staged_value_types,
+                    arrow_capture,
+                )?;
+            }
+            PlannedLinearFunctionStatement::CapturedAssignment(assignment)
+                if arrow_capture.is_some() =>
+            {
+                check_planned_captured_assignment(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    frame,
+                    type_import_execution,
+                    deferred,
+                    callable,
+                    assignment,
+                    arrow_capture,
+                )?;
+            }
             _ => return Err(SourcePlanner::unsupported_function_body(callable)),
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_planned_parameter_assignment(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    frame: &mut SourceFlowFrame<'_, '_>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    assignment: &PlannedLinearParameterAssignment,
+    locals: &[PlannedVariable],
+    staged_value_types: &HashMap<SemanticSymbolId, TypeId>,
+    arrow_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<TypeId, SourceCheckError> {
+    let snapshot = frame
+        .snapshot_at(store, global_types, assignment.statement)
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    let declared_type = if locals.iter().any(|local| {
+        local.declaration == assignment.flow.parameter
+            && local.symbol == assignment.flow.symbol
+            && matches!(
+                local.initializer,
+                PlannedVariableInitializer::AbsentAnnotated
+            )
+    }) {
+        staged_value_types.get(&assignment.flow.symbol).copied()
+    } else {
+        store
+            .value_symbol_links(assignment.flow.symbol)
+            .and_then(|links| links.resolved_type)
+    }
+    .ok_or(SourceCheckError::Variable(
+        VariableInvariant::MissingCurrentFlowType(assignment.flow.symbol),
+    ))?;
+    let checked = check_assignment_to_type_with_capture_context(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        snapshot.types(),
+        type_import_execution,
+        deferred,
+        declared_type,
+        None,
+        &assignment.right,
+        assignment.flow.target,
+        Some(assignment.expression),
+        None,
+        arrow_capture,
+    )?;
+    let current_type = current_flow_type_after_assignment(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        checked,
+    )?;
+    frame
+        .complete_assignment(assignment.flow.target, assignment.flow.symbol, current_type)
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    Ok(current_type)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_planned_captured_assignment(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    frame: &mut SourceFlowFrame<'_, '_>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    assignment: &PlannedCapturedLocalAssignment,
+    arrow_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<TypeId, SourceCheckError> {
+    let local = assignment.flow.local;
+    let snapshot = frame
+        .snapshot_at(store, global_types, assignment.flow.statement)
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    let declared_type = arrow_capture
+        .ok_or(SourceCheckError::Variable(
+            VariableInvariant::MissingStagedValueType(local.symbol()),
+        ))?
+        .declared_type(store, host, local)?;
+    let checked = check_assignment_to_type_with_capture_context(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        snapshot.types(),
+        type_import_execution,
+        deferred,
+        declared_type,
+        None,
+        &assignment.right,
+        local.target(),
+        Some(assignment.flow.expression),
+        None,
+        arrow_capture,
+    )?;
+    let current_type = current_flow_type_after_assignment(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        checked,
+    )?;
+    frame
+        .complete_assignment(local.target(), local.symbol(), current_type)
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    Ok(current_type)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -54770,11 +56021,174 @@ fn publish_checked_source_callable_return_with_contextual_return(
         .map_err(SourcePlanner::callable_plan_error)
 }
 
+fn infer_callable_statement_return(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    returned_types: &[TypeId],
+    has_bare_return: bool,
+    contextual_return: Option<TypeId>,
+) -> Result<TypeId, SourceCheckError> {
+    if returned_types.is_empty() {
+        return empty_source_return_for_context(store, contextual_return);
+    }
+    let mut returned_types = returned_types.to_vec();
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(DerivedTypeError::BootstrapUninitialized)?;
+    if bootstrap.options.strict_null_checks && has_bare_return {
+        returned_types.push(bootstrap.undefined_type);
+    }
+    let combined = store.expression_union_type_with_global_types_and_session(
+        global_types,
+        &returned_types,
+        UnionReduction::Subtype,
+        session,
+    )?;
+    inferred_source_return_for_context_worker(
+        store,
+        global_types,
+        combined,
+        contextual_return,
+        Some(session),
+    )
+}
+
+fn check_callable_statement_condition_effects(
+    store: &CanonicalTypeMapperStore,
+    callable: &SourceCallablePlan,
+    condition: &PlannedSourceCondition,
+) -> Result<(), SourceCheckError> {
+    match condition {
+        PlannedSourceCondition::Logical { left, right, .. } => {
+            check_callable_statement_condition_effects(store, callable, left)?;
+            check_callable_statement_condition_effects(store, callable, right)
+        }
+        PlannedSourceCondition::Expression { expression, .. }
+        | PlannedSourceCondition::Truthiness { expression, .. } => {
+            check_callable_statement_expression_effects(store, callable, expression)
+        }
+        PlannedSourceCondition::Typeof(condition) => {
+            check_callable_statement_expression_effects(store, callable, &condition.identifier)
+        }
+        PlannedSourceCondition::Equality(condition) => {
+            check_callable_statement_expression_effects(store, callable, &condition.operand)?;
+            check_callable_statement_expression_effects(store, callable, &condition.value)
+        }
+    }
+}
+
+fn check_callable_statement_expression_effects(
+    store: &CanonicalTypeMapperStore,
+    callable: &SourceCallablePlan,
+    expression: &PlannedExpression,
+) -> Result<(), SourceCheckError> {
+    let mut pending = vec![expression];
+    while let Some(expression) = pending.pop() {
+        if matches!(expression.kind, PlannedExpressionKind::Call(_)) {
+            let signature = store
+                .signature_links(expression.node)
+                .and_then(|links| links.resolved_signature.signature())
+                .and_then(|signature| store.signature(signature))
+                .ok_or(SourceCheckError::Call(expression.node))?;
+            let assertion = signature
+                .resolved_type_predicate()
+                .is_some_and(|predicate| {
+                    store.type_predicate(predicate).is_none_or(|predicate| {
+                        matches!(
+                            predicate.kind(),
+                            TypePredicateKind::AssertsThis | TypePredicateKind::AssertsIdentifier
+                        )
+                    })
+                });
+            if assertion
+                || signature
+                    .resolved_return_type()
+                    .and_then(|type_| store.type_payload(type_))
+                    .is_none_or(|record| record.flags().intersects(TypeFlags::NEVER))
+            {
+                return Err(SourcePlanner::unsupported_function_body(callable));
+            }
+        }
+        expression.eager_children(&mut pending);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_callable_statement_bare_return(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    statement: NodeRef,
+    actual: TypeId,
+    expected: TypeId,
+) -> Result<(), SourceCheckError> {
+    if source_type_is_assignable_to(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        actual,
+        expected,
+    )? {
+        return Ok(());
+    }
+    let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+    if options.no_error_truncation {
+        flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+    }
+    let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        actual,
+        expected,
+        flags,
+    )?;
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(statement),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+                [display.source, display.target],
+            ),
+            related_information: Vec::new(),
+        },
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+
 fn inferred_source_return_for_context(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
     returned: TypeId,
     contextual_return: Option<TypeId>,
+) -> Result<TypeId, SourceCheckError> {
+    inferred_source_return_for_context_worker(
+        store,
+        global_types,
+        returned,
+        contextual_return,
+        None,
+    )
+}
+
+fn inferred_source_return_for_context_worker(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    returned: TypeId,
+    contextual_return: Option<TypeId>,
+    session: Option<&mut InstantiationSession>,
 ) -> Result<TypeId, SourceCheckError> {
     let widened = if contextual_return.is_some()
         && store
@@ -54787,7 +56201,11 @@ fn inferred_source_return_for_context(
     } else {
         widened_fresh_literal_type(store, returned)?
     };
-    Ok(store.get_widened_type_with_global_types(widened, global_types)?)
+    Ok(if let Some(session) = session {
+        store.get_widened_type_with_global_types_and_session(widened, global_types, session)?
+    } else {
+        store.get_widened_type_with_global_types(widened, global_types)?
+    })
 }
 
 fn empty_source_return_for_context(
@@ -67445,6 +68863,26 @@ pub(super) fn check_source_file(
             &function.object_parameter_bindings,
         )?;
         let (expression, return_flow_types) = match &function.body {
+            PlannedFunctionBody::StatementList(body) => {
+                check_planned_callable_statement_list(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    &mut function_diagnostics,
+                    body_flow_types,
+                    &type_import_execution,
+                    &mut deferred,
+                    body,
+                    &mut staged_value_types,
+                    &mut value_order,
+                    None,
+                )?;
+                inferred_function_diagnostics[index] = Some(function_diagnostics);
+                continue;
+            }
             PlannedFunctionBody::Empty => (None, body_flow_types),
             PlannedFunctionBody::ObjectShorthandAssignment(assignment) => {
                 check_planned_object_shorthand_assignment(
@@ -69543,6 +70981,24 @@ pub(super) fn check_source_file(
                             );
                         }
                     }
+                    PlannedFunctionBody::StatementList(body) => {
+                        check_planned_callable_statement_list(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            body_flow_types,
+                            &type_import_execution,
+                            &mut deferred,
+                            body,
+                            &mut staged_value_types,
+                            &mut value_order,
+                            None,
+                        )?;
+                    }
                     PlannedFunctionBody::Linear(statements) => {
                         check_planned_linear_function_statements(
                             bound,
@@ -69954,6 +71410,24 @@ pub(super) fn check_source_file(
                         }
                     }
                     match &arrow.body {
+                        PlannedArrowBody::StatementList(body) => {
+                            check_planned_callable_statement_list(
+                                store,
+                                host,
+                                global_types,
+                                source,
+                                options,
+                                session,
+                                diagnostics,
+                                body_flow_types,
+                                &type_import_execution,
+                                &mut deferred,
+                                body,
+                                &mut staged_value_types,
+                                &mut value_order,
+                                Some(source_capture),
+                            )?;
+                        }
                         PlannedArrowBody::ReturnJsx {
                             expression,
                             element,
@@ -70014,7 +71488,8 @@ pub(super) fn check_source_file(
                                     diagnostic_node,
                                 } => (Some(expression), *diagnostic_node),
                                 PlannedArrowBody::ForOf(_) => (None, callable.declaration),
-                                PlannedArrowBody::ReturnJsx { .. } => {
+                                PlannedArrowBody::StatementList(_)
+                                | PlannedArrowBody::ReturnJsx { .. } => {
                                     unreachable!("JSX arrow returns are checked above")
                                 }
                             };
@@ -73909,6 +75384,24 @@ pub(super) fn check_source_file(
             continue;
         }
         match &arrow.body {
+            PlannedArrowBody::StatementList(body) => {
+                check_planned_callable_statement_list(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    body_flow_types,
+                    &type_import_execution,
+                    &mut deferred,
+                    body,
+                    &mut staged_value_types,
+                    &mut value_order,
+                    Some(source_capture),
+                )?;
+            }
             PlannedArrowBody::Empty => {}
             PlannedArrowBody::ForOf(iteration) => {
                 check_planned_lexical_iteration_with_capture_context(
@@ -74717,6 +76210,678 @@ mod tests {
         let parsed = parse_source_file(text);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         parsed
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check the actual local body with limited and adequate callers.
+    fn callable_uninitialized_local_body_keeps_the_current_caller() {
+        let library = parsed(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Base<T> { value: T; [index: number]: Array<number>; }",
+        ));
+        let source = parsed(concat!(
+            "interface Derived extends Base<number> {} ",
+            "interface Plain { value: number; } ",
+            "const choose = (flag: boolean, left: Derived, right: Plain) => { ",
+            "let selected: Derived; selected = left; ",
+            "if (flag) { return selected; } return right; };",
+        ));
+        let library_file = FileId::new(58_560);
+        let file = FileId::new(58_561);
+        let mut context = context_with_cross_file_global(
+            library_file,
+            &library,
+            file,
+            &source,
+            CanonicalModuleState::Script,
+            CanonicalModuleState::Script,
+            false,
+        );
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let source_file = context.source_file(file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, &library_bound), (&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut plan = SourcePlanner::new_semantic_with_global_types(
+            &source.arena,
+            &bound,
+            source_file,
+            context.store(),
+            &host,
+            &globals,
+            options,
+        )
+        .finish()
+        .unwrap();
+        assert_eq!(plan.arrows.len(), 1);
+        let planned = plan.arrows.pop().unwrap();
+        let arrow = PlannedArrowExpression {
+            callable: planned.source.callable,
+            parameter_initializers: planned.parameter_initializers,
+            expression_statement: planned.expression_statement,
+            linear_body: planned.linear_body,
+            loop_body: None,
+            prototype_this: None,
+            body: planned.body,
+        };
+        let PlannedArrowBody::StatementList(body) = &arrow.body else {
+            panic!("the original conditional body must use the shared statement plan");
+        };
+        assert_eq!(body.locals.len(), 1);
+        assert!(matches!(
+            body.locals[0].initializer,
+            PlannedVariableInitializer::AbsentAnnotated
+        ));
+        assert!(matches!(
+            &body.statements[1],
+            PlannedCallableStatement::Leaf(PlannedLinearFunctionStatement::ParameterAssignment(write))
+                if write.flow.parameter == body.locals[0].declaration
+                    && write.flow.symbol == body.locals[0].symbol
+        ));
+        let capabilities = HashMap::new();
+        let imports = SourceTypeImportExecution {
+            value_uses: HashMap::new(),
+            annotation_capabilities: &capabilities,
+            property_flow: super::super::source_flow::OwnClassPropertyFlow::default(),
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let materialized = materialize_checked_source_callable(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut InstantiationSession::new(InstantiationLimits::default()),
+            &mut diagnostics,
+            &arrow.callable,
+            &capabilities,
+        )
+        .unwrap();
+        let entries = source_arrow_parameter_entry_types(context.store(), &arrow.callable).unwrap();
+        let derived = entries[&arrow.callable.parameters[1].symbol];
+        let plain = entries[&arrow.callable.parameters[2].symbol];
+        let mut limited = InstantiationSession::new(InstantiationLimits {
+            max_count: 0,
+            ..InstantiationLimits::default()
+        });
+        let mark = limited.limit_event_mark();
+        let result = check_planned_arrow_argument(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            source_file,
+            options,
+            &mut limited,
+            &mut diagnostics,
+            &HashMap::new(),
+            &imports,
+            &mut Vec::new(),
+            arrow.callable.declaration,
+            &arrow,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(SourceCheckError::LiteralCache(SourceLiteralCacheError::UnsupportedUnionConstituent(type_)))
+                if type_ == derived || type_ == plain
+        ));
+        assert!(limited.limit_event_occurred_since(mark));
+        assert_eq!(limited.recovery_error_type(), None);
+        assert_eq!(context.store().type_resolution_len(), 0);
+        assert_eq!(
+            context
+                .store()
+                .signature(materialized.signature)
+                .unwrap()
+                .resolved_return_type(),
+            None
+        );
+        assert!(!is_type_checked(&context, file));
+        let mut adequate = InstantiationSession::new(InstantiationLimits::default());
+        check_planned_arrow_argument(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            source_file,
+            options,
+            &mut adequate,
+            &mut diagnostics,
+            &HashMap::new(),
+            &imports,
+            &mut Vec::new(),
+            arrow.callable.declaration,
+            &arrow,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(adequate.total_count() > 0);
+        assert_eq!(adequate.limit_event_count(), 0);
+        assert!(
+            context
+                .store()
+                .signature(materialized.signature)
+                .unwrap()
+                .resolved_return_type()
+                .is_some()
+        );
+        assert_eq!(context.store().type_resolution_len(), 0);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the spent caller, lazy member, and exact restoration together.
+    fn callable_statement_return_reduction_keeps_the_spent_caller_and_real_arrays() {
+        use crate::semantic::instantiate::instantiate_type_with_vector_and_session;
+
+        let library = parsed(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Base<T> { value: T; [index: number]: Array<number>; }",
+        ));
+        let source = parsed(concat!(
+            "interface Derived extends Base<number> {} ",
+            "interface Plain { value: number; } ",
+            "const choose = (flag: boolean, left: Derived, right: Plain) => { ",
+            "const entry = flag; if (entry) { const chosen = left; return chosen; } ",
+            "const finalValue = right; return finalValue; };",
+        ));
+        let library_file = FileId::new(58_552);
+        let file = FileId::new(58_553);
+        let mut context = context_with_cross_file_global(
+            library_file,
+            &library,
+            file,
+            &source,
+            CanonicalModuleState::Script,
+            CanonicalModuleState::Script,
+            false,
+        );
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let source_file = context.source_file(file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, &library_bound), (&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut plan = SourcePlanner::new_semantic_with_global_types(
+            &source.arena,
+            &bound,
+            source_file,
+            context.store(),
+            &host,
+            &globals,
+            options,
+        )
+        .finish()
+        .unwrap();
+        assert_eq!(plan.arrows.len(), 1);
+        let planned = plan.arrows.pop().unwrap();
+        let arrow = PlannedArrowExpression {
+            callable: planned.source.callable,
+            parameter_initializers: planned.parameter_initializers,
+            expression_statement: planned.expression_statement,
+            linear_body: planned.linear_body,
+            loop_body: None,
+            prototype_this: None,
+            body: planned.body,
+        };
+        let capabilities = HashMap::new();
+        let imports = SourceTypeImportExecution {
+            value_uses: HashMap::new(),
+            annotation_capabilities: &capabilities,
+            property_flow: super::super::source_flow::OwnClassPropertyFlow::default(),
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut prepared_session = InstantiationSession::new(InstantiationLimits::default());
+        let materialized = materialize_checked_source_callable(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut prepared_session,
+            &mut diagnostics,
+            &arrow.callable,
+            &capabilities,
+        )
+        .unwrap();
+        let entries = source_arrow_parameter_entry_types(context.store(), &arrow.callable).unwrap();
+        let derived = entries[&arrow.callable.parameters[1].symbol];
+        let plain = entries[&arrow.callable.parameters[2].symbol];
+        let TypeData::Interface(data) = context.store().type_payload(derived).unwrap().data()
+        else {
+            panic!("Derived must retain its real inherited interface");
+        };
+        let proxy = context
+            .store()
+            .symbol_table(data.reference.object.structured.members.unwrap())
+            .unwrap()
+            .get_source("value")
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .value_symbol_links(proxy)
+                .unwrap()
+                .resolved_type
+                .is_none()
+        );
+        let base_owner = global_symbol(&context, "Base");
+        let base = context
+            .store()
+            .declared_type_links(base_owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Interface(base_data) = context.store().type_payload(base).unwrap().data()
+        else {
+            unreachable!();
+        };
+        let parameter = base_data
+            .reference
+            .resolved_type_arguments
+            .as_ref()
+            .unwrap()[0];
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let mut spent = InstantiationSession::new(InstantiationLimits {
+            max_count: 1,
+            ..InstantiationLimits::default()
+        });
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                context.store_mut_for_test(),
+                parameter,
+                &[parameter],
+                &[number],
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+                &mut spent,
+            ),
+            Ok(number)
+        );
+        let mark = spent.limit_event_mark();
+        let result = infer_callable_statement_return(
+            context.store_mut_for_test(),
+            &globals,
+            &mut spent,
+            &[derived, plain],
+            false,
+            None,
+        );
+        assert!(
+            matches!(result, Err(SourceCheckError::LiteralCache(SourceLiteralCacheError::UnsupportedUnionConstituent(type_))) if type_ == derived || type_ == plain)
+        );
+        assert!(spent.limit_event_occurred_since(mark));
+        assert_eq!(
+            (
+                spent.query_count(),
+                spent.total_count(),
+                spent.limit_event_count()
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(spent.recovery_error_type(), None);
+        assert!(
+            context
+                .store()
+                .signature(materialized.signature)
+                .unwrap()
+                .resolved_return_type()
+                .is_none()
+        );
+        assert!(
+            context
+                .store()
+                .value_symbol_links(proxy)
+                .unwrap()
+                .resolved_type
+                .is_none()
+        );
+        assert_eq!(context.store().type_resolution_len(), 0);
+        assert!(!is_type_checked(&context, file));
+        let mut adequate = InstantiationSession::new(InstantiationLimits::default());
+        check_planned_arrow_argument(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            source_file,
+            options,
+            &mut adequate,
+            &mut diagnostics,
+            &HashMap::new(),
+            &imports,
+            &mut Vec::new(),
+            arrow.callable.declaration,
+            &arrow,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(adequate.total_count() > 0);
+        assert_eq!(adequate.limit_event_count(), 0);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(proxy)
+                .unwrap()
+                .resolved_type,
+            Some(number)
+        );
+        assert!(
+            context
+                .store()
+                .signature(materialized.signature)
+                .unwrap()
+                .resolved_return_type()
+                .is_some()
+        );
+        let PlannedArrowBody::StatementList(body) = &arrow.body else {
+            unreachable!();
+        };
+        let returned = callable_statement_nodes(&body.statements)
+            .into_iter()
+            .filter_map(|statement| {
+                if let PlannedCallableStatement::Return {
+                    expression: Some(expression),
+                    ..
+                } = statement
+                {
+                    Some(expression.node)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(returned.len(), 2);
+        for (node, expected) in returned.into_iter().zip([derived, plain]) {
+            assert_eq!(resolved_node_type(&context, node), expected);
+        }
+        let warm = observable_state(&context, file);
+        let work = (adequate.total_count(), adequate.limit_event_count());
+        check_planned_arrow_argument(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            source_file,
+            options,
+            &mut adequate,
+            &mut diagnostics,
+            &HashMap::new(),
+            &imports,
+            &mut Vec::new(),
+            arrow.callable.declaration,
+            &arrow,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!((adequate.total_count(), adequate.limit_event_count()), work);
+        // The final identifier return resets the query. Warm reduction reuses its mapped member.
+        assert_eq!(adequate.query_count(), 0);
+        assert_eq!(observable_state(&context, file), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn callable_statement_lists_recheck_real_scopes_and_local_owners_cold_and_warm() {
+        let source = parsed(concat!(
+            "function select(flag: boolean, value: number) { ",
+            "const entry = value; { var saved = entry; } ",
+            "if (flag) { const inside = entry; return inside; } ",
+            "const after = saved; return after; } ",
+            "function other(): number { return 0; }",
+        ));
+        let file = FileId::new(58_550);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let plan = SourcePlanner::new_semantic_with_global_types(
+            &source.arena,
+            &bound,
+            context.source_file(file).unwrap(),
+            context.store(),
+            &host,
+            context.global_types(),
+            context.options(),
+        )
+        .finish()
+        .unwrap();
+        let [select, other] = plan.functions.as_slice() else {
+            unreachable!()
+        };
+        let PlannedFunctionBody::StatementList(body) = &select.body else {
+            unreachable!()
+        };
+        assert!(select.callable.return_type.is_inferred());
+        assert!(body.flow.statement_list_is_exact(&body.syntax));
+        let mut copied = body.syntax.clone();
+        copied.callable.body = other.callable.body;
+        assert!(!body.flow.statement_list_is_exact(&copied));
+        let returns = callable_statement_nodes(&body.statements)
+            .into_iter()
+            .filter_map(|node| {
+                if let PlannedCallableStatement::Return { statement, .. } = node {
+                    Some(*statement)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(returns.len(), 2);
+        for &returned in &returns {
+            assert_eq!(
+                body.syntax.statement_scope(returned),
+                bound.block_scope_container(returned)
+            );
+        }
+        assert_ne!(
+            body.syntax.statement_scope(returns[0]),
+            body.syntax.statement_scope(returns[1])
+        );
+        assert_eq!(body.locals[1].binding, VariableBindingKind::Var);
+        let inside = &body.locals[2];
+        let original = context.store().symbol(inside.symbol).unwrap().clone();
+        for warm in [false, true] {
+            if warm {
+                context.check_source_file(file).unwrap();
+            }
+            let before = format!("{:#?}", context.store());
+            assert!(
+                body.flow
+                    .frame_with_captured_locals(context.store(), &host, &bound, HashMap::new())
+                    .is_ok()
+            );
+            assert_eq!(format!("{:#?}", context.store()), before);
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                inside.symbol,
+                original.declarations().map(<[NodeRef]>::to_vec),
+                Some(other.callable.declaration),
+            ));
+            let damaged = format!("{:#?}", context.store());
+            for _ in 0..2 {
+                assert!(
+                    matches!(body.flow.frame_with_captured_locals(context.store(), &host, &bound, HashMap::new()),
+                    Err(SourceFlowError::Invariant(super::super::source_flow::SourceFlowInvariant::InvalidCall(node)))
+                        if node == select.callable.declaration)
+                );
+                assert_eq!(format!("{:#?}", context.store()), damaged);
+            }
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                inside.symbol,
+                original.declarations().map(<[NodeRef]>::to_vec),
+                original.value_declaration(),
+            ));
+            assert!(
+                body.flow
+                    .frame_with_captured_locals(context.store(), &host, &bound, HashMap::new())
+                    .is_ok()
+            );
+            assert_eq!(format!("{:#?}", context.store()), before);
+        }
+        let ready = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), ready);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn callable_statement_returns_replay_later_reads_and_restore_the_resolution_stack() {
+        let source = parsed(concat!(
+            "function select(flag: boolean, value: number) { const entry = value; ",
+            "if (flag) { return entry; } const after = entry; return after; }",
+        ));
+        let file = FileId::new(58_551);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let source_file = context.source_file(file).unwrap();
+        let plan = SourcePlanner::new_semantic_with_global_types(
+            &source.arena,
+            &bound,
+            source_file,
+            context.store(),
+            &host,
+            &globals,
+            options,
+        )
+        .finish()
+        .unwrap();
+        let [function] = plan.functions.as_slice() else {
+            unreachable!()
+        };
+        let PlannedFunctionBody::StatementList(body) = &function.body else {
+            unreachable!()
+        };
+        let PlannedCallableStatement::Return {
+            expression: Some(expression),
+            ..
+        } = body.statements.last().unwrap()
+        else {
+            unreachable!()
+        };
+        context.check_source_file(file).unwrap();
+        let cached = context
+            .store()
+            .type_node_links(expression.node)
+            .unwrap()
+            .clone();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(cached.resolved_type, Some(number));
+        let signature = context
+            .store()
+            .signature_links(function.callable.declaration)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        let entries =
+            source_arrow_parameter_entry_types(context.store(), &function.callable).unwrap();
+        let capabilities = HashMap::new();
+        let imports = SourceTypeImportExecution {
+            value_uses: HashMap::new(),
+            annotation_capabilities: &capabilities,
+            property_flow: super::super::source_flow::OwnClassPropertyFlow::default(),
+        };
+        let mut caller = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut poison = cached.clone();
+        poison.resolved_type = Some(string);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(expression.node, poison.clone())
+        );
+        let before = observable_state(&context, file);
+        for _ in 0..2 {
+            assert_eq!(
+                check_planned_callable_statement_list(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    source_file,
+                    options,
+                    &mut caller,
+                    &mut diagnostics,
+                    entries.clone(),
+                    &imports,
+                    &mut Vec::new(),
+                    body,
+                    &mut HashMap::new(),
+                    &mut Vec::new(),
+                    None
+                ),
+                Err(SourceCheckError::Assertion(
+                    SourceAssertionError::InvalidExpressionCache {
+                        node: expression.node,
+                        cached: Some(string),
+                        expected: number,
+                    }
+                ))
+            );
+            assert_eq!(
+                context.store().type_node_links(expression.node),
+                Some(&poison)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(number)
+            );
+            assert_eq!(context.store().type_resolution_len(), 0);
+            assert_eq!(observable_state(&context, file), before);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(expression.node, cached)
+        );
+        assert_eq!(
+            check_planned_callable_statement_list(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                source_file,
+                options,
+                &mut caller,
+                &mut diagnostics,
+                entries,
+                &imports,
+                &mut Vec::new(),
+                body,
+                &mut HashMap::new(),
+                &mut Vec::new(),
+                None
+            ),
+            Ok(number)
+        );
+        assert_eq!(context.store().type_resolution_len(), 0);
+        assert!(diagnostics.is_empty());
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), before);
     }
 
     fn source_facts_with_module_state(
@@ -107072,7 +109237,31 @@ class Foo2 {
 
         let bootstrap = context.store().intrinsic_bootstrap().unwrap();
         let expected = bootstrap.string_or_number_type;
-        for name in ["choose", "classify"] {
+        let fallback = variable_value_type(&context, &source, file, "fallback");
+        assert_eq!(
+            resolved_node_type(&context, variable_initializer(&source, file, "fallback")),
+            fallback,
+        );
+        let TypeData::Literal(literal) = context.store().type_payload(fallback).unwrap().data()
+        else {
+            panic!("the original const fallback must keep its numeric literal")
+        };
+        assert_eq!(literal.value, LiteralValue::Number(Number::new(1.0)));
+        assert_eq!(literal.fresh_type, Some(fallback));
+        assert_ne!(literal.regular_type, fallback);
+        let mut choose_members = [bootstrap.string_type, fallback];
+        choose_members.sort_unstable();
+        let choose_expected = bootstrap.cached_union_type(&choose_members).unwrap();
+        let TypeData::Union(union) = context
+            .store()
+            .type_payload(choose_expected)
+            .unwrap()
+            .data()
+        else {
+            panic!("choose must keep the canonical string and fresh literal union")
+        };
+        assert_eq!(union.union.types, choose_members);
+        for (name, expected) in [("choose", choose_expected), ("classify", expected)] {
             let owner = function_symbol(&context, &source, file, name);
             let callable = context
                 .store()
@@ -107095,7 +109284,7 @@ class Foo2 {
         }
         assert_eq!(
             variable_value_type(&context, &source, file, "chosen"),
-            expected,
+            choose_expected,
         );
         assert_eq!(
             variable_value_type(&context, &source, file, "classified"),
