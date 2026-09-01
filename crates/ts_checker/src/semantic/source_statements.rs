@@ -493,6 +493,7 @@ pub(super) enum SourceCallableStatementSyntax {
         statements: Vec<Self>,
     },
     If(Box<SourceCallableIfSyntax>),
+    Try(Box<SourceCallableTrySyntax>),
     Return {
         statement: NodeRef,
         expression: Option<NodeRef>,
@@ -509,7 +510,53 @@ pub(super) struct SourceCallableIfSyntax {
     pub(super) else_statements: Vec<SourceCallableStatementSyntax>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableTrySyntax {
+    pub(super) statement: NodeRef,
+    pub(super) try_block: NodeRef,
+    pub(super) catch_clause: NodeRef,
+    pub(super) catch_block: NodeRef,
+    pub(super) binding: Option<SourceCallableCatchBindingSyntax>,
+    pub(super) try_statements: Vec<SourceCallableStatementSyntax>,
+    pub(super) catch_statements: Vec<SourceCallableStatementSyntax>,
+}
+
+/// A catch binding has its own lexical owner. It is not an ordinary local.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableCatchBindingSyntax {
+    pub(super) clause: NodeRef,
+    pub(super) declaration: NodeRef,
+    pub(super) name: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) type_node: Option<NodeRef>,
+    pub(super) initializer: Option<NodeRef>,
+    pub(super) block_redeclaration: Option<NodeRef>,
+}
+
 impl SourceCallableStatementListSyntax {
+    pub(super) fn catch_bindings(&self) -> Vec<&SourceCallableCatchBindingSyntax> {
+        let mut pending = self.statements.iter().collect::<Vec<_>>();
+        let mut bindings = Vec::new();
+        while let Some(statement) = pending.pop() {
+            match statement {
+                SourceCallableStatementSyntax::Try(tried) => {
+                    bindings.extend(tried.binding.as_ref());
+                    pending.extend(&tried.try_statements);
+                    pending.extend(&tried.catch_statements);
+                }
+                SourceCallableStatementSyntax::Block { statements, .. } => {
+                    pending.extend(statements);
+                }
+                SourceCallableStatementSyntax::If(branch) => {
+                    pending.extend(&branch.then_statements);
+                    pending.extend(&branch.else_statements);
+                }
+                _ => {}
+            }
+        }
+        bindings
+    }
+
     /// Returns only the lexical scope retained by the complete source walk.
     pub(super) fn statement_scope(&self, wanted: NodeRef) -> Option<NodeRef> {
         self.find_statement_scope(wanted, true)
@@ -532,7 +579,8 @@ impl SourceCallableStatementListSyntax {
                     SourceLinearFunctionStatementSyntax::Local(local),
                 ) => local.statement,
                 SourceCallableStatementSyntax::Leaf(
-                    SourceLinearFunctionStatementSyntax::Expression { statement, .. },
+                    SourceLinearFunctionStatementSyntax::Expression { statement, .. }
+                    | SourceLinearFunctionStatementSyntax::Throw { statement, .. },
                 )
                 | SourceCallableStatementSyntax::Return { statement, .. } => *statement,
                 SourceCallableStatementSyntax::Empty(node) => *node,
@@ -556,6 +604,17 @@ impl SourceCallableStatementListSyntax {
                         );
                     }
                     branch.control.statement
+                }
+                SourceCallableStatementSyntax::Try(tried) => {
+                    if include_branches {
+                        pending.extend(
+                            tried.try_statements.iter().map(|statement| (statement, scope)),
+                        );
+                        pending.extend(tried.catch_statements.iter().map(|statement| {
+                            (statement, tried.catch_clause)
+                        }));
+                    }
+                    tried.statement
                 }
                 SourceCallableStatementSyntax::Leaf(_) => return None,
             };
@@ -582,6 +641,10 @@ impl SourceCallableStatementListSyntax {
                 SourceCallableStatementSyntax::If(branch) => {
                     pending.extend(&branch.then_statements);
                     pending.extend(&branch.else_statements);
+                }
+                SourceCallableStatementSyntax::Try(tried) => {
+                    pending.extend(&tried.try_statements);
+                    pending.extend(&tried.catch_statements);
                 }
                 _ => {}
             }
@@ -4908,6 +4971,7 @@ impl SyntaxPlanner<'_> {
         Ok(statements)
     }
 
+    #[allow(clippy::too_many_lines)] // Each admitted statement uses its existing source proof.
     fn plan_callable_statement(
         &self,
         statement: NodeRef,
@@ -4950,6 +5014,12 @@ impl SyntaxPlanner<'_> {
                 statement,
                 expression: self.plan_linear_return(statement, parent, callable)?,
             },
+            SyntaxKind::ThrowStatement => SourceCallableStatementSyntax::Leaf(
+                SourceLinearFunctionStatementSyntax::Throw {
+                    statement,
+                    expression: self.plan_linear_throw(statement, parent, callable)?,
+                },
+            ),
             SyntaxKind::Block => {
                 let record = self.node(statement)?;
                 let NodeData::Block(block) = &record.data else {
@@ -4993,6 +5063,9 @@ impl SyntaxPlanner<'_> {
             SyntaxKind::IfStatement => SourceCallableStatementSyntax::If(Box::new(
                 self.plan_callable_if(statement, parent, scope, depth)?,
             )),
+            SyntaxKind::TryStatement => SourceCallableStatementSyntax::Try(Box::new(
+                self.plan_callable_try(statement, parent, scope, depth)?,
+            )),
             _ => {
                 return Err(self.unsupported(
                     statement,
@@ -5002,6 +5075,167 @@ impl SyntaxPlanner<'_> {
             }
         };
         Ok(vec![result])
+    }
+
+    fn plan_callable_try(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        scope: NodeRef,
+        depth: usize,
+    ) -> Result<SourceCallableTrySyntax, SourceFunctionStatementsError> {
+        let invalid = |node, kind| self.unsupported(
+            node,
+            kind,
+            SourceFunctionStatementsRole::BodyStatement,
+        );
+        let record = self.node(statement)?;
+        let NodeData::TryStatement(tried) = &record.data else {
+            return Err(invalid(statement, record.kind));
+        };
+        if record.flags.0 != 0
+            || record.parent != Some(parent.node)
+            || tried.finally_block.is_some()
+            || tried.flow_node.is_some()
+            || tried.facts != 0
+        {
+            return Err(invalid(statement, record.kind));
+        }
+        self.validate_range(statement, parent)?;
+        self.validate_container(statement, self.callable.declaration)?;
+        self.validate_block_scope_container(statement, scope)?;
+        let try_block = self.reference(tried.try_block);
+        let catch_clause = tried.catch_clause.map(|node| self.reference(node))
+            .ok_or_else(|| invalid(statement, record.kind))?;
+        let catch_record = self.node(catch_clause)?;
+        let NodeData::CatchClause(caught) = &catch_record.data else {
+            return Err(invalid(catch_clause, catch_record.kind));
+        };
+        if catch_record.kind != SyntaxKind::CatchClause
+            || catch_record.flags.0 != 0
+            || catch_record.parent != Some(statement.node)
+            || caught.next_container.is_some()
+            || caught.facts != 0
+        {
+            return Err(invalid(catch_clause, catch_record.kind));
+        }
+        self.validate_range(catch_clause, statement)?;
+        self.validate_order(try_block, catch_clause)?;
+        self.validate_container(catch_clause, self.callable.declaration)?;
+        self.validate_block_scope_container(catch_clause, scope)?;
+        let catch_block = self.reference(caught.block);
+        if self.node(try_block)?.kind != SyntaxKind::Block
+            || self.node(catch_block)?.kind != SyntaxKind::Block
+        {
+            return Err(invalid(statement, record.kind));
+        }
+        let binding = caught.variable_declaration.map(|declaration| {
+            self.plan_callable_catch_binding(
+                catch_clause,
+                catch_block,
+                self.reference(declaration),
+            )
+        }).transpose()?;
+        let try_statements = self.plan_callable_list(
+            &[try_block.node], statement, scope, depth + 1,
+        )?;
+        let catch_statements = self.plan_callable_list(
+            &[catch_block.node], catch_clause, catch_clause, depth + 1,
+        )?;
+        Ok(SourceCallableTrySyntax {
+            statement,
+            try_block,
+            catch_clause,
+            catch_block,
+            binding,
+            try_statements,
+            catch_statements,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep catch declaration, scope, and symbol checks together.
+    fn plan_callable_catch_binding(
+        &self,
+        clause: NodeRef,
+        block: NodeRef,
+        declaration: NodeRef,
+    ) -> Result<SourceCallableCatchBindingSyntax, SourceFunctionStatementsError> {
+        let invalid = |node, kind| self.unsupported(
+            node, kind, SourceFunctionStatementsRole::LocalDeclaration,
+        );
+        let record = self.node(declaration)?;
+        let NodeData::VariableDeclaration(variable) = &record.data else {
+            return Err(invalid(declaration, record.kind));
+        };
+        if record.kind != SyntaxKind::VariableDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(clause.node)
+            || variable.exclamation_token.is_some()
+            || variable.local_symbol.is_some()
+            || variable.symbol.is_some()
+            || variable.facts != 0
+        {
+            return Err(invalid(declaration, record.kind));
+        }
+        self.validate_range(declaration, clause)?;
+        self.validate_order(declaration, block)?;
+        self.validate_container(declaration, self.callable.declaration)?;
+        self.validate_block_scope_container(declaration, clause)?;
+        let name = self.reference(variable.name);
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(invalid(name, name_record.kind));
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(invalid(name, name_record.kind));
+        }
+        self.validate_range(name, declaration)?;
+        self.validate_container(name, self.callable.declaration)?;
+        self.validate_block_scope_container(name, clause)?;
+        let type_node = variable.type_.map(|node| self.reference(node));
+        let initializer = variable.initializer.map(|node| self.reference(node));
+        let mut previous = name;
+        for node in [type_node, initializer].into_iter().flatten() {
+            self.validate_parent(node, Some(declaration.node), SourceFunctionStatementsRole::LocalDeclaration)?;
+            self.validate_range(node, declaration)?;
+            self.validate_order(previous, node)?;
+            self.validate_container(node, self.callable.declaration)?;
+            self.validate_block_scope_container(node, clause)?;
+            previous = node;
+        }
+        let symbol = plan_top_level_variable(
+            self.bound, self.store, declaration, name, &identifier.text,
+            VariableBindingKind::Let, false,
+        )?;
+        let locals = self.bound.locals(clause)
+            .ok_or(SourceFunctionStatementsInvariant::MissingLocals(clause))?;
+        let actual = self.store.symbol_table(locals)
+            .and_then(|table| table.get_source(&identifier.text));
+        if actual != Some(symbol) {
+            return Err(SourceFunctionStatementsInvariant::LocalTableMismatch {
+                declaration, scope: clause, expected: symbol, actual,
+            }.into());
+        }
+        let block_redeclaration = self.bound.locals(block)
+            .and_then(|locals| self.store.symbol_table(locals))
+            .and_then(|table| table.get_source(&identifier.text))
+            .and_then(|symbol| self.store.symbol(symbol))
+            .filter(|symbol| symbol.flags().intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE))
+            .and_then(|symbol| symbol.value_declaration());
+        if let Some(redeclared) = block_redeclaration {
+            self.node(redeclared)?;
+            self.validate_range(redeclared, block)?;
+            self.validate_container(redeclared, self.callable.declaration)?;
+            self.validate_block_scope_container(redeclared, block)?;
+        }
+        Ok(SourceCallableCatchBindingSyntax {
+            clause, declaration, name, symbol, type_node, initializer, block_redeclaration,
+        })
     }
 
     fn plan_callable_if(

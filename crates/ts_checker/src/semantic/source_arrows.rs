@@ -2588,7 +2588,10 @@ fn plan_body(
         && block.statements.nodes.iter().any(|statement| {
             matches!(
                 store.source_node_kind(NodeRef::new(body.arena, body.file, *statement)),
-                Some(SyntaxKind::IfStatement | SyntaxKind::Block)
+                Some(
+                    SyntaxKind::IfStatement | SyntaxKind::Block
+                        | SyntaxKind::TryStatement | SyntaxKind::ThrowStatement
+                )
             )
         })
         && let Some((arena, bound)) = host.source(callable.declaration)
@@ -2597,7 +2600,9 @@ fn plan_body(
             arena, bound, store, callable,
         ) {
             Ok(_) => return Ok(SourceArrowBodyPlan::StatementBlock { block: body }),
-            Err(super::source_statements::SourceFunctionStatementsError::Unsupported(_)) => {}
+            Err(super::source_statements::SourceFunctionStatementsError::Unsupported(_)) => {
+                return Err(unsupported(SourceArrowUnsupported::ComplexBlock(body)));
+            }
             Err(_) => return Err(invariant(SourceArrowInvariant::InvalidBody(body))),
         }
     }

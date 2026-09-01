@@ -44,6 +44,7 @@ struct SavedFlow {
     current: Option<FlowRef>,
     container: NodeId,
     return_target: Option<FlowRef>,
+    exception_target: Option<FlowRef>,
     break_target: Option<FlowRef>,
     continue_target: Option<FlowRef>,
     active_labels: Vec<ActiveLabel>,
@@ -78,6 +79,7 @@ struct FlowBuilder<'a, 'hooks> {
     current: Option<FlowRef>,
     container: NodeId,
     return_target: Option<FlowRef>,
+    exception_target: Option<FlowRef>,
     break_target: Option<FlowRef>,
     continue_target: Option<FlowRef>,
     true_target: Option<FlowRef>,
@@ -107,6 +109,7 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             current: None,
             container: NodeId::new(0),
             return_target: None,
+            exception_target: None,
             break_target: None,
             continue_target: None,
             true_target: None,
@@ -252,10 +255,8 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             SyntaxKind::CaseClause | SyntaxKind::DefaultClause => {
                 self.bind_case_or_default_clause(node_id);
             }
-            SyntaxKind::TryStatement | SyntaxKind::CatchClause => {
-                self.mark_unsupported(node_id, UnsupportedFlowKind::TryStatement);
-                self.bind_children_without_flow(node_id);
-            }
+            SyntaxKind::TryStatement => self.bind_try_statement(node_id),
+            SyntaxKind::CatchClause => self.bind_catch_clause(node_id),
             SyntaxKind::BreakStatement => {
                 self.bind_break_or_continue_statement(node_id, JumpKind::Break);
             }
@@ -759,6 +760,61 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             return;
         }
         self.current = self.finish_label(post_if_label);
+    }
+
+    fn bind_try_statement(&mut self, node_id: NodeId) {
+        let (try_block, catch_clause) = match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::TryStatement(data)) if data.finally_block.is_none() => {
+                (data.try_block, data.catch_clause)
+            }
+            _ => {
+                self.mark_unsupported(node_id, UnsupportedFlowKind::TryStatement);
+                self.bind_children_without_flow(node_id);
+                return;
+            }
+        };
+        let saved_return_target = self.return_target;
+        let saved_exception_target = self.exception_target;
+        let normal_exit_label = self.alloc_label();
+        // Keep native label order without redirecting returns when finally is absent.
+        let _return_label = self.alloc_label();
+        let exception_label = self.alloc_label();
+        self.add_current_antecedent(exception_label);
+        self.exception_target = Some(exception_label);
+        self.record_node_flow_including_unreachable(try_block);
+        self.bind_node(try_block);
+        if self.add_current_antecedent(normal_exit_label)
+            && let Some(catch_clause) = catch_clause
+        {
+            self.current = self.finish_label(exception_label);
+            let catch_exception_label = self.alloc_label();
+            self.add_current_antecedent(catch_exception_label);
+            self.exception_target = Some(catch_exception_label);
+            self.record_node_flow_including_unreachable(catch_clause);
+            self.bind_node(catch_clause);
+            self.add_current_antecedent(normal_exit_label);
+        }
+        self.return_target = saved_return_target;
+        self.exception_target = saved_exception_target;
+        if self.current.is_some() {
+            self.current = self.finish_label(normal_exit_label);
+        }
+    }
+
+    fn bind_catch_clause(&mut self, node_id: NodeId) {
+        let (variable_declaration, block) = match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::CatchClause(data)) => (data.variable_declaration, data.block),
+            _ => {
+                self.mark_unsupported(node_id, UnsupportedFlowKind::TryStatement);
+                self.bind_children_without_flow(node_id);
+                return;
+            }
+        };
+        if let Some(variable_declaration) = variable_declaration {
+            self.bind_node(variable_declaration);
+        }
+        self.record_node_flow_including_unreachable(block);
+        self.bind_node(block);
     }
 
     fn bind_condition(&mut self, expression: NodeId, true_target: FlowRef, false_target: FlowRef) {
@@ -1850,6 +1906,7 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             current: self.current,
             container: self.container,
             return_target: self.return_target.take(),
+            exception_target: self.exception_target.take(),
             break_target: self.break_target.take(),
             continue_target: self.continue_target.take(),
             active_labels: std::mem::take(&mut self.active_labels),
@@ -1861,6 +1918,7 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
         self.current = saved.current;
         self.container = saved.container;
         self.return_target = saved.return_target;
+        self.exception_target = saved.exception_target;
         self.break_target = saved.break_target;
         self.continue_target = saved.continue_target;
         self.active_labels = saved.active_labels;
@@ -1980,6 +2038,12 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             .expect("binder mutation references belong to its flow arena");
         self.current = Some(flow);
         self.has_flow_effects = true;
+        // CALL nodes share this allocator but are not native mutation exception inputs.
+        if flags.intersects(FlowFlags::ASSIGNMENT | FlowFlags::ARRAY_MUTATION)
+            && let Some(exception_target) = self.exception_target
+        {
+            self.add_antecedent(exception_target, flow);
+        }
     }
 
     fn create_flow_switch_clause(
@@ -2969,6 +3033,414 @@ mod tests {
                 Some(identifier.text.as_str())
             })
             .collect()
+    }
+
+    fn flow_for_ast(
+        graph: &BoundFlowGraph,
+        flags: FlowFlags,
+        node: NodeRef,
+    ) -> ts_ast::FlowRef {
+        let index = graph
+            .nodes()
+            .iter()
+            .position(|flow| {
+                flow.flags.contains(flags) && flow.payload == Some(FlowNodePayload::Ast(node))
+            })
+            .expect("the actual source node has the requested flow");
+        graph
+            .nodes()
+            .flow_ref(ts_ast::FlowNodeId(u32::try_from(index).unwrap()))
+            .unwrap()
+    }
+
+    fn numeric_assignment_target(arena: &NodeArena, text: &str) -> ts_ast::NodeId {
+        arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::BinaryExpression(binary) = &node.data else {
+                    return None;
+                };
+                if arena.get(binary.operator_token)?.kind != SyntaxKind::EqualsToken {
+                    return None;
+                }
+                let NodeData::NumericLiteral(number) = &arena.get(binary.right)?.data else {
+                    return None;
+                };
+                (number.text == text).then_some(binary.left)
+            })
+            .expect("the fixture has the written numeric assignment")
+    }
+
+    fn mutation_fixture_calls(arena: &NodeArena, file: FileId) -> (NodeRef, NodeRef) {
+        let node_ref = |node| NodeRef::new(arena.id(), file, node);
+        let observe = arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::CallExpression(call)
+                    if matches!(
+                        arena.get(call.expression).map(|node| &node.data),
+                        Some(NodeData::Identifier(name)) if name.text == "observe"
+                    ) =>
+                {
+                    Some(node_ref(node))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let push = arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::CallExpression(call)
+                    if arena.get(call.expression).unwrap().kind
+                        == SyntaxKind::PropertyAccessExpression =>
+                {
+                    Some(node_ref(node))
+                }
+                _ => None,
+            })
+            .unwrap();
+        (observe, push)
+    }
+
+    #[test]
+    fn try_catch_entries_keep_mutations_and_calls_separate() {
+        let parsed = parse_source_file(concat!(
+            "function run(value: number, values: number[]) { ",
+            "try { value = 1; observe(value); values.push(value); } ",
+            "catch (error) { value = 2; } return value; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(170);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+        let node_ref = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let function = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(node_ref(node))
+            })
+            .unwrap();
+        let (try_node, statement) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::TryStatement(statement) => Some((node, statement)),
+                _ => None,
+            })
+            .unwrap();
+        let catch_node = statement.catch_clause.unwrap();
+        let NodeData::CatchClause(catch) = &parsed.arena.get(catch_node).unwrap().data else {
+            panic!("the actual catch clause is retained");
+        };
+        let (observe, push) = mutation_fixture_calls(&parsed.arena, file);
+        let assignment = |text| {
+            flow_for_ast(
+                graph,
+                FlowFlags::ASSIGNMENT,
+                node_ref(numeric_assignment_target(&parsed.arena, text)),
+            )
+        };
+        let first = assignment("1");
+        let second = assignment("2");
+        let observed_call = flow_for_ast(graph, FlowFlags::CALL, observe);
+        let array_mutation = flow_for_ast(graph, FlowFlags::ARRAY_MUTATION, push);
+        let array_call = flow_for_ast(graph, FlowFlags::CALL, push);
+        let start = graph.container_start(function).unwrap();
+        let catch_entry = graph.flow_at(node_ref(catch_node)).unwrap();
+        assert_eq!(graph.flow_at(node_ref(try_node)), Some(start));
+        assert_eq!(graph.flow_at(node_ref(statement.try_block)), Some(start));
+        assert_eq!(graph.flow_at(node_ref(catch.block)), Some(catch_entry));
+        assert_eq!(
+            graph.nodes().get(catch_entry).unwrap().antecedents,
+            [start, first, array_mutation]
+        );
+        assert_eq!(
+            graph.nodes().get(array_mutation).unwrap().antecedent,
+            Some(observed_call)
+        );
+        let return_node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ReturnStatement).then_some(node_ref(node))
+            })
+            .unwrap();
+        let normal_exit = graph.flow_at(return_node).unwrap();
+        assert_eq!(
+            graph.nodes().get(normal_exit).unwrap().antecedents,
+            [array_call, second]
+        );
+        for node in [try_node, statement.try_block, catch_node, catch.block] {
+            assert_eq!(graph.flow_container(node_ref(node)), Some(function));
+        }
+        assert!(graph.nodes().iter().all(|flow| {
+            !flow.flags.contains(FlowFlags::ASSIGNMENT)
+                || flow.payload
+                    != Some(FlowNodePayload::Ast(node_ref(
+                        catch.variable_declaration.unwrap(),
+                    )))
+        }));
+        assert_eq!(graph.container_end(function), None);
+        let repeated = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        assert_eq!(
+            repeated.flow_graph(&parsed.arena, parsed.source_file),
+            Some(graph)
+        );
+    }
+
+    #[test]
+    fn try_catch_initializers_and_abrupt_exits_keep_real_flow() {
+        let parsed =
+            parse_source_file("function run() { try {} catch (error = 1) { error; } }");
+        let file = FileId::new(171);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+        let node_ref = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let (catch_node, catch) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::CatchClause(catch) => Some((node, catch)),
+                _ => None,
+            })
+            .unwrap();
+        let declaration = catch.variable_declaration.unwrap();
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(declaration).unwrap().data
+        else {
+            panic!("the malformed initializer belongs to the real catch variable");
+        };
+        assert!(variable.initializer.is_some());
+        let catch_entry = graph.flow_at(node_ref(catch_node)).unwrap();
+        let assignment = flow_for_ast(graph, FlowFlags::ASSIGNMENT, node_ref(declaration));
+        assert_eq!(graph.flow_at(node_ref(catch.block)), Some(assignment));
+        assert_eq!(
+            graph.nodes().get(assignment).unwrap().antecedent,
+            Some(catch_entry)
+        );
+
+        for (source, kind, normal_exit, return_exit) in [
+            (
+                "function run(value: number) { try { return value; } catch { throw value; } }",
+                SyntaxKind::FunctionDeclaration,
+                false,
+                false,
+            ),
+            (
+                "class Item { constructor() { try { return; } catch { return; } } }",
+                SyntaxKind::Constructor,
+                false,
+                true,
+            ),
+            (
+                "function run(value: number) { try { throw value; } catch {} value; }",
+                SyntaxKind::FunctionDeclaration,
+                true,
+                false,
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{source}");
+            let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+            let graph = result
+                .flow_graph(&parsed.arena, parsed.source_file)
+                .unwrap();
+            assert!(graph.is_complete(), "{source}: {:?}", graph.unsupported());
+            let container = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let start = graph.container_start(container).unwrap();
+            assert_eq!(graph.container_end(container), normal_exit.then_some(start));
+            assert_eq!(
+                graph.container_return(container),
+                return_exit.then_some(start)
+            );
+            for (node, record) in parsed.arena.iter() {
+                if matches!(
+                    record.kind,
+                    SyntaxKind::ReturnStatement | SyntaxKind::ThrowStatement
+                ) {
+                    assert_eq!(
+                        graph.flow_at(NodeRef::new(parsed.arena.id(), file, node)),
+                        Some(start)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_try_and_container_entries_restore_exception_targets() {
+        for container_source in [
+            "function inner() { value = 11; }",
+            "const inner = () => { value = 11; };",
+            "class Inner { field = (value = 11); }",
+            "class Inner { static { value = 11; } }",
+        ] {
+            let source = format!(
+                "function run(value: number) {{ try {{ value = 1; {container_source} \
+                 try {{ value = 2; }} catch (inner) {{ value = 3; }} value = 4; \
+                 }} catch (outer) {{ value; }} }}"
+            );
+            let parsed = parse_source_file(&source);
+            assert!(parsed.diagnostics.is_empty(), "{source}");
+            let file = FileId::new(172);
+            let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+            let graph = result
+                .flow_graph(&parsed.arena, parsed.source_file)
+                .unwrap();
+            assert!(graph.is_complete(), "{source}: {:?}", graph.unsupported());
+            let node_ref = |node| NodeRef::new(parsed.arena.id(), file, node);
+            let (function, body) = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| match &record.data {
+                    NodeData::FunctionDeclaration(function)
+                        if record.parent == Some(parsed.source_file) =>
+                    {
+                        Some((node_ref(node), function.body.unwrap()))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let (outer_node, outer) = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| match &record.data {
+                    NodeData::TryStatement(statement) if record.parent == Some(body) => {
+                        Some((node, statement))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let inner = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| match &record.data {
+                    NodeData::TryStatement(statement) if node != outer_node => Some(statement),
+                    _ => None,
+                })
+                .unwrap();
+            let assignment = |text| {
+                flow_for_ast(
+                    graph,
+                    FlowFlags::ASSIGNMENT,
+                    node_ref(numeric_assignment_target(&parsed.arena, text)),
+                )
+            };
+            let start = graph.container_start(function).unwrap();
+            let outer_entry = graph.flow_at(node_ref(outer.catch_clause.unwrap())).unwrap();
+            let outer_inputs = &graph.nodes().get(outer_entry).unwrap().antecedents;
+            assert_eq!(outer_inputs.first(), Some(&start));
+            assert!(outer_inputs.contains(&assignment("1")));
+            assert_eq!(outer_inputs.last(), Some(&assignment("4")));
+            for excluded in ["2", "3", "11"] {
+                assert!(!outer_inputs.contains(&assignment(excluded)), "{source}");
+            }
+            let nested_target = node_ref(numeric_assignment_target(&parsed.arena, "11"));
+            assert_ne!(graph.flow_container(nested_target), Some(function));
+            let nested_container = graph.flow_container(nested_target).unwrap();
+            assert_eq!(graph.container_is_complete(nested_container), Some(true));
+            let inner_entry = graph.flow_at(node_ref(inner.try_block)).unwrap();
+            let inner_catch = graph.flow_at(node_ref(inner.catch_clause.unwrap())).unwrap();
+            assert_eq!(
+                graph.nodes().get(inner_catch).unwrap().antecedents,
+                [inner_entry, assignment("2")]
+            );
+            let inner_exit = graph
+                .nodes()
+                .get(assignment("4"))
+                .unwrap()
+                .antecedent
+                .unwrap();
+            assert_eq!(
+                graph.nodes().get(inner_exit).unwrap().antecedents,
+                [assignment("2"), assignment("3")]
+            );
+            for catch in [outer.catch_clause.unwrap(), inner.catch_clause.unwrap()] {
+                assert_eq!(graph.flow_container(node_ref(catch)), Some(function));
+            }
+            assert!(graph.container_end(function).is_some());
+        }
+    }
+
+    #[test]
+    fn unsupported_try_or_catch_children_cannot_recover_flow() {
+        for statement in [
+            concat!(
+                "try { try { value = 1; } finally {} } ",
+                "catch { function nested() { return; } value; }",
+            ),
+            concat!(
+                "try { value; } catch { function nested() { return; } ",
+                "try { value = 1; } finally {} }",
+            ),
+        ] {
+            let source = format!("function run(value: number) {{ {statement} value; }} after;");
+            let parsed = parse_source_file(&source);
+            assert!(parsed.diagnostics.is_empty(), "{source}");
+            let file = FileId::new(173);
+            let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+            let graph = result
+                .flow_graph(&parsed.arena, parsed.source_file)
+                .unwrap();
+            let node_ref = |node| NodeRef::new(parsed.arena.id(), file, node);
+            let functions = parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration)
+                        .then_some((node_ref(node), record.parent == Some(parsed.source_file)))
+                })
+                .collect::<Vec<_>>();
+            let function = functions.iter().find(|(_, outer)| *outer).unwrap().0;
+            let nested = functions.iter().find(|(_, outer)| !*outer).unwrap().0;
+            assert_eq!(graph.container_is_complete(function), Some(false));
+            assert_eq!(graph.container_start(function), None);
+            assert_eq!(graph.container_end(function), None);
+            assert_eq!(graph.container_return(function), None);
+            assert_eq!(graph.container_is_complete(nested), Some(true));
+            assert!(graph.container_start(nested).is_some());
+            assert_eq!(
+                graph.container_is_complete(node_ref(parsed.source_file)),
+                Some(true)
+            );
+            assert_eq!(graph.unsupported().len(), 1);
+            assert_eq!(graph.unsupported()[0].container, function);
+            assert_eq!(graph.unsupported()[0].kind, UnsupportedFlowKind::TryStatement);
+            let after = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ExpressionStatement
+                        && record.parent == Some(parsed.source_file))
+                    .then_some(node_ref(node))
+                })
+                .unwrap();
+            assert!(graph.flow_at(after).is_some());
+            for (node, record) in parsed.arena.iter() {
+                if record.kind == SyntaxKind::CatchClause {
+                    assert_eq!(graph.flow_at(node_ref(node)), None);
+                }
+            }
+            assert!(
+                graph
+                    .nodes()
+                    .iter()
+                    .all(|flow| !flow.flags.intersects(FlowFlags::REDUCE_LABEL))
+            );
+        }
     }
 
     #[test]
