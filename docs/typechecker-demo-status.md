@@ -4,10 +4,15 @@ Updated 2026-08-31. No complete real-world project has passed in Rust yet.
 
 ## Targets
 
-Use Hono and TanStack Query core as the two main project targets. Both have
-prepared dependencies, fixed original configurations and complete first-failure
-measurements. Neither is proved close to a full pass. Hono stays the first
-integration target. Query tests whether the same fixes work in another codebase.
+Use Pathe for the first small complete demo and Hono for the main integration
+target. Pathe's original typecheck includes nine roots, with all four test files.
+It already uses TypeScript-Go and has a supported modern module configuration.
+Its tools and locked dependencies are being prepared. It has no Rust result yet.
+
+Keep TanStack Query core as a cross-project check. Hono and Query have prepared
+dependencies, fixed original configurations and complete first-failure records.
+Neither is proved close to a full pass. UFO is the second small candidate, but
+its separate type-test contract must also run before a complete demo claim.
 
 | Project | Original source roots | Completed source checks | Unsupported | Other results | Load syntax diagnostics |
 | --- | ---: | ---: | ---: | --- | ---: |
@@ -45,6 +50,17 @@ are the older baseline, with independent reviews and closed cleanup. Their
 original inputs stay fixed.
 Query means its production core package, not React Query or the whole monorepo.
 
+Tiny-invariant's first Rust measurement is now complete. All five original roots
+and the ordinary check stop at unsupported operations. Its original Node10
+module-resolution option also produces TS5108. The project-pinned TypeScript
+5.3.3 reference reports no diagnostics, but the loaded graphs differ: 168 files
+in the reference and 30 in Rust. Node and Jest declarations are among the
+reference-only files. This is not a same-input diagnostic comparison or a pass.
+The [complete result](../target/wave202-tiny-invariant-rust-measurement-1-result.md)
+and [independent review](../target/wave202-tiny-invariant-rust-measurement-1-result-review.md)
+retain all six failures, graph differences and closed cleanup. The original
+config stays unchanged. Tiny-invariant is no longer the first clean-demo target.
+
 ## What works and what is not verified
 
 An earlier core check passed 6,422 Rust tests on `57e743da`.
@@ -69,7 +85,8 @@ The helper uses `question_token`, but the AST field is `postfix_token`.
 All 6,559 selected tests remain unrun. Separate cleanup and independent review
 are closed. The [failed check](../target/wave202-core-parser-combined-full-4-quality-report.md)
 retains the complete error. The exact field-name correction is committed and
-independently verified at `c70de1f9`. The next check is in preparation.
+independently verified at `c70de1f9`. The next check's preparation is reviewed.
+New active copies are being prepared for the same 6,559-test selection.
 The primary branch still uses the previously accepted compiler source.
 
 The five parser repairs are committed at `b1746a95`, with 28 new tests.
@@ -121,7 +138,12 @@ retain all six failures. This is still a failed gate.
 The written conditional-argument proof repair is source-reviewed and committed
 at `2c443dcf`. The unique-symbol property repair is source-reviewed and committed
 at `c79055e9`. Their source integration is committed and independently reviewed
-at `f9b477c4`. Its next 5,107-test check is being prepared. Neither repair has run.
+at `f9b477c4`. Its next check failed compilation on three calls to an absent
+`EscapedName::is_late_bound` method. All 5,107 tests remain unrun. Separate cleanup
+and saved-result review are closed. The three exact `.as_ref()` corrections are
+committed and independently reviewed at `979dfe7b`. A fresh check is in preparation.
+The [failed build](../target/wave202-alias-repair-focused-5-runtime.md) remains
+separate from the older 5,099 passing and six failing test outcomes.
 
 The first shared project compiler is committed and independently verified at
 `b71b4158`. It combines the repaired library, class work, core, parser and
@@ -188,16 +210,22 @@ not run. A finite Rust compile request is prepared for that source.
 
 ## Next work
 
-1. Fix the Rust test API errors found by the early checks. Compile and test the
-   eight project repairs below before accepting their combined source.
-2. Compile the combined typed-field and shared statement source, then measure
-   both unchanged projects again. Use the new C7 failures to select repairs.
-3. Finish the shared try/catch/throw and returned-arrow work. Each uses the
-   existing statement and type workers, with separate source and test owners.
-4. Run the repaired core and alias checks, keeping every old result in the
-   comparison. Finish the remaining failures before accepting those batches.
-5. Compare complete project diagnostics with TypeScript-Go. Then show one
-   deliberate type error in a separate copy with its correct location.
+1. Prepare and measure all nine Pathe roots with the original config, dependencies
+   and generated declarations. Record both its pinned reference and the port's
+   pinned Go reference. Do not call it close before measuring its failures.
+2. Apply the shared Rust test API correction, then compile and test the project
+   repairs before combining them. Keep all original tests and failures.
+3. Finish the measured Hono repairs and combine the shared statement work.
+   Rerun Hono and Query with their complete unchanged graphs.
+4. Run the repaired core and alias checks. Preserve every old result in the
+   comparison and finish the remaining failures before accepting those batches.
+5. Retain complete ordinary project diagnostics in the census reporter. Compare
+   the full project result with the reference, then show a deliberate type error
+   in a separate copy with its correct code, message and location.
+
+The next demo must show a complete ordinary project check, not just cold-root
+coverage. Missing diagnostics, unchecked declarations and unsupported operations
+must remain visible. The source-only repair count is not the demo's pass count.
 
 The diagnosis coordinator read all 16 project reports. Of 181 assigned failure
 rows, 160 have a located source cause, 18 remain unresolved and three overlap
@@ -213,7 +241,9 @@ all eight batches are prepared or in final preparation review. The first actual
 generic-class check stopped on four Rust API errors in an inherited public test
 file. Its normal library compiled, but its required test targets were not reached.
 No TypeScript test ran. The same failing test file exists in all eight batches
-and the statement/field integration. One shared test-only correction is in progress.
+and the statement/field integration. The shared test-only correction is committed
+and independently reviewed at `36a3e127`. The same exact one-file patch is being
+applied to all nine isolated bases. It changes no TS input or assertion.
 The import-annotation request timed out before execution. The constructor-annotation
 request was not submitted. Both are on hold until the shared correction is ready.
 Source review is not proof that a batch compiles or checks a project.
@@ -232,6 +262,24 @@ Source review is not proof that a batch compiles or checks a project.
 The imported-arrow barrel cases still need the explicit reexport connection
 and imported class-owner work. These feature commits do not complete their roots.
 
+Three further Hono repairs have complete source review and signed commits:
+empty derived classes at `a2f0ea80`, optional named method parameters at
+`c3444fc0`, and typed arrow object parameters at `7aad3ef5`. They have no runtime
+result yet. Predicate arrows, contextual overloads, contextual arrow bodies and
+shared `for...of` statements have separate implementation and test owners.
+
+The shared try/catch/throw implementation is committed and independently closed
+at `0ddc0f07`. Typed synchronous returned arrows are committed at `381a3191`
+after source/test review. Neither has run. Callable alias heritage remains under
+review. Duplicate script-global recovery is independently closed at `907b67dc`,
+also without a runtime result. These source changes must not increase the
+measured project counts until the combined project check executes.
+
+The diagnostic-payload implementation has a source/test pair. It will preserve
+complete ordinary diagnostics and mark cold or failed snapshots as partial.
+It must keep the first checker failure and must not run extra type queries just
+to fill the report. Its failed post-source collector limit remains explicit.
+
 The generic-constructor work has a second source/test pair with separate file
 ownership. The imported-arrow work also depends on the import and reexport
 repairs. These dependencies remain explicit. The
@@ -243,15 +291,14 @@ uses the existing three-job limit. It checks Rust APIs before broad integration,
 including test code when needed. A compile result is not a passing TypeScript
 test or project result.
 
-Small libraries remain possible earlier demo targets, but none is proved
-close to a full check. Tiny-invariant's locked dependencies are now installed
-in an isolated copy, using its pinned Node 18.4.0 and explicit Yarn 1.22.22.
-Install scripts were disabled. All five original TypeScript roots and the full
-config are unchanged. Independent input review comes before the reference
-typecheck. Its compiler limits remain unverified by a full project run.
-Mitt, UFO, Pathe and sourcemap-codec still need dependency preparation. Mitt also
-needs its original generated package declarations. No smaller root list or
-omitted ambient package counts as a complete project check.
+The [small-project audit](../target/wave202-small-modern-demo-selection.md)
+records the exact cached revisions and original build contracts. Pathe has five
+source files and four tests. UFO's source config has seven roots, but its 14
+separate test files and Vitest type tests need their own complete check. UFO also
+has an original `@ts-nocheck` file, which must not count as checked code.
+Mitt and sourcemap-codec select the same removed Node10 option as tiny-invariant.
+Their configs stay unchanged. No smaller root list or omitted ambient package
+counts as a complete project check.
 
 Source workers have separate worktrees and test partners. Shared merge work
 has explicit file ownership and one Git coordinator. At most three Cargo
