@@ -848,7 +848,6 @@ fn callable_for_of_keeps_iterable_identity_loop_scope_and_body_call_diagnostics(
 fn callable_for_of_keeps_unreleased_headers_and_loop_exits_rejected() {
     for body in [
         "for await (const item of values) {}",
-        "for (const [item] of values) {}",
         "for (const item of values) { break; }",
         "for (const item of values) { continue; }",
     ] {
@@ -866,5 +865,71 @@ fn callable_for_of_keeps_unreleased_headers_and_loop_exits_rejected() {
             assert!(!checked(&checker));
             assert_eq!(publication(&checker, &parsed), before);
         }
+    }
+}
+
+#[test]
+fn callable_for_of_array_binding_reports_non_array_element_with_original_library() {
+    let source = "const run = (values: string[], flag: boolean): void => { const sequence = values; if (flag) {} for (const [item] of values) {} };";
+    assert_eq!(source.len(), 129);
+    assert_eq!(&source[106..112], "[item]");
+    let parsed = parse_source_file(source);
+    let library = parse_source_file(ARRAY_LIBRARY);
+    let patterns = parsed
+        .arena
+        .iter()
+        .filter(|(_, record)| record.kind == SyntaxKind::ArrayBindingPattern)
+        .map(|(id, _)| node(&parsed, id))
+        .collect::<Vec<_>>();
+    let [pattern] = patterns.as_slice() else {
+        panic!("expected the original array binding pattern")
+    };
+    let NodeData::BindingPattern(pattern_data) = &parsed.arena.get(pattern.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let [element] = pattern_data.elements.nodes.as_slice() else {
+        panic!("expected the original item binding")
+    };
+    let element = node(&parsed, *element);
+    let NodeData::BindingElement(binding) = &parsed.arena.get(element.node).unwrap().data else {
+        unreachable!()
+    };
+    let name = node(&parsed, binding.name.unwrap());
+    let mut checker = context(&parsed, &library);
+    checker.check_source_file(FILE).unwrap();
+    assert!(checked(&checker));
+    let [diagnostic] = checker.diagnostics().as_slice() else {
+        panic!("expected the original library's array-binding diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2461);
+    assert_eq!(
+        diagnostic.diagnostic.category(),
+        ts_diagnostics::Category::Error
+    );
+    assert_eq!(diagnostic.diagnostic.arguments, ["string".to_owned()]);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Type 'string' is not an array type."
+    );
+    assert_eq!(diagnostic.node, Some(*pattern));
+    let range = diagnostic.range_override.map_or_else(
+        || parsed.arena.get(pattern.node).unwrap().range,
+        |range| range.range(),
+    );
+    assert_eq!((range.start.get(), range.end.get()), (106, 112));
+    assert!(diagnostic.related_information.is_empty());
+    let item = symbol(&checker, element);
+    let any = checker.store().intrinsic_bootstrap().unwrap().any_type;
+    assert_eq!(value_type(&checker, item), any);
+    assert_eq!(checker.get_type_at_location(name), Ok(any));
+    assert_eq!(checker.get_symbol_at_location(name), Ok(Some(item)));
+    let before = publication(&checker, &parsed);
+    for _ in 0..2 {
+        checker.recheck_source_file(FILE).unwrap();
+        assert!(checked(&checker));
+        assert_eq!(checker.get_type_at_location(name), Ok(any));
+        assert_eq!(checker.get_symbol_at_location(name), Ok(Some(item)));
+        assert_eq!(publication(&checker, &parsed), before);
     }
 }

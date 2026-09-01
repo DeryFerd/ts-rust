@@ -17746,7 +17746,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             let (linear_body, body) = match (source.body, statements) {
                 (
                     SourceArrowBodyPlan::LinearBlock { .. }
-                    | SourceArrowBodyPlan::StatementBlock { .. },
+                    | SourceArrowBodyPlan::StatementBlock { .. }
+                    | SourceArrowBodyPlan::ForOfBlock { .. },
                     PlannedFunctionBody::StatementList(body),
                 ) => (None, PlannedArrowBody::StatementList(body)),
                 (SourceArrowBodyPlan::LinearBlock { .. }, PlannedFunctionBody::Linear(linear)) => {
@@ -23214,7 +23215,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let (linear_body, body) = match (body, statements) {
                     (
                         SourceArrowBodyPlan::LinearBlock { .. }
-                        | SourceArrowBodyPlan::StatementBlock { .. },
+                        | SourceArrowBodyPlan::StatementBlock { .. }
+                        | SourceArrowBodyPlan::ForOfBlock { .. },
                         PlannedFunctionBody::StatementList(body),
                     ) => (None, PlannedArrowBody::StatementList(body)),
                     (
@@ -51231,14 +51233,59 @@ fn check_callable_statement_nodes(
                     iterable.node,
                     checked.result,
                 )?;
-                let current = inferred_variable_type(
-                    store,
-                    global_types,
-                    header.binding,
-                    iteration_type,
-                )?;
+                let destructured = header
+                    .bindings
+                    .first()
+                    .is_some_and(|binding| binding.declaration != header.declaration);
+                let binding_iteration_type = if destructured {
+                    let declaration = header.bindings[0].declaration;
+                    let pattern = host
+                        .node(declaration)
+                        .and_then(|record| record.parent)
+                        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+                        .filter(|pattern| {
+                            host.node(*pattern)
+                                .is_some_and(|record| record.kind == SyntaxKind::ArrayBindingPattern)
+                        })
+                        .ok_or(SourceCheckError::Variable(
+                            VariableInvariant::InvalidBindingPattern(declaration),
+                        ))?;
+                    source_array_binding_iteration_type(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        pattern,
+                        iteration_type,
+                    )?
+                } else {
+                    iteration_type
+                };
                 let entries = returned.declared_entries.clone();
                 for binding in &header.bindings {
+                    let type_ = if destructured {
+                        let checked = check_source_array_binding_element(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            diagnostics,
+                            binding.declaration,
+                            iteration_type,
+                            binding_iteration_type,
+                        )?;
+                        if let Some(diagnostic) = checked.diagnostic {
+                            merge_retry_diagnostic(diagnostics, diagnostic);
+                        }
+                        checked.type_
+                    } else {
+                        iteration_type
+                    };
+                    let current =
+                        inferred_variable_type(store, global_types, header.binding, type_)?;
                     stage_value_type(
                         store,
                         staged_value_types,

@@ -4978,15 +4978,41 @@ impl SyntaxPlanner<'_> {
         let body = self.callable.body;
         self.validate_range(body, declaration)?;
         let nodes = self.plan_body(body, declaration)?;
-        // A direct first loop keeps the established standalone callable route.
+        // Keep existing standalone loops. Only new flat-array bodies use this route.
         if let Some(&first) = nodes.first()
             && self.node(self.reference(first))?.kind == SyntaxKind::ForOfStatement
         {
-            return Err(self.unsupported(
-                self.reference(first),
-                SyntaxKind::ForOfStatement,
-                SourceFunctionStatementsRole::BodyStatement,
-            ));
+            let first = self.reference(first);
+            let header = plan_source_scoped_iteration_header_syntax(
+                self.arena,
+                self.bound,
+                self.store,
+                first,
+                (body, declaration),
+                SourceControlLoopKind::ForOf,
+            )?;
+            if header
+                .bindings
+                .first()
+                .is_none_or(|binding| binding.declaration == header.declaration)
+            {
+                return Err(self.unsupported(
+                    first,
+                    SyntaxKind::ForOfStatement,
+                    SourceFunctionStatementsRole::BodyStatement,
+                ));
+            }
+            match self.plan_for_of() {
+                Ok(_) => {
+                    return Err(self.unsupported(
+                        first,
+                        SyntaxKind::ForOfStatement,
+                        SourceFunctionStatementsRole::BodyStatement,
+                    ));
+                }
+                Err(SourceFunctionStatementsError::Unsupported(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
         let statements = self.plan_callable_list(&nodes, body, declaration, 0)?;
         let flow = self.bound.flow_graph();
@@ -5214,15 +5240,11 @@ impl SyntaxPlanner<'_> {
             (parent, container),
             SourceControlLoopKind::ForOf,
         )?;
-        let [binding] = header.bindings.as_slice() else {
-            return Err(unsupported_control_statement(
-                statement,
-                SyntaxKind::ForOfStatement,
-            ));
-        };
-        if binding.declaration != header.declaration
-            || self.node(header.control.body)?.kind != SyntaxKind::Block
-        {
+        let binding = header
+            .bindings
+            .last()
+            .ok_or(SourceFunctionStatementsInvariant::MissingLocals(statement))?;
+        if self.node(header.control.body)?.kind != SyntaxKind::Block {
             return Err(unsupported_control_statement(
                 statement,
                 SyntaxKind::ForOfStatement,
