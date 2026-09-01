@@ -32,14 +32,23 @@ preserves in order. Separate saved-data checks reproduce both emitted digests.
 The original failed result stays unchanged. A separate offline readback timed
 out while hashing the executable, before census validation. It created no new
 result. This reporting defect is separate from the nine checker failures.
+The corrected reader now passes all 66 saved-data controls. It keeps parser
+diagnostics, partial checker results and full-project results separate. The
+[reader checks](../target/wave202-pathe-root-census-2-reader-controls-result.md)
+and [review](../target/wave202-pathe-root-census-2-reader-controls-result-review.md)
+are closed. The corrected reader still needs a live project run.
 Pathe is not one fix away from a demonstrated pass. Its original build and
 project-pinned compiler check also remain separate requirements.
 
-The Pathe fixes now have committed source and independent review. They cover
+Seven Pathe changes are combined at `b4ece9d3`. They cover
 keyword tuple labels, string-default parameter inference, ordinary property
 operands, shared throw statements, function-expression bodies and destructuring
-loops. The typed callable-error location mapping is also committed. Integration
-is in progress. The computed-key donor still needs a complete source review.
+loops, plus typed callable-error locations. The first combined build failed on
+two Rust compile errors. Its failed result and cleanup are closed. Both errors
+are fixed in reviewed commit `7c6cda70`. The
+[compile repair](../target/wave202-pathe-demo-compile-repair-handoff.md) and
+[review](../target/wave202-pathe-demo-compile-repair-review.md) preserve all tests.
+A fresh binary build is next. Computed-key source review is also in progress.
 None of these changes has a new Pathe project result yet.
 
 The corrected six-feature compiler at `a89c891b` builds successfully. The build
@@ -52,9 +61,16 @@ do not claim a passing TypeScript project.
 Its focused check compiled and ran all 79 selected tests: 52 passed and 27 failed.
 All seven Boolean-negation tests passed. The failures include generic interface
 calls, nullish assignment flow, interface heritage, wrapper types and diagnostic
-details. Seven separate investigations are tracing these failures. The
+details. The
 [complete test log](../target/wave202-demo-next-source-focused-2.cargo.log)
-retains every result. Separate cleanup and final result review are pending.
+retains every result. Separate cleanup and final result review are closed.
+
+Eleven reviewed repairs and the two-error compile fix are combined in a separate
+source branch. Independent integration review is in progress. The planned check
+retains 407 tests across the binder, checker, parser and project-error reporting.
+These are selected tests, not passing results. A separate one-test run exposed
+the remaining optional-property error as an invalid-union check. Its source
+repair is in progress. The diagnostic-only source will not be integrated.
 
 The first build failed on two Rust E0308 errors because two calls omitted `Some`
 around an optional session. That failed attempt and its cleanup remain in the
@@ -63,8 +79,8 @@ around an optional session. That failed attempt and its cleanup remain in the
 The first 248-test parser command also stopped before compilation because
 `cargo test` rejects `--keep-going`. The corrected command passed all 248 tests,
 including the three new keyword-tuple-label tests. No test was ignored or filtered.
-That parser run still needs separate cleanup and final result review. A passing
-parser test does not prove that Pathe's 35 loaded-file diagnostics are gone.
+Separate cleanup and final result review are closed. A passing parser test does
+not prove that Pathe's 35 loaded-file diagnostics are gone.
 
 The latest core check passed 6,557 of 6,559 tests. All 19 earlier failures now
 pass, but two old passes regressed. The latest alias check passed 5,103 of 5,108
