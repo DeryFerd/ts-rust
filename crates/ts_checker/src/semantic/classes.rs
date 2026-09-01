@@ -2853,6 +2853,7 @@ pub(super) fn plan_source_class_members_with_imports(
                                 | SyntaxKind::Identifier
                                 | SyntaxKind::NullKeyword
                                 | SyntaxKind::ObjectLiteralExpression
+                                | SyntaxKind::ArrayLiteralExpression
                         )
                     ) || source_enum_member_const_assertion(store, host, initializer)?)
                 {
@@ -15691,11 +15692,19 @@ fn plan_property_with_body_mode(
                 }
                 NodeData::ObjectLiteralExpression(_)
                     if source_body
-                        && private
                         && merged_auto_accessor.is_none()
-                        && property.type_.is_none()
-                        && initializer_node == type_node
+                        && (property.type_.is_some()
+                            || private && initializer_node == type_node)
                         && initializer_record.kind == SyntaxKind::ObjectLiteralExpression =>
+                {
+                    None
+                }
+                NodeData::ArrayLiteralExpression(array)
+                    if source_body
+                        && merged_auto_accessor.is_none()
+                        && property.type_.is_some()
+                        && array.elements.nodes.is_empty()
+                        && initializer_record.kind == SyntaxKind::ArrayLiteralExpression =>
                 {
                     None
                 }
@@ -15745,6 +15754,20 @@ fn plan_property_with_body_mode(
                     }
                     (Some(literal.text.clone()), None, None, None)
                 }
+                NodeData::Identifier(identifier)
+                    if source_body
+                        && merged_auto_accessor.is_none()
+                        && property.type_.is_some() =>
+                {
+                    if initializer_record.kind != SyntaxKind::Identifier
+                        || identifier.flow_node.is_some()
+                        || identifier.text.is_empty()
+                        || identifier.text == "this"
+                    {
+                        return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
+                    }
+                    (None, None, None, None)
+                }
                 NodeData::Identifier(identifier) => {
                     if private
                         || side != ClassPropertySide::Instance
@@ -15782,9 +15805,9 @@ fn plan_property_with_body_mode(
                     }
                     (None, Some(literal.text.clone()), None, None)
                 }
-                NodeData::KeywordExpression(_) | NodeData::ObjectLiteralExpression(_) => {
-                    (None, None, None, None)
-                }
+                NodeData::KeywordExpression(_)
+                | NodeData::ObjectLiteralExpression(_)
+                | NodeData::ArrayLiteralExpression(_) => (None, None, None, None),
                 NodeData::AsExpression(_) if enum_const_assertion => (None, None, None, None),
                 NodeData::AsExpression(assertion) => {
                     let operand = NodeRef::new(member.arena, member.file, assertion.expression);

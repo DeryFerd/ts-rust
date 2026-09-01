@@ -126177,6 +126177,151 @@ class Foo2 {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Check all three initializer families through the real source path.
+    fn typed_class_field_initializers_reject_changed_source_caches_and_restore() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "declare const seed: string; ",
+            "class Box<T> { values: T[] = []; ",
+            "state: { name: string } = { name: seed }; label: string = seed; }",
+        ));
+        let library_file = FileId::new(174_2720);
+        let file = FileId::new(174_2721);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                strict_property_initialization: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let fields = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::PropertyDeclaration(property) = &record.data else {
+                    return None;
+                };
+                (record.kind == SyntaxKind::PropertyDeclaration
+                    && record.parent.is_some_and(|parent| {
+                        source
+                            .arena
+                            .get(parent)
+                            .is_some_and(|parent| parent.kind == SyntaxKind::ClassDeclaration)
+                    }))
+                .then(|| {
+                    (
+                        NodeRef::new(source.arena.id(), file, node),
+                        NodeRef::new(source.arena.id(), file, property.type_.unwrap()),
+                        NodeRef::new(source.arena.id(), file, property.initializer.unwrap()),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 3);
+        let owner = context
+            .file(file)
+            .unwrap()
+            .1
+            .symbol(NodeRef::new(
+                source.arena.id(),
+                file,
+                source.arena.get(fields[0].0.node).unwrap().parent.unwrap(),
+            ))
+            .unwrap();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().boolean_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            fields[0].1,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(context.check_source_file(file).is_err());
+        assert!(
+            context
+                .store()
+                .source_class_provenance_for_symbol(owner)
+                .is_none()
+        );
+        assert!(!is_type_checked(&context, file));
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(fields[0].1, TypeNodeLinks::default(),)
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let members = context.get_nongeneric_class_members(owner).unwrap();
+        let warm = observable_state(&context, file);
+        for (_, annotation, initializer) in &fields {
+            for node in [*annotation, *initializer] {
+                let original = context.store().type_node_links(node).unwrap().clone();
+                assert_ne!(original.resolved_type, Some(wrong));
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    node,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+                assert!(context.recheck_source_file(file).is_err(), "{node:?}");
+                assert_eq!(resolved_node_type(&context, node), wrong);
+                assert!(
+                    context
+                        .store()
+                        .source_class_annotation_scope(members.shells().instance_type())
+                        .is_none()
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(node, original)
+                );
+                context.check_source_file(file).unwrap();
+                assert_eq!(
+                    context.get_nongeneric_class_members(owner).unwrap(),
+                    members
+                );
+                assert_eq!(observable_state(&context, file), warm);
+            }
+        }
+        let read = fields[2].2;
+        let original = context.store().symbol_node_links(read).unwrap().clone();
+        let wrong_symbol = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .undefined_symbol;
+        assert_ne!(original.resolved_symbol, Some(wrong_symbol));
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            read,
+            SymbolNodeLinks {
+                resolved_symbol: Some(wrong_symbol)
+            },
+        ));
+        assert!(context.recheck_source_file(file).is_err());
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(read)
+                .unwrap()
+                .resolved_symbol,
+            Some(wrong_symbol)
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_symbol_node_links(read, original)
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn source_class_field_type_demand_stops_at_active_initializer_cycles() {
         let source = parsed("class Cycle { read = () => this.copy; copy = this.read; }");
         let file = FileId::new(174_2719);
