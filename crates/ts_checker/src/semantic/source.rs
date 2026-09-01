@@ -30136,7 +30136,7 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
         PlannedExpressionKind::Parenthesized(inner) => {
             primitive_binary_operand_plan_is_supported(inner)
         }
-        PlannedExpressionKind::Property(property) => property.class_access_context().is_some(),
+        PlannedExpressionKind::Property(_) => true,
         PlannedExpressionKind::Binary(binary) => {
             binary.node == expression.node
                 && primitive_binary_operand_plan_is_supported(&binary.left)
