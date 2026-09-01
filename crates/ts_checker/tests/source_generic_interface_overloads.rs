@@ -1655,7 +1655,7 @@ fn generic_interface_call_return_query_prepares_all_formals_before_source_check(
         assert!(!interface.declared_members_resolved);
         assert!(interface.declared_call_signatures.is_none());
     }
-    let source = NodeRef::new(parsed.arena.id(), FILE, parsed.source_file);
+    let source = context.source_file(FILE).unwrap();
     assert!(
         store
             .source_file_links(source)
