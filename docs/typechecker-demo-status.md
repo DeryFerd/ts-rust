@@ -4,17 +4,19 @@ Updated 2026-09-01. No complete real-world project has passed in Rust yet.
 
 ## Current result
 
-The compiler builds, but the Pathe demo is not ready. The latest full-project
-run still completes zero of nine roots. It gets past some earlier failures,
-but that has not increased complete-project coverage.
+The Pathe demo is not ready. The last ordinary compiler build passed, but the
+new source batch has not been compiled. The latest project run still completes
+zero of nine roots. Passing an earlier failure has not increased complete-project
+coverage yet.
 
 | Measurement | Latest result |
 | --- | --- |
 | [Pathe census 6](../target/wave202-pathe-demo-census-6-result.md), `5f7ad5e3` | All nine original roots attempted. Zero complete, eight unsupported, one internal checker error. All 277 loaded files parse. The ordinary project check also fails. The measured stage took 22.903 seconds. |
 | [Ordinary compiler build 7](../target/wave202-pathe-demo-bin-7-result.md), `65612688` | Build passed in 77.257 seconds. This includes the logical-condition registry repair. A build is not a TypeScript project pass. |
 | [Focused condition tests](../target/wave202-pathe-logical-condition-registry-focus-5-result.md), `65612688` | Compile and listing passed. All eight tests ran. Seven pass, including the new condition test. The original Pathe normalizer still fails with `FunctionBody`. |
-| [Combined tests 5](../target/wave202-pathe-demo-tests-5-result.md), `5f7ad5e3` | Compilation stopped on one test-only enum name error. All 464 tests remain unrun. |
-| [Test API repair](../target/wave202-pathe-method-test-api-repair-handoff.md), `7d2a40ae` | The enum name is fixed. No assertion or production code changed. The next selection retains all 464 tests and adds the condition test, for 465 total. Source capture passed. Tests have not run yet. |
+| [Combined tests 6](../target/wave202-pathe-demo-tests-6-result.md), `7d2a40ae` | Binder, parser and fixture compilation passed. Checker test compilation failed on the public ObjectFlags import. All 465 tests remain unrun. |
+| [Next Pathe source batch](../target/wave202-pathe-diagnostic-integration-handoff.md), `41599a0f` | Seven complete changes are committed and source-reviewed. They include the ObjectFlags repair, callable throws, object-method statements, error locations and three diagnostic traces. The 474-test check and ordinary compiler build remain unrun. |
+| [Counted-loop source](../target/wave202-pathe-callable-counted-for-handoff.md), `972e05d9` | Source and flow reviews passed. The separate 18-test selection contains six new tests and 12 existing ForOf controls. It has not run. This code is not in the next Pathe batch. |
 
 The focused result has a closed [independent review](../target/wave202-pathe-logical-condition-registry-focus-5-result-review.md).
 Its original seven tests still have six passes and one failure. The new eighth
@@ -31,30 +33,44 @@ module-resolution parity still need separate evidence.
 | Project | Decision and remaining work |
 | --- | --- |
 | Pathe | First target. Its original config selects five source files and four test files, with 4,843 lines in total. Dependencies and a successful pinned Go reference are available. Every Rust failure now has a separate recorded root attempt. Fix these measured failures first. |
-| UFO | Second candidate. Its original source selection has seven files and 1,571 lines. Dependency setup is incomplete, so there is no paired Rust and Go baseline yet. Do not describe it as close to passing until that measurement exists. |
+| UFO | Second candidate. Its original source selection has seven files and 1,571 lines. Dependency installation waits for network approval. There is no paired Rust and Go baseline yet, so it is not a verified near-pass. |
 
 Keep both projects unchanged. Do not remove tests, replace declarations, change
 compiler options, or supply permissive stub types to produce a demo.
 
 ## Current fix priorities
 
-Seven investigations now run in parallel. Each has its own report and source
-scope. Implementation workers will use separate worktrees and paired tests.
+The next Pathe batch has a closed [source review](../target/wave202-pathe-diagnostic-integration-review.md).
+These changes still need runtime checks. Keep source review, passing tests and
+complete project checks separate.
 
 | Failure | Next action |
 | --- | --- |
-| Proxy handler in `src/index.ts` | Add authenticated object-method ownership to the shared statement-list planner. The current planner excludes methods before it checks their bodies. |
-| `throw new Error(...)` in `test/glob.spec.ts` | Fix the [constructor position check](../target/wave202-pathe-c6-error-constructor-diagnosis.md). It accepts this throw in a function declaration but rejects it in an arrow, before constructor lookup. |
-| Counted loop in `src/_glob.ts` | Port counted loops into callable statement checking, including the header, update, body and flow checks. The existing standalone loop path is not a safe direct replacement. |
-| `new Set(...)` in `src/utils.ts` | Check real constructor preparation and signature readiness. The saved outer error does not yet prove the inner cause. |
-| Variable reference in `src/_path.ts` | Add the missing [typed error location](../target/wave202-pathe-c6-prior-identifier-diagnosis.md), then measure again. Do not assume that the reference is an invalid forward use. |
-| Import aliases in three test files | Record the actual alias state and declaration at the terminal failure. Distinguish missing preparation from cycles before changing resolution. |
-| Original normalizer | Use one [failure-only diagnostic run](../target/wave202-pathe-normalizer-function-body-diagnosis.md) to select the exact remaining state, flow or call-effect guard. Keep the original function and all eight tests intact. |
+| Proxy handler in `src/index.ts` | Object-method statement support is committed with three new controls. Run the original root. The focused fixtures do not prove that its imported namespace and final fallback work. |
+| `throw new Error(...)` in `test/glob.spec.ts` | The [constructor position repair](../target/wave202-pathe-callable-throw-new-handoff.md) is committed with four new tests. Constructor argument checks and the complete original root still need runtime evidence. |
+| Counted loop in `src/_glob.ts` | Run the separate 18-test check of header, increment, body and flow support. Then review its result before merging it. The prepared join needs one call to pass the existing host argument. |
+| `new Set(...)` in `src/utils.ts` | Error-only traces now record constructor preparation and signature readiness. Use the next census to identify the first failed operation before changing semantics. |
+| Variable reference in `src/_path.ts` | The reporter now exposes an already-retained node. Measure the actual location. The declaration-order rule has not changed. |
+| Import aliases in three test files | Error-only traces now record the retained alias state and declarations. Use the result to distinguish missing preparation from cycles. Alias resolution has not changed. |
+| Original normalizer | New error-only traces identify the failed checker stage. The original function and all eight tests remain intact. Its most recent focused result still fails. |
 
-Run the retained 465-test selection before accepting the combined repairs.
-Use at most three Cargo lanes. Source work, test design and reference checks
-can run in more workers. Measure progress by completed checks and retained
-diagnostics, not by worker count or the number of commits.
+The [474-test selection](../target/wave202-pathe-demo-tests-7-request.template.md)
+retains all 465 old tests and adds nine. Run it and the ordinary compiler build
+on the same frozen source in separate output directories. The counted-loop
+check uses a third directory and its own source commit. Use at most three Cargo
+lanes in total.
+
+After the ordinary build and its resource check finish, run the unchanged
+Pathe project and all nine cold roots. That diagnostic run need not wait for
+the 474-test check, but it must retain and report any test failure. This source
+has temporary traces. Final acceptance still requires the unchanged original
+corpus and an ordinary project check with those traces removed.
+
+The [later counted-loop join plan](../target/wave202-pathe-counted-integration-plan.md)
+retains all 480 tests in 41 groups. No join is released yet. Counted loops inside
+object methods are an untested combination, even if the separate batches pass.
+Measure progress by completed checks and retained diagnostics, not worker count
+or the number of commits.
 
 ## Demo pass conditions
 
