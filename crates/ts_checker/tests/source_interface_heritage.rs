@@ -1,10 +1,13 @@
 use ts_ast::{FileId, NodeData, NodeRef};
 use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-    EscapedName, SemanticSymbolId,
+    CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, SourceCheckError, TypeData, TypeId,
+    AliasTargetState, CanonicalCheckerContext, CanonicalCheckerOptions,
+    CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+    CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, SourceCheckError, TypeData,
+    TypeId,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -20,6 +23,15 @@ fn checker_context<'arena>(
     parsed: &'arena ParseResult,
     file: FileId,
     path: &str,
+) -> CanonicalCheckerContext<'arena> {
+    checker_context_with_options(parsed, file, path, CanonicalCheckerOptions::default())
+}
+
+fn checker_context_with_options<'arena>(
+    parsed: &'arena ParseResult,
+    file: FileId,
+    path: &str,
+    options: CanonicalCheckerOptions,
 ) -> CanonicalCheckerContext<'arena> {
     let mut binder = CanonicalBinder::new();
     binder
@@ -41,7 +53,7 @@ fn checker_context<'arena>(
     CanonicalCheckerContext::new(
         binder.finish(),
         [(file, &parsed.arena)].into_iter().collect(),
-        CanonicalCheckerOptions::default(),
+        options,
     )
     .unwrap()
 }
@@ -155,6 +167,41 @@ fn interface_property_names(
         })
         .collect();
     (declared, resolved)
+}
+
+fn own_interface_property(
+    context: &CanonicalCheckerContext<'_>,
+    type_: TypeId,
+    name: &str,
+) -> SemanticSymbolId {
+    let TypeData::Interface(interface) = context.store().type_payload(type_).unwrap().data() else {
+        panic!("expected an interface type")
+    };
+    context
+        .store()
+        .symbol_table(interface.declared_members.unwrap())
+        .unwrap()
+        .get_source(name)
+        .unwrap_or_else(|| panic!("missing own property {name}"))
+}
+
+fn override_snapshot(
+    context: &CanonicalCheckerContext<'_>,
+) -> impl std::fmt::Debug + PartialEq + use<> {
+    let store = context.store();
+    (
+        [
+            store.type_len(),
+            store.type_alias_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.index_info_len(),
+            store.symbol_store().symbol_table_len(),
+        ],
+        store.relation_state_snapshot(),
+        context.diagnostics().clone(),
+    )
 }
 
 #[test]
@@ -748,6 +795,12 @@ fn compatible_interface_overrides_replace_inherited_properties() {
             "interface Base { value: {} }\n",
             "interface Derived extends Base { value: any }\n",
         ),
+        concat!(
+            "type EventName = 'added' | 'removed';\n",
+            "interface Base { value: EventName; inherited: string }\n",
+            "interface Derived extends Base { value: 'added' }\n",
+            "function read(value: Derived): 'added' { return value.value; }\n",
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -819,6 +872,572 @@ fn compatible_interface_overrides_replace_inherited_properties() {
 }
 
 #[test]
+fn interface_override_modifiers_preserve_own_flags() {
+    for (base, own, optional, readonly, reverse_assignable) in [
+        ("value?: string", "value: string", false, false, false),
+        (
+            "readonly value: string",
+            "value: string",
+            false,
+            false,
+            true,
+        ),
+        ("value: string", "readonly value: string", false, true, true),
+        (
+            "readonly value?: string",
+            "readonly value?: string",
+            true,
+            true,
+            true,
+        ),
+    ] {
+        let source =
+            format!("interface Base {{ {base} }}\ninterface Derived extends Base {{ {own} }}\n");
+        let parsed = parse_source_file(&source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(103);
+        let mut context = checker_context(&parsed, file, "/project/interface-override-flags.ts");
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let base = declared_type(&context, interface_symbol(&parsed, file, &context, "Base"));
+        let derived = declared_type(
+            &context,
+            interface_symbol(&parsed, file, &context, "Derived"),
+        );
+        let property = own_interface_property(&context, derived, "value");
+        let symbol = context.store().symbol(property).unwrap();
+        assert_eq!(symbol.flags().contains(SymbolFlags::OPTIONAL), optional);
+        assert_eq!(
+            symbol.check_flags().contains(CheckFlags::READONLY),
+            readonly
+        );
+        assert_eq!(context.is_type_assignable_to(derived, base), Ok(true));
+        assert_eq!(
+            context.is_type_assignable_to(base, derived),
+            Ok(reverse_assignable),
+        );
+        let warm = override_snapshot(&context);
+        context.check_source_file(file).unwrap();
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(override_snapshot(&context), warm);
+        assert_eq!(own_interface_property(&context, derived, "value"), property);
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Each invalid extension keeps its real property and replay state.
+fn incompatible_interface_overrides_report_diagnostics_and_keep_own_properties() {
+    let cases = [
+        (
+            concat!(
+                "interface Base { value: number }\n",
+                "interface Derived extends Base { value: string }\n",
+                "function read(value: Derived): string { return value.value; }\n",
+            ),
+            (false, false),
+            "value",
+            ("string", Some("string"), false),
+            concat!(
+                "Interface 'Derived' incorrectly extends interface 'Base'.\n",
+                "  Types of property 'value' are incompatible.\n",
+                "    Type 'string' is not assignable to type 'number'.",
+            ),
+        ),
+        (
+            concat!(
+                "type EventName = 'added' | 'removed';\n",
+                "interface Base { type: EventName }\n",
+                "interface Derived extends Base { type: 'other' }\n",
+                "function read(value: Derived): 'other' { return value.type; }\n",
+            ),
+            (true, false),
+            "type",
+            ("\"other\"", Some("\"other\""), false),
+            concat!(
+                "Interface 'Derived' incorrectly extends interface 'Base'.\n",
+                "  Types of property 'type' are incompatible.\n",
+                "    Type '\"other\"' is not assignable to type 'EventName'.",
+            ),
+        ),
+        (
+            concat!(
+                "interface Base { value: string | undefined }\n",
+                "interface Derived extends Base { value?: string }\n",
+                "function read(value: Derived): string | undefined { return value.value; }\n",
+            ),
+            (true, false),
+            "value",
+            ("string", Some("string | undefined"), true),
+            concat!(
+                "Interface 'Derived' incorrectly extends interface 'Base'.\n",
+                "  Property 'value' is optional in type 'Derived' but required in type 'Base'.",
+            ),
+        ),
+        (
+            concat!(
+                "interface Base { value: string }\n",
+                "interface Derived extends Base { value?: string }\n",
+                "function read(value: Derived): string | undefined { return value.value; }\n",
+            ),
+            (true, false),
+            "value",
+            ("string", Some("string | undefined"), true),
+            concat!(
+                "Interface 'Derived' incorrectly extends interface 'Base'.\n",
+                "  Types of property 'value' are incompatible.\n",
+                "    Type 'string | undefined' is not assignable to type 'string'.\n",
+                "      Type 'undefined' is not assignable to type 'string'.",
+            ),
+        ),
+        (
+            concat!(
+                "interface Base { value: string }\n",
+                "interface Derived extends Base { value?: string }\n",
+            ),
+            (true, true),
+            "value",
+            ("string", None, true),
+            concat!(
+                "Interface 'Derived' incorrectly extends interface 'Base'.\n",
+                "  Property 'value' is optional in type 'Derived' but required in type 'Base'.",
+            ),
+        ),
+        (
+            concat!(
+                "interface Base { value: string }\n",
+                "interface Derived extends Base { value?: any }\n",
+            ),
+            (true, false),
+            "value",
+            ("any", None, true),
+            concat!(
+                "Interface 'Derived' incorrectly extends interface 'Base'.\n",
+                "  Property 'value' is optional in type 'Derived' but required in type 'Base'.",
+            ),
+        ),
+        (
+            concat!(
+                "interface Base { value: unknown }\n",
+                "interface Derived extends Base { value?: unknown }\n",
+            ),
+            (true, false),
+            "value",
+            ("unknown", None, true),
+            concat!(
+                "Interface 'Derived' incorrectly extends interface 'Base'.\n",
+                "  Property 'value' is optional in type 'Derived' but required in type 'Base'.",
+            ),
+        ),
+        (
+            concat!(
+                "interface Base { value: string }\n",
+                "interface Derived extends Base { value?: unknown }\n",
+            ),
+            (true, false),
+            "value",
+            ("unknown", None, true),
+            concat!(
+                "Interface 'Derived' incorrectly extends interface 'Base'.\n",
+                "  Types of property 'value' are incompatible.\n",
+                "    Type 'unknown' is not assignable to type 'string'.",
+            ),
+        ),
+        (
+            concat!(
+                "interface Base { p: string }\n",
+                "interface Derived extends Base { p: string | undefined }\n",
+            ),
+            (true, false),
+            "p",
+            ("string | undefined", None, false),
+            concat!(
+                "Interface 'Derived' incorrectly extends interface 'Base'.\n",
+                "  Types of property 'p' are incompatible.\n",
+                "    Type 'string | undefined' is not assignable to type 'string'.\n",
+                "      Type 'undefined' is not assignable to type 'string'.",
+            ),
+        ),
+        (
+            concat!(
+                "interface InnerBase { x: string; y: string }\n",
+                "interface InnerDerived { x?: string; y: number }\n",
+                "interface Base { p: InnerBase }\n",
+                "interface Derived extends Base { p: InnerDerived }\n",
+            ),
+            (true, false),
+            "p",
+            ("InnerDerived", None, false),
+            concat!(
+                "Interface 'Derived' incorrectly extends interface 'Base'.\n",
+                "  The types of 'p.x' are incompatible between these types.\n",
+                "    Type 'string | undefined' is not assignable to type 'string'.\n",
+                "      Type 'undefined' is not assignable to type 'string'.",
+            ),
+        ),
+        (
+            concat!(
+                "interface InnerBase { x: string; y: string }\n",
+                "interface InnerDerived { x?: string; y: number }\n",
+                "interface Base { p: InnerBase }\n",
+                "interface Derived extends Base { p: InnerDerived }\n",
+            ),
+            (true, true),
+            "p",
+            ("InnerDerived", None, false),
+            concat!(
+                "Interface 'Derived' incorrectly extends interface 'Base'.\n",
+                "  Types of property 'p' are incompatible.\n",
+                "    Type 'InnerDerived' is not assignable to type 'InnerBase'.\n",
+                "      Property 'x' is optional in type 'InnerDerived' but required in type 'InnerBase'.",
+            ),
+        ),
+        (
+            concat!(
+                "namespace Events {\n",
+                "export interface Base { value: number }\n",
+                "export interface Derived extends Base { value: string }\n",
+                "}\n",
+                "function read(value: Events.Derived): string { return value.value; }\n",
+            ),
+            (false, false),
+            "value",
+            ("string", Some("string"), false),
+            concat!(
+                "Interface 'Derived' incorrectly extends interface 'Base'.\n",
+                "  Types of property 'value' are incompatible.\n",
+                "    Type 'string' is not assignable to type 'number'.",
+            ),
+        ),
+    ];
+    for (
+        source,
+        (strict_null_checks, exact_optional_property_types),
+        property_name,
+        (property_display, read_display, optional),
+        expected_diagnostic,
+    ) in cases
+    {
+        for query_first in [false, true] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(11);
+            let mut options = CanonicalCheckerOptions::default();
+            options.intrinsic.strict_null_checks = strict_null_checks;
+            options.intrinsic.exact_optional_property_types = exact_optional_property_types;
+            let mut context = checker_context_with_options(
+                &parsed,
+                file,
+                "/project/interface-heritage-incompatible-override.ts",
+                options,
+            );
+            let base_owner = interface_symbol(&parsed, file, &context, "Base");
+            let derived_owner = interface_symbol(&parsed, file, &context, "Derived");
+            let queried =
+                query_first.then(|| context.get_declared_type_of_symbol(derived_owner).unwrap());
+            assert!(context.diagnostics().is_empty());
+            context.check_source_file(file).unwrap();
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!(
+                    "expected one invalid-extension diagnostic: {:?}",
+                    context.diagnostics()
+                )
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2430);
+            assert_eq!(diagnostic.diagnostic.arguments, ["Derived", "Base"]);
+            assert_eq!(diagnostic.diagnostic.render().unwrap(), expected_diagnostic);
+            let anchor = diagnostic.node.unwrap();
+            assert_eq!(anchor.file, file);
+            assert_eq!(node_text(&parsed, anchor), "Derived");
+            assert!(diagnostic.related_information.is_empty());
+
+            let derived = declared_type(&context, derived_owner);
+            let base = declared_type(&context, base_owner);
+            if let Some(queried) = queried {
+                assert_eq!(queried, derived);
+            }
+            let own = own_interface_property(&context, derived, property_name);
+            let own_type = context
+                .store()
+                .value_symbol_links(own)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert_eq!(context.type_to_string(own_type).unwrap(), property_display);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol(own)
+                    .unwrap()
+                    .flags()
+                    .contains(SymbolFlags::OPTIONAL),
+                optional,
+            );
+            if let Some(read_display) = read_display {
+                let read = read_access(&parsed, file, property_name);
+                let read_type = context
+                    .store()
+                    .type_node_links(read)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                assert_eq!(context.type_to_string(read_type).unwrap(), read_display);
+                if optional {
+                    let TypeData::Union(union) =
+                        context.store().type_payload(read_type).unwrap().data()
+                    else {
+                        panic!("strict optional property reads must retain undefined")
+                    };
+                    let undefined = context
+                        .store()
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .undefined_type;
+                    assert_eq!(union.union.types.len(), 2);
+                    assert!(union.union.types.contains(&own_type));
+                    assert!(union.union.types.contains(&undefined));
+                } else {
+                    assert_eq!(read_type, own_type);
+                }
+            }
+            assert_eq!(context.is_type_assignable_to(derived, base), Ok(false));
+
+            let warm = override_snapshot(&context);
+            context.check_source_file(file).unwrap();
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(override_snapshot(&context), warm);
+                assert_eq!(
+                    own_interface_property(&context, derived, property_name),
+                    own
+                );
+            }
+        }
+    }
+}
+
+fn imported_override_context<'arena>(
+    source: &'arena ParseResult,
+    file: FileId,
+    provider: &'arena ParseResult,
+    provider_file: FileId,
+) -> CanonicalCheckerContext<'arena> {
+    let files = [
+        (file, source, "\"/project/override.ts\""),
+        (provider_file, provider, "\"/project/events.ts\""),
+    ];
+    let mut binder = CanonicalBinder::new();
+    for (file, parsed, path) in files {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source(path),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+    }
+    for (file, parsed, _) in files {
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+    }
+    let specifier = source
+        .arena
+        .iter()
+        .find_map(|(_, record)| match &record.data {
+            NodeData::ImportDeclaration(import) => Some(NodeRef::new(
+                source.arena.id(),
+                file,
+                import.module_specifier,
+            )),
+            _ => None,
+        })
+        .unwrap();
+    let mut options = CanonicalCheckerOptions::default();
+    options.intrinsic.strict_null_checks = true;
+    CanonicalCheckerContext::new_with_module_resolutions(
+        binder.finish(),
+        files
+            .iter()
+            .map(|(file, parsed, _)| (*file, &parsed.arena))
+            .collect(),
+        options,
+        CanonicalModuleResolutionManifestInput::new([CanonicalModuleResolutionEntry::resolved(
+            specifier,
+            CanonicalResolvedModuleInput::new(
+                provider_file,
+                CanonicalModuleResolutionMode::Esm,
+                CanonicalModuleResolutionMode::Esm,
+            ),
+        )]),
+    )
+    .unwrap()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Imported ownership, diagnostics and query order share one source pair.
+fn imported_interface_overrides_use_the_provider_alias_owner() {
+    let provider = parse_source_file(concat!(
+        "export type EventName = 'added' | 'removed';\n",
+        "export interface Base { type: EventName; inherited: number }\n",
+    ));
+    let file = FileId::new(105);
+    let provider_file = FileId::new(106);
+    for (literal, compatible) in [("added", true), ("other", false)] {
+        let source = parse_source_file(&format!(
+            "import type {{ Base as ImportedBase }} from './events';\n\
+             type EventName = 'local';\n\
+             interface Derived extends ImportedBase {{ type: '{literal}' }}\n\
+             function read(event: Derived): '{literal}' {{ return event.type; }}\n",
+        ));
+        for (provider_first, query_first) in [(false, false), (false, true), (true, false)] {
+            let mut context = imported_override_context(&source, file, &provider, provider_file);
+            let base_owner = interface_symbol(&provider, provider_file, &context, "Base");
+            let derived_owner = interface_symbol(&source, file, &context, "Derived");
+            if provider_first {
+                context.check_source_file(provider_file).unwrap();
+            }
+            let queried =
+                query_first.then(|| context.get_declared_type_of_symbol(derived_owner).unwrap());
+            assert!(context.diagnostics().is_empty());
+            context.check_source_file(file).unwrap();
+            let base = declared_type(&context, base_owner);
+            let derived = declared_type(&context, derived_owner);
+            if let Some(queried) = queried {
+                assert_eq!(queried, derived);
+            }
+            assert_eq!(context.is_type_assignable_to(derived, base), Ok(compatible));
+            assert_eq!(
+                interface_property_names(&context, derived),
+                (
+                    vec!["type".to_owned()],
+                    vec!["type".to_owned(), "inherited".to_owned()],
+                ),
+            );
+            let own = own_interface_property(&context, derived, "type");
+            let inherited = own_interface_property(&context, base, "type");
+            assert_ne!(own, inherited);
+            let own_type = context
+                .store()
+                .value_symbol_links(own)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert_eq!(
+                context.type_to_string(own_type).unwrap(),
+                format!("\"{literal}\"")
+            );
+            let read = read_access(&source, file, "type");
+            assert_eq!(
+                context.store().type_node_links(read).unwrap().resolved_type,
+                Some(own_type)
+            );
+            let inherited_type = context
+                .store()
+                .value_symbol_links(inherited)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let alias = context
+                .store()
+                .type_payload(inherited_type)
+                .unwrap()
+                .alias()
+                .unwrap();
+            let alias_owner = context.store().type_alias(alias).unwrap().symbol().unwrap();
+            let declarations = context
+                .store()
+                .symbol(alias_owner)
+                .unwrap()
+                .declarations()
+                .unwrap();
+            assert_eq!(declarations.len(), 1);
+            assert_eq!(declarations[0].file, provider_file);
+            assert_eq!(declarations[0].arena, provider.arena.id());
+            let NodeData::TypeAliasDeclaration(declaration) =
+                &provider.arena.get(declarations[0].node).unwrap().data
+            else {
+                panic!("the inherited property must retain the provider alias declaration")
+            };
+            assert_eq!(
+                node_text(
+                    &provider,
+                    NodeRef::new(provider.arena.id(), provider_file, declaration.name)
+                ),
+                "EventName",
+            );
+            let imported = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(record.data, NodeData::ImportSpecifier(_)).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let imported = context.file(file).unwrap().1.symbol(imported).unwrap();
+            let imported = context.store().get_merged_symbol(imported).unwrap();
+            assert_ne!(imported, base_owner);
+            assert_eq!(
+                context
+                    .store()
+                    .alias_symbol_links(imported)
+                    .unwrap()
+                    .alias_target,
+                AliasTargetState::Resolved(base_owner),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .source_file_links(context.source_file(provider_file).unwrap())
+                    .is_some_and(|links| links.type_checked),
+                provider_first,
+            );
+            if compatible {
+                assert!(context.diagnostics().is_empty());
+            } else {
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("expected one invalid imported extension diagnostic")
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 2430);
+                assert_eq!(diagnostic.diagnostic.arguments, ["Derived", "Base"]);
+                assert_eq!(
+                    diagnostic.diagnostic.render().unwrap(),
+                    concat!(
+                        "Interface 'Derived' incorrectly extends interface 'Base'.\n",
+                        "  Types of property 'type' are incompatible.\n",
+                        "    Type '\"other\"' is not assignable to type 'EventName'.",
+                    )
+                );
+                let anchor = diagnostic.node.unwrap();
+                assert_eq!(anchor.file, file);
+                assert_eq!(node_text(&source, anchor), "Derived");
+                assert!(diagnostic.related_information.is_empty());
+            }
+            let warm = override_snapshot(&context);
+            context.check_source_file(file).unwrap();
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(override_snapshot(&context), warm);
+                assert_eq!(own_interface_property(&context, derived, "type"), own);
+            }
+        }
+    }
+}
+
+#[test]
 #[allow(clippy::too_many_lines)] // Every heritage boundary must retain the same cold graph state.
 fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
     let cases = [
@@ -828,14 +1447,6 @@ fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
                 "interface Left extends Right { left: number }\n",
                 "interface Right extends Left { right: number }\n",
                 "function read(value: Left): number { return value.left; }\n",
-            ),
-        ),
-        (
-            "incompatible-override",
-            concat!(
-                "interface Base { value: number }\n",
-                "interface Derived extends Base { value: string }\n",
-                "function read(value: Derived): string { return value.value; }\n",
             ),
         ),
         (
@@ -881,7 +1492,7 @@ fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
         ),
     ];
 
-    for (index, (name, source)) in cases.into_iter().enumerate() {
+    for (index, (name, source)) in [0, 2, 3, 4, 5, 6].into_iter().zip(cases) {
         let parsed = parse_source_file(source);
         assert!(
             parsed.diagnostics.is_empty(),

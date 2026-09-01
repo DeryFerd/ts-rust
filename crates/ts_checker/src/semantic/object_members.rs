@@ -7620,44 +7620,26 @@ pub(super) fn plan_interface(
                 else {
                     continue;
                 };
-                let own_kind = store.source_node_kind(property.type_node);
-                let base_kind = store.source_node_kind(base_property.type_node);
                 let own_method = store
                     .symbol(property.symbol)
                     .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::METHOD));
                 let base_method = store
                     .symbol(base_property.symbol)
                     .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::METHOD));
-                let same_primitive = own_kind == base_kind
-                    && matches!(
-                        own_kind,
-                        Some(
-                            SyntaxKind::AnyKeyword
-                                | SyntaxKind::UnknownKeyword
-                                | SyntaxKind::StringKeyword
-                                | SyntaxKind::NumberKeyword
-                                | SyntaxKind::BooleanKeyword
-                                | SyntaxKind::BigIntKeyword
-                                | SyntaxKind::SymbolKeyword
-                                | SyntaxKind::VoidKeyword
-                                | SyntaxKind::NeverKeyword
-                        )
-                    );
-                let compatible = if own_method || base_method {
-                    own_method
-                        && base_method
-                        && matching_planned_interface_method_contract(
+                // Property annotations are checked by the source relation after
+                // both interfaces have their real member types. Syntax does not
+                // determine whether a literal satisfies an inherited alias.
+                if (own_method || base_method)
+                    && (!own_method
+                        || !base_method
+                        || property.optional && !base_property.optional
+                        || !matching_planned_interface_method_contract(
                             store,
                             host,
                             property,
                             base_property,
-                        )
-                } else {
-                    same_primitive
-                        || own_kind == Some(SyntaxKind::AnyKeyword)
-                            && base_kind != Some(SyntaxKind::NeverKeyword)
-                };
-                if !compatible || property.optional && !base_property.optional {
+                        ))
+                {
                     return Err(PropertyObjectError::UnsupportedMember {
                         node: property.declaration,
                         kind: store
@@ -7675,6 +7657,126 @@ pub(super) fn plan_interface(
         });
     }
     Ok(plan)
+}
+
+/// Checks ordinary overrides after both interfaces retain their declared types.
+/// The source relation owns instantiation, option checks and cache validation.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One declaration keeps its owner proof, caller and diagnostic order.
+pub(super) fn check_source_interface_property_heritage(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    symbol: SemanticSymbolId,
+    type_: TypeId,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<(), SourceCheckError> {
+    let Some(provenance) = store.direct_interface_heritage_provenance(type_).cloned() else {
+        return Ok(());
+    };
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+    if store.get_merged_symbol(symbol) != Some(provenance.owner_symbol) {
+        return Err(invalid().into());
+    }
+    let plan = plan_interface(store, host, provenance.owner_symbol).map_err(|_| invalid())?;
+    let heritage = plan.heritage.as_ref().ok_or_else(invalid)?;
+    // Alias-base and method-only providers still enforce their existing rules.
+    if heritage
+        .bases
+        .iter()
+        .any(|base| base.kind == DirectInterfaceBaseKind::NongenericTypeLiteralAlias)
+    {
+        return Ok(());
+    }
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = record.data() else {
+        return Err(invalid().into());
+    };
+    let base_types = interface.resolved_base_types.clone().ok_or_else(invalid)?;
+    if record.symbol() != Some(plan.symbol)
+        || !interface.base_types_resolved
+        || !interface.declared_members_resolved
+        || interface.declared_members != plan.members
+        || !record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+        || base_types.len() != heritage.bases.len()
+        || !provenance.bases.iter().copied().eq(heritage
+            .bases
+            .iter()
+            .zip(&base_types)
+            .map(|(base, &type_)| (base.symbol, type_)))
+    {
+        return Err(invalid().into());
+    }
+    let declaration = host.node(plan.node).ok_or_else(invalid)?;
+    let NodeData::InterfaceDeclaration(interface) = &declaration.data else {
+        return Err(invalid().into());
+    };
+    let name = NodeRef::new(plan.node.arena, plan.node.file, interface.name);
+    if store.source_node_parent(name) != Some(SourceNodeParent::Parent(plan.node))
+        || !host.symbol_matches(store, plan.node, plan.symbol)
+    {
+        return Err(invalid().into());
+    }
+    for base_type in base_types {
+        let base = store.type_payload(base_type).ok_or_else(invalid)?;
+        let members = base.data().structured().ok_or_else(invalid)?;
+        let Some(table) = members.members else {
+            if members
+                .properties
+                .as_ref()
+                .is_some_and(|properties| !properties.is_empty())
+            {
+                return Err(invalid().into());
+            }
+            continue;
+        };
+        let table = store.symbol_table(table).ok_or_else(invalid)?;
+        let overrides_property = plan.properties.iter().any(|property| {
+            store
+                .symbol(property.symbol)
+                .is_some_and(|record| !record.flags().contains(SymbolFlags::METHOD))
+                && planned_declared_property_key(store, property)
+                    .and_then(|key| table.get(key))
+                    .and_then(|symbol| store.symbol(symbol))
+                    .is_some_and(|record| !record.flags().contains(SymbolFlags::METHOD))
+        });
+        if !overrides_property {
+            continue;
+        }
+        let related = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .relate_source_types(type_, base_type, super::RelationKind::Assignable)
+        .map_err(|error| match error {
+            super::relater::SourceRelationError::Relation(error) => {
+                SourceCheckError::RelationUnavailable(error)
+            }
+            super::relater::SourceRelationError::Source(error) => SourceCheckError::from(error),
+        })?
+        .related();
+        if !related {
+            let diagnostic = super::object_diagnostics::interface_heritage_mismatch_diagnostic(
+                store,
+                host,
+                global_types,
+                type_,
+                base_type,
+                name,
+                options,
+                session,
+            )?;
+            super::source::merge_retry_diagnostic(diagnostics, diagnostic);
+        }
+    }
+    Ok(())
 }
 
 /// Proves the exact lazy `ReactPortal extends ReactElement<any>` declaration.

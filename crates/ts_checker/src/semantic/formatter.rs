@@ -56,6 +56,7 @@ use super::{
     object_aliases::property_object_alias_projection,
     object_members,
     reference_types::validate_direct_generic_reference,
+    relater::EffectivePropertyRelationType,
     signatures::{ElementFlags, IndexFlags, SignatureFlags, TypePredicateKind},
     source_callables::{
         SourceCallableDisplayError, SourceCallableState, SourceCallableUnsupported,
@@ -555,6 +556,230 @@ pub(super) fn get_type_names_for_assignability_error_with_host_global_types_and_
         target,
         flags,
     )
+}
+
+/// Displays the effective property types from the completed relation without
+/// allocating the optional unions used only for this diagnostic.
+pub(super) fn get_type_names_for_effective_property_assignability_error_with_host_global_types_and_flags(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: &EffectivePropertyRelationType,
+    target: &EffectivePropertyRelationType,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<AssignabilityErrorDisplay, TypeDisplayUnavailable> {
+    let source_types = effective_property_display_types(store, global_types, source)?;
+    let target_types = effective_property_display_types(store, global_types, target)?;
+    if let ([source], [target]) = (source_types.as_slice(), target_types.as_slice()) {
+        return get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            *source,
+            *target,
+            flags,
+        );
+    }
+
+    let flags = flags | CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+    let mut source_name = effective_property_types_to_string(
+        store,
+        host,
+        global_types,
+        source.declared_type(),
+        &source_types,
+        flags,
+    )?;
+    let target_name = effective_property_types_to_string(
+        store,
+        host,
+        global_types,
+        target.declared_type(),
+        &target_types,
+        flags,
+    )?;
+
+    // A remaining virtual target union is not `never`. Preserve the ordinary
+    // diagnostic's literal widening only when none of its members is a unit.
+    if let [source] = source_types.as_slice() {
+        let source_record = store
+            .type_payload(*source)
+            .ok_or(TypeDisplayUnavailable::Type(*source))?;
+        if is_literal_type(source_record) {
+            let mut target_has_singleton = false;
+            for target in &target_types {
+                if type_could_have_top_level_singleton_types(store, *target, &mut HashSet::new())? {
+                    target_has_singleton = true;
+                    break;
+                }
+            }
+            if !target_has_singleton {
+                let generalized = base_type_of_literal_type(store, *source, source_record)?;
+                let generalized_record = store
+                    .type_payload(generalized)
+                    .ok_or(TypeDisplayUnavailable::Type(generalized))?;
+                source_name = if generalized_record
+                    .flags()
+                    .intersects(TypeFlags::UNIQUE_ES_SYMBOL)
+                {
+                    display_unique_symbol_reference(store, host, generalized)?
+                } else {
+                    type_to_string_with_host_global_types_and_flags(
+                        store,
+                        host,
+                        global_types,
+                        generalized,
+                        flags,
+                    )?
+                };
+            }
+        }
+    }
+    Ok(AssignabilityErrorDisplay {
+        source: source_name,
+        target: target_name,
+    })
+}
+
+fn effective_property_display_types(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    effective: &EffectivePropertyRelationType,
+) -> Result<Vec<TypeId>, TypeDisplayUnavailable> {
+    let declared = effective.declared_type();
+    let types = effective.types();
+    if types == [declared] {
+        return Ok(types.to_vec());
+    }
+    let declared_record = store
+        .type_payload(declared)
+        .ok_or(TypeDisplayUnavailable::Type(declared))?;
+    if matches!(declared_record.data(), TypeData::Union(_)) {
+        ensure_acyclic_union_graph(store, declared)?;
+        validate_display_union(store, Some(global_types), declared)?;
+    }
+    if types.is_empty() {
+        return Err(TypeDisplayUnavailable::MalformedType(declared));
+    }
+
+    let mut normalized = Vec::with_capacity(types.len());
+    let mut any = None;
+    let mut unknown = None;
+    for type_id in types {
+        let record = store
+            .type_payload(*type_id)
+            .ok_or(TypeDisplayUnavailable::Type(*type_id))?;
+        let flags = record.flags();
+        if flags.intersects(TypeFlags::ANY | TypeFlags::UNKNOWN | TypeFlags::NEVER) {
+            require_data_kind(*type_id, record, TypeDataKind::Intrinsic)?;
+        }
+        if flags.intersects(TypeFlags::ANY) {
+            any = Some(*type_id);
+        } else if flags.intersects(TypeFlags::UNKNOWN) {
+            unknown = Some(*type_id);
+        } else if !flags.intersects(TypeFlags::NEVER) {
+            normalized.push(*type_id);
+        }
+    }
+    if let Some(type_id) = any.or(unknown) {
+        return Ok(vec![type_id]);
+    }
+    if normalized.is_empty() {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(TypeDisplayUnavailable::MissingBootstrap)?;
+        return Ok(vec![bootstrap.never_type]);
+    }
+    if normalized.len() == 1 {
+        return Ok(normalized);
+    }
+    format_union_types(store, declared, &normalized)
+}
+
+fn effective_property_types_to_string(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    declared: TypeId,
+    types: &[TypeId],
+    flags: CanonicalTypeFormatFlags,
+) -> Result<String, TypeDisplayUnavailable> {
+    if let [type_id] = types {
+        return type_to_string_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            *type_id,
+            flags,
+        );
+    }
+    let mut display_types = Vec::new();
+    for type_id in types {
+        append_effective_property_union_display_types(
+            store,
+            global_types,
+            *type_id,
+            &mut display_types,
+        )?;
+    }
+    let display_types = format_union_types(store, declared, &display_types)?;
+    let displayed = display_union_list(
+        store,
+        Some(host),
+        Some(global_types),
+        declared,
+        &display_types,
+        flags,
+        &mut DisplayState::default(),
+        &mut HashSet::new(),
+    )?;
+    truncate_display(declared, displayed, flags)
+}
+
+fn append_effective_property_union_display_types(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    type_id: TypeId,
+    types: &mut Vec<TypeId>,
+) -> Result<(), TypeDisplayUnavailable> {
+    let record = store
+        .type_payload(type_id)
+        .ok_or(TypeDisplayUnavailable::Type(type_id))?;
+    if !record.flags().intersects(TypeFlags::UNION)
+        || record
+            .flags()
+            .intersects(TypeFlags::BOOLEAN | TypeFlags::ENUM_LIKE)
+        || record.alias().is_some()
+        || store.source_jsdoc_callback_identity(type_id).is_some()
+        || store.source_jsdoc_typedef_identity(type_id).is_some()
+    {
+        types.push(type_id);
+        return Ok(());
+    }
+    ensure_acyclic_union_graph(store, type_id)?;
+    validate_display_union(store, Some(global_types), type_id)?;
+    let TypeData::Union(data) = record.data() else {
+        return Err(TypeDisplayUnavailable::InvalidUnion(type_id));
+    };
+    let display_union = data.origin.unwrap_or(type_id);
+    let display_record = store
+        .type_payload(display_union)
+        .ok_or(TypeDisplayUnavailable::Type(display_union))?;
+    match display_record.data() {
+        TypeData::Union(data) => {
+            for constituent in &data.union.types {
+                append_effective_property_union_display_types(
+                    store,
+                    global_types,
+                    *constituent,
+                    types,
+                )?;
+            }
+        }
+        TypeData::Index(_) => types.push(display_union),
+        _ => return Err(TypeDisplayUnavailable::InvalidUnion(type_id)),
+    }
+    Ok(())
 }
 
 fn get_type_names_for_assignability_error_with_optional_host_and_flags(

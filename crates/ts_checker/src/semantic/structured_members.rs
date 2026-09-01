@@ -3,8 +3,9 @@
 //! Ordered nongeneric bases preserve every repeated source contribution. A
 //! single base can also provide authenticated index or call signatures.
 //! Shared base properties or methods must have identical types and modifiers.
-//! Compatible derived members replace inherited members; incompatible
-//! overrides remain unsupported until TS2430 is ported.
+//! Derived properties replace inherited properties with their real declared
+//! types. Source declaration checking reports incompatible overrides as TS2430.
+//! Method and alias-base combinations retain their existing admission rules.
 
 use std::collections::{HashMap, HashSet};
 
@@ -758,18 +759,23 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
         let base_method = store
             .symbol(base_property)
             .is_some_and(|record| record.flags().contains(SymbolFlags::METHOD));
-        let compatible = if source_alias_heritage {
+        let supported = if source_alias_heritage {
             !own_method
                 && !base_method
+                && (!property.optional || base_optional)
                 && source_alias_override_types_are_exact(store, own_type, base_type)
         } else if own_method && base_method {
-            matching_interface_method_contract(store, property.symbol, base_property)
+            (!property.optional || base_optional)
+                && matching_interface_method_contract(store, property.symbol, base_property)
         } else if own_method || base_method {
             false
         } else {
-            store.is_type_assignable_to(own_type, base_type) == Ok(true)
+            // A declared type must keep its own property even when extension
+            // checking reports an error. The source checker compares the
+            // completed interfaces with its options and caller session.
+            true
         };
-        if property.optional && !base_optional || !compatible {
+        if !supported {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: property.declaration,
                 kind: store

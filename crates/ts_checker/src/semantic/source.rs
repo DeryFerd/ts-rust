@@ -69816,6 +69816,22 @@ pub(super) fn check_source_file(
                     } else {
                         query.check_type_alias_declaration(symbol)
                     }
+                })
+                .map_err(SourceCheckError::from)
+                .and_then(|type_| {
+                    if check_interface_members {
+                        super::object_members::check_source_interface_property_heritage(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            symbol,
+                            type_,
+                            session,
+                            &mut statement_diagnostics,
+                        )?;
+                    }
+                    Ok(type_)
                 });
                 merge_retry_diagnostics(diagnostics, statement_diagnostics);
                 result?;

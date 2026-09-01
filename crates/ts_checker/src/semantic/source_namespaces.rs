@@ -14142,7 +14142,17 @@ pub(super) fn execute_source_namespace(
                             if interface.heritage_clauses.is_some()
                     )
                 });
-                let target = if heritage {
+                let target = if heritage && generic.is_none() {
+                    CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                    )?
+                    .get_declared_interface_for_source_check(*symbol)?
+                } else if heritage {
                     store.get_declared_type_of_symbol(host, *symbol)?
                 } else {
                     CanonicalTypeQuery::new_with_global_types_and_session(
@@ -14155,6 +14165,18 @@ pub(super) fn execute_source_namespace(
                     )?
                     .get_declared_type_of_symbol(*symbol)?
                 };
+                if heritage && generic.is_none() {
+                    object_members::check_source_interface_property_heritage(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        *symbol,
+                        target,
+                        session,
+                        diagnostics,
+                    )?;
+                }
                 if let Some(generic) = generic {
                     if !generic.call_signatures.is_empty()
                         || !generic.construct_signatures.is_empty()

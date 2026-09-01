@@ -1675,6 +1675,42 @@ pub(super) struct ResolvedDeclaredProperty {
     pub(super) declaration: NodeRef,
 }
 
+/// Effective property values retained by the relation that rejected them.
+/// The list can include a virtual optional union without allocating a type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct EffectivePropertyRelationType {
+    declared_type: TypeId,
+    types: Vec<TypeId>,
+}
+
+impl EffectivePropertyRelationType {
+    pub(super) const fn declared_type(&self) -> TypeId {
+        self.declared_type
+    }
+
+    pub(super) fn types(&self) -> &[TypeId] {
+        &self.types
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum InterfaceHeritagePropertyRelationFailureKind {
+    Types {
+        source: EffectivePropertyRelationType,
+        target: EffectivePropertyRelationType,
+        source_component: EffectivePropertyRelationType,
+    },
+    Optional,
+}
+
+/// The first failed property from the ordinary ordered property comparison.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct InterfaceHeritagePropertyRelationFailure {
+    pub(super) source_property: SemanticSymbolId,
+    pub(super) target_property: SemanticSymbolId,
+    pub(super) kind: InterfaceHeritagePropertyRelationFailureKind,
+}
+
 /// Ordered, name-indexed view of one validated declared property-only object.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ResolvedDeclaredPropertyObject {
@@ -4768,6 +4804,16 @@ impl<'store> RelaterSession<'store> {
         target: TypeId,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
+        self.each_type_related_to_type_with_failure(source, target, intersection_state, None)
+    }
+
+    fn each_type_related_to_type_with_failure(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        intersection_state: IntersectionState,
+        source_component: Option<&mut Option<TypeId>>,
+    ) -> Result<Ternary, RelationUnavailable> {
         let source_types = self.union_types(source)?;
         let target_types = if self.store.type_flags(target)?.intersects(TypeFlags::UNION) {
             Some(self.union_types(target)?)
@@ -4822,6 +4868,9 @@ impl<'store> RelaterSession<'store> {
                 intersection_state,
             )?;
             if related == Ternary::False {
+                if let Some(source_component) = source_component {
+                    *source_component = Some(source_type);
+                }
                 return Ok(Ternary::False);
             }
             result &= related;
@@ -5388,6 +5437,23 @@ impl<'store> RelaterSession<'store> {
         source_members: &ResolvedObjectMembers,
         target_members: &ResolvedObjectMembers,
     ) -> Result<Ternary, RelationUnavailable> {
+        self.properties_related_to_with_failure(
+            source,
+            target,
+            source_members,
+            target_members,
+            None,
+        )
+    }
+
+    fn properties_related_to_with_failure(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        source_members: &ResolvedObjectMembers,
+        target_members: &ResolvedObjectMembers,
+        mut failure: Option<&mut Option<InterfaceHeritagePropertyRelationFailure>>,
+    ) -> Result<Ternary, RelationUnavailable> {
         let require_optional_properties = matches!(
             self.relation,
             RelationKind::Subtype | RelationKind::StrictSubtype
@@ -5467,11 +5533,12 @@ impl<'store> RelaterSession<'store> {
                 self.property_type(source_property, ObjectPropertyOrigin::Declared)?;
                 ObjectPropertyOrigin::Declared
             };
-            let related = self.property_related_to(
+            let related = self.property_related_to_with_failure(
                 source_property,
                 source_origin,
                 *target_property,
                 target_members.property_origin,
+                failure.as_deref_mut(),
             )?;
             if related == Ternary::False {
                 return Ok(Ternary::False);
@@ -6942,6 +7009,24 @@ impl<'store> RelaterSession<'store> {
         target_property: SemanticSymbolId,
         target_origin: ObjectPropertyOrigin,
     ) -> Result<Ternary, RelationUnavailable> {
+        self.property_related_to_with_failure(
+            source_property,
+            source_origin,
+            target_property,
+            target_origin,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep value comparison before the optional-presence check.
+    fn property_related_to_with_failure(
+        &mut self,
+        source_property: SemanticSymbolId,
+        source_origin: ObjectPropertyOrigin,
+        target_property: SemanticSymbolId,
+        target_origin: ObjectPropertyOrigin,
+        mut failure: Option<&mut Option<InterfaceHeritagePropertyRelationFailure>>,
+    ) -> Result<Ternary, RelationUnavailable> {
         let (source_flags, source_readonly, source_declaration, source_owner) = {
             let source = self.property_symbol(source_property, source_origin)?;
             (
@@ -7054,15 +7139,54 @@ impl<'store> RelaterSession<'store> {
                 _ => None,
             };
             let previous_origin = std::mem::replace(&mut self.signature_global_member, origin);
-            let related = self.property_types_related(&source_types, &target_types);
+            let mut source_component = None;
+            let related = self.property_types_related_with_failure(
+                &source_types,
+                &target_types,
+                failure.as_ref().map(|_| &mut source_component),
+            );
             self.signature_global_member = previous_origin;
-            related?
+            let related = related?;
+            if related == Ternary::False
+                && let Some(failure) = failure.as_deref_mut()
+            {
+                *failure = Some(InterfaceHeritagePropertyRelationFailure {
+                    source_property,
+                    target_property,
+                    kind: InterfaceHeritagePropertyRelationFailureKind::Types {
+                        source: EffectivePropertyRelationType {
+                            declared_type: source_type,
+                            types: source_types,
+                        },
+                        target: EffectivePropertyRelationType {
+                            declared_type: target_type,
+                            types: target_types,
+                        },
+                        source_component: {
+                            let type_ = source_component
+                                .expect("a failed property value retains its source component");
+                            EffectivePropertyRelationType {
+                                declared_type: type_,
+                                types: vec![type_],
+                            }
+                        },
+                    },
+                });
+            }
+            related
         };
         if self.relation != RelationKind::Comparable
             && related != Ternary::False
             && source_flags.intersects(SymbolFlags::OPTIONAL)
             && !target_flags.intersects(SymbolFlags::OPTIONAL)
         {
+            if let Some(failure) = failure {
+                *failure = Some(InterfaceHeritagePropertyRelationFailure {
+                    source_property,
+                    target_property,
+                    kind: InterfaceHeritagePropertyRelationFailureKind::Optional,
+                });
+            }
             Ok(Ternary::False)
         } else {
             Ok(related)
@@ -7097,6 +7221,9 @@ impl<'store> RelaterSession<'store> {
             }
             return Ok(vec![type_id]);
         }
+        if flags.intersects(TypeFlags::ANY_OR_UNKNOWN) {
+            return Ok(vec![type_id]);
+        }
         let contains_undefined = type_id == self.bootstrap.undefined_type
             || flags.intersects(TypeFlags::UNION)
                 && self
@@ -7115,6 +7242,15 @@ impl<'store> RelaterSession<'store> {
         &mut self,
         source_types: &[TypeId],
         target_types: &[TypeId],
+    ) -> Result<Ternary, RelationUnavailable> {
+        self.property_types_related_with_failure(source_types, target_types, None)
+    }
+
+    fn property_types_related_with_failure(
+        &mut self,
+        source_types: &[TypeId],
+        target_types: &[TypeId],
+        mut source_component: Option<&mut Option<TypeId>>,
     ) -> Result<Ternary, RelationUnavailable> {
         if source_types.is_empty() {
             return Ok(Ternary::True);
@@ -7147,7 +7283,11 @@ impl<'store> RelaterSession<'store> {
                     }
                     related
                 } else {
-                    self.property_types_related(&source_members, target_types)?
+                    self.property_types_related_with_failure(
+                        &source_members,
+                        target_types,
+                        source_component.as_deref_mut(),
+                    )?
                 };
                 if related == Ternary::False {
                     return Ok(Ternary::False);
@@ -7169,6 +7309,36 @@ impl<'store> RelaterSession<'store> {
                 }
             }
             if related == Ternary::False {
+                if let Some(source_component) = source_component {
+                    if let [target_type] = target_types
+                        && self.relation == RelationKind::Assignable
+                        && self
+                            .store
+                            .type_flags(*source_type)?
+                            .intersects(TypeFlags::UNION)
+                    {
+                        // A cached union failure does not retain its failed member.
+                        // Repeat the same ordered worker only for this diagnostic.
+                        let mut constituent = None;
+                        let traced = self.each_type_related_to_type_with_failure(
+                            *source_type,
+                            *target_type,
+                            IntersectionState::NONE,
+                            Some(&mut constituent),
+                        )?;
+                        let unavailable = || RelationUnavailable::StructuralRelation {
+                            source: *source_type,
+                            target: *target_type,
+                            relation: self.relation,
+                        };
+                        if traced != Ternary::False {
+                            return Err(unavailable());
+                        }
+                        *source_component = Some(constituent.ok_or_else(unavailable)?);
+                    } else {
+                        *source_component = Some(*source_type);
+                    }
+                }
                 return Ok(Ternary::False);
             }
             result &= related;
@@ -10165,7 +10335,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         host: &DeclaredTypeHost<'_>,
         type_id: TypeId,
     ) -> Result<Option<ResolvedDeclaredPropertyObject>, RelationUnavailable> {
-        self.resolved_declared_property_object_with_optional_global_types(host, type_id, None, None)
+        self.resolved_declared_property_object_with_optional_global_types(
+            host, type_id, None, None, None, None,
+        )
     }
 
     /// Retains the caller's array capability while validating lazy alias values.
@@ -10180,6 +10352,35 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             type_id,
             Some(RelationGlobalTypes::from_global_types(global_types)),
             Some(global_types.global_this_value_type),
+            None,
+            None,
+        )
+    }
+
+    /// Validates the same ordered property view with the caller's session and options.
+    pub(super) fn resolved_declared_property_object_with_global_types_and_session(
+        &mut self,
+        host: &DeclaredTypeHost<'_>,
+        type_id: TypeId,
+        global_types: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+        instantiation_session: &mut InstantiationSession,
+    ) -> Result<Option<ResolvedDeclaredPropertyObject>, RelationUnavailable> {
+        if let Some(requested) = strict_function_types
+            && let Err(established) = self.claim_strict_function_types(requested)
+        {
+            return Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                established,
+                requested,
+            });
+        }
+        self.resolved_declared_property_object_with_optional_global_types(
+            host,
+            type_id,
+            Some(RelationGlobalTypes::from_global_types(global_types)),
+            Some(global_types.global_this_value_type),
+            strict_function_types,
+            Some(instantiation_session),
         )
     }
 
@@ -10189,6 +10390,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         type_id: TypeId,
         global_types: Option<RelationGlobalTypes>,
         global_this_hint: Option<TypeId>,
+        strict_function_types: Option<bool>,
+        instantiation_session: Option<&mut InstantiationSession>,
     ) -> Result<Option<ResolvedDeclaredPropertyObject>, RelationUnavailable> {
         let flags = self
             .type_payload(type_id)
@@ -10207,11 +10410,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
             }
             let bootstrap = self.relation_bootstrap_facts()?;
-            let mut session = RelaterSession::new_with_global_types(
+            let mut session = RelaterSession::new_with_global_types_options_and_session(
                 self,
                 RelationKind::Assignable,
                 bootstrap,
                 global_types,
+                strict_function_types,
+                instantiation_session,
             )
             .with_global_this_hint(global_this_hint);
             let resolved = session.resolved_object_members(type_id, false)?;
@@ -10264,11 +10469,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         });
         if ownerless_synthetic {
             let bootstrap = self.relation_bootstrap_facts()?;
-            let mut session = RelaterSession::new_with_global_types(
+            let mut session = RelaterSession::new_with_global_types_options_and_session(
                 self,
                 RelationKind::Assignable,
                 bootstrap,
                 global_types,
+                strict_function_types,
+                instantiation_session,
             )
             .with_global_this_hint(global_this_hint);
             let resolved = session.resolved_object_members(type_id, false)?;
@@ -10431,11 +10638,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         };
 
         let bootstrap = self.relation_bootstrap_facts()?;
-        let mut session = RelaterSession::new_with_global_types(
+        let mut session = RelaterSession::new_with_global_types_options_and_session(
             self,
             RelationKind::Assignable,
             bootstrap,
             global_types,
+            strict_function_types,
+            instantiation_session,
         )
         .with_global_this_hint(global_this_hint);
         let resolved = session.resolved_object_members(type_id, false)?;
@@ -10911,6 +11120,57 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             IntersectionState::NONE,
         )?;
         Ok(session.finish_without_specialized_root_cache(result))
+    }
+
+    /// Repeats the ordinary property comparison to retain its diagnostic child.
+    /// Nested relations keep the caller's session and their original cache keys.
+    pub(super) fn interface_heritage_property_relation_failure_with_session(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        global_types: &CanonicalGlobalTypes,
+        strict_function_types: bool,
+        instantiation_session: &mut InstantiationSession,
+    ) -> Result<Option<InterfaceHeritagePropertyRelationFailure>, RelationUnavailable> {
+        if let Err(established) = self.claim_strict_function_types(strict_function_types) {
+            return Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                established,
+                requested: strict_function_types,
+            });
+        }
+        let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
+        for type_ in [source, target] {
+            validate_direct_interface_heritage_relation_endpoint(self, type_, array_targets, None)?;
+            validate_property_object_alias_relation_endpoint(self, type_, array_targets)?;
+        }
+        let bootstrap = self.relation_bootstrap_facts()?;
+        let mut relation = RelaterSession::new_with_global_types_options_and_session(
+            self,
+            RelationKind::Assignable,
+            bootstrap,
+            Some(RelationGlobalTypes::from_global_types(global_types)),
+            Some(strict_function_types),
+            Some(instantiation_session),
+        )
+        .with_global_this_hint(Some(global_types.global_this_value_type));
+        relation.observe_type_surface(source);
+        relation.observe_type_surface(target);
+        let source_members = relation.resolved_object_members(source, false)?;
+        let target_members = relation.resolved_object_members(target, false)?;
+        let mut failure = None;
+        let result = relation.properties_related_to_with_failure(
+            source,
+            target,
+            &source_members,
+            &target_members,
+            Some(&mut failure),
+        )?;
+        relation.ensure_source_relation_completed(source, target, result)?;
+        Ok(if relation.finish_without_specialized_root_cache(result) {
+            None
+        } else {
+            failure
+        })
     }
 
     /// Reuses signature comparison to identify the diagnostic child, including
