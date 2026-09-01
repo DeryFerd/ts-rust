@@ -1086,6 +1086,46 @@ fn validated_intersection_relation_projection(
     }
 }
 
+/// The canonical empty type literal has no member obligations for a scalar.
+/// Without global types, this needs no apparent primitive wrapper.
+fn authenticated_scalar_matches_empty_type_literal(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    source: TypeId,
+    target: TypeId,
+    relation: RelationKind,
+) -> Result<bool, RelationUnavailable> {
+    if relation.is_identity()
+        || !matches!(
+            store.type_flags(source)?,
+            TypeFlags::STRING
+                | TypeFlags::NUMBER
+                | TypeFlags::BIG_INT
+                | TypeFlags::ES_SYMBOL
+                | TypeFlags::STRING_LITERAL
+                | TypeFlags::NUMBER_LITERAL
+                | TypeFlags::BIG_INT_LITERAL
+                | TypeFlags::BOOLEAN_LITERAL
+        )
+    {
+        return Ok(false);
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    if target != bootstrap.empty_type_literal_type {
+        return Ok(false);
+    }
+    store
+        .validate_union_constituent(source)
+        .map_err(|error| union_validation_unavailable(source, error))?;
+    if validate_resolved_declared_property_object(store, target)
+        != DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::TypeLiteral)
+    {
+        return Err(RelationUnavailable::InvalidStructuredMembers(target));
+    }
+    Ok(true)
+}
+
 /// Rejects canonical void or strict nullish sources against a proven object target.
 /// Generic members may stay cold. Declared property objects must be resolved.
 fn authenticated_void_or_nullish_object_nonmatch(
@@ -3300,6 +3340,17 @@ impl<'store> RelaterSession<'store> {
                 target,
                 self.relation,
                 self.bootstrap,
+            )?
+        {
+            return Ok(Ternary::True);
+        }
+
+        if self.global_types.is_none()
+            && authenticated_scalar_matches_empty_type_literal(
+                self.store,
+                source,
+                target,
+                self.relation,
             )?
         {
             return Ok(Ternary::True);
@@ -8922,6 +8973,27 @@ impl<'store> RelaterSession<'store> {
             .intersects(TypeFlags::INTERSECTION)
         {
             let projection = self.intersection_projection(type_id)?;
+            // The primitive still contributes members when the other constituent is {}.
+            if let Some(primitive) = self
+                .store
+                .primitive_empty_intersection_type(type_id)
+                .map_err(|_| RelationUnavailable::MalformedIntersection(type_id))?
+            {
+                let flags = self.store.type_flags(primitive)?;
+                let receiver = match self
+                    .global_types
+                    .and_then(|globals| globals.apparent_primitive_type(flags))
+                {
+                    Some(wrapper) => {
+                        if self.store.type_flags(wrapper)? != TypeFlags::OBJECT {
+                            return Err(RelationUnavailable::InvalidStructuredMembers(wrapper));
+                        }
+                        wrapper
+                    }
+                    None => primitive,
+                };
+                return self.resolved_object_members(receiver, allow_fresh_literal);
+            }
             return Ok(ResolvedObjectMembers {
                 members: Some(projection.members),
                 properties: projection.properties,
@@ -11650,6 +11722,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             if source_flags.intersects(TypeFlags::SINGLETON) {
                 return Ok(true);
             }
+        }
+
+        if global_types.is_none()
+            && authenticated_scalar_matches_empty_type_literal(self, source, target, relation)?
+        {
+            return Ok(true);
         }
 
         if authenticated_scalar_source_parameter_nonmatch(self, source, target, relation)? {
@@ -26716,11 +26794,7 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(
                 relate(store, number, target, RelationKind::Assignable, None),
-                Err(RelationUnavailable::StructuralRelation {
-                    source: number,
-                    target,
-                    relation: RelationKind::Assignable
-                })
+                Ok(true)
             );
             assert_eq!(
                 relate(store, number, target, RelationKind::Assignable, configured),
@@ -27277,6 +27351,290 @@ mod tests {
             assert_eq!(store.is_type_assignable_to(object, empty), Ok(true));
             assert_eq!(store.relation_state_snapshot(), warm);
         }
+    }
+
+    #[test]
+    fn canonical_scalars_relate_to_empty_type_literal_without_global_wrappers() {
+        for strict_null_checks in [false, true] {
+            let mut store = initialized(strict_null_checks);
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let empty = bootstrap.empty_type_literal_type;
+            let nullish = [bootstrap.null_type, bootstrap.undefined_type];
+            let void = bootstrap.void_type;
+            let boolean = bootstrap.boolean_type;
+            let mut scalars = vec![
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.bigint_type,
+                bootstrap.es_symbol_type,
+                bootstrap.regular_false_type,
+                bootstrap.regular_true_type,
+                bootstrap.false_type,
+                bootstrap.true_type,
+            ];
+            let string = store.regular_string_literal_type("value".into()).unwrap();
+            scalars.push(string);
+            scalars.push(store.fresh_type_of_literal_type(string).unwrap());
+            scalars.push(store.regular_number_literal_type(Number::new(1.0)).unwrap());
+            scalars.push(
+                store
+                    .regular_bigint_literal_type(PseudoBigInt::new("1", false))
+                    .unwrap(),
+            );
+            let before = store.relation_state_snapshot();
+            let counts = (store.type_len(), store.symbol_len(), store.signature_len());
+            for _ in 0..2 {
+                for &source in &scalars {
+                    for relation in [
+                        RelationKind::Assignable,
+                        RelationKind::Comparable,
+                        RelationKind::Subtype,
+                        RelationKind::StrictSubtype,
+                    ] {
+                        assert_eq!(store.is_type_related_to(source, empty, relation), Ok(true));
+                    }
+                    assert_eq!(store.is_type_identical_to(source, empty), Ok(false));
+                    assert_eq!(store.is_type_assignable_to(empty, source), Ok(false));
+                }
+                for source in nullish {
+                    assert_eq!(
+                        store.is_type_assignable_to(source, empty),
+                        Ok(!strict_null_checks)
+                    );
+                }
+                assert_eq!(store.is_type_assignable_to(void, empty), Ok(false));
+            }
+            assert_eq!(store.relation_state_snapshot(), before);
+            assert_eq!(
+                (store.type_len(), store.symbol_len(), store.signature_len()),
+                counts
+            );
+
+            // Boolean takes the existing union path before its literal checks.
+            assert_eq!(store.is_type_assignable_to(boolean, empty), Ok(true));
+            let warm = store.relation_state_snapshot();
+            assert_eq!(store.is_type_assignable_to(boolean, empty), Ok(true));
+            assert_eq!(store.relation_state_snapshot(), warm);
+        }
+    }
+
+    #[test]
+    fn scalar_empty_type_literal_relation_checks_canonical_source_and_target() {
+        let mut store = initialized(true);
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let empty = bootstrap.empty_type_literal_type;
+        let owner = bootstrap.empty_type_literal_symbol;
+        let other_empty = bootstrap.empty_object_type;
+        let fake_number = store
+            .alloc_intrinsic_type(TypeFlags::NUMBER, "number")
+            .unwrap();
+        let fake_literal = alloc_literal(
+            &mut store,
+            TypeFlags::STRING_LITERAL,
+            LiteralValue::String("value".into()),
+        );
+        let lookalike_empty = alloc_resolved_object(&mut store, ObjectFlags::ANONYMOUS, None);
+        let before = store.relation_state_snapshot();
+        for _ in 0..2 {
+            assert_eq!(store.is_type_assignable_to(number, empty), Ok(true));
+            assert_eq!(
+                store.is_type_assignable_to(fake_number, empty),
+                Err(RelationUnavailable::UnsupportedUnionConstituent(
+                    fake_number
+                ))
+            );
+            assert_eq!(
+                store.is_type_assignable_to(fake_literal, empty),
+                Err(RelationUnavailable::MalformedLiteral(fake_literal))
+            );
+            for target in [other_empty, lookalike_empty] {
+                assert_eq!(
+                    store.is_type_assignable_to(number, target),
+                    Err(RelationUnavailable::StructuralRelation {
+                        source: number,
+                        target,
+                        relation: RelationKind::Assignable,
+                    })
+                );
+            }
+        }
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        assert!(store.set_type_symbol(empty, None));
+        let damaged = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(number, empty),
+            Err(RelationUnavailable::InvalidStructuredMembers(empty))
+        );
+        assert_eq!(store.relation_state_snapshot(), damaged);
+        assert!(store.set_type_symbol(empty, Some(owner)));
+        assert_eq!(store.is_type_assignable_to(number, empty), Ok(true));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep cold, warm, and damaged states on the same source declarations.
+    fn primitive_empty_intersection_properties_use_the_real_global_wrappers() {
+        use crate::semantic::instantiate::{InstantiationLimits, InstantiationSession};
+
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {}\n",
+            "interface Object {} interface Function {}\n",
+            "interface CallableFunction {} interface NewableFunction {}\n",
+            "interface IArguments {} interface Boolean {} interface RegExp {}\n",
+            "interface String { readonly length: number; charAt(index: number): string }\n",
+            "interface Number { toFixed(digits?: number): string }\n",
+        ));
+        let source = parse_source_file(concat!(
+            "type Text = string & {}; type Numeric = number & {};\n",
+            "type Big = bigint & {};\n",
+            "type StringMembers = String; type NumberMembers = Number;\n",
+            "type Sized = { readonly length: number };\n",
+            "type WrongSized = { readonly length: string };\n",
+        ));
+        assert!(library.diagnostics.is_empty());
+        assert!(source.diagnostics.is_empty());
+        let mut context = source_relation_context(
+            &library,
+            &source,
+            COLD_WRAPPER_SOURCE_FILE,
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let [text, numeric, big, sized, wrong_sized] =
+            ["Text", "Numeric", "Big", "Sized", "WrongSized"].map(|name| {
+                context
+                    .get_type_from_type_node(cold_wrapper_alias_node(&source, name))
+                    .unwrap()
+            });
+        let globals = context.global_types().clone();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (string, number, bigint) = (
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.bigint_type,
+        );
+        let mut caller = InstantiationSession::new(InstantiationLimits::default());
+        let lookup = |store: &mut TestStore,
+                      receiver,
+                      name: &str,
+                      globals: Option<&CanonicalGlobalTypes>,
+                      caller: &mut InstantiationSession| {
+            store.resolved_own_property_by_key_with_context(
+                receiver,
+                EscapedName::source(name).as_ref(),
+                globals,
+                caller,
+            )
+        };
+        let store = context.store_mut_for_test();
+        let cold = cold_wrapper_allocations(store);
+        for (receiver, primitive, wrapper, name) in [
+            (text, string, globals.string_type, "length"),
+            (numeric, number, globals.number_type, "toFixed"),
+        ] {
+            assert_eq!(
+                lookup(store, receiver, name, None, &mut caller),
+                Err(RelationUnavailable::UnsupportedStructuredType(primitive))
+            );
+            assert_eq!(
+                lookup(store, receiver, name, Some(&globals), &mut caller),
+                Err(RelationUnavailable::UnresolvedStructuredMembers(wrapper))
+            );
+        }
+        assert_eq!(
+            lookup(store, big, "toString", Some(&globals), &mut caller),
+            Err(RelationUnavailable::UnsupportedStructuredType(bigint))
+        );
+        assert_eq!(cold_wrapper_allocations(store), cold);
+
+        for (name, wrapper) in [
+            ("StringMembers", globals.string_type),
+            ("NumberMembers", globals.number_type),
+        ] {
+            assert_eq!(
+                context.get_type_from_type_node(cold_wrapper_alias_node(&source, name)),
+                Ok(wrapper)
+            );
+        }
+        let store = context.store_mut_for_test();
+        let warm = cold_wrapper_allocations(store);
+        for _ in 0..2 {
+            let length = lookup(store, text, "length", Some(&globals), &mut caller)
+                .unwrap()
+                .unwrap();
+            assert_eq!(length.type_, number);
+            assert!(length.readonly && !length.optional);
+            assert_eq!(
+                lookup(
+                    store,
+                    globals.string_type,
+                    "length",
+                    Some(&globals),
+                    &mut caller
+                ),
+                Ok(Some(length))
+            );
+            for (receiver, wrapper, name) in [
+                (text, globals.string_type, "charAt"),
+                (numeric, globals.number_type, "toFixed"),
+            ] {
+                let method = lookup(store, receiver, name, Some(&globals), &mut caller)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    lookup(store, wrapper, name, Some(&globals), &mut caller),
+                    Ok(Some(method))
+                );
+                assert!(
+                    store
+                        .symbol(method.symbol)
+                        .unwrap()
+                        .flags()
+                        .contains(SymbolFlags::METHOD)
+                );
+                let signatures = store
+                    .type_payload(method.type_)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap()
+                    .signatures
+                    .as_deref()
+                    .unwrap();
+                let [signature] = signatures else {
+                    panic!("expected one declared method signature");
+                };
+                assert_eq!(
+                    store.signature(*signature).unwrap().resolved_return_type(),
+                    Some(string)
+                );
+            }
+        }
+        assert_eq!(cold_wrapper_allocations(store), warm);
+        assert_eq!(caller.total_count(), 0);
+        assert_eq!(
+            store.is_type_assignable_to_with_global_types(text, sized, &globals),
+            Ok(true)
+        );
+        assert_eq!(
+            store.is_type_assignable_to_with_global_types(text, wrong_sized, &globals),
+            Ok(false)
+        );
+        let mut invalid_globals = globals.clone();
+        invalid_globals.string_type = text;
+        let before = cold_wrapper_allocations(store);
+        assert_eq!(
+            lookup(store, text, "length", Some(&invalid_globals), &mut caller),
+            Err(RelationUnavailable::InvalidStructuredMembers(text))
+        );
+        assert_eq!(cold_wrapper_allocations(store), before);
     }
 
     #[test]

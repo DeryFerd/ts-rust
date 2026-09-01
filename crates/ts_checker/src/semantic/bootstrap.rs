@@ -2785,6 +2785,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
                 Ok(())
             }
+            TypeData::Intersection(_) => {
+                if self
+                    .primitive_empty_intersection_type(type_)
+                    .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?
+                    .is_some()
+                    && let Some(alias) = record.alias().and_then(|alias| self.type_alias(alias))
+                {
+                    for argument in alias.type_arguments().unwrap_or_default() {
+                        self.validate_cached_array_capability_worker(
+                            *argument,
+                            array_validation,
+                            visited,
+                            allowed_pending,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
             TypeData::Object(_) | TypeData::Interface(_) => {
                 if let Some(edges) = self.source_interface_condition_identity_edges(
                     type_,
@@ -5654,6 +5672,21 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 array_visited,
                 allowed_pending,
             ),
+            TypeData::Intersection(_) => {
+                if self
+                    .primitive_empty_intersection_type(type_)
+                    .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?
+                    .is_none()
+                {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                }
+                self.validate_cached_array_capability_worker(
+                    type_,
+                    array_validation,
+                    array_visited,
+                    allowed_pending,
+                )
+            }
             TypeData::Union(data) => {
                 if !visiting.insert(type_) {
                     return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
@@ -6064,6 +6097,25 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     };
                     if origins != Ordering::Equal {
                         return Ok(origins);
+                    }
+                }
+                (TypeData::Intersection(left_data), TypeData::Intersection(right_data))
+                    if self
+                        .primitive_empty_intersection_type(left)
+                        .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(left))?
+                        .is_some()
+                        && self
+                            .primitive_empty_intersection_type(right)
+                            .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(right))?
+                            .is_some() =>
+                {
+                    let constituents = self.compare_union_type_lists_worker(
+                        &left_data.intersection.types,
+                        &right_data.intersection.types,
+                        comparing,
+                    )?;
+                    if constituents != Ordering::Equal {
+                        return Ok(constituents);
                     }
                 }
                 _ => {}
@@ -13147,6 +13199,154 @@ mod tests {
                 .cached_template_literal_type(&[String::new(), String::new()], &[number_type],),
             None,
         );
+    }
+
+    #[test]
+    fn primitive_empty_intersections_preserve_literal_union_members_and_replay() {
+        let mut store = initialized(IntrinsicBootstrapOptions::default());
+        let snapshot = |store: &TestStore| {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                checker_state(store),
+                store.intersection_types.clone(),
+                store.intersection_keys_by_type.clone(),
+                bootstrap.union_types.clone(),
+                bootstrap.union_of_union_types.clone(),
+            )
+        };
+        let (empty, cases) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.empty_type_literal_type,
+                [
+                    (bootstrap.string_type, bootstrap.empty_string_type),
+                    (bootstrap.number_type, bootstrap.zero_type),
+                    (bootstrap.bigint_type, bootstrap.zero_bigint_type),
+                ],
+            )
+        };
+        for (primitive, literal) in cases {
+            for operands in [[primitive, empty], [empty, primitive]] {
+                let retained = store
+                    .canonical_source_intersection_type(&operands, None)
+                    .unwrap();
+                let union = store
+                    .literal_union_type(&[literal, retained], None)
+                    .unwrap();
+                assert_eq!(union_types(&store, union), &[literal, retained]);
+                let flags = store.type_payload(union).unwrap().object_flags();
+                assert!(flags.contains(ObjectFlags::CONTAINS_INTERSECTIONS));
+                assert!(!flags.contains(ObjectFlags::PRIMITIVE_UNION));
+                let before = snapshot(&store);
+                for members in [[literal, retained], [retained, literal]] {
+                    assert_eq!(store.validate_union_constituent(union), Ok(()));
+                    assert_eq!(store.validate_cached_union_result(union, None), Ok(()));
+                    assert_eq!(store.validate_cached_array_capability(retained), Ok(()));
+                    assert_eq!(
+                        store.cached_literal_union_type_with_alias(&members, None, None),
+                        Ok(Some(union))
+                    );
+                    assert_eq!(store.literal_union_type(&members, None), Ok(union));
+                    assert_eq!(snapshot(&store), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn primitive_empty_union_replay_rejects_missing_intersection_provenance() {
+        let mut store = initialized(IntrinsicBootstrapOptions::default());
+        let snapshot = |store: &TestStore| {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                checker_state(store),
+                store.intersection_types.clone(),
+                store.intersection_keys_by_type.clone(),
+                bootstrap.union_types.clone(),
+                bootstrap.union_of_union_types.clone(),
+            )
+        };
+        let (string, empty, literal) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.empty_type_literal_type,
+                bootstrap.empty_string_type,
+            )
+        };
+        let retained = store
+            .canonical_source_intersection_type(&[string, empty], None)
+            .unwrap();
+        let members = [literal, retained];
+        let union = store.literal_union_type(&members, None).unwrap();
+        let intact = snapshot(&store);
+        let key = store.intersection_keys_by_type.remove(&retained).unwrap();
+        let before = snapshot(&store);
+        for _ in 0..2 {
+            let expected = LiteralTypeCacheError::InvalidCachedUnion(retained);
+            assert_eq!(store.validate_union_constituent(union), Err(expected));
+            assert_eq!(
+                store.validate_cached_union_result(union, None),
+                Err(expected)
+            );
+            assert_eq!(
+                store.validate_cached_array_capability(retained),
+                Err(expected)
+            );
+            assert_eq!(
+                store.cached_literal_union_type_with_alias(&members, None, None),
+                Err(expected)
+            );
+            assert_eq!(store.literal_union_type(&members, None), Err(expected));
+            assert_eq!(snapshot(&store), before);
+        }
+        assert!(
+            store
+                .intersection_keys_by_type
+                .insert(retained, key)
+                .is_none()
+        );
+        assert_eq!(store.validate_union_constituent(union), Ok(()));
+        assert_eq!(store.validate_cached_union_result(union, None), Ok(()));
+        assert_eq!(store.literal_union_type(&members, None), Ok(union));
+        assert_eq!(snapshot(&store), intact);
+    }
+
+    #[test]
+    fn primitive_empty_union_order_uses_constituents_before_allocation_order() {
+        for number_first in [false, true] {
+            let mut store = initialized(IntrinsicBootstrapOptions::default());
+            let (string, number, empty) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.string_type,
+                    bootstrap.number_type,
+                    bootstrap.empty_type_literal_type,
+                )
+            };
+            let primitives = if number_first {
+                [number, string]
+            } else {
+                [string, number]
+            };
+            let allocated = primitives.map(|primitive| {
+                store
+                    .canonical_source_intersection_type(&[primitive, empty], None)
+                    .unwrap()
+            });
+            let expected = if number_first {
+                [allocated[1], allocated[0]]
+            } else {
+                allocated
+            };
+            let union = store.literal_union_type(&allocated, None).unwrap();
+            assert_eq!(union_types(&store, union), &expected);
+            assert_eq!(
+                store.literal_union_type(&[allocated[1], allocated[0]], None),
+                Ok(union)
+            );
+            assert_eq!(store.validate_union_constituent(union), Ok(()));
+        }
     }
 
     #[test]
