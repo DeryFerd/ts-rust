@@ -11,28 +11,33 @@ integration target. Query tests whether the same fixes work in another codebase.
 
 | Project | Original source roots | Completed source checks | Unsupported | Other results | Load syntax diagnostics |
 | --- | ---: | ---: | ---: | --- | ---: |
-| Hono | 188 | 27 | 155 | 5 internal errors, 1 original-policy declaration skip | 0 |
+| Hono | 188 | 29 | 155 | 3 internal errors, 1 original-policy declaration skip | 0 |
 | TanStack Query core | 23 | 1 | 22 | None | 0 |
 
-These are complete first-failure measurements on `035a0751`, not pass rates. A completed
+These are complete first-failure measurements on `6d7a5f06`, not pass rates. A completed
 source check does not include a complete diagnostic comparison. Both ordinary
 project controls failed. Every original source root has an outcome. One binary
 checked both projects. Both commands and separate cleanup are closed. The raw
-streams, counts, final reports and all 58 saved output hashes are verified.
+streams, counts, root lists and loaded graphs are verified. Independent review
+and the complete 58-file output seal are closed.
 
 The full loaded graphs and root lists are unchanged from the earlier run.
 Hono's 55 syntax diagnostics and Query's 25 syntax diagnostics are now gone.
-Hono's HTTP status source completes again. This repairs the one-file regression
-in the previous measurement. It does not improve on that file's older result.
-All other Hono source outcomes are unchanged apart from one printed internal
-symbol number. Every Query outcome is unchanged.
+Hono's JSX constants and request constants now complete. All 27 previous Hono
+completions remain, including its HTTP status source. Two internal errors now
+reach typed unsupported results. Fourteen Hono outcomes changed, including one
+printed internal symbol number that is not progress. Query's utils source now
+reaches a parameter check instead of the earlier overload-owner refusal.
+Its other 23 outcomes, including the ordinary project result, are unchanged.
 
-The saved [Hono stream](../target/wave202-demo-shared-project-census-5-hono.jsonl)
-and [Query stream](../target/wave202-demo-shared-project-census-5-query.jsonl)
+The saved [Hono stream](../target/wave202-demo-shared-project-census-7-hono.jsonl)
+and [Query stream](../target/wave202-demo-shared-project-census-7-query.jsonl)
 retain every outcome, complete typed error and loaded diagnostic. The
-[complete report](../target/wave202-demo-shared-project-census-5-result.md)
-and [independent review](../target/wave202-demo-shared-project-census-5-result-review.md)
-record the source, build, unchanged inputs and closed cleanup.
+[complete report](../target/wave202-demo-shared-project-census-7-result.md)
+records the source, build, unchanged inputs and closed cleanup. Its
+[independent review](../target/wave202-demo-shared-project-census-7-result-review.md)
+is closed. The previous complete measurement remains in the
+[C5 report](../target/wave202-demo-shared-project-census-5-result.md).
 
 The [Hono result](../target/wave202-demo-hono-first-failure-census-1-result.md)
 and [Query result](../target/wave202-demo-query-first-failure-census-1-result.md)
@@ -58,10 +63,14 @@ and reviewed at `99597a7b`. The remaining failure needs scalar method-value
 lookup through the existing wrapper-type provider. Its source and tests have
 paired approval and are committed at `4192503d`, including a correction for
 caller-limit cache recovery.
-Both are now combined and source-reviewed at `267cfa91`. Its full test run is
-being prepared. Neither repair has a runtime result yet. The primary branch
-still uses the previously accepted compiler source. No core candidate is
-accepted from this failed check.
+Both are now combined and source-reviewed at `267cfa91`. Its next check passed
+formatting, then Clippy stopped on Rust error E0609 in a new scalar-method test.
+The helper uses `question_token`, but the AST field is `postfix_token`.
+All 6,559 selected tests remain unrun. Separate cleanup and independent review
+are closed. The [failed check](../target/wave202-core-parser-combined-full-4-quality-report.md)
+retains the complete error. The exact field-name correction is committed and
+independently verified at `c70de1f9`. The next check is in preparation.
+The primary branch still uses the previously accepted compiler source.
 
 The five parser repairs are committed at `b1746a95`, with 28 new tests.
 The shared project run now confirms that all 55 Hono syntax diagnostics and
@@ -111,7 +120,8 @@ and [independent review](../target/wave202-alias-repair-focused-4-runtime-review
 retain all six failures. This is still a failed gate.
 The written conditional-argument proof repair is source-reviewed and committed
 at `2c443dcf`. The unique-symbol property repair is source-reviewed and committed
-at `c79055e9`. Their reviewed source integration is now in progress. Neither has run.
+at `c79055e9`. Their source integration is committed and independently reviewed
+at `f9b477c4`. Its next 5,107-test check is being prepared. Neither repair has run.
 
 The first shared project compiler is committed and independently verified at
 `b71b4158`. It combines the repaired library, class work, core, parser and
@@ -144,7 +154,7 @@ The separate namespace query selection repair is also committed and reviewed
 at `b879db17`. Its first failing operation is shared by 20 measured tests.
 Those tests have not run on the repair. The four fixes are now combined and
 source-reviewed at `035a0751`, with 7,296 selected names and 559 required controls.
-The latest project measurement in the table used that source. Its build took
+The earlier C5 project measurement used that source. Its build took
 74 seconds, Hono took 335 seconds and Query took 40 seconds. That measurement
 did not run the unit tests.
 
@@ -165,27 +175,27 @@ a unit struct. Neither Hono nor Query ran. The main and separate cleanup are
 closed. The [saved build result](../target/wave202-demo-shared-project-census-6-result.md)
 and [independent review](../target/wave202-demo-shared-project-census-6-result-review.md)
 retain the failure. All 24 saved output hashes and modes are verified.
-There are no new project outcomes.
+That failed build produced no project outcomes.
 
 The exact one-line correction is committed and independently verified at
-`6d7a5f06`. It keeps all real binder and owner checks. The next unchanged-project
-run is being prepared on that source. The batch's 7,318 test names remain source
-metadata, not test results. The shared function/arrow local-variable repair is
-also committed and reviewed at `76811b77`. Its integration with typed fields is
-now in progress, including the compile correction. It stays outside the next
-project run.
+`6d7a5f06`. It keeps all real binder and owner checks. The latest project run
+built that source in 73 seconds and checked both unchanged projects. Its results
+are in the table above. The batch's 7,318 test names remain source metadata,
+not test results. The shared function/arrow local-variable repair at `76811b77`
+is now combined with typed fields and the compile correction at `d1762098`.
+Both source intervals have independent review. Its 7,346 selected tests have
+not run. A finite Rust compile request is prepared for that source.
 
 ## Next work
 
-1. Check Rust compilation before combining more source repairs. Then run the
-   shared checker-library check and combined core tests. Keep every old result
-   in the comparison. Use the completed alias run to select its next batch.
-2. Run the corrected batch on both unchanged projects with one fixed binary.
-   Use the next actual failure in each source file to choose the following repairs.
-3. Combine the typed-field and shared function/arrow local-variable work after
-   source review, then measure both projects again.
-4. Compile and test the eight project repairs below, then combine them. Finish
-   the remaining alias repairs. Require tests before accepting their source.
+1. Fix the Rust test API errors found by the early checks. Compile and test the
+   eight project repairs below before accepting their combined source.
+2. Compile the combined typed-field and shared statement source, then measure
+   both unchanged projects again. Use the new C7 failures to select repairs.
+3. Finish the shared try/catch/throw and returned-arrow work. Each uses the
+   existing statement and type workers, with separate source and test owners.
+4. Run the repaired core and alias checks, keeping every old result in the
+   comparison. Finish the remaining failures before accepting those batches.
 5. Compare complete project diagnostics with TypeScript-Go. Then show one
    deliberate type error in a separate copy with its correct location.
 
@@ -199,8 +209,14 @@ All eight feature commits now have independent source review and verified
 commit contents. They add 55 controls. None has a runtime result. The generic
 constructor batch's separate Rust error, a question mark applied to a bool,
 is corrected and independently verified at `fcaf8610`. Rust compile checks for
-all eight batches are being prepared. Source review is not proof that a batch
-compiles or checks a project.
+all eight batches are prepared or in final preparation review. The first actual
+generic-class check stopped on four Rust API errors in an inherited public test
+file. Its normal library compiled, but its required test targets were not reached.
+No TypeScript test ran. The same failing test file exists in all eight batches
+and the statement/field integration. One shared test-only correction is in progress.
+The import-annotation request timed out before execution. The constructor-annotation
+request was not submitted. Both are on hold until the shared correction is ready.
+Source review is not proof that a batch compiles or checks a project.
 
 | Repair pair | Feature commit | Work in the commit |
 | --- | --- | --- |
@@ -228,11 +244,14 @@ including test code when needed. A compile result is not a passing TypeScript
 test or project result.
 
 Small libraries remain possible earlier demo targets, but none is proved
-close to a full check. The cached tiny-invariant, Mitt, UFO, Pathe and
-sourcemap-codec inputs lack dependencies. Current-source audits also retain
-known compiler limits. Mitt additionally needs its original generated package
-declarations. A valid measurement must prepare those inputs first and keep
-the full original configuration, including any tests and ambient types.
+close to a full check. Tiny-invariant's locked dependencies are now installed
+in an isolated copy, using its pinned Node 18.4.0 and explicit Yarn 1.22.22.
+Install scripts were disabled. All five original TypeScript roots and the full
+config are unchanged. Independent input review comes before the reference
+typecheck. Its compiler limits remain unverified by a full project run.
+Mitt, UFO, Pathe and sourcemap-codec still need dependency preparation. Mitt also
+needs its original generated package declarations. No smaller root list or
+omitted ambient package counts as a complete project check.
 
 Source workers have separate worktrees and test partners. Shared merge work
 has explicit file ownership and one Git coordinator. At most three Cargo
