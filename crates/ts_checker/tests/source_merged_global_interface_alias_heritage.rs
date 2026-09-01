@@ -4,10 +4,11 @@ use ts_binder::{
     EscapedName, SemanticSymbolId, SymbolFlags, canonical_has_syntactic_modifier,
 };
 use ts_checker::semantic::{
-    CanonicalArtifactQueryError, CanonicalCheckerContext, CanonicalCheckerOptions,
-    DeclaredTypeError, IntrinsicBootstrapOptions, TypeData, TypeId, TypeNodeUnavailable,
+    CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeError, IntrinsicBootstrapOptions,
+    TypeAliasId, TypeData, TypeId, TypeNodeUnavailable, TypeRecord,
+    artifact_queries::CanonicalArtifactQueryError,
     type_records::{InterfaceTypeData, StructuredTypeData},
-    types::ObjectFlags,
+    types::{ObjectFlags, TypeFlags},
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -390,6 +391,31 @@ fn assert_alias_result(
     }
 }
 
+// Owns the full reference record without another store read.
+#[derive(Debug, PartialEq)]
+struct ReferenceSnapshot {
+    id: TypeId,
+    flags: TypeFlags,
+    object_flags: ObjectFlags,
+    symbol: Option<SemanticSymbolId>,
+    alias: Option<TypeAliasId>,
+    data: TypeData,
+}
+
+fn reference_snapshot(record: &TypeRecord) -> ReferenceSnapshot {
+    let TypeData::TypeReference(data) = record.data() else {
+        panic!("the snapshot must retain the actual TypeReference variant")
+    };
+    ReferenceSnapshot {
+        id: record.id(),
+        flags: record.flags(),
+        object_flags: record.object_flags(),
+        symbol: record.symbol(),
+        alias: record.alias(),
+        data: TypeData::TypeReference(data.clone()),
+    }
+}
+
 fn snapshot(
     checker: &CanonicalCheckerContext<'_>,
     inputs: &[Input<'_>],
@@ -594,7 +620,7 @@ fn merged_global_alias_bases_keep_all_declarations_and_inherited_owners() {
                     .file(AUGMENTATION)
                     .unwrap()
                     .1
-                    .locals(source)
+                    .locals(source.node_ref())
                     .unwrap();
                 assert_eq!(
                     store.symbol_table(locals).unwrap().get_source("Added"),
@@ -1301,7 +1327,7 @@ fn global_dependent_alias_heritage_keeps_the_inherited_generic_proxy() {
         ];
         let warm = (
             snapshot(&checker, &inputs, &types, &owners),
-            checker.store().type_payload(reference).cloned(),
+            checker.store().type_payload(reference).map(reference_snapshot),
             format!("{:?}", checker.store().mapper_payload(mapper)),
         );
         for _ in 0..2 {
@@ -1330,7 +1356,7 @@ fn global_dependent_alias_heritage_keeps_the_inherited_generic_proxy() {
             assert_eq!(
                 (
                     snapshot(&checker, &inputs, &types, &owners),
-                    checker.store().type_payload(reference).cloned(),
+                    checker.store().type_payload(reference).map(reference_snapshot),
                     format!("{:?}", checker.store().mapper_payload(mapper)),
                 ),
                 warm,
