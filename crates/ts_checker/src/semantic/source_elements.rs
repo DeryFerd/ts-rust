@@ -2973,6 +2973,7 @@ struct ResolvedIndexSignatures {
     number: Option<TypeId>,
 }
 
+#[allow(clippy::too_many_lines)] // Source-owned indexes and declared indexes keep separate proofs.
 fn resolved_index_signature_surface(
     store: &CanonicalTypeMapperStore,
     receiver_type: TypeId,
@@ -2983,9 +2984,40 @@ fn resolved_index_signature_surface(
     let TypeData::Object(object) = record.data() else {
         return Ok(None);
     };
+    let computed = object.source_computed_literal.is_some()
+        || super::object_members::source_object_requires_computed_proof(store, receiver_type);
+    if computed
+        && !super::object_members::source_computed_object_receiver_is_exact(store, receiver_type)
+    {
+        return Err(SourceElementError::Unsupported(
+            SourceElementUnsupported::IndexSignatureSurface(receiver_type),
+        ));
+    }
     let Some(index_infos) = object.structured.index_infos.as_deref() else {
         return Ok(None);
     };
+    if computed {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?;
+        let mut result = ResolvedIndexSignatures {
+            string: None,
+            number: None,
+        };
+        for index in index_infos {
+            let info = store
+                .index_info(*index)
+                .ok_or(SourceElementError::InvalidType(receiver_type))?;
+            if info.key_type() == bootstrap.string_type {
+                result.string = Some(info.value_type());
+            } else if info.key_type() == bootstrap.number_type {
+                result.number = Some(info.value_type());
+            } else {
+                return Err(SourceElementError::InvalidType(receiver_type));
+            }
+        }
+        return Ok(Some(result));
+    }
     let object_flags = record.object_flags();
     if index_infos.is_empty()
         || record.flags() != TypeFlags::OBJECT
@@ -7136,3 +7168,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "source_elements_computed_index_tests.rs"]
+mod computed_index_tests;

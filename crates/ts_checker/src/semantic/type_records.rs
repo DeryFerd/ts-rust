@@ -161,6 +161,8 @@ pub struct ObjectTypeData {
     pub target: Option<TypeId>,
     pub mapper: Option<TypeMapperId>,
     pub instantiations: TypeCacheState,
+    pub(super) source_computed_literal:
+        Option<std::sync::Arc<super::object_members::SourceComputedObjectLiteralOrigin>>,
 }
 
 /// Deferred or resolved instantiation of an interface/tuple target.
@@ -628,6 +630,36 @@ pub struct TypeRecord {
 }
 
 impl TypeRecord {
+    pub(super) fn attach_source_computed_literal(
+        &mut self,
+        origin: std::sync::Arc<super::object_members::SourceComputedObjectLiteralOrigin>,
+    ) -> bool {
+        if self.id != origin.type_id()
+            || self.symbol != Some(origin.owner())
+            || self.flags != TypeFlags::OBJECT
+            || self.alias.is_some()
+            || !self.object_flags.contains(
+                ObjectFlags::OBJECT_LITERAL
+                    | ObjectFlags::FRESH_LITERAL
+                    | ObjectFlags::MEMBERS_RESOLVED,
+            )
+        {
+            return false;
+        }
+        let TypeData::Object(object) = &mut self.data else {
+            return false;
+        };
+        if object.source_computed_literal.is_some()
+            || object.target.is_some()
+            || object.mapper.is_some()
+            || object.instantiations != TypeCacheState::Unallocated
+        {
+            return false;
+        }
+        object.source_computed_literal = Some(origin);
+        true
+    }
+
     #[must_use]
     pub const fn id(&self) -> TypeId {
         self.id

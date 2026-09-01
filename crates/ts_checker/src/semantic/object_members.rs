@@ -3451,6 +3451,30 @@ pub(super) struct ObjectLiteralPropertyCloneOrigin {
     source: SemanticSymbolId,
 }
 
+/// Keeps hidden computed members and their checked inputs on the original object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceComputedObjectLiteralOrigin {
+    type_: TypeId,
+    plan: PropertyObjectPlan,
+    keys: Vec<super::source::CheckedSourceComputedObjectKey>,
+    property_types: Vec<TypeId>,
+    properties: Vec<SemanticSymbolId>,
+    indexes: Vec<(super::IndexInfoId, TypeId)>,
+}
+
+impl SourceComputedObjectLiteralOrigin {
+    pub(super) const fn type_id(&self) -> TypeId {
+        self.type_
+    }
+    pub(super) const fn owner(&self) -> SemanticSymbolId {
+        self.plan.symbol
+    }
+
+    pub(super) fn property_symbols(&self) -> &[SemanticSymbolId] {
+        &self.properties
+    }
+}
+
 impl ObjectLiteralPropertyCloneOrigin {
     pub(super) const fn symbol(&self) -> SemanticSymbolId {
         self.symbol
@@ -3870,6 +3894,14 @@ impl PropertyObjectPlan {
     ) -> Option<&[super::source_properties::ClassBindingPropertyPlan]> {
         self.class_assignment_properties.as_deref()
     }
+    pub(super) fn has_source_computed_properties(&self) -> bool {
+        self.kind == PropertyObjectKind::ObjectLiteral
+            && self
+                .properties
+                .iter()
+                .any(|property| property.name.as_ref() == InternalSymbolName::Computed.as_ref())
+    }
+
     pub(super) fn object_literal_getter(
         &self,
         symbol: SemanticSymbolId,
@@ -6092,6 +6124,25 @@ pub(super) fn plan_object_literal(
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
 ) -> Result<PropertyObjectPlan, PropertyObjectError> {
+    plan_object_literal_worker(store, host, node, false)
+}
+
+/// Source checking supplies the key expressions before object publication.
+pub(super) fn plan_source_object_literal(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<PropertyObjectPlan, PropertyObjectError> {
+    plan_object_literal_worker(store, host, node, true)
+}
+
+#[allow(clippy::too_many_lines)] // The owner and complete source member set are checked together.
+fn plan_object_literal_worker(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    source_computed_keys: bool,
+) -> Result<PropertyObjectPlan, PropertyObjectError> {
     let record = preflight_node(store, host, node)
         .map_err(|_| PropertyObjectError::InvalidObjectLiteral(node))?;
     let NodeData::ObjectLiteralExpression(object) = &record.data else {
@@ -6139,15 +6190,17 @@ pub(super) fn plan_object_literal(
         let expression = NodeRef::new(name.arena, name.file, computed.expression);
         let expression_record = preflight_node(store, host, expression)
             .map_err(|_| PropertyObjectError::InvalidObjectLiteral(node))?;
-        if !matches!(
-            (&expression_record.data, expression_record.kind),
-            (NodeData::StringLiteral(_), SyntaxKind::StringLiteral)
-                | (NodeData::NumericLiteral(_), SyntaxKind::NumericLiteral)
-                | (
-                    NodeData::NoSubstitutionTemplateLiteral(_),
-                    SyntaxKind::NoSubstitutionTemplateLiteral
-                )
-        ) {
+        if !source_computed_keys
+            && !matches!(
+                (&expression_record.data, expression_record.kind),
+                (NodeData::StringLiteral(_), SyntaxKind::StringLiteral)
+                    | (NodeData::NumericLiteral(_), SyntaxKind::NumericLiteral)
+                    | (
+                        NodeData::NoSubstitutionTemplateLiteral(_),
+                        SyntaxKind::NoSubstitutionTemplateLiteral
+                    )
+            )
+        {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: name,
                 kind: SyntaxKind::ComputedPropertyName,
@@ -6170,8 +6223,28 @@ pub(super) fn plan_object_literal(
         } else {
             TypeLiteralMemberPolicy::General
         },
+        source_computed_keys,
     )?;
     plan.class_assignment_properties = assignment;
+    if plan.has_source_computed_properties()
+        && (!plan.spreads.is_empty()
+            || plan.properties.iter().any(|property| {
+                !matches!(
+                    store.source_node_kind(property.declaration),
+                    Some(SyntaxKind::PropertyAssignment | SyntaxKind::ShorthandPropertyAssignment)
+                )
+            }))
+    {
+        let property = plan
+            .properties
+            .iter()
+            .find(|property| property.name.as_ref() == InternalSymbolName::Computed.as_ref())
+            .expect("the plan has a source-checked computed property");
+        return Err(PropertyObjectError::UnsupportedMember {
+            node: property.name_node,
+            kind: SyntaxKind::ComputedPropertyName,
+        });
+    }
     plan.const_context = object_literal_has_const_assertion(store, host, node)?;
     if plan.const_context {
         for property in &mut plan.properties {
@@ -6535,6 +6608,7 @@ fn plan_type_literal_with_policy(
         &[],
         alias_symbol,
         policy,
+        false,
     )
 }
 
@@ -7361,6 +7435,7 @@ pub(super) fn plan_interface(
         &additional_members,
         None,
         TypeLiteralMemberPolicy::General,
+        false,
     )?;
     plan.heritage = heritage;
     if let Some(call) = plan.call_signatures.first()
@@ -11027,6 +11102,7 @@ pub(super) fn plan_generic_interface(
         &additional_members,
         None,
         TypeLiteralMemberPolicy::GenericInterface,
+        false,
     )?;
     plan.heritage = heritage;
     if let Some(call) = plan.call_signatures.first()
@@ -11928,6 +12004,7 @@ fn plan_members(
     additional_members: &[(NodeRef, &NodeList)],
     alias_symbol: Option<SemanticSymbolId>,
     policy: TypeLiteralMemberPolicy,
+    source_computed_keys: bool,
 ) -> Result<PropertyObjectPlan, PropertyObjectError> {
     let provisional = PropertyObjectPlan {
         kind,
@@ -12023,9 +12100,23 @@ fn plan_members(
             })
         })
         .count();
+    let source_computed_count = if source_computed_keys && kind == PropertyObjectKind::ObjectLiteral
+    {
+        member_entries
+            .iter()
+            .filter(|(_, member)| {
+                bound_symbol(store, host, *member)
+                    .and_then(|symbol| store.symbol(symbol))
+                    .is_some_and(|symbol| symbol.name() == InternalSymbolName::Computed.as_ref())
+            })
+            .count()
+    } else {
+        0
+    };
     if policy != TypeLiteralMemberPolicy::GenericInterface
         && (direct_member_count == 0 && members.is_some()
-            || direct_member_count > computed_method_count && members.is_none())
+            || direct_member_count > computed_method_count + source_computed_count
+                && members.is_none())
     {
         return Err(invalid_plan(&provisional));
     }
@@ -12035,6 +12126,7 @@ fn plan_members(
     let mut properties = Vec::with_capacity(member_count);
     let mut methods = Vec::new();
     let mut computed_properties = HashSet::new();
+    let mut source_computed_properties = HashSet::new();
     let mut computed_method_groups = HashMap::<SemanticSymbolId, usize>::new();
     let mut accessors = Vec::new();
     let mut object_literal_getters = Vec::new();
@@ -12482,6 +12574,7 @@ fn plan_members(
         let name = NodeRef::new(member.arena, member.file, name_id);
         let name_record =
             preflight_node(store, host, name).map_err(|_| invalid_plan(&provisional))?;
+        let mut source_computed_property = false;
         let property_name = match &name_record.data {
             NodeData::Identifier(identifier) if name_record.kind == SyntaxKind::Identifier => {
                 identifier.text.clone()
@@ -12527,6 +12620,13 @@ fn plan_members(
                     {
                         literal.text.clone()
                     }
+                    _ if source_computed_keys
+                        && kind == PropertyObjectKind::ObjectLiteral
+                        && member_record.kind == SyntaxKind::PropertyAssignment =>
+                    {
+                        source_computed_property = true;
+                        String::new()
+                    }
                     _ => {
                         return Err(PropertyObjectError::UnsupportedMember {
                             node: name,
@@ -12542,7 +12642,11 @@ fn plan_members(
                 });
             }
         };
-        let property_name = EscapedName::source(property_name);
+        let property_name = if source_computed_property {
+            EscapedName::internal(InternalSymbolName::Computed)
+        } else {
+            EscapedName::source(property_name)
+        };
         if name_record.parent != Some(member.node)
             || name_record.range.start < member_record.range.start
             || name_record.range.end > member_record.range.end
@@ -12656,7 +12760,11 @@ fn plan_members(
                 .parent()
                 .and_then(|parent| store.get_merged_symbol(parent))
                 != Some(symbol)
-            || table.and_then(|table| table.get(property_name.as_ref())) != Some(property_symbol)
+            || if source_computed_property {
+                table.is_some_and(|table| table.iter().any(|(_, symbol)| symbol == property_symbol))
+            } else {
+                table.and_then(|table| table.get(property_name.as_ref())) != Some(property_symbol)
+            }
         {
             return Err(invalid_plan(&provisional));
         }
@@ -12732,7 +12840,9 @@ fn plan_members(
             }
             continue;
         }
-        if !seen_names.insert(property_name.clone()) {
+        if source_computed_property {
+            source_computed_properties.insert(property_symbol);
+        } else if !seen_names.insert(property_name.clone()) {
             return Err(invalid_plan(&provisional));
         }
         properties.push(PlannedProperty {
@@ -12807,7 +12917,10 @@ fn plan_members(
         table.len()
             != properties
                 .iter()
-                .filter(|property| !computed_properties.contains(&property.symbol))
+                .filter(|property| {
+                    !computed_properties.contains(&property.symbol)
+                        && !source_computed_properties.contains(&property.symbol)
+                })
                 .count()
                 .saturating_add(reserved_index_count)
                 .saturating_add(reserved_call_count)
@@ -16872,6 +16985,9 @@ pub(super) fn object_literal_state(
     plan: &PropertyObjectPlan,
 ) -> Result<Option<PropertyObjectState>, PropertyObjectError> {
     debug_assert_eq!(plan.kind, PropertyObjectKind::ObjectLiteral);
+    if plan.has_source_computed_properties() {
+        return source_computed_object_literal_state(store, plan);
+    }
     if is_javascript_expando_object_plan(store, plan) {
         return javascript_expando_object_state(store, plan);
     }
@@ -20806,6 +20922,11 @@ fn object_literal_property_types(
     object: &ObjectTypeData,
     plan: &PropertyObjectPlan,
 ) -> Option<Vec<TypeId>> {
+    if object.source_computed_literal.is_some() {
+        let origin = object.source_computed_literal.as_deref()?;
+        return (source_computed_object_literal_origin(store, origin.type_)?.plan == *plan)
+            .then(|| origin.property_types.clone());
+    }
     if !valid_object_tail(object)
         || object.structured.constrained != ConstrainedTypeData::default()
         || object.structured.signatures.is_some()
@@ -24822,11 +24943,649 @@ fn valid_bound_object_literal_property(
             store.source_node_parent(property.type_node)
                 == Some(SourceNodeParent::Parent(property.declaration))
         }
-        && plan
-            .members
-            .and_then(|members| store.symbol_table(members))
-            .and_then(|members| members.get(property.name.as_ref()))
-            == Some(property.symbol)
+        && if property.name.as_ref() == InternalSymbolName::Computed.as_ref() {
+            store.source_node_kind(property.name_node) == Some(SyntaxKind::ComputedPropertyName)
+                && plan
+                    .members
+                    .and_then(|members| store.symbol_table(members))
+                    .is_none_or(|members| {
+                        members.iter().all(|(_, symbol)| symbol != property.symbol)
+                    })
+        } else {
+            plan.members
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get(property.name.as_ref()))
+                == Some(property.symbol)
+        }
+}
+
+#[derive(Clone, Debug)]
+struct ComputedObjectPropertyKey {
+    name: Option<EscapedName>,
+    name_type: Option<TypeId>,
+    numeric: bool,
+}
+
+fn source_computed_object_property_keys(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    keys: &[super::source::CheckedSourceComputedObjectKey],
+) -> Result<Vec<ComputedObjectPropertyKey>, PropertyObjectError> {
+    let invalid = || PropertyObjectError::InvalidObjectLiteral(plan.node);
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let mut result = Vec::with_capacity(plan.properties.len());
+    let mut names = HashSet::new();
+    let mut key_index = 0;
+    for property in &plan.properties {
+        let late = property.name.as_ref() == InternalSymbolName::Computed.as_ref();
+        let key = if store.source_node_kind(property.name_node)
+            == Some(SyntaxKind::ComputedPropertyName)
+        {
+            let checked = keys.get(key_index).ok_or_else(invalid)?;
+            let (node, type_) = (checked.node(), checked.type_id());
+            key_index += 1;
+            if store.source_node_parent(node) != Some(SourceNodeParent::Parent(property.name_node))
+                || !checked.is_current(store)
+            {
+                return Err(invalid());
+            }
+            if let Some(name) = super::source::literal_computed_property_name(store, type_) {
+                let name = EscapedName::source(name);
+                if !late && name != property.name {
+                    return Err(invalid());
+                }
+                ComputedObjectPropertyKey {
+                    numeric: name
+                        .as_ref()
+                        .as_utf8()
+                        .is_some_and(|name| ts_jsnum::from_string(name).to_string() == name),
+                    name: Some(name),
+                    name_type: late.then_some(type_),
+                }
+            } else if late && (type_ == bootstrap.string_type || type_ == bootstrap.number_type) {
+                ComputedObjectPropertyKey {
+                    name: None,
+                    name_type: None,
+                    numeric: type_ == bootstrap.number_type,
+                }
+            } else {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: property.name_node,
+                    kind: SyntaxKind::ComputedPropertyName,
+                });
+            }
+        } else {
+            if late {
+                return Err(invalid());
+            }
+            ComputedObjectPropertyKey {
+                name: Some(property.name.clone()),
+                name_type: None,
+                numeric: property
+                    .name
+                    .as_ref()
+                    .as_utf8()
+                    .is_some_and(|name| ts_jsnum::from_string(name).to_string() == name),
+            }
+        };
+        if let Some(name) = &key.name
+            && !names.insert(name.clone())
+        {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: property.name_node,
+                kind: SyntaxKind::ComputedPropertyName,
+            });
+        }
+        result.push(key);
+    }
+    if key_index != keys.len() {
+        return Err(invalid());
+    }
+    Ok(result)
+}
+
+pub(super) fn preflight_source_computed_object_keys(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    keys: &[super::source::CheckedSourceComputedObjectKey],
+) -> Result<(), PropertyObjectError> {
+    source_computed_object_property_keys(store, plan, keys).map(|_| ())
+}
+
+fn computed_object_index_components(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    keys: &[ComputedObjectPropertyKey],
+    numeric: bool,
+) -> Vec<NodeRef> {
+    plan.properties
+        .iter()
+        .zip(keys)
+        .filter_map(|(property, key)| {
+            ((!numeric || key.numeric)
+                && store.source_node_kind(property.name_node)
+                    == Some(SyntaxKind::ComputedPropertyName))
+            .then_some(property.declaration)
+        })
+        .collect()
+}
+
+/// A store-only reader must use the original publisher's proof, not mutable member links.
+#[allow(clippy::too_many_lines)]
+pub(super) fn source_computed_object_literal_origin(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<&SourceComputedObjectLiteralOrigin> {
+    let record = store.type_payload(type_)?;
+    let TypeData::Object(object) = record.data() else {
+        return None;
+    };
+    let origin = object.source_computed_literal.as_deref()?;
+    let plan = &origin.plan;
+    let declarations = store.source_direct_children(plan.node)?;
+    if origin.type_ != type_
+        || !plan.has_source_computed_properties()
+        || plan.declarations != [plan.node]
+        || declarations
+            != plan
+                .properties
+                .iter()
+                .map(|property| property.declaration)
+                .collect::<Vec<_>>()
+        || !plan.methods.is_empty()
+        || !plan.accessors.is_empty()
+        || !plan.object_literal_getters.is_empty()
+        || !plan.spreads.is_empty()
+        || !plan.indexes.is_empty()
+        || !plan.call_signatures.is_empty()
+        || plan.alias_symbol.is_some()
+        || plan.heritage.is_some()
+        || !valid_object_literal_owner(store, plan)
+        || !unresolved_property_links(store, plan)
+        || store.source_declaration_symbol(plan.node) != Some(plan.symbol)
+        || store.type_node_links(plan.node)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(type_),
+                outer_type_parameters: None,
+            })
+        || record.flags() != TypeFlags::OBJECT
+        || record.symbol() != Some(plan.symbol)
+        || record.alias().is_some()
+        || !valid_object_tail(object)
+        || object.structured.constrained != ConstrainedTypeData::default()
+        || object.structured.signatures.is_some()
+        || object.structured.call_signature_count != 0
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || origin.properties.len() != plan.properties.len()
+        || origin.property_types.len() != plan.properties.len()
+        || record.object_flags()
+            != expected_object_literal_flags(store, &origin.property_types)?
+                | ObjectFlags::MEMBERS_RESOLVED
+    {
+        return None;
+    }
+    let keys = source_computed_object_property_keys(store, plan, &origin.keys).ok()?;
+    let members = object.structured.members?;
+    if Some(members) == plan.members {
+        return None;
+    }
+    let table = store.symbol_table(members)?;
+    let mut named = Vec::new();
+    let mut seen = HashSet::new();
+    for (((property, key), symbol), value_type) in plan
+        .properties
+        .iter()
+        .zip(&keys)
+        .zip(&origin.properties)
+        .zip(&origin.property_types)
+    {
+        let bound = store.symbol(property.symbol)?;
+        let cloned = store.symbol(*symbol)?;
+        if !seen.insert(*symbol)
+            || *symbol == property.symbol
+            || !valid_bound_object_literal_property(store, plan, property)
+            || store.source_declaration_symbol(property.declaration) != Some(property.symbol)
+            || !store.source_symbol_declarations_match(property.symbol)
+            || !matches!(
+                store.source_node_kind(property.declaration),
+                Some(SyntaxKind::PropertyAssignment | SyntaxKind::ShorthandPropertyAssignment)
+            )
+            || property.optional
+            || property.readonly != plan.const_context
+            || !valid_object_literal_property_type(store, property, *value_type)
+            || store.get_merged_symbol(*symbol) != Some(*symbol)
+            || cloned.flags() != SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+            || cloned.check_flags()
+                != source_property_check_flags(property.readonly)
+                    | if key.name_type.is_some() {
+                        CheckFlags::LATE
+                    } else {
+                        CheckFlags::NONE
+                    }
+            || cloned.name() != key.name.as_ref().map_or(bound.name(), EscapedName::as_ref)
+            || cloned.declarations() != bound.declarations()
+            || cloned.value_declaration() != Some(property.declaration)
+            || cloned.parent() != Some(plan.symbol)
+            || cloned.members().is_some()
+            || cloned.exports().is_some()
+            || cloned.export_symbol().is_some()
+            || store.value_symbol_links(*symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(*value_type),
+                    target: Some(property.symbol),
+                    name_type: key.name_type,
+                    ..ValueSymbolLinks::default()
+                })
+            || store.object_literal_property_clone_origin(*symbol)
+                != Some(&ObjectLiteralPropertyCloneOrigin {
+                    symbol: *symbol,
+                    owner: plan.node,
+                    source: property.symbol,
+                })
+        {
+            return None;
+        }
+        if let Some(name) = &key.name {
+            if table.get(name.as_ref()) != Some(*symbol) {
+                return None;
+            }
+            named.push(*symbol);
+        }
+    }
+    if table.len() != named.len()
+        || object.structured.properties.as_deref()
+            != (!named.is_empty()).then_some(named.as_slice())
+    {
+        return None;
+    }
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let expected_domains = [false, true]
+        .into_iter()
+        .filter(|numeric| {
+            keys.iter()
+                .any(|key| key.name.is_none() && key.numeric == *numeric)
+        })
+        .collect::<Vec<_>>();
+    let index_ids = origin.indexes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    if expected_domains.len() != origin.indexes.len()
+        || object.structured.index_infos.as_deref()
+            != (!index_ids.is_empty()).then_some(index_ids.as_slice())
+    {
+        return None;
+    }
+    for ((id, value), numeric) in origin.indexes.iter().zip(expected_domains) {
+        let info = store.index_info(*id)?;
+        if info.key_type()
+            != if numeric {
+                bootstrap.number_type
+            } else {
+                bootstrap.string_type
+            }
+            || info.value_type() != *value
+            || store.validate_union_constituent(*value).is_err()
+            || info.is_readonly() != plan.const_context
+            || info.declaration().is_some()
+            || info.index_symbol().is_some()
+            || info.components() != computed_object_index_components(store, plan, &keys, numeric)
+        {
+            return None;
+        }
+    }
+    Some(origin)
+}
+
+pub(super) fn source_object_requires_computed_proof(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> bool {
+    store
+        .type_payload(type_)
+        .and_then(TypeRecord::symbol)
+        .and_then(|symbol| store.symbol(symbol))
+        .and_then(ts_binder::semantic::Symbol::value_declaration)
+        .and_then(|node| store.source_direct_children(node))
+        .is_some_and(|children| {
+            children.iter().any(|node| {
+                store
+                    .source_declaration_symbol(*node)
+                    .and_then(|symbol| store.symbol(symbol))
+                    .is_some_and(|symbol| symbol.name() == InternalSymbolName::Computed.as_ref())
+            })
+        })
+}
+
+pub(super) fn source_computed_object_named_properties(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<Vec<(SemanticSymbolId, EscapedName, TypeId)>> {
+    source_computed_object_literal_origin(store, type_)?;
+    let structured = store.type_payload(type_)?.data().structured()?;
+    structured
+        .properties
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|symbol| {
+            Some((
+                *symbol,
+                store.symbol(*symbol)?.name().to_owned(),
+                store.value_symbol_links(*symbol)?.resolved_type?,
+            ))
+        })
+        .collect()
+}
+
+pub(super) fn source_computed_object_receiver_is_exact(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> bool {
+    if source_computed_object_literal_origin(store, type_).is_some() {
+        return true;
+    }
+    matches!(store.validate_derived_object_literal_for_relation(type_),
+        super::derived_types::DerivedObjectLiteralValidation::Valid { source, .. }
+            if source_computed_object_literal_origin(store, source).is_some())
+}
+
+pub(super) fn source_computed_object_clone_is_exact(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    owner: SemanticSymbolId,
+) -> bool {
+    let Some(type_) = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::value_declaration)
+        .and_then(|node| store.type_node_links(node))
+        .and_then(|links| links.resolved_type)
+    else {
+        return false;
+    };
+    source_computed_object_literal_origin(store, type_).is_some_and(|origin| {
+        origin.plan.symbol == owner
+            && origin.property_symbols().contains(&symbol)
+            && store
+                .type_payload(type_)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.properties.as_ref())
+                .is_some_and(|properties| properties.contains(&symbol))
+    })
+}
+
+pub(super) fn source_computed_object_property_type(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    source: SemanticSymbolId,
+) -> Option<TypeId> {
+    let origin = source_computed_object_literal_origin(store, type_)?;
+    origin
+        .plan
+        .properties
+        .iter()
+        .position(|property| property.symbol == source)
+        .map(|index| origin.property_types[index])
+}
+
+fn source_computed_object_literal_state(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+) -> Result<Option<PropertyObjectState>, PropertyObjectError> {
+    let Some(links) = store.type_node_links(plan.node) else {
+        return if valid_object_literal_owner(store, plan)
+            && unresolved_property_links(store, plan)
+            && plan
+                .properties
+                .iter()
+                .all(|property| valid_bound_object_literal_property(store, plan, property))
+        {
+            Ok(None)
+        } else {
+            Err(PropertyObjectError::InvalidObjectLiteral(plan.node))
+        };
+    };
+    let type_ = links
+        .resolved_type
+        .ok_or(PropertyObjectError::InvalidObjectLiteral(plan.node))?;
+    match source_computed_object_literal_origin(store, type_) {
+        Some(origin) if origin.plan == *plan => Ok(Some(PropertyObjectState::Resolved(type_))),
+        _ => Err(invalid_cache(plan, type_)),
+    }
+}
+
+/// Publishes the ordinary property clones and index information after all keys and values check.
+#[allow(clippy::too_many_lines)]
+pub(super) fn publish_source_computed_object_literal(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    plan: &PropertyObjectPlan,
+    checked_keys: &[super::source::CheckedSourceComputedObjectKey],
+    property_types: &[TypeId],
+) -> Result<TypeId, PropertyObjectError> {
+    let invalid = || PropertyObjectError::InvalidObjectLiteral(plan.node);
+    if !plan.has_source_computed_properties()
+        || !plan.spreads.is_empty()
+        || !plan.object_literal_getters.is_empty()
+        || !plan.methods.is_empty()
+        || !plan.accessors.is_empty()
+        || !plan.indexes.is_empty()
+        || !plan.call_signatures.is_empty()
+        || plan.alias_symbol.is_some()
+        || plan.heritage.is_some()
+        || plan.declarations != [plan.node]
+        || property_types.len() != plan.properties.len()
+        || !valid_object_literal_owner(store, plan)
+        || !unresolved_property_links(store, plan)
+        || plan
+            .properties
+            .iter()
+            .zip(property_types)
+            .any(|(property, type_)| {
+                !valid_bound_object_literal_property(store, plan, property)
+                    || property.optional
+                    || property.readonly != plan.const_context
+                    || !valid_object_literal_property_type(store, property, *type_)
+                    || !matches!(
+                        store.source_node_kind(property.declaration),
+                        Some(
+                            SyntaxKind::PropertyAssignment
+                                | SyntaxKind::ShorthandPropertyAssignment
+                        )
+                    )
+            })
+    {
+        return Err(invalid());
+    }
+    let keys = source_computed_object_property_keys(store, plan, checked_keys)?;
+    if let Some(state) = source_computed_object_literal_state(store, plan)? {
+        let origin =
+            source_computed_object_literal_origin(store, state.type_id()).ok_or_else(invalid)?;
+        return if origin.keys == checked_keys && origin.property_types == property_types {
+            Ok(state.type_id())
+        } else {
+            Err(invalid_cache(plan, state.type_id()))
+        };
+    }
+    let flags = expected_object_literal_flags(store, property_types).ok_or_else(invalid)?;
+    let mut cloned_data = Vec::with_capacity(plan.properties.len());
+    for (property, key) in plan.properties.iter().zip(&keys) {
+        let bound = store.symbol(property.symbol).ok_or_else(invalid)?;
+        let mut data = SymbolData::new(
+            SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            key.name.clone().unwrap_or_else(|| bound.name().to_owned()),
+        );
+        data.check_flags = source_property_check_flags(property.readonly)
+            | if key.name_type.is_some() {
+                CheckFlags::LATE
+            } else {
+                CheckFlags::NONE
+            };
+        data.declarations = Some(vec![property.declaration]);
+        data.value_declaration = Some(property.declaration);
+        data.parent = Some(plan.symbol);
+        cloned_data.push(data);
+    }
+    let domains = [false, true]
+        .into_iter()
+        .filter(|numeric| {
+            keys.iter()
+                .any(|key| key.name.is_none() && key.numeric == *numeric)
+        })
+        .collect::<Vec<_>>();
+    let prepared_members =
+        PreparedSymbolTable::new(keys.iter().filter(|key| key.name.is_some()).count())
+            .ok_or(PropertyObjectError::Capacity(plan.node))?;
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_checker_symbol_allocations(plan.properties.len(), 1)
+        || !store.try_reserve_value_symbol_links(plan.properties.len())
+        || !store.try_reserve_object_literal_property_clone_origins(plan.properties.len())
+        || !store.try_reserve_index_infos(domains.len())
+        || !store.try_reserve_type_node_links(1)
+    {
+        return Err(PropertyObjectError::Capacity(plan.node));
+    }
+    let (string, number) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| (bootstrap.string_type, bootstrap.number_type))
+        .ok_or_else(invalid)?;
+    let mut index_inputs = Vec::with_capacity(domains.len());
+    for numeric in domains {
+        let values = keys
+            .iter()
+            .zip(property_types)
+            .filter_map(|(key, type_)| (!numeric || key.numeric).then_some(*type_))
+            .collect::<Vec<_>>();
+        let [first, rest @ ..] = values.as_slice() else {
+            return Err(invalid());
+        };
+        // The existing subtype reducer skips scalars. Structured comparisons need a caller session.
+        if rest.iter().any(|type_| type_ != first)
+            && values.iter().any(|type_| {
+                store.type_payload(*type_).is_none_or(|record| {
+                    record
+                        .flags()
+                        .intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
+                })
+            })
+        {
+            let property = plan
+                .properties
+                .iter()
+                .find(|property| property.name.as_ref() == InternalSymbolName::Computed.as_ref())
+                .ok_or_else(invalid)?;
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: property.name_node,
+                kind: SyntaxKind::ComputedPropertyName,
+            });
+        }
+        index_inputs.push((
+            if numeric { number } else { string },
+            values,
+            computed_object_index_components(store, plan, &keys, numeric),
+        ));
+    }
+    let mut index_plans = Vec::with_capacity(index_inputs.len());
+    for (key, values, components) in index_inputs {
+        let [first, rest @ ..] = values.as_slice() else {
+            return Err(invalid());
+        };
+        let value = if rest.iter().all(|type_| type_ == first) {
+            *first
+        } else if let Some(globals) = global_types {
+            store
+                .expression_union_type_with_global_types(globals, &values, UnionReduction::Subtype)
+                .map_err(|_| invalid())?
+        } else {
+            return Err(invalid());
+        };
+        if store.validate_union_constituent(value).is_err() {
+            return Err(invalid());
+        }
+        index_plans.push((key, value, components));
+    }
+    let members = store.alloc_prepared_symbol_table(prepared_members);
+    let mut named = Vec::new();
+    let mut properties = Vec::with_capacity(plan.properties.len());
+    for (((property, key), type_), data) in plan
+        .properties
+        .iter()
+        .zip(&keys)
+        .zip(property_types)
+        .zip(cloned_data)
+    {
+        let symbol = store
+            .alloc_symbol(data)
+            .expect("the computed object plan checked its clone");
+        assert!(store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(*type_),
+                target: Some(property.symbol),
+                name_type: key.name_type,
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert!(store.record_object_literal_property_clone_origin(
+            ObjectLiteralPropertyCloneOrigin {
+                symbol,
+                owner: plan.node,
+                source: property.symbol,
+            }
+        ));
+        if let Some(name) = &key.name {
+            assert_eq!(
+                store.insert_symbol(members, name.clone(), symbol),
+                Some(None)
+            );
+            named.push(symbol);
+        }
+        properties.push(symbol);
+    }
+    let indexes = index_plans
+        .into_iter()
+        .map(|(key, value, components)| {
+            (
+                store
+                    .alloc_index_info(key, value, plan.const_context, None, components)
+                    .expect("the computed object plan checked each index input"),
+                value,
+            )
+        })
+        .collect::<Vec<_>>();
+    let type_ = store
+        .alloc_plain_object_type(flags, Some(plan.symbol))
+        .expect("the computed object plan checked its owner");
+    assert!(store.set_structured_type_members(
+        type_,
+        Some(members),
+        (!named.is_empty()).then_some(named),
+        None,
+        None,
+        (!indexes.is_empty()).then(|| indexes.iter().map(|(id, _)| *id).collect()),
+    ));
+    let origin = Arc::new(SourceComputedObjectLiteralOrigin {
+        type_,
+        plan: plan.clone(),
+        keys: checked_keys.to_vec(),
+        property_types: property_types.to_vec(),
+        properties,
+        indexes,
+    });
+    assert!(
+        store
+            .type_payload_mut(type_)
+            .expect("the new object is store-owned")
+            .attach_source_computed_literal(origin)
+    );
+    assert!(store.set_type_node_links(
+        plan.node,
+        TypeNodeLinks {
+            resolved_type: Some(type_),
+            outer_type_parameters: None,
+        }
+    ));
+    Ok(type_)
 }
 
 fn valid_object_literal_property_declarations(
@@ -24992,6 +25751,7 @@ pub(super) fn publish_object_literal(
     if plan.kind != PropertyObjectKind::ObjectLiteral
         || store.source_node_kind(plan.node) != Some(SyntaxKind::ObjectLiteralExpression)
         || !plan.object_literal_getters.is_empty()
+        || plan.has_source_computed_properties()
     {
         return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
     }

@@ -59,8 +59,9 @@ use super::{
     },
     source_statements::{
         SourceCallableCatchBindingSyntax, SourceCallableStatementListSyntax,
-        SourceCapturedIterationStatementSyntax,
-        SourceLinearLogicalStatementSyntax, plan_source_callable_statement_list_syntax,
+        SourceCallableStatementSyntax, SourceCapturedIterationStatementSyntax,
+        SourceLinearFunctionStatementSyntax, SourceLinearLogicalStatementSyntax,
+        SourceLocalDeclarationSyntax, plan_source_callable_statement_list_syntax,
         plan_source_for_statement_syntax, plan_source_linear_logical_statement_syntax,
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
@@ -3686,6 +3687,36 @@ impl SourceFlowPlan {
             if syntax.callable.declaration != self.container {
                 return Err(SourceFlowInvariant::ForeignNode(self.container).into());
             }
+            for (&target, &declaration) in &self.assignment_declarations {
+                if !self.nullish_assignments.contains_key(&target)
+                    && !self.updates.contains_key(&target)
+                    && arena
+                        .get(target.node)
+                        .is_some_and(|record| record.kind == SyntaxKind::Identifier)
+                    && arena.get(declaration.node).is_some_and(|record| {
+                        matches!(&record.data, NodeData::VariableDeclaration(variable) if variable.initializer.is_some())
+                    })
+                {
+                    let symbol = self
+                        .assignments
+                        .get(&target)
+                        .ok_or(SourceFlowInvariant::UnknownAssignment(target))?
+                        .symbol;
+                    validate_initialized_local_assignment(
+                        arena,
+                        bound,
+                        store,
+                        host,
+                        self.container,
+                        SourceFlowParameterAssignment {
+                            target,
+                            parameter: declaration,
+                            symbol,
+                        },
+                        syntax,
+                    )?;
+                }
+            }
         }
         if let Some(region) = self.region {
             let (arena, _) = host
@@ -5753,6 +5784,73 @@ impl SourceFlowFrame<'_, '_> {
                 Err(SourceFlowInvariant::AssignmentAlreadyCompleted(declaration).into())
             }
         }
+    }
+
+    /// Compound writes widen the real antecedent, not the checked result type.
+    pub(super) fn complete_compound_assignment(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        assignment: SourceFlowParameterAssignment,
+        expression: NodeRef,
+        operator: SyntaxKind,
+    ) -> Result<(), SourceFlowError> {
+        let invalid = || SourceFlowInvariant::InvalidParameterAssignment(assignment.target);
+        let syntax = self.plan.statement_list.as_ref().ok_or_else(invalid)?;
+        let (arena, _) = host.source(self.plan.container).ok_or_else(invalid)?;
+        if !expression.is_for(arena.id(), self.bound.file_id()) || !self.bound.contains(expression)
+        {
+            return Err(invalid().into());
+        }
+        validate_statement_list_source(arena, self.bound, store, host, syntax)?;
+        validate_parameter_assignment_in_list(
+            arena,
+            self.bound,
+            store,
+            Some(host),
+            self.plan.container,
+            assignment,
+            Some(syntax),
+        )?;
+        let planned = self
+            .plan
+            .assignments
+            .get(&assignment.target)
+            .ok_or_else(invalid)?;
+        let record = host.node(expression).ok_or_else(invalid)?;
+        let NodeData::BinaryExpression(binary) = &record.data else {
+            return Err(invalid().into());
+        };
+        let right = NodeRef::new(expression.arena, expression.file, binary.right);
+        if planned.declaration != assignment.target
+            || planned.symbol != assignment.symbol
+            || self.plan.assignment_declarations.get(&assignment.target)
+                != Some(&assignment.parameter)
+            || host.node(assignment.target).and_then(|node| node.parent) != Some(expression.node)
+            || arena.get(binary.operator_token).map(|node| node.kind) != Some(operator)
+            || super::primitive_operators::compound_assignment_binary_operator(operator).is_none()
+            || host.node(right).and_then(|node| node.parent) != Some(expression.node)
+            || [assignment.target, right, expression]
+                .into_iter()
+                .any(|node| {
+                    store
+                        .type_node_links(node)
+                        .and_then(|links| links.resolved_type)
+                        .is_none()
+                })
+        {
+            return Err(invalid().into());
+        }
+        let state = self
+            .assignment_states
+            .get_mut(&assignment.target)
+            .ok_or_else(invalid)?;
+        if !matches!(state, SourceFlowAssignmentState::Pending) {
+            return Err(SourceFlowInvariant::AssignmentAlreadyCompleted(assignment.target).into());
+        }
+        *state = SourceFlowAssignmentState::Update;
+        self.memo.clear();
+        Ok(())
     }
 
     fn resolve_flow(
@@ -8996,6 +9094,146 @@ fn validate_parameter_assignment(
     validate_parameter_assignment_in_list(arena, bound, store, host, container, assignment, None)
 }
 
+fn initialized_statement_local(
+    syntax: &SourceCallableStatementListSyntax,
+    declaration: NodeRef,
+) -> Option<&SourceLocalDeclarationSyntax> {
+    let mut pending = syntax.statements.iter().collect::<Vec<_>>();
+    while let Some(statement) = pending.pop() {
+        match statement {
+            SourceCallableStatementSyntax::Leaf(SourceLinearFunctionStatementSyntax::Local(
+                local,
+            )) if local.declaration == declaration && local.initializer.is_some() => {
+                return Some(local);
+            }
+            SourceCallableStatementSyntax::Block { statements, .. } => {
+                pending.extend(statements);
+            }
+            SourceCallableStatementSyntax::If(branch) => {
+                pending.extend(&branch.then_statements);
+                pending.extend(&branch.else_statements);
+            }
+            SourceCallableStatementSyntax::ForOf(iteration) => {
+                pending.extend(&iteration.statements);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn initialized_local_write_statement(
+    syntax: &SourceCallableStatementListSyntax,
+    wanted: NodeRef,
+) -> bool {
+    let mut pending = syntax.statements.iter().collect::<Vec<_>>();
+    while let Some(statement) = pending.pop() {
+        match statement {
+            SourceCallableStatementSyntax::Leaf(
+                SourceLinearFunctionStatementSyntax::Expression { statement, .. },
+            ) if *statement == wanted => return true,
+            SourceCallableStatementSyntax::Block { statements, .. } => {
+                pending.extend(statements);
+            }
+            SourceCallableStatementSyntax::If(branch) => {
+                pending.extend(&branch.then_statements);
+                pending.extend(&branch.else_statements);
+            }
+            SourceCallableStatementSyntax::ForOf(iteration) => {
+                pending.extend(&iteration.statements);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn validate_initialized_local_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    assignment: SourceFlowParameterAssignment,
+    syntax: &SourceCallableStatementListSyntax,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(assignment.target);
+    let local = initialized_statement_local(syntax, assignment.parameter).ok_or_else(invalid)?;
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || syntax.callable.declaration != container
+        || local.symbol != assignment.symbol
+        || [
+            container,
+            assignment.target,
+            assignment.parameter,
+            local.name,
+        ]
+        .into_iter()
+        .any(|node| !node.is_for(arena.id(), bound.file_id()) || !bound.contains(node))
+        || bound.symbol(assignment.parameter) != Some(assignment.symbol)
+        || bound.container(assignment.parameter) != Some(container)
+        || bound.container(assignment.target) != Some(container)
+        || bound.flow_container(assignment.target) != Some(container)
+        || own_class_flow_symbol(store, host, bound, assignment.target).map_err(|_| invalid())?
+            != assignment.symbol
+    {
+        return Err(invalid().into());
+    }
+    let target = arena.get(assignment.target.node).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &target.data else {
+        return Err(invalid().into());
+    };
+    let expression_ref = NodeRef::new(
+        container.arena,
+        container.file,
+        target.parent.ok_or_else(invalid)?,
+    );
+    let expression = arena.get(expression_ref.node).ok_or_else(invalid)?;
+    let NodeData::BinaryExpression(binary) = &expression.data else {
+        return Err(invalid().into());
+    };
+    let operator = arena.get(binary.operator_token).ok_or_else(invalid)?;
+    let statement = NodeRef::new(
+        container.arena,
+        container.file,
+        expression.parent.ok_or_else(invalid)?,
+    );
+    validate_statement_list_expression(arena, bound, syntax, statement, expression_ref)?;
+    if !initialized_local_write_statement(syntax, statement)
+        || bound.block_scope_container(assignment.target) != syntax.statement_scope(statement)
+        || target.kind != SyntaxKind::Identifier
+        || target.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || arena.get(local.name.node).is_none_or(|record| {
+            !matches!(&record.data, NodeData::Identifier(name) if name.text == identifier.text)
+        })
+        || expression.kind != SyntaxKind::BinaryExpression
+        || expression.flags.0 != 0
+        || binary.left != assignment.target.node
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.facts != 0
+        || binary.modifiers.is_some()
+        || operator.kind != SyntaxKind::EqualsToken
+        || operator.flags.0 != 0
+        || operator.parent != Some(expression_ref.node)
+        || !matches!(operator.data, NodeData::Token(_))
+        || target.range.start < expression.range.start
+        || target.range.end > expression.range.end
+        || operator.range.start < target.range.end
+        || operator.range.end > expression.range.end
+        || arena.get(binary.right).is_none_or(|right| {
+            right.parent != Some(expression_ref.node)
+                || right.range.start < operator.range.end
+                || right.range.end > expression.range.end
+        })
+    {
+        return Err(invalid().into());
+    }
+    Ok(())
+}
+
 fn validate_parameter_assignment_in_list(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -9009,6 +9247,21 @@ fn validate_parameter_assignment_in_list(
         .get(assignment.parameter.node)
         .is_some_and(|record| record.kind == SyntaxKind::VariableDeclaration)
     {
+        if arena.get(assignment.parameter.node).is_some_and(|record| {
+            matches!(&record.data, NodeData::VariableDeclaration(variable) if variable.initializer.is_some())
+        }) {
+            return validate_initialized_local_assignment(
+                arena,
+                bound,
+                store,
+                host.ok_or(SourceFlowInvariant::InvalidParameterAssignment(assignment.target))?,
+                container,
+                assignment,
+                statement_list.ok_or(SourceFlowInvariant::InvalidParameterAssignment(
+                    assignment.target,
+                ))?,
+            );
+        }
         return validate_annotated_local_assignment(
             arena,
             bound,
@@ -9113,6 +9366,13 @@ fn validate_parameter_assignment_in_list(
         return Err(invalid().into());
     };
     let operator = arena.get(binary.operator_token).ok_or_else(invalid)?;
+    let compound = statement_list.is_some()
+        && matches!(
+            function.kind,
+            SyntaxKind::FunctionDeclaration | SyntaxKind::FunctionExpression
+        )
+        && parameter_declaration == assignment.parameter
+        && super::primitive_operators::compound_assignment_binary_operator(operator.kind).is_some();
     if expression.kind != SyntaxKind::BinaryExpression
         || expression.flags.0 != 0
         || binary.left != assignment.target.node
@@ -9120,7 +9380,7 @@ fn validate_parameter_assignment_in_list(
         || binary.type_.is_some()
         || binary.facts != 0
         || binary.modifiers.is_some()
-        || operator.kind != SyntaxKind::EqualsToken
+        || operator.kind != SyntaxKind::EqualsToken && !compound
         || operator.flags.0 != 0
         || operator.parent != target.parent
         || !matches!(operator.data, NodeData::Token(_))

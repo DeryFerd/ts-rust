@@ -606,6 +606,122 @@ pub(super) fn plan_top_level_object_binding_elements(
     )
 }
 
+/// Proves flat const bindings against the callable's real lexical scope.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Validates one scoped binding declaration.
+pub(super) fn plan_callable_object_binding_elements(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    callable: NodeRef,
+    statement_parent: NodeRef,
+    block_scope: NodeRef,
+) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || [declaration, callable, statement_parent, block_scope]
+            .iter()
+            .any(|node| !node.is_for(arena.id(), bound.file_id()))
+        || !matches!(
+            arena.get(callable.node).map(|node| node.kind),
+            Some(
+                SyntaxKind::ArrowFunction
+                    | SyntaxKind::FunctionDeclaration
+                    | SyntaxKind::FunctionExpression
+            )
+        )
+    {
+        return Err(VariableInvariant::InvalidBindingPattern(declaration).into());
+    }
+    let record = arena
+        .get(declaration.node)
+        .ok_or(VariableInvariant::InvalidBindingPattern(declaration))?;
+    let NodeData::VariableDeclaration(variable) = &record.data else {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(declaration),
+        ));
+    };
+    let list = record
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or(VariableInvariant::InvalidBindingPattern(declaration))?;
+    let list_record = arena
+        .get(list.node)
+        .ok_or(VariableInvariant::InvalidBindingPattern(list))?;
+    let statement = list_record
+        .parent
+        .map(|node| NodeRef::new(list.arena, list.file, node))
+        .ok_or(VariableInvariant::InvalidBindingPattern(list))?;
+    let statement_record = binding_child_node(arena, store, statement, statement_parent)?;
+    let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+        return Err(VariableInvariant::InvalidBindingPattern(statement).into());
+    };
+    let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
+        return Err(VariableInvariant::InvalidBindingPattern(list).into());
+    };
+    if statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.flags.0 != 0
+        || statement_data.declaration_list != list.node
+        || statement_data.modifiers.is_some()
+        || statement_data.flow_node.is_some()
+        || statement_data.facts != 0
+        || list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.flags.0 != VariableBindingKind::Const.declaration_flags()
+        || list_data.declarations.nodes.as_slice() != [declaration.node]
+        || list_data.declarations.range != list_record.range
+        || list_data.declarations.has_trailing_comma
+        || list_data.facts != 0
+        || variable.type_.is_some()
+    {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(declaration),
+        ));
+    }
+    let initializer = variable
+        .initializer
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(declaration),
+        ))?;
+    let initializer_record = binding_child_node(arena, store, initializer, declaration)?;
+    let pattern = NodeRef::new(declaration.arena, declaration.file, variable.name);
+    let pattern_record = binding_child_node(arena, store, pattern, declaration)?;
+    if pattern_record.range.end > initializer_record.range.start
+        || bound.container(declaration) != Some(callable)
+        || bound.block_scope_container(declaration) != Some(block_scope)
+        || bound.container(initializer) != Some(callable)
+        || bound.block_scope_container(initializer) != Some(block_scope)
+    {
+        return Err(VariableInvariant::InvalidBindingPattern(declaration).into());
+    }
+    let elements = plan_object_binding_elements_at_scope(
+        arena,
+        bound,
+        store,
+        declaration,
+        VariableBindingKind::Const,
+        false,
+        ObjectBindingScope {
+            statement_parent,
+            container: callable,
+            block_scope,
+        },
+    )?;
+    if elements.is_empty()
+        || elements.iter().any(|element| {
+            element.rest
+                || element.initializer.is_some()
+                || element.computed_key.is_some()
+                || !element.parent_properties.is_empty()
+        })
+    {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(pattern),
+        ));
+    }
+    Ok(elements)
+}
+
 pub(super) fn plan_class_object_binding_elements(
     arena: &NodeArena,
     bound: &BoundFile,

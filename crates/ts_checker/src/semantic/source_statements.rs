@@ -155,6 +155,18 @@ pub(super) struct SourceLocalDeclarationSyntax {
     pub(super) initializer: Option<NodeRef>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceLocalObjectBindingSyntax {
+    pub(super) statement: NodeRef,
+    pub(super) list: NodeRef,
+    pub(super) declaration: NodeRef,
+    pub(super) pattern: NodeRef,
+    pub(super) initializer: NodeRef,
+    pub(super) callable: NodeRef,
+    pub(super) statement_parent: NodeRef,
+    pub(super) block_scope: NodeRef,
+}
+
 /// One exact `if` arm ending in a value-returning `return`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceReturnBranchSyntax {
@@ -496,6 +508,7 @@ pub(super) struct SourceCallableStatementListSyntax {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SourceCallableStatementSyntax {
     Leaf(SourceLinearFunctionStatementSyntax),
+    ObjectBinding(SourceLocalObjectBindingSyntax),
     Empty(NodeRef),
     Block {
         block: NodeRef,
@@ -627,6 +640,7 @@ impl SourceCallableStatementListSyntax {
                 SourceCallableStatementSyntax::Leaf(
                     SourceLinearFunctionStatementSyntax::Local(local),
                 ) => local.statement,
+                SourceCallableStatementSyntax::ObjectBinding(binding) => binding.statement,
                 SourceCallableStatementSyntax::Leaf(
                     SourceLinearFunctionStatementSyntax::Expression { statement, .. }
                     | SourceLinearFunctionStatementSyntax::Throw { statement, .. },
@@ -5175,6 +5189,65 @@ impl SyntaxPlanner<'_> {
         Ok(statements)
     }
 
+    fn plan_callable_object_binding_statement(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        scope: NodeRef,
+    ) -> Result<Option<SourceLocalObjectBindingSyntax>, SourceFunctionStatementsError> {
+        let NodeData::VariableStatement(variable) = &self.node(statement)?.data else {
+            return Ok(None);
+        };
+        let list = self.reference(variable.declaration_list);
+        let NodeData::VariableDeclarationList(declarations) = &self.node(list)?.data else {
+            return Ok(None);
+        };
+        let [declaration] = declarations.declarations.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let declaration = self.reference(*declaration);
+        let NodeData::VariableDeclaration(variable) = &self.node(declaration)?.data else {
+            return Ok(None);
+        };
+        let pattern = self.reference(variable.name);
+        if self.node(pattern)?.kind != SyntaxKind::ObjectBindingPattern {
+            return Ok(None);
+        }
+        super::variables::plan_callable_object_binding_elements(
+            self.arena,
+            self.bound,
+            self.store,
+            declaration,
+            self.callable.declaration,
+            parent,
+            scope,
+        )?;
+        let initializer = variable
+            .initializer
+            .map(|node| self.reference(node))
+            .ok_or_else(|| {
+                self.unsupported(
+                    declaration,
+                    SyntaxKind::VariableDeclaration,
+                    SourceFunctionStatementsRole::LocalInitializer,
+                )
+            })?;
+        self.validate_container(statement, self.callable.declaration)?;
+        self.validate_block_scope_container(statement, scope)?;
+        self.validate_container(list, self.callable.declaration)?;
+        self.validate_block_scope_container(list, scope)?;
+        Ok(Some(SourceLocalObjectBindingSyntax {
+            statement,
+            list,
+            declaration,
+            pattern,
+            initializer,
+            callable: self.callable.declaration,
+            statement_parent: parent,
+            block_scope: scope,
+        }))
+    }
+
     #[allow(clippy::too_many_lines)] // Each admitted statement uses its existing source proof.
     fn plan_callable_statement(
         &self,
@@ -5187,6 +5260,11 @@ impl SyntaxPlanner<'_> {
         let kind = self.node(statement)?.kind;
         let result = match kind {
             SyntaxKind::VariableStatement => {
+                if let Some(binding) =
+                    self.plan_callable_object_binding_statement(statement, parent, scope)?
+                {
+                    return Ok(vec![SourceCallableStatementSyntax::ObjectBinding(binding)]);
+                }
                 return self
                     .plan_local_statement(statement, parent, callable)
                     .map(|locals| {
@@ -9766,7 +9844,9 @@ impl SyntaxPlanner<'_> {
         }
 
         let token = self.node(operator)?;
-        if token.kind != SyntaxKind::EqualsToken
+        let compound = self.statement_scope.is_some()
+            && super::primitive_operators::compound_assignment_binary_operator(token.kind).is_some();
+        if token.kind != SyntaxKind::EqualsToken && !compound
             || token.flags.0 != 0
             || !matches!(token.data, NodeData::Token(_))
         {

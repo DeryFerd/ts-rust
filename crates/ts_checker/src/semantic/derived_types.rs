@@ -182,6 +182,7 @@ struct ObjectShape {
     symbol: SemanticSymbolId,
     members: SymbolTableId,
     properties: Vec<PropertyShape>,
+    index_infos: Option<Vec<super::IndexInfoId>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -219,6 +220,12 @@ struct WidenPropertyPlan {
 }
 
 #[derive(Debug)]
+struct WidenIndexPlan {
+    source: super::IndexInfoId,
+    transform: WidenTransform,
+}
+
+#[derive(Debug)]
 enum WidenPlan {
     Existing {
         source: TypeId,
@@ -228,6 +235,7 @@ enum WidenPlan {
         source: TypeId,
         shape: ObjectShape,
         properties: Vec<WidenPropertyPlan>,
+        indexes: Vec<WidenIndexPlan>,
     },
     ContextualObject {
         union: TypeId,
@@ -235,6 +243,7 @@ enum WidenPlan {
         shape: ObjectShape,
         properties: Vec<WidenPropertyPlan>,
         undefined_properties: Vec<PropertyShape>,
+        indexes: Vec<WidenIndexPlan>,
     },
     Array {
         source: TypeId,
@@ -390,6 +399,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .iter()
             .filter(|plan| matches!(plan, WidenPlan::Union { .. }))
             .count();
+        let index_count = plans
+            .iter()
+            .try_fold(0usize, |count, plan| match plan {
+                WidenPlan::Object { indexes, .. } | WidenPlan::ContextualObject { indexes, .. } => {
+                    count.checked_add(indexes.len())
+                }
+                _ => Some(count),
+            })
+            .ok_or(DerivedTypeError::Capacity(type_))?;
         let mut undefined_names = HashSet::new();
         let clone_count = plans.iter().try_fold(0usize, |count, plan| match plan {
             WidenPlan::Existing { .. } | WidenPlan::Array { .. } | WidenPlan::Union { .. } => {
@@ -439,6 +457,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .try_reserve_undefined_properties(undefined_names.len())
             || !self.try_reserve_types(type_count)
             || !self.try_reserve_checker_symbol_allocations(clone_count, object_count)
+            || !self.try_reserve_index_infos(index_count)
         {
             return Err(DerivedTypeError::Capacity(type_));
         }
@@ -927,12 +946,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 transform,
             });
         }
+        let indexes =
+            self.plan_widened_indexes(source, &shape, global_types, plans, visiting, planned)?;
         visiting.remove(&source);
         planned.insert(source);
         plans.push(WidenPlan::Object {
             source,
             shape,
             properties,
+            indexes,
         });
         Ok(WidenTransform::Cached(source))
     }
@@ -1116,12 +1138,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
             }
 
+            let indexes =
+                self.plan_widened_indexes(*member, shape, global_types, plans, visiting, planned)?;
             plans.push(WidenPlan::ContextualObject {
                 union,
                 source: *member,
                 shape: shape.clone(),
                 properties,
                 undefined_properties,
+                indexes,
             });
             constituents.push(WidenTransform::ContextualCached {
                 union,
@@ -1153,7 +1178,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         };
         if !self.source_symbol_declarations_match(bound)
             || !self.source_symbol_declarations_match(owner)
-            || source.name() != record.name()
+            || (source.name() != record.name()
+                && self
+                    .contextual_computed_property_origin(property, owner_declaration, bound)
+                    .is_none())
             || source.declarations() != record.declarations()
             || source.value_declaration() != record.value_declaration()
             || source.parent() != Some(owner)
@@ -1168,6 +1196,74 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         ))
     }
 
+    fn contextual_computed_property_origin(
+        &self,
+        property: SemanticSymbolId,
+        owner: NodeRef,
+        bound: SemanticSymbolId,
+    ) -> Option<()> {
+        let source_type = self.type_node_links(owner)?.resolved_type?;
+        let properties =
+            super::object_members::source_computed_object_named_properties(self, source_type)?;
+        let name = self.symbol(property)?.name();
+        let original = properties
+            .into_iter()
+            .find_map(|(symbol, source_name, _)| {
+                (source_name.as_ref() == name
+                    && self.value_symbol_links(symbol)?.target == Some(bound))
+                .then_some(symbol)
+            })?;
+
+        // Follow real clone links back to the authenticated computed property.
+        let mut current = property;
+        let mut seen = HashSet::new();
+        while current != original {
+            if !seen.insert(current) {
+                return None;
+            }
+            let record = self.symbol(current)?;
+            let links = self.value_symbol_links(current)?;
+            let target = links.target?;
+            let type_ = links.resolved_type?;
+            if !self.valid_symbol_clone(target, current, type_) {
+                let target_record = self.symbol(target)?;
+                let target_links = self.value_symbol_links(target)?;
+                let undefined = self.intrinsic_bootstrap()?.undefined_or_missing_type;
+                let expected_links = ValueSymbolLinks {
+                    resolved_type: Some(undefined),
+                    target: Some(target),
+                    name_type: target_links.name_type,
+                    ..ValueSymbolLinks::default()
+                };
+                // This cache entry exists before the first contextual object is published.
+                if self
+                    .derived_types
+                    .undefined_properties
+                    .get(&record.name().to_owned())
+                    != Some(&current)
+                    || self.get_merged_symbol(current) != Some(current)
+                    || self.get_merged_symbol(target) != Some(target)
+                    || record.flags()
+                        != SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT | SymbolFlags::OPTIONAL
+                    || target_record.flags() != SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+                    || record.check_flags() != target_record.check_flags() & CheckFlags::READONLY
+                    || record.name() != target_record.name()
+                    || record.declarations() != target_record.declarations()
+                    || record.value_declaration() != target_record.value_declaration()
+                    || record.parent() != target_record.parent()
+                    || record.members().is_some()
+                    || record.exports().is_some()
+                    || record.export_symbol().is_some()
+                    || links != &expected_links
+                {
+                    return None;
+                }
+            }
+            current = target;
+        }
+        Some(())
+    }
+
     /// Pinned `compareSymbols` orders each selected symbol by its retained declaration.
     fn sort_contextual_properties(&self, properties: &mut [SemanticSymbolId]) -> Option<()> {
         let mut ordered = properties
@@ -1180,6 +1276,74 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             *property = symbol;
         }
         Some(())
+    }
+
+    #[allow(clippy::too_many_arguments)] // Index values share the caller's widening graph.
+    fn plan_widened_indexes(
+        &self,
+        source: TypeId,
+        shape: &ObjectShape,
+        global_types: Option<&CanonicalGlobalTypes>,
+        plans: &mut Vec<WidenPlan>,
+        visiting: &mut HashSet<TypeId>,
+        planned: &mut HashSet<TypeId>,
+    ) -> Result<Vec<WidenIndexPlan>, DerivedTypeError> {
+        shape
+            .index_infos
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|index| {
+                let value = self
+                    .index_info(*index)
+                    .ok_or(DerivedTypeError::MalformedObjectLiteral(source))?
+                    .value_type();
+                Ok(WidenIndexPlan {
+                    source: *index,
+                    transform: self.plan_widened_type(
+                        value,
+                        global_types,
+                        plans,
+                        visiting,
+                        planned,
+                    )?,
+                })
+            })
+            .collect()
+    }
+
+    fn publish_widened_indexes(
+        &mut self,
+        plans: Vec<WidenIndexPlan>,
+    ) -> Option<Vec<super::IndexInfoId>> {
+        if plans.is_empty() {
+            return None;
+        }
+        Some(
+            plans
+                .into_iter()
+                .map(|plan| {
+                    let value = match plan.transform {
+                        WidenTransform::Identity(type_) => type_,
+                        WidenTransform::Cached(source) => self.derived_types.widened_types[&source],
+                        WidenTransform::ContextualCached { union, source } => {
+                            self.derived_types.contextual_widened_types[&(union, source)]
+                        }
+                    };
+                    let info = self
+                        .index_info(plan.source)
+                        .expect("the widening plan checked its source index");
+                    self.alloc_index_info(
+                        info.key_type(),
+                        value,
+                        info.is_readonly(),
+                        info.declaration(),
+                        info.components().to_vec(),
+                    )
+                    .expect("the widening plan checked and reserved its index inputs")
+                })
+                .collect(),
+        )
     }
 
     fn publish_regular_object(&mut self, plan: RegularObjectPlan) {
@@ -1218,7 +1382,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             (!properties.is_empty()).then_some(properties),
             None,
             None,
-            None,
+            plan.shape.index_infos,
         ));
         assert_eq!(plan.shape.flags, TypeFlags::OBJECT);
         assert_eq!(
@@ -1256,6 +1420,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 source,
                 shape,
                 properties: property_plans,
+                indexes,
             } => {
                 let members = self.alloc_symbol_table();
                 let mut properties = Vec::with_capacity(property_plans.len());
@@ -1293,13 +1458,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 let widened = self
                     .alloc_plain_object_type(ObjectFlags::ANONYMOUS | retained, Some(shape.symbol))
                     .expect("the widened object plan validated its owner and flags");
+                let index_infos = self.publish_widened_indexes(indexes);
                 assert!(self.set_structured_type_members(
                     widened,
                     Some(members),
                     (!properties.is_empty()).then_some(properties),
                     None,
                     None,
-                    None,
+                    index_infos,
                 ));
                 assert_eq!(
                     self.derived_types.widened_types.insert(source, widened),
@@ -1317,6 +1483,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 shape,
                 properties: property_plans,
                 undefined_properties,
+                indexes,
             } => {
                 let members = self.alloc_symbol_table();
                 let mut properties =
@@ -1381,13 +1548,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 let widened = self
                     .alloc_plain_object_type(ObjectFlags::ANONYMOUS | retained, Some(shape.symbol))
                     .expect("the contextual object plan authenticated its owner and flags");
+                let index_infos = self.publish_widened_indexes(indexes);
                 assert!(self.set_structured_type_members(
                     widened,
                     Some(members),
                     (!properties.is_empty()).then_some(properties),
                     None,
                     None,
-                    None,
+                    index_infos,
                 ));
                 assert_eq!(
                     self.derived_types
@@ -1923,6 +2091,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let TypeData::Object(object) = record.data() else {
             return None;
         };
+        if object.source_computed_literal.is_some()
+            || super::object_members::source_object_requires_computed_proof(self, type_)
+        {
+            let properties =
+                super::object_members::source_computed_object_named_properties(self, type_)?;
+            return Some(ObjectShape {
+                flags: record.flags(),
+                object_flags: record.object_flags(),
+                symbol: record.symbol()?,
+                members: object.structured.members?,
+                properties: properties
+                    .into_iter()
+                    .map(|(symbol, name, type_)| PropertyShape {
+                        symbol,
+                        name,
+                        type_,
+                    })
+                    .collect(),
+                index_infos: object.structured.index_infos.clone(),
+            });
+        }
         let owner = record.symbol()?;
         let owner_record = self.symbol(owner)?;
         let [owner_declaration] = owner_record.declarations()? else {
@@ -2111,6 +2300,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             symbol: owner,
             members,
             properties: result,
+            index_infos: None,
         })
     }
 
@@ -2136,7 +2326,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if record.flags() != TypeFlags::OBJECT
             || record.alias().is_some()
             || !valid_object_tail(object)
-            || !valid_structured_tail(&object.structured)
+            || !valid_structured_tail_with_indexes(&object.structured)
+            || object.source_computed_literal.is_some()
         {
             return None;
         }
@@ -2174,6 +2365,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             symbol,
             members,
             properties,
+            index_infos: object.structured.index_infos.clone(),
         })
     }
 
@@ -2225,6 +2417,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 || target_shape.symbol != source_shape.symbol
                 || target_shape.members == source_shape.members
                 || target_shape.properties.len() != source_shape.properties.len()
+                || target_shape.index_infos != source_shape.index_infos
             {
                 return None;
             }
@@ -2509,6 +2702,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED | retained
             || target_shape.symbol != source_shape.symbol
             || target_shape.members == source_shape.members
+            || !self.widened_indexes_are_valid(
+                &source_shape,
+                &target_shape,
+                &mut HashSet::from([source]),
+                &mut regular_visiting,
+                array_targets,
+            )
             || target_shape.properties.len()
                 != source_shape.properties.len() + missing_properties.len()
         {
@@ -2639,6 +2839,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED | retained
                 || target_shape.symbol != source_shape.symbol
                 || target_shape.members == source_shape.members
+                || !self.widened_indexes_are_valid(
+                    &source_shape,
+                    &target_shape,
+                    visiting,
+                    regular_visiting,
+                    array_targets,
+                )
                 || target_shape.properties.len() != source_shape.properties.len()
             {
                 return None;
@@ -2689,6 +2896,63 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         .is_some();
         visiting.remove(&source);
         valid
+    }
+
+    fn widened_indexes_are_valid(
+        &self,
+        source: &ObjectShape,
+        target: &ObjectShape,
+        visiting: &mut HashSet<TypeId>,
+        regular_visiting: &mut HashSet<TypeId>,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> bool {
+        let source_indexes = source.index_infos.as_deref().unwrap_or_default();
+        let target_indexes = target.index_infos.as_deref().unwrap_or_default();
+        if source_indexes.len() != target_indexes.len() {
+            return false;
+        }
+        source_indexes
+            .iter()
+            .zip(target_indexes)
+            .all(|(source, target)| {
+                let (Some(source_info), Some(target_info)) =
+                    (self.index_info(*source), self.index_info(*target))
+                else {
+                    return false;
+                };
+                if source == target
+                    || source_info.key_type() != target_info.key_type()
+                    || source_info.is_readonly() != target_info.is_readonly()
+                    || source_info.declaration() != target_info.declaration()
+                    || source_info.components() != target_info.components()
+                    || target_info.index_symbol().is_some()
+                {
+                    return false;
+                }
+                let value = source_info.value_type();
+                let Some(record) = self.type_payload(value) else {
+                    return false;
+                };
+                if !record
+                    .object_flags()
+                    .intersects(ObjectFlags::REQUIRES_WIDENING)
+                {
+                    return target_info.value_type() == value;
+                }
+                self.derived_types
+                    .widened_types
+                    .get(&value)
+                    .is_some_and(|expected| {
+                        target_info.value_type() == *expected
+                            && self.widened_cache_entry_is_valid(
+                                value,
+                                *expected,
+                                visiting,
+                                regular_visiting,
+                                array_targets,
+                            )
+                    })
+            })
     }
 
     fn valid_symbol_clone(
@@ -2763,10 +3027,17 @@ fn valid_object_tail(object: &ObjectTypeData) -> bool {
 }
 
 fn valid_structured_tail(structured: &StructuredTypeData) -> bool {
+    valid_structured_tail_with_indexes(structured) && structured.index_infos.is_none()
+}
+
+fn valid_structured_tail_with_indexes(structured: &StructuredTypeData) -> bool {
     structured.constrained == ConstrainedTypeData::default()
         && structured.signatures.is_none()
         && structured.call_signature_count == 0
-        && structured.index_infos.is_none()
+        && structured
+            .index_infos
+            .as_ref()
+            .is_none_or(|indexes| !indexes.is_empty())
         && structured
             .object_type_without_abstract_construct_signatures
             .is_none()
@@ -5222,3 +5493,7 @@ mod tests {
         assert_eq!(observable_state(context.store()), recursive_boundary_state);
     }
 }
+
+#[cfg(test)]
+#[path = "derived_types_computed_contextual_tests.rs"]
+mod computed_contextual_tests;

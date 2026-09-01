@@ -332,7 +332,8 @@ use super::{
         SourceJoinedFunctionStatementsInvariant, SourceJoinedFunctionStatementsSyntax,
         SourceIterationHeaderSyntax,
         SourceLinearFunctionStatementSyntax, SourceLinearFunctionStatementsSyntax,
-        SourceLocalDeclarationSyntax, SourceLoopFunctionStatementSyntax,
+        SourceLocalDeclarationSyntax, SourceLocalObjectBindingSyntax,
+        SourceLoopFunctionStatementSyntax,
         SourceLoopFunctionStatementsSyntax, SourceReturnBranchSyntax,
         SourceSwitchArrayBindingSyntax, SourceSwitchFunctionStatementsSyntax,
         SourceSwitchObjectBindingSyntax, SourceTypeofConditionSyntax,
@@ -1155,6 +1156,142 @@ pub(super) struct PlannedIdentifierRead {
     pub(super) kind: PlannedIdentifierReadKind,
 }
 
+/// Created only after the source checker checks the original key expression.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CheckedSourceComputedObjectKey {
+    node: NodeRef,
+    type_: TypeId,
+    input: CheckedSourceComputedObjectKeyInput,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CheckedSourceComputedObjectKeyInput {
+    Literal,
+    Identifier(PlannedIdentifierRead),
+    Call {
+        callee: NodeRef,
+        read: PlannedIdentifierRead,
+        callee_type: TypeNodeLinks,
+        signature: SignatureLinks,
+    },
+}
+
+impl CheckedSourceComputedObjectKey {
+    pub(super) const fn node(&self) -> NodeRef {
+        self.node
+    }
+    pub(super) const fn type_id(&self) -> TypeId {
+        self.type_
+    }
+
+    pub(super) fn is_current(&self, store: &CanonicalTypeMapperStore) -> bool {
+        let valid_read = |node, read: &PlannedIdentifierRead| {
+            store.source_node_kind(node) == Some(SyntaxKind::Identifier)
+                && store.get_merged_symbol(read.resolved_symbol) == Some(read.resolved_symbol)
+                && store.get_merged_symbol(read.value_symbol) == Some(read.value_symbol)
+                && store.symbol_node_links(node)
+                    == Some(&SymbolNodeLinks {
+                        resolved_symbol: Some(read.resolved_symbol),
+                    })
+        };
+        if store.type_node_links(self.node)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(self.type_),
+                outer_type_parameters: None,
+            })
+            || store.validate_union_constituent(self.type_).is_err()
+        {
+            return false;
+        }
+        match &self.input {
+            CheckedSourceComputedObjectKeyInput::Literal => matches!(
+                store.source_node_kind(self.node),
+                Some(
+                    SyntaxKind::StringLiteral
+                        | SyntaxKind::NumericLiteral
+                        | SyntaxKind::BigIntLiteral
+                        | SyntaxKind::NoSubstitutionTemplateLiteral
+                )
+            ),
+            CheckedSourceComputedObjectKeyInput::Identifier(read) => {
+                read.kind == PlannedIdentifierReadKind::Variable && valid_read(self.node, read)
+            }
+            CheckedSourceComputedObjectKeyInput::Call {
+                callee,
+                read,
+                callee_type,
+                signature,
+            } => {
+                store.source_node_kind(self.node) == Some(SyntaxKind::CallExpression)
+                    && store.source_node_parent(*callee)
+                        == Some(SourceNodeParent::Parent(self.node))
+                    && valid_read(*callee, read)
+                    && store.type_node_links(*callee) == Some(callee_type)
+                    && callee_type.outer_type_parameters.is_none()
+                    && callee_type
+                        .resolved_type
+                        .is_some_and(|type_| store.validate_union_constituent(type_).is_ok())
+                    && store.signature_links(self.node) == Some(signature)
+                    && signature
+                        .resolved_signature
+                        .signature()
+                        .and_then(|signature| store.signature(signature))
+                        .is_some_and(|signature| {
+                            signature.resolved_return_type() == Some(self.type_)
+                        })
+            }
+        }
+    }
+}
+
+fn checked_source_computed_object_key(
+    store: &CanonicalTypeMapperStore,
+    expression: &PlannedExpression,
+    type_: TypeId,
+) -> Result<CheckedSourceComputedObjectKey, SourceCheckError> {
+    let invalid = || {
+        SourceCheckError::ObjectLiteral(SourceObjectLiteralError::InvalidCache {
+            node: expression.node,
+            type_: Some(type_),
+        })
+    };
+    let input = match &expression.kind {
+        PlannedExpressionKind::Identifier(read) => {
+            CheckedSourceComputedObjectKeyInput::Identifier(*read)
+        }
+        PlannedExpressionKind::Call(call) if call.arguments.is_empty() => {
+            let PlannedExpressionKind::Identifier(read) = &call.callee.kind else {
+                return Err(invalid());
+            };
+            CheckedSourceComputedObjectKeyInput::Call {
+                callee: call.callee.node,
+                read: *read,
+                callee_type: store
+                    .type_node_links(call.callee.node)
+                    .cloned()
+                    .ok_or_else(invalid)?,
+                signature: store
+                    .signature_links(expression.node)
+                    .cloned()
+                    .ok_or_else(invalid)?,
+            }
+        }
+        PlannedExpressionKind::String(_)
+        | PlannedExpressionKind::Number { .. }
+        | PlannedExpressionKind::BigInt { .. } => CheckedSourceComputedObjectKeyInput::Literal,
+        _ => return Err(invalid()),
+    };
+    let checked = CheckedSourceComputedObjectKey {
+        node: expression.node,
+        type_,
+        input,
+    };
+    if !checked.is_current(store) {
+        return Err(invalid());
+    }
+    Ok(checked)
+}
+
 impl PlannedIdentifierRead {
     const fn variable(read: PlannedVariableRead) -> Self {
         Self {
@@ -1784,8 +1921,16 @@ struct PlannedCallableStatementList {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedCallableObjectBinding {
+    syntax: SourceLocalObjectBindingSyntax,
+    elements: Vec<PlannedObjectBindingElement>,
+    initializer: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
 enum PlannedCallableStatement {
     Leaf(PlannedLinearFunctionStatement),
+    ObjectBinding(Box<PlannedCallableObjectBinding>),
     Block(Vec<Self>),
     If {
         condition: Box<PlannedSourceCondition>,
@@ -1827,6 +1972,7 @@ struct PlannedCallableCatchBinding {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CallableLocalWrites {
     Linear,
+    Conditional,
     ForOf,
     Unavailable,
 }
@@ -1843,6 +1989,9 @@ impl PlannedCallableStatementList {
             .collect::<Vec<_>>();
         for node in callable_statement_nodes(&self.statements) {
             match node {
+                PlannedCallableStatement::ObjectBinding(binding) => {
+                    expressions.push(&binding.initializer);
+                }
                 PlannedCallableStatement::Leaf(PlannedLinearFunctionStatement::Expression {
                     expression,
                     ..
@@ -1852,6 +2001,9 @@ impl PlannedCallableStatementList {
                 ) => expressions.push(&assignment.right),
                 PlannedCallableStatement::Leaf(
                     PlannedLinearFunctionStatement::ParameterAssignment(assignment),
+                ) => expressions.push(&assignment.right),
+                PlannedCallableStatement::Leaf(
+                    PlannedLinearFunctionStatement::CompoundParameterAssignment(assignment),
                 ) => expressions.push(&assignment.right),
                 PlannedCallableStatement::Return {
                     expression: Some(expression),
@@ -1965,6 +2117,7 @@ enum PlannedLinearFunctionStatement {
     Function(Box<PlannedFunction>),
     Enum(SourceEnumPlan),
     ParameterAssignment(Box<PlannedLinearParameterAssignment>),
+    CompoundParameterAssignment(Box<PlannedLinearParameterCompoundAssignment>),
     CapturedAssignment(Box<PlannedCapturedLocalAssignment>),
     Expression {
         statement: NodeRef,
@@ -1982,6 +2135,7 @@ impl PlannedLinearFunctionStatement {
             Self::Local(index) => locals.get(*index).map(|local| local.name),
             Self::Expression { statement, .. } | Self::Throw { statement, .. } => Some(*statement),
             Self::ParameterAssignment(assignment) => Some(assignment.statement),
+            Self::CompoundParameterAssignment(assignment) => Some(assignment.statement),
             Self::CapturedAssignment(assignment) => Some(assignment.flow.statement),
             Self::Function(_) | Self::Enum(_) => None,
         }
@@ -2056,6 +2210,15 @@ struct PlannedLinearParameterAssignment {
     statement: NodeRef,
     expression: NodeRef,
     flow: SourceFlowParameterAssignment,
+    right: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedLinearParameterCompoundAssignment {
+    statement: NodeRef,
+    expression: NodeRef,
+    flow: SourceFlowParameterAssignment,
+    operator: SyntaxKind,
     right: PlannedExpression,
 }
 
@@ -15070,6 +15233,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let mut mutations = Vec::new();
         let mut catch_initializers = Vec::new();
         let mut iteration_assignments = Vec::new();
+        let mut object_assignments = Vec::new();
         let (store, host) = self
             .semantic
             .ok_or_else(|| Self::unsupported_function_body(callable))?;
@@ -15080,6 +15244,19 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         for node in nodes {
             match node {
+                PlannedCallableStatement::ObjectBinding(binding) => {
+                    for element in &binding.elements {
+                        points.push(element.name);
+                        object_assignments.push(SourceFlowAssignment {
+                            declaration: element.element,
+                            symbol: element.symbol,
+                        });
+                    }
+                    collect_eager_logical_truthiness_conditions(
+                        &binding.initializer,
+                        &mut logical_conditions,
+                    );
+                }
                 PlannedCallableStatement::Leaf(leaf) => {
                     points.extend(leaf.flow_point(&locals));
                     if let PlannedLinearFunctionStatement::Expression { expression, .. } = leaf
@@ -15091,6 +15268,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     mutations.extend(leaf.array_mutation(store, host)?);
                     match leaf {
                         PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
+                            parameters.push(assignment.flow);
+                            collect_eager_logical_truthiness_conditions(
+                                &assignment.right,
+                                &mut logical_conditions,
+                            );
+                        }
+                        PlannedLinearFunctionStatement::CompoundParameterAssignment(assignment) => {
                             parameters.push(assignment.flow);
                             collect_eager_logical_truthiness_conditions(
                                 &assignment.right,
@@ -15190,6 +15374,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         for node in callable_statement_nodes(&statements) {
             let expression = match node {
+                PlannedCallableStatement::ObjectBinding(binding) => Some(&binding.initializer),
                 PlannedCallableStatement::Leaf(PlannedLinearFunctionStatement::Expression {
                     expression,
                     ..
@@ -15229,7 +15414,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     symbol: local.symbol,
                 })
                 .chain(catch_initializers)
-                .chain(iteration_assignments),
+                .chain(iteration_assignments)
+                .chain(object_assignments),
             parameters,
             calls,
             captures,
@@ -15258,6 +15444,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         for statement in syntax {
             let statement = match statement {
                 SourceCallableStatementSyntax::Empty(_) => continue,
+                SourceCallableStatementSyntax::ObjectBinding(binding) => {
+                    PlannedCallableStatement::ObjectBinding(Box::new(
+                        self.finish_callable_object_binding(callable, *binding)?,
+                    ))
+                }
                 SourceCallableStatementSyntax::Leaf(
                     SourceLinearFunctionStatementSyntax::Local(local),
                 ) => {
@@ -15271,7 +15462,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         expression,
                     },
                 ) => {
-                    let local_assignment = if local_writes != CallableLocalWrites::Unavailable {
+                    if let Some(assignment) = self.plan_linear_parameter_compound_assignment(
+                        callable,
+                        *statement,
+                        *expression,
+                    )? {
+                        statements.push(PlannedCallableStatement::Leaf(
+                            PlannedLinearFunctionStatement::CompoundParameterAssignment(Box::new(
+                                assignment,
+                            )),
+                        ));
+                        continue;
+                    }
+                    let local_assignment = if matches!(
+                        local_writes,
+                        CallableLocalWrites::Linear | CallableLocalWrites::ForOf
+                    ) {
                         self.plan_linear_annotated_local_assignment(
                             callable,
                             locals,
@@ -15280,6 +15486,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         )?
                     } else {
                         None
+                    };
+                    let local_assignment = match local_assignment {
+                        Some(assignment) => Some(assignment),
+                        None if local_writes != CallableLocalWrites::Unavailable => self
+                            .plan_initialized_local_assignment(
+                                callable,
+                                locals,
+                                *statement,
+                                *expression,
+                            )?,
+                        None => None,
                     };
                     let leaf = if let Some(assignment) = local_assignment {
                         PlannedLinearFunctionStatement::ParameterAssignment(Box::new(assignment))
@@ -15336,10 +15553,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             branch.control.statement,
                         )?
                     };
-                    let branch_writes = if local_writes == CallableLocalWrites::ForOf {
-                        CallableLocalWrites::ForOf
-                    } else {
-                        CallableLocalWrites::Unavailable
+                    let branch_writes = match local_writes {
+                        CallableLocalWrites::ForOf => CallableLocalWrites::ForOf,
+                        CallableLocalWrites::Linear | CallableLocalWrites::Conditional => {
+                            CallableLocalWrites::Conditional
+                        }
+                        CallableLocalWrites::Unavailable => CallableLocalWrites::Unavailable,
                     };
                     let then_statements = self.finish_callable_statement_scope(
                         callable,
@@ -15415,6 +15634,56 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             statements.push(statement);
         }
         Ok(statements)
+    }
+
+    fn finish_callable_object_binding(
+        &mut self,
+        callable: &SourceCallablePlan,
+        syntax: SourceLocalObjectBindingSyntax,
+    ) -> Result<PlannedCallableObjectBinding, SourceCheckError> {
+        let invalid = || {
+            SourceCheckError::Variable(VariableInvariant::InvalidBindingPattern(syntax.declaration))
+        };
+        let (store, _) = self
+            .semantic
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        let elements = super::variables::plan_callable_object_binding_elements(
+            self.arena,
+            self.bound,
+            store,
+            syntax.declaration,
+            syntax.callable,
+            syntax.statement_parent,
+            syntax.block_scope,
+        )
+        .map_err(Self::variable_plan_error)?;
+        let declaration = self.node(syntax.declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration.data else {
+            return Err(invalid());
+        };
+        if syntax.callable != callable.declaration
+            || declaration.parent != Some(syntax.list.node)
+            || self.node(syntax.list)?.parent != Some(syntax.statement.node)
+            || variable.name != syntax.pattern.node
+            || variable.initializer != Some(syntax.initializer.node)
+        {
+            return Err(invalid());
+        }
+        let initializer = self.plan_expression(syntax.initializer)?;
+        for element in &elements {
+            if !self.prior_variables.insert(element.symbol)
+                || !self.readable_variables.insert(element.symbol)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(element.symbol),
+                ));
+            }
+        }
+        Ok(PlannedCallableObjectBinding {
+            syntax,
+            elements,
+            initializer,
+        })
     }
 
     fn finish_callable_try(
@@ -15774,6 +16043,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
                     Some(assignment.statement)
                 }
+                PlannedLinearFunctionStatement::CompoundParameterAssignment(assignment) => {
+                    Some(assignment.statement)
+                }
                 PlannedLinearFunctionStatement::CapturedAssignment(assignment) => {
                     Some(assignment.flow.statement)
                 }
@@ -15813,6 +16085,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
                 Some(assignment.flow)
             }
+            PlannedLinearFunctionStatement::CompoundParameterAssignment(assignment) => {
+                Some(assignment.flow)
+            }
             _ => None,
         });
         let Some((store, host)) = self.semantic else {
@@ -15827,6 +16102,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         for statement in &statements {
             match statement {
                 PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
+                    collect_eager_logical_truthiness_conditions(&assignment.right, &mut conditions);
+                }
+                PlannedLinearFunctionStatement::CompoundParameterAssignment(assignment) => {
                     collect_eager_logical_truthiness_conditions(&assignment.right, &mut conditions);
                 }
                 PlannedLinearFunctionStatement::CapturedAssignment(assignment) => {
@@ -16384,6 +16662,71 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }))
     }
 
+    fn plan_initialized_local_assignment(
+        &mut self,
+        callable: &SourceCallablePlan,
+        locals: &[PlannedVariable],
+        statement: NodeRef,
+        expression: NodeRef,
+    ) -> Result<Option<PlannedLinearParameterAssignment>, SourceCheckError> {
+        let record = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &record.data else {
+            return Ok(None);
+        };
+        if self.node(self.reference(binary.operator_token))?.kind != SyntaxKind::EqualsToken {
+            return Ok(None);
+        }
+        let target = self.reference(binary.left);
+        let right = self.reference(binary.right);
+        let NodeData::Identifier(identifier) = &self.node(target)?.data else {
+            return Ok(None);
+        };
+        let name = identifier.text.clone();
+        let (store, host) = self
+            .semantic
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        let read = plan_identifier_read(
+            self.arena,
+            self.bound,
+            store,
+            host,
+            &self.prior_variables,
+            &self.readable_variables,
+            target,
+            &name,
+        )
+        .map_err(Self::variable_plan_error)?;
+        let Some(local) = locals.iter().find(|local| {
+            local.symbol == read.value_symbol
+                && !local.evolving_array
+                && matches!(local.initializer, PlannedVariableInitializer::Expression(_))
+                && !callable
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.symbol == local.symbol)
+        }) else {
+            return Ok(None);
+        };
+        if self.bound.container(local.declaration) != Some(callable.declaration)
+            || self.bound.container(target) != Some(callable.declaration)
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        self.identifier_reads.push((target, read.resolved_symbol));
+        self.primitive_binary_position_roots.insert(right);
+        let right = self.plan_expression(right)?;
+        Ok(Some(PlannedLinearParameterAssignment {
+            statement,
+            expression,
+            flow: SourceFlowParameterAssignment {
+                target,
+                parameter: local.declaration,
+                symbol: local.symbol,
+            },
+            right,
+        }))
+    }
+
     fn plan_linear_captured_local_assignment(
         &mut self,
         callable: &SourceCallablePlan,
@@ -16468,6 +16811,85 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 expression,
                 local,
             },
+            right,
+        }))
+    }
+
+    fn plan_linear_parameter_compound_assignment(
+        &mut self,
+        callable: &SourceCallablePlan,
+        statement: NodeRef,
+        expression: NodeRef,
+    ) -> Result<Option<PlannedLinearParameterCompoundAssignment>, SourceCheckError> {
+        let record = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &record.data else {
+            return Ok(None);
+        };
+        let operator = self.reference(binary.operator_token);
+        let operator_record = self.node(operator)?;
+        if compound_assignment_binary_operator(operator_record.kind).is_none() {
+            return Ok(None);
+        }
+        let target = self.reference(binary.left);
+        let right = self.reference(binary.right);
+        let target_record = self.node(target)?;
+        let NodeData::Identifier(identifier) = &target_record.data else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        if !matches!(
+            self.node(callable.declaration)?.kind,
+            SyntaxKind::FunctionDeclaration | SyntaxKind::FunctionExpression
+        ) || record.kind != SyntaxKind::BinaryExpression
+            || record.flags.0 != 0
+            || binary.symbol.is_some()
+            || binary.type_.is_some()
+            || binary.facts != 0
+            || binary.modifiers.is_some()
+            || target_record.kind != SyntaxKind::Identifier
+            || target_record.parent != Some(expression.node)
+            || target_record.flags.0 != 0
+            || identifier.flow_node.is_some()
+            || operator_record.flags.0 != 0
+            || operator_record.parent != Some(expression.node)
+            || !matches!(operator_record.data, NodeData::Token(_))
+            || self.node(right)?.parent != Some(expression.node)
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let operator = operator_record.kind;
+        let name = identifier.text.clone();
+        let Some((store, host)) = self.semantic else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let read = plan_identifier_read(
+            self.arena,
+            self.bound,
+            store,
+            host,
+            &self.prior_variables,
+            &self.readable_variables,
+            target,
+            &name,
+        )
+        .map_err(Self::variable_plan_error)?;
+        let parameter = callable
+            .parameters
+            .iter()
+            .find(|parameter| parameter.symbol == read.value_symbol)
+            .map(|parameter| parameter.declaration)
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        self.identifier_reads.push((target, read.resolved_symbol));
+        self.primitive_binary_position_roots.insert(right);
+        let right = self.plan_expression(right)?;
+        Ok(Some(PlannedLinearParameterCompoundAssignment {
+            statement,
+            expression,
+            flow: SourceFlowParameterAssignment {
+                target,
+                parameter,
+                symbol: read.value_symbol,
+            },
+            operator,
             right,
         }))
     }
@@ -28185,7 +28607,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::ObjectLiteral,
             ));
         };
-        let plan = super::object_members::plan_object_literal(store, host, expression)
+        let plan = super::object_members::plan_source_object_literal(store, host, expression)
             .map_err(|error| self.object_plan_error(error))?;
         let mut properties = Vec::with_capacity(plan.properties.len());
         let mut spreads = Vec::with_capacity(plan.spread_expression_nodes().len());
@@ -28204,7 +28626,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             let name = plan.properties[index].name_node;
             if let NodeData::ComputedPropertyName(computed) = &self.node(name)?.data {
                 let key = self.reference(computed.expression);
-                computed_keys.push(self.plan_expression(key)?);
+                computed_keys.push(self.plan_computed_binding_key(key, name)?);
             }
             if let Some(getter) = plan.object_literal_getter(plan.properties[index].symbol) {
                 if let Some(annotation) = getter.return_annotation {
@@ -31252,14 +31674,16 @@ fn preflight_inferred_function_return_dependencies(
                 .substitutions
                 .iter()
                 .all(|element| expression_is_closed(element, parameters, locals, functions)),
-            PlannedExpressionKind::Object { properties, .. } => properties
-                .iter()
-                .all(|property| match property {
-                    PlannedObjectMember::Eager(expression)
-                    | PlannedObjectMember::Getter { expression, .. } => {
-                        expression_is_closed(expression, parameters, locals, functions)
-                    }
-                }),
+            PlannedExpressionKind::Object { properties, .. } => {
+                expression.object_computed_keys.iter().chain(&expression.object_spreads)
+                    .all(|key| expression_is_closed(key, parameters, locals, functions))
+                    && properties.iter().all(|property| match property {
+                        PlannedObjectMember::Eager(expression)
+                        | PlannedObjectMember::Getter { expression, .. } => {
+                            expression_is_closed(expression, parameters, locals, functions)
+                        }
+                    })
+            }
             PlannedExpressionKind::Property(property) => {
                 expression_is_closed(&property.receiver, parameters, locals, functions)
             }
@@ -31440,11 +31864,26 @@ fn preflight_inferred_function_return_dependencies(
         functions: FunctionDependencies<'_, '_>,
     ) -> bool {
         statements.iter().all(|statement| match statement {
+            PlannedCallableStatement::ObjectBinding(binding) => {
+                expression_is_closed(&binding.initializer, parameters, locals, functions)
+                    && binding
+                        .elements
+                        .iter()
+                        .all(|element| locals.insert(element.symbol))
+            }
             PlannedCallableStatement::Leaf(PlannedLinearFunctionStatement::CapturedAssignment(
                 assignment,
             )) => {
                 locals.contains(&assignment.flow.local.symbol())
                     && expression_is_closed(&assignment.right, parameters, locals, functions)
+            }
+            PlannedCallableStatement::Leaf(
+                PlannedLinearFunctionStatement::CompoundParameterAssignment(assignment),
+            ) => {
+                parameters.iter().any(|parameter| {
+                    parameter.symbol == assignment.flow.symbol
+                        && parameter.declaration == assignment.flow.parameter
+                }) && expression_is_closed(&assignment.right, parameters, locals, functions)
             }
             PlannedCallableStatement::Leaf(
                 PlannedLinearFunctionStatement::ParameterAssignment(assignment),
@@ -32713,9 +33152,25 @@ where
             super::object_members::object_literal_state(store, plan)
                 .map_err(source_object_execution_error)?;
             // Check every computed key before values or spreads, without a value context.
+            let mut checked_keys = Vec::with_capacity(expression.object_computed_keys.len());
             for key in &expression.object_computed_keys {
                 let checked_key = check_nested_expression(store, session, key, None, None)?;
                 preflight_source_expression_cache(store, key.node, checked_key.raw)?;
+                if plan.has_source_computed_properties() {
+                    checked_keys.push(checked_source_computed_object_key(
+                        store,
+                        key,
+                        checked_key.raw,
+                    )?);
+                }
+            }
+            if plan.has_source_computed_properties() {
+                super::object_members::preflight_source_computed_object_keys(
+                    store,
+                    plan,
+                    &checked_keys,
+                )
+                .map_err(source_computed_object_execution_error)?;
             }
             let mut checked_properties = Vec::with_capacity(properties.len());
             let mut property_types = Vec::with_capacity(properties.len());
@@ -32805,7 +33260,16 @@ where
                     },
                 ));
             }
-            let object = if plan.spreads.is_empty() {
+            let object = if plan.has_source_computed_properties() {
+                super::object_members::publish_source_computed_object_literal(
+                    store,
+                    global_types,
+                    plan,
+                    &checked_keys,
+                    &property_types,
+                )
+                .map_err(source_computed_object_execution_error)?
+            } else if plan.spreads.is_empty() {
                 super::object_members::publish_object_literal(store, plan, &property_types)
                     .map_err(source_object_execution_error)?
             } else {
@@ -33087,6 +33551,21 @@ pub(super) fn widened_fresh_literal_type(
         Err(SourceCheckError::LiteralCache(
             SourceLiteralCacheError::InvalidCachedLiteral(type_),
         ))
+    }
+}
+
+fn source_computed_object_execution_error(
+    error: super::object_members::PropertyObjectError,
+) -> SourceCheckError {
+    match error {
+        super::object_members::PropertyObjectError::UnsupportedMember { node, kind } => {
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                node,
+                kind,
+                role: SourceSyntaxRole::ObjectProperty,
+            })
+        }
+        error => source_object_execution_error(error),
     }
 }
 
@@ -41162,6 +41641,7 @@ fn check_contextual_object_literal_method(
                 matches!(
                     statement,
                     PlannedLinearFunctionStatement::ParameterAssignment(_)
+                        | PlannedLinearFunctionStatement::CompoundParameterAssignment(_)
                         | PlannedLinearFunctionStatement::CapturedAssignment(_)
                 )
             })
@@ -43262,16 +43742,25 @@ fn logical_binary_check_error(
     binary: &LogicalBinaryPlan,
     error: &LogicalBinaryError,
 ) -> SourceCheckError {
+    logical_type_check_error(host, binary.node, binary.left.node, error)
+}
+
+fn logical_type_check_error(
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+    left: NodeRef,
+    error: &LogicalBinaryError,
+) -> SourceCheckError {
     match error {
         LogicalBinaryError::Unsupported(LogicalBinaryUnsupported::Operator(kind)) => {
             SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
-                node: binary.node,
+                node: expression,
                 kind: *kind,
                 role: SourceSyntaxRole::BinaryOperator,
             })
         }
         LogicalBinaryError::Unsupported(LogicalBinaryUnsupported::Type(_)) => {
-            let node = binary.left.node;
+            let node = left;
             SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
                 node,
                 kind: host
@@ -43282,14 +43771,14 @@ fn logical_binary_check_error(
         }
         #[cfg(not(test))]
         LogicalBinaryError::Unsupported(LogicalBinaryUnsupported::MissingGlobalTypes) => {
-            SourceCheckError::LogicalOperator(binary.node)
+            SourceCheckError::LogicalOperator(expression)
         }
         LogicalBinaryError::Invariant(
             LogicalBinaryInvariant::MissingBootstrap
             | LogicalBinaryInvariant::InvalidType(_)
             | LogicalBinaryInvariant::CyclicUnion(_)
             | LogicalBinaryInvariant::InvalidUnion(_),
-        ) => SourceCheckError::LogicalOperator(binary.node),
+        ) => SourceCheckError::LogicalOperator(expression),
         LogicalBinaryError::Literal(error) => (*error).into(),
     }
 }
@@ -44566,22 +45055,13 @@ fn check_compound_assignment(
         },
     )
     .map_err(|error| primitive_binary_check_error(host, assignment.expression, &error))?;
-    let arithmetic_operands_failed = resolution
-        .diagnostics
-        .iter()
-        .any(|diagnostic| matches!(diagnostic.diagnostic.code(), 2362 | 2363 | 2447));
-    for mut diagnostic in resolution.diagnostics {
-        if matches!(diagnostic.diagnostic.code(), 2365 | 2447)
-            && let Some(text) = primitive_binary_operator_text(operator)
-            && let Some(argument) = diagnostic.diagnostic.arguments.first_mut()
-        {
-            *argument = format!("{text}=");
-        }
-        if diagnostic.diagnostic.code() == 2447 {
-            diagnostic.node = Some(primitive_binary_operator_node(host, assignment.expression)?);
-        }
-        merge_retry_diagnostic(diagnostics, diagnostic);
-    }
+    let arithmetic_operands_failed = merge_compound_operand_diagnostics(
+        host,
+        diagnostics,
+        assignment.expression,
+        operator,
+        resolution.diagnostics,
+    )?;
     publish_expression_type(store, assignment.expression, resolution.result_type)?;
     if !arithmetic_operands_failed
         && !source_type_is_assignable_to(
@@ -47042,7 +47522,7 @@ fn issue_computed_binding_name_diagnostic(
     Ok(())
 }
 
-fn literal_computed_property_name(
+pub(super) fn literal_computed_property_name(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> Option<String> {
@@ -50660,6 +51140,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
             }
             PlannedLinearFunctionStatement::Local(_)
             | PlannedLinearFunctionStatement::ParameterAssignment(_)
+            | PlannedLinearFunctionStatement::CompoundParameterAssignment(_)
             | PlannedLinearFunctionStatement::CapturedAssignment(_)
             | PlannedLinearFunctionStatement::Expression { .. }
             | PlannedLinearFunctionStatement::Throw { .. } => {}
@@ -51046,6 +51527,9 @@ fn check_planned_linear_function_statements_with_capture_entries(
                     arrow_capture,
                 )?;
                 nested_flow_types.insert(assignment.flow.local.symbol(), current_type);
+            }
+            PlannedLinearFunctionStatement::CompoundParameterAssignment(_) => {
+                return Err(SourcePlanner::unsupported_function_body(callable));
             }
             PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
                 let current_type = check_planned_parameter_assignment(
@@ -52552,6 +53036,76 @@ fn check_callable_statement_nodes(
             value_exports: &[],
         });
         match statement {
+            PlannedCallableStatement::ObjectBinding(binding) => {
+                let first = binding.elements.first().ok_or(SourceCheckError::Variable(
+                    VariableInvariant::InvalidBindingPattern(binding.syntax.pattern),
+                ))?;
+                let snapshot = frame
+                    .snapshot_at(store, global_types, first.name)
+                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                let checked = check_expression_type_with_capture_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    snapshot.types(),
+                    type_import_execution,
+                    &binding.initializer,
+                    None,
+                    deferred,
+                    None,
+                    capture,
+                )?;
+                complete_nullish_assignment_effects(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    frame,
+                    type_import_execution,
+                    &binding.initializer,
+                    snapshot.types(),
+                )?;
+                check_callable_statement_expression_effects(
+                    store,
+                    callable,
+                    &binding.initializer,
+                )?;
+                for element in &binding.elements {
+                    let type_ = object_binding_property_type(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        diagnostics,
+                        checked.result,
+                        element.property,
+                        &element.property_name,
+                        false,
+                    )?;
+                    let type_ = inferred_variable_type(
+                        store,
+                        global_types,
+                        VariableBindingKind::Const,
+                        type_,
+                    )?;
+                    stage_value_type(
+                        store,
+                        staged_value_types,
+                        value_order,
+                        element.symbol,
+                        type_,
+                    )?;
+                    frame
+                        .complete_assignment(element.element, element.symbol, type_)
+                        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                }
+            }
             PlannedCallableStatement::Leaf(leaf) => {
                 check_planned_function_statement_prefix_with_capture_context(
                     store,
@@ -52614,6 +53168,13 @@ fn check_callable_statement_nodes(
                         )?
                     }
                     PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
+                        check_callable_statement_expression_effects(
+                            store,
+                            callable,
+                            &assignment.right,
+                        )?
+                    }
+                    PlannedLinearFunctionStatement::CompoundParameterAssignment(assignment) => {
                         check_callable_statement_expression_effects(
                             store,
                             callable,
@@ -53298,6 +53859,23 @@ fn check_planned_function_statement_prefix_with_capture_context(
                     arrow_capture,
                 )?;
             }
+            PlannedLinearFunctionStatement::CompoundParameterAssignment(assignment) => {
+                check_planned_parameter_compound_assignment(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    frame,
+                    type_import_execution,
+                    deferred,
+                    callable,
+                    assignment,
+                    arrow_capture,
+                )?;
+            }
             PlannedLinearFunctionStatement::CapturedAssignment(assignment)
                 if arrow_capture.is_some() =>
             {
@@ -53323,6 +53901,181 @@ fn check_planned_function_statement_prefix_with_capture_context(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // Keep the source caller's flow and session together.
+fn check_planned_parameter_compound_assignment(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    frame: &mut SourceFlowFrame<'_, '_>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    assignment: &PlannedLinearParameterCompoundAssignment,
+    arrow_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<(), SourceCheckError> {
+    let snapshot = frame
+        .snapshot_at(store, global_types, assignment.statement)
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    let prior = snapshot
+        .types()
+        .get(&assignment.flow.symbol)
+        .copied()
+        .ok_or(SourceCheckError::Variable(
+            VariableInvariant::MissingCurrentFlowType(assignment.flow.symbol),
+        ))?;
+    let left_type =
+        super::logical_operators::base_type_of_literal_type(store, Some(global_types), prior)
+            .map_err(|error| {
+                logical_type_check_error(
+                    host,
+                    assignment.expression,
+                    assignment.flow.target,
+                    &error,
+                )
+            })?;
+    publish_expression_type(store, assignment.flow.target, left_type)?;
+    let right = check_expression_type_with_capture_context(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        snapshot.types(),
+        type_import_execution,
+        &assignment.right,
+        None,
+        deferred,
+        None,
+        arrow_capture,
+    )?;
+    let operator = compound_assignment_binary_operator(assignment.operator)
+        .ok_or(SourceCheckError::PrimitiveOperator(assignment.expression))?;
+    let resolution = check_primitive_binary(
+        store,
+        PrimitiveBinaryRequest {
+            expression: assignment.expression,
+            left: assignment.flow.target,
+            operator,
+            right: assignment.right.node,
+            left_type,
+            right_type: right.result,
+            left_recovery: None,
+            right_recovery: right.primitive_binary_recovery,
+            bigint_exponentiation_target: bigint_exponentiation_target(options),
+        },
+    )
+    .map_err(|error| primitive_binary_check_error(host, assignment.expression, &error))?;
+    let arithmetic_operands_failed = merge_compound_operand_diagnostics(
+        host,
+        diagnostics,
+        assignment.expression,
+        operator,
+        resolution.diagnostics,
+    )?;
+    publish_expression_type(store, assignment.expression, resolution.result_type)?;
+    if !arithmetic_operands_failed
+        && !source_type_is_assignable_to(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            resolution.result_type,
+            left_type,
+        )?
+    {
+        report_parameter_compound_assignment_error(
+            store,
+            host,
+            global_types,
+            options,
+            diagnostics,
+            assignment.flow.target,
+            CheckedAssignment {
+                declared_type: left_type,
+                assigned_type: resolution.result_type,
+            },
+        )?;
+    }
+    frame
+        .complete_compound_assignment(
+            store,
+            host,
+            assignment.flow,
+            assignment.expression,
+            assignment.operator,
+        )
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))
+}
+
+fn merge_compound_operand_diagnostics(
+    host: &DeclaredTypeHost<'_>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    expression: NodeRef,
+    operator: SyntaxKind,
+    incoming: Vec<CanonicalCheckerDiagnostic>,
+) -> Result<bool, SourceCheckError> {
+    let arithmetic_operands_failed = incoming
+        .iter()
+        .any(|diagnostic| matches!(diagnostic.diagnostic.code(), 2362 | 2363 | 2447));
+    for mut diagnostic in incoming {
+        if matches!(diagnostic.diagnostic.code(), 2365 | 2447)
+            && let Some(text) = primitive_binary_operator_text(operator)
+            && let Some(argument) = diagnostic.diagnostic.arguments.first_mut()
+        {
+            *argument = format!("{text}=");
+        }
+        if diagnostic.diagnostic.code() == 2447 {
+            diagnostic.node = Some(primitive_binary_operator_node(host, expression)?);
+        }
+        merge_retry_diagnostic(diagnostics, diagnostic);
+    }
+    Ok(arithmetic_operands_failed)
+}
+
+fn report_parameter_compound_assignment_error(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    left: NodeRef,
+    checked: CheckedAssignment,
+) -> Result<(), SourceCheckError> {
+    let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+    if options.no_error_truncation {
+        flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+    }
+    let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        checked.assigned_type,
+        checked.declared_type,
+        flags,
+    )?;
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(left),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+                [display.source, display.target],
+            ),
+            related_information: Vec::new(),
+        },
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_planned_parameter_assignment(
     store: &mut CanonicalTypeMapperStore,
@@ -53344,14 +54097,16 @@ fn check_planned_parameter_assignment(
     let snapshot = frame
         .snapshot_at(store, global_types, assignment.statement)
         .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-    let declared_type = if locals.iter().any(|local| {
+    let local = locals.iter().find(|local| {
         local.declaration == assignment.flow.parameter
             && local.symbol == assignment.flow.symbol
             && matches!(
                 local.initializer,
                 PlannedVariableInitializer::AbsentAnnotated
+                    | PlannedVariableInitializer::Expression(_)
             )
-    }) {
+    });
+    let declared_type = if local.is_some() {
         staged_value_types.get(&assignment.flow.symbol).copied()
     } else {
         store
@@ -53361,6 +54116,33 @@ fn check_planned_parameter_assignment(
     .ok_or(SourceCheckError::Variable(
         VariableInvariant::MissingCurrentFlowType(assignment.flow.symbol),
     ))?;
+    let readonly = local.is_some_and(|local| local.binding.is_const());
+    let target_type = if readonly {
+        let target = host
+            .node(assignment.flow.target)
+            .ok_or_else(|| SourcePlanner::unsupported_function_body(callable))?;
+        let NodeData::Identifier(identifier) = &target.data else {
+            return Err(SourcePlanner::unsupported_function_body(callable));
+        };
+        merge_retry_diagnostic(
+            diagnostics,
+            CanonicalCheckerDiagnostic {
+                node: Some(assignment.flow.target),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2588).ok_or(SourceCheckError::MissingDiagnostic(2588))?,
+                    [identifier.text.as_str()],
+                ),
+                related_information: Vec::new(),
+            },
+        );
+        store
+            .intrinsic_bootstrap()
+            .ok_or(DerivedTypeError::BootstrapUninitialized)?
+            .error_type
+    } else {
+        declared_type
+    };
     let checked = check_assignment_to_type_with_capture_context(
         store,
         host,
@@ -53372,7 +54154,7 @@ fn check_planned_parameter_assignment(
         snapshot.types(),
         type_import_execution,
         deferred,
-        declared_type,
+        target_type,
         None,
         &assignment.right,
         assignment.flow.target,
@@ -53380,6 +54162,16 @@ fn check_planned_parameter_assignment(
         None,
         arrow_capture,
     )?;
+    // Invalid const writes still have a binder assignment. Its flow type uses
+    // the declared local type, not the error type of the write target.
+    let checked = if readonly {
+        CheckedAssignment {
+            declared_type,
+            assigned_type: checked.assigned_type,
+        }
+    } else {
+        checked
+    };
     let current_type = current_flow_type_after_assignment(
         store,
         host,
@@ -70284,6 +71076,7 @@ pub(super) fn check_source_file(
                         PlannedLinearFunctionStatement::Local(_)
                         | PlannedLinearFunctionStatement::Enum(_)
                         | PlannedLinearFunctionStatement::ParameterAssignment(_)
+                        | PlannedLinearFunctionStatement::CompoundParameterAssignment(_)
                         | PlannedLinearFunctionStatement::CapturedAssignment(_)
                         | PlannedLinearFunctionStatement::Expression { .. }
                         | PlannedLinearFunctionStatement::Throw { .. } => None,
@@ -108145,38 +108938,609 @@ class Foo2 {
     }
 
     #[test]
-    fn unsupported_object_forms_fail_before_writes() {
-        let cases = [(
-            "const key = 'property'; const value: any = { [key]: 1 };",
-            SourceSyntaxRole::ObjectProperty,
-        )];
-        for (index, (text, role)) in cases.into_iter().enumerate() {
-            let source = parsed(text);
-            let file = FileId::new(73 + u32::try_from(index).unwrap());
-            let mut context = context_with_module_state(
-                &[(file, &source)],
-                CanonicalModuleState::External,
-                CanonicalCheckerOptions::default(),
-            );
-            let before = observable_state(&context, file);
+    fn source_computed_object_keys_keep_parameter_shadowing_and_flow_identity() {
+        let source = parsed(concat!(
+            "const key = 'outer'; ",
+            "function build(key: string, input: number) { return { [key]: input }; } ",
+            "const object = build('inner', 1);",
+        ));
+        let file = FileId::new(99_260);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let (key, name, object) = source
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                let NodeData::ComputedPropertyName(computed) = &record.data else {
+                    return None;
+                };
+                let property = source.arena.get(record.parent?).unwrap();
+                Some((
+                    NodeRef::new(source.arena.id(), file, computed.expression),
+                    NodeRef::new(source.arena.id(), file, id),
+                    NodeRef::new(source.arena.id(), file, property.parent?),
+                ))
+            })
+            .unwrap();
+        let parameter = source.arena.iter().find_map(|(id, record)| {
+            let NodeData::ParameterDeclaration(parameter) = &record.data else { return None; };
+            matches!(&source.arena.get(parameter.name)?.data, NodeData::Identifier(name) if name.text == "key")
+                .then_some(NodeRef::new(source.arena.id(), file, id))
+        }).unwrap();
+        let actual = context.file(file).unwrap().1.symbol(parameter).unwrap();
+        let outer = variable_symbol(&context, &source, file, "key");
+        assert_ne!(actual, outer);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(key)
+                .unwrap()
+                .resolved_symbol,
+            Some(actual)
+        );
+        assert!(context.file(file).unwrap().1.flow_at(key).is_some());
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        assert_eq!(context.get_type_at_location(key).unwrap(), string);
+        assert_eq!(context.get_type_at_location(name).unwrap(), number);
+        let type_ = context.get_type_at_location(object).unwrap();
+        let origin = super::super::object_members::source_computed_object_literal_origin(
+            context.store(),
+            type_,
+        )
+        .unwrap();
+        assert_eq!(origin.property_symbols().len(), 1);
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.get_type_at_location(object).unwrap(), type_);
+        assert_eq!(observable_state(&context, file), warm);
+    }
 
-            let result = context.check_source_file(file);
-            assert!(
-                matches!(
-                    result,
-                    Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Syntax {
-                            role: actual,
-                            ..
-                        }
-                    )) if actual == role
-                ),
-                "source: {text}; result: {result:?}"
-            );
-            assert_eq!(observable_state(&context, file), before, "source: {text}");
-            assert!(context.diagnostics().is_empty());
-            assert!(!is_type_checked(&context, file));
+    #[test]
+    #[allow(clippy::too_many_lines)] // Fresh, widened, and regular objects retain distinct index identities.
+    fn source_computed_object_keys_keep_mixed_index_components_and_regular_identity() {
+        let source = parsed(concat!(
+            "declare const key: string; declare const position: number; ",
+            "declare const count: number; declare const text: string; ",
+            "const value = { [key]: count, fixed: text, [position]: count, 2: count };",
+        ));
+        let file = FileId::new(99_261);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let object = variable_initializer(&source, file, "value");
+        let type_ = context.get_type_at_location(object).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        let NodeData::ObjectLiteralExpression(declaration) =
+            &source.arena.get(object.node).unwrap().data
+        else {
+            panic!("the source retains its actual object declaration")
+        };
+        let first = NodeRef::new(object.arena, file, declaration.properties.nodes[0]);
+        let third = NodeRef::new(object.arena, file, declaration.properties.nodes[2]);
+        let TypeData::Object(record) = context.store().type_payload(type_).unwrap().data() else {
+            panic!("object")
+        };
+        let indexes = record.structured.index_infos.clone().unwrap();
+        assert_eq!(indexes.len(), 2);
+        let string_index = context.store().index_info(indexes[0]).unwrap();
+        assert_eq!(string_index.key_type(), string);
+        assert_eq!(string_index.components(), &[first, third]);
+        let TypeData::Union(union) = context
+            .store()
+            .type_payload(string_index.value_type())
+            .unwrap()
+            .data()
+        else {
+            panic!("the string index must include both actual value types")
+        };
+        assert_eq!(union.union.types.len(), 2);
+        assert!(union.union.types.contains(&string) && union.union.types.contains(&number));
+        let number_index = context.store().index_info(indexes[1]).unwrap();
+        assert_eq!(number_index.key_type(), number);
+        assert_eq!(number_index.value_type(), number);
+        assert_eq!(number_index.components(), &[third]);
+        assert_eq!(object_property_type(&context, object, "fixed"), string);
+        assert_eq!(object_property_type(&context, object, "2"), number);
+        let variable = variable_symbol(&context, &source, file, "value");
+        let widened = context
+            .store()
+            .value_symbol_links(variable)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_ne!(widened, type_);
+        let widened_indexes = context
+            .store()
+            .type_payload(widened)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .index_infos
+            .as_ref()
+            .unwrap();
+        assert_eq!(widened_indexes.len(), indexes.len());
+        for (source_index, widened_index) in indexes.iter().zip(widened_indexes) {
+            assert_ne!(source_index, widened_index);
+            let original = context.store().index_info(*source_index).unwrap();
+            let derived = context.store().index_info(*widened_index).unwrap();
+            assert_eq!(derived.key_type(), original.key_type());
+            assert_eq!(derived.value_type(), original.value_type());
+            assert_eq!(derived.is_readonly(), original.is_readonly());
+            assert_eq!(derived.declaration(), original.declaration());
+            assert_eq!(derived.components(), original.components());
+            assert_eq!(derived.index_symbol(), None);
         }
+        assert!(
+            super::super::object_members::source_computed_object_receiver_is_exact(
+                context.store(),
+                widened
+            )
+        );
+        let regular = context
+            .store_mut_for_test()
+            .get_regular_type_of_object_literal(type_)
+            .unwrap();
+        assert_ne!(regular, type_);
+        assert_eq!(
+            context
+                .store()
+                .type_payload(regular)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .index_infos
+                .as_ref(),
+            Some(&indexes)
+        );
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .get_regular_type_of_object_literal(type_)
+                .unwrap(),
+            regular
+        );
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each damaged input is restored before exact replay.
+    fn source_computed_object_keys_reject_changed_caches_and_recover() {
+        for damage in 0..5 {
+            let source = parsed(concat!(
+                "declare const key: string; declare const position: number; declare const input: number; ",
+                "const value = { [key]: input }; const donor = { [position]: input };",
+            ));
+            let file = FileId::new(99_262);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let object = variable_initializer(&source, file, "value");
+            let donor = variable_initializer(&source, file, "donor");
+            let type_ = context.get_type_at_location(object).unwrap();
+            let donor_type = context.get_type_at_location(donor).unwrap();
+            let key = source.arena.iter().find_map(|(_, record)| {
+                let NodeData::ComputedPropertyName(computed) = &record.data else { return None; };
+                matches!(&source.arena.get(computed.expression)?.data, NodeData::Identifier(name) if name.text == "key")
+                    .then_some(NodeRef::new(source.arena.id(), file, computed.expression))
+            }).unwrap();
+            let original_key = context.store().type_node_links(key).unwrap().clone();
+            let original_object = context.store().type_node_links(object).unwrap().clone();
+            let original_members = context
+                .store()
+                .type_payload(type_)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .clone();
+            let foreign_index = context
+                .store()
+                .type_payload(donor_type)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .index_infos
+                .clone();
+            let clone = super::super::object_members::source_computed_object_literal_origin(
+                context.store(),
+                type_,
+            )
+            .unwrap()
+            .property_symbols()[0];
+            let original_value = context.store().value_symbol_links(clone).unwrap().clone();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+            match damage {
+                0 | 1 => {
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        key,
+                        TypeNodeLinks {
+                            resolved_type: Some(if damage == 0 { number } else { string }),
+                            outer_type_parameters: (damage == 1).then(Vec::new),
+                        }
+                    ));
+                }
+                2 => {
+                    let mut changed = original_value.clone();
+                    changed.resolved_type = Some(string);
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(clone, changed)
+                    );
+                }
+                3 => {
+                    assert!(context.store_mut_for_test().set_structured_type_members(
+                        type_,
+                        original_members.members,
+                        original_members.properties.clone(),
+                        None,
+                        None,
+                        foreign_index
+                    ));
+                }
+                4 => {
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        object,
+                        TypeNodeLinks {
+                            resolved_type: Some(donor_type),
+                            outer_type_parameters: None,
+                        }
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            mark_source_unchecked(&mut context, file);
+            let before = observable_state(&context, file);
+            let key_links = context.store().type_node_links(key).cloned();
+            let value_links = context.store().value_symbol_links(clone).cloned();
+            let members = context
+                .store()
+                .type_payload(type_)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .clone();
+            let error = context.check_source_file(file).unwrap_err();
+            assert_eq!(context.check_source_file(file), Err(error));
+            assert_eq!(observable_state(&context, file), before);
+            assert_eq!(context.store().type_node_links(key), key_links.as_ref());
+            assert_eq!(
+                context.store().value_symbol_links(clone),
+                value_links.as_ref()
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_payload(type_)
+                    .unwrap()
+                    .data()
+                    .structured(),
+                Some(&members)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(key, original_key)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(object, original_object)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(clone, original_value)
+            );
+            assert!(context.store_mut_for_test().set_structured_type_members(
+                type_,
+                original_members.members,
+                original_members.properties,
+                None,
+                None,
+                original_members.index_infos
+            ));
+            context.check_source_file(file).unwrap();
+            assert_eq!(context.get_type_at_location(object).unwrap(), type_);
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Same-type key and call caches must fail before source replay.
+    fn source_computed_object_keys_reject_foreign_read_and_signature_identity() {
+        let source = parsed(concat!(
+            "declare const first: string; declare const second: string; declare const input: number; ",
+            "declare function key(): string; declare function other(): string; ",
+            "const direct = { [first]: input }; const called = { [key()]: input }; const donor = other();",
+        ));
+        let file = FileId::new(99_264);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let names = source
+            .arena
+            .iter()
+            .filter_map(|(id, record)| {
+                let NodeData::ComputedPropertyName(computed) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(source.arena.id(), file, id),
+                    NodeRef::new(source.arena.id(), file, computed.expression),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let [(direct_name, direct), (call_name, call)] = names.as_slice() else {
+            panic!("two computed keys")
+        };
+        let NodeData::CallExpression(called) = &source.arena.get(call.node).unwrap().data else {
+            panic!("call key")
+        };
+        let callee = NodeRef::new(source.arena.id(), file, called.expression);
+        let donor = variable_initializer(&source, file, "donor");
+        let NodeData::CallExpression(donor_call) = &source.arena.get(donor.node).unwrap().data
+        else {
+            panic!("donor call")
+        };
+        let donor_callee = NodeRef::new(source.arena.id(), file, donor_call.expression);
+        let original_read = context.store().symbol_node_links(*direct).unwrap().clone();
+        let original_callee = context.store().symbol_node_links(callee).unwrap().clone();
+        let original_type = context.store().type_node_links(callee).unwrap().clone();
+        let original_signature = context.store().signature_links(*call).unwrap().clone();
+        let foreign_read = SymbolNodeLinks {
+            resolved_symbol: Some(variable_symbol(&context, &source, file, "second")),
+        };
+        let foreign_callee = context
+            .store()
+            .symbol_node_links(donor_callee)
+            .unwrap()
+            .clone();
+        let foreign_type = context
+            .store()
+            .type_node_links(donor_callee)
+            .unwrap()
+            .clone();
+        let foreign_signature = context.store().signature_links(donor).unwrap().clone();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            resolved_node_type(&context, *call),
+            resolved_node_type(&context, donor)
+        );
+        assert_ne!(original_read, foreign_read);
+        assert_ne!(
+            original_signature.resolved_signature,
+            foreign_signature.resolved_signature
+        );
+        for damage in 0..4 {
+            let name = if damage == 0 {
+                *direct_name
+            } else {
+                *call_name
+            };
+            match damage {
+                0 => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(*direct, foreign_read.clone())
+                ),
+                1 => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(callee, foreign_callee.clone())
+                ),
+                2 => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(callee, foreign_type.clone())
+                ),
+                3 => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_links(*call, foreign_signature.clone())
+                ),
+                _ => unreachable!(),
+            }
+            let before = observable_state(&context, file);
+            let error = context.get_type_at_location(name).unwrap_err();
+            assert_eq!(context.get_type_at_location(name), Err(error));
+            assert_eq!(observable_state(&context, file), before);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(*direct, original_read.clone())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(callee, original_callee.clone())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(callee, original_type.clone())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_links(*call, original_signature.clone())
+            );
+            assert_eq!(context.get_type_at_location(name).unwrap(), number);
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn source_computed_object_keys_require_the_original_one_time_proof() {
+        let source = parsed("declare const key: string; const value = { [key]: 1 };");
+        let file = FileId::new(99_265);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let object = variable_initializer(&source, file, "value");
+        let type_ = context.get_type_at_location(object).unwrap();
+        let record = context.store().type_payload(type_).unwrap();
+        let (flags, owner) = (record.object_flags(), record.symbol());
+        let TypeData::Object(data) = record.data() else {
+            panic!("source object")
+        };
+        let original = data.source_computed_literal.clone().unwrap();
+        let members = data.structured.clone();
+        let fake = context
+            .store_mut_for_test()
+            .alloc_plain_object_type(flags & !ObjectFlags::MEMBERS_RESOLVED, owner)
+            .unwrap();
+        assert!(context.store_mut_for_test().set_structured_type_members(
+            fake,
+            members.members,
+            members.properties.clone(),
+            None,
+            None,
+            members.index_infos.clone()
+        ));
+        let before = observable_state(&context, file);
+        assert!(
+            !context
+                .store_mut_for_test()
+                .type_payload_mut(type_)
+                .unwrap()
+                .attach_source_computed_literal(original.clone())
+        );
+        assert!(
+            !context
+                .store_mut_for_test()
+                .type_payload_mut(fake)
+                .unwrap()
+                .attach_source_computed_literal(original)
+        );
+        assert_eq!(observable_state(&context, file), before);
+        assert!(
+            super::super::object_members::source_computed_object_literal_origin(
+                context.store(),
+                fake
+            )
+            .is_none()
+        );
+        assert!(context.store_mut_for_test().set_type_node_links(
+            object,
+            TypeNodeLinks {
+                resolved_type: Some(fake),
+                outer_type_parameters: None,
+            }
+        ));
+        let key_name = source
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                (record.kind == SyntaxKind::ComputedPropertyName).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    id,
+                ))
+            })
+            .unwrap();
+        let before = observable_state(&context, file);
+        assert!(context.get_type_at_location(key_name).is_err());
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.store_mut_for_test().set_type_node_links(
+            object,
+            TypeNodeLinks {
+                resolved_type: Some(type_),
+                outer_type_parameters: None,
+            }
+        ));
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.get_type_at_location(object).unwrap(), type_);
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn source_computed_object_keys_keep_unproved_domains_unpublished() {
+        for text in [
+            "declare const key: any; const value = { [key]: 1 };",
+            "declare const key: string | number; const value = { [key]: 1 };",
+            "declare const key: symbol; const value = { [key]: 1 };",
+            "const value = { [1n]: 1 };",
+            "const value = { [missing]: 1 };",
+            "declare const key: string; const value = { ...{}, [key]: 1 };",
+            "declare const key: string; const value = { [key]: { left: 1 }, named: { right: 2 } };",
+        ] {
+            let source = parsed(text);
+            let file = FileId::new(99_263);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let object = variable_initializer(&source, file, "value");
+            let symbol = variable_symbol(&context, &source, file, "value");
+            let error = context.check_source_file(file).unwrap_err();
+            assert!(
+                matches!(error, SourceCheckError::Unsupported(_)),
+                "{text}: {error:?}"
+            );
+            assert!(context.store().type_node_links(object).is_none());
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+            assert!(!is_type_checked(&context, file));
+            let before = observable_state(&context, file);
+            assert_eq!(context.check_source_file(file), Err(error));
+            assert_eq!(observable_state(&context, file), before);
+        }
+    }
+
+    #[test]
+    fn source_computed_object_key_uses_its_checked_literal_name() {
+        let source = parsed("const key = 'property'; const value: any = { [key]: 1 };");
+        let file = FileId::new(73);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+        context.check_source_file(file).unwrap();
+        let object = variable_initializer(&source, file, "value");
+        let type_ = context.get_type_at_location(object).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (any, number) = (bootstrap.any_type, bootstrap.number_type);
+        assert_ne!(type_, any);
+        assert_eq!(object_property_type(&context, object, "property"), number);
+        let TypeData::Object(record) = context.store().type_payload(type_).unwrap().data() else {
+            panic!("the initializer must keep its own object type")
+        };
+        let [symbol] = record.structured.properties.as_deref().unwrap() else {
+            panic!("the checked literal key must produce one named property")
+        };
+        let property = context.store().symbol(*symbol).unwrap();
+        let declaration = property.value_declaration().unwrap();
+        let raw = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        assert_eq!(property.name().as_utf8(), Some("property"));
+        assert_eq!(property.declarations(), Some(&[declaration][..]));
+        assert_eq!(
+            context.store().value_symbol_links(*symbol).unwrap().target,
+            Some(raw)
+        );
+        assert_eq!(
+            context.store().symbol(raw).unwrap().name(),
+            InternalSymbolName::Computed.as_ref()
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.get_type_at_location(object).unwrap(), type_);
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]

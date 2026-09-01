@@ -8292,6 +8292,9 @@ impl<'store> RelaterSession<'store> {
         record: &ts_binder::semantic::Symbol,
         owner: SemanticSymbolId,
     ) -> bool {
+        if super::object_members::source_computed_object_clone_is_exact(self.store, symbol, owner) {
+            return true;
+        }
         if self
             .store
             .object_literal_property_requires_method_proof(symbol)
@@ -9309,6 +9312,39 @@ impl<'store> RelaterSession<'store> {
             })
             .ok_or(RelationUnavailable::Type(type_id))?;
         let class_reference = self.class_field_reference_target(type_id)?.is_some();
+        let computed_source = object
+            .as_ref()
+            .is_some_and(|object| object.source_computed_literal.is_some())
+            || record_object_flags
+                .contains(ObjectFlags::OBJECT_LITERAL | ObjectFlags::FRESH_LITERAL)
+                && super::object_members::source_object_requires_computed_proof(
+                    self.store, type_id,
+                );
+        if computed_source {
+            if super::object_members::source_computed_object_literal_origin(self.store, type_id)
+                .is_none()
+            {
+                return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+            }
+            let structured =
+                structured.ok_or(RelationUnavailable::MalformedStructuredType(type_id))?;
+            let members = structured
+                .members
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+            self.observe_symbol_table(members);
+            self.store
+                .observe_relation_object_instantiation_map_read(type_id);
+            return Ok(ResolvedObjectMembers {
+                members: Some(members),
+                properties: structured.properties.unwrap_or_default(),
+                index_infos: structured.index_infos.unwrap_or_default(),
+                property_origin: ObjectPropertyOrigin::FreshObjectLiteral(
+                    record_symbol.ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?,
+                ),
+                call_signatures: Vec::new(),
+                exact_callable: false,
+            });
+        }
         let mut property_origin = match self.validate_derived_object_literal(type_id) {
             DerivedObjectLiteralValidation::Valid { owner, .. } => {
                 ObjectPropertyOrigin::DerivedObjectLiteral {
@@ -9415,6 +9451,13 @@ impl<'store> RelaterSession<'store> {
                 )
                 .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?
                 .ok_or(RelationUnavailable::UnresolvedStructuredMembers(type_id))?;
+                (structured.index_infos.clone().unwrap_or_default(), false)
+            } else if matches!(
+                property_origin,
+                ObjectPropertyOrigin::DerivedObjectLiteral { .. }
+            ) && super::object_members::source_computed_object_receiver_is_exact(
+                self.store, type_id,
+            ) {
                 (structured.index_infos.clone().unwrap_or_default(), false)
             } else {
                 self.validated_declared_index_infos(type_id, record_symbol, &structured)?

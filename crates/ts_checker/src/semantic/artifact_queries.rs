@@ -297,6 +297,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some(type_) = self.computed_object_property_artifact_type(node)? {
+            return Ok(type_);
+        }
+
         if let Some(type_) = self.duplicate_property_artifact_type(node)? {
             return Ok(type_);
         }
@@ -2355,6 +2359,62 @@ impl CanonicalCheckerContext<'_> {
             return Ok(None);
         };
         self.merged_artifact_symbol(node, symbol).map(Some)
+    }
+
+    fn computed_object_property_artifact_type(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (arena, bound, record) = self.validated_artifact_node(node)?;
+        let declaration = match &record.data {
+            NodeData::ComputedPropertyName(_) => {
+                let Some(parent) = record.parent else {
+                    return Ok(None);
+                };
+                NodeRef::new(node.arena, node.file, parent)
+            }
+            NodeData::PropertyAssignment(_) => node,
+            _ => return Ok(None),
+        };
+        let (_, _, property) = self.validated_artifact_node(declaration)?;
+        let NodeData::PropertyAssignment(assignment) = &property.data else {
+            return Ok(None);
+        };
+        if node != declaration && assignment.name != node.node {
+            return Ok(None);
+        }
+        let Some(owner) = property.parent else {
+            return Ok(None);
+        };
+        if arena
+            .get(owner)
+            .is_none_or(|owner| owner.kind != SyntaxKind::ObjectLiteralExpression)
+        {
+            return Ok(None);
+        }
+        let owner = NodeRef::new(node.arena, node.file, owner);
+        let Some(type_) = self.cached_artifact_type(owner)? else {
+            return Ok(None);
+        };
+        let Some(TypeData::Object(object)) = self.store().type_payload(type_).map(TypeRecord::data)
+        else {
+            return Ok(None);
+        };
+        if object.source_computed_literal.is_none()
+            && !super::object_members::source_object_requires_computed_proof(self.store(), type_)
+        {
+            return Ok(None);
+        }
+        let symbol = bound
+            .symbol(declaration)
+            .ok_or(CanonicalArtifactQueryError::InvalidType { node, type_ })?;
+        let value = super::object_members::source_computed_object_property_type(
+            self.store(),
+            type_,
+            symbol,
+        )
+        .ok_or(CanonicalArtifactQueryError::InvalidType { node, type_ })?;
+        self.validate_artifact_type(node, value).map(Some)
     }
 
     fn literal_computed_artifact_symbol(

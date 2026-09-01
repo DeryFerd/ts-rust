@@ -1297,6 +1297,11 @@ struct SourceIndexOnlyDisplay {
     readonly: bool,
 }
 
+struct SourceComputedObjectDisplay {
+    properties: Vec<StructuralPropertyDisplay>,
+    indexes: Vec<SourceIndexOnlyDisplay>,
+}
+
 #[derive(Clone, Copy)]
 enum DeclaredMethodDisplayStyle {
     Function,
@@ -1656,6 +1661,32 @@ fn display_object_type(
     if kind == ObjectFlags::INTERFACE {
         return display_interface_name(store, host, type_id, record, state);
     }
+    if let Some(object) =
+        validated_source_computed_object_display(store, host, global_types, type_id, record)?
+    {
+        // Visible computed names need the location-aware serializer's own proof.
+        if state.location.is_some() {
+            return Err(TypeDisplayUnavailable::UnsupportedType {
+                type_id,
+                kind: record.data().kind(),
+            });
+        }
+        if !visiting.insert(type_id) {
+            return Err(TypeDisplayUnavailable::CyclicType(type_id));
+        }
+        let result = display_source_computed_object(
+            store,
+            host,
+            global_types,
+            type_id,
+            &object,
+            flags,
+            state,
+            visiting,
+        );
+        visiting.remove(&type_id);
+        return result;
+    }
     if let Some(host) = host
         && let Some(index) = validated_source_index_only_display(store, host, type_id, record)?
     {
@@ -1701,6 +1732,203 @@ fn display_object_type(
     );
     visiting.remove(&type_id);
     result
+}
+
+/// Reads only objects authenticated by the computed-name publisher and its derived caches.
+fn validated_source_computed_object_display(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+    record: &TypeRecord,
+) -> Result<Option<SourceComputedObjectDisplay>, TypeDisplayUnavailable> {
+    let TypeData::Object(object) = record.data() else {
+        return Ok(None);
+    };
+    if object.source_computed_literal.is_none()
+        && !object_members::source_object_requires_computed_proof(store, type_id)
+    {
+        return Ok(None);
+    }
+    let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
+    let mut source = type_id;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(source) {
+            return Err(invalid());
+        }
+        if object_members::source_computed_object_literal_origin(store, source).is_some() {
+            break;
+        }
+        let derived = match global_types {
+            Some(globals) => {
+                store.validate_derived_object_literal_with_global_types(source, globals)
+            }
+            None => store.validate_derived_object_literal_for_relation(source),
+        };
+        match derived {
+            DerivedObjectLiteralValidation::Valid {
+                source: original, ..
+            } => source = original,
+            DerivedObjectLiteralValidation::Invalid
+            | DerivedObjectLiteralValidation::NotDerived => {
+                return Err(invalid());
+            }
+        }
+    }
+
+    let mut properties = Vec::new();
+    for &symbol in object.structured.properties.as_deref().unwrap_or_default() {
+        let property = store.symbol(symbol).ok_or_else(invalid)?;
+        let links = store.value_symbol_links(symbol).ok_or_else(invalid)?;
+        let name =
+            source_computed_property_display_name(store, host, type_id, property, links.name_type)?;
+        properties.push(StructuralPropertyDisplay::Property {
+            name,
+            type_id: links.resolved_type.ok_or_else(invalid)?,
+            optional: property.flags().contains(SymbolFlags::OPTIONAL),
+            readonly: property.check_flags().contains(CheckFlags::READONLY),
+        });
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(TypeDisplayUnavailable::MissingBootstrap)?;
+    let mut indexes = Vec::new();
+    for index in object.structured.index_infos.as_deref().unwrap_or_default() {
+        let info = store.index_info(*index).ok_or_else(invalid)?;
+        if info.key_type() != bootstrap.string_type && info.key_type() != bootstrap.number_type {
+            return Err(invalid());
+        }
+        if !source_computed_index_value_is_scalar(store, info.value_type()) {
+            return Err(TypeDisplayUnavailable::UnsupportedType {
+                type_id,
+                kind: record.data().kind(),
+            });
+        }
+        indexes.push(SourceIndexOnlyDisplay {
+            parameter_name: "x".to_owned(),
+            key_type: info.key_type(),
+            value_type: info.value_type(),
+            readonly: info.is_readonly(),
+        });
+    }
+    Ok(Some(SourceComputedObjectDisplay {
+        properties,
+        indexes,
+    }))
+}
+
+fn source_computed_property_display_name(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    type_id: TypeId,
+    property: &ts_binder::semantic::Symbol,
+    name_type: Option<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
+    let name = property.name().as_utf8().ok_or_else(invalid)?;
+    let Some(name_type) = name_type else {
+        return structural_property_display_name(
+            host,
+            type_id,
+            StructuralObjectProof::ObjectLiteral,
+            property,
+            name,
+        );
+    };
+    let literal = store.type_payload(name_type).ok_or_else(invalid)?;
+    let TypeData::Literal(literal) = literal.data() else {
+        return Err(invalid());
+    };
+    match &literal.value {
+        LiteralValue::String(value) if value == name => Ok(if is_identifier_text(name) {
+            name.to_owned()
+        } else {
+            quote_string_literal(name, '"')
+        }),
+        LiteralValue::Number(value) if value.to_string() == name => Ok(if name.starts_with('-') {
+            format!("[{name}]")
+        } else {
+            name.to_owned()
+        }),
+        _ => Err(invalid()),
+    }
+}
+
+fn source_computed_index_value_is_scalar(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+) -> bool {
+    let mut pending = vec![type_id];
+    let mut seen = HashSet::new();
+    while let Some(type_id) = pending.pop() {
+        if !seen.insert(type_id) {
+            continue;
+        }
+        let Some(record) = store.type_payload(type_id) else {
+            return false;
+        };
+        if let TypeData::Union(union) = record.data() {
+            pending.extend(&union.union.types);
+        } else if !record
+            .flags()
+            .intersects(TypeFlags::PRIMITIVE | TypeFlags::ANY_OR_UNKNOWN | TypeFlags::NEVER)
+            || record
+                .flags()
+                .intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn display_source_computed_object(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+    object: &SourceComputedObjectDisplay,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    if state.check_truncation(flags) {
+        state.add(2);
+        return Ok(if flags.contains(CanonicalTypeFormatFlags::NO_TRUNCATION) {
+            "{ /*elided*/ }".to_owned()
+        } else {
+            "{ ...; }".to_owned()
+        });
+    }
+    let mut result = String::from("{ ");
+    for index in &object.indexes {
+        append_source_index_signature(
+            store,
+            host,
+            global_types,
+            index,
+            flags,
+            state,
+            visiting,
+            &mut result,
+        )?;
+    }
+    append_structural_properties(
+        store,
+        host,
+        global_types,
+        type_id,
+        &object.properties,
+        flags,
+        state,
+        visiting,
+        &mut result,
+    )?;
+    result.push('}');
+    state.add(2);
+    Ok(result)
 }
 
 fn validated_source_index_only_display(
@@ -1803,6 +2031,32 @@ fn display_source_index_only_type(
         };
     }
     let mut result = String::from("{ ");
+    append_source_index_signature(
+        store,
+        Some(host),
+        global_types,
+        index,
+        flags,
+        state,
+        visiting,
+        &mut result,
+    )?;
+    result.push('}');
+    state.add(2);
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_source_index_signature(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    index: &SourceIndexOnlyDisplay,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+    result: &mut String,
+) -> Result<(), TypeDisplayUnavailable> {
     if index.readonly {
         result.push_str("readonly ");
         state.add(9);
@@ -1813,7 +2067,7 @@ fn display_source_index_only_type(
     state.add(index.parameter_name.len().saturating_add(4));
     result.push_str(&display_type_worker(
         store,
-        Some(host),
+        host,
         global_types,
         index.key_type,
         flags,
@@ -1823,16 +2077,15 @@ fn display_source_index_only_type(
     result.push_str("]: ");
     result.push_str(&display_type_worker(
         store,
-        Some(host),
+        host,
         global_types,
         index.value_type,
         flags,
         state,
         visiting,
     )?);
-    result.push_str("; }");
-    state.add(2);
-    Ok(result)
+    result.push_str("; ");
+    Ok(())
 }
 
 fn display_validated_enum_value(
@@ -21261,6 +21514,257 @@ mod tests {
             ),
             Err(TypeDisplayUnavailable::MalformedType(drifted)),
         );
+    }
+
+    fn computed_object_display_fixture(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (CanonicalCheckerContext<'_>, NodeRef, TypeId) {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = parsed_context(parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let object = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let fresh = context
+            .store()
+            .type_node_links(object)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert!(
+            object_members::source_computed_object_literal_origin(context.store(), fresh).is_some()
+        );
+        (context, object, fresh)
+    }
+
+    #[test]
+    fn computed_object_display_keeps_regular_widened_names_and_rejects_name_poison() {
+        let parsed = parse_source_file(concat!(
+            "const name = 'value'; declare const key: string; ",
+            "const object: any = { [name]: undefined, [key]: undefined };",
+        ));
+        let file = FileId::new(194_010);
+        let (mut context, _, fresh) = computed_object_display_fixture(&parsed, file);
+        let regular = context
+            .store_mut_for_test()
+            .get_regular_type_of_object_literal(fresh)
+            .unwrap();
+        let widened = context
+            .store_mut_for_test()
+            .get_widened_type(regular)
+            .unwrap();
+        assert_ne!(fresh, regular);
+        assert_ne!(regular, widened);
+        let property = context
+            .store()
+            .type_payload(fresh)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .properties
+            .as_ref()
+            .unwrap()[0];
+        let links = context
+            .store()
+            .value_symbol_links(property)
+            .unwrap()
+            .clone();
+        assert!(links.name_type.is_some());
+        assert!(
+            context
+                .store()
+                .symbol(property)
+                .unwrap()
+                .check_flags()
+                .contains(CheckFlags::LATE)
+        );
+        let expected = [
+            (fresh, "{ [x: string]: undefined; value: undefined; }"),
+            (regular, "{ [x: string]: undefined; value: undefined; }"),
+            (widened, "{ [x: string]: any; value: any; }"),
+        ];
+        let counts = alias_display_cache_counts(&context);
+        for (type_, display) in expected {
+            assert_eq!(context.type_to_string(type_).unwrap(), display);
+            assert_eq!(type_to_string(context.store(), type_).unwrap(), display);
+        }
+        assert_eq!(alias_display_cache_counts(&context), counts);
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                name_type: Some(number),
+                ..links.clone()
+            }
+        ));
+        let poisoned = alias_display_cache_counts(&context);
+        for (type_, _) in expected {
+            assert_eq!(
+                context.type_to_string(type_),
+                Err(TypeDisplayUnavailable::MalformedType(type_))
+            );
+        }
+        assert_eq!(alias_display_cache_counts(&context), poisoned);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(property, links)
+        );
+        context.recheck_source_file(file).unwrap();
+        for (type_, display) in expected {
+            assert_eq!(context.type_to_string(type_).unwrap(), display);
+        }
+        assert_eq!(alias_display_cache_counts(&context), counts);
+    }
+
+    #[test]
+    fn computed_object_display_rejects_replaced_or_removed_index_evidence() {
+        let parsed = parse_source_file(concat!(
+            "declare const key: string; declare const value: string | number; ",
+            "const object: any = { [key]: value };",
+        ));
+        let file = FileId::new(194_011);
+        let (mut context, object, fresh) = computed_object_display_fixture(&parsed, file);
+        let (members, index, owner) = {
+            let record = context.store().type_payload(fresh).unwrap();
+            let structured = record.data().structured().unwrap();
+            (
+                structured.members,
+                structured.index_infos.as_ref().unwrap()[0],
+                record.symbol().unwrap(),
+            )
+        };
+        let info = context.store().index_info(index).unwrap();
+        let (key, value, components) = (
+            info.key_type(),
+            info.value_type(),
+            info.components().to_vec(),
+        );
+        assert_eq!(components.len(), 1);
+        assert_ne!(components[0], object);
+        let expected = "{ [x: string]: string | number; }";
+        assert_eq!(context.type_to_string(fresh).unwrap(), expected);
+        let forged = context
+            .store_mut_for_test()
+            .alloc_index_info(key, value, false, None, vec![object])
+            .unwrap();
+        for indexes in [Some(vec![forged]), None] {
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_structured_type_members(fresh, members, None, None, None, indexes)
+            );
+            let counts = alias_display_cache_counts(&context);
+            assert_eq!(
+                context.type_to_string(fresh),
+                Err(TypeDisplayUnavailable::MalformedType(fresh))
+            );
+            assert_eq!(alias_display_cache_counts(&context), counts);
+        }
+        assert!(context.store_mut_for_test().set_structured_type_members(
+            fresh,
+            members,
+            None,
+            None,
+            None,
+            Some(vec![index])
+        ));
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_index_info_symbol(index, Some(owner))
+        );
+        let counts = alias_display_cache_counts(&context);
+        assert_eq!(
+            context.type_to_string(fresh),
+            Err(TypeDisplayUnavailable::MalformedType(fresh))
+        );
+        assert_eq!(alias_display_cache_counts(&context), counts);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_index_info_symbol(index, None)
+        );
+        assert_eq!(context.type_to_string(fresh).unwrap(), expected);
+        assert_eq!(
+            context.store().index_info(index).unwrap().components(),
+            components
+        );
+        assert_eq!(alias_display_cache_counts(&context), counts);
+    }
+
+    #[test]
+    fn computed_object_display_keeps_child_flags_cycles_and_location_boundary() {
+        let parsed = parse_source_file(concat!(
+            "declare const key: string; const quoted = '2'; ",
+            "const object = { [key]: 'value', [quoted]: 'value' } as const;",
+        ));
+        let file = FileId::new(194_012);
+        let (mut context, object, fresh) = computed_object_display_fixture(&parsed, file);
+        let flags = CanonicalTypeFormatFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE;
+        let counts = alias_display_cache_counts(&context);
+        assert_eq!(
+            context.type_to_string_with_flags(fresh, flags).unwrap(),
+            "{ readonly [x: string]: 'value'; readonly \"2\": 'value'; }"
+        );
+        assert_eq!(
+            context.type_to_string_at_location(fresh, object),
+            Err(TypeDisplayUnavailable::UnsupportedType {
+                type_id: fresh,
+                kind: TypeDataKind::Object,
+            })
+        );
+        assert_eq!(alias_display_cache_counts(&context), counts);
+        let host = DeclaredTypeHost::new([(&parsed.arena, context.file(file).unwrap().1)]).unwrap();
+        let mut state = DisplayState {
+            approximate_length: 63,
+            ..DisplayState::default()
+        };
+        let mut visiting = HashSet::from([fresh]);
+        assert_eq!(
+            display_type_worker(
+                context.store(),
+                Some(&host),
+                Some(context.global_types()),
+                fresh,
+                flags,
+                &mut state,
+                &mut visiting
+            ),
+            Err(TypeDisplayUnavailable::CyclicType(fresh))
+        );
+        assert_eq!(visiting, HashSet::from([fresh]));
+        assert_eq!(state.approximate_length, 63);
+        assert!(!state.truncating);
+        visiting.clear();
+        state.approximate_length = DEFAULT_MAXIMUM_TRUNCATION_LENGTH + 1;
+        assert_eq!(
+            display_type_worker(
+                context.store(),
+                Some(&host),
+                Some(context.global_types()),
+                fresh,
+                flags,
+                &mut state,
+                &mut visiting
+            )
+            .unwrap(),
+            "{ ...; }"
+        );
+        assert!(visiting.is_empty());
+        assert!(state.truncating);
+        assert_eq!(alias_display_cache_counts(&context), counts);
     }
 
     #[test]
