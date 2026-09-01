@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use ts_ast::{FileId, NodeArena, NodeArenaId, NodeData, NodeId, NodeRef, SyntaxKind};
+use ts_ast::{FileId, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
     AstScope, CanonicalSourceFileFacts, CheckFlags, EscapedName, EscapedNameRef,
     InternalSymbolName, SemanticStoreId, SemanticSymbolId, SymbolData, SymbolFlags, SymbolStore,
@@ -75,7 +75,8 @@ use super::{
     },
     source_callables::{
         SourceCallableAliasAnnotation, SourceCallableAliasSnapshot,
-        SourceCallableTypeParameterSyntaxProof, source_generic_index_map_syntax,
+        SourceCallableTypeParameterSyntaxProof, SourceDirectCallResolution,
+        source_generic_index_map_syntax,
         source_type_parameter_default_is_assignable, valid_source_generic_index_map,
     },
     source_flow::SourceCapturedLocal,
@@ -893,6 +894,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     class_instance_super_views_by_instance: HashMap<TypeId, TypeId>,
     class_instance_super_members: HashMap<(TypeId, SemanticSymbolId), ClassInstanceSuperMember>,
     source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
+    source_direct_call_resolutions: HashMap<NodeRef, SourceDirectCallResolutionState>,
     source_callable_interface_return_proofs:
         HashMap<SignatureId, SourceCallableInterfaceReturnProof>,
     source_callable_alias_annotations: HashMap<
@@ -983,6 +985,32 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
 impl<TypePayload, MapperPayload> Default for SemanticStore<TypePayload, MapperPayload> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Debug)]
+enum SourceDirectCallResolutionState {
+    Checking(Arc<SourceDirectCallResolution>),
+    Publishing(Arc<SourceDirectCallResolution>),
+    Complete(Arc<SourceDirectCallResolution>),
+    Invalid(NodeArenaRevision),
+}
+
+impl SourceDirectCallResolutionState {
+    fn proof(&self) -> Option<&Arc<SourceDirectCallResolution>> {
+        match self {
+            Self::Checking(proof) | Self::Publishing(proof) | Self::Complete(proof) => Some(proof),
+            Self::Invalid(_) => None,
+        }
+    }
+
+    fn revision(&self) -> NodeArenaRevision {
+        match self {
+            Self::Checking(proof) | Self::Publishing(proof) | Self::Complete(proof) => {
+                proof.revision()
+            }
+            Self::Invalid(revision) => *revision,
+        }
     }
 }
 
@@ -1082,6 +1110,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             class_instance_super_views_by_instance: HashMap::new(),
             class_instance_super_members: HashMap::new(),
             source_callable_provenance: HashMap::new(),
+            source_direct_call_resolutions: HashMap::new(),
             source_callable_interface_return_proofs: HashMap::new(),
             source_callable_alias_annotations: HashMap::new(),
             source_callable_alias_owners: HashMap::new(),
@@ -1260,6 +1289,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_files_by_arena.insert(arena.id(), source);
         self.source_node_facts.insert(arena.id(), node_facts);
         self.source_node_children.insert(arena.id(), node_children);
+        for (callback, state) in &mut self.source_direct_call_resolutions {
+            if callback.arena == arena.id() && state.revision() != arena.revision() {
+                *state = SourceDirectCallResolutionState::Invalid(arena.revision());
+            }
+        }
         Some(source)
     }
 
@@ -4004,6 +4038,89 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
+    pub(super) fn source_direct_call_resolution(
+        &self,
+        callback: NodeRef,
+    ) -> Option<&Arc<SourceDirectCallResolution>> {
+        let proof = self
+            .source_direct_call_resolutions
+            .get(&callback)?
+            .proof()?;
+        (self.source_files.get(&callback.file) == Some(&proof.source())
+            && proof.stored_is_exact(self))
+        .then_some(proof)
+    }
+
+    pub(super) fn source_direct_call_resolution_was_registered(&self, callback: NodeRef) -> bool {
+        self.source_direct_call_resolutions.contains_key(&callback)
+    }
+
+    pub(super) fn source_direct_call_resolution_is_published(&self, callback: NodeRef) -> bool {
+        matches!(
+            self.source_direct_call_resolutions.get(&callback),
+            Some(
+                SourceDirectCallResolutionState::Publishing(_)
+                    | SourceDirectCallResolutionState::Complete(_)
+            )
+        ) && self.source_direct_call_resolution(callback).is_some()
+    }
+
+    pub(super) fn begin_source_direct_call_resolution(
+        &mut self,
+        proof: Arc<SourceDirectCallResolution>,
+    ) -> Option<bool> {
+        let callback = proof.callback();
+        if self.source_files.get(&callback.file) != Some(&proof.source())
+            || !proof.stored_is_exact(self)
+            || self
+                .source_direct_call_resolutions
+                .get(&callback)
+                .is_some_and(|state| state.revision() != proof.revision())
+        {
+            return None;
+        }
+        if let Some(existing) = self
+            .source_direct_call_resolutions
+            .get(&callback)
+            .and_then(SourceDirectCallResolutionState::proof)
+        {
+            return (existing.as_ref() == proof.as_ref()).then_some(false);
+        }
+        self.source_direct_call_resolutions.try_reserve(1).ok()?;
+        self.source_direct_call_resolutions
+            .insert(callback, SourceDirectCallResolutionState::Checking(proof));
+        Some(true)
+    }
+
+    pub(super) fn begin_source_direct_call_publication(&mut self, callback: NodeRef) -> bool {
+        let Some(proof) = self.source_direct_call_resolution(callback).cloned() else {
+            return false;
+        };
+        self.source_direct_call_resolutions
+            .insert(callback, SourceDirectCallResolutionState::Publishing(proof));
+        true
+    }
+
+    pub(super) fn finish_source_direct_call_resolution(&mut self, callback: NodeRef) -> bool {
+        let Some(proof) = self.source_direct_call_resolution(callback).cloned() else {
+            return false;
+        };
+        self.source_direct_call_resolutions
+            .insert(callback, SourceDirectCallResolutionState::Complete(proof));
+        true
+    }
+
+    pub(super) fn fail_source_direct_call_resolution(&mut self, callback: NodeRef) {
+        for state in self.source_direct_call_resolutions.values_mut() {
+            if state
+                .proof()
+                .is_some_and(|proof| proof.depends_on(callback))
+            {
+                *state = SourceDirectCallResolutionState::Invalid(state.revision());
+            }
+        }
+    }
+
     fn source_direct_call_contextual_callable_is_exact(
         &self,
         declaration: NodeRef,
@@ -4012,6 +4129,20 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         contextual_target: TypeId,
         captured_assignment: Option<SourceCapturedLocal>,
     ) -> bool {
+        let lexical = if self.source_direct_call_resolutions.contains_key(&declaration) {
+            if !self.source_direct_call_resolution_is_published(declaration) {
+                return false;
+            }
+            let Some(proof) = self.source_direct_call_resolution(declaration) else {
+                return false;
+            };
+            if proof.target() != contextual_target {
+                return false;
+            }
+            true
+        } else {
+            false
+        };
         let Some(owner) = self.symbol(owner_symbol) else {
             return false;
         };
@@ -4084,7 +4215,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         Some(SyntaxKind::ExpressionStatement)
                     )
             )
-            || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || !lexical && self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
             || owner.flags() != SymbolFlags::FUNCTION
             || owner.check_flags() != CheckFlags::NONE
             || owner.name() != InternalSymbolName::Function.as_ref()

@@ -219,7 +219,7 @@ use super::{
         materialize_parameterless_source_function_expression, plan_callable_type_predicate,
         plan_javascript_duplicate_function_implementation, plan_source_callable,
         publish_array_filter_predicate_source_callable,
-        publish_contextual_direct_call_source_callable, publish_contextual_source_callable,
+        publish_contextual_source_callable,
         publish_inferred_source_callable_return, publish_jsdoc_contextual_source_callable,
         publish_jsdoc_parameterized_source_callable, source_array_filter_predicate_arrow_is_exact,
         source_direct_call_argument_arrow_is_exact, source_object_property_arrow_symbol,
@@ -40661,6 +40661,15 @@ fn check_planned_arrow_argument(
         })
         && store
             .source_object_literal_method_owner_is_exact(expression, arrow.callable.owner_symbol);
+    let contextual_statement_arrow = matches!(arrow.body, PlannedArrowBody::StatementList(_))
+        && contextual_type.is_some()
+        && arrow
+            .callable
+            .parameters
+            .iter()
+            .any(|parameter| parameter.is_implicit_any())
+        && source_direct_call_argument_arrow_is_exact(store, host, expression)
+            .map_err(SourcePlanner::callable_plan_error)?;
     if matches!(
         arrow.body,
         PlannedArrowBody::StatementList(_) | PlannedArrowBody::ForOf(_)
@@ -40669,11 +40678,12 @@ fn check_planned_arrow_argument(
         || arrow.linear_body.is_some()
         || arrow.loop_body.is_some()
         || arrow.prototype_this.is_some()
-        || arrow
-            .callable
-            .parameters
-            .iter()
-            .any(|parameter| parameter.is_implicit_any())
+        || !contextual_statement_arrow
+            && arrow
+                .callable
+                .parameters
+                .iter()
+                .any(|parameter| parameter.is_implicit_any())
         || host
             .node(expression)
             .is_none_or(|record| match (&record.data, record.kind) {
@@ -41767,6 +41777,60 @@ fn check_contextual_direct_call_arrow(
     contextual_type: TypeId,
     outer_capture: Option<SourceArrowCaptureContext<'_>>,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    let proof = super::source_callables::prepare_source_direct_call_resolution(
+        store,
+        host,
+        source,
+        arrow.callable.declaration,
+        contextual_type,
+        current_flow_types,
+    )
+    .map_err(SourcePlanner::callable_plan_error)?;
+    let introduced = proof
+        .map(|proof| {
+            store
+                .begin_source_direct_call_resolution(proof)
+                .ok_or(SourceCheckError::Arrow(arrow.callable.declaration))
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let result = check_contextual_direct_call_arrow_worker(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        current_flow_types,
+        type_import_execution,
+        deferred,
+        arrow,
+        contextual_type,
+        outer_capture,
+    );
+    if result.is_err() && introduced {
+        store.fail_source_direct_call_resolution(arrow.callable.declaration);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_contextual_direct_call_arrow_worker(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    arrow: &PlannedArrowExpression,
+    contextual_type: TypeId,
+    outer_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
     let unsupported = || {
         SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(arrow.callable.declaration))
     };
@@ -41923,6 +41987,8 @@ fn check_contextual_direct_call_arrow(
             return Err(SourceCheckError::Arrow(arrow.callable.declaration));
         }
     }
+    let mut statement_values = HashMap::new();
+    let mut statement_value_order = Vec::new();
     let return_type = match &arrow.body {
         PlannedArrowBody::Empty => {
             store
@@ -41952,9 +42018,29 @@ fn check_contextual_direct_call_arrow(
             let widened = widened_fresh_literal_type(store, checked.result)?;
             store.get_widened_type_with_global_types(widened, global_types)?
         }
-        PlannedArrowBody::StatementList(_)
-        | PlannedArrowBody::ForOf(_)
-        | PlannedArrowBody::ReturnJsx { .. } => {
+        PlannedArrowBody::StatementList(body) => {
+            if body.syntax.callable != arrow.callable {
+                return Err(SourceCheckError::Arrow(arrow.callable.declaration));
+            }
+            check_planned_callable_statement_list_worker(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                flow_types,
+                type_import_execution,
+                deferred,
+                body,
+                &mut statement_values,
+                &mut statement_value_order,
+                outer_capture,
+                Some(&prepared_parameters),
+            )?
+        }
+        PlannedArrowBody::ForOf(_) | PlannedArrowBody::ReturnJsx { .. } => {
             return Err(unsupported());
         }
     };
@@ -41999,20 +42085,29 @@ fn check_contextual_direct_call_arrow(
         publish_expression_type(store, arrow.callable.declaration, callable)?;
         return Ok(CheckedExpressionTypes::leaf(callable, callable));
     }
-    let callable = publish_contextual_direct_call_source_callable(
+    publish_staged_variable_state(
         store,
-        &PreparedContextualDirectCallSourceCallable {
-            declaration: arrow.callable.declaration,
-            owner_symbol: arrow.callable.owner_symbol,
-            captured_assignment: arrow.callable.captured_assignment(),
-            contextual_target: contextual_type,
-            parameters: prepared_parameters,
-            flags: arrow.callable.flags,
-            min_argument_count: arrow.callable.min_argument_count,
-            return_type,
-        },
-    )
-    .map_err(SourcePlanner::callable_plan_error)?;
+        source.node_ref(),
+        &statement_values,
+        &statement_value_order,
+        &[],
+        &[],
+    )?;
+    let callable =
+        super::source_callables::publish_contextual_direct_call_source_callable_with_resolution(
+            store,
+            &PreparedContextualDirectCallSourceCallable {
+                declaration: arrow.callable.declaration,
+                owner_symbol: arrow.callable.owner_symbol,
+                captured_assignment: arrow.callable.captured_assignment(),
+                contextual_target: contextual_type,
+                parameters: prepared_parameters,
+                flags: arrow.callable.flags,
+                min_argument_count: arrow.callable.min_argument_count,
+                return_type,
+            },
+        )
+        .map_err(SourcePlanner::callable_plan_error)?;
     publish_expression_type(store, arrow.callable.declaration, callable)?;
     Ok(CheckedExpressionTypes::leaf(callable, callable))
 }
@@ -52868,13 +52963,68 @@ fn check_planned_callable_statement_list(
     value_order: &mut Vec<SemanticSymbolId>,
     outer_capture: Option<SourceArrowCaptureContext<'_>>,
 ) -> Result<TypeId, SourceCheckError> {
+    check_planned_callable_statement_list_worker(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        flow_types,
+        type_import_execution,
+        deferred,
+        body,
+        staged_value_types,
+        value_order,
+        outer_capture,
+        None,
+    )
+}
+
+/// Contextual callbacks use the same statements before their signature is published.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn check_planned_callable_statement_list_worker(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: HashMap<SemanticSymbolId, TypeId>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    body: &PlannedCallableStatementList,
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+    outer_capture: Option<SourceArrowCaptureContext<'_>>,
+    contextual_parameters: Option<&[ContextualSourceCallableParameter]>,
+) -> Result<TypeId, SourceCheckError> {
     let callable = &body.syntax.callable;
     if !body.flow.statement_list_is_exact(&body.syntax) {
         return Err(SourceCheckError::Function(
             SourceFunctionInvariant::Callable(callable.declaration),
         ));
     }
-    let signature = if callable.return_type.is_inferred() {
+    if let Some(parameters) = contextual_parameters
+        && (!callable.return_type.is_inferred()
+            || parameters.is_empty()
+            || parameters.len() != callable.parameters.len()
+            || parameters
+                .iter()
+                .zip(&callable.parameters)
+                .any(|(actual, planned)| {
+                    actual.declaration != planned.declaration
+                        || actual.symbol != planned.symbol
+                        || !planned.is_implicit_any()
+                        || flow_types.get(&actual.symbol) != Some(&actual.type_)
+                        || store.type_payload(actual.type_).is_none()
+                }))
+    {
+        return Err(SourceCheckError::Arrow(callable.declaration));
+    }
+    let signature = if callable.return_type.is_inferred() && contextual_parameters.is_none() {
         use super::source_callables::SourceCallableState;
         let state = super::source_callables::source_callable_state(store, callable, false)
             .map_err(SourcePlanner::callable_plan_error)?;
@@ -52931,8 +53081,15 @@ fn check_planned_callable_statement_list(
                 .get_type_from_type_node(annotation)
             })
             .transpose()?;
+        let declared_entries = match contextual_parameters {
+            Some(parameters) => parameters
+                .iter()
+                .map(|parameter| (parameter.symbol, parameter.type_))
+                .collect(),
+            None => source_arrow_parameter_entry_types(store, callable)?,
+        };
         let mut returned = CallableStatementReturns {
-            declared_entries: source_arrow_parameter_entry_types(store, callable)?,
+            declared_entries,
             has_bare_return: body.syntax.has_implicit_return,
             ..CallableStatementReturns::default()
         };

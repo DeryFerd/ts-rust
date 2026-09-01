@@ -9,9 +9,13 @@
 //! and validates the resulting store shape.
 //! Source values never borrow `FunctionType` `TypeNode` or `__call` provenance.
 
+#[cfg(test)]
+#[path = "source_direct_call_resolution_tests.rs"]
+mod source_direct_call_resolution_tests;
+
 use std::{collections::HashSet, sync::Arc};
 
-use ts_ast::{ModifierList, NodeData, NodeFlags, NodeList, NodeRef, SyntaxKind};
+use ts_ast::{ModifierList, NodeArenaRevision, NodeData, NodeFlags, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalNameResolver, CanonicalResolutionLocation, CanonicalSourceFileFacts, CheckFlags,
     InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
@@ -38,7 +42,7 @@ use super::{
     },
     links::{
         DeclaredTypeLinks, DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState,
-        SignatureLinks, SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks,
+        SignatureLinks, SourceFileRef, SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks,
     },
     mapped_types::{MappedTypeModifiers, plan_mapped_type_declaration},
     object_aliases::{
@@ -5010,6 +5014,582 @@ pub(super) fn source_object_literal_method_symbol(
     })
 }
 
+/// A canonical name lookup, kept separate from mutable node and value links.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceDirectCallReference {
+    callback: NodeRef,
+    call: NodeRef,
+    callee: NodeRef,
+    receiver: NodeRef,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    annotation: Option<NodeRef>,
+    initializer: Option<NodeRef>,
+    property: Option<NodeRef>,
+    argument: usize,
+    revision: NodeArenaRevision,
+}
+
+/// Minted only by the canonical resolver and the existing callable providers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceDirectCallResolution {
+    source: SourceFileRef,
+    reference: SourceDirectCallReference,
+    receiver_type: TypeId,
+    callee_type: TypeId,
+    callee_signature: SignatureId,
+    callee_signature_owner: TypeId,
+    target: TypeId,
+    target_signature: SignatureId,
+    parent: Option<(Arc<SourceDirectCallResolution>, usize)>,
+}
+
+impl SourceDirectCallResolution {
+    pub(super) fn callback(&self) -> NodeRef {
+        self.reference.callback
+    }
+
+    pub(super) fn source(&self) -> SourceFileRef {
+        self.source
+    }
+
+    pub(super) fn revision(&self) -> NodeArenaRevision {
+        self.reference.revision
+    }
+
+    pub(super) fn target(&self) -> TypeId {
+        self.target
+    }
+
+    pub(super) fn depends_on(&self, callback: NodeRef) -> bool {
+        self.callback() == callback
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|(parent, _)| parent.depends_on(callback))
+    }
+
+    fn canonical_is_exact(&self, store: &CanonicalTypeMapperStore) -> bool {
+        if !self.stored_is_exact(store) {
+            return false;
+        }
+        if self
+            .parent
+            .as_ref()
+            .is_some_and(|(parent, _)| !parent.canonical_is_exact(store))
+        {
+            return false;
+        }
+        let super::callable_sets::StoredCallableSetValidation::Valid { projection, .. } =
+            super::callable_sets::validate_stored_callable_set(store, self.callee_type)
+        else {
+            return false;
+        };
+        let [callee] = projection.call_signatures.as_ref() else {
+            return false;
+        };
+        if !projection.construct_signatures.is_empty()
+            || callee.signature != self.callee_signature
+            || callee.owner != self.callee_signature_owner
+            || callee.rest_parameter.is_some()
+            || callee.parameters.get(self.reference.argument) != Some(&self.target)
+            || !matches!(validate_stored_single_callable(store, self.target),
+                StoredSingleCallableValidation::Valid { callable, .. }
+                    if callable.signature == self.target_signature)
+        {
+            return false;
+        }
+        let Some(property) = self.reference.property else {
+            return self.reference.callee == self.reference.receiver
+                && self.callee_type == self.receiver_type;
+        };
+        let Some(name) = store.source_identifier_text(property) else {
+            return false;
+        };
+        let Some(receiver) = store.type_payload(self.receiver_type) else {
+            return false;
+        };
+        let members = if receiver.flags() == TypeFlags::INTERSECTION {
+            let Ok(projection) = store.validate_intersection_type(self.receiver_type) else {
+                return false;
+            };
+            Some(projection.members)
+        } else if matches!(
+            super::object_members::validate_resolved_declared_property_object(
+                store,
+                self.receiver_type
+            ),
+            super::object_members::DeclaredPropertyObjectValidation::Valid(_)
+        ) {
+            receiver
+                .data()
+                .structured()
+                .and_then(|structured| structured.members)
+        } else {
+            return false;
+        };
+        let Some(symbol) = members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(ts_binder::EscapedNameRef::source(name)))
+        else {
+            return false;
+        };
+        store.source_node_parent(property) == Some(SourceNodeParent::Parent(self.reference.callee))
+            && store.source_node_parent(self.reference.receiver)
+                == Some(SourceNodeParent::Parent(self.reference.callee))
+            && store
+                .symbol_node_links(self.reference.callee)
+                .and_then(|links| links.resolved_symbol)
+                == Some(symbol)
+            && store
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                == Some(self.callee_type)
+    }
+
+    pub(super) fn stored_is_exact<TypePayload, MapperPayload>(
+        &self,
+        store: &SemanticStore<TypePayload, MapperPayload>,
+    ) -> bool {
+        let reference = &self.reference;
+        if store.source_declaration_symbol(reference.declaration) != Some(reference.symbol)
+            || !store.source_symbol_declarations_match(reference.symbol)
+            || store.source_node_parent(reference.callback)
+                != Some(SourceNodeParent::Parent(reference.call))
+            || store.source_node_parent(reference.callee)
+                != Some(SourceNodeParent::Parent(reference.call))
+            || store.source_node_kind(reference.callback) != Some(SyntaxKind::ArrowFunction)
+            || store.source_identifier_text(reference.receiver).is_none()
+            || store.symbol(reference.symbol).is_none_or(|symbol| {
+                Some(symbol.name()) != store.source_identifier_text(reference.receiver)
+                    || symbol.check_flags() != CheckFlags::NONE
+            })
+            || store
+                .symbol_node_links(reference.receiver)
+                .is_some_and(|links| {
+                    links.resolved_symbol.is_some_and(|symbol| {
+                        store.get_merged_symbol(symbol) != Some(reference.symbol)
+                    })
+                })
+            || store
+                .type_node_links(reference.callee)
+                .and_then(|links| links.resolved_type)
+                != Some(self.callee_type)
+            || store
+                .type_node_links(reference.receiver)
+                .and_then(|links| links.resolved_type)
+                != Some(self.receiver_type)
+            || store
+                .callable_signature_parameter_types(self.callee_signature)
+                .and_then(|parameters| parameters.get(reference.argument))
+                .copied()
+                != Some(self.target)
+        {
+            return false;
+        }
+        for (signature, type_) in [
+            (self.callee_signature, None),
+            (self.target_signature, Some(self.target)),
+        ] {
+            let Some(record) = store.signature(signature) else {
+                return false;
+            };
+            let Some(declaration) = record.declaration() else {
+                return false;
+            };
+            if !record.type_parameters().is_empty()
+                || record.has_rest_parameter()
+                || store
+                    .signature_links(declaration)
+                    .and_then(|links| links.resolved_signature.signature())
+                    != Some(signature)
+                || type_.is_some_and(|type_| {
+                    !(store
+                        .type_node_links(declaration)
+                        .and_then(|links| links.resolved_type)
+                        == Some(type_)
+                        || store
+                            .source_callable_provenance(type_)
+                            .is_some_and(|provenance| {
+                                provenance.declaration == declaration
+                                    && provenance.signature == signature
+                            }))
+                })
+            {
+                return false;
+            }
+        }
+        if let Some((parent, position)) = &self.parent {
+            if store.source_direct_call_resolution(parent.callback()) != Some(parent)
+                || store.source_node_parent(reference.declaration)
+                    != Some(SourceNodeParent::Parent(parent.callback()))
+                || store
+                    .callable_signature_parameter_types(parent.target_signature)
+                    .and_then(|parameters| parameters.get(*position))
+                    .copied()
+                    != Some(self.receiver_type)
+            {
+                return false;
+            }
+        } else if let Some(annotation) = reference.annotation {
+            if store
+                .type_node_links(annotation)
+                .and_then(|links| links.resolved_type)
+                != Some(self.receiver_type)
+            {
+                return false;
+            }
+        } else if let Some(initializer) = reference.initializer {
+            if store.source_callable_type_for_declaration(initializer) != Some(self.receiver_type) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        true
+    }
+}
+
+/// The actual callee was already checked by the ordinary call evaluator.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) fn prepare_source_direct_call_resolution(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    source: SourceFileRef,
+    callback: NodeRef,
+    target: TypeId,
+    current_flow_types: &std::collections::HashMap<SemanticSymbolId, TypeId>,
+) -> Result<Option<Arc<SourceDirectCallResolution>>, SourceCallableError> {
+    if !callback.is_for(source.node_ref().arena, source.node_ref().file) {
+        return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
+            callback,
+        )));
+    }
+    let Some(reference) = source_direct_call_reference(store, host, callback)? else {
+        return Ok(None);
+    };
+    let invalid = || invariant(SourceCallableInvariant::InvalidTypeCache(callback));
+    let receiver_type = current_flow_types
+        .get(&reference.symbol)
+        .copied()
+        .or_else(|| {
+            store
+                .value_symbol_links(reference.symbol)
+                .and_then(|links| links.resolved_type)
+        })
+        .ok_or_else(invalid)?;
+    let callee_type = store
+        .type_node_links(reference.callee)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    if reference.property.is_none() && callee_type != receiver_type {
+        return Err(invalid());
+    }
+    let super::callable_sets::StoredCallableSetValidation::Valid { projection, .. } =
+        super::callable_sets::validate_stored_callable_set(store, callee_type)
+    else {
+        return Err(invalid());
+    };
+    let [callee] = projection.call_signatures.as_ref() else {
+        return Err(invalid());
+    };
+    if !projection.construct_signatures.is_empty()
+        || callee.rest_parameter.is_some()
+        || callee.parameters.get(reference.argument) != Some(&target)
+    {
+        return Err(invalid());
+    }
+    let StoredSingleCallableValidation::Valid {
+        callable: contextual,
+        ..
+    } = validate_stored_single_callable(store, target)
+    else {
+        return Err(invalid());
+    };
+    let parent = if reference.annotation.is_none() && reference.initializer.is_none() {
+        let Some(SourceNodeParent::Parent(owner)) = store.source_node_parent(reference.declaration)
+        else {
+            return Err(invalid());
+        };
+        let parent = store
+            .source_direct_call_resolution(owner)
+            .ok_or_else(invalid)?
+            .clone();
+        let record = preflight_node(store, host, owner)?;
+        let NodeData::ArrowFunction(arrow) = &record.data else {
+            return Err(invalid());
+        };
+        let position = arrow
+            .parameters
+            .nodes
+            .iter()
+            .position(|node| *node == reference.declaration.node)
+            .ok_or_else(invalid)?;
+        if store
+            .callable_signature_parameter_types(parent.target_signature)
+            .and_then(|parameters| parameters.get(position))
+            .copied()
+            != Some(receiver_type)
+        {
+            return Err(invalid());
+        }
+        Some((parent, position))
+    } else {
+        None
+    };
+    let proof = Arc::new(SourceDirectCallResolution {
+        source,
+        reference,
+        receiver_type,
+        callee_type,
+        callee_signature: callee.signature,
+        callee_signature_owner: callee.owner,
+        target,
+        target_signature: contextual.signature,
+        parent,
+    });
+    if !proof.canonical_is_exact(store) {
+        return Err(invalid());
+    }
+    Ok(Some(proof))
+}
+
+/// Resolves the nearest source binding without demanding the callback body.
+#[allow(clippy::too_many_lines)]
+fn source_direct_call_reference(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    callback: NodeRef,
+) -> Result<Option<SourceDirectCallReference>, SourceCallableError> {
+    let invalid = || invariant(SourceCallableInvariant::InvalidOwnerSymbol(callback));
+    let (arena, bound) = host.source(callback).ok_or_else(invalid)?;
+    if store.source_node_kind(callback) != Some(SyntaxKind::ArrowFunction)
+        || bound
+            .source_facts()
+            .is_none_or(|facts| facts.is_javascript_file() || facts.is_declaration_file())
+    {
+        return Ok(None);
+    }
+    let Some(SourceNodeParent::Parent(call)) = store.source_node_parent(callback) else {
+        return Ok(None);
+    };
+    let record = preflight_node(store, host, call)?;
+    let NodeData::CallExpression(data) = &record.data else {
+        return Ok(None);
+    };
+    if record.kind != SyntaxKind::CallExpression
+        || record.flags.0 != 0
+        || data.question_dot_token.is_some()
+        || data.type_arguments.is_some()
+        || data.symbol.is_some()
+        || data.facts != 0
+    {
+        return Ok(None);
+    }
+    let mut arguments = data
+        .arguments
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| **node == callback.node);
+    let Some((argument, _)) = arguments.next() else {
+        return Ok(None);
+    };
+    if arguments.next().is_some() {
+        return Err(invalid());
+    }
+    let callee = NodeRef::new(call.arena, call.file, data.expression);
+    let callee_record = preflight_node(store, host, callee)?;
+    if callee_record.parent != Some(call.node) || callee_record.flags.0 != 0 {
+        return Err(invalid());
+    }
+    let (receiver, property) = match &callee_record.data {
+        NodeData::Identifier(_) if callee_record.kind == SyntaxKind::Identifier => (callee, None),
+        NodeData::PropertyAccessExpression(property)
+            if callee_record.kind == SyntaxKind::PropertyAccessExpression
+                && property.question_dot_token.is_none()
+                && property.flow_node.is_none()
+                && property.facts == 0 =>
+        {
+            let receiver = NodeRef::new(call.arena, call.file, property.expression);
+            let name = NodeRef::new(call.arena, call.file, property.name);
+            if preflight_node(store, host, receiver)?.parent != Some(callee.node)
+                || preflight_node(store, host, name)?.parent != Some(callee.node)
+                || store.source_identifier_text(name).is_none()
+            {
+                return Err(invalid());
+            }
+            (receiver, Some(name))
+        }
+        _ => return Ok(None),
+    };
+    if property.is_some()
+        && super::source_calls::source_global_array_callback_method_name(host, callee).is_some()
+    {
+        return Ok(None);
+    }
+    let receiver_record = preflight_node(store, host, receiver)?;
+    let NodeData::Identifier(identifier) = &receiver_record.data else {
+        return Ok(None);
+    };
+    if receiver_record.kind != SyntaxKind::Identifier
+        || receiver_record.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Ok(None);
+    }
+    let mut resolver_host = host.name_resolver_host(store)?;
+    let mut resolver =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut resolver_host)
+            .map_err(DeclaredTypeError::from)?;
+    let Some(symbol) = resolver
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(receiver)),
+            &identifier.text,
+            SymbolFlags::VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?
+    else {
+        return Ok(None);
+    };
+    let symbol = store.get_merged_symbol(symbol).ok_or_else(invalid)?;
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    let Some(declaration) = owner.value_declaration() else {
+        return Ok(None);
+    };
+    if !matches!(
+        store.source_node_kind(declaration),
+        Some(SyntaxKind::VariableDeclaration | SyntaxKind::Parameter)
+    ) || !matches!(
+        owner.flags(),
+        SymbolFlags::BLOCK_SCOPED_VARIABLE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+    ) {
+        return Ok(None);
+    }
+    if !declaration.is_for(callback.arena, callback.file)
+        || owner.declarations() != Some(&[declaration])
+        || owner.check_flags() != CheckFlags::NONE
+        || !host.symbol_matches(store, declaration, symbol)
+        || !store.source_symbol_declarations_match(symbol)
+        || store.symbol_node_links(receiver).is_some_and(|links| {
+            links
+                .resolved_symbol
+                .is_some_and(|cached| store.get_merged_symbol(cached) != Some(symbol))
+        })
+    {
+        return Err(invalid());
+    }
+    let declaration_record = preflight_node(store, host, declaration)?;
+    let (annotation, initializer) = match &declaration_record.data {
+        NodeData::VariableDeclaration(variable)
+            if declaration_record.kind == SyntaxKind::VariableDeclaration
+                && owner.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE =>
+        {
+            let Some(initializer) = variable.initializer else {
+                return Ok(None);
+            };
+            let initializer = NodeRef::new(callback.arena, callback.file, initializer);
+            let Some(SourceNodeParent::Parent(list)) = store.source_node_parent(declaration) else {
+                return Err(invalid());
+            };
+            let list = preflight_node(store, host, list)?;
+            const CONST_DECLARATION_FLAG: u32 = 1 << 1;
+            if list.kind != SyntaxKind::VariableDeclarationList
+                || list.flags.0 != CONST_DECLARATION_FLAG
+                || store.source_node_kind(initializer) != Some(SyntaxKind::ArrowFunction)
+                || store.source_node_parent(initializer)
+                    != Some(SourceNodeParent::Parent(declaration))
+            {
+                return Ok(None);
+            }
+            (
+                variable
+                    .type_
+                    .map(|node| NodeRef::new(callback.arena, callback.file, node)),
+                Some(initializer),
+            )
+        }
+        NodeData::ParameterDeclaration(parameter)
+            if declaration_record.kind == SyntaxKind::Parameter
+                && owner.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                && parameter.initializer.is_none()
+                && parameter.dot_dot_dot_token.is_none() =>
+        {
+            let Some(container) = bound.container(declaration) else {
+                return Err(invalid());
+            };
+            if !matches!(
+                store.source_node_kind(container),
+                Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionDeclaration)
+            ) || store.source_node_parent(declaration)
+                != Some(SourceNodeParent::Parent(container))
+            {
+                return Ok(None);
+            }
+            (
+                parameter
+                    .type_
+                    .map(|node| NodeRef::new(callback.arena, callback.file, node)),
+                None,
+            )
+        }
+        _ => return Ok(None),
+    };
+    let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(call) else {
+        return Ok(None);
+    };
+    let statement_record = preflight_node(store, host, statement)?;
+    if !matches!(&statement_record.data, NodeData::ExpressionStatement(statement)
+        if statement.expression == call.node && statement.flow_node.is_none())
+        || statement_record.kind != SyntaxKind::ExpressionStatement
+        || statement_record.flags.0 != 0
+    {
+        return Ok(None);
+    }
+    let Some(container) = bound.container(call) else {
+        return Ok(None);
+    };
+    if !matches!(
+        store.source_node_kind(container),
+        Some(SyntaxKind::SourceFile | SyntaxKind::ArrowFunction | SyntaxKind::FunctionDeclaration)
+    ) || bound.container(statement) != Some(container)
+    {
+        return Ok(None);
+    }
+    let callback_owner = bound.symbol(callback).ok_or_else(invalid)?;
+    if !host.symbol_matches(store, callback, callback_owner)
+        || store.symbol(callback_owner).is_none_or(|owner| {
+            owner.flags() != SymbolFlags::FUNCTION
+                || owner.check_flags() != CheckFlags::NONE
+                || owner.declarations() != Some(&[callback])
+                || owner.value_declaration() != Some(callback)
+                || owner.members().is_some()
+                || owner.exports().is_some()
+                || owner.parent().is_some()
+                || owner.export_symbol().is_some()
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(Some(SourceDirectCallReference {
+        callback,
+        call,
+        callee,
+        receiver,
+        symbol,
+        declaration,
+        annotation,
+        initializer,
+        property,
+        argument,
+        revision: arena.revision(),
+    }))
+}
+
 /// Authenticates one unparenthesized callback in a direct or source-owned method call.
 #[allow(clippy::too_many_lines)] // Validate the callback, array owner, and source container.
 pub(super) fn source_direct_call_argument_arrow_is_exact(
@@ -5022,6 +5602,9 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
     }
     if store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction) {
         return Ok(false);
+    }
+    if source_direct_call_reference(store, host, declaration)?.is_some() {
+        return Ok(true);
     }
     if source_array_sort_argument_arrow_is_exact(store, host, declaration) {
         return Ok(true);
@@ -6747,6 +7330,14 @@ fn stored_direct_call_argument_arrow_is_exact(
     owner_symbol: SemanticSymbolId,
     captured_assignment: Option<SourceCapturedLocal>,
 ) -> bool {
+    if store.source_direct_call_resolution_was_registered(declaration) {
+        return captured_assignment.is_none()
+            && store.source_declaration_symbol(declaration) == Some(owner_symbol)
+            && store.source_direct_call_resolution_is_published(declaration)
+            && store
+                .source_direct_call_resolution(declaration)
+                .is_some_and(|proof| proof.canonical_is_exact(store));
+    }
     if let Some(captured) = captured_assignment {
         let Some(bootstrap) = store.intrinsic_bootstrap() else {
             return false;
@@ -12252,6 +12843,39 @@ pub(super) fn publish_contextual_source_callable(
             return_type: prepared.return_type,
         },
     )
+}
+
+/// Completes the lexical proof only after contextual callable publication succeeds.
+pub(super) fn publish_contextual_direct_call_source_callable_with_resolution(
+    store: &mut CanonicalTypeMapperStore,
+    prepared: &PreparedContextualDirectCallSourceCallable,
+) -> Result<TypeId, SourceCallableError> {
+    let declaration = prepared.declaration;
+    if !store.source_direct_call_resolution_was_registered(declaration) {
+        return publish_contextual_direct_call_source_callable(store, prepared);
+    }
+    if store
+        .source_direct_call_resolution(declaration)
+        .is_none_or(|proof| {
+            proof.target() != prepared.contextual_target || !proof.canonical_is_exact(store)
+        })
+        || !store.begin_source_direct_call_publication(declaration)
+    {
+        store.fail_source_direct_call_resolution(declaration);
+        return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+            declaration,
+        )));
+    }
+    let result = publish_contextual_direct_call_source_callable(store, prepared);
+    if result.is_err() || !store.finish_source_direct_call_resolution(declaration) {
+        store.fail_source_direct_call_resolution(declaration);
+        return result.and_then(|_| {
+            Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+                declaration,
+            )))
+        });
+    }
+    result
 }
 
 /// Publishes a contextually typed direct-call arrow without inventing an anchor.
