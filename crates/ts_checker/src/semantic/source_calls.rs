@@ -4384,10 +4384,14 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
             };
             arena.get(prefix.operand).is_some_and(|operand| {
                 operand.parent == Some(node.node)
-                    && matches!(
+                    && (matches!(
                         operand.kind,
                         SyntaxKind::NumericLiteral | SyntaxKind::BigIntLiteral
-                    )
+                    ) || prefix.operator == SyntaxKind::ExclamationToken
+                        && is_supported_call_argument_syntax(
+                            arena,
+                            NodeRef::new(node.arena, node.file, prefix.operand),
+                        ))
             })
         }
         SyntaxKind::PropertyAccessExpression => {
@@ -5042,10 +5046,14 @@ fn is_context_insensitive_primitive_binary_operand_syntax(
             };
             arena.get(prefix.operand).is_some_and(|operand| {
                 operand.parent == Some(node.node)
-                    && matches!(
+                    && (matches!(
                         operand.kind,
                         SyntaxKind::NumericLiteral | SyntaxKind::BigIntLiteral
-                    )
+                    ) || prefix.operator == SyntaxKind::ExclamationToken
+                        && is_supported_call_argument_syntax(
+                            arena,
+                            NodeRef::new(node.arena, node.file, prefix.operand),
+                        ))
             })
         }
         SyntaxKind::ElementAccessExpression => is_context_insensitive_element_syntax(arena, node),
@@ -5089,7 +5097,9 @@ fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
         PlannedExpressionKind::Assertion { operand, .. } => {
             is_supported_call_argument_plan(operand)
         }
-        PlannedExpressionKind::Parenthesized(inner) => is_supported_call_argument_plan(inner),
+        PlannedExpressionKind::Parenthesized(inner) | PlannedExpressionKind::LogicalNot(inner) => {
+            is_supported_call_argument_plan(inner)
+        }
         PlannedExpressionKind::Binary(binary) => {
             let (left, right) = binary.operands();
             binary.node() == expression.node
@@ -5134,6 +5144,7 @@ fn is_context_insensitive_primitive_binary_operand_plan(expression: &PlannedExpr
         PlannedExpressionKind::Parenthesized(inner) => {
             is_context_insensitive_primitive_binary_operand_plan(inner)
         }
+        PlannedExpressionKind::LogicalNot(operand) => is_supported_call_argument_plan(operand),
         PlannedExpressionKind::Binary(binary) => {
             let (left, right) = binary.operands();
             binary.node() == expression.node

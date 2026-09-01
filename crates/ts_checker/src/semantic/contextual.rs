@@ -563,13 +563,15 @@ fn prepare_expression(
             contextual_type,
             location,
         )?),
-        PlannedExpressionKind::Boolean(_) => PreparedExpression::Literal(literal_treatment(
-            store,
-            global_types,
-            LiteralKind::Boolean,
-            contextual_type,
-            location,
-        )?),
+        PlannedExpressionKind::Boolean(_) | PlannedExpressionKind::LogicalNot(_) => {
+            PreparedExpression::Literal(literal_treatment(
+                store,
+                global_types,
+                LiteralKind::Boolean,
+                contextual_type,
+                location,
+            )?)
+        }
         PlannedExpressionKind::Parenthesized(inner) => {
             PreparedExpression::Parenthesized(Box::new(prepare_expression(
                 store,
