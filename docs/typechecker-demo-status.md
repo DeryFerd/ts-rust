@@ -4,9 +4,12 @@ Updated 2026-09-01. No complete real-world project has passed in Rust yet.
 
 ## Current result
 
-The demo is not ready. The combined build failed with four Rust errors, so
-all 454 selected tests remain unrun. Fix those compile errors, then build and
-check unchanged Pathe. Use its next typed failures to choose the next fixes.
+The demo is not ready. The combined source `21df31a3` failed Rust
+compilation at three alias API calls. All 464 selected tests remain unrun.
+The one-function repair is committed and reviewed at `5f7ad5e3`. It retains
+the contextual methods, template substitutions, computed calls and generic
+constructor contexts. The next build and 464-test run will use that source.
+Then check unchanged Pathe and use its actual failures to choose the next fixes.
 
 Pathe is the first demo target. The latest census checked the same original
 inputs in 21.862 seconds. All 277 loaded files parse without errors, but none
@@ -16,23 +19,44 @@ and [independent review](../target/wave202-pathe-first-error-census-3-result-rev
 include the completed resource check. Source and evidence stayed unchanged.
 This diagnostic build does not include the newer combined repairs.
 
-The focused local-write tests improved to six passes out of seven. That run
-used a separate source branch. It does not establish a combined compiler pass.
+The focused local-write tests improved to six passes out of seven. The latest
+diagnostic run preserves that count and locates the normalizer's
+`UnknownCondition` at `normalized[2] === "/"`. The normalizer has a static
+dependency path to seven of nine Pathe roots. This supports fixing it first,
+but does not predict seven passing roots. These separate runs do not establish
+a combined compiler pass.
 
 | Check | Actual result |
 | --- | --- |
+| [Combined demo tests 4](../target/wave202-pathe-demo-tests-4-result.md), `21df31a3` | Binder and parser harnesses compiled. Checker and fixture compilation failed at three alias API calls. No list or run phase started. All 464 tests are unrun. |
+| [Normalizer condition trace focus 4](../target/wave202-pathe-normalizer-condition-trace-focus-4-result.md), `9727de9e` | Compile and list passed. Six tests passed and one failed. The failure-only trace identifies a binary expression at byte range `[345, 366)` in the unchanged normalizer. |
 | [Combined repairs 3](../target/wave202-pathe-combined-repairs-3-result.md), `9c1a7cbf` | Binder and parser harnesses compiled. Checker and fixture compilation failed with four distinct Rust errors. No list or run phase started. All 454 tests are unrun. |
-| [Local-write trace focus 2](../target/wave202-pathe-local-write-trace-focus-2-result.md), `38101730` | Compiled and ran all seven unchanged tests. Six passed and one failed, up from four passes and three failures. |
+| [Local-write flow trace focus 3](../target/wave202-pathe-local-write-flow-trace-focus-3-result.md), `d02e8cb9` | Compile and list passed. All seven unchanged tests ran. Six passed and one failed. One trace reports `UnknownCondition`. |
 | [Generic constructor focus](../target/wave202-pathe-generic-constructors-focus-1-result.md), `5373bc05` | Compilation failed after 38.598 seconds with two Rust enum API errors. All five tests remain unrun. |
 | [Rust API preflight](../target/wave202-pathe-checker-compile-preflight-1-result.md), `38b8e0f1` | Failed after 32.463 seconds with exit 101. Four Rust errors across three of 19 targets. The other 16 emitted check metadata. No tests ran. |
 | [Diagnostic CLI build](../target/wave202-pathe-first-error-trace-bin-1-result.md), `68067fca` | Passed in 77.775 seconds. Census 3 then used this unchanged binary without a rebuild. |
 
+The latest [combined result review](../target/wave202-pathe-demo-tests-4-result-review.md)
+and [cleanup review](../target/wave202-pathe-demo-tests-4-cleanup-result-review.md)
+are closed. The errors call alias metadata methods on an alias ID. The
+[repair](../target/wave202-pathe-demo-alias-api-repair-handoff.md) resolves that
+ID through the existing store lookup and keeps both validators unchanged.
+Its [source review](../target/wave202-pathe-demo-alias-api-repair-review.md)
+is closed. The repair has not been compiled or tested. The ordinary CLI build
+at the failed source was held before execution, so it does not repeat that
+known compile failure.
+
 The [combined result review](../target/wave202-pathe-combined-repairs-3-result-review.md)
-is closed. Cleanup remains pending. The four diagnostics report missing
+and [cleanup review](../target/wave202-pathe-combined-repairs-3-cleanup-result-review.md)
+are closed. The four diagnostics report missing
 `SignatureLinks` and `SourceNodeParent` names, an unknown closure parameter
 type in `source.rs`, and an `Option<EscapedNameRef>` versus `Option<&str>`
 comparison in `source_callables.rs`. Fixture compilation repeats the same
 checker errors. These are four error sites, not eight separate defects.
+The [three-edit API repair](../target/wave202-pathe-compiler-api-repair-handoff.md)
+and its [review](../target/wave202-pathe-compiler-api-repair-review.md) are
+closed at `bebfdd9b` and included in the new combined source. Compilation is
+still required to prove that the repairs work.
 
 The [combined CLI build 4](../target/wave202-pathe-combined-core-bin-4-outcome.md)
 never launched. Approval timed out before process creation. It was not retried
@@ -40,19 +64,30 @@ because the test build had already failed on the same source. It produced no
 executable or project result.
 
 Both branch-join type identity failures now pass. The original 519-byte
-`normalizeWindowsPath` function still stops at `Function(Callable)`. Its new
-run emitted zero trace lines, so it did not locate that failure's internal
-cause. The fixture uses real ES5 and ES2015 core declarations, not Pathe's full
+`normalizeWindowsPath` function still stops at `Function(Callable)`. Focus 3
+emitted one typed flow-invariant trace, but did not identify the failed source
+expression or the internal guard. Numeric debug IDs are not source locations.
+The [diagnosis](../target/wave202-pathe-normalizer-flow-trace-3-diagnosis.md)
+and [review](../target/wave202-pathe-normalizer-flow-trace-3-diagnosis-review.md)
+are closed. The fixture uses real ES5 and ES2015 core declarations, not Pathe's full
 library set or all its options. The [earlier four-pass, three-fail result](../target/wave202-pathe-conditional-local-writes-focus-1-result.md)
 and its [review](../target/wave202-pathe-conditional-local-writes-focus-1-result-review.md)
-remain unchanged. The normalizer and the project still do not pass.
+remain unchanged. Focus 3's [result review](../target/wave202-pathe-local-write-flow-trace-focus-3-result-review.md)
+and [cleanup review](../target/wave202-pathe-local-write-flow-trace-focus-3-cleanup-closure-review.md)
+are closed. Diagnostic-only commit `9727de9e` adds a failure-only trace for the
+condition kind and source range. Its seven-test run finished with six passes
+and one failure. The reported byte range `[345, 366)` is
+`normalized[2] === "/"` in the original 519-byte file. This uses the reported
+source range, not a numeric debug ID. The [result review](../target/wave202-pathe-normalizer-condition-trace-focus-4-result-review.md)
+is closed. Cleanup is pending. That trace must not enter the production
+compiler. The normalizer and project still fail.
 
 The constructor run found two API errors in `constructor_values.rs`, lines
 512 and 515: code treated `PropertyObjectState` as an `Option`. The two-line
 [repair](../target/wave202-pathe-constructor-api-fix-handoff.md) and
 [source review](../target/wave202-pathe-constructor-api-fix-review.md) are closed
-at `9c1a7cbf`. The combined compile did not report those two errors, but failed
-at the four sites above. The five constructor tests remain unrun.
+at `9c1a7cbf`. Combined repairs 3 did not report those two errors, but failed
+at its four sites listed above. The five constructor tests remain unrun.
 The [local-write result review](../target/wave202-pathe-local-write-trace-focus-2-result-review.md)
 and [constructor result review](../target/wave202-pathe-generic-constructors-focus-1-result-review.md)
 are closed. The [local-write cleanup](../target/wave202-pathe-local-write-trace-focus-2-cleanup-closure-review.md)
@@ -71,7 +106,14 @@ selected test unrun. Their
 [rerun result](../target/wave202-pathe-focused-repairs-2-result.md) and
 [review](../target/wave202-pathe-focused-repairs-2-result-review.md) stay unchanged.
 
-The combined source checkpoint `2cc8d38d` is signed and independently reviewed, with
+The [combined source handoff](../target/wave202-pathe-demo-generic-context-join-handoff.md)
+and [review](../target/wave202-pathe-demo-generic-context-join-review.md) close
+`21df31a3`, with 899 files and all prior tests preserved. It joins the complete
+API and computed-call changes with the template, method and generic-context
+changes. The one-file alias API repair at `5f7ad5e3` is its direct descendant.
+It preserves all 899 files and all tests. This is source review, not a test pass.
+
+The earlier combined source checkpoint `2cc8d38d` is signed and independently reviewed, with
 894 files. It includes all five local-write, parameter-write, object-binding,
 computed-key and callback donors, both public API repairs, and the complete
 branch-join, generic-constructor and stored-arrow repairs. The
@@ -89,11 +131,17 @@ the source used by the failed combined compile. No combined test has run.
 | Generic library constructors | Real `SetConstructor` declarations and iterator inference | Included in `2cc8d38d`. The separate five-test run failed to compile. |
 | Contextual callback parameters and bodies | Local `Register` and nested `Assert` callbacks | Included in `2cc8d38d`. Six tests unrun. |
 | Computed keys and their stored type evidence | Literal keys and contextual property order | Included in `2cc8d38d`. Tests unrun. |
+| Template substitutions | Conditional expressions inside a loop's template literal | Included in `21df31a3`. Three tests unrun. |
+| Contextual methods and generic constructor contexts | The real `Proxy` constructor and its handler | Included in `21df31a3`. Three method and two constructor-context tests unrun. |
+| Nested calls in computed keys | Real `String.raw` and imported normalizer calls | Included in `21df31a3`. Two tests unrun. |
 
 The [combined selection](../target/wave202-pathe-combined-repairs-3-template-review.md)
 retains all 408 earlier cases, 39 feature cases and seven constructor and
 stored-arrow cases, for 454 total. Compilation stopped before any ran.
-No failed test was removed.
+No failed test was removed. The next [464-test selection](../target/wave202-pathe-demo-next-selection-plan.md)
+adds ten tests and retains every old registration. Its
+[independent review](../target/wave202-pathe-demo-next-selection-review.md)
+confirms 36 groups. All 464 remain unrun at the new source.
 
 Census 3 exposed a conditional expression rejected inside the lexical loop
 body. The [source diagnosis](../target/wave202-pathe-for-of-conditional-initializer-diagnosis.md)
@@ -103,10 +151,12 @@ does not accept a `TemplateSpan` parent. The separate
 at `b102fdcc`, with [independent review](../target/wave202-pathe-template-join-review.md).
 The [contextual method change](../target/wave202-pathe-contextual-method-prefix-handoff.md)
 is also closed at `4ee8330f`, with [independent review](../target/wave202-pathe-contextual-method-prefix-review.md).
-Each adds three tests. Neither change was in the measured combined compile,
-and all six new tests are unrun. They are separate commits, not one verified
-combined result. The method change does not complete the Proxy constructor.
-Real `String.raw` composition also remains separate work.
+Each adds three tests. Neither change was in the earlier combined repairs 3 compile.
+Both are now included in `21df31a3`, and all six new tests remain unrun.
+The [generic-context donor](../target/wave202-pathe-generic-constructor-contexts-handoff.md)
+and [computed-call donor](../target/wave202-pathe-computed-call-arguments-handoff.md)
+are also included. Their source reviews do not prove a complete Proxy or
+`String.raw` pass. The next combined run must test their interaction.
 
 No callable trace appeared in census 3, so the callback invariant remains
 unexplained. Diagnostic-only source stays out of the production port.
