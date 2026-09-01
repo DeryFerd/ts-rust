@@ -389,6 +389,36 @@ pub enum CanonicalCensusOutcome {
     },
 }
 
+/// Which retained records a partial census payload contains.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusDiagnosticScope {
+    Program,
+    RawContext,
+}
+
+/// Diagnostic records are separate from source-check completion.
+///
+/// Raw context records include full-graph bind and global diagnostics before
+/// checker issuance order. They have not passed through comment directives or
+/// the complete post-source collector and are not final Program diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalCensusDiagnostics {
+    CompleteProgram {
+        records: Vec<ProgramDiagnostic>,
+    },
+    CompleteSourceContext {
+        records: Vec<ProgramDiagnostic>,
+    },
+    Partial {
+        scope: CanonicalCensusDiagnosticScope,
+        records: Vec<ProgramDiagnostic>,
+        conversion_error: Option<CanonicalProgramCheckError>,
+    },
+    UnavailableBeforeContext,
+    Skipped(CanonicalCensusSkipReason),
+    Unattempted,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CanonicalCensusCompletion {
     Complete,
@@ -430,6 +460,7 @@ pub enum CanonicalCensusEvent {
     AttemptFinished {
         attempt: CanonicalCensusAttempt,
         outcome: CanonicalCensusOutcome,
+        diagnostics: CanonicalCensusDiagnostics,
         elapsed: Duration,
     },
 }
@@ -3319,7 +3350,8 @@ impl Program {
     /// callback. Each eligible cold root then gets its own complete context.
     /// Contexts are dropped before attempt outcomes are observed. The scoped
     /// Program borrow is for reporting only, and is never a checked Program.
-    /// No cold attempt collects Program diagnostics, artifacts, or replay.
+    /// Cold attempts retain raw context diagnostics, not complete Program
+    /// diagnostics. They do not collect artifacts or run source replay.
     ///
     /// Observers can stop between events. An error stops immediately without
     /// another callback. A caller must open its output before this call and
@@ -3402,12 +3434,24 @@ impl Program {
             CanonicalCensusEvent::AttemptStarted { attempt },
             observer,
         )?;
+        let mut diagnostics = CanonicalCensusDiagnostics::UnavailableBeforeContext;
         let outcome = if self.options.no_check {
+            diagnostics = CanonicalCensusDiagnostics::Skipped(CanonicalCensusSkipReason::NoCheck);
             CanonicalCensusOutcome::Skipped(CanonicalCensusSkipReason::NoCheck)
         } else {
             canonical_census_outcome(
-                self.check_program_canonical_observed(|_, _| (), attempt, observer)
-                    .map(|_| CanonicalCensusOutcome::Complete),
+                self.check_program_canonical_observed(
+                    |_, _| (),
+                    attempt,
+                    observer,
+                    Some(&mut diagnostics),
+                )
+                .map(|(records, ())| {
+                    diagnostics = CanonicalCensusDiagnostics::CompleteProgram {
+                        records: self.canonical_diagnostic_snapshot(&records),
+                    };
+                    CanonicalCensusOutcome::Complete
+                }),
             )?
         };
         let preparation_failed = census_preparation_failed(&outcome);
@@ -3416,6 +3460,7 @@ impl Program {
             CanonicalCensusEvent::AttemptFinished {
                 attempt,
                 outcome,
+                diagnostics,
                 elapsed: started.elapsed(),
             },
             observer,
@@ -3432,11 +3477,18 @@ impl Program {
                 CanonicalCensusEvent::AttemptStarted { attempt },
                 observer,
             )?;
+            let mut diagnostics = CanonicalCensusDiagnostics::UnavailableBeforeContext;
             let outcome = match root.file_id {
-                Some(file) => canonical_census_outcome(
-                    self.check_canonical_census_root(file, attempt, observer),
-                )?,
-                None => CanonicalCensusOutcome::Unloaded,
+                Some(file) => canonical_census_outcome(self.check_canonical_census_root(
+                    file,
+                    attempt,
+                    observer,
+                    &mut diagnostics,
+                ))?,
+                None => {
+                    diagnostics = CanonicalCensusDiagnostics::Unattempted;
+                    CanonicalCensusOutcome::Unloaded
+                }
             };
             let preparation_failed = census_preparation_failed(&outcome);
             observe_canonical_census(
@@ -3444,6 +3496,7 @@ impl Program {
                 CanonicalCensusEvent::AttemptFinished {
                     attempt,
                     outcome,
+                    diagnostics,
                     elapsed: started.elapsed(),
                 },
                 observer,
@@ -3467,11 +3520,14 @@ impl Program {
             Option<&Program>,
             CanonicalCensusEvent,
         ) -> Result<CanonicalCensusControl, E>,
+        diagnostics: &mut CanonicalCensusDiagnostics,
     ) -> Result<CanonicalCensusOutcome, CanonicalObservedCheckError<E>> {
         let Some(source) = self.source_file_by_id(file) else {
+            *diagnostics = CanonicalCensusDiagnostics::Unattempted;
             return Ok(CanonicalCensusOutcome::Unloaded);
         };
         if self.options.no_check {
+            *diagnostics = CanonicalCensusDiagnostics::Skipped(CanonicalCensusSkipReason::NoCheck);
             return Ok(CanonicalCensusOutcome::Skipped(
                 CanonicalCensusSkipReason::NoCheck,
             ));
@@ -3488,16 +3544,74 @@ impl Program {
                 )
             })
         {
+            *diagnostics = CanonicalCensusDiagnostics::Skipped(reason);
             return Ok(CanonicalCensusOutcome::Skipped(reason));
         }
-        let CanonicalPreparedChecker { mut context, .. } =
-            self.prepare_canonical_checker_observed(attempt, observer)?;
-        self.observe_canonical_phase(attempt, CanonicalCensusPhase::Source, observer, || {
-            self.check_canonical_source(&mut context, source)
-                .map(|_| ())
-        })?;
+        let CanonicalPreparedChecker {
+            mut context,
+            bind_diagnostics,
+            ..
+        } = self.prepare_canonical_checker_observed(attempt, observer)?;
+        let result =
+            self.observe_canonical_phase(attempt, CanonicalCensusPhase::Source, observer, || {
+                self.check_canonical_source(&mut context, source)
+                    .map(|_| ())
+            });
+        if let Err(error) = result {
+            if matches!(&error, CanonicalObservedCheckError::Failure { .. }) {
+                *diagnostics =
+                    self.canonical_census_context_diagnostics(&context, &bind_diagnostics, false);
+            }
+            return Err(error);
+        }
+        *diagnostics = self.canonical_census_context_diagnostics(&context, &bind_diagnostics, true);
         drop(context);
         Ok(CanonicalCensusOutcome::Complete)
+    }
+
+    /// Copies only records that the context already owns, without checker queries.
+    fn canonical_census_context_diagnostics(
+        &self,
+        context: &CanonicalCheckerContext<'_>,
+        bind_diagnostics: &[ProgramDiagnostic],
+        source_complete: bool,
+    ) -> CanonicalCensusDiagnostics {
+        let mut records = bind_diagnostics.to_vec();
+        let converted = (|| {
+            if !self.source_files.is_empty() {
+                for diagnostic in context.global_type_diagnostics() {
+                    records.push(self.canonical_program_diagnostic(
+                        diagnostic.node,
+                        None,
+                        &diagnostic.diagnostic,
+                        std::iter::empty(),
+                    )?);
+                }
+            }
+            for diagnostic in context.diagnostics().as_slice() {
+                records.push(
+                    self.canonical_program_diagnostic(
+                        diagnostic.node,
+                        diagnostic.range_override,
+                        &diagnostic.diagnostic,
+                        diagnostic
+                            .related_information
+                            .iter()
+                            .map(|related| (related.node, &related.diagnostic)),
+                    )?,
+                );
+            }
+            Ok::<_, CanonicalProgramCheckError>(())
+        })();
+        if source_complete && converted.is_ok() {
+            CanonicalCensusDiagnostics::CompleteSourceContext { records }
+        } else {
+            CanonicalCensusDiagnostics::Partial {
+                scope: CanonicalCensusDiagnosticScope::RawContext,
+                records,
+                conversion_error: converted.err(),
+            }
+        }
     }
 
     fn from_config_with_overrides(
@@ -5449,6 +5563,7 @@ impl Program {
             queries,
             CanonicalCensusAttempt::Ordinary,
             &mut |_, _| Ok::<_, Infallible>(CanonicalCensusControl::Continue),
+            None,
         ) {
             Ok(result) => Ok(result),
             Err(CanonicalObservedCheckError::Failure { error, .. }) => Err(error),
@@ -5467,18 +5582,41 @@ impl Program {
             Option<&Program>,
             CanonicalCensusEvent,
         ) -> Result<CanonicalCensusControl, E>,
+        census_diagnostics: Option<&mut CanonicalCensusDiagnostics>,
     ) -> Result<(Vec<ProgramDiagnostic>, T), CanonicalObservedCheckError<E>> {
         let CanonicalPreparedChecker {
             mut context,
             bind_diagnostics,
             check_files,
         } = self.prepare_canonical_checker_observed(attempt, observer)?;
-        let checked_sources =
-            self.observe_canonical_phase(attempt, CanonicalCensusPhase::Source, observer, || {
-                self.check_canonical_sources(&mut context, check_files)
-            })?;
+        let checked_sources = match self.observe_canonical_phase(
+            attempt,
+            CanonicalCensusPhase::Source,
+            observer,
+            || self.check_canonical_sources(&mut context, check_files),
+        ) {
+            Ok(checked_sources) => checked_sources,
+            Err(error) => {
+                if matches!(&error, CanonicalObservedCheckError::Failure { .. })
+                    && let Some(diagnostics) = census_diagnostics
+                {
+                    *diagnostics = self.canonical_census_context_diagnostics(
+                        &context,
+                        &bind_diagnostics,
+                        false,
+                    );
+                }
+                return Err(error);
+            }
+        };
         self.observe_canonical_phase(attempt, CanonicalCensusPhase::PostSource, observer, || {
-            self.finish_canonical_check(context, bind_diagnostics, checked_sources, queries)
+            self.finish_canonical_check(
+                context,
+                bind_diagnostics,
+                checked_sources,
+                queries,
+                census_diagnostics,
+            )
         })
     }
 
@@ -5819,17 +5957,33 @@ impl Program {
         bind_diagnostics: Vec<ProgramDiagnostic>,
         checked_sources: Vec<CanonicalCheckedSource<'arena>>,
         queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
+        census_diagnostics: Option<&mut CanonicalCensusDiagnostics>,
     ) -> Result<(Vec<ProgramDiagnostic>, T), CanonicalProgramCheckError> {
-        let diagnostics =
-            self.canonical_checker_diagnostics(&mut context, &bind_diagnostics, &checked_sources)?;
+        let diagnostics = match self.canonical_checker_diagnostics(
+            &mut context,
+            &bind_diagnostics,
+            &checked_sources,
+        ) {
+            Ok(diagnostics) => diagnostics,
+            Err(error) => {
+                if let Some(diagnostics) = census_diagnostics {
+                    // The collector's local compiler-generated prefix is unavailable.
+                    *diagnostics = self.canonical_census_context_diagnostics(
+                        &context,
+                        &bind_diagnostics,
+                        false,
+                    );
+                }
+                return Err(error);
+            }
+        };
         let cold_diagnostics = self.canonical_diagnostic_snapshot(&diagnostics);
         for ((enclosing, target), specifier) in &self.package_display_specifiers {
             if let Some(source) = self
                 .source_file(target)
                 .filter(|source| source_is_external_module(source))
                 && let Some(enclosing) = self.source_file_by_id(*enclosing)
-            {
-                context
+                && let Err(error) = context
                     .set_module_display_specifier(
                         NodeRef::new(
                             enclosing.parse.arena.id(),
@@ -5844,7 +5998,16 @@ impl Program {
                         error: SourceCheckError::TypeDisplayUnavailable(
                             TypeDisplayUnavailable::SymbolDisplay(error),
                         ),
-                    })?;
+                    })
+            {
+                if let Some(diagnostics) = census_diagnostics {
+                    *diagnostics = CanonicalCensusDiagnostics::Partial {
+                        scope: CanonicalCensusDiagnosticScope::Program,
+                        records: cold_diagnostics,
+                        conversion_error: None,
+                    };
+                }
+                return Err(error);
             }
         }
         let mut canonical_queries = CanonicalProgramQueries {

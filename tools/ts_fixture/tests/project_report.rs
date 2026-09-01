@@ -399,13 +399,41 @@ fn project_census_keeps_full_binding_policy_and_diagnostics_unavailable_for_cold
             .to_string()
             .contains("Complete canonical Program snapshot")
     );
-    assert!(
-        encoded
-            .as_array()
-            .unwrap()
+    let attempts = encoded
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| record["event"] == "attempt_finished")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempts
             .iter()
-            .all(|record| record.get("diagnostics").is_none())
+            .map(|record| record["diagnostics"]["status"].as_str())
+            .collect::<Vec<_>>(),
+        [
+            Some("complete_program"),
+            Some("skipped"),
+            Some("complete_source_context"),
+            Some("skipped"),
+        ]
     );
+    assert_eq!(attempts[1]["diagnostics"]["reason"], "declaration_file");
+    assert_eq!(attempts[3]["diagnostics"]["reason"], "no_check_directive");
+    for index in [0, 2] {
+        assert!(
+            attempts[index]["diagnostics"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|record| record["code"] == 2322)
+        );
+    }
+    for index in [1, 3] {
+        assert!(attempts[index]["diagnostics"].get("records").is_none());
+    }
+    assert!(encoded.as_array().unwrap().iter().all(|record| {
+        (record["event"] == "attempt_finished") == record.get("diagnostics").is_some()
+    }));
 }
 
 #[test]
