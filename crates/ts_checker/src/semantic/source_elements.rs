@@ -247,7 +247,12 @@ fn plan_direct_source_element_syntax_worker(
         && operator.kind.is_assignment_operator()
     {
         let actual = NodeRef::new(node.arena, node.file, parent);
-        if assignment != Some(actual) || operator.kind != SyntaxKind::EqualsToken {
+        if assignment != Some(actual)
+            || !matches!(
+                operator.kind,
+                SyntaxKind::EqualsToken | SyntaxKind::QuestionQuestionEqualsToken
+            )
+        {
             return Err(SourceElementError::Unsupported(
                 SourceElementUnsupported::Write(node),
             ));
@@ -1619,6 +1624,57 @@ where
         return Err(SourceElementError::InvalidType(receiver_type).into());
     }
     let indices = classify_indices(store, index_type)?;
+    let nullish_write = write
+        && host
+            .node(plan.node)
+            .and_then(|node| node.parent)
+            .map(|parent| NodeRef::new(plan.node.arena, plan.node.file, parent))
+            .and_then(|parent| host.node(parent))
+            .is_some_and(|node| {
+                matches!(&node.data, NodeData::BinaryExpression(binary)
+            if binary.left == plan.node.node
+                && host.node(NodeRef::new(plan.node.arena, plan.node.file, binary.operator_token))
+                    .is_some_and(|token| token.kind == SyntaxKind::QuestionQuestionEqualsToken))
+            });
+    if nullish_write
+        && (indices.len() != 1
+            || store.type_payload(receiver_type).is_some_and(|record| {
+                record.flags().intersects(TypeFlags::UNION)
+                    || record.object_flags().intersects(ObjectFlags::CLASS)
+                    || record
+                        .symbol()
+                        .and_then(|owner| store.symbol(owner))
+                        .is_some_and(|owner| {
+                            owner
+                                .flags()
+                                .intersects(SymbolFlags::CLASS | SymbolFlags::ENUM)
+                        })
+            }))
+    {
+        return Err(unsupported_access(plan.node).into());
+    }
+    if nullish_write {
+        let index = &indices[0];
+        let array = store
+            .canonical_array_reference_with_targets(array_targets, receiver_type)
+            .map_err(SourceElementError::from)?;
+        if (array.is_some() || is_string_receiver(store, receiver_type)?)
+            && !index.is_number_applicable()
+        {
+            return Err(unsupported_access(plan.node).into());
+        }
+        if let Some(tuple) = store
+            .canonical_tuple_shape(receiver_type)
+            .map_err(|_| SourceElementError::InvalidType(receiver_type))?
+            && (tuple.is_readonly()
+                || !matches!(index.shape, IndexShape::Literal { numeric_name: true })
+                || tuple.combined_flags().intersects(ElementFlags::VARIABLE)
+                || options.intrinsic.exact_optional_property_types
+                    && tuple.combined_flags().intersects(ElementFlags::OPTIONAL))
+        {
+            return Err(unsupported_access(plan.node).into());
+        }
+    }
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or(RelationUnavailable::MissingBootstrap)
@@ -1709,7 +1765,7 @@ where
     } else {
         resolution.type_
     };
-    let type_ = if propagate_undefined && type_ != any && type_ != error && type_ != undefined {
+    let mut type_ = if propagate_undefined && type_ != any && type_ != error && type_ != undefined {
         element_union_type(
             store,
             global_types,
@@ -1721,7 +1777,7 @@ where
         type_
     };
 
-    let diagnostic = prepare_element_diagnostic(
+    let mut diagnostic = prepare_element_diagnostic(
         store,
         host,
         global_types,
@@ -1731,8 +1787,126 @@ where
         index_type,
         resolution.diagnostic,
     )?;
+    if nullish_write && diagnostic.is_none() {
+        if let Some(symbol) = resolution.property
+            && store.symbol(symbol).is_some_and(|property| {
+                property.check_flags().contains(CheckFlags::READONLY)
+                    || property.flags().contains(SymbolFlags::ENUM_MEMBER)
+                    || property.flags().contains(SymbolFlags::GET_ACCESSOR)
+                        && !property.flags().contains(SymbolFlags::SET_ACCESSOR)
+            })
+        {
+            let name = store
+                .symbol(symbol)
+                .and_then(|property| property.name().as_utf8())
+                .ok_or(SourceElementError::InvalidCache(plan.node))?;
+            diagnostic = Some(CanonicalCheckerDiagnostic {
+                node: Some(plan.index.node),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2540).ok_or(SourceElementError::MissingDiagnostic(2540))?,
+                    [name.to_owned()],
+                ),
+                related_information: Vec::new(),
+            });
+            type_ = error;
+        } else if resolution
+            .property
+            .and_then(|symbol| store.symbol(symbol))
+            .is_some_and(|property| {
+                property
+                    .flags()
+                    .intersects(SymbolFlags::GET_ACCESSOR | SymbolFlags::SET_ACCESSOR)
+                    || property.flags().contains(SymbolFlags::OPTIONAL)
+                        && options.intrinsic.exact_optional_property_types
+            })
+        {
+            return Err(unsupported_access(plan.node).into());
+        } else if nullish_index_is_readonly(store, array_targets, receiver_type, &indices)? {
+            let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+            if options.no_error_truncation {
+                flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+            }
+            let name = if let Some(globals) = global_types {
+                type_to_string_with_host_global_types_and_flags(
+                    store,
+                    host,
+                    globals,
+                    receiver_type,
+                    flags,
+                )
+                .map_err(SourceElementError::from)?
+            } else {
+                type_to_string_with_host_and_flags(store, host, receiver_type, flags)
+                    .map_err(SourceElementError::from)?
+            };
+            diagnostic = Some(CanonicalCheckerDiagnostic {
+                node: Some(plan.node),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2542).ok_or(SourceElementError::MissingDiagnostic(2542))?,
+                    [name],
+                ),
+                related_information: Vec::new(),
+            });
+        }
+    }
     publish_element_links(store, plan.node, resolution.property, type_)?;
     Ok(CheckedSourceElement { type_, diagnostic })
+}
+
+fn nullish_index_is_readonly(
+    store: &CanonicalTypeMapperStore,
+    array_targets: CanonicalArrayTargets,
+    receiver: TypeId,
+    indices: &[ClassifiedIndex],
+) -> Result<bool, SourceElementError> {
+    if let Some(array) = store.canonical_array_reference_with_targets(array_targets, receiver)? {
+        return Ok(array.readonly);
+    }
+    if let Some(tuple) = store
+        .canonical_tuple_shape(receiver)
+        .map_err(|_| SourceElementError::InvalidType(receiver))?
+    {
+        return Ok(tuple.is_readonly());
+    }
+    if is_string_receiver(store, receiver)? {
+        return Ok(true);
+    }
+    let Some(signatures) = resolved_index_signature_surface(store, receiver)? else {
+        return Ok(false);
+    };
+    let TypeData::Object(object) = store
+        .type_payload(receiver)
+        .ok_or(SourceElementError::InvalidType(receiver))?
+        .data()
+    else {
+        return Err(SourceElementError::InvalidType(receiver));
+    };
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    for index in indices {
+        let key = if index.is_number_applicable()
+            && signatures.number.is_some()
+            && !matches!(index.shape, IndexShape::Any)
+        {
+            bootstrap.number_type
+        } else if signatures.string.is_some() {
+            bootstrap.string_type
+        } else {
+            bootstrap.number_type
+        };
+        for info in object.structured.index_infos.iter().flatten() {
+            let info = store
+                .index_info(*info)
+                .ok_or(SourceElementError::InvalidType(receiver))?;
+            if info.key_type() == key && info.is_readonly() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn receiver_continues_optional_chain(arena: &NodeArena, receiver: &ts_ast::Node) -> bool {

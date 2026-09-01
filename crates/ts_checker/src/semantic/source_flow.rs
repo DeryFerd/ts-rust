@@ -652,6 +652,7 @@ pub(super) enum SourceFlowCallEffect {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SourceFlowRegion {
     statement: NodeRef,
+    entry_node: NodeRef,
     entry: FlowRef,
     exit: FlowRef,
     unreachable_incrementor: Option<NodeRef>,
@@ -664,6 +665,31 @@ pub(super) struct SourceTruthinessCondition {
     pub(super) expression: NodeRef,
     pub(super) symbol: SemanticSymbolId,
     pub(super) negated: bool,
+}
+
+/// The left operand of an authenticated `??=` uses presence, not truthiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceNullishCondition {
+    pub(super) expression: NodeRef,
+    pub(super) symbol: Option<SemanticSymbolId>,
+}
+
+/// A checked nullish write keeps its real target and declaration separate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceFlowNullishAssignment {
+    pub(super) expression: NodeRef,
+    pub(super) target: NodeRef,
+    pub(super) declaration: Option<NodeRef>,
+    pub(super) symbol: Option<SemanticSymbolId>,
+    pub(super) readonly: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceNullishAssignmentProof {
+    assignment: SourceFlowNullishAssignment,
+    receiver: Option<SemanticSymbolId>,
+    flow: Option<FlowRef>,
+    revision: NodeArenaRevision,
 }
 
 /// A direct current-class field on the binder's real condition edges.
@@ -728,6 +754,7 @@ pub(super) struct SourceInCondition {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceFlowCondition {
     Unchanged(NodeRef),
+    Nullish(SourceNullishCondition),
     Truthiness(SourceTruthinessCondition),
     ClassPropertyTruthiness(SourceClassPropertyTruthinessCondition),
     Typeof(SourceTypeofCondition),
@@ -739,6 +766,7 @@ impl SourceFlowCondition {
     pub(super) const fn expression(self) -> NodeRef {
         match self {
             Self::Unchanged(expression) => expression,
+            Self::Nullish(condition) => condition.expression,
             Self::Truthiness(condition) => condition.expression,
             Self::ClassPropertyTruthiness(condition) => condition.expression,
             Self::Typeof(condition) => condition.expression,
@@ -750,6 +778,7 @@ impl SourceFlowCondition {
     const fn symbol(self) -> Option<SemanticSymbolId> {
         Some(match self {
             Self::Unchanged(_) | Self::ClassPropertyTruthiness(_) => return None,
+            Self::Nullish(condition) => return condition.symbol,
             Self::Truthiness(condition) => condition.symbol,
             Self::Typeof(condition) => condition.symbol,
             Self::Equality(condition) => condition.symbol,
@@ -1753,6 +1782,8 @@ pub(super) struct SourceFlowPlan {
     property_assignments: HashMap<NodeRef, ClassPropertyFlowAssignment>,
     region: Option<SourceFlowRegion>,
     updates: HashMap<NodeRef, SourceFlowUpdate>,
+    nullish_assignments: HashMap<NodeRef, SourceNullishAssignmentProof>,
+    nullish_calls: HashMap<NodeRef, FlowRef>,
 }
 
 /// The detached logical join proves both condition edges, but is not an exit.
@@ -2066,6 +2097,8 @@ struct SourceFlowEffects {
     property_assignments: HashMap<NodeRef, ClassPropertyFlowAssignment>,
     region: Option<SourceFlowRegion>,
     updates: HashMap<NodeRef, SourceFlowUpdate>,
+    nullish_assignments: HashMap<NodeRef, SourceNullishAssignmentProof>,
+    nullish_calls: HashMap<NodeRef, FlowRef>,
     region_points: HashMap<NodeRef, FlowRef>,
 }
 
@@ -2364,7 +2397,43 @@ impl SourceFlowPlan {
         captures: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
         array_mutations: impl IntoIterator<Item = SourceFlowArrayMutation>,
     ) -> Result<Self, SourceFlowError> {
+        Self::preflight_statement_list_with_nullish_assignments(
+            arena,
+            bound,
+            store,
+            host,
+            syntax,
+            points,
+            conditions,
+            logical_conditions,
+            assignments,
+            parameter_assignments,
+            calls,
+            captures,
+            array_mutations,
+            [],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_statement_list_with_nullish_assignments(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        syntax: &SourceCallableStatementListSyntax,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        logical_conditions: Vec<SourceTruthinessCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+        captures: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
+        array_mutations: impl IntoIterator<Item = SourceFlowArrayMutation>,
+        nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+    ) -> Result<Self, SourceFlowError> {
         validate_statement_list_source(arena, bound, store, host, syntax)?;
+        let nullish_assignments = nullish_assignments.into_iter().collect::<Vec<_>>();
         let container = syntax.callable.declaration;
         let points = points.into_iter().collect::<Vec<_>>();
         let mut conditions = conditions.into_iter().collect::<Vec<_>>();
@@ -2443,11 +2512,32 @@ impl SourceFlowPlan {
             });
         }
         for call in calls {
-            let statement = validate_statement_list_call(arena, bound, syntax, call)?;
+            let statement = match prepare_nullish_call(
+                arena,
+                bound,
+                container,
+                call,
+                &nullish_assignments,
+                &mut effects,
+            )? {
+                Some(statement) => statement,
+                None => validate_statement_list_call(arena, bound, syntax, call)?,
+            };
             if effects.calls.insert(call, statement).is_some() {
                 return Err(SourceFlowInvariant::DuplicateCall(call).into());
             }
         }
+        prepare_nullish_assignments(
+            arena,
+            bound,
+            store,
+            Some(host),
+            container,
+            nullish_assignments,
+            &mut assignments,
+            &mut conditions,
+            &mut effects,
+        )?;
         Self::preflight_with_effects(
             bound,
             container,
@@ -2486,7 +2576,41 @@ impl SourceFlowPlan {
         updates: impl IntoIterator<Item = SourceFlowUpdate>,
         calls: impl IntoIterator<Item = NodeRef>,
     ) -> Result<Self, SourceFlowError> {
-        let region = source_statement_flow_region(arena, bound, store, statement)?;
+        Self::preflight_source_statement_with_nullish_assignments(
+            arena,
+            bound,
+            store,
+            host,
+            statement,
+            points,
+            conditions,
+            assignments,
+            updates,
+            calls,
+            [],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_source_statement_with_nullish_assignments(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        statement: NodeRef,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        updates: impl IntoIterator<Item = SourceFlowUpdate>,
+        calls: impl IntoIterator<Item = NodeRef>,
+        nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+    ) -> Result<Self, SourceFlowError> {
+        let nullish_assignments = nullish_assignments.into_iter().collect::<Vec<_>>();
+        let region = if nullish_assignments.is_empty() {
+            source_statement_flow_region(arena, bound, store, statement)?
+        } else {
+            source_nullish_statement_flow_region(arena, bound, statement, &nullish_assignments)?
+        };
         let container = bound.source_file();
         let mut effects = SourceFlowEffects {
             region: Some(region),
@@ -2513,7 +2637,7 @@ impl SourceFlowPlan {
                 _ => None,
             })
             .collect::<HashSet<_>>();
-        let conditions = conditions
+        let mut conditions = conditions
             .into_iter()
             .filter(|condition| retained_conditions.contains(&condition.expression()))
             .collect::<Vec<_>>();
@@ -2533,11 +2657,32 @@ impl SourceFlowPlan {
             });
         }
         for call in calls {
-            let statement = validate_source_statement_call(arena, bound, call)?;
+            let statement = match prepare_nullish_call(
+                arena,
+                bound,
+                container,
+                call,
+                &nullish_assignments,
+                &mut effects,
+            )? {
+                Some(statement) => statement,
+                None => validate_source_statement_call(arena, bound, call)?,
+            };
             if effects.calls.insert(call, statement).is_some() {
                 return Err(SourceFlowInvariant::DuplicateCall(call).into());
             }
         }
+        prepare_nullish_assignments(
+            arena,
+            bound,
+            store,
+            Some(host),
+            container,
+            nullish_assignments,
+            &mut assignments,
+            &mut conditions,
+            &mut effects,
+        )?;
         Self::preflight_with_effects(
             bound,
             container,
@@ -2876,6 +3021,7 @@ impl SourceFlowPlan {
             logical_statements,
             [],
             [],
+            [],
         )
     }
 
@@ -2909,6 +3055,7 @@ impl SourceFlowPlan {
             logical_statements,
             captured_assignments,
             captured_array_mutations,
+            [],
         )
     }
 
@@ -2987,6 +3134,7 @@ impl SourceFlowPlan {
             logical_statements,
             captured_assignments,
             captured_array_mutations,
+            [],
         )
     }
 
@@ -3018,6 +3166,42 @@ impl SourceFlowPlan {
             logical_statements,
             [],
             [],
+            [],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_linear_with_nullish_assignments(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        container: NodeRef,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceTruthinessCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+        logical_statements: impl IntoIterator<Item = SourceLinearLogicalStatementSyntax>,
+        captured_assignments: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
+        captured_array_mutations: impl IntoIterator<Item = SourceFlowCapturedArrayMutation>,
+        nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+    ) -> Result<Self, SourceFlowError> {
+        Self::preflight_linear_effects(
+            arena,
+            bound,
+            store,
+            Some(host),
+            container,
+            points,
+            conditions,
+            assignments,
+            parameter_assignments,
+            calls,
+            logical_statements,
+            captured_assignments,
+            captured_array_mutations,
+            nullish_assignments,
         )
     }
 
@@ -3036,6 +3220,7 @@ impl SourceFlowPlan {
         logical_statements: impl IntoIterator<Item = SourceLinearLogicalStatementSyntax>,
         captured_assignments: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
         captured_array_mutations: impl IntoIterator<Item = SourceFlowCapturedArrayMutation>,
+        nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
     ) -> Result<Self, SourceFlowError> {
         if bound.node_arena_id() != arena.id()
             || bound.node_arena_revision() != arena.revision()
@@ -3044,6 +3229,7 @@ impl SourceFlowPlan {
             return Err(SourceFlowInvariant::ForeignNode(container).into());
         }
 
+        let nullish_assignments = nullish_assignments.into_iter().collect::<Vec<_>>();
         let mut planned_assignments = assignments.into_iter().collect::<Vec<_>>();
         let mut effects = SourceFlowEffects::default();
         for assignment in parameter_assignments {
@@ -3089,7 +3275,17 @@ impl SourceFlowPlan {
             planned_assignments.push(assignment);
         }
         for call in calls {
-            let statement = validate_linear_direct_call(arena, bound, store, container, call)?;
+            let statement = match prepare_nullish_call(
+                arena,
+                bound,
+                container,
+                call,
+                &nullish_assignments,
+                &mut effects,
+            )? {
+                Some(statement) => statement,
+                None => validate_linear_direct_call(arena, bound, store, container, call)?,
+            };
             if effects.calls.insert(call, statement).is_some() {
                 return Err(SourceFlowInvariant::DuplicateCall(call).into());
             }
@@ -3168,6 +3364,17 @@ impl SourceFlowPlan {
             conditions = retained;
         }
 
+        prepare_nullish_assignments(
+            arena,
+            bound,
+            store,
+            host,
+            container,
+            nullish_assignments,
+            &mut planned_assignments,
+            &mut conditions,
+            &mut effects,
+        )?;
         let expected_start_payload = arena
             .get(container.node)
             .is_some_and(|record| {
@@ -3218,6 +3425,17 @@ impl SourceFlowPlan {
                 && effects.class_body.is_none()
             {
                 return Err(SourceFlowInvariant::InvalidClassProperty(expression).into());
+            }
+            if let SourceFlowCondition::Nullish(condition) = condition
+                && effects
+                    .nullish_assignments
+                    .get(&expression)
+                    .is_none_or(|proof| {
+                        proof.assignment.target != expression
+                            || proof.assignment.symbol != condition.symbol
+                    })
+            {
+                return Err(SourceFlowInvariant::UnknownCondition(expression).into());
             }
             if planned_conditions.insert(expression, condition).is_some() {
                 return Err(SourceFlowInvariant::DuplicateCondition(expression).into());
@@ -3349,6 +3567,8 @@ impl SourceFlowPlan {
             property_assignments: effects.property_assignments,
             region: effects.region,
             updates: effects.updates,
+            nullish_assignments: effects.nullish_assignments,
+            nullish_calls: effects.nullish_calls,
         };
         plan.validate_flow_paths(bound)?;
         Ok(plan)
@@ -3375,6 +3595,40 @@ impl SourceFlowPlan {
         bound: &'graph BoundFile,
         base: SourceFlowTypes,
     ) -> Result<SourceFlowFrame<'plan, 'graph>, SourceFlowError> {
+        if !self.nullish_assignments.is_empty() {
+            let (arena, _) = host
+                .source(self.container)
+                .ok_or(SourceFlowInvariant::ForeignNode(self.container))?;
+            for proof in self.nullish_assignments.values() {
+                if source_nullish_assignment_proof(
+                    arena,
+                    bound,
+                    store,
+                    host,
+                    self.container,
+                    proof.assignment,
+                )? != *proof
+                {
+                    return Err(SourceFlowInvariant::InvalidParameterAssignment(
+                        proof.assignment.target,
+                    )
+                    .into());
+                }
+            }
+            let assignments = self
+                .nullish_assignments
+                .values()
+                .map(|proof| proof.assignment)
+                .collect::<Vec<_>>();
+            for (call, antecedent) in &self.nullish_calls {
+                let (statement, actual) =
+                    validate_nullish_call(arena, bound, self.container, *call, &assignments)?
+                        .ok_or(SourceFlowInvariant::InvalidCall(*call))?;
+                if actual != *antecedent || self.calls.get(call) != Some(&statement) {
+                    return Err(SourceFlowInvariant::InvalidCall(*call).into());
+                }
+            }
+        }
         if let Some(syntax) = &self.statement_list {
             let (arena, _) = host
                 .source(self.container)
@@ -3388,7 +3642,17 @@ impl SourceFlowPlan {
             let (arena, _) = host
                 .source(region.statement)
                 .ok_or(SourceFlowInvariant::InvalidSourceRegion(region.statement))?;
-            if source_statement_flow_region(arena, bound, store, region.statement)? != region {
+            let actual = if self.nullish_assignments.is_empty() {
+                source_statement_flow_region(arena, bound, store, region.statement)?
+            } else {
+                let assignments = self
+                    .nullish_assignments
+                    .values()
+                    .map(|proof| proof.assignment)
+                    .collect::<Vec<_>>();
+                source_nullish_statement_flow_region(arena, bound, region.statement, &assignments)?
+            };
+            if actual != region {
                 return Err(SourceFlowInvariant::InvalidSourceRegion(region.statement).into());
             }
             for (point, expected) in &self.points {
@@ -3438,9 +3702,17 @@ impl SourceFlowPlan {
     ) -> Result<SourceFlowFrame<'plan, 'graph>, SourceFlowError> {
         let graph = bound.flow_graph();
         validate_container(graph, self.container)?;
+        for proof in self.nullish_assignments.values() {
+            if bound.node_arena_revision() != proof.revision {
+                return Err(SourceFlowInvariant::InvalidParameterAssignment(
+                    proof.assignment.target,
+                )
+                .into());
+            }
+        }
         if let Some(region) = self.region
-            && (bound.flow_at(region.statement).or_else(|| {
-                (bound.flow_graph().is_unreachable(region.statement) == Some(true))
+            && (bound.flow_at(region.entry_node).or_else(|| {
+                (bound.flow_graph().is_unreachable(region.entry_node) == Some(true))
                     .then(|| bound.flow_graph().nodes().unreachable())
             }) != Some(region.entry)
                 || bound.flow_container(region.statement) != Some(self.container))
@@ -3548,6 +3820,9 @@ impl SourceFlowPlan {
                 self.validate_flow_paths(bound)?;
             }
         }
+        if !self.nullish_assignments.is_empty() {
+            self.validate_flow_paths(bound)?;
+        }
         Ok(SourceFlowFrame {
             plan: self,
             bound,
@@ -3564,6 +3839,13 @@ impl SourceFlowPlan {
                             SourceFlowAssignmentState::ReadonlyUpdate
                         }
                         Some(_) => SourceFlowAssignmentState::Update,
+                        None if self
+                            .nullish_assignments
+                            .get(&declaration)
+                            .is_some_and(|proof| proof.assignment.readonly) =>
+                        {
+                            SourceFlowAssignmentState::ReadonlyUpdate
+                        }
                         None => SourceFlowAssignmentState::Pending,
                     };
                     (declaration, state)
@@ -3638,6 +3920,11 @@ impl SourceFlowPlan {
         for declaration in self.assignments.keys() {
             if !coverage.assignments.contains(declaration) {
                 return Err(SourceFlowInvariant::UnreachedAssignment(*declaration).into());
+            }
+        }
+        for (target, proof) in &self.nullish_assignments {
+            if proof.flow.is_some() && !coverage.assignments.contains(target) {
+                return Err(SourceFlowInvariant::UnreachedAssignment(*target).into());
             }
         }
         for (target, assignment) in &self.property_assignments {
@@ -3728,6 +4015,7 @@ impl SourceFlowPlan {
                 }
                 if !self.assignments.contains_key(&declaration)
                     && !self.property_assignments.contains_key(&declaration)
+                    && !self.nullish_assignments.contains_key(&declaration)
                 {
                     if source_flow_kind(flow, node.flags)? == SourceFlowKind::ArrayMutation {
                         return Err(SourceFlowUnsupported::FlowKind {
@@ -3737,6 +4025,11 @@ impl SourceFlowPlan {
                         .into());
                     }
                     return Err(SourceFlowInvariant::UnknownAssignment(declaration).into());
+                }
+                if let Some(proof) = self.nullish_assignments.get(&declaration)
+                    && proof.flow != Some(flow)
+                {
+                    return Err(SourceFlowInvariant::InvalidPayload(flow).into());
                 }
                 coverage.assignments.insert(declaration);
                 self.validate_flow(bound, antecedent, depth + 1, validated, visiting, coverage)
@@ -4870,6 +5163,10 @@ fn class_type_has_uninitialized_value(
 }
 
 impl SourceFlowFrame<'_, '_> {
+    pub(super) fn contains_call(&self, call: NodeRef) -> bool {
+        self.plan.contains_call(call)
+    }
+
     /// Keeps a local's declared type and initial flow type without an assignment node.
     pub(super) fn enter_uninitialized_local(
         &mut self,
@@ -5100,6 +5397,9 @@ impl SourceFlowFrame<'_, '_> {
         }
         validate_source_call_effect(store, host, self.bound, call, effect)?;
         self.call_effects.insert(call, effect);
+        if self.plan.nullish_calls.contains_key(&call) {
+            self.memo.clear();
+        }
         Ok(())
     }
 
@@ -5221,6 +5521,9 @@ impl SourceFlowFrame<'_, '_> {
         match state {
             SourceFlowAssignmentState::Pending => {
                 *state = SourceFlowAssignmentState::Resolved(current_type);
+                if self.plan.nullish_assignments.contains_key(&declaration) {
+                    self.memo.clear();
+                }
                 Ok(())
             }
             SourceFlowAssignmentState::Resolved(_)
@@ -5307,6 +5610,27 @@ impl SourceFlowFrame<'_, '_> {
             SourceFlowKind::Assignment | SourceFlowKind::ArrayMutation => {
                 let antecedent = linear_antecedent(flow, &node)?;
                 let declaration = ast_payload(flow, &node)?;
+                if let Some(proof) = self.plan.nullish_assignments.get(&declaration).copied()
+                    && proof.assignment.symbol.is_none()
+                {
+                    let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
+                    if proof.assignment.readonly || !prior.reachable {
+                        return Ok(prior);
+                    }
+                    let Some(receiver) = proof.receiver else {
+                        return Ok(prior);
+                    };
+                    if self.reference.is_some_and(|symbol| symbol != receiver) {
+                        return Ok(prior);
+                    }
+                    let declared = self
+                        .declared_types
+                        .get(&receiver)
+                        .copied()
+                        .ok_or(SourceFlowInvariant::MissingCurrentType(receiver))?;
+                    // A real member write invalidates receiver refinements only on its branch.
+                    return Ok(prior.with_type(receiver, declared));
+                }
                 if self.plan.property_assignments.contains_key(&declaration) {
                     return self.resolve_flow(store, globals, antecedent, depth + 1);
                 }
@@ -5363,7 +5687,9 @@ impl SourceFlowFrame<'_, '_> {
                 )?;
                 let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
                 let Some(effect) = self.call_effects.get(&call).copied() else {
-                    return if self.plan.region.is_some() {
+                    return if self.plan.region.is_some()
+                        || self.plan.nullish_calls.contains_key(&call)
+                    {
                         Err(SourceFlowInvariant::InvalidCallEffect(call).into())
                     } else {
                         Ok(prior)
@@ -5448,6 +5774,21 @@ impl SourceFlowFrame<'_, '_> {
                 let narrowed = match condition {
                     SourceFlowCondition::Unchanged(_)
                     | SourceFlowCondition::ClassPropertyTruthiness(_) => unreachable!(),
+                    SourceFlowCondition::Nullish(_) => {
+                        let null = store
+                            .intrinsic_bootstrap()
+                            .ok_or(SourceFlowInvariant::EqualityNarrowing(
+                                SourceEqualityNarrowingError::MissingBootstrap,
+                            ))?
+                            .null_type;
+                        narrow_by_equality(store, globals, current, null, false, !assume_true, None)
+                            .map_err(|error| match error {
+                                SourceEqualityNarrowingError::Union(error) => {
+                                    SourceFlowError::Join { flow, error }
+                                }
+                                error => SourceFlowInvariant::EqualityNarrowing(error).into(),
+                            })?
+                    }
                     SourceFlowCondition::Truthiness(condition) => narrow_by_truthiness(
                         store,
                         Some(globals),
@@ -6719,6 +7060,15 @@ fn source_region_point_flow(
     region: Option<SourceFlowRegion>,
 ) -> Result<FlowRef, SourceFlowError> {
     validate_bound_node(bound, bound.flow_graph(), point)?;
+    if let Some(region) = region
+        && point == region.statement
+        && region.entry_node != point
+        && source_node_is_descendant_of(arena, region.entry_node, point.node)
+        && bound.flow_at(region.entry_node) == Some(region.entry)
+        && bound.flow_container(region.entry_node) == Some(bound.source_file())
+    {
+        return Ok(region.entry);
+    }
     if let Some(flow) = bound.flow_at(point) {
         if bound.flow_container(point) != Some(bound.source_file()) {
             return Err(SourceFlowInvariant::MissingFlowPoint(point).into());
@@ -6744,6 +7094,76 @@ fn source_region_point_flow(
         current = NodeRef::new(point.arena, point.file, parent);
     }
     Err(SourceFlowInvariant::MissingFlowPoint(point).into())
+}
+
+fn source_nullish_statement_flow_region(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    statement: NodeRef,
+    assignments: &[SourceFlowNullishAssignment],
+) -> Result<SourceFlowRegion, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidSourceRegion(statement);
+    let source = bound.source_file();
+    if arena.id() != bound.node_arena_id()
+        || arena.revision() != bound.node_arena_revision()
+        || !statement.is_for(arena.id(), bound.file_id())
+        || bound.flow_container(statement) != Some(source)
+        || assignments.is_empty()
+    {
+        return Err(invalid().into());
+    }
+    let record = arena.get(statement.node).ok_or_else(invalid)?;
+    if record.parent != Some(source.node)
+        || !matches!(
+            record.kind,
+            SyntaxKind::ExpressionStatement | SyntaxKind::VariableStatement
+        )
+        || assignments.iter().any(|assignment| {
+            !source_node_is_descendant_of(arena, assignment.expression, statement.node)
+        })
+    {
+        return Err(invalid().into());
+    }
+    let NodeData::SourceFile(file) = &arena.get(source.node).ok_or_else(invalid)?.data else {
+        return Err(invalid().into());
+    };
+    let index = file
+        .statements
+        .nodes
+        .iter()
+        .position(|node| *node == statement.node)
+        .ok_or_else(invalid)?;
+    let entry = source_following_statement_entry(arena, bound, statement)?.ok_or_else(invalid)?;
+    let entry_node = arena
+        .iter()
+        .find_map(|(id, _)| {
+            let node = NodeRef::new(arena.id(), bound.file_id(), id);
+            (source_node_is_descendant_of(arena, node, statement.node)
+                && bound.flow_container(node) == Some(source)
+                && bound.flow_at(node) == Some(entry))
+            .then_some(node)
+        })
+        .ok_or_else(invalid)?;
+    let mut exit = None;
+    for following in &file.statements.nodes[index + 1..] {
+        exit = source_following_statement_entry(
+            arena,
+            bound,
+            NodeRef::new(arena.id(), bound.file_id(), *following),
+        )?;
+        if exit.is_some() {
+            break;
+        }
+    }
+    Ok(SourceFlowRegion {
+        statement,
+        entry_node,
+        entry,
+        exit: exit
+            .or_else(|| bound.flow_graph().container_end(source))
+            .ok_or_else(invalid)?,
+        unreachable_incrementor: None,
+    })
 }
 
 fn source_statement_flow_region(
@@ -6818,6 +7238,7 @@ fn source_statement_flow_region(
         .ok_or_else(invalid)?;
     Ok(SourceFlowRegion {
         statement,
+        entry_node: statement,
         entry,
         exit,
         unreachable_incrementor,
@@ -7232,6 +7653,385 @@ fn validate_container(graph: &BoundFlowGraph, container: NodeRef) -> Result<(), 
         Some(false) => Err(SourceFlowUnsupported::IncompleteContainer(container).into()),
         None => Err(SourceFlowInvariant::MissingContainer(container).into()),
     }
+}
+
+/// Rechecks source and binder ownership before a nullish write enters flow.
+pub(super) fn validate_source_nullish_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    assignment: SourceFlowNullishAssignment,
+) -> Result<(), SourceFlowError> {
+    source_nullish_assignment_proof(arena, bound, store, host, container, assignment).map(|_| ())
+}
+
+#[allow(clippy::too_many_lines)] // Match the AST, lexical owner and retained mutation together.
+fn source_nullish_assignment_proof(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    assignment: SourceFlowNullishAssignment,
+) -> Result<SourceNullishAssignmentProof, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(assignment.target);
+    if arena.id() != bound.node_arena_id()
+        || arena.revision() != bound.node_arena_revision()
+        || !container.is_for(arena.id(), bound.file_id())
+    {
+        return Err(invalid().into());
+    }
+    for node in [assignment.expression, assignment.target] {
+        validate_bound_node(bound, bound.flow_graph(), node)?;
+        if bound.flow_container(node) != Some(container) || bound.container(node) != Some(container)
+        {
+            return Err(invalid().into());
+        }
+    }
+    let expression = arena.get(assignment.expression.node).ok_or_else(invalid)?;
+    let NodeData::BinaryExpression(binary) = &expression.data else {
+        return Err(invalid().into());
+    };
+    let target = arena.get(assignment.target.node).ok_or_else(invalid)?;
+    let operator = arena.get(binary.operator_token).ok_or_else(invalid)?;
+    let right = arena.get(binary.right).ok_or_else(invalid)?;
+    if expression.kind != SyntaxKind::BinaryExpression
+        || expression.flags.0 != 0
+        || binary.left != assignment.target.node
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.modifiers.is_some()
+        || binary.facts != 0
+        || target.parent != Some(assignment.expression.node)
+        || target.flags.0 != 0
+        || operator.kind != SyntaxKind::QuestionQuestionEqualsToken
+        || operator.parent != Some(assignment.expression.node)
+        || operator.flags.0 != 0
+        || !matches!(operator.data, NodeData::Token(_))
+        || right.parent != Some(assignment.expression.node)
+        || expression.range.start > target.range.start
+        || target.range.end > operator.range.start
+        || operator.range.end > right.range.start
+        || right.range.end > expression.range.end
+    {
+        return Err(invalid().into());
+    }
+
+    let receiver = match (&target.data, assignment.declaration, assignment.symbol) {
+        (NodeData::Identifier(_), Some(declaration), Some(symbol))
+            if target.kind == SyntaxKind::Identifier =>
+        {
+            validate_bound_node(bound, bound.flow_graph(), declaration)?;
+            if bound.container(declaration) != Some(container)
+                || bound.symbol(declaration) != Some(symbol)
+                || store
+                    .symbol(symbol)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                    != Some(declaration)
+                || own_class_flow_symbol(store, host, bound, assignment.target)? != symbol
+            {
+                return Err(invalid().into());
+            }
+            let record = arena.get(declaration.node).ok_or_else(invalid)?;
+            let (name, readonly) = match &record.data {
+                NodeData::VariableDeclaration(variable)
+                    if record.kind == SyntaxKind::VariableDeclaration =>
+                {
+                    let list = record
+                        .parent
+                        .and_then(|node| arena.get(node))
+                        .ok_or_else(invalid)?;
+                    let NodeData::VariableDeclarationList(declarations) = &list.data else {
+                        return Err(invalid().into());
+                    };
+                    if list.kind != SyntaxKind::VariableDeclarationList
+                        || !matches!(list.flags.0, 0..=2)
+                        || declarations
+                            .declarations
+                            .nodes
+                            .iter()
+                            .filter(|node| **node == declaration.node)
+                            .count()
+                            != 1
+                    {
+                        return Err(invalid().into());
+                    }
+                    (variable.name, list.flags.0 == 2)
+                }
+                NodeData::ParameterDeclaration(parameter)
+                    if record.kind == SyntaxKind::Parameter
+                        && record.parent == Some(container.node) =>
+                {
+                    (parameter.name, false)
+                }
+                _ => return Err(invalid().into()),
+            };
+            if assignment.readonly != readonly
+                || arena.get(name).is_none_or(|name| {
+                    name.kind != SyntaxKind::Identifier || name.parent != Some(declaration.node)
+                })
+            {
+                return Err(invalid().into());
+            }
+            None
+        }
+        (NodeData::PropertyAccessExpression(_), None, None)
+        | (NodeData::ElementAccessExpression(_), None, None) => {
+            nullish_member_receiver(arena, bound, store, host, container, assignment.target)?
+        }
+        _ => return Err(invalid().into()),
+    };
+    let mut flow = None;
+    for (index, node) in bound.flow_graph().nodes().iter().enumerate() {
+        if node.flags.intersects(FlowFlags::ASSIGNMENT)
+            && node.payload == Some(FlowNodePayload::Ast(assignment.target))
+        {
+            let actual = FlowRef::new(
+                arena.id(),
+                bound.file_id(),
+                FlowNodeId(u32::try_from(index).map_err(|_| invalid())?),
+            );
+            if flow.replace(actual).is_some()
+                || source_flow_kind(actual, node.flags)? != SourceFlowKind::Assignment
+            {
+                return Err(invalid().into());
+            }
+            linear_antecedent(actual, node)?;
+        }
+    }
+    if flow.is_none() && assignment.symbol.is_some() {
+        return Err(invalid().into());
+    }
+    if flow.is_some() && assignment.symbol.is_none() && receiver.is_none() {
+        return Err(SourceFlowUnsupported::PropertyWrite(assignment.target).into());
+    }
+    Ok(SourceNullishAssignmentProof {
+        assignment,
+        receiver,
+        flow,
+        revision: arena.revision(),
+    })
+}
+
+fn nullish_member_receiver(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    target: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceFlowError> {
+    let invalid = || SourceFlowUnsupported::PropertyWrite(target);
+    let mut current = target;
+    let mut visited = HashSet::new();
+    while visited.insert(current) && visited.len() <= FLOW_DEPTH_LIMIT {
+        let record = arena.get(current.node).ok_or_else(invalid)?;
+        let receiver = match &record.data {
+            NodeData::PropertyAccessExpression(access)
+                if record.kind == SyntaxKind::PropertyAccessExpression
+                    && access.question_dot_token.is_none() =>
+            {
+                access.expression
+            }
+            NodeData::ElementAccessExpression(access)
+                if record.kind == SyntaxKind::ElementAccessExpression
+                    && access.question_dot_token.is_none() =>
+            {
+                access.expression
+            }
+            NodeData::Identifier(_) if record.kind == SyntaxKind::Identifier => {
+                let symbol = own_class_flow_symbol(store, host, bound, current)?;
+                let declaration = store
+                    .symbol(symbol)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                    .ok_or_else(invalid)?;
+                if bound.container(declaration) != Some(container) {
+                    return Err(invalid().into());
+                }
+                return Ok(Some(symbol));
+            }
+            NodeData::CallExpression(_) if record.kind == SyntaxKind::CallExpression => {
+                return Ok(None);
+            }
+            _ => return Err(invalid().into()),
+        };
+        let receiver = NodeRef::new(target.arena, target.file, receiver);
+        if arena
+            .get(receiver.node)
+            .is_none_or(|record| record.parent != Some(current.node))
+            || bound.flow_container(receiver) != Some(container)
+        {
+            return Err(invalid().into());
+        }
+        current = receiver;
+    }
+    Err(invalid().into())
+}
+
+fn validate_nullish_call(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    container: NodeRef,
+    call: NodeRef,
+    assignments: &[SourceFlowNullishAssignment],
+) -> Result<Option<(NodeRef, FlowRef)>, SourceFlowError> {
+    if !assignments
+        .iter()
+        .any(|assignment| source_node_is_descendant_of(arena, call, assignment.expression.node))
+    {
+        return Ok(None);
+    }
+    let invalid = || SourceFlowInvariant::InvalidCall(call);
+    validate_bound_node(bound, bound.flow_graph(), call)?;
+    let record = arena.get(call.node).ok_or_else(invalid)?;
+    let NodeData::CallExpression(data) = &record.data else {
+        return Err(invalid().into());
+    };
+    if record.kind != SyntaxKind::CallExpression
+        || record.flags.0 != 0
+        || data.question_dot_token.is_some()
+        || data.symbol.is_some()
+        || data.facts != 0
+        || bound.container(call) != Some(container)
+        || bound.flow_container(call) != Some(container)
+        || arena.get(data.expression).is_none_or(|callee| {
+            callee.parent != Some(call.node)
+                || !matches!(
+                    callee.kind,
+                    SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression
+                )
+        })
+    {
+        return Err(invalid().into());
+    }
+    let mut statement = call;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(statement) || visited.len() > FLOW_DEPTH_LIMIT {
+            return Err(invalid().into());
+        }
+        let record = arena.get(statement.node).ok_or_else(invalid)?;
+        if bound.flow_container(statement) != Some(container)
+            || bound.block_scope_container(statement) != bound.block_scope_container(call)
+        {
+            return Err(invalid().into());
+        }
+        if matches!(
+            record.kind,
+            SyntaxKind::ExpressionStatement
+                | SyntaxKind::VariableStatement
+                | SyntaxKind::ReturnStatement
+        ) {
+            break;
+        }
+        statement = NodeRef::new(call.arena, call.file, record.parent.ok_or_else(invalid)?);
+    }
+    let mut antecedent = None;
+    for (index, node) in bound.flow_graph().nodes().iter().enumerate() {
+        if node.flags.intersects(FlowFlags::CALL)
+            && node.payload == Some(FlowNodePayload::Ast(call))
+        {
+            let flow = FlowRef::new(
+                arena.id(),
+                bound.file_id(),
+                FlowNodeId(u32::try_from(index).map_err(|_| invalid())?),
+            );
+            if source_flow_kind(flow, node.flags)? != SourceFlowKind::Call
+                || antecedent.replace(linear_antecedent(flow, node)?).is_some()
+            {
+                return Err(invalid().into());
+            }
+        }
+    }
+    Ok(Some((statement, antecedent.ok_or_else(invalid)?)))
+}
+
+fn prepare_nullish_call(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    container: NodeRef,
+    call: NodeRef,
+    assignments: &[SourceFlowNullishAssignment],
+    effects: &mut SourceFlowEffects,
+) -> Result<Option<NodeRef>, SourceFlowError> {
+    let Some((statement, antecedent)) =
+        validate_nullish_call(arena, bound, container, call, assignments)?
+    else {
+        return Ok(None);
+    };
+    if effects.nullish_calls.insert(call, antecedent).is_some() {
+        return Err(SourceFlowInvariant::DuplicateCall(call).into());
+    }
+    Ok(Some(statement))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_nullish_assignments(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    container: NodeRef,
+    nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+    assignments: &mut Vec<SourceFlowAssignment>,
+    conditions: &mut Vec<SourceFlowCondition>,
+    effects: &mut SourceFlowEffects,
+) -> Result<(), SourceFlowError> {
+    for assignment in nullish_assignments {
+        let host = host.ok_or(SourceFlowInvariant::InvalidParameterAssignment(
+            assignment.target,
+        ))?;
+        let proof =
+            source_nullish_assignment_proof(arena, bound, store, host, container, assignment)?;
+        if effects
+            .nullish_assignments
+            .insert(assignment.target, proof)
+            .is_some()
+            || effects
+                .assignment_declarations
+                .contains_key(&assignment.target)
+            || effects.captured_origins.contains_key(&assignment.target)
+            || effects
+                .property_assignments
+                .contains_key(&assignment.target)
+        {
+            return Err(SourceFlowInvariant::DuplicateAssignment(assignment.target).into());
+        }
+        if let (Some(declaration), Some(symbol)) = (assignment.declaration, assignment.symbol) {
+            effects
+                .assignment_declarations
+                .insert(assignment.target, declaration);
+            assignments.push(SourceFlowAssignment {
+                declaration: assignment.target,
+                symbol,
+            });
+        }
+        for condition in [
+            SourceFlowCondition::Nullish(SourceNullishCondition {
+                expression: assignment.target,
+                symbol: assignment.symbol,
+            }),
+            match assignment.symbol.filter(|_| !assignment.readonly) {
+                Some(symbol) => SourceFlowCondition::Truthiness(SourceTruthinessCondition {
+                    expression: assignment.expression,
+                    symbol,
+                    negated: false,
+                }),
+                None => SourceFlowCondition::Unchanged(assignment.expression),
+            },
+        ] {
+            if bound.flow_graph().nodes().iter().any(|node| {
+                node.flags
+                    .intersects(FlowFlags::TRUE_CONDITION | FlowFlags::FALSE_CONDITION)
+                    && node.payload == Some(FlowNodePayload::Ast(condition.expression()))
+            }) {
+                conditions.push(condition);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parameter_assignment_declaration_and_name(
@@ -8252,6 +9052,18 @@ fn validate_planned_call_container(
     statement: NodeRef,
     antecedent: FlowRef,
 ) -> Result<(), SourceFlowError> {
+    if let Some(expected) = plan.nullish_calls.get(&call) {
+        if *expected != antecedent
+            || !bound.contains(call)
+            || bound.container(call) != Some(plan.container)
+            || bound.flow_container(call) != Some(plan.container)
+            || bound.flow_container(statement) != Some(plan.container)
+            || plan.calls.get(&call) != Some(&statement)
+        {
+            return Err(SourceFlowInvariant::InvalidCall(call).into());
+        }
+        return Ok(());
+    }
     let Some(body) = plan.class_body.as_ref() else {
         return validate_call_container(bound, plan.container, call, statement, antecedent);
     };
@@ -12496,6 +13308,8 @@ mod tests {
             property_assignments: HashMap::new(),
             region: None,
             updates: HashMap::new(),
+            nullish_assignments: HashMap::new(),
+            nullish_calls: HashMap::new(),
         };
         let without_payload = FlowNode::new(FlowFlags::START);
         assert_eq!(validate_start_node(&plan, start, &without_payload), Ok(()));
@@ -15236,6 +16050,376 @@ mod tests {
                     .snapshot_at(context.store_mut_for_test(), &globals, *after_statement)
                     .unwrap(),
                 after,
+            );
+        }
+    }
+
+    #[test]
+    fn nullish_assignment_flow_keeps_nested_writes_conditional_and_replays() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(
+            "function effects(value: number | undefined, side: number | undefined): void { \
+             value ??= (side ??= 1); value; side; }",
+        );
+        let file = FileId::new(32_291);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let (function, _, statements) = linear_function_nodes(&parsed, file, "effects");
+        let assignment = |name: &str| {
+            let declaration = captured_variable(&parsed, file, name);
+            let (expression, target) = parsed
+                .arena
+                .iter()
+                .find_map(|(id, record)| {
+                    let NodeData::BinaryExpression(binary) = &record.data else {
+                        return None;
+                    };
+                    matches!(&parsed.arena.get(binary.left)?.data,
+                    NodeData::Identifier(identifier) if identifier.text == name)
+                    .then_some((
+                        NodeRef::new(parsed.arena.id(), file, id),
+                        NodeRef::new(parsed.arena.id(), file, binary.left),
+                    ))
+                })
+                .unwrap();
+            SourceFlowNullishAssignment {
+                expression,
+                target,
+                declaration: Some(declaration),
+                symbol: bound.symbol(declaration),
+                readonly: false,
+            }
+        };
+        let value = assignment("value");
+        let side = assignment("side");
+        let value_symbol = value.symbol.unwrap();
+        let side_symbol = side.symbol.unwrap();
+        let plan = SourceFlowPlan::preflight_linear_with_nullish_assignments(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            function,
+            statements
+                .iter()
+                .copied()
+                .chain([value.target, side.target]),
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [value, side],
+        )
+        .unwrap();
+        let (number, undefined) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.undefined_type)
+        };
+        let optional = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[number, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let base: SourceFlowTypes = [(value_symbol, optional), (side_symbol, optional)]
+            .into_iter()
+            .collect();
+        for _ in 0..2 {
+            let mut frame = plan
+                .frame_with_captured_locals(context.store(), &host, &bound, base.clone())
+                .unwrap();
+            let right = frame
+                .snapshot_at(context.store_mut_for_test(), &globals, side.target)
+                .unwrap();
+            assert_eq!(right.type_of(value_symbol), Some(undefined));
+            assert_eq!(right.type_of(side_symbol), Some(optional));
+            assert!(
+                frame
+                    .snapshot_at(context.store_mut_for_test(), &globals, statements[1])
+                    .is_err()
+            );
+            frame
+                .complete_assignment(side.target, side_symbol, number)
+                .unwrap();
+            assert!(frame.memo.is_empty());
+            frame
+                .complete_assignment(value.target, value_symbol, number)
+                .unwrap();
+            let after = frame
+                .snapshot_at(context.store_mut_for_test(), &globals, statements[1])
+                .unwrap();
+            assert_eq!(after.type_of(value_symbol), Some(number));
+            assert_eq!(after.type_of(side_symbol), Some(optional));
+            assert_eq!(frame.declared_types, base);
+            assert_eq!(
+                frame.complete_assignment(value.target, value_symbol, number),
+                Err(SourceFlowInvariant::AssignmentAlreadyCompleted(value.target).into())
+            );
+        }
+        for changed in [
+            SourceFlowNullishAssignment {
+                declaration: side.declaration,
+                ..value
+            },
+            SourceFlowNullishAssignment {
+                symbol: side.symbol,
+                ..value
+            },
+            SourceFlowNullishAssignment {
+                readonly: true,
+                ..value
+            },
+            SourceFlowNullishAssignment {
+                expression: side.expression,
+                ..value
+            },
+        ] {
+            assert!(
+                validate_source_nullish_assignment(
+                    &parsed.arena,
+                    &bound,
+                    context.store(),
+                    &host,
+                    function,
+                    changed,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn nullish_assignment_flow_keeps_falsy_values_on_the_non_nullish_edge() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(
+            "function effects(value: string | number | boolean | undefined): void { \
+             value ??= 1; value; }",
+        );
+        let file = FileId::new(32_292);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let (function, parameter, statements) = linear_function_nodes(&parsed, file, "effects");
+        let expression = expression_statement_expression(&parsed, file, statements[0]);
+        let NodeData::BinaryExpression(binary) = &parsed.arena.get(expression.node).unwrap().data
+        else {
+            panic!("expected nullish assignment")
+        };
+        let target = NodeRef::new(parsed.arena.id(), file, binary.left);
+        let symbol = bound.symbol(parameter).unwrap();
+        let assignment = SourceFlowNullishAssignment {
+            expression,
+            target,
+            declaration: Some(parameter),
+            symbol: Some(symbol),
+            readonly: false,
+        };
+        let plan = SourceFlowPlan::preflight_linear_with_nullish_assignments(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            function,
+            statements.iter().copied(),
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [assignment],
+        )
+        .unwrap();
+        let (undefined, false_type, number) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.undefined_type,
+                bootstrap.regular_false_type,
+                bootstrap.number_type,
+            )
+        };
+        let zero = context
+            .store_mut_for_test()
+            .regular_number_literal_type(ts_jsnum::Number::new(0.0))
+            .unwrap();
+        let empty = context
+            .store_mut_for_test()
+            .regular_string_literal_type(String::new())
+            .unwrap();
+        let present = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[zero, empty, false_type],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let input = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[present, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let edge = |wanted| {
+            bound
+                .flow_graph()
+                .nodes()
+                .iter()
+                .enumerate()
+                .find_map(|(index, node)| {
+                    (node.flags.intersects(wanted)
+                        && node.payload == Some(FlowNodePayload::Ast(target)))
+                    .then(|| {
+                        bound
+                            .flow_graph()
+                            .nodes()
+                            .flow_ref(FlowNodeId(u32::try_from(index).unwrap()))
+                            .unwrap()
+                    })
+                })
+                .unwrap()
+        };
+        let mut frame = plan
+            .frame(&bound, [(symbol, input)].into_iter().collect())
+            .unwrap();
+        assert_eq!(
+            frame
+                .resolve_flow(
+                    context.store_mut_for_test(),
+                    &globals,
+                    edge(FlowFlags::TRUE_CONDITION),
+                    0
+                )
+                .unwrap()
+                .type_of(symbol),
+            Some(present)
+        );
+        assert_eq!(
+            frame
+                .resolve_flow(
+                    context.store_mut_for_test(),
+                    &globals,
+                    edge(FlowFlags::FALSE_CONDITION),
+                    0
+                )
+                .unwrap()
+                .type_of(symbol),
+            Some(undefined)
+        );
+        frame.complete_assignment(target, symbol, number).unwrap();
+        assert!(frame.memo.is_empty());
+    }
+
+    #[test]
+    fn nullish_source_statement_keeps_readonly_assignment_state() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        for readonly in [false, true] {
+            let input = if readonly {
+                "const value: number | undefined = undefined; value ??= 1; value;"
+            } else {
+                "let value: number | undefined; value ??= 1; value;"
+            };
+            let parsed = parse_source_file(input);
+            let file = FileId::new(32_293);
+            let mut context = loop_context(&parsed, file);
+            let bound = context.file(file).unwrap().1.clone();
+            let globals = context.global_types().clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let declaration = captured_variable(&parsed, file, "value");
+            let symbol = bound.symbol(declaration).unwrap();
+            let (expression, binary) = parsed
+                .arena
+                .iter()
+                .find_map(|(id, record)| match &record.data {
+                    NodeData::BinaryExpression(binary) => {
+                        Some((NodeRef::new(parsed.arena.id(), file, id), binary))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let target = NodeRef::new(parsed.arena.id(), file, binary.left);
+            let statement = NodeRef::new(
+                parsed.arena.id(),
+                file,
+                parsed.arena.get(expression.node).unwrap().parent.unwrap(),
+            );
+            let assignment = SourceFlowNullishAssignment {
+                expression,
+                target,
+                declaration: Some(declaration),
+                symbol: Some(symbol),
+                readonly,
+            };
+            let plan = SourceFlowPlan::preflight_source_statement_with_nullish_assignments(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                &host,
+                statement,
+                [target],
+                [],
+                [],
+                [],
+                [],
+                [assignment],
+            )
+            .unwrap();
+            let (number, undefined) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (bootstrap.number_type, bootstrap.undefined_type)
+            };
+            let mut frame = plan
+                .frame_with_captured_locals(
+                    context.store(),
+                    &host,
+                    &bound,
+                    [(symbol, undefined)].into_iter().collect(),
+                )
+                .unwrap();
+            if readonly {
+                assert_eq!(
+                    frame.assignment_states[&target],
+                    SourceFlowAssignmentState::ReadonlyUpdate
+                );
+                assert_eq!(
+                    frame.complete_assignment(target, symbol, number),
+                    Err(SourceFlowInvariant::AssignmentAlreadyCompleted(target).into())
+                );
+            } else {
+                frame.complete_assignment(target, symbol, number).unwrap();
+            }
+            let after = frame
+                .snapshot_for_symbols_at_end(context.store_mut_for_test(), &globals, [symbol])
+                .unwrap();
+            assert_eq!(
+                after.type_of(symbol),
+                Some(if readonly { undefined } else { number })
             );
         }
     }
