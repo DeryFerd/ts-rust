@@ -59,7 +59,10 @@ use super::{
         TypeRecord,
     },
     types::{ObjectFlags, TypeFlags},
-    variables::{PlannedObjectBindingElement, plan_function_object_parameter_bindings},
+    variables::{
+        PlannedObjectBindingElement, plan_function_object_parameter_bindings,
+        plan_typed_arrow_object_parameter_bindings,
+    },
 };
 
 #[cfg(test)]
@@ -3606,7 +3609,8 @@ fn plan_source_callable_with_owner_shape(
                 format!("__{source_index}")
             }
             (NodeData::BindingPattern(_), SyntaxKind::ObjectBindingPattern)
-                if view.family == SourceCallableFamily::FunctionDeclaration
+                if (view.family == SourceCallableFamily::FunctionDeclaration
+                    || record.kind == SyntaxKind::ArrowFunction && !is_async)
                     && body_mode == SourceCallableBodyMode::Present
                     && type_parameters.is_empty()
                     && authenticated_function_object_parameter_bindings(
@@ -5846,9 +5850,13 @@ pub(super) fn authenticated_function_object_parameter_bindings(
     parameter: NodeRef,
 ) -> Option<Vec<PlannedObjectBindingElement>> {
     let (arena, bound) = host.source(declaration)?;
-    let bindings =
+    let bindings = if host.node(declaration)?.kind == SyntaxKind::ArrowFunction {
+        plan_typed_arrow_object_parameter_bindings(arena, bound, store, declaration, parameter)
+            .ok()?
+    } else {
         plan_function_object_parameter_bindings(arena, bound, store, declaration, parameter)
-            .ok()?;
+            .ok()?
+    };
     let NodeData::ParameterDeclaration(syntax) = &host.node(parameter)?.data else {
         return None;
     };

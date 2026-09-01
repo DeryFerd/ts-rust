@@ -13183,19 +13183,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 parameter.declaration,
             ));
         };
+        if matches!(
+            callable.family,
+            SourceCallableFamily::FunctionDeclaration | SourceCallableFamily::ArrowFunction
+        ) && name_record.kind == SyntaxKind::ObjectBindingPattern
+        {
+            let bindings = authenticated_function_object_parameter_bindings(
+                store,
+                host,
+                callable.declaration,
+                parameter.declaration,
+            )
+            .ok_or_else(|| callable_parameter_execution_error(callable, parameter.declaration))?;
+            return Ok(bindings.into_iter().map(|binding| binding.symbol).collect());
+        }
         if callable.family == SourceCallableFamily::FunctionDeclaration {
-            if name_record.kind == SyntaxKind::ObjectBindingPattern {
-                let bindings = authenticated_function_object_parameter_bindings(
-                    store,
-                    host,
-                    callable.declaration,
-                    parameter.declaration,
-                )
-                .ok_or_else(|| {
-                    callable_parameter_execution_error(callable, parameter.declaration)
-                })?;
-                return Ok(bindings.into_iter().map(|binding| binding.symbol).collect());
-            }
             let bindings = authenticated_function_array_parameter_bindings(
                 store,
                 host,
@@ -39635,6 +39637,7 @@ fn check_planned_arrow_argument(
         &[],
         arrow_capture,
     )?;
+    add_arrow_object_parameter_entries(store, host, &arrow.callable, &mut captured_entry_types)?;
     let mut linear_values = HashMap::new();
     let mut linear_value_order = Vec::new();
     let flow_types = if let Some(statements) = &arrow.linear_body {
@@ -44457,7 +44460,10 @@ fn check_callable_parameter_initializers_with_capture_context(
                 VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
             ));
         }
-        if callable.family != SourceCallableFamily::FunctionDeclaration {
+        if !matches!(
+            callable.family,
+            SourceCallableFamily::FunctionDeclaration | SourceCallableFamily::ArrowFunction
+        ) {
             continue;
         }
         let NodeData::ParameterDeclaration(parameter_syntax) = &host
@@ -44479,9 +44485,43 @@ fn check_callable_parameter_initializers_with_capture_context(
             .node(pattern)
             .is_some_and(|record| record.kind == SyntaxKind::ObjectBindingPattern)
         {
-            let planned = object_bindings.get(object_binding_index).ok_or_else(|| {
-                callable_parameter_execution_error(callable, parameter.declaration)
-            })?;
+            let arrow_bindings;
+            let planned = if callable.family == SourceCallableFamily::ArrowFunction {
+                let bindings = authenticated_function_object_parameter_bindings(
+                    store,
+                    host,
+                    callable.declaration,
+                    parameter.declaration,
+                )
+                .ok_or_else(|| {
+                    callable_parameter_execution_error(callable, parameter.declaration)
+                })?;
+                // Named keys have no expressions to plan. Reuse the function binding check.
+                if bindings.iter().any(|binding| binding.computed_key.is_some()) {
+                    return Err(callable_parameter_execution_error(
+                        callable,
+                        parameter.declaration,
+                    ));
+                }
+                arrow_bindings = PlannedObjectParameterBindings {
+                    parameter: *parameter,
+                    elements: bindings
+                        .into_iter()
+                        .map(|binding| PlannedObjectVariableElement {
+                            binding,
+                            computed_key: None,
+                            initializer: None,
+                        })
+                        .collect(),
+                };
+                &arrow_bindings
+            } else {
+                let planned = object_bindings.get(object_binding_index).ok_or_else(|| {
+                    callable_parameter_execution_error(callable, parameter.declaration)
+                })?;
+                object_binding_index += 1;
+                planned
+            };
             if planned.parameter != *parameter {
                 return Err(callable_parameter_execution_error(
                     callable,
@@ -44503,7 +44543,9 @@ fn check_callable_parameter_initializers_with_capture_context(
                 planned,
                 body_type,
             )?;
-            object_binding_index += 1;
+            continue;
+        }
+        if callable.family != SourceCallableFamily::FunctionDeclaration {
             continue;
         }
         let Some(bindings) = authenticated_function_array_parameter_bindings(
@@ -48983,6 +49025,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
     captured_entry_types: &mut HashMap<SemanticSymbolId, TypeId>,
     outer_capture: Option<SourceArrowCaptureContext<'_>>,
 ) -> Result<HashMap<SemanticSymbolId, TypeId>, SourceCheckError> {
+    add_arrow_object_parameter_entries(store, host, callable, captured_entry_types)?;
     let mut base_flow_types = base_flow_types;
     for index in &statements.deferred_local_arrows {
         let local = statements
@@ -50787,6 +50830,7 @@ fn check_planned_callable_statement_list(
             has_bare_return: body.syntax.has_implicit_return,
             ..CallableStatementReturns::default()
         };
+        add_arrow_object_parameter_entries(store, host, callable, &mut returned.declared_entries)?;
         check_callable_statement_nodes(
             store,
             host,
@@ -56037,13 +56081,16 @@ fn publish_checked_source_callable_return_with_contextual_return(
     } else {
         contextual_return
     };
-    let parameter_entries = if arrow_capture.is_none()
+    let mut parameter_entries = if arrow_capture.is_none()
         && expression.is_some_and(expression_has_deferred_object_members)
     {
         Some(source_arrow_parameter_entry_types(store, callable)?)
     } else {
         None
     };
+    if let Some(entries) = &mut parameter_entries {
+        add_arrow_object_parameter_entries(store, host, callable, entries)?;
+    }
     let arrow_capture = arrow_capture.or_else(|| {
         parameter_entries
             .as_ref()
@@ -57095,6 +57142,29 @@ fn source_arrow_capture_can_keep_narrowing(
         return Ok(true);
     }
     if record.kind == SyntaxKind::BindingElement {
+        if store.source_node_kind(parent) == Some(SyntaxKind::ObjectBindingPattern)
+            && let Some(super::store::SourceNodeParent::Parent(parameter)) =
+                store.source_node_parent(parent)
+            && store.source_node_kind(parameter) == Some(SyntaxKind::Parameter)
+            && let Some(super::store::SourceNodeParent::Parent(arrow)) =
+                store.source_node_parent(parameter)
+            && store.source_node_kind(arrow) == Some(SyntaxKind::ArrowFunction)
+            && host.node(parameter).is_some_and(|record| {
+                matches!(
+                    &record.data,
+                    NodeData::ParameterDeclaration(syntax) if syntax.type_.is_some()
+                )
+            })
+        {
+            return authenticated_function_object_parameter_bindings(store, host, arrow, parameter)
+                .filter(|bindings| {
+                    bindings.iter().any(|binding| {
+                        binding.element == declaration && binding.symbol == symbol
+                    })
+                })
+                .map(|_| true)
+                .ok_or_else(invalid);
+        }
         return source_for_of_let_capture_is_exact(store, host, symbol, declaration);
     }
     if record.kind != SyntaxKind::VariableDeclaration
@@ -57377,6 +57447,58 @@ fn source_arrow_parameter_entry_types(
             Ok((parameter.symbol, declared))
         })
         .collect()
+}
+
+/// Adds checked binding leaves to the caller's existing deferred-body entries.
+fn add_arrow_object_parameter_entries(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    callable: &SourceCallablePlan,
+    entries: &mut HashMap<SemanticSymbolId, TypeId>,
+) -> Result<(), SourceCheckError> {
+    if callable.family != SourceCallableFamily::ArrowFunction {
+        return Ok(());
+    }
+    for parameter in &callable.parameters {
+        let invalid = || callable_parameter_execution_error(callable, parameter.declaration);
+        let record = host.node(parameter.declaration).ok_or_else(invalid)?;
+        let NodeData::ParameterDeclaration(syntax) = &record.data else {
+            return Err(invalid());
+        };
+        let name = NodeRef::new(
+            parameter.declaration.arena,
+            parameter.declaration.file,
+            syntax.name,
+        );
+        if syntax.type_.is_none()
+            || host
+                .node(name)
+                .is_none_or(|record| record.kind != SyntaxKind::ObjectBindingPattern)
+        {
+            continue;
+        }
+        let bindings = authenticated_function_object_parameter_bindings(
+            store,
+            host,
+            callable.declaration,
+            parameter.declaration,
+        )
+        .ok_or_else(invalid)?;
+        for binding in bindings {
+            let type_ = store
+                .value_symbol_links(binding.symbol)
+                .and_then(|links| links.resolved_type)
+                .ok_or_else(invalid)?;
+            if entries
+                .get(&binding.symbol)
+                .is_some_and(|existing| *existing != type_)
+            {
+                return Err(invalid());
+            }
+            entries.insert(binding.symbol, type_);
+        }
+    }
+    Ok(())
 }
 
 /// Retains writes from nested bodies and parameter initializers in this callable.
@@ -71373,7 +71495,7 @@ pub(super) fn check_source_file(
                         callable.declaration,
                         &current_flow_types,
                     )?;
-                    let for_of_entries = matches!(arrow.body, PlannedArrowBody::ForOf(_))
+                    let mut for_of_entries = matches!(arrow.body, PlannedArrowBody::ForOf(_))
                         .then(|| source_arrow_parameter_entry_types(store, &callable))
                         .transpose()?;
                     let for_of_capture = match (&arrow.body, for_of_entries.as_ref()) {
@@ -71431,6 +71553,22 @@ pub(super) fn check_source_file(
                             &[],
                             arrow_capture,
                         )?;
+                    if let Some(entries) = &mut for_of_entries {
+                        add_arrow_object_parameter_entries(store, host, &callable, entries)?;
+                    }
+                    let for_of_capture = match (&arrow.body, for_of_entries.as_ref()) {
+                        (PlannedArrowBody::ForOf(iteration), Some(entries)) => {
+                            Some(SourceArrowCaptureContext {
+                                declared_types: entries,
+                                mutable_symbols: None,
+                                outer: Some(&source_capture),
+                                flow: None,
+                                assignments: &iteration.capture_assignments,
+                                value_exports: &[],
+                            })
+                        }
+                        _ => None,
+                    };
                     let body_flow_types = if let Some(statements) = &arrow.linear_body {
                         check_planned_linear_function_statements_with_capture_entries(
                             bound,
@@ -75432,7 +75570,7 @@ pub(super) fn check_source_file(
             arrow.source.callable.declaration,
             &current_flow_types,
         )?;
-        let for_of_entries = matches!(arrow.body, PlannedArrowBody::ForOf(_))
+        let mut for_of_entries = matches!(arrow.body, PlannedArrowBody::ForOf(_))
             .then(|| source_arrow_parameter_entry_types(store, &arrow.source.callable))
             .transpose()?;
         let for_of_capture = match (&arrow.body, for_of_entries.as_ref()) {
@@ -75464,6 +75602,22 @@ pub(super) fn check_source_file(
             &[],
             for_of_capture,
         )?;
+        if let Some(entries) = &mut for_of_entries {
+            add_arrow_object_parameter_entries(store, host, &arrow.source.callable, entries)?;
+        }
+        let for_of_capture = match (&arrow.body, for_of_entries.as_ref()) {
+            (PlannedArrowBody::ForOf(iteration), Some(entries)) => {
+                Some(SourceArrowCaptureContext {
+                    declared_types: entries,
+                    mutable_symbols: None,
+                    outer: Some(&source_capture),
+                    flow: None,
+                    assignments: &iteration.capture_assignments,
+                    value_exports: &[],
+                })
+            }
+            _ => None,
+        };
         if let Some(statements) = &arrow.linear_body {
             check_planned_linear_function_statements(
                 bound,
@@ -118376,6 +118530,130 @@ class Foo2 {
         assert_eq!(
             context.store().value_symbol_links(*second),
             Some(&second_links)
+        );
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn typed_arrow_object_parameters_publish_leaf_types_as_one_batch() {
+        let source = parsed(
+            "const read = ({ first, second }: { first: number; second: string }): void => {};",
+        );
+        let file = FileId::new(202_903);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let arrow = variable_initializer(&source, file, "read");
+        let NodeData::ArrowFunction(syntax) = &source.arena.get(arrow.node).unwrap().data else {
+            panic!("expected the original arrow")
+        };
+        let parameter = NodeRef::new(source.arena.id(), file, syntax.parameters.nodes[0]);
+        let (_, bound) = context.file(file).unwrap();
+        let parent = bound.symbol(parameter).unwrap();
+        let owner = bound.symbol(arrow).unwrap();
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .family,
+            SourceCallableFamily::ArrowFunction,
+        );
+        let symbols = source
+            .arena
+            .iter()
+            .filter(|(_, record)| record.kind == SyntaxKind::BindingElement)
+            .map(|(node, _)| {
+                bound
+                    .symbol(NodeRef::new(source.arena.id(), file, node))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let [first, second] = symbols.as_slice() else {
+            panic!("expected two arrow binding leaves")
+        };
+        let first_links = context.store().value_symbol_links(*first).unwrap().clone();
+        let second_links = context.store().value_symbol_links(*second).unwrap().clone();
+        let parent_links = context.store().value_symbol_links(parent).unwrap().clone();
+        {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let plan = plan_source_callable(
+                context.store(),
+                &host,
+                arrow,
+                owner,
+                Some(CanonicalArrayTargets::from_global_types(
+                    context.global_types(),
+                )),
+            )
+            .unwrap();
+            let mut entries = source_arrow_parameter_entry_types(context.store(), &plan).unwrap();
+            assert_eq!(entries.len(), 1);
+            add_arrow_object_parameter_entries(context.store(), &host, &plan, &mut entries).unwrap();
+            assert_eq!(entries.len(), 3);
+            assert_eq!(entries.get(&parent).copied(), parent_links.resolved_type);
+            assert_eq!(entries.get(first).copied(), first_links.resolved_type);
+            assert_eq!(entries.get(second).copied(), second_links.resolved_type);
+            for symbol in [*first, *second] {
+                assert_eq!(
+                    source_arrow_capture_can_keep_narrowing(context.store(), &host, symbol, &[]),
+                    Ok(true),
+                );
+            }
+        }
+        let poisoned = ValueSymbolLinks {
+            resolved_type: Some(context.store().intrinsic_bootstrap().unwrap().number_type),
+            ..ValueSymbolLinks::default()
+        };
+        assert_ne!(second_links, poisoned);
+        mark_source_unchecked(&mut context, file);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(*first, ValueSymbolLinks::default())
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(*second, poisoned.clone())
+        );
+        let before = observable_state(&context, file);
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Arrow(parameter)),
+            );
+            assert_eq!(observable_state(&context, file), before);
+            assert_eq!(
+                context.store().value_symbol_links(*first),
+                Some(&ValueSymbolLinks::default()),
+            );
+            assert_eq!(context.store().value_symbol_links(*second), Some(&poisoned));
+            assert_eq!(
+                context.store().value_symbol_links(parent),
+                Some(&parent_links),
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(*second, second_links)
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(context.store().value_symbol_links(*first), Some(&first_links));
+        assert_eq!(
+            context.store().source_callable_type_for_owner(owner),
+            Some(callable),
         );
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
