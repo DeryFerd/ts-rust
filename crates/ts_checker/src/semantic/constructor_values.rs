@@ -509,10 +509,10 @@ fn read_global_named_constructor(
         return Ok(None);
     };
     let state = interface_state(store, &plan.owner, constructor_type)?;
-    if state.is_none() {
+    if matches!(state, PropertyObjectState::EmptyBootstrap(_)) {
         return Err(invalid());
     }
-    if !matches!(state, Some(PropertyObjectState::Resolved(actual)) if actual == constructor_type) {
+    if !matches!(state, PropertyObjectState::Resolved(actual) if actual == constructor_type) {
         return Ok(None);
     }
     let Some(annotation_type) = store
