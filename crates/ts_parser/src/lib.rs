@@ -11056,11 +11056,12 @@ impl<'a> Parser<'a> {
         ) {
             let dot_dot_dot_token = (self.current.kind == SyntaxKind::DotDotDotToken)
                 .then(|| self.consume_token_node());
-            let named = self.current.kind == SyntaxKind::Identifier
+            let named = (self.current.kind == SyntaxKind::Identifier
+                || self.current.kind.is_keyword())
                 && (self.next_token_kind() == SyntaxKind::ColonToken
                     || self.next_tokens_are(SyntaxKind::QuestionToken, SyntaxKind::ColonToken));
             if named {
-                let name = self.parse_identifier("Expected a tuple element name.");
+                let name = self.parse_identifier_name("Expected a tuple element name.");
                 let question_token = (self.current.kind == SyntaxKind::QuestionToken)
                     .then(|| self.consume_token_node());
                 self.expect_and_bump(SyntaxKind::ColonToken, "Expected ':'.");
@@ -20372,6 +20373,140 @@ export as namespace GlobalName;
             result.arena.get(statements[1]).unwrap().kind,
             SyntaxKind::VariableStatement
         );
+    }
+
+    #[test]
+    fn keyword_tuple_labels_preserve_required_optional_and_rest_members() {
+        let result = parse_source_file(concat!(
+            "type Required = [type: number, code: number, id: number]; ",
+            "type Modifiers = [new?: number, ...type: string[]];",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        let expected: &[&[(&str, SyntaxKind, bool, bool)]] = &[
+            &[
+                ("type", SyntaxKind::NumberKeyword, false, false),
+                ("code", SyntaxKind::NumberKeyword, false, false),
+                ("id", SyntaxKind::NumberKeyword, false, false),
+            ],
+            &[
+                ("new", SyntaxKind::NumberKeyword, true, false),
+                ("type", SyntaxKind::ArrayType, false, true),
+            ],
+        ];
+        assert_eq!(statements.len(), expected.len());
+        for (&statement, expected_members) in statements.iter().zip(expected) {
+            let NodeData::TypeAliasDeclaration(alias) = &result.arena.get(statement).unwrap().data
+            else {
+                panic!("expected type alias");
+            };
+            let NodeData::TupleTypeNode(tuple) = &result.arena.get(alias.type_).unwrap().data
+            else {
+                panic!("expected tuple type");
+            };
+            assert_eq!(tuple.elements.nodes.len(), expected_members.len());
+            for (&element, &(name, kind, optional, rest)) in
+                tuple.elements.nodes.iter().zip(expected_members.iter())
+            {
+                let node = result.arena.get(element).unwrap();
+                assert_eq!(node.kind, SyntaxKind::NamedTupleMember);
+                assert_eq!(node.parent, Some(alias.type_));
+                let NodeData::NamedTupleMember(member) = &node.data else {
+                    panic!("expected named tuple member");
+                };
+                let label = result.arena.get(member.name).unwrap();
+                assert_eq!(label.kind, SyntaxKind::Identifier);
+                assert_eq!(label.parent, Some(element));
+                let NodeData::Identifier(identifier) = &label.data else {
+                    panic!("expected tuple label identifier");
+                };
+                assert_eq!(identifier.text, name);
+                assert_eq!(
+                    member
+                        .question_token
+                        .map(|id| result.arena.get(id).unwrap().kind),
+                    optional.then_some(SyntaxKind::QuestionToken),
+                );
+                assert_eq!(
+                    member
+                        .dot_dot_dot_token
+                        .map(|id| result.arena.get(id).unwrap().kind),
+                    rest.then_some(SyntaxKind::DotDotDotToken),
+                );
+                let type_node = result.arena.get(member.type_).unwrap();
+                assert_eq!(type_node.kind, kind);
+                assert_eq!(type_node.parent, Some(element));
+                if let NodeData::ArrayTypeNode(array) = &type_node.data {
+                    assert_eq!(
+                        result.arena.get(array.element_type).unwrap().kind,
+                        SyntaxKind::StringKeyword,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyword_tuple_labels_keep_unnamed_type_forms() {
+        let result = parse_source_file("type Plain = [number, string?, ...boolean[]];");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 1);
+        let NodeData::TypeAliasDeclaration(alias) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected type alias");
+        };
+        let NodeData::TupleTypeNode(tuple) = &result.arena.get(alias.type_).unwrap().data else {
+            panic!("expected tuple type");
+        };
+        assert_eq!(tuple.elements.nodes.len(), 3);
+        assert_eq!(
+            result.arena.get(tuple.elements.nodes[0]).unwrap().kind,
+            SyntaxKind::NumberKeyword,
+        );
+        let optional = result.arena.get(tuple.elements.nodes[1]).unwrap();
+        assert_eq!(optional.kind, SyntaxKind::OptionalType);
+        let NodeData::OptionalTypeNode(optional) = &optional.data else {
+            panic!("expected optional type");
+        };
+        assert_eq!(
+            result.arena.get(optional.type_).unwrap().kind,
+            SyntaxKind::StringKeyword,
+        );
+        let rest = result.arena.get(tuple.elements.nodes[2]).unwrap();
+        assert_eq!(rest.kind, SyntaxKind::RestType);
+        let NodeData::RestTypeNode(rest) = &rest.data else {
+            panic!("expected rest type");
+        };
+        let array = result.arena.get(rest.type_).unwrap();
+        assert_eq!(array.kind, SyntaxKind::ArrayType);
+        let NodeData::ArrayTypeNode(array) = &array.data else {
+            panic!("expected array type");
+        };
+        assert_eq!(
+            result.arena.get(array.element_type).unwrap().kind,
+            SyntaxKind::BooleanKeyword,
+        );
+    }
+
+    #[test]
+    fn keyword_tuple_labels_require_a_colon() {
+        let result = parse_source_file("type Bad = [type? number];");
+        assert!(!result.diagnostics.is_empty());
+        let NodeData::TypeAliasDeclaration(alias) = &result
+            .arena
+            .get(source_statements(&result)[0])
+            .unwrap()
+            .data
+        else {
+            panic!("expected type alias");
+        };
+        let NodeData::TupleTypeNode(tuple) = &result.arena.get(alias.type_).unwrap().data else {
+            panic!("expected tuple type");
+        };
+        assert!(tuple.elements.nodes.iter().all(|element| {
+            result.arena.get(*element).unwrap().kind != SyntaxKind::NamedTupleMember
+        }));
     }
 
     #[test]
