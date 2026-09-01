@@ -9,6 +9,10 @@ use ts_checker::semantic::{
 };
 use ts_parser::{ParseResult, parse_source_file};
 
+use ts_ast::{FlowFlags, FlowNodePayload};
+use ts_checker::semantic::IntrinsicBootstrapOptions;
+use ts_checker::semantic::artifact_queries::CanonicalArtifactQueryError;
+
 const SOURCE: &str = concat!(
     "function id(value: number): number { return value; }\n",
     "const sum = (1 + 2) * id(3);\n",
@@ -271,6 +275,495 @@ fn compound_assignments_keep_numeric_bigint_results_and_valid_assignment_checks(
             (2322, "count", vec!["string", "number"]),
         ],
     );
+}
+
+fn strict_nullish_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/project/nullish-assignment.ts\""),
+                CanonicalSourceLanguage::TypeScript,
+                false,
+                CanonicalModuleState::Script,
+            )
+            .with_always_strict(true),
+        )
+        .unwrap();
+    binder
+        .bind_typescript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    CanonicalCheckerContext::new(
+        binder.finish(),
+        [(file, &parsed.arena)].into_iter().collect(),
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            no_implicit_any: true,
+            strict_function_types: true,
+            ..CanonicalCheckerOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+// Compare a cold artifact query with a source-first check under strict null checks.
+fn nullish_context(
+    parsed: &ParseResult,
+    file: FileId,
+    first_query: Option<NodeRef>,
+) -> CanonicalCheckerContext<'_> {
+    let mut context = strict_nullish_context(parsed, file);
+    assert!(!is_type_checked(&context, file));
+    let first = first_query.map(|node| (node, context.get_type_at_location(node).unwrap()));
+    context.check_source_file(file).unwrap();
+    assert!(is_type_checked(&context, file));
+    if let Some((node, type_)) = first {
+        assert_eq!(context.get_type_at_location(node), Ok(type_));
+    }
+    context
+}
+
+fn assert_nullish_diagnostics(
+    context: &CanonicalCheckerContext<'_>,
+    source: &str,
+    parsed: &ParseResult,
+    expected: &[(u32, &str, &[&str])],
+) {
+    let actual = context
+        .diagnostics()
+        .as_slice()
+        .iter()
+        .map(|diagnostic| {
+            assert!(diagnostic.range_override.is_none());
+            assert!(diagnostic.related_information.is_empty());
+            (
+                diagnostic.diagnostic.code(),
+                node_text(source, parsed, diagnostic.node.unwrap()),
+                diagnostic
+                    .diagnostic
+                    .arguments
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        expected
+            .iter()
+            .map(|&(code, text, arguments)| (code, text, arguments.to_vec()))
+            .collect::<Vec<_>>(),
+    );
+    for (diagnostic, &(_, text, _)) in context.diagnostics().as_slice().iter().zip(expected) {
+        // Each expected error is on the final occurrence of its text in these inputs.
+        let start = source.rfind(text).unwrap();
+        let range = parsed
+            .arena
+            .get(diagnostic.node.unwrap().node)
+            .unwrap()
+            .range;
+        assert_eq!(usize::try_from(range.start.get()).unwrap(), start);
+        assert_eq!(
+            usize::try_from(range.end.get()).unwrap(),
+            start + text.len()
+        );
+    }
+}
+
+fn nullish_state(
+    context: &CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    file: FileId,
+) -> impl PartialEq + std::fmt::Debug + use<> {
+    let store = context.store();
+    (
+        [
+            store.type_len(),
+            store.type_alias_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.index_info_len(),
+            store.type_resolution_len(),
+        ],
+        parsed
+            .arena
+            .iter()
+            .map(|(id, _)| {
+                let node = NodeRef::new(parsed.arena.id(), file, id);
+                (
+                    node,
+                    store.node_links(node).cloned(),
+                    store.type_node_links(node).cloned(),
+                    store.symbol_node_links(node).cloned(),
+                    store.signature_links(node).cloned(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        store
+            .symbol_store()
+            .symbols()
+            .map(|(symbol, _)| (symbol, store.value_symbol_links(symbol).cloned()))
+            .collect::<Vec<_>>(),
+        store
+            .source_file_links(context.source_file(file).unwrap())
+            .cloned(),
+        store.relation_state_snapshot(),
+        context.file(file).unwrap().1.flow_graph().clone(),
+        context.diagnostics().clone(),
+    )
+}
+
+fn assert_nullish_replay(
+    context: &mut CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    file: FileId,
+    nodes: &[NodeRef],
+) {
+    let types = nodes
+        .iter()
+        .map(|&node| (node, context.get_type_at_location(node).unwrap()))
+        .collect::<Vec<_>>();
+    let before = nullish_state(context, parsed, file);
+    context.check_source_file(file).unwrap();
+    assert_eq!(nullish_state(context, parsed, file), before);
+    context.recheck_source_file(file).unwrap();
+    for (node, type_) in types {
+        assert_eq!(context.get_type_at_location(node), Ok(type_));
+    }
+    assert_eq!(nullish_state(context, parsed, file), before);
+}
+
+#[test]
+fn nullish_later_member_read_stops_before_unproved_flow_publication() {
+    // Go accepts this source. Until member writes narrow later reads, reject the source.
+    let source = concat!(
+        "const object: { value: number | undefined } = { value: undefined };\n",
+        "object.value ??= 1;\n",
+        "const good: number = object.value;\n",
+    );
+    let parsed = parse_source_file(source);
+    let file = FileId::new(202_941);
+    let assignment = expression_by_text(source, &parsed, file, "object.value ??= 1");
+    let read = variable_initializer(&parsed, file, "good");
+    assert_eq!(node_text(source, &parsed, read), "object.value");
+    let expected = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Property(read));
+
+    for cold_query_first in [false, true] {
+        let mut context = strict_nullish_context(&parsed, file);
+        let before = nullish_state(&context, &parsed, file);
+        if cold_query_first {
+            assert_eq!(
+                context.get_type_at_location(read),
+                Err(CanonicalArtifactQueryError::SourceCheck(expected)),
+            );
+            assert_eq!(nullish_state(&context, &parsed, file), before);
+        }
+        assert_eq!(context.check_source_file(file), Err(expected));
+        assert_eq!(nullish_state(&context, &parsed, file), before);
+        assert!(context.store().type_node_links(assignment).is_none());
+        assert!(context.store().type_node_links(read).is_none());
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+        assert_eq!(
+            context.get_type_at_location(read),
+            Err(CanonicalArtifactQueryError::SourceCheck(expected)),
+        );
+        assert_eq!(nullish_state(&context, &parsed, file), before);
+        assert_eq!(context.recheck_source_file(file), Err(expected));
+        assert_eq!(nullish_state(&context, &parsed, file), before);
+    }
+}
+
+#[test]
+fn nullish_statement_assignment_narrows_the_following_read() {
+    let source = concat!(
+        "let value: string | undefined;\n",
+        "value ??= 'fallback';\n",
+        "const good: string = value;\n",
+    );
+    let parsed = parse_source_file(source);
+    let file = FileId::new(202_935);
+    let assignment = expression_by_text(source, &parsed, file, "value ??= 'fallback'");
+    let read = variable_initializer(&parsed, file, "good");
+    let NodeData::BinaryExpression(binary) = &parsed.arena.get(assignment.node).unwrap().data
+    else {
+        panic!("expected the actual nullish assignment");
+    };
+    let left = NodeRef::new(parsed.arena.id(), file, binary.left);
+
+    for first in [None, Some(assignment), Some(read)] {
+        let mut context = nullish_context(&parsed, file, first);
+        assert!(context.diagnostics().is_empty());
+        for node in [assignment, read] {
+            let type_ = context.get_type_at_location(node).unwrap();
+            assert_eq!(context.type_to_string(type_).unwrap(), "string");
+        }
+        let owner = context.get_symbol_at_location(left).unwrap().unwrap();
+        assert_eq!(context.get_symbol_at_location(read), Ok(Some(owner)));
+        let write_type = context.get_type_at_location(left).unwrap();
+        assert_eq!(
+            context.type_to_string(write_type).unwrap(),
+            "string | undefined",
+        );
+        assert_nullish_replay(&mut context, &parsed, file, &[assignment, left, read]);
+    }
+}
+
+#[test]
+fn nullish_assignments_check_rhs_types_even_when_the_left_is_not_nullish() {
+    let source = concat!(
+        "let value: string | undefined;\n",
+        "value ??= 1;\n",
+        "let present: string = 'ready';\n",
+        "present ??= 2;\n",
+    );
+    let parsed = parse_source_file(source);
+    let file = FileId::new(202_936);
+    let nullable = expression_by_text(source, &parsed, file, "value ??= 1");
+    let present = expression_by_text(source, &parsed, file, "present ??= 2");
+
+    for first in [None, Some(nullable), Some(present)] {
+        let mut context = nullish_context(&parsed, file, first);
+        assert_nullish_diagnostics(
+            &context,
+            source,
+            &parsed,
+            &[
+                (2322, "value", &["number", "string"]),
+                (2322, "present", &["number", "string"]),
+            ],
+        );
+        let type_ = context.get_type_at_location(present).unwrap();
+        assert_eq!(context.type_to_string(type_).unwrap(), "string");
+        assert_nullish_replay(&mut context, &parsed, file, &[nullable, present]);
+    }
+}
+
+#[test]
+fn nullish_member_assignments_publish_results_and_native_assignment_errors() {
+    let source = concat!(
+        "const cache: { [key: string]: number | undefined } = {};\n",
+        "const good: number = (cache['x'] ??= 1);\n",
+        "const bad: string = (cache['y'] ??= 2);\n",
+        "const object: { value: number | undefined } = { value: undefined };\n",
+        "const property: number = (object.value ??= 3);\n",
+        "function cached(cache: { [key: string]: number | undefined }): number {\n",
+        "  return cache['z'] ??= 4;\n",
+        "}\n",
+    );
+    let parsed = parse_source_file(source);
+    let file = FileId::new(202_937);
+    let good = expression_by_text(source, &parsed, file, "cache['x'] ??= 1");
+    let bad = expression_by_text(source, &parsed, file, "cache['y'] ??= 2");
+    let property = expression_by_text(source, &parsed, file, "object.value ??= 3");
+    let returned = expression_by_text(source, &parsed, file, "cache['z'] ??= 4");
+
+    for first in [None, Some(good), Some(bad), Some(returned)] {
+        let mut context = nullish_context(&parsed, file, first);
+        assert_nullish_diagnostics(
+            &context,
+            source,
+            &parsed,
+            &[(2322, "bad", &["number", "string"])],
+        );
+        for node in [good, bad, property, returned] {
+            let type_ = context.get_type_at_location(node).unwrap();
+            assert_eq!(context.type_to_string(type_).unwrap(), "number");
+        }
+        assert_nullish_replay(
+            &mut context,
+            &parsed,
+            file,
+            &[good, bad, property, returned],
+        );
+    }
+}
+
+#[test]
+fn nullish_assignments_preserve_readonly_property_and_index_errors() {
+    let source = concat!(
+        "const frozen: { readonly value: number | undefined } = { value: undefined };\n",
+        "frozen.value ??= 1;\n",
+        "const cache: { readonly [key: string]: number | undefined } = {};\n",
+        "cache['x'] ??= 1;\n",
+    );
+    let parsed = parse_source_file(source);
+    let file = FileId::new(202_938);
+    let property = expression_by_text(source, &parsed, file, "frozen.value ??= 1");
+    let index = expression_by_text(source, &parsed, file, "cache['x'] ??= 1");
+
+    for first in [None, Some(property), Some(index)] {
+        let mut context = nullish_context(&parsed, file, first);
+        assert_nullish_diagnostics(
+            &context,
+            source,
+            &parsed,
+            &[
+                (2540, "value", &["value"]),
+                (
+                    2542,
+                    "cache['x']",
+                    &["{ readonly [key: string]: number | undefined; }"],
+                ),
+            ],
+        );
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let error = bootstrap.error_type;
+        let number = bootstrap.number_type;
+        assert_eq!(context.get_type_at_location(property), Ok(error));
+        assert_eq!(context.get_type_at_location(index), Ok(number));
+        assert_nullish_replay(&mut context, &parsed, file, &[property, index]);
+    }
+}
+
+#[test]
+fn nullish_computed_targets_keep_one_call_diagnostic_and_real_signatures() {
+    let source = concat!(
+        "function receiver(): { [key: string]: number | undefined } { return {}; }\n",
+        "function index(value: number): string { return 'x'; }\n",
+        "const result: number = (receiver()[index('bad')] ??= 1);\n",
+    );
+    let parsed = parse_source_file(source);
+    let file = FileId::new(202_940);
+    let assignment = expression_by_text(source, &parsed, file, "receiver()[index('bad')] ??= 1");
+    let receiver = expression_by_text(source, &parsed, file, "receiver()");
+    let index = expression_by_text(source, &parsed, file, "index('bad')");
+
+    for first in [None, Some(assignment), Some(index)] {
+        let mut context = nullish_context(&parsed, file, first);
+        assert_nullish_diagnostics(
+            &context,
+            source,
+            &parsed,
+            &[(2345, "'bad'", &["string", "number"])],
+        );
+        let type_ = context.get_type_at_location(assignment).unwrap();
+        assert_eq!(context.type_to_string(type_).unwrap(), "number");
+        for (call, expected_name) in [(receiver, "receiver"), (index, "index")] {
+            let signature = context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let declaration = context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .declaration()
+                .unwrap();
+            let NodeData::FunctionDeclaration(function) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("expected the called function's declaration");
+            };
+            let NodeData::Identifier(name) =
+                &parsed.arena.get(function.name.unwrap()).unwrap().data
+            else {
+                panic!("expected the declared function name");
+            };
+            assert_eq!(name.text, expected_name);
+        }
+        assert_nullish_replay(&mut context, &parsed, file, &[assignment, receiver, index]);
+    }
+}
+
+#[test]
+fn nested_nullish_assignments_keep_rhs_writes_conditional() {
+    let source = concat!(
+        "function conditional(value: number | undefined, side: number | undefined): void {\n",
+        "  value ??= (side ??= 1);\n",
+        "  const good: number = value;\n",
+        "  const stillOptional: number | undefined = side;\n",
+        "  const bad: number = side;\n",
+        "}\n",
+    );
+    let parsed = parse_source_file(source);
+    let file = FileId::new(202_939);
+    let outer = expression_by_text(source, &parsed, file, "value ??= (side ??= 1)");
+    let inner = expression_by_text(source, &parsed, file, "side ??= 1");
+    let good = variable_initializer(&parsed, file, "good");
+    let optional = variable_initializer(&parsed, file, "stillOptional");
+    let bad = variable_initializer(&parsed, file, "bad");
+
+    for first in [None, Some(inner), Some(bad)] {
+        let mut context = nullish_context(&parsed, file, first);
+        assert_nullish_diagnostics(
+            &context,
+            source,
+            &parsed,
+            &[(2322, "bad", &["number | undefined", "number"])],
+        );
+        for (node, expected) in [
+            (outer, "number"),
+            (inner, "number"),
+            (good, "number"),
+            (optional, "number | undefined"),
+            (bad, "number | undefined"),
+        ] {
+            let type_ = context.get_type_at_location(node).unwrap();
+            assert_eq!(context.type_to_string(type_).unwrap(), expected);
+        }
+
+        let graph = context.file(file).unwrap().1.flow_graph();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+        let NodeData::BinaryExpression(outer_binary) = &parsed.arena.get(outer.node).unwrap().data
+        else {
+            panic!("expected the outer nullish assignment");
+        };
+        let NodeData::BinaryExpression(inner_binary) = &parsed.arena.get(inner.node).unwrap().data
+        else {
+            panic!("expected the inner nullish assignment");
+        };
+        let outer_left = NodeRef::new(parsed.arena.id(), file, outer_binary.left);
+        let inner_left = NodeRef::new(parsed.arena.id(), file, inner_binary.left);
+        let inner_entry = graph
+            .nodes()
+            .get(graph.flow_at(inner_left).unwrap())
+            .unwrap();
+        assert!(inner_entry.flags.contains(FlowFlags::FALSE_CONDITION));
+        assert_eq!(inner_entry.payload, Some(FlowNodePayload::Ast(outer_left)));
+        for expression in [outer, inner] {
+            let NodeData::BinaryExpression(binary) =
+                &parsed.arena.get(expression.node).unwrap().data
+            else {
+                panic!("expected the actual nullish assignment");
+            };
+            let left = NodeRef::new(parsed.arena.id(), file, binary.left);
+            let writes = graph
+                .nodes()
+                .iter()
+                .filter(|flow| {
+                    flow.flags.contains(FlowFlags::ASSIGNMENT)
+                        && flow.payload == Some(FlowNodePayload::Ast(left))
+                })
+                .count();
+            assert_eq!(writes, 1, "one bound write for each assignment target");
+            assert!(graph.nodes().iter().any(|flow| {
+                flow.flags.contains(FlowFlags::TRUE_CONDITION)
+                    && flow.payload == Some(FlowNodePayload::Ast(left))
+            }));
+            assert!(graph.nodes().iter().any(|flow| {
+                flow.flags.contains(FlowFlags::FALSE_CONDITION)
+                    && flow.payload == Some(FlowNodePayload::Ast(left))
+            }));
+        }
+        assert_nullish_replay(
+            &mut context,
+            &parsed,
+            file,
+            &[outer, inner, good, optional, bad],
+        );
+    }
 }
 
 #[test]

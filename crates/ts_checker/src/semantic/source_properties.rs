@@ -2810,6 +2810,155 @@ pub(super) fn check_direct_source_property_with_source(
     .map(|(checked, _)| checked)
 }
 
+/// Checks a read/write property target without publishing an ordinary read first.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_nullish_property_assignment_target(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<(CheckedSourceProperty, TypeId), SourcePropertyQueryError> {
+    if plan.optional
+        || plan.class_access.is_some()
+        || !matches!(plan.privacy, SourcePropertyPrivacy::Identifier)
+        || store.type_payload(receiver_type).is_some_and(|record| {
+            record.flags().intersects(TypeFlags::UNION)
+                || record.object_flags().intersects(ObjectFlags::CLASS)
+                || record
+                    .symbol()
+                    .and_then(|owner| store.symbol(owner))
+                    .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
+        })
+    {
+        return Err(unsupported_access(plan.node).into());
+    }
+    if store
+        .type_payload(receiver_type)
+        .is_some_and(|record| record.flags().intersects(TypeFlags::ANY))
+    {
+        let checked = check_direct_source_property_with_source(
+            store,
+            host,
+            global_types,
+            options,
+            plan,
+            receiver_type,
+            session,
+            diagnostics,
+        )?;
+        let type_ = checked.type_;
+        return Ok((checked, type_));
+    }
+    let property = super::object_members::resolve_object_property_by_key_with_source(
+        store,
+        host,
+        global_types,
+        options,
+        receiver_type,
+        EscapedNameRef::source(&plan.name),
+        session,
+        diagnostics,
+    )
+    .map_err(SourcePropertyQueryError::Source)?;
+    let Some(property) = property else {
+        let checked = check_direct_source_property_with_source(
+            store,
+            host,
+            global_types,
+            options,
+            plan,
+            receiver_type,
+            session,
+            diagnostics,
+        )?;
+        let type_ = checked.type_;
+        return Ok((checked, type_));
+    };
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    let error = bootstrap.error_type;
+    let undefined = bootstrap.undefined_type;
+    let optional = property.optional
+        && bootstrap.options.strict_null_checks
+        && !bootstrap.options.exact_optional_property_types;
+    let accessor_flags = store
+        .symbol(property.symbol)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?
+        .flags();
+    if property.readonly
+        || accessor_flags.contains(SymbolFlags::ENUM_MEMBER)
+        || accessor_flags.contains(SymbolFlags::GET_ACCESSOR)
+            && !accessor_flags.contains(SymbolFlags::SET_ACCESSOR)
+    {
+        publish_property_links(store, plan.node, Some(property.symbol), error)?;
+        super::source::merge_retry_diagnostic(
+            diagnostics,
+            CanonicalCheckerDiagnostic {
+                node: Some(plan.name_node),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2540).ok_or(SourcePropertyError::MissingDiagnostic(2540))?,
+                    [plan.name.clone()],
+                ),
+                related_information: Vec::new(),
+            },
+        );
+        return Ok((
+            CheckedSourceProperty {
+                type_: error,
+                diagnostics: Vec::new(),
+            },
+            error,
+        ));
+    }
+    if accessor_flags.intersects(SymbolFlags::GET_ACCESSOR | SymbolFlags::SET_ACCESSOR)
+        || property.optional && options.intrinsic.exact_optional_property_types
+    {
+        return Err(unsupported_access(plan.node).into());
+    }
+    let write = store
+        .value_symbol_links(property.symbol)
+        .and_then(|links| links.write_type)
+        .unwrap_or(property.type_);
+    let read = if optional {
+        property_union_type_with_session(
+            store,
+            Some(global_types),
+            plan.node,
+            &[property.type_, undefined],
+            Some(property.symbol),
+            session,
+        )?
+    } else {
+        property.type_
+    };
+    let write = if optional {
+        property_union_type_with_session(
+            store,
+            Some(global_types),
+            plan.node,
+            &[write, undefined],
+            Some(property.symbol),
+            session,
+        )?
+    } else {
+        write
+    };
+    publish_property_links(store, plan.node, Some(property.symbol), read)?;
+    Ok((
+        CheckedSourceProperty {
+            type_: read,
+            diagnostics: Vec::new(),
+        },
+        write,
+    ))
+}
+
 /// Resolves a dotted call target without caching a provisional source read.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn source_property_type_for_effects(

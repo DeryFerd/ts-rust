@@ -9082,6 +9082,10 @@ impl SyntaxPlanner<'_> {
                     plan_source_linear_logical_statement_syntax(
                         self.arena, self.bound, statement, callable,
                     )?;
+                } else if self.node(self.reference(binary.operator_token))?.kind
+                    == SyntaxKind::QuestionQuestionEqualsToken
+                {
+                    self.validate_linear_nullish_assignment_expression(expression, callable)?;
                 } else {
                     self.validate_linear_assignment_expression(expression, callable)?;
                 }
@@ -9105,6 +9109,72 @@ impl SyntaxPlanner<'_> {
             .into());
         }
         Ok(expression)
+    }
+
+    fn validate_linear_nullish_assignment_expression(
+        &self,
+        expression: NodeRef,
+        callable: NodeRef,
+    ) -> Result<(), SourceFunctionStatementsError> {
+        let record = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &record.data else {
+            return Err(self.unsupported(
+                expression,
+                record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        };
+        let left = self.reference(binary.left);
+        let operator = self.reference(binary.operator_token);
+        let right = self.reference(binary.right);
+        for node in [left, operator, right] {
+            self.validate_parent(
+                node,
+                Some(expression.node),
+                SourceFunctionStatementsRole::BodyStatement,
+            )?;
+            self.validate_range(node, expression)?;
+            self.validate_container(node, callable)?;
+            self.validate_block_scope_container(node, callable)?;
+        }
+        self.validate_order(left, operator)?;
+        self.validate_order(operator, right)?;
+        let token = self.node(operator)?;
+        if token.kind != SyntaxKind::QuestionQuestionEqualsToken
+            || token.flags.0 != 0
+            || !matches!(token.data, NodeData::Token(_))
+        {
+            return Err(self.unsupported(
+                operator,
+                token.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+        let target = self.node(left)?;
+        let supported = match &target.data {
+            NodeData::Identifier(identifier) => {
+                target.kind == SyntaxKind::Identifier
+                    && !identifier.text.is_empty()
+                    && identifier.flow_node.is_none()
+            }
+            NodeData::PropertyAccessExpression(property) => {
+                target.kind == SyntaxKind::PropertyAccessExpression
+                    && property.question_dot_token.is_none()
+            }
+            NodeData::ElementAccessExpression(element) => {
+                target.kind == SyntaxKind::ElementAccessExpression
+                    && element.question_dot_token.is_none()
+            }
+            _ => false,
+        };
+        if target.flags.0 != 0 || !supported {
+            return Err(self.unsupported(
+                left,
+                target.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+        Ok(())
     }
 
     fn validate_linear_assignment_expression(
