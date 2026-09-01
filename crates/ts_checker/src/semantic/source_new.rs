@@ -53,13 +53,14 @@ use super::{
     declared::{execute_type_parameter, preflight_class_or_interface_reference},
     functions::plan_function_type,
     generic_calls::{
-        GenericCallVectorError, GenericCallVectorRequest,
-        demand_generic_call_vector_return_with_session, materialize_generic_call_vector_source,
-        preflight_generic_class_constructor_signature,
+        GenericCallVectorError, GenericCallVectorRequest, GenericConstructorContextMethod,
+        PreparedGenericConstructorContext, demand_generic_call_vector_return_with_session,
+        materialize_generic_call_vector_source, preflight_generic_class_constructor_signature,
     },
     generic_method_calls::{
         GenericMethodCallError, GenericMethodCallResolution, GenericMethodCallSelection,
-        resolve_generic_class_constructor,
+        prepare_generic_constructor_context, resolve_generic_class_constructor,
+        resolve_generic_class_constructor_with_context,
     },
     instantiate::InstantiationSession,
     jsdoc::leading_jsdoc_comment,
@@ -919,8 +920,7 @@ fn plan_direct_default_new_with_context(
     let mut has_expression_arguments = false;
     let argument_start = match new_expression.arguments.as_ref() {
         Some(argument_nodes) => {
-            if argument_nodes.has_trailing_comma
-                || argument_nodes.range.start < record.range.start
+            if argument_nodes.range.start < record.range.start
                 || argument_nodes.range.end != record.range.end
                 || argument_nodes.range.end.get()
                     < argument_nodes.range.start.get().saturating_add(2)
@@ -6614,6 +6614,83 @@ fn check_source_generic_library_new(
     argument_types: &[TypeId],
     explicit_type_arguments: Option<&[TypeId]>,
 ) -> Result<PreparedSourceGenericNew, SourceNewError> {
+    check_source_generic_library_new_with_context(
+        store,
+        host,
+        globals,
+        options,
+        session,
+        plan,
+        argument_types,
+        explicit_type_arguments,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_source_generic_constructor_context(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    plan: &SourceDefaultNewPlan,
+    prefix: &[TypeId],
+    methods: &[GenericConstructorContextMethod],
+) -> Result<PreparedGenericConstructorContext, SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+    if !plan.is_generic_library_constructor()
+        || plan
+            .written_type_argument_nodes()
+            .is_some_and(|arguments| !arguments.is_empty())
+    {
+        return Err(unsupported(SourceNewUnsupported::Arguments(plan.node)));
+    }
+    preflight_source_generic_class_new_with_context(store, host, globals, options, plan, None)?;
+    preflight_prepared_default_new_cache_with_context(store, host, plan, Some((globals, options)))?;
+    let arguments = plan.checked_expression_arguments().ok_or_else(invalid)?;
+    if arguments.len() != prefix.len() + 1
+        || arguments
+            .iter()
+            .zip(prefix)
+            .any(|(argument, &type_)| exact_type_cache(store, argument.node) != Ok(Some(type_)))
+    {
+        return Err(invalid());
+    }
+    let candidates =
+        resolve_library_new_candidates(store, host, globals, options, plan)?.ok_or_else(invalid)?;
+    let existing_signature = exact_signature_cache(store, plan.node).map_err(|()| invalid())?;
+    prepare_generic_constructor_context(
+        store,
+        globals,
+        options.strict_function_types,
+        GenericCallVectorRequest {
+            form: super::calls::DirectCallForm::New,
+            optional_chain: false,
+            explicit_type_arguments: None,
+            has_spread_argument: false,
+            callee: candidates.value_type,
+            arguments: prefix,
+        },
+        existing_signature,
+        methods,
+        session,
+    )
+    .map_err(|error| generic_constructor_error(plan.node, error))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_source_generic_library_new_with_context(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    plan: &SourceDefaultNewPlan,
+    argument_types: &[TypeId],
+    explicit_type_arguments: Option<&[TypeId]>,
+    context: Option<&PreparedGenericConstructorContext>,
+) -> Result<PreparedSourceGenericNew, SourceNewError> {
     preflight_source_generic_class_new_with_context(store, host, globals, options, plan, None)?;
     preflight_prepared_default_new_cache_with_context(store, host, plan, Some((globals, options)))?;
     preflight_generic_new_arguments(store, plan, argument_types, explicit_type_arguments)?;
@@ -6622,7 +6699,7 @@ fn check_source_generic_library_new(
         resolve_library_new_candidates(store, host, globals, options, plan)?.ok_or_else(invalid)?;
     let existing_signature = exact_signature_cache(store, plan.node).map_err(|()| invalid())?;
     let limit_mark = session.limit_event_mark();
-    let resolution = resolve_generic_class_constructor(
+    let resolution = resolve_generic_class_constructor_with_context(
         store,
         globals,
         options.strict_function_types,
@@ -6636,6 +6713,7 @@ fn check_source_generic_library_new(
         },
         existing_signature,
         session,
+        context,
     )
     .map_err(|error| generic_constructor_error(plan.node, error))?
     .ok_or_else(|| unsupported(SourceNewUnsupported::Arguments(plan.node)))?;
@@ -6868,8 +6946,7 @@ fn resolve_library_new_candidates(
         || !bound.contains(plan.constructor)
         || !bound.contains(plan.node)
         || new_expression.arguments.as_ref().is_some_and(|arguments| {
-            arguments.has_trailing_comma
-                || record.range.end > arguments.range.start
+            record.range.end > arguments.range.start
                 || arguments.range.end != expression.range.end
                 || arguments.range.end.get() < arguments.range.start.get().saturating_add(2)
                 || arena.source_text().is_some_and(|source| {

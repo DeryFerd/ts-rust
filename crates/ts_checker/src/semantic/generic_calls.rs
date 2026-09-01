@@ -24,7 +24,7 @@
 use std::cell::RefCell;
 
 use ts_ast::{NodeRef, SyntaxKind};
-use ts_binder::{CheckFlags, SymbolData, SymbolFlags};
+use ts_binder::{CheckFlags, EscapedName, SymbolData, SymbolFlags};
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, MinArgumentCountFlags,
@@ -453,6 +453,37 @@ impl GenericCallVectorCandidate {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct GenericConstructorContextMethod {
+    pub(super) name: EscapedName,
+    pub(super) parameter_count: usize,
+}
+
+/// A single named constructor retains its prefix inference across source checking.
+#[derive(Clone, Debug)]
+pub(super) struct PreparedGenericConstructorContext {
+    callee: TypeId,
+    signature: SignatureId,
+    prefix: Vec<TypeId>,
+    parameter_templates: Vec<TypeId>,
+    inference: GenericCallInferenceState,
+    contextual_type: TypeId,
+}
+
+impl PreparedGenericConstructorContext {
+    pub(super) const fn callee(&self) -> TypeId {
+        self.callee
+    }
+
+    pub(super) const fn signature(&self) -> SignatureId {
+        self.signature
+    }
+
+    pub(super) const fn contextual_type(&self) -> TypeId {
+        self.contextual_type
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum GenericCallArgumentRelation {
     Assignable,
@@ -579,6 +610,29 @@ pub(super) fn check_generic_call_candidate_with_session(
     relation: GenericCallArgumentRelation,
     session: &mut InstantiationSession,
 ) -> Result<GenericCallVectorCandidate, GenericCallVectorError> {
+    check_generic_call_candidate_with_context(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        callable,
+        relation,
+        None,
+        session,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_generic_call_candidate_with_context(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: GenericCallVectorRequest<'_>,
+    callable: &ValidatedSingleCallable,
+    relation: GenericCallArgumentRelation,
+    context: Option<&PreparedGenericConstructorContext>,
+    session: &mut InstantiationSession,
+) -> Result<GenericCallVectorCandidate, GenericCallVectorError> {
     let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
     if generic_call_signature_candidate(store, request.callee, callable.signature, array_targets)?
         != *callable
@@ -594,6 +648,7 @@ pub(super) fn check_generic_call_candidate_with_session(
         array_targets,
         Some(global_types),
         relation,
+        context,
         session,
         |store, session, source, target| {
             store.is_type_assignable_to_with_session(
@@ -675,6 +730,371 @@ pub(super) fn finish_generic_call_candidate_with_session(
             )
         },
     )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) fn prepare_generic_constructor_context_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: GenericCallVectorRequest<'_>,
+    callable: &ValidatedSingleCallable,
+    methods: &[GenericConstructorContextMethod],
+    session: &mut InstantiationSession,
+) -> Result<PreparedGenericConstructorContext, GenericCallVectorError> {
+    let unsupported = || GenericCallVectorUnsupported::NonNakedParameter {
+        signature: callable.signature,
+        index: request.arguments.len(),
+        type_: request.callee,
+    };
+    let array_targets = Some(CanonicalArrayTargets::from_global_types(globals));
+    validate_generic_class_constructor_request(store, request, array_targets)?;
+    if request.form != DirectCallForm::New
+        || request.explicit_type_arguments.is_some()
+        || request.arguments.is_empty()
+        || methods.is_empty()
+        || generic_call_signature_candidate(
+            store,
+            request.callee,
+            callable.signature,
+            array_targets,
+        )? != *callable
+    {
+        return Err(unsupported().into());
+    }
+    let shape =
+        validate_generic_call_signature_shape(store, request.callee, callable, array_targets)?;
+    let argument_count = request
+        .arguments
+        .len()
+        .checked_add(1)
+        .ok_or_else(unsupported)?;
+    if !shape.named_constructor
+        || shape.class_constructor.is_some()
+        || shape.rest_element_template.is_some()
+        || argument_count < shape.minimum_argument_count
+        || argument_count > shape.parameter_templates.len()
+    {
+        return Err(unsupported().into());
+    }
+    let limit_mark = session.limit_event_mark();
+    let mut inference = collect_generic_call_argument_inferences(
+        store,
+        &shape,
+        request.arguments,
+        Some(globals),
+        session,
+    )?;
+    solve_generic_call_argument_inferences(
+        store,
+        &shape,
+        &mut inference,
+        Some(globals),
+        &mut |store, session, source, target| {
+            store.is_type_assignable_to_with_session(
+                source,
+                target,
+                Some(globals),
+                Some(strict_function_types),
+                session,
+            )
+        },
+        &mut |store, session, source, target| {
+            store.is_type_related_to_with_session(
+                source,
+                target,
+                RelationKind::StrictSubtype,
+                Some(globals),
+                None,
+                session,
+            )
+        },
+        &mut |store, session, source, target| {
+            store.is_type_related_to_with_session(
+                source,
+                target,
+                RelationKind::Subtype,
+                Some(globals),
+                None,
+                session,
+            )
+        },
+        session,
+    )?;
+    let template = shape.parameter_templates[request.arguments.len()];
+    for (index, parameter) in inference.type_parameters.iter().copied().enumerate() {
+        if generic_constructor_type_contains_parameter(
+            store,
+            template,
+            &[parameter],
+            array_targets,
+            shape.signature,
+            &mut Vec::new(),
+        )? && (!inference.from_candidates[index] || inference.constraint_recovered[index])
+        {
+            return Err(unsupported().into());
+        }
+    }
+    let (shell, _) = get_or_create_checked_generic_call_vector_shell(
+        store,
+        &shape,
+        &inference.type_parameters,
+        &inference.arguments,
+    )?;
+    let checked = GenericCallVectorInstantiation {
+        type_arguments: inference.arguments.clone(),
+        signature: shell.signature,
+        mapper: shell.mapper,
+    };
+    if check_generic_call_arguments(
+        store,
+        request.arguments,
+        &shape,
+        &inference.type_parameters,
+        &checked,
+        session,
+        &mut |store, session, source, target| {
+            store.is_type_assignable_to_with_session(
+                source,
+                target,
+                Some(globals),
+                Some(strict_function_types),
+                session,
+            )
+        },
+    )?
+    .is_some()
+    {
+        return Err(unsupported().into());
+    }
+    let contextual_type = demand_generic_call_vector_parameter(
+        store,
+        &shape,
+        &inference.type_parameters,
+        &inference.arguments,
+        shell.signature,
+        request.arguments.len(),
+        session,
+    )?;
+    validate_deferred_constructor_methods(
+        store,
+        globals,
+        &shape,
+        template,
+        contextual_type,
+        methods,
+        &mut inference,
+        session,
+    )?;
+    reject_constructor_limit_recovery(&shape, session, limit_mark)?;
+    Ok(PreparedGenericConstructorContext {
+        callee: request.callee,
+        signature: shape.signature,
+        prefix: request.arguments.to_vec(),
+        parameter_templates: shape.parameter_templates,
+        inference,
+        contextual_type,
+    })
+}
+
+fn deferred_constructor_method_callable(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    signature: SignatureId,
+) -> Result<ValidatedSingleCallable, GenericCallVectorError> {
+    let unsupported = || GenericCallVectorUnsupported::NonNakedParameter {
+        signature,
+        index: 0,
+        type_,
+    };
+    let callable_type =
+        match generic_constructor_union_members(store, type_, array_targets, signature)? {
+            None => type_,
+            Some(types) => {
+                let undefined = store
+                    .intrinsic_bootstrap()
+                    .ok_or(GenericCallVectorInvariant::MissingBootstrap)?
+                    .undefined_type;
+                if types.len() != 2 || !types.contains(&undefined) {
+                    return Err(unsupported().into());
+                }
+                types
+                    .into_iter()
+                    .find(|&part| part != undefined)
+                    .ok_or_else(unsupported)?
+            }
+        };
+    let callables = generic_constructor_inference_callables(store, callable_type, array_targets)?
+        .ok_or_else(unsupported)?;
+    let [callable] = callables.as_slice() else {
+        return Err(unsupported().into());
+    };
+    let record = store.signature(callable.signature).ok_or(
+        GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature),
+    )?;
+    if !record.type_parameters().is_empty()
+        || record.this_parameter().is_some()
+        || record.resolved_type_predicate().is_some()
+        || callable.rest_parameter.is_some()
+        || callable.min_argument_count != callable.parameters.len()
+        || callable.return_type.is_none()
+    {
+        return Err(unsupported().into());
+    }
+    Ok(callable.clone())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn validate_deferred_constructor_methods(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    shape: &GenericCallSignatureShape,
+    template: TypeId,
+    contextual_type: TypeId,
+    methods: &[GenericConstructorContextMethod],
+    inference: &mut GenericCallInferenceState,
+    session: &mut InstantiationSession,
+) -> Result<(), GenericCallVectorError> {
+    let unsupported = || GenericCallVectorUnsupported::NonNakedParameter {
+        signature: shape.signature,
+        index: 0,
+        type_: template,
+    };
+    let mut member_symbols = Vec::with_capacity(2);
+    for receiver in [template, contextual_type] {
+        let members = super::instantiated_members::resolve_members_with_array_targets_and_session(
+            store,
+            receiver,
+            shape.array_targets,
+            session,
+        )
+        .map_err(|error| generic_constructor_member_error(error, receiver))?;
+        if members.reference() != receiver {
+            return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
+        }
+        let structured = store
+            .type_payload(receiver)
+            .and_then(|record| record.data().structured())
+            .ok_or_else(unsupported)?;
+        if structured.call_signature_count != 0
+            || structured
+                .signatures
+                .as_ref()
+                .is_some_and(|signatures| !signatures.is_empty())
+            || structured
+                .index_infos
+                .as_ref()
+                .is_some_and(|indexes| !indexes.is_empty())
+        {
+            return Err(unsupported().into());
+        }
+        let names = members
+            .properties()
+            .iter()
+            .copied()
+            .map(|symbol| {
+                let record = store
+                    .symbol(symbol)
+                    .ok_or(RelationUnavailable::Symbol(symbol))?;
+                Ok((
+                    record.name().to_owned(),
+                    symbol,
+                    record.flags().contains(SymbolFlags::OPTIONAL),
+                ))
+            })
+            .collect::<Result<Vec<_>, RelationUnavailable>>()?;
+        if names.iter().any(|(name, _, optional)| {
+            !optional && !methods.iter().any(|method| method.name == *name)
+        }) || methods.iter().enumerate().any(|(index, method)| {
+            method.parameter_count == 0
+                || methods[..index]
+                    .iter()
+                    .any(|previous| previous.name == method.name)
+                || names
+                    .iter()
+                    .filter(|(name, _, _)| *name == method.name)
+                    .count()
+                    != 1
+        }) {
+            return Err(unsupported().into());
+        }
+        member_symbols.push(names);
+    }
+    for method in methods {
+        let mut callables = Vec::with_capacity(2);
+        for (receiver, symbols) in [template, contextual_type].into_iter().zip(&member_symbols) {
+            let property = super::object_members::resolve_object_property_by_key(
+                store,
+                Some(globals),
+                receiver,
+                method.name.as_ref(),
+                session,
+            )?
+            .ok_or_else(unsupported)?;
+            if !symbols
+                .iter()
+                .any(|(name, symbol, _)| *name == method.name && *symbol == property.symbol)
+            {
+                return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
+            }
+            callables.push(deferred_constructor_method_callable(
+                store,
+                property.type_,
+                shape.array_targets,
+                shape.signature,
+            )?);
+        }
+        let original = &callables[0];
+        let contextual = &callables[1];
+        if method.parameter_count > original.parameters.len()
+            || original.parameters.len() != contextual.parameters.len()
+        {
+            return Err(unsupported().into());
+        }
+        for parameter in &original.parameters[..method.parameter_count] {
+            for (index, formal) in inference.type_parameters.iter().copied().enumerate() {
+                if generic_constructor_type_contains_parameter(
+                    store,
+                    *parameter,
+                    &[formal],
+                    shape.array_targets,
+                    shape.signature,
+                    &mut Vec::new(),
+                )? {
+                    if !inference.from_candidates[index] || inference.constraint_recovered[index] {
+                        return Err(unsupported().into());
+                    }
+                    inference.fixed[index] = true;
+                }
+            }
+        }
+        let unfixed = inference
+            .type_parameters
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, parameter)| (!inference.fixed[index]).then_some(parameter))
+            .collect::<Vec<_>>();
+        for type_ in original
+            .parameters
+            .iter()
+            .copied()
+            .chain(original.return_type)
+        {
+            if generic_constructor_type_contains_parameter(
+                store,
+                type_,
+                &unfixed,
+                shape.array_targets,
+                shape.signature,
+                &mut Vec::new(),
+            )? {
+                return Err(unsupported().into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn declared_method_signature_callee(
@@ -1821,6 +2241,7 @@ fn project_validated_generic_call_vector_with_session(
         array_targets,
         global_types,
         GenericCallArgumentRelation::Assignable,
+        None,
         session,
         &mut is_assignable,
         &mut is_strict_subtype,
@@ -1847,6 +2268,7 @@ fn check_validated_generic_call_candidate(
     array_targets: Option<CanonicalArrayTargets>,
     global_types: Option<&CanonicalGlobalTypes>,
     relation: GenericCallArgumentRelation,
+    context: Option<&PreparedGenericConstructorContext>,
     session: &mut InstantiationSession,
     mut is_assignable: impl FnMut(
         &mut CanonicalTypeMapperStore,
@@ -1926,18 +2348,43 @@ fn check_validated_generic_call_candidate(
         });
     }
 
-    let selected_type_arguments = match request.explicit_type_arguments {
-        Some(explicit) => explicit_checked_type_arguments(store, &shape, explicit, session)?,
-        None => infer_generic_call_type_arguments(
-            store,
-            &shape,
-            request.arguments,
-            global_types,
-            &mut is_assignable,
-            &mut is_strict_subtype,
-            &mut is_subtype,
-            session,
-        )?,
+    let selected_type_arguments = if let Some(context) = context {
+        if !shape.named_constructor
+            || shape.class_constructor.is_some()
+            || request.explicit_type_arguments.is_some()
+            || context.callee != request.callee
+            || context.signature != shape.signature
+            || context.parameter_templates != shape.parameter_templates
+            || request.arguments.len() != context.prefix.len() + 1
+            || request.arguments.get(..context.prefix.len()) != Some(context.prefix.as_slice())
+            || context.inference.type_parameters
+                != shape
+                    .type_parameters
+                    .iter()
+                    .map(|parameter| parameter.type_)
+                    .collect::<Vec<_>>()
+            || context.inference.arguments.len() != shape.type_parameters.len()
+        {
+            return Err(
+                GenericCallVectorInvariant::CallableSignatureMismatch(shape.signature).into(),
+            );
+        }
+        // The deferred method headers prove that this argument adds no candidates.
+        context.inference.arguments.clone()
+    } else {
+        match request.explicit_type_arguments {
+            Some(explicit) => explicit_checked_type_arguments(store, &shape, explicit, session)?,
+            None => infer_generic_call_type_arguments(
+                store,
+                &shape,
+                request.arguments,
+                global_types,
+                &mut is_assignable,
+                &mut is_strict_subtype,
+                &mut is_subtype,
+                session,
+            )?,
+        }
     };
     reject_constructor_limit_recovery(&shape, session, limit_mark)?;
 
@@ -1977,6 +2424,22 @@ fn check_validated_generic_call_candidate(
         signature: checked_shell.signature,
         mapper: checked_shell.mapper,
     };
+    if let Some(context) = context {
+        let parameter = demand_generic_call_vector_parameter(
+            store,
+            &shape,
+            &sources,
+            &checked.type_arguments,
+            checked.signature,
+            context.prefix.len(),
+            session,
+        )?;
+        if parameter != context.contextual_type {
+            return Err(
+                GenericCallVectorInvariant::InvalidCheckedInstantiation(shape.signature).into(),
+            );
+        }
+    }
     let applicability = match relation {
         GenericCallArgumentRelation::Assignable => check_generic_call_arguments(
             store,
@@ -4177,6 +4640,40 @@ fn infer_generic_call_type_arguments(
     ) -> Result<bool, RelationUnavailable>,
     session: &mut InstantiationSession,
 ) -> Result<Vec<TypeId>, GenericCallVectorError> {
+    let mut inference =
+        collect_generic_call_argument_inferences(store, shape, arguments, global_types, session)?;
+    solve_generic_call_argument_inferences(
+        store,
+        shape,
+        &mut inference,
+        global_types,
+        is_assignable,
+        is_strict_subtype,
+        is_subtype,
+        session,
+    )?;
+    Ok(inference.arguments)
+}
+
+/// Keeps the real prefix candidates until a deferred argument has been checked.
+#[derive(Clone, Debug)]
+struct GenericCallInferenceState {
+    type_parameters: Vec<TypeId>,
+    buckets: Vec<Vec<TypeId>>,
+    contravariant_buckets: Vec<Vec<TypeId>>,
+    arguments: Vec<TypeId>,
+    from_candidates: Vec<bool>,
+    constraint_recovered: Vec<bool>,
+    fixed: Vec<bool>,
+}
+
+fn collect_generic_call_argument_inferences(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    arguments: &[TypeId],
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+) -> Result<GenericCallInferenceState, GenericCallVectorError> {
     let type_parameters = shape
         .type_parameters
         .iter()
@@ -4227,6 +4724,48 @@ fn infer_generic_call_type_arguments(
             session,
         )?;
     }
+
+    let count = type_parameters.len();
+    Ok(GenericCallInferenceState {
+        type_parameters,
+        buckets,
+        contravariant_buckets,
+        arguments: Vec::new(),
+        from_candidates: vec![false; count],
+        constraint_recovered: vec![false; count],
+        fixed: vec![false; count],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_generic_call_argument_inferences(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    inference: &mut GenericCallInferenceState,
+    global_types: Option<&CanonicalGlobalTypes>,
+    is_assignable: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_strict_subtype: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_subtype: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    session: &mut InstantiationSession,
+) -> Result<(), GenericCallVectorError> {
+    let type_parameters = &inference.type_parameters;
+    let buckets = &inference.buckets;
+    let contravariant_buckets = &inference.contravariant_buckets;
 
     let unknown = store
         .intrinsic_bootstrap()
@@ -4364,6 +4903,7 @@ fn infer_generic_call_type_arguments(
                 )?
             }
         };
+        inference.from_candidates[index] = candidate.is_some();
         let mut argument = match candidate {
             Some(candidate) => candidate,
             None => parameter
@@ -4388,7 +4928,7 @@ fn infer_generic_call_type_arguments(
                                     constrained_string_rest_tuple_parameter(
                                         store,
                                         template,
-                                        &type_parameters,
+                                        type_parameters,
                                     ) == Some(*constraint)
                                 })
                         })
@@ -4398,12 +4938,14 @@ fn infer_generic_call_type_arguments(
         if let Some(constraint) = instantiated_constraint
             && !is_assignable(store, session, argument, constraint)?
         {
+            inference.constraint_recovered[index] = true;
             argument = constraint;
         }
         inferred.push(argument);
         session.clear_active_mapper_caches();
     }
-    Ok(inferred)
+    inference.arguments = inferred;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

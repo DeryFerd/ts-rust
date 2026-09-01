@@ -19,11 +19,13 @@ use super::{
     generic_calls::{
         GenericCallArgumentRelation, GenericCallVectorApplicability, GenericCallVectorCandidate,
         GenericCallVectorError, GenericCallVectorRequest, GenericCallVectorResolution,
-        check_generic_call_candidate_with_session, finish_generic_call_candidate_with_session,
-        generic_class_constructor_candidates, generic_class_constructor_type_argument_bounds,
-        generic_named_constructor_candidates,
-        generic_method_signature_callee, generic_method_type_argument_bounds,
-        preflight_generic_class_constructor_signature, validate_generic_call_vector_request,
+        GenericConstructorContextMethod, PreparedGenericConstructorContext,
+        check_generic_call_candidate_with_context, check_generic_call_candidate_with_session,
+        finish_generic_call_candidate_with_session, generic_class_constructor_candidates,
+        generic_class_constructor_type_argument_bounds, generic_method_signature_callee,
+        generic_method_type_argument_bounds, generic_named_constructor_candidates,
+        preflight_generic_class_constructor_signature,
+        prepare_generic_constructor_context_with_session, validate_generic_call_vector_request,
         validate_generic_class_constructor_request,
     },
     instantiate::InstantiationSession,
@@ -298,6 +300,42 @@ fn finish_candidate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn check_candidate_with_context(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: GenericCallVectorRequest<'_>,
+    callable: &ValidatedSingleCallable,
+    relation: GenericCallArgumentRelation,
+    session: &mut InstantiationSession,
+    context: Option<&PreparedGenericConstructorContext>,
+) -> Result<CheckedMethodCandidate, GenericMethodCallError> {
+    match context {
+        None => check_candidate(
+            store,
+            globals,
+            strict_function_types,
+            request,
+            callable,
+            relation,
+            session,
+        ),
+        Some(context) => check_generic_call_candidate_with_context(
+            store,
+            globals,
+            strict_function_types,
+            request,
+            callable,
+            relation,
+            Some(context),
+            session,
+        )
+        .map(CheckedMethodCandidate::Generic)
+        .map_err(Into::into),
+    }
+}
+
 fn fixed_selection(
     callee: TypeId,
     signature: SignatureId,
@@ -418,6 +456,27 @@ pub(super) fn resolve_generic_class_constructor(
     existing_new_signature: Option<SignatureId>,
     session: &mut InstantiationSession,
 ) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
+    resolve_generic_class_constructor_with_context(
+        store,
+        globals,
+        strict_function_types,
+        request,
+        existing_new_signature,
+        session,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_generic_class_constructor_with_context(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: GenericCallVectorRequest<'_>,
+    existing_new_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
+    context: Option<&PreparedGenericConstructorContext>,
+) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
     if request.form != DirectCallForm::New || request.optional_chain || request.has_spread_argument
     {
         return Ok(None);
@@ -439,6 +498,15 @@ pub(super) fn resolve_generic_class_constructor(
     } else {
         return Ok(None);
     };
+    if let Some(context) = context {
+        if !matches!(family, GenericCandidateFamily::NamedConstruct)
+            || candidates.len() != 1
+            || context.callee() != request.callee
+            || context.signature() != candidates[0].signature
+        {
+            return Err(GenericMethodCallError::Invalid(request.callee));
+        }
+    }
     validate_generic_class_constructor_request(store, request, array_targets)?;
     if let Some(signature) = existing_new_signature {
         preflight_generic_class_constructor_signature(
@@ -449,7 +517,7 @@ pub(super) fn resolve_generic_class_constructor(
         )?;
     }
     let limit_mark = session.limit_event_mark();
-    let selected = resolve_generic_candidates(
+    let selected = resolve_generic_candidates_with_context(
         store,
         globals,
         strict_function_types,
@@ -458,11 +526,53 @@ pub(super) fn resolve_generic_class_constructor(
         family,
         existing_new_signature,
         session,
+        context,
     )?;
     if session.limit_event_occurred_since(limit_mark) {
         return Err(GenericMethodCallError::Unsupported(request.callee));
     }
     Ok(selected)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_generic_constructor_context(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: GenericCallVectorRequest<'_>,
+    existing_new_signature: Option<SignatureId>,
+    methods: &[GenericConstructorContextMethod],
+    session: &mut InstantiationSession,
+) -> Result<PreparedGenericConstructorContext, GenericMethodCallError> {
+    let array_targets = Some(CanonicalArrayTargets::from_global_types(globals));
+    validate_generic_class_constructor_request(store, request, array_targets)?;
+    let candidates = generic_named_constructor_candidates(store, request.callee, array_targets)?
+        .ok_or(GenericMethodCallError::Unsupported(request.callee))?;
+    if candidates.len() != 1 {
+        return Err(GenericMethodCallError::Unsupported(request.callee));
+    }
+    if let Some(signature) = existing_new_signature {
+        preflight_generic_class_constructor_signature(
+            store,
+            request.callee,
+            signature,
+            array_targets,
+        )?;
+    }
+    let ordered = reorder_direct_call_candidates(store, request.callee, &candidates)?;
+    let [callable] = ordered.as_slice() else {
+        return Err(GenericMethodCallError::Invalid(request.callee));
+    };
+    prepare_generic_constructor_context_with_session(
+        store,
+        globals,
+        strict_function_types,
+        request,
+        callable,
+        methods,
+        session,
+    )
+    .map_err(Into::into)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -475,6 +585,31 @@ fn resolve_generic_candidates(
     family: GenericCandidateFamily,
     existing_call_signature: Option<SignatureId>,
     session: &mut InstantiationSession,
+) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
+    resolve_generic_candidates_with_context(
+        store,
+        globals,
+        strict_function_types,
+        request,
+        candidates,
+        family,
+        existing_call_signature,
+        session,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn resolve_generic_candidates_with_context(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: GenericCallVectorRequest<'_>,
+    candidates: &[ValidatedSingleCallable],
+    family: GenericCandidateFamily,
+    existing_call_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
+    context: Option<&PreparedGenericConstructorContext>,
 ) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
     let array_targets = Some(CanonicalArrayTargets::from_global_types(globals));
     let ordered = reorder_direct_call_candidates(store, request.callee, candidates)?;
@@ -511,7 +646,7 @@ fn resolve_generic_candidates(
             {
                 continue;
             }
-            let candidate = check_candidate(
+            let candidate = check_candidate_with_context(
                 store,
                 globals,
                 strict_function_types,
@@ -519,6 +654,7 @@ fn resolve_generic_candidates(
                 callable,
                 relation,
                 session,
+                context,
             )?;
             if candidate.applicable() {
                 return finish_candidate(
@@ -574,7 +710,7 @@ fn resolve_generic_candidates(
             }
         }
         if eligible.is_empty() && ordered.len() == 1 {
-            check_candidate(
+            check_candidate_with_context(
                 store,
                 globals,
                 strict_function_types,
@@ -582,6 +718,7 @@ fn resolve_generic_candidates(
                 ordered[0],
                 GenericCallArgumentRelation::Assignable,
                 session,
+                context,
             )?
             .diagnostic()
         } else if eligible.is_empty() {
@@ -620,7 +757,7 @@ fn resolve_generic_candidates(
                     return Err(GenericMethodCallError::Unsupported(request.callee));
                 }
             }
-            let candidate = check_candidate(
+            let candidate = check_candidate_with_context(
                 store,
                 globals,
                 strict_function_types,
@@ -628,6 +765,7 @@ fn resolve_generic_candidates(
                 first,
                 GenericCallArgumentRelation::Assignable,
                 session,
+                context,
             )?;
             if candidate.applicable() {
                 return Err(GenericMethodCallError::Invalid(request.callee));
@@ -661,7 +799,7 @@ fn resolve_generic_candidates(
             existing_call_signature,
         )?
     } else {
-        let candidate = check_candidate(
+        let candidate = check_candidate_with_context(
             store,
             globals,
             strict_function_types,
@@ -669,6 +807,7 @@ fn resolve_generic_candidates(
             recovery,
             GenericCallArgumentRelation::Assignable,
             session,
+            context,
         )?;
         finish_candidate(
             store,

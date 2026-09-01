@@ -38010,17 +38010,153 @@ fn check_expression_type_with_capture_context(
             }
             if let Some(arguments) = construction.checked_expression_arguments() {
                 let mut argument_types = Vec::with_capacity(arguments.len());
+                let mut constructor_context = None;
                 let mut library_arguments = (construction.is_library_constructor() && !generic)
                     .then(|| Vec::with_capacity(arguments.len()));
                 for (index, argument) in arguments.iter().enumerate() {
-                    let contextual = if !generic
+                    let sensitive_method = match &argument.unparenthesized().kind {
+                        PlannedExpressionKind::Object { properties, .. } => properties.iter().any(
+                            |property| match property.eager_expression().map(|value| &value.kind) {
+                                Some(PlannedExpressionKind::Arrow(method)) => {
+                                    method.callable.family
+                                        == super::source_callables::SourceCallableFamily::ObjectLiteralMethod
+                                        && method.callable.parameters.iter().any(|parameter| {
+                                            parameter.is_implicit_any()
+                                        })
+                                }
+                                _ => false,
+                            },
+                        ),
+                        _ => false,
+                    };
+                    let contextual = if construction.is_generic_library_constructor()
+                        && sensitive_method
+                    {
+                        let unsupported = || {
+                            SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+                                construction.node(),
+                            ))
+                        };
+                        if index + 1 != arguments.len()
+                            || constructor_context.is_some()
+                            || !argument.array_spreads.is_empty()
+                            || !argument.object_spreads.is_empty()
+                            || !argument.object_computed_keys.is_empty()
+                            || argument.non_null_assertion
+                            || argument.awaited
+                            || argument.promise_call.is_some()
+                            || argument.jsdoc_type.is_some()
+                            || argument.used_before_assignment
+                            || argument.nullish_source_flow.is_some()
+                        {
+                            return Err(unsupported());
+                        }
+                        let PlannedExpressionKind::Object { plan, properties } = &argument.kind
+                        else {
+                            return Err(unsupported());
+                        };
+                        if plan.kind != super::object_members::PropertyObjectKind::ObjectLiteral
+                            || plan.node != argument.node
+                            || plan.const_context
+                            || properties.is_empty()
+                            || properties.len() != plan.properties.len()
+                            || !plan.methods.is_empty()
+                            || !plan.accessors.is_empty()
+                            || !plan.object_literal_getters.is_empty()
+                            || !plan.spreads.is_empty()
+                            || !plan.indexes.is_empty()
+                            || !plan.call_signatures.is_empty()
+                            || plan.alias_symbol.is_some()
+                            || plan.heritage.is_some()
+                        {
+                            return Err(unsupported());
+                        }
+                        let mut methods = Vec::with_capacity(properties.len());
+                        for (property, member) in plan.properties.iter().zip(properties) {
+                            let PlannedObjectMember::Eager(expression) = member else {
+                                return Err(unsupported());
+                            };
+                            let PlannedExpressionKind::Arrow(method) = &expression.kind else {
+                                return Err(unsupported());
+                            };
+                            let callable = &method.callable;
+                            if callable.family
+                                != super::source_callables::SourceCallableFamily::ObjectLiteralMethod
+                                || !expression.array_spreads.is_empty()
+                                || !expression.object_spreads.is_empty()
+                                || !expression.object_computed_keys.is_empty()
+                                || expression.non_null_assertion
+                                || expression.awaited
+                                || expression.promise_call.is_some()
+                                || expression.jsdoc_type.is_some()
+                                || expression.used_before_assignment
+                                || expression.nullish_source_flow.is_some()
+                                || callable.declaration != expression.node
+                                || !callable
+                                    .declaration
+                                    .is_for(argument.node.arena, argument.node.file)
+                                || host.node(callable.declaration).is_none_or(|node| {
+                                    node.parent != Some(argument.node.node)
+                                })
+                                || callable.owner_symbol != property.symbol
+                                || !store.source_object_literal_method_owner_is_exact(
+                                    callable.declaration,
+                                    callable.owner_symbol,
+                                )
+                                || store.symbol(callable.owner_symbol).is_none_or(|symbol| {
+                                    symbol.name() != property.name.as_ref()
+                                        || symbol.parent() != Some(plan.symbol)
+                                })
+                                || property.optional
+                                || property.readonly
+                                || callable.is_async
+                                || !callable.type_parameters.is_empty()
+                                || callable.this_parameter.is_some()
+                                || callable.type_predicate.is_some()
+                                || callable.parameters.is_empty()
+                                || !method.parameter_initializers.is_empty()
+                                || method.prototype_this.is_some()
+                                || callable.parameters.iter().any(|parameter| {
+                                    !parameter.is_implicit_any()
+                                        || parameter.explicit_type_node().is_some()
+                                        || parameter.optional
+                                        || parameter.initializer.is_some()
+                                        || parameter.rest
+                                })
+                            {
+                                return Err(unsupported());
+                            }
+                            methods.push(super::generic_calls::GenericConstructorContextMethod {
+                                name: property.name.clone(),
+                                parameter_count: callable.parameters.len(),
+                            });
+                        }
+                        let prepared =
+                            super::source_new::prepare_source_generic_constructor_context(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                session,
+                                construction,
+                                &argument_types,
+                                &methods,
+                            )
+                            .map_err(|error| {
+                                SourcePlanner::new_plan_error(construction.node(), error)
+                            })?;
+                        let contextual = prepared.contextual_type();
+                        constructor_context = Some(prepared);
+                        Some(contextual)
+                    } else if !generic
                         && matches!(
                             argument.unparenthesized().kind,
                             PlannedExpressionKind::Array(_)
                                 | PlannedExpressionKind::Object { .. }
                                 | PlannedExpressionKind::Arrow(_)
                                 | PlannedExpressionKind::Template(_)
-                        ) {
+                        )
+                    {
                         super::source_new::source_constructor_argument_contextual_type(
                             store,
                             host,
@@ -38083,17 +38219,31 @@ fn check_expression_type_with_capture_context(
                             diagnostics,
                             construction.written_type_argument_nodes(),
                         )?;
-                    let prepared = super::source_new::check_source_generic_class_new(
-                        store,
-                        host,
-                        global_types,
-                        options,
-                        session,
-                        construction,
-                        access.as_ref(),
-                        &argument_types,
-                        explicit_type_arguments.as_deref(),
-                    )
+                    let prepared = if let Some(context) = &constructor_context {
+                        super::source_new::check_source_generic_library_new_with_context(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            construction,
+                            &argument_types,
+                            explicit_type_arguments.as_deref(),
+                            Some(context),
+                        )
+                    } else {
+                        super::source_new::check_source_generic_class_new(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            construction,
+                            access.as_ref(),
+                            &argument_types,
+                            explicit_type_arguments.as_deref(),
+                        )
+                    }
                     .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
                     let mut staged = CanonicalCheckerDiagnostics::default();
                     let call_diagnostics =
