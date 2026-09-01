@@ -3136,6 +3136,17 @@ impl TypeQueryPlan {
                 }
             }
         }
+        if !intersection.deferred
+            && let Some(reduced) = store
+                .reduced_source_primitive_intersection_type(constituents, array_targets)
+                .map_err(|error| intersection_type_error(error, node))?
+        {
+            return if reduced == cached {
+                Ok(Some(reduced))
+            } else {
+                Err(invalid())
+            };
+        }
         if types.len() < 2 {
             let expected = types.first().copied().or_else(|| {
                 store
@@ -17180,6 +17191,25 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 ));
             }
         } else if !mapped_deferred && !ordinary_properties && !numeric_parameter {
+            let primitive_operands = types
+                .iter()
+                .map(|child| {
+                    self.planned_primitive_empty_intersection_operand(*child, &mut HashSet::new())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if let Some(primitive) = primitive_operands
+                .iter()
+                .flatten()
+                .copied()
+                .find(|kind| *kind != SyntaxKind::TypeLiteral)
+                && (primitive_operands.iter().any(|kind| {
+                    !matches!(kind, Some(kind) if *kind == primitive || *kind == SyntaxKind::TypeLiteral)
+                }) || !primitive_operands.contains(&Some(SyntaxKind::TypeLiteral)))
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+                ));
+            }
             if let Some(literal) = types.iter().copied().find(|constituent| {
                 matches!(
                     self.plan.literals.get(constituent),
@@ -17265,6 +17295,95 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
         }
         Ok(())
+    }
+
+    /// Primitive operands admit only empty type literals through real alias plans.
+    fn planned_primitive_empty_intersection_operand(
+        &self,
+        node: NodeRef,
+        active: &mut HashSet<NodeRef>,
+    ) -> Result<Option<SyntaxKind>, DeclaredTypeError> {
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedIntersectionConstituent(
+                node,
+            ))
+        };
+        if !active.insert(node) {
+            return Err(invalid());
+        }
+        let result = (|| {
+            let record = preflight_node(self.store, self.host, node)?;
+            match &record.data {
+                NodeData::KeywordTypeNode(_)
+                    if matches!(
+                        record.kind,
+                        SyntaxKind::StringKeyword
+                            | SyntaxKind::NumberKeyword
+                            | SyntaxKind::BigIntKeyword
+                    ) =>
+                {
+                    Ok(Some(record.kind))
+                }
+                NodeData::TypeLiteralNode(literal)
+                    if record.kind == SyntaxKind::TypeLiteral
+                        && literal.members.nodes.is_empty()
+                        && self.plan.type_literals.contains_key(&node) =>
+                {
+                    Ok(Some(SyntaxKind::TypeLiteral))
+                }
+                NodeData::ParenthesizedTypeNode(parenthesized)
+                    if record.kind == SyntaxKind::ParenthesizedType =>
+                {
+                    self.planned_primitive_empty_intersection_operand(
+                        NodeRef::new(node.arena, node.file, parenthesized.type_),
+                        active,
+                    )
+                }
+                NodeData::TypeReferenceNode(_) if record.kind == SyntaxKind::TypeReference => {
+                    let Some(reference) = self.plan.references.get(&node) else {
+                        return Ok(None);
+                    };
+                    if reference.import_alias.is_some()
+                        || reference.global_array_target.is_some()
+                        || reference.direct_generic
+                        || !reference.type_arguments.is_empty()
+                        || reference.arity != PlannedTypeReferenceArity::Valid
+                    {
+                        return Ok(None);
+                    }
+                    let Some(alias) = self.plan.aliases.get(&reference.symbol) else {
+                        return Ok(None);
+                    };
+                    if !alias.type_parameters.is_empty() {
+                        return Ok(None);
+                    }
+                    self.planned_primitive_empty_intersection_operand(alias.type_node, active)
+                }
+                NodeData::IntersectionTypeNode(_)
+                    if record.kind == SyntaxKind::IntersectionType =>
+                {
+                    let intersection = self.plan.intersections.get(&node).ok_or_else(&invalid)?;
+                    let mut primitive = None;
+                    for &child in &intersection.types {
+                        let Some(kind) =
+                            self.planned_primitive_empty_intersection_operand(child, active)?
+                        else {
+                            return Ok(None);
+                        };
+                        if kind != SyntaxKind::TypeLiteral {
+                            if primitive.is_some_and(|previous| previous != kind) {
+                                return Err(invalid());
+                            }
+                            primitive = Some(kind);
+                        }
+                    }
+                    Ok(Some(primitive.unwrap_or(SyntaxKind::TypeLiteral)))
+                }
+                _ => Ok(None),
+            }
+        })();
+        assert!(active.remove(&node));
+        result
     }
 
     fn planned_numeric_parameter_intersection(
@@ -17549,6 +17668,16 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let result = (|| {
             let record = preflight_node(self.store, self.host, node)?;
             match &record.data {
+                NodeData::KeywordTypeNode(_)
+                    if matches!(
+                        record.kind,
+                        SyntaxKind::StringKeyword
+                            | SyntaxKind::NumberKeyword
+                            | SyntaxKind::BigIntKeyword
+                    ) =>
+                {
+                    Ok(())
+                }
                 NodeData::ParenthesizedTypeNode(parenthesized)
                     if record.kind == SyntaxKind::ParenthesizedType =>
                 {
@@ -47109,7 +47238,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .map_err(|error| intersection_type_error(error, node))?
         } else {
             self.store
-                .canonical_intersection_type(&types, intersection.alias_symbol)
+                .canonical_source_intersection_type(&types, intersection.alias_symbol)
                 .map_err(|error| intersection_type_error(error, node))?
         };
         if let Some(cached) = self
@@ -115605,6 +115734,60 @@ export type Env = {
             before,
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn primitive_intersections_reject_unhandled_operands_before_semantic_writes() {
+        for source in [
+            "type Bad = string & { brand: string };",
+            "type Bad = string & number;",
+            "type Bad = boolean & {};",
+            "type Empty = {}; type Bad = number & Empty & { brand: string };",
+            "type Text = string & {}; type Bad = Text & { brand: string };",
+        ] {
+            let mut fixture = fixture(source);
+            let node = alias_parts(&fixture, "Bad").2;
+            let nodes = fixture
+                .parsed
+                .arena
+                .iter()
+                .map(|(node, _)| NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+                .collect::<Vec<_>>();
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                (
+                    store_state(store),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.intersection_types.clone(),
+                    store.intersection_keys_by_type.clone(),
+                    nodes
+                        .iter()
+                        .map(|node| {
+                            (
+                                store.type_node_links(*node).cloned(),
+                                store.symbol_node_links(*node).cloned(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let before = snapshot(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let error = query_node(&mut fixture, node, &mut diagnostics).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::UnsupportedIntersectionConstituent(_)
+                    )
+                ),
+                "{source}: {error:?}"
+            );
+            assert_eq!(snapshot(&fixture.store), before, "{source}");
+            assert_eq!(query_node(&mut fixture, node, &mut diagnostics), Err(error));
+            assert_eq!(snapshot(&fixture.store), before, "{source}");
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]

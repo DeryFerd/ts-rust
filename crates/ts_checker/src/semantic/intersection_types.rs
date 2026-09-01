@@ -137,6 +137,26 @@ impl CanonicalTypeMapperStore {
         alias_symbol: Option<SemanticSymbolId>,
         array_targets: Option<CanonicalArrayTargets>,
     ) -> Result<TypeId, IntersectionTypeError> {
+        self.canonical_intersection_type_worker(input, alias_symbol, array_targets, false)
+    }
+
+    /// Written primitive pairs keep `{}` so literal unions retain their members.
+    pub(super) fn canonical_source_intersection_type(
+        &mut self,
+        input: &[TypeId],
+        alias_symbol: Option<SemanticSymbolId>,
+    ) -> Result<TypeId, IntersectionTypeError> {
+        let no_supertype_reduction = self.source_primitive_empty_pair(input).is_some();
+        self.canonical_intersection_type_worker(input, alias_symbol, None, no_supertype_reduction)
+    }
+
+    fn canonical_intersection_type_worker(
+        &mut self,
+        input: &[TypeId],
+        alias_symbol: Option<SemanticSymbolId>,
+        array_targets: Option<CanonicalArrayTargets>,
+        no_supertype_reduction: bool,
+    ) -> Result<TypeId, IntersectionTypeError> {
         let (unknown_type, never_type) = self
             .intrinsic_bootstrap()
             .map(|bootstrap| (bootstrap.unknown_type, bootstrap.never_type))
@@ -155,6 +175,11 @@ impl CanonicalTypeMapperStore {
             self.append_intersection_constituent(*type_, &mut types, array_targets)?;
         }
         self.validate_branded_string_intersection(&types)?;
+        if let Some(primitive) = self.primitive_empty_intersection_constituents(&types)?
+            && !no_supertype_reduction
+        {
+            return Ok(primitive);
+        }
         if types.is_empty() {
             return Ok(unknown_type);
         }
@@ -168,6 +193,9 @@ impl CanonicalTypeMapperStore {
             alias_arguments: Vec::new(),
         };
         if let Some(cached) = self.intersection_types.get(&key).copied() {
+            if self.intersection_keys_by_type.get(&cached) != Some(&key) {
+                return Err(IntersectionTypeError::InvalidCachedIntersection(cached));
+            }
             if self.type_payload(cached).is_some_and(|record| {
                 record
                     .object_flags()
@@ -934,7 +962,10 @@ impl CanonicalTypeMapperStore {
             }
             return Ok(());
         }
-        if record.flags() == TypeFlags::STRING_LITERAL {
+        if matches!(
+            record.flags(),
+            TypeFlags::STRING_LITERAL | TypeFlags::STRING | TypeFlags::NUMBER | TypeFlags::BIG_INT
+        ) {
             self.validate_union_constituent(type_)
                 .map_err(|_| IntersectionTypeError::MalformedConstituent(type_))?;
             if !output.contains(&type_) {
@@ -994,6 +1025,103 @@ impl CanonicalTypeMapperStore {
                 Err(IntersectionTypeError::MalformedConstituent(type_))
             }
         }
+    }
+
+    /// Only this exact resolved pair gets Go's NoSupertypeReduction behavior.
+    fn source_primitive_empty_pair(&self, constituents: &[TypeId]) -> Option<TypeId> {
+        let [left, right] = constituents else {
+            return None;
+        };
+        let bootstrap = self.intrinsic_bootstrap()?;
+        let primitive = if *left == bootstrap.empty_type_literal_type {
+            *right
+        } else if *right == bootstrap.empty_type_literal_type {
+            *left
+        } else {
+            return None;
+        };
+        [
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.bigint_type,
+        ]
+        .contains(&primitive)
+        .then_some(primitive)
+    }
+
+    /// Other primitive intersections still need their own reduction rules.
+    fn primitive_empty_intersection_constituents(
+        &self,
+        constituents: &[TypeId],
+    ) -> Result<Option<TypeId>, IntersectionTypeError> {
+        let Some(primitive) = constituents.iter().copied().find(|type_| {
+            self.type_payload(*type_).is_some_and(|record| {
+                matches!(
+                    record.flags(),
+                    TypeFlags::STRING | TypeFlags::NUMBER | TypeFlags::BIG_INT
+                )
+            })
+        }) else {
+            return Ok(None);
+        };
+        self.validate_union_constituent(primitive)
+            .map_err(|_| IntersectionTypeError::MalformedConstituent(primitive))?;
+        for &constituent in constituents {
+            if constituent == primitive {
+                continue;
+            }
+            match validate_resolved_declared_property_object(self, constituent) {
+                DeclaredPropertyObjectValidation::Valid(
+                    DeclaredPropertyObjectProof::TypeLiteral,
+                ) if self
+                    .type_payload(constituent)
+                    .and_then(|record| record.data().structured())
+                    .is_some_and(|members| {
+                        members.properties.as_deref().is_none_or(<[_]>::is_empty)
+                            && members.signatures.as_deref().is_none_or(<[_]>::is_empty)
+                            && members.index_infos.as_deref().is_none_or(<[_]>::is_empty)
+                    }) => {}
+                DeclaredPropertyObjectValidation::Malformed => {
+                    return Err(IntersectionTypeError::MalformedConstituent(constituent));
+                }
+                _ => return Err(IntersectionTypeError::UnsupportedConstituent(constituent)),
+            }
+        }
+        Ok(Some(primitive))
+    }
+
+    /// Replays the source reduction before looking up a retained intersection key.
+    pub(super) fn reduced_source_primitive_intersection_type(
+        &self,
+        input: &[TypeId],
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<Option<TypeId>, IntersectionTypeError> {
+        if self.source_primitive_empty_pair(input).is_some() {
+            return Ok(None);
+        }
+        let mut constituents = Vec::new();
+        for &type_ in input {
+            self.append_intersection_constituent(type_, &mut constituents, array_targets)?;
+        }
+        self.primitive_empty_intersection_constituents(&constituents)
+    }
+
+    /// Union and relation consumers use the complete stored pair, not its flags.
+    pub(super) fn primitive_empty_intersection_type(
+        &self,
+        type_: TypeId,
+    ) -> Result<Option<TypeId>, IntersectionTypeError> {
+        let Some(TypeData::Intersection(intersection)) =
+            self.type_payload(type_).map(TypeRecord::data)
+        else {
+            return Ok(None);
+        };
+        let Some(primitive) = self.source_primitive_empty_pair(&intersection.intersection.types)
+        else {
+            return Ok(None);
+        };
+        self.validate_intersection_type(type_)?;
+        Ok(Some(primitive))
     }
 
     fn validate_branded_string_intersection(
@@ -1181,6 +1309,14 @@ impl CanonicalTypeMapperStore {
             {
                 return Err(invalid());
             }
+        }
+        if self
+            .primitive_empty_intersection_constituents(&key.types)
+            .map_err(|_| invalid())?
+            .is_some()
+            && self.source_primitive_empty_pair(&key.types).is_none()
+        {
+            return Err(invalid());
         }
         let expected =
             expected_properties(self, &key.types, array_targets).map_err(|_| invalid())?;
@@ -1532,7 +1668,10 @@ fn expected_properties(
         let record = store
             .type_payload(*type_)
             .ok_or(IntersectionTypeError::MalformedConstituent(*type_))?;
-        if record.flags() == TypeFlags::STRING_LITERAL {
+        if matches!(
+            record.flags(),
+            TypeFlags::STRING_LITERAL | TypeFlags::STRING | TypeFlags::NUMBER | TypeFlags::BIG_INT
+        ) {
             store
                 .validate_union_constituent(*type_)
                 .map_err(|_| IntersectionTypeError::MalformedConstituent(*type_))?;
@@ -2189,6 +2328,149 @@ mod tests {
             store.symbol_store().symbol_table_len(),
             store.checker_link_allocated_lengths(),
         )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn primitive_empty_intersections_preserve_only_exact_source_pairs() {
+        let source = parse_source_file("type Empty = {}; type Brand = { brand: string };");
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(46_223);
+        let mut context = generic_intersection_context(&source, file);
+        let named_empty = generic_intersection_alias(&source, &context, file, "Empty");
+        let brand = generic_intersection_alias(&source, &context, file, "Brand");
+        let store = context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (empty, string, number, bigint) = (
+            bootstrap.empty_type_literal_type,
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.bigint_type,
+        );
+        assert_ne!(empty, named_empty);
+        let state = |store: &CanonicalTypeMapperStore| {
+            (
+                intersection_cache_state(store),
+                store.type_alias_len(),
+                store.intersection_types.clone(),
+                store.intersection_keys_by_type.clone(),
+            )
+        };
+        for primitive in [string, number, bigint] {
+            for pair in [[primitive, empty], [empty, primitive]] {
+                let before = state(store);
+                assert_eq!(
+                    store.canonical_intersection_type(&pair, None),
+                    Ok(primitive)
+                );
+                assert_eq!(state(store), before);
+                let retained = store
+                    .canonical_source_intersection_type(&pair, None)
+                    .unwrap();
+                assert_eq!(
+                    store.primitive_empty_intersection_type(retained),
+                    Ok(Some(primitive))
+                );
+                assert_eq!(
+                    store.validate_intersection_type(retained).unwrap().types,
+                    pair
+                );
+                let warm = state(store);
+                assert_eq!(
+                    store.canonical_source_intersection_type(&pair, None),
+                    Ok(retained)
+                );
+                assert_eq!(
+                    store.canonical_intersection_type(&pair, None),
+                    Ok(primitive)
+                );
+                assert_eq!(
+                    store.reduced_source_primitive_intersection_type(&pair, None),
+                    Ok(None)
+                );
+                assert_eq!(
+                    store.canonical_source_intersection_type(&[retained, empty], None),
+                    Ok(primitive),
+                );
+                assert_eq!(state(store), warm);
+
+                let flags = store.type_payload(retained).unwrap().object_flags();
+                assert!(store.set_type_object_flags(retained, ObjectFlags::NONE));
+                let poisoned = state(store);
+                for _ in 0..2 {
+                    let error = IntersectionTypeError::InvalidCachedIntersection(retained);
+                    assert_eq!(
+                        store.primitive_empty_intersection_type(retained),
+                        Err(error)
+                    );
+                    assert_eq!(
+                        store.canonical_source_intersection_type(&pair, None),
+                        Err(error)
+                    );
+                    assert_eq!(state(store), poisoned);
+                }
+                assert!(store.set_type_object_flags(retained, flags));
+                assert_eq!(
+                    store.canonical_source_intersection_type(&pair, None),
+                    Ok(retained)
+                );
+            }
+            for pair in [[primitive, named_empty], [named_empty, primitive]] {
+                let before = state(store);
+                assert_eq!(
+                    store.canonical_source_intersection_type(&pair, None),
+                    Ok(primitive)
+                );
+                assert_eq!(
+                    store.reduced_source_primitive_intersection_type(&pair, None),
+                    Ok(Some(primitive)),
+                );
+                assert_eq!(state(store), before);
+            }
+            let before = state(store);
+            assert_eq!(
+                store.canonical_source_intersection_type(&[primitive, empty, empty], None),
+                Ok(primitive),
+            );
+            assert_eq!(
+                store.canonical_source_intersection_type(&[primitive, brand], None),
+                Err(IntersectionTypeError::UnsupportedConstituent(brand)),
+            );
+            assert_eq!(state(store), before);
+        }
+        let before = state(store);
+        assert_eq!(
+            store.canonical_source_intersection_type(&[string, number], None),
+            Err(IntersectionTypeError::UnsupportedConstituent(number)),
+        );
+        assert_eq!(state(store), before);
+
+        let string_pair = [string, empty];
+        let text = store
+            .canonical_source_intersection_type(&string_pair, None)
+            .unwrap();
+        let numeric = store
+            .canonical_source_intersection_type(&[number, empty], None)
+            .unwrap();
+        let key = store.intersection_keys_by_type.get(&text).unwrap().clone();
+        assert_eq!(
+            store.intersection_types.insert(key.clone(), numeric),
+            Some(text)
+        );
+        let poisoned = state(store);
+        for _ in 0..2 {
+            assert!(store.validate_intersection_type(numeric).is_ok());
+            assert_eq!(
+                store.canonical_source_intersection_type(&string_pair, None),
+                Err(IntersectionTypeError::InvalidCachedIntersection(numeric)),
+            );
+            assert_eq!(state(store), poisoned);
+        }
+        assert_eq!(store.intersection_types.insert(key, text), Some(numeric));
+        assert_eq!(
+            store.canonical_source_intersection_type(&string_pair, None),
+            Ok(text)
+        );
     }
 
     #[test]
