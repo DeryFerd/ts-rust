@@ -35,6 +35,7 @@ use super::{
     formatter::{
         FunctionTypeDisplayUnavailable,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
+        get_type_names_for_effective_property_assignability_error_with_host_global_types_and_flags,
         type_to_string_with_host_global_types_and_flags,
     },
     functions::{
@@ -48,8 +49,11 @@ use super::{
         object_literal_getter_projection_with_host, object_literal_state, plan_object_literal,
         validate_resolved_declared_property_type_graph,
     },
-    relater::{CallableRelationFailure, ResolvedDeclaredProperty, ResolvedDeclaredPropertyObject},
-    relation::SignatureCheckMode,
+    relater::{
+        CallableRelationFailure, InterfaceHeritagePropertyRelationFailureKind,
+        ResolvedDeclaredProperty, ResolvedDeclaredPropertyObject,
+    },
+    relation::{RelationKind, SignatureCheckMode},
     signatures::ElementFlags,
     source::{
         CheckedExpressionShape, CheckedExpressionTypes, CheckedObjectMember, PlannedExpression,
@@ -83,6 +87,24 @@ fn render_detail_chain(chain: Vec<Diagnostic>, indentation: usize) -> Vec<String
             )
         })
         .collect()
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DiagnosticPropertyMode {
+    Declared,
+    SourceLiteral,
+    InterfaceHeritage,
+}
+
+/// Existing source-literal flags keep their original property-query policy.
+impl From<bool> for DiagnosticPropertyMode {
+    fn from(allow_source_literals: bool) -> Self {
+        if allow_source_literals {
+            Self::SourceLiteral
+        } else {
+            Self::Declared
+        }
+    }
 }
 
 /// Builds the complete diagnostic batch for one already-failed assignment.
@@ -1599,9 +1621,10 @@ fn recursive_callable_mismatch_chain(
     options: CanonicalCheckerOptions,
     check_mode: SignatureCheckMode,
     active: &mut HashSet<(TypeId, TypeId)>,
-    allow_source_literals: bool,
+    property_mode: impl Into<DiagnosticPropertyMode>,
     session: &mut InstantiationSession,
 ) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
+    let property_mode = property_mode.into();
     if active.len() >= 64 || !active.insert((source_type, target_type)) {
         return Ok(None);
     }
@@ -1615,7 +1638,7 @@ fn recursive_callable_mismatch_chain(
         options,
         check_mode,
         active,
-        allow_source_literals,
+        property_mode,
         session,
     );
     assert!(active.remove(&(source_type, target_type)));
@@ -1633,7 +1656,7 @@ fn recursive_callable_mismatch_chain_inner(
     options: CanonicalCheckerOptions,
     check_mode: SignatureCheckMode,
     active: &mut HashSet<(TypeId, TypeId)>,
-    allow_source_literals: bool,
+    property_mode: DiagnosticPropertyMode,
     session: &mut InstantiationSession,
 ) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
     let source_callable = match validate_stored_single_callable(store, source_type) {
@@ -1746,7 +1769,7 @@ fn recursive_callable_mismatch_chain_inner(
                     options,
                     callback_mode,
                     active,
-                    allow_source_literals,
+                    property_mode,
                     session,
                 )?
                 else {
@@ -1763,7 +1786,7 @@ fn recursive_callable_mismatch_chain_inner(
                     flags,
                     options,
                     active,
-                    allow_source_literals,
+                    property_mode,
                     session,
                 )?);
             }
@@ -1783,7 +1806,7 @@ fn recursive_callable_mismatch_chain_inner(
                 flags,
                 options,
                 active,
-                allow_source_literals,
+                property_mode,
                 session,
             )?;
             let arguments = chain[0].arguments.clone();
@@ -2128,6 +2151,232 @@ fn valid_labeled_tuple_rest_parameter(
     Ok(true)
 }
 
+/// Builds TS2430 only after the complete interface-to-base relation failed.
+#[allow(clippy::too_many_arguments)] // Keep the failed relation and its source query together.
+pub(super) fn interface_heritage_mismatch_diagnostic(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    name_node: NodeRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
+    let flags = display_flags(options);
+    let chain = interface_heritage_property_mismatch_chain(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+        &mut HashSet::new(),
+        session,
+    )?
+    .ok_or(RelationUnavailable::StructuralRelation {
+        source: source_type,
+        target: target_type,
+        relation: RelationKind::Assignable,
+    })?;
+    let AssignabilityErrorDisplay { source, target } =
+        get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            source_type,
+            target_type,
+            flags,
+        )?;
+    let mut diagnostic = primary(2430, name_node, vec![source, target])?;
+    diagnostic.diagnostic.details = render_detail_chain(chain, 1);
+    Ok(diagnostic)
+}
+
+#[allow(clippy::too_many_arguments)] // Nested property failures retain their caller and cycle guard.
+fn interface_heritage_property_mismatch_chain(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    active: &mut HashSet<(TypeId, TypeId)>,
+    session: &mut InstantiationSession,
+) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
+    for type_ in [source_type, target_type] {
+        if !store
+            .type_payload(type_)
+            .ok_or(RelationUnavailable::Type(type_))?
+            .flags()
+            .intersects(TypeFlags::OBJECT)
+        {
+            return Ok(None);
+        }
+    }
+    if active.len() >= 64 || !active.insert((source_type, target_type)) {
+        return Ok(None);
+    }
+    let result = interface_heritage_property_mismatch_chain_inner(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+        active,
+        session,
+    );
+    assert!(active.remove(&(source_type, target_type)));
+    result
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Share the actual failed edge through each nested property.
+fn interface_heritage_property_mismatch_chain_inner(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    active: &mut HashSet<(TypeId, TypeId)>,
+    session: &mut InstantiationSession,
+) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
+    for type_ in [source_type, target_type] {
+        match validate_class_heritage_members(store, type_) {
+            ClassHeritageMembersValidation::Malformed => return Err(invalid_structure(type_)),
+            ClassHeritageMembersValidation::Valid => continue,
+            ClassHeritageMembersValidation::NotClass => {}
+        }
+        match validate_resolved_declared_property_type_graph(store, type_) {
+            DeclaredPropertyTypeGraphValidation::Traversable(_) => {}
+            DeclaredPropertyTypeGraphValidation::Opaque => return Ok(None),
+            DeclaredPropertyTypeGraphValidation::Malformed => {
+                return Err(invalid_structure(type_));
+            }
+        }
+    }
+    let Some(failure) = store.interface_heritage_property_relation_failure_with_session(
+        source_type,
+        target_type,
+        global_types,
+        options.strict_function_types,
+        session,
+    )?
+    else {
+        return Ok(None);
+    };
+    let source_property = store
+        .symbol(failure.source_property)
+        .ok_or(RelationUnavailable::Symbol(failure.source_property))?;
+    let target_property = store
+        .symbol(failure.target_property)
+        .ok_or(RelationUnavailable::Symbol(failure.target_property))?;
+    if source_property.name() != target_property.name() {
+        return Err(invalid_structure(source_type));
+    }
+    let name = target_property
+        .name()
+        .as_utf8()
+        .ok_or(RelationUnavailable::UnsupportedProperty(
+            failure.target_property,
+        ))?
+        .to_owned();
+    let chain = match failure.kind {
+        InterfaceHeritagePropertyRelationFailureKind::Optional => {
+            let AssignabilityErrorDisplay { source, target } =
+                get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                    store,
+                    host,
+                    global_types,
+                    source_type,
+                    target_type,
+                    flags,
+                )?;
+            vec![detail_message(2327, vec![name, source, target])?]
+        }
+        InterfaceHeritagePropertyRelationFailureKind::Types {
+            source,
+            target,
+            source_component,
+        } => {
+            let display =
+                get_type_names_for_effective_property_assignability_error_with_host_global_types_and_flags(
+                    store,
+                    host,
+                    global_types,
+                    &source,
+                    &target,
+                    flags,
+                )?;
+            let component_display =
+                get_type_names_for_effective_property_assignability_error_with_host_global_types_and_flags(
+                    store,
+                    host,
+                    global_types,
+                    &source_component,
+                    &target,
+                    flags,
+                )?;
+            let mut chain = vec![detail_message(
+                2322,
+                vec![display.source.clone(), display.target.clone()],
+            )?];
+            if display != component_display {
+                chain.push(detail_message(
+                    2322,
+                    vec![component_display.source, component_display.target],
+                )?);
+            }
+            if target.types().contains(&target.declared_type()) {
+                let nested = recursive_assignability_child_chain(
+                    store,
+                    host,
+                    global_types,
+                    source_component.declared_type(),
+                    target.declared_type(),
+                    flags,
+                    options,
+                    active,
+                    DiagnosticPropertyMode::InterfaceHeritage,
+                    session,
+                )?;
+                if let Some(nested) = nested {
+                    chain.extend(nested);
+                }
+            }
+            prepend_interface_heritage_property_detail(&mut chain, &name)?;
+            chain
+        }
+    };
+    Ok(Some(chain))
+}
+
+/// TS2430 follows the pinned property-path fold without changing other callers.
+fn prepend_interface_heritage_property_detail(
+    chain: &mut Vec<Diagnostic>,
+    name: &str,
+) -> Result<(), SourceCheckError> {
+    let Some(2326 | 2200 | 2201) = chain.get(1).map(Diagnostic::code) else {
+        return prepend_property_detail(chain, name);
+    };
+    let tail = chain[1]
+        .arguments
+        .first()
+        .expect("property details retain their path argument");
+    let path = append_diagnostic_property_path(
+        &diagnostic_property_path(name),
+        &diagnostic_property_path(tail),
+    );
+    chain.drain(..2);
+    chain.insert(0, detail_message(2200, vec![path])?);
+    Ok(())
+}
+
 pub(super) fn declared_property_mismatch_details(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2269,6 +2518,51 @@ fn diagnostic_properties(
     type_: TypeId,
     source_literal_session: Option<&mut InstantiationSession>,
 ) -> Result<Option<Vec<ResolvedDeclaredProperty>>, SourceCheckError> {
+    diagnostic_properties_worker(
+        store,
+        host,
+        global_types,
+        type_,
+        source_literal_session,
+        None,
+    )
+}
+
+fn diagnostic_properties_in_mode(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    type_: TypeId,
+    mode: DiagnosticPropertyMode,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+) -> Result<Option<Vec<ResolvedDeclaredProperty>>, SourceCheckError> {
+    match mode {
+        DiagnosticPropertyMode::Declared => {
+            diagnostic_properties(store, host, global_types, type_, None)
+        }
+        DiagnosticPropertyMode::SourceLiteral => {
+            diagnostic_properties(store, host, global_types, type_, Some(session))
+        }
+        DiagnosticPropertyMode::InterfaceHeritage => diagnostic_properties_worker(
+            store,
+            host,
+            global_types,
+            type_,
+            None,
+            Some((session, Some(options.strict_function_types))),
+        ),
+    }
+}
+
+fn diagnostic_properties_worker(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    type_: TypeId,
+    source_literal_session: Option<&mut InstantiationSession>,
+    declared_session: Option<(&mut InstantiationSession, Option<bool>)>,
+) -> Result<Option<Vec<ResolvedDeclaredProperty>>, SourceCheckError> {
     match validate_class_heritage_members(store, type_) {
         ClassHeritageMembersValidation::Malformed => return Err(invalid_structure(type_)),
         ClassHeritageMembersValidation::Valid => {
@@ -2316,8 +2610,20 @@ fn diagnostic_properties(
         }
         DeclaredPropertyTypeGraphValidation::Malformed => return Err(invalid_structure(type_)),
     }
-    store
-        .resolved_declared_property_object_with_global_types(host, type_, global_types)?
+    let properties = match declared_session {
+        Some((session, strict_function_types)) => store
+            .resolved_declared_property_object_with_global_types_and_session(
+                host,
+                type_,
+                global_types,
+                strict_function_types,
+                session,
+            )?,
+        None => {
+            store.resolved_declared_property_object_with_global_types(host, type_, global_types)?
+        }
+    };
+    properties
         .map(|properties| properties.properties().to_vec())
         .ok_or_else(|| invalid_structure(type_))
         .map(Some)
@@ -2562,9 +2868,10 @@ fn recursive_declared_property_mismatch_chain(
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
     active: &mut HashSet<(TypeId, TypeId)>,
-    allow_source_literals: bool,
+    property_mode: impl Into<DiagnosticPropertyMode>,
     session: &mut InstantiationSession,
 ) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
+    let property_mode = property_mode.into();
     if active.len() >= 64 || !active.insert((source_type, target_type)) {
         return Ok(None);
     }
@@ -2578,7 +2885,7 @@ fn recursive_declared_property_mismatch_chain(
         flags,
         options,
         active,
-        allow_source_literals,
+        property_mode,
         session,
     );
     assert!(active.remove(&(source_type, target_type)));
@@ -2595,25 +2902,29 @@ fn recursive_declared_property_mismatch_chain_inner(
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
     active: &mut HashSet<(TypeId, TypeId)>,
-    allow_source_literals: bool,
+    property_mode: DiagnosticPropertyMode,
     session: &mut InstantiationSession,
 ) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
-    let Some(source) = diagnostic_properties(
+    let Some(source) = diagnostic_properties_in_mode(
         store,
         host,
         global_types,
         source_type,
-        allow_source_literals.then_some(&mut *session),
+        property_mode,
+        options,
+        session,
     )?
     else {
         return Ok(None);
     };
-    let Some(target) = diagnostic_properties(
+    let Some(target) = diagnostic_properties_in_mode(
         store,
         host,
         global_types,
         target_type,
-        allow_source_literals.then_some(&mut *session),
+        property_mode,
+        options,
+        session,
     )?
     else {
         return Ok(None);
@@ -2663,7 +2974,7 @@ fn recursive_declared_property_mismatch_chain_inner(
             flags,
             options,
             active,
-            allow_source_literals,
+            property_mode,
             session,
         );
     }
@@ -2681,7 +2992,7 @@ fn recursive_property_mismatch_chain(
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
     active: &mut HashSet<(TypeId, TypeId)>,
-    allow_source_literals: bool,
+    property_mode: DiagnosticPropertyMode,
     session: &mut InstantiationSession,
 ) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
     let Some(nested) = recursive_assignability_child_chain(
@@ -2693,7 +3004,7 @@ fn recursive_property_mismatch_chain(
         flags,
         options,
         active,
-        allow_source_literals,
+        property_mode,
         session,
     )?
     else {
@@ -2782,9 +3093,10 @@ fn recursive_assignability_child_chain(
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
     active: &mut HashSet<(TypeId, TypeId)>,
-    allow_source_literals: bool,
+    property_mode: impl Into<DiagnosticPropertyMode>,
     session: &mut InstantiationSession,
 ) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
+    let property_mode = property_mode.into();
     if is_terminal_scalar_relation_leaf(store, source_type)
         && is_terminal_scalar_relation_leaf(store, target_type)
     {
@@ -2815,7 +3127,7 @@ fn recursive_assignability_child_chain(
                 flags,
                 options,
                 active,
-                allow_source_literals,
+                property_mode,
                 session,
             )?
             else {
@@ -2835,6 +3147,21 @@ fn recursive_assignability_child_chain(
         assert!(active.remove(&(source_type, target_type)));
         return result;
     }
+    if property_mode == DiagnosticPropertyMode::InterfaceHeritage
+        && let Some(chain) = interface_heritage_property_mismatch_chain(
+            store,
+            host,
+            global_types,
+            source_type,
+            target_type,
+            flags,
+            options,
+            active,
+            session,
+        )?
+    {
+        return Ok(Some(chain));
+    }
     if let Some(chain) = recursive_declared_property_mismatch_chain(
         store,
         host,
@@ -2844,7 +3171,7 @@ fn recursive_assignability_child_chain(
         flags,
         options,
         active,
-        allow_source_literals,
+        property_mode,
         session,
     )? {
         return Ok(Some(chain));
@@ -2859,7 +3186,7 @@ fn recursive_assignability_child_chain(
         options,
         SignatureCheckMode::NONE,
         active,
-        allow_source_literals,
+        property_mode,
         session,
     )
 }
@@ -2874,7 +3201,7 @@ fn nested_assignability_chain(
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
     active: &mut HashSet<(TypeId, TypeId)>,
-    allow_source_literals: bool,
+    property_mode: DiagnosticPropertyMode,
     session: &mut InstantiationSession,
 ) -> Result<Vec<Diagnostic>, SourceCheckError> {
     let mut chain = vec![assignability_message(
@@ -2894,7 +3221,7 @@ fn nested_assignability_chain(
         flags,
         options,
         active,
-        allow_source_literals,
+        property_mode,
         session,
     )? {
         chain.extend(child);
