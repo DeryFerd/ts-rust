@@ -78,7 +78,16 @@ pub(super) use super::store::SourceCallableFamily;
 
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
 
-/// One source parameter and its explicit or implicit type identity.
+/// The actual source edges for an inferred string-default parameter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceCallableStringDefault {
+    function: NodeRef,
+    parameter: NodeRef,
+    name: NodeRef,
+    initializer: NodeRef,
+}
+
+/// One source parameter and its written, inferred or implicit type identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)] // Preserve the flat upstream parameter state.
 pub(super) struct SourceCallableParameterPlan {
@@ -89,6 +98,7 @@ pub(super) struct SourceCallableParameterPlan {
     null_literal_identity: bool,
     implicit_any: bool,
     inferred_initializer: bool,
+    string_default: Option<SourceCallableStringDefault>,
     jsdoc_function: bool,
     contextual_type: Option<TypeId>,
     pub(super) optional: bool,
@@ -101,17 +111,27 @@ impl SourceCallableParameterPlan {
         (self.identity_node, self.null_literal_identity)
     }
 
-    /// Returns the annotation used by this parameter, including its initializer source.
+    /// Returns a written annotation, including an annotation-backed array initializer.
     pub(super) const fn explicit_type_node(self) -> Option<NodeRef> {
-        if self.implicit_any {
+        if self.implicit_any || self.string_default.is_some() {
             None
         } else {
             Some(self.type_node)
         }
     }
 
-    /// Returns the written, contextual, implicit `any`, or implicit `any[]` type.
+    /// Returns the written, inferred, contextual, implicit `any`, or implicit `any[]` type.
     pub(super) fn base_type(self, store: &CanonicalTypeMapperStore) -> Option<TypeId> {
+        if let Some(origin) = self.string_default {
+            return origin
+                .matches_parameter(store, self)
+                .then(|| {
+                    store
+                        .intrinsic_bootstrap()
+                        .map(|bootstrap| bootstrap.string_type)
+                })
+                .flatten();
+        }
         if let Some(type_) = self.contextual_type {
             return Some(type_);
         }
@@ -134,8 +154,141 @@ impl SourceCallableParameterPlan {
         self.inferred_initializer
     }
 
+    pub(super) const fn has_string_default_type(self) -> bool {
+        self.string_default.is_some()
+    }
+
+    /// Rechecks the written initializer without publishing an expression type.
+    pub(super) fn string_default_value(
+        self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+    ) -> Result<Option<String>, SourceCallableError> {
+        let Some(origin) = self.string_default else {
+            return Ok(None);
+        };
+        let invalid = || invariant(SourceCallableInvariant::InvalidParameter(self.declaration));
+        if !origin.matches_parameter(store, self) {
+            return Err(invalid());
+        }
+        let parameter = preflight_node(store, host, self.declaration)?;
+        let NodeData::ParameterDeclaration(syntax) = &parameter.data else {
+            return Err(invalid());
+        };
+        let name = preflight_node(store, host, origin.name)?;
+        let initializer = preflight_node(store, host, origin.initializer)?;
+        let NodeData::StringLiteral(literal) = &initializer.data else {
+            return Err(invalid());
+        };
+        if syntax.name != origin.name.node
+            || syntax.type_.is_some()
+            || syntax.initializer != Some(origin.initializer.node)
+            || syntax.question_token.is_some()
+            || syntax.dot_dot_dot_token.is_some()
+            || syntax.modifiers.is_some()
+            || initializer.flags.0 != 0
+            || literal.token_flags.0 != 0
+            || initializer.range.start < name.range.end
+            || initializer.range.end != parameter.range.end
+            || !host.symbol_matches(store, self.declaration, self.symbol)
+        {
+            return Err(invalid());
+        }
+        if let Some(source) = host
+            .source(origin.initializer)
+            .and_then(|(arena, _)| arena.source_text())
+        {
+            let spelling = source
+                .get(initializer.range.start.get() as usize..initializer.range.end.get() as usize)
+                .ok_or_else(invalid)?;
+            let mut scanner = ts_scanner::Scanner::new(spelling);
+            let token = scanner.scan();
+            if token.kind != SyntaxKind::StringLiteral
+                || token.value.as_ref().and_then(ts_core::JsString::as_utf8)
+                    != Some(literal.text.as_str())
+                || scanner.scan().kind != SyntaxKind::EndOfFile
+                || !scanner.diagnostics().is_empty()
+            {
+                return Err(invalid());
+            }
+        }
+        if let Some(cached) = store
+            .type_node_links(origin.initializer)
+            .and_then(|links| links.resolved_type)
+        {
+            let expected = store
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| bootstrap.cached_string_literal_type(&literal.text))
+                .and_then(|regular| store.fresh_type_of_literal_type(regular).ok());
+            if expected != Some(cached) {
+                return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
+                    self.declaration,
+                )));
+            }
+        }
+        Ok(Some(literal.text.clone()))
+    }
+
     pub(super) const fn has_jsdoc_function_type(self) -> bool {
         self.jsdoc_function
+    }
+}
+
+impl SourceCallableStringDefault {
+    fn matches_parameter(
+        self,
+        store: &CanonicalTypeMapperStore,
+        parameter: SourceCallableParameterPlan,
+    ) -> bool {
+        let cache_valid = store.symbol_node_links(self.initializer)
+            .is_none_or(|links| links == &SymbolNodeLinks::default())
+            && store.type_node_links(self.initializer).is_none_or(|links| {
+                links == &TypeNodeLinks::default()
+                    || links.resolved_type.is_some_and(|cached| {
+                        links == &TypeNodeLinks { resolved_type: Some(cached), ..TypeNodeLinks::default() }
+                            && store.type_payload(cached).is_some_and(|record| {
+                                record.flags() == TypeFlags::STRING_LITERAL
+                                    && matches!(record.data(), TypeData::Literal(literal)
+                                        if literal.fresh_type == Some(cached) && literal.regular_type != cached)
+                            })
+                            && store.validate_union_constituent(cached).is_ok()
+                    })
+            });
+        parameter.declaration == self.parameter
+            && parameter.type_node == self.name
+            && parameter.identity_node == self.name
+            && parameter.initializer == Some(self.initializer)
+            && !parameter.null_literal_identity
+            && !parameter.implicit_any
+            && !parameter.inferred_initializer
+            && !parameter.jsdoc_function
+            && parameter.contextual_type.is_none()
+            && !parameter.optional
+            && !parameter.rest
+            && store.source_node_kind(self.function) == Some(SyntaxKind::FunctionDeclaration)
+            && store.source_node_kind(self.parameter) == Some(SyntaxKind::Parameter)
+            && store.source_node_parent(self.parameter)
+                == Some(SourceNodeParent::Parent(self.function))
+            && store.source_node_kind(self.name) == Some(SyntaxKind::Identifier)
+            && store.source_node_parent(self.name) == Some(SourceNodeParent::Parent(self.parameter))
+            && store.source_node_kind(self.initializer) == Some(SyntaxKind::StringLiteral)
+            && store.source_node_parent(self.initializer)
+                == Some(SourceNodeParent::Parent(self.parameter))
+            && store
+                .source_direct_children(self.parameter)
+                .is_some_and(|children| {
+                    children.len() == 2
+                        && children.contains(&self.name)
+                        && children.contains(&self.initializer)
+                })
+            && store.source_declaration_symbol(self.parameter) == Some(parameter.symbol)
+            && source_parameter_declarations_are_exact(
+                store,
+                self.function,
+                self.parameter,
+                parameter.symbol,
+            )
+            && cache_valid
     }
 }
 
@@ -3717,6 +3870,29 @@ fn plan_source_callable_with_owner_shape(
         let initializer = data
             .initializer
             .map(|initializer| NodeRef::new(declaration.arena, declaration.file, initializer));
+        let string_default = initializer
+            .filter(|initializer| {
+                view.family == SourceCallableFamily::FunctionDeclaration
+                    && body_mode == SourceCallableBodyMode::Present
+                    && matches!(&owner_shape, SourceCallableOwnerShape::Unique)
+                    && type_parameters.is_empty()
+                    && !is_async
+                    && name_record.kind == SyntaxKind::Identifier
+                    && data.type_.is_none()
+                    && data.modifiers.is_none()
+                    && data.question_token.is_none()
+                    && !rest
+                    && bound
+                        .source_facts()
+                        .is_some_and(|facts| !facts.is_javascript_file())
+                    && store.source_node_kind(*initializer) == Some(SyntaxKind::StringLiteral)
+            })
+            .map(|initializer| SourceCallableStringDefault {
+                function: declaration,
+                parameter,
+                name,
+                initializer,
+            });
         let (type_node, type_start, type_end, identity_node, null_literal_identity, implicit_any) =
             if let Some(type_id) = data.type_ {
                 let type_node = NodeRef::new(declaration.arena, declaration.file, type_id);
@@ -3775,7 +3951,9 @@ fn plan_source_callable_with_owner_shape(
                     || direct_implicit_any_rest_arrow)
                     || body_mode.is_ambient() && !rest
                     || !type_parameters.is_empty()
-                    || initializer.is_some() && !initialized_array_binding
+                    || initializer.is_some()
+                        && !initialized_array_binding
+                        && string_default.is_none()
                     || rest
                         && implicit_any_array_type(store).is_none_or(|array| {
                             array_targets.is_none()
@@ -3805,7 +3983,7 @@ fn plan_source_callable_with_owner_shape(
                     name_record.range.end,
                     identity,
                     false,
-                    inferred_annotation.is_none(),
+                    inferred_annotation.is_none() && string_default.is_none(),
                 )
             };
         let optional = validate_optional_token(
@@ -3920,6 +4098,7 @@ fn plan_source_callable_with_owner_shape(
             null_literal_identity,
             implicit_any,
             inferred_initializer: initialized_array_binding,
+            string_default,
             jsdoc_function: javascript_jsdoc_function_parameter
                 .as_ref()
                 .is_some_and(|(declaration, _)| *declaration == parameter),
@@ -3928,6 +4107,7 @@ fn plan_source_callable_with_owner_shape(
             initializer,
             rest,
         };
+        planned.string_default_value(store, host)?;
         if explicit_this {
             this_parameter = Some(planned);
         } else {
@@ -10636,6 +10816,16 @@ fn valid_source_callable_plan_owner(
         || owner.parent() != plan.owner_parent
         || !function_expression_context_is_exact(store, plan)
         || !this_parameter_is_exact
+        || plan.parameters.iter().any(|parameter| {
+            parameter.string_default.is_some_and(|origin| {
+                origin.function != plan.declaration
+                    || plan.family != SourceCallableFamily::FunctionDeclaration
+                    || plan.body_mode != SourceCallableBodyMode::Present
+                    || !plan.type_parameters.is_empty()
+                    || plan.is_async
+                    || !origin.matches_parameter(store, *parameter)
+            })
+        })
         || plan.type_parameter_syntax.is_ordinary_typescript_arrow() != ordinary_arrow
         || ordinary_arrow
             && (!plan.requires_type_query_evidence()
@@ -29776,6 +29966,196 @@ mod tests {
         assert_eq!(replay, callable);
         assert_eq!(publication_state(context.store()), warm);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn inferred_string_parameter_origins_keep_real_owners_and_header_replay() {
+        let mut fixture = QueryFixture::new(
+            concat!(
+                "function first(value = \"first\"): string { return value; } ",
+                "function second(value = \"second\"): string { return value; }",
+            ),
+            FileId::new(42_180),
+        );
+        let declarations = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let before = generic_transaction_state(&fixture.store);
+        let plans = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            declarations
+                .iter()
+                .map(|declaration| {
+                    plan_source_callable(
+                        &fixture.store,
+                        &host,
+                        *declaration,
+                        fixture.bound.symbol(*declaration).unwrap(),
+                        None,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(plans.len(), 2);
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let parameter = plans[0].parameters[0];
+        assert!(parameter.has_string_default_type());
+        assert!(!parameter.is_implicit_any());
+        assert!(!parameter.has_inferred_initializer_type());
+        assert_eq!(parameter.explicit_type_node(), None);
+        assert_eq!(parameter.base_type(&fixture.store), Some(string));
+        assert_eq!(plans[0].min_argument_count, 0);
+        assert_eq!(generic_transaction_state(&fixture.store), before);
+
+        let mut forged = plans[0].clone();
+        forged.parameters[0].string_default = plans[1].parameters[0].string_default;
+        assert_eq!(forged.parameters[0].base_type(&fixture.store), None);
+        assert_eq!(
+            source_callable_state(&fixture.store, &forged, true),
+            Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
+                plans[0].declaration
+            )))
+        );
+        assert_eq!(generic_transaction_state(&fixture.store), before);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = fixture
+            .query_callable(
+                plans[0].declaration,
+                plans[0].owner_symbol,
+                &mut diagnostics,
+            )
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(parameter.symbol)
+                .and_then(|links| links.resolved_type),
+            Some(string)
+        );
+        let initializer = parameter.initializer.unwrap();
+        assert!(fixture.store.type_node_links(initializer).is_none());
+        let regular = fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .cached_string_literal_type("first")
+            .unwrap();
+        let fresh = fixture.store.fresh_type_of_literal_type(regular).unwrap();
+        assert_eq!(
+            super::super::source::widened_fresh_literal_type(&fixture.store, fresh),
+            Ok(string)
+        );
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        let warm = generic_transaction_state(&fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                fixture.query_callable(
+                    plans[0].declaration,
+                    plans[0].owner_symbol,
+                    &mut diagnostics
+                ),
+                Ok(callable)
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), warm);
+            assert!(fixture.store.type_node_links(initializer).is_none());
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn inferred_string_parameter_rejects_wrong_default_cache_before_publication() {
+        for (index, (warm, wrong_literal)) in
+            [(false, false), (false, true), (true, false), (true, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let mut fixture = QueryFixture::new(
+                "function text(value = \"expected\"): string { return value; }",
+                FileId::new(42_181 + u32::try_from(index).unwrap()),
+            );
+            let (declaration, owner, _) = helper_arity_declaration(&fixture);
+            let plan = {
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&fixture.parsed.arena, &fixture.bound)],
+                    GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                )
+                .unwrap();
+                plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap()
+            };
+            let initializer = plan.parameters[0].initializer.unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            if warm {
+                fixture
+                    .query_callable(declaration, owner, &mut diagnostics)
+                    .unwrap();
+            }
+            let wrong = if wrong_literal {
+                let regular = fixture
+                    .store
+                    .regular_string_literal_type("different".to_owned())
+                    .unwrap();
+                fixture.store.fresh_type_of_literal_type(regular).unwrap()
+            } else {
+                fixture.store.intrinsic_bootstrap().unwrap().string_type
+            };
+            assert!(fixture.store.set_type_node_links(
+                initializer,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+            let before = generic_transaction_state(&fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    fixture.query_callable(declaration, owner, &mut diagnostics),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidFunctionType(plan.parameters[0].declaration)
+                    )),
+                );
+                assert_eq!(generic_transaction_state(&fixture.store), before);
+                assert_eq!(
+                    fixture
+                        .store
+                        .type_node_links(initializer)
+                        .and_then(|links| links.resolved_type),
+                    Some(wrong)
+                );
+            }
+            if !warm {
+                assert!(
+                    fixture
+                        .store
+                        .source_callable_type_for_owner(owner)
+                        .is_none()
+                );
+                assert!(
+                    fixture
+                        .store
+                        .value_symbol_links(plan.parameters[0].symbol)
+                        .is_none()
+                );
+            }
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]
