@@ -13,49 +13,90 @@ The [comparison](../target/wave202-pathe-census2-progress-comparison.md),
 [result](../target/wave202-pathe-root-census-2-result.md) and
 [review](../target/wave202-pathe-root-census-2-result-review.md) are closed.
 
-The next source has thirteen combined repairs and a one-line test compile fix
-at `38b8e0f1`. Its 408-test rerun stopped during compilation with an incorrect
-import in `source_flat_array_for_of.rs`. All 408 tests remain unrun. The
-earlier attempt also stopped during compilation. Neither run proves that
-these repairs pass their tests. The [rerun result](../target/wave202-pathe-focused-repairs-2-result.md)
-and [review](../target/wave202-pathe-focused-repairs-2-result-review.md) retain the failure.
-Do not combine this source with the older test counts below.
+Three newer checks have actual results. They used separate source branches,
+not one accepted combined compiler.
 
-A compile-only pass is prepared to collect reported errors across 18 public
-checker test targets and the ordinary checker library. It does not run tests
-or check the library's private unit tests. The full 408-test gate is still required.
+| Check | Actual result |
+| --- | --- |
+| [Local-write focus](../target/wave202-pathe-conditional-local-writes-focus-1-result.md), `f7884fb6` | Compiled and ran all seven tests. Four passed and three failed. |
+| [Rust API preflight](../target/wave202-pathe-checker-compile-preflight-1-result.md), `38b8e0f1` | Failed after 32.463 seconds with exit 101. Four Rust errors across three of 19 targets. The other 16 emitted check metadata. No tests ran. |
+| [Diagnostic CLI build](../target/wave202-pathe-first-error-trace-bin-1-result.md), `68067fca` | Passed in 77.775 seconds. No test or project census ran. |
 
-The immediate work uses separate branches with source, test and review owners.
-Five changes now have reviewed commits. None has a runtime result yet.
+The local-write failures are two final-return type identity checks after a
+branch join and the original 519-byte `normalizeWindowsPath` function, which
+still stops at `Function(Callable)`. That focused fixture uses real ES5 and
+ES2015 core declarations, not the complete Pathe library set or all its options.
+The [independent review](../target/wave202-pathe-conditional-local-writes-focus-1-result-review.md)
+retains all seven outcomes. The normalizer and the project still do not pass.
+
+The preflight checked 18 public test targets and the ordinary checker library.
+It did not link or run tests, or check the private unit-test library. Its
+[review](../target/wave202-pathe-checker-compile-preflight-1-result-review.md)
+confirms four reported API errors, not the absence of later errors. The
+[three-file repair](../target/wave202-pathe-public-api-repairs-handoff.md) has
+[source approval](../target/wave202-pathe-public-api-repairs-review.md) and is
+committed at `4dce5ef9`. Its rerun is pending. The earlier 408-test attempts remain failed
+compile results with every selected test unrun. Their
+[rerun result](../target/wave202-pathe-focused-repairs-2-result.md) and
+[review](../target/wave202-pathe-focused-repairs-2-result-review.md) stay unchanged.
+
+The four complete local-write, parameter-write, object-binding and computed-key
+donors were combined at `b0191a35`. The
+[source handoff](../target/wave202-pathe-next-source-join-handoff.md) and
+[review](../target/wave202-pathe-next-source-join-source-review.md) are closed.
+The complete callback donor is now included at `df09f085`. Its
+[five-source review](../target/wave202-pathe-five-source-join-review.md) is closed.
+There is no combined build or test result. The separate one-line
+[public test API fix](../target/wave202-pathe-callback-api-fix-handoff.md) is
+closed at `f959c6f9`. Both it and the three-file API repair are staged in the
+combined branch for [integration review](../target/wave202-pathe-five-source-api-join-handoff.md).
 
 | Work | Pathe code it addresses | Source state |
 | --- | --- | --- |
-| Conditional writes to initialized locals | `normalizeWindowsPath`, also used by computed keys | `f7884fb6`, seven tests unrun |
+| Conditional writes to initialized locals | `normalizeWindowsPath`, also used by computed keys | Four tests pass, three fail on `f7884fb6`. Branch-join repair `4ff5fd50` is committed and unrun. |
 | Compound writes to parameters | `path += "/"` in `normalize` | `424f3d8b`, five tests unrun |
 | Object destructuring in callable bodies | `const { children } = parent` in `_pushToLeaves` | `17b225b1`, two tests unrun |
-| Generic library constructors | Real `SetConstructor` declarations and iterator inference | In progress |
-| Contextual callback parameters and bodies | Local `Register` and nested `Assert` callbacks | `c5288bbc`, six tests unrun |
-| Computed keys and their stored type evidence | Literal keys and contextual property order | `ef87fb20`, tests unrun |
+| Generic library constructors | Real `SetConstructor` declarations and iterator inference | `5373bc05`, source review closed. Five tests unrun. |
+| Contextual callback parameters and bodies | Local `Register` and nested `Assert` callbacks | Included in `df09f085`. Six tests unrun. |
+| Computed keys and their stored type evidence | Literal keys and contextual property order | Included in `df09f085`. Tests unrun. |
 
-The first focused run will check the seven local-write tests. One contains
-the original 519-byte `normalizeWindowsPath` function. It uses real ES5 and
-ES2015 core declarations, but not the complete Pathe library set or all its
-options. This can show a working function, not a complete project pass.
-Four changes are being combined in a separate worktree. The callback change
-has a separate integration review. The combined source must keep every
-original test and all new controls.
+The [local branch-join repair](../target/wave202-pathe-local-write-joins-review.md)
+deletes seven production lines and keeps all seven original tests. Commit
+`4ff5fd50` targets the two type identity failures, not the normalizer's callable
+failure. It has not run. The [normalizer trace plan](../target/wave202-pathe-normalizer-followup-diagnosis.md)
+reuses two existing error traces on that repaired source for the next focused run.
+The [constructor work](../target/wave202-pathe-generic-constructors-handoff.md)
+is committed at `5373bc05`, with [independent review](../target/wave202-pathe-generic-constructors-review.md).
+The [stored-arrow position guard](../target/wave202-pathe-arrow-constructor-returns-review.md)
+is committed at `ddda3baa`. Both remain unrun and need integration into the
+combined compiler. A separate five-test constructor run is being prepared.
 Real `String.raw` and imported helper calls still need separate integration.
 
 The remaining loop and callback errors lose their original cause in error
 conversion. A diagnostic-only change at `68067fca` retains more failure detail.
-Its build and project run are pending. It will not enter the production port.
-The Proxy expression also needs its casted arrow-return position and handler checked.
+Its build passed, with [independent saved-result review](../target/wave202-pathe-first-error-trace-bin-1-result-review.md).
+Its project census has not run, and this diagnostic-only source will not enter
+the production port. Proxy's contextual handler remains separate work.
+
+Resource checks are separate from these results. Both the
+[preflight cleanup](../target/wave202-pathe-checker-compile-preflight-1-closure-review.md)
+and [local-write cleanup](../target/wave202-pathe-conditional-local-writes-focus-1-cleanup-closure-review.md)
+are complete and independently reviewed. They did not change any test result.
+[Diagnostic-build cleanup](../target/wave202-pathe-first-error-trace-bin-1-cleanup-result-review.md)
+is also closed. The next unchanged-input census is being prepared with the
+diagnostic executable. It will locate failures, not test the newer combined fixes.
 
 The demo is complete only when the original whole-project check finishes and
 matches the reference diagnostics, including the four test roots. Focused
 invalid programs must still report real type errors. UFO remains the second
 small target, but its dependency install still needs network approval. Hono
 and TanStack Query remain broader checks, not near-complete demo claims.
+
+The [offline second-project check](../target/wave202-offline-second-demo-candidate.md)
+found no ready replacement for UFO. Mitt lacks its test dependencies and generated
+package declarations. Sourcemap-codec lacks its Node declarations and dependencies.
+Neither has a new measured Rust result. Keep Pathe first and choose the second
+project from an actual baseline, not its source size.
 
 ## Targets
 
@@ -386,11 +427,12 @@ private validator call. The TypeScript inputs and assertions stay unchanged.
 
 ## Next work
 
-1. Combine and test the committed Pathe fixes. Trace the 27 focused failures in
-   parallel, with one owner per cause. Complete the computed-key source review.
-   Repeat all nine Pathe roots with the original config and dependencies. Use
-   the typed reporter mapping to locate the remaining internal error. Fix the
-   newly measured stops before adding unrelated language features.
+1. Finish the public test API integration. Add the reviewed branch-join,
+   constructor and stored-arrow repairs. Verify the branch-join repair against
+   all seven unchanged local-write tests, then run the combined selection.
+   Use the built diagnostic CLI to locate the remaining
+   loop and callable failures. Repeat all nine Pathe roots with the original
+   config and dependencies. Keep the diagnostic-only source out of production.
 2. Run Pathe's original build and project-pinned typecheck separately. Compare
    its loaded files before and after the build. Obtain approval for UFO's install
    and verify its dependencies, then check its seven source roots and separate
@@ -410,18 +452,19 @@ The next demo must show a complete ordinary project check, not just cold-root
 coverage. Missing diagnostics, unchecked declarations and unsupported operations
 must remain visible. The source-only repair count is not the demo's pass count.
 
-The current Pathe first stops are:
+The latest measured Pathe first stops are still those from census 2:
 
 | Original files | First stop | Next action |
 | --- | --- | --- |
-| `src/_glob.ts`, `test/glob.spec.ts` | Arrow bodies containing `throw` | Shared throw integration and project-shaped tests committed. Run them. |
-| `src/_internal.ts`, `src/utils.ts` | Untyped parameters with string defaults | Inference repair committed. Run its five new controls. |
-| `src/_path.ts` | Function-expression body with a parameter | Shared-body repair and eight new tests committed. Integrate and run them. |
-| `src/index.ts` | Ordinary property used in a binary expression | Operand repair and three public tests committed. Run them. |
-| `test/index.spec.ts` | Computed object key containing a call | Verify the existing computed-key donor, then integrate it. |
-| `test/node-glob.spec.ts` | Source-file destructuring `for...of` | Source-file and callable-loop repairs committed with eight new tests. Integrate and run them. |
-| `test/utils.spec.ts` | Internal callable error, location unavailable | Typed location mapping committed. Measure the actual error next. |
-| Installed Node `http2.d.ts` | Parser rejects keyword tuple labels | All 248 selected parser tests passed. Recheck the original loaded file. |
+| `src/_glob.ts` | A later arrow block | Use the diagnostic build to expose the underlying failure. |
+| `src/_internal.ts` | Function body | Keep the normalizer's callable failure separate from the branch-join repair. |
+| `src/_path.ts` | Function-expression initializer | Measure again after the combined body repairs. |
+| `src/index.ts` | New expression | Integrate the stored-arrow guard and check Proxy's handler separately. |
+| `src/utils.ts` | New expression | Finish the real generic-constructor tests and integration. |
+| `test/glob.spec.ts` | Arrow parameter | Integrate and test the contextual callback donor. |
+| `test/index.spec.ts` | Computed object key containing a call | Check real `String.raw` and imported-helper composition. |
+| `test/node-glob.spec.ts` | `for...of` statement | Use the diagnostic build to expose the remaining loop failure. |
+| `test/utils.spec.ts` | Internal callable error with a typed arrow location | Use the diagnostic build to retain the underlying error. |
 
 These are first stops, not a complete list of remaining failures. The six-feature
 integration and its 79 focused tests remain separate from the next demo binary
