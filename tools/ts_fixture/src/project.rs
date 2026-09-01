@@ -1888,6 +1888,7 @@ fn census_source_error_node(error: &ts_checker::semantic::SourceCheckError) -> O
         | E::PrimitiveOperator(node)
         | E::LogicalOperator(node)
         | E::Conditional(node) => Some(*node),
+        E::Function(ts_checker::semantic::SourceFunctionInvariant::Callable(node)) => Some(*node),
         E::ObjectLiteral(O::InvalidCache { node, .. } | O::Capacity(node)) => Some(*node),
         E::Provenance(
             P::MissingNode(node)
