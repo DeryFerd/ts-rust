@@ -8,23 +8,30 @@ Use Pathe for the first small complete demo, UFO for the second, and Hono for
 the larger integration target. Pathe's original typecheck includes nine roots,
 with all four test files.
 It already uses TypeScript-Go and has a supported modern module configuration.
-Its unchanged source, Node and pnpm files are acquired and verified. Its locked
-dependency install exited successfully. Full installed-file review is still in
-progress, so it is not ready for its build yet. The ordinary pinned Go compiler
-has built and passed independent review. Pathe's build, reference checks and
-first Rust measurement remain. It has no Rust result yet.
+Its unchanged source, tools and installed dependencies are verified. The port's
+pinned ordinary Go compiler checked all nine roots with zero diagnostics and
+277 loaded files. That result and cleanup have independent review. The Rust
+project-checking tool is built and its cleanup is closed. The first Rust Pathe
+run stopped at `E00.SOURCE_SYNTAX`, an unsupported arrow in `src/_glob.ts`.
+It returned no complete Rust graph or diagnostics. The main process exited 0,
+but the project check is incomplete. Independent result review and separate
+post-close verification are closed. No typed source location is available for
+the arrow. Pathe's original build and project-pinned compiler check remain
+separate requirements.
 
 The latest core check passed 6,557 of 6,559 tests. All 19 earlier failures now
-pass, but two old passes regressed. The alias check also found regressions.
+pass, but two old passes regressed. The latest alias check passed 5,103 of 5,108
+tests. All 40 earlier alias regressions recovered. Five alias failures remain.
 These are separate candidate builds, not one accepted combined compiler.
 
 Keep TanStack Query core as a cross-project check. Hono and Query have prepared
 dependencies, fixed original configurations and complete first-failure records.
 Neither is proved close to a full pass. UFO is the second small candidate. Its
 seven source roots and 14 separate test files need their original checks,
-including Vitest type tests. Its source and tools are verified. Install controls
-are approved and its isolation wrapper is in preparation. No UFO package tool
-has run.
+including Vitest type tests. Its source and tools are verified. Its system-only
+isolation probe passed with closed cleanup and independent review. The dependency
+install awaits user approval for host-network package requests. No install
+process was created and no package tool ran.
 
 | Project | Original source roots | Completed source checks | Unsupported | Other results | Load syntax diagnostics |
 | --- | ---: | ---: | ---: | --- | ---: |
@@ -156,8 +163,13 @@ The first stop is proved in two old tests and the new control. The one-file
 membership repair is committed at `7ad6a0b9`, with one new control and a closed
 [commit review](../target/wave202-alias-written-plan-membership-repair-commit-review.md).
 It preserves the old callable checks and all existing test inputs and assertions.
-The fresh 5,108-test check is prepared but has not run. The other 38 regressions
-and all later checks still need measurement. No repaired pass count is available.
+The fresh check ran all 5,108 tests: 5,103 passed and five failed. All 53 required
+controls passed. It recovered 42 of the previous 47 failures, including all 40
+old-pass regressions, and retained all 5,060 previous passes. The
+[latest alias result](../target/wave202-alias-repair-focused-7-runtime.md)
+and [independent review](../target/wave202-alias-repair-focused-7-result-review.md)
+are closed, including separate cleanup. The gate remains failed. This is not a
+project result or approval to promote the source.
 The [failed build](../target/wave202-alias-repair-focused-5-runtime.md) remains
 separate from the older 5,099 passing and six failing test outcomes.
 
@@ -230,19 +242,21 @@ private validator call. The TypeScript inputs and assertions stay unchanged.
 
 ## Next work
 
-1. Finish Pathe's installed-file review, then measure all nine roots with the
-   original config and dependencies. Static import checks support running its
-   original typecheck before the build. Record the actual graph, then compare
-   it again after the original build. Record both its pinned reference and the
-   port's pinned Go reference. Prepare UFO's separate checks in parallel.
-2. Build the project-checking tool at `0b8e389d` for the first measurement.
-   Prepare full test verification separately, so linking every test executable
-   does not delay that measurement. Neither new build has run. Keep the original
-   inputs and earlier failed outcomes.
-3. Finish the measured Hono repairs and combine the shared statement work.
-   Rerun Hono and Query with their complete unchanged graphs.
-4. Fix the measured alias regressions. Keep the two held core regressions visible.
-   Preserve every old result before accepting either batch.
+1. Locate Pathe's unsupported arrow through a typed source location, then fix the
+   measured cause and repeat the original nine-root check. Do not infer a source
+   range from the report's internal node number. Complete Rust graph and
+   diagnostic comparison with the closed Go reference remains required.
+2. Run Pathe's original build and project-pinned typecheck separately. Compare
+   its loaded files before and after the build. Obtain approval for UFO's install
+   and verify its dependencies, then check its seven source roots and separate
+   14-file test contract.
+3. Combine and verify the committed Hono and Query repairs, including the
+   P1/P2 source integration at `81fec0a2`. Its source review is complete, but it
+   has no runtime result. Run full test verification separately from the first
+   demo.
+4. Fix the five remaining alias failures within the released work. Keep held
+   source and the two held core regressions unchanged. Preserve every old result
+   before accepting a batch.
 5. Use the reporter's now-passing focused tests to proceed to a full project
    diagnostic comparison. Show a deliberate type error in a separate copy with
    its correct code, message and location.
@@ -282,7 +296,10 @@ five required artifacts. A separate [recovery audit](../target/wave202-p1-p2-bui
 verified unchanged inputs and no remaining owned processes, services or locks.
 The original cleanup commands remain unrun and their saved packets remain
 incomplete. That history is not replaced by the later closure check.
-No test body ran. P3 through P6 requests are source-reviewed. P8's first request
+No test body ran. The new isolated P1/P2 source integration is complete at
+`81fec0a2`. Its [source review](../target/wave202-demo-p1-p2-integration-review.md)
+confirms both signed checkpoints and all 20 retained donor controls. It has no
+runtime result. P3 through P6 requests are source-reviewed. P8's first request
 stopped at an environment check before Cargo or target creation. Its new request
 binds the actual recorded environment without changing it. P7 remains on hold.
 Source review is not proof that a batch compiles or checks a project.
@@ -309,19 +326,37 @@ The first four were combined at `3023dea1`, with 27 added control groups. They
 are now combined with the diagnostic reporter and latest API corrections at
 `0b8e389d`. The [source handoff](../target/wave202-demo-first-four-reporter-integration-handoff.md)
 and [independent review](../target/wave202-demo-first-four-reporter-integration-review.md)
-verify that combination. Its project-tool build and full test verification are
-in preparation. Neither has run.
+verify that combination. Its ordinary project-tool build completed in 73.796
+seconds, including queue time. It recorded 52 compiler-artifact events and 94
+unique output files. The [build result](../target/wave202-project-tool-0b8e389d-build-1-result.md)
+and [independent review](../target/wave202-project-tool-0b8e389d-build-1-result-review.md)
+confirm the executable, unchanged source and closed separate cleanup. No test or
+project ran in that build. Full test verification remains unrun.
 These controls have no passing result on the combined source. Separate pairs
-are checking the remaining joins.
+completed the contextual join at `84d261d4` and the remaining three-feature join
+at `660ab8d6`. Their [contextual review](../target/wave202-c7-contextual-integration-review.md)
+and [three-feature review](../target/wave202-c7-remaining-three-integration-review.md)
+are closed. Both are source-only results, with no compiler or test execution.
 Each repair can expose a later unsupported operation in its original project file.
 
-Six new source/test pairs have separate worktrees for 11 distinct measured first
-failures. They cover `!`, `in`, `string & {}`, inherited interface properties,
-generic interface call parameters and `??=`. The
+Six new source/test pairs have committed repairs in separate worktrees for 11
+distinct measured first failures. They cover `!`, `in`, `string & {}`, inherited
+interface properties, generic interface call parameters and `??=`. The nullish
+assignment commit is `24ce2343`, with a closed
+[source/test review](../target/wave202-demo-nullish-assignment-review.md).
+These six repairs have not run. Their [integration plan](../target/wave202-demo-six-feature-integration-plan.md)
+has independent review, and integration into a separate worktree is released.
+The batch adds 41 tests. Its first verification will run 79 focused tests and
+build the ordinary project checker independently. The
 [repair tasks](../target/wave202-next-project-repair-candidates.md) record exact
 errors, file ownership and positive and negative tests. Eleven first failures
-do not predict 11 passing roots. Only one exact existing interface test has
-approval to change its expected unsupported result to a normal type diagnostic.
+do not predict 11 passing roots. Three exact expectation changes are approved
+for these six features. The generic call-owned type-parameter case keeps its
+105-byte TypeScript input and changes unsupported to owner and replay success.
+The primitive scalar-to-empty-object relation keeps its original call and input
+and changes one expected `Err` to `Ok(true)`. The incompatible inherited
+interface-property override keeps its 144-byte TypeScript input and changes
+unsupported to TS2430. These approvals do not permit changes to other tests.
 
 The shared try/catch/throw implementation is committed and independently closed
 at `0ddc0f07`. Typed synchronous returned arrows are committed at `381a3191`
@@ -375,24 +410,52 @@ closed. Its first system-only isolation probe failed on incompatible `findmnt`
 flags. Cleanup and complete input checks passed. No package tool ran in that
 attempt. The later locked dependency install exited 0. Its
 [saved result](../target/project-inputs/wave202-pathe-inputs-1/evidence/package-isolation-2-install/result)
-records command, cleanup and input statuses of 0, with `closed=1`. Full installed
-dependency integrity review is still running. Installation exit 0 alone does
-not make Pathe ready for its build or prove that every required payload exists.
+records command, cleanup and input statuses of 0, with `closed=1`. The complete
+[installed-input review](../target/wave202-pathe-package-isolation-2-install-review.md)
+is now closed. It verified all 124 applicable installed packages, file contents,
+command shims, links and unchanged original inputs. Native payloads are present,
+but their runtime behavior and the original build remain untested.
 The [ordinary Go CLI plan](../target/wave202-pathe-go-cli-preparation.md) uses one
 offline build of the exact pinned compiler. The existing instrumented test binary
 will not replace the ordinary reference command. That ordinary build passed,
 and its [independent review](../target/wave202-pathe-go-cli-build-1-result-review.md)
 verified the compiler artifact, unchanged inputs and closed cleanup. No project
-reference check ran in that build.
+reference check ran in that build. The later
+[ordinary Go reference](../target/wave202-pathe-reference-check-1-result.md)
+and [independent review](../target/wave202-pathe-reference-check-1-result-review.md)
+are closed. All nine roots checked with zero diagnostics. The 277 loaded files
+include nine roots, 175 dependency files and 93 bundled libraries. The original
+options and diagnostic directives remain unchanged. This is the port's pinned
+Go reference, not Pathe's project-pinned compiler or a Rust result. It does not
+prove full structured-diagnostic or module-resolution parity.
+
+The first [Rust Pathe report](../target/wave202-demo-project-check-1-pathe.json)
+records construction as unsupported, code `E00.SOURCE_SYNTAX`. Its error names
+an arrow in `src/_glob.ts`, but supplies no typed source range. The original
+project config was used. Graph, diagnostics, type artifacts, symbol artifacts
+and replay are unavailable. Missing diagnostics are not zero diagnostics.
+The [terminal receipt](../target/wave202-demo-project-check-1-terminal-receipt.json)
+records one actual execution after an approval timeout, with main exit 0.
+That exit does not mean the project passed. The
+[complete result](../target/wave202-demo-project-check-1-result.md) and
+[independent review](../target/wave202-demo-project-check-1-result-review.md)
+are closed. Separate post-close verification exited 0 and confirmed unchanged
+inputs, executable and saved evidence. The compiler limitation remains open.
+The earlier build and Go reference closures remain separate facts.
+
 UFO's [input plan](../target/wave202-ufo-input-preparation-plan.md) and review are
 closed. Its [acquisition report](../target/wave202-ufo-input-acquisition-1.md)
 records all 39 original files and both verified tool archives in a separate
 directory. [Independent acquisition review](../target/wave202-ufo-input-acquisition-1-review.md)
 is closed. The exact pnpm 10 [install controls](../target/wave202-ufo-pnpm-controls.md)
 have [independent approval](../target/wave202-ufo-pnpm-controls-review.md).
-The UFO-specific isolation wrapper is in preparation. Its probe and install
-remain separate next steps. No UFO package tool ran. It keeps its own Node,
-pnpm, build and type-test requirements.
+The [system-only probe](../target/wave202-ufo-package-isolation-1-probe-result.md)
+and [independent review](../target/wave202-ufo-package-isolation-1-probe-review.md)
+are closed. The probe exited 0 with unchanged inputs and verified isolation.
+No package tool ran in that probe. The install's first permission request timed
+out. The identical retry was denied pending informed approval for host-network
+package requests. Neither request created an install process. User approval is
+pending. UFO keeps its own Node, pnpm, build and type-test requirements.
 
 Source workers have separate worktrees and test partners. Shared merge work
 has explicit file ownership and one Git coordinator. At most three Cargo
