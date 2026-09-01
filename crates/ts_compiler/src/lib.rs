@@ -5941,14 +5941,147 @@ impl Program {
         };
         context
             .check_source_file_with_jsx_runtime(source.id, runtime)
-            .map_err(|error| CanonicalProgramCheckError::SourceCheck {
-                file_name: source.file_name.clone(),
-                error,
+            .map_err(|error| {
+                if let SourceCheckError::DeclaredType(DeclaredTypeError::NameResolution(
+                    CanonicalNameResolutionError::AliasResolutionUnavailable(alias),
+                )) = &error
+                {
+                    self.trace_terminal_alias_failure(context, &source.file_name, *alias);
+                }
+                CanonicalProgramCheckError::SourceCheck {
+                    file_name: source.file_name.clone(),
+                    error,
+                }
             })?;
         Ok(CanonicalCheckedSource {
             source,
             runtime: runtime.into(),
         })
+    }
+
+    fn terminal_alias_trace_text(text: &str) -> serde_json::Value {
+        let end = text
+            .char_indices()
+            .nth(256)
+            .map_or(text.len(), |(index, _)| index);
+        serde_json::json!({ "text": &text[..end], "truncated": end < text.len() })
+    }
+
+    fn terminal_alias_trace_symbol(
+        &self,
+        context: &CanonicalCheckerContext<'_>,
+        symbol: ts_binder::SemanticSymbolId,
+    ) -> serde_json::Value {
+        let symbols = context.store().symbol_store();
+        let Some(record) = symbols.symbol(symbol) else {
+            return serde_json::json!({ "identity": format!("{symbol:?}"), "unavailable": "symbol_not_owned" });
+        };
+        let declarations = record.declarations().unwrap_or(&[]);
+        let locations = declarations
+            .iter()
+            .take(8)
+            .map(|reference| {
+                let read = || -> Result<serde_json::Value, &'static str> {
+                    let (arena, bound) = context
+                        .file(reference.file)
+                        .ok_or("context_file_unavailable")?;
+                    if !reference.is_for(arena.id(), bound.file_id())
+                        || !bound.declarations_complete()
+                        || bound.node_arena_revision() != arena.revision()
+                        || !bound.contains(*reference)
+                        || !symbols.contains_node_ref(*reference)
+                    {
+                        return Err("node_binding_unavailable");
+                    }
+                    let source = self
+                        .source_file_by_id(reference.file)
+                        .ok_or("program_file_unavailable")?;
+                    if !std::ptr::eq(arena, &source.parse.arena)
+                        || bound.source_file().node != source.parse.source_file
+                    {
+                        return Err("program_arena_mismatch");
+                    }
+                    if bound.symbol(*reference) != Some(symbol)
+                        && bound.local_symbol(*reference) != Some(symbol)
+                    {
+                        return Err("raw_declaration_symbol_mismatch");
+                    }
+                    let node = arena.get(reference.node).ok_or("node_unavailable")?;
+                    if node.range.start > node.range.end
+                        || node.range.end.get() as usize > source.source_text.len()
+                    {
+                        return Err("node_range_unavailable");
+                    }
+                    Ok(serde_json::json!({
+                        "file": Self::terminal_alias_trace_text(&source.file_name),
+                        "kind": format!("{:?}", node.kind),
+                        "startByte": node.range.start.get(), "endByte": node.range.end.get(),
+                        "rawBinderOwnerMatched": true,
+                    }))
+                };
+                read().unwrap_or_else(|reason| serde_json::json!({ "unavailable": reason }))
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "identity": format!("{symbol:?}"), "flags": format!("{:?}", record.flags()),
+            "name": record.name().as_utf8().map(Self::terminal_alias_trace_text)
+                .unwrap_or_else(|| serde_json::json!({ "unavailable": "non_utf8_symbol_name" })),
+            "declarationsAvailable": record.declarations().is_some(),
+            "declarationCount": declarations.len(), "declarationsTruncated": declarations.len() > 8,
+            "declarations": locations,
+            "mergedIdentity": { "unavailable": "observing_accessor_excluded" },
+            "importExportOwner": { "unavailable": "not_collected_in_minimal_trace" },
+            "moduleSpecifier": { "unavailable": "not_collected_in_minimal_trace" },
+        })
+    }
+
+    // Diagnostic-only: read retained failure facts without running checker queries.
+    fn trace_terminal_alias_failure(
+        &self,
+        context: &CanonicalCheckerContext<'_>,
+        root_file: &str,
+        alias: ts_binder::SemanticSymbolId,
+    ) {
+        use std::io::Write as _;
+
+        let links = context.store().alias_symbol_links(alias);
+        let (state, target) = match links.map(|links| links.alias_target) {
+            None => ("missing", None),
+            Some(AliasTargetState::Unresolved) => ("unresolved", None),
+            Some(AliasTargetState::Unknown) => ("unknown", None),
+            Some(AliasTargetState::Resolved(target)) => ("resolved", Some(target)),
+        };
+        let record = serde_json::json!({
+            "event": "terminal_alias_unavailable", "schemaVersion": 1,
+            "rootFile": Self::terminal_alias_trace_text(root_file),
+            "error": "DeclaredType.NameResolution.AliasResolutionUnavailable",
+            "snapshot": "current_after_source_error", "useSite": { "unavailable": "not_in_returned_error" },
+            "alias": self.terminal_alias_trace_symbol(context, alias),
+            "aliasLinks": {
+                "state": state,
+                "rawImmediateTargetIdentity": links.and_then(|links| links.immediate_target).map(|target| format!("{target:?}")),
+                "rawTypeOnlyDeclarationIdentity": links.and_then(|links| links.type_only_declaration).map(|node| format!("{node:?}")),
+                "referenced": links.map(|links| links.referenced),
+                "target": target.map(|target| self.terminal_alias_trace_symbol(context, target)),
+            },
+        });
+        let Ok(mut bytes) = serde_json::to_vec(&record) else {
+            return;
+        };
+        if bytes.len() > 65_536 {
+            let fallback = serde_json::json!({
+                "event": "terminal_alias_unavailable", "schemaVersion": 1,
+                "rootFile": Self::terminal_alias_trace_text(root_file),
+                "aliasIdentity": format!("{alias:?}"), "aliasLinkState": state,
+                "snapshot": "current_after_source_error", "unavailable": "record_byte_limit", "truncated": true,
+            });
+            let Ok(fallback) = serde_json::to_vec(&fallback) else {
+                return;
+            };
+            bytes = fallback;
+        }
+        bytes.push(b'\n');
+        let _ = std::io::stderr().lock().write_all(&bytes);
     }
 
     fn finish_canonical_check<'arena, T>(
