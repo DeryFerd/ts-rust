@@ -35,6 +35,37 @@ result. This reporting defect is separate from the nine checker failures.
 Pathe is not one fix away from a demonstrated pass. Its original build and
 project-pinned compiler check also remain separate requirements.
 
+The Pathe fixes now have committed source and independent review. They cover
+keyword tuple labels, string-default parameter inference, ordinary property
+operands, shared throw statements, function-expression bodies and destructuring
+loops. The typed callable-error location mapping is also committed. Integration
+is in progress. The computed-key donor still needs a complete source review.
+None of these changes has a new Pathe project result yet.
+
+The corrected six-feature compiler at `a89c891b` builds successfully. The build
+took 77.385 seconds, with no Rust errors. Separate cleanup and independent review
+are complete. The ordinary project-checking executable is available. Its
+[build result](../target/wave202-demo-next-source-bin-2-result.md) and
+[review](../target/wave202-demo-next-source-bin-2-result-review.md)
+do not claim a passing TypeScript project.
+
+Its focused check compiled and ran all 79 selected tests: 52 passed and 27 failed.
+All seven Boolean-negation tests passed. The failures include generic interface
+calls, nullish assignment flow, interface heritage, wrapper types and diagnostic
+details. Seven separate investigations are tracing these failures. The
+[complete test log](../target/wave202-demo-next-source-focused-2.cargo.log)
+retains every result. Separate cleanup and final result review are pending.
+
+The first build failed on two Rust E0308 errors because two calls omitted `Some`
+around an optional session. That failed attempt and its cleanup remain in the
+[build result](../target/wave202-demo-next-source-bin-1-result.md) and
+[review](../target/wave202-demo-next-source-bin-1-result-review.md).
+The first 248-test parser command also stopped before compilation because
+`cargo test` rejects `--keep-going`. The corrected command passed all 248 tests,
+including the three new keyword-tuple-label tests. No test was ignored or filtered.
+That parser run still needs separate cleanup and final result review. A passing
+parser test does not prove that Pathe's 35 loaded-file diagnostics are gone.
+
 The latest core check passed 6,557 of 6,559 tests. All 19 earlier failures now
 pass, but two old passes regressed. The latest alias check passed 5,103 of 5,108
 tests. All 40 earlier alias regressions recovered. Five alias failures remain.
@@ -258,13 +289,11 @@ private validator call. The TypeScript inputs and assertions stay unchanged.
 
 ## Next work
 
-1. Fix Pathe's measured first stops in parallel. Reuse existing throw and
-   computed-key work. Add default-parameter inference, multi-statement
-   function-expression bodies, ordinary property operands and source-file
-   destructuring loops.
-   Fix keyword-named tuple labels in the parser. Locate the remaining internal
-   error through a typed reporter mapping, not its printed node number.
-   Repeat all nine roots with the original config and dependencies.
+1. Combine and test the committed Pathe fixes. Trace the 27 focused failures in
+   parallel, with one owner per cause. Complete the computed-key source review.
+   Repeat all nine Pathe roots with the original config and dependencies. Use
+   the typed reporter mapping to locate the remaining internal error. Fix the
+   newly measured stops before adding unrelated language features.
 2. Run Pathe's original build and project-pinned typecheck separately. Compare
    its loaded files before and after the build. Obtain approval for UFO's install
    and verify its dependencies, then check its seven source roots and separate
@@ -288,14 +317,14 @@ The current Pathe first stops are:
 
 | Original files | First stop | Next action |
 | --- | --- | --- |
-| `src/_glob.ts`, `test/glob.spec.ts` | Arrow bodies containing `throw` | Integrate the existing shared throw checker. |
-| `src/_internal.ts`, `src/utils.ts` | Untyped parameters with string defaults | Infer the parameter type through the existing initializer checker. |
-| `src/_path.ts` | Function-expression body with a parameter | Connect its existing callable owner to shared body checking. |
-| `src/index.ts` | Ordinary property used in a binary expression | Remove the class-only operand restriction without bypassing property checks. |
-| `test/index.spec.ts` | Computed object key containing a call | Integrate the existing computed-key checker. |
-| `test/node-glob.spec.ts` | Source-file destructuring `for...of` | Reuse existing binding and iterator checks with the real callback owners. |
-| `test/utils.spec.ts` | Internal callable error, location unavailable | Add the exact typed error-to-node mapping, then measure again. |
-| Installed Node `http2.d.ts` | Parser rejects keyword tuple labels | Use the existing identifier-name parser for tuple labels. |
+| `src/_glob.ts`, `test/glob.spec.ts` | Arrow bodies containing `throw` | Shared throw integration and project-shaped tests committed. Run them. |
+| `src/_internal.ts`, `src/utils.ts` | Untyped parameters with string defaults | Inference repair committed. Run its five new controls. |
+| `src/_path.ts` | Function-expression body with a parameter | Shared-body repair and eight new tests committed. Integrate and run them. |
+| `src/index.ts` | Ordinary property used in a binary expression | Operand repair and three public tests committed. Run them. |
+| `test/index.spec.ts` | Computed object key containing a call | Verify the existing computed-key donor, then integrate it. |
+| `test/node-glob.spec.ts` | Source-file destructuring `for...of` | Source-file and callable-loop repairs committed with eight new tests. Integrate and run them. |
+| `test/utils.spec.ts` | Internal callable error, location unavailable | Typed location mapping committed. Measure the actual error next. |
+| Installed Node `http2.d.ts` | Parser rejects keyword tuple labels | All 248 selected parser tests passed. Recheck the original loaded file. |
 
 These are first stops, not a complete list of remaining failures. The six-feature
 integration and its 79 focused tests remain separate from the next demo binary
@@ -381,10 +410,12 @@ distinct measured first failures. They cover `!`, `in`, `string & {}`, inherited
 interface properties, generic interface call parameters and `??=`. The nullish
 assignment commit is `24ce2343`, with a closed
 [source/test review](../target/wave202-demo-nullish-assignment-review.md).
-These six repairs have not run. Their [integration plan](../target/wave202-demo-six-feature-integration-plan.md)
-has independent review, and integration into a separate worktree is released.
-The batch adds 41 tests. Its first verification will run 79 focused tests and
-build the ordinary project checker independently. The
+These six repairs are integrated at `ad7c6f90`. Their
+[source review](../target/wave202-demo-six-feature-integration-review.md) is closed.
+The first binary build failed on the two session-argument errors described above.
+The corrected build at `a89c891b` passed. Its 79-test check then passed 52 and
+failed 27. The batch adds 41 tests, but that source count is not a pass count.
+The failures are now under separate investigation. The
 [repair tasks](../target/wave202-next-project-repair-candidates.md) record exact
 errors, file ownership and positive and negative tests. Eleven first failures
 do not predict 11 passing roots. Three exact expectation changes are approved
