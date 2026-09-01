@@ -14,25 +14,42 @@ The [comparison](../target/wave202-pathe-census2-progress-comparison.md),
 [review](../target/wave202-pathe-root-census-2-result-review.md) are closed.
 
 The next source has thirteen combined repairs and a one-line test compile fix
-at `38b8e0f1`. Its 408-test rerun is prepared, not yet measured. The previous
-attempt stopped during compilation, so it produced no passing or failing tests.
+at `38b8e0f1`. Its 408-test rerun stopped during compilation with an incorrect
+import in `source_flat_array_for_of.rs`. All 408 tests remain unrun. The
+earlier attempt also stopped during compilation. Neither run proves that
+these repairs pass their tests. The [rerun result](../target/wave202-pathe-focused-repairs-2-result.md)
+and [review](../target/wave202-pathe-focused-repairs-2-result-review.md) retain the failure.
 Do not combine this source with the older test counts below.
 
-The immediate work is split across separate branches with source, test and
-review owners. These are diagnosed causes, not new runtime results.
+A compile-only pass is prepared to collect reported errors across 18 public
+checker test targets and the ordinary checker library. It does not run tests
+or check the library's private unit tests. The full 408-test gate is still required.
 
-| Work | Pathe code it addresses |
-| --- | --- |
-| Conditional writes to initialized locals | `normalizeWindowsPath`, also used by computed keys |
-| Compound writes to parameters | `path += "/"` in `normalize` |
-| Object destructuring in callable bodies | `const { children } = parent` in `_pushToLeaves` |
-| Generic library constructors | The real `SetConstructor` declarations used by `new Set(...)` |
-| Contextual callback parameters and bodies | The local `Register` and nested `Assert` callbacks |
-| Computed keys and their stored type evidence | Literal keys first, then real `String.raw` and helper calls |
+The immediate work uses separate branches with source, test and review owners.
+Five changes now have reviewed commits. None has a runtime result yet.
+
+| Work | Pathe code it addresses | Source state |
+| --- | --- | --- |
+| Conditional writes to initialized locals | `normalizeWindowsPath`, also used by computed keys | `f7884fb6`, seven tests unrun |
+| Compound writes to parameters | `path += "/"` in `normalize` | `424f3d8b`, five tests unrun |
+| Object destructuring in callable bodies | `const { children } = parent` in `_pushToLeaves` | `17b225b1`, two tests unrun |
+| Generic library constructors | Real `SetConstructor` declarations and iterator inference | In progress |
+| Contextual callback parameters and bodies | Local `Register` and nested `Assert` callbacks | `c5288bbc`, six tests unrun |
+| Computed keys and their stored type evidence | Literal keys and contextual property order | `ef87fb20`, tests unrun |
+
+The first focused run will check the seven local-write tests. One contains
+the original 519-byte `normalizeWindowsPath` function. It uses real ES5 and
+ES2015 core declarations, but not the complete Pathe library set or all its
+options. This can show a working function, not a complete project pass.
+Four changes are being combined in a separate worktree. The callback change
+has a separate integration review. The combined source must keep every
+original test and all new controls.
+Real `String.raw` and imported helper calls still need separate integration.
 
 The remaining loop and callback errors lose their original cause in error
-conversion. They need better failure detail before a semantic fix. The Proxy
-expression also needs its casted arrow-return position and handler checked.
+conversion. A diagnostic-only change at `68067fca` retains more failure detail.
+Its build and project run are pending. It will not enter the production port.
+The Proxy expression also needs its casted arrow-return position and handler checked.
 
 The demo is complete only when the original whole-project check finishes and
 matches the reference diagnostics, including the four test roots. Focused
@@ -118,7 +135,8 @@ test. Three package builds succeeded, but no test ran. The
 The [one-line fix](../target/wave202-pathe-focused-repairs-compile-fix-handoff.md)
 and [review](../target/wave202-pathe-focused-repairs-compile-fix-review.md) are
 closed at `38b8e0f1`. It uses the registered `SourceFileRef` without changing
-the fixture, assertions or selected tests. Its rerun is pending.
+the fixture, assertions or selected tests. Its rerun stopped at the incorrect
+import described above. No tests ran.
 This includes the optional-property repair. It keeps canonical declared-union
 order instead of incorrectly requiring numeric type-ID order. The original
 failing test stays unchanged. The diagnostic-only source is excluded.
@@ -127,7 +145,8 @@ Computed-key review found a separate bug: missing index evidence can reach an
 incorrect `any` result. The repair and focused test are reviewed and committed
 at `220334d0`, but have not run. Integration review found another conflict:
 contextual widening rejects a valid computed property's real name. That
-compatibility repair is now in progress. Pathe also needs argument-bearing computed keys
+compatibility repair is now committed with the combined computed-key changes
+at `ef87fb20`. Its tests remain unrun. Pathe also needs argument-bearing computed keys
 with real `String.raw` tags. The existing computed-key subset does not support
 that full expression. The next composition test must use the actual imported
 helper and bundled libraries, without replacement declarations. That control
