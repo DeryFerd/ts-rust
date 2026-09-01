@@ -726,7 +726,7 @@ fn validate_union_shell(
         || record.symbol().is_some()
         || mode == UnionMemberMode::Raw && record.alias().is_some()
         || data.union.structured != StructuredTypeData::default()
-        || data.union.types[0] >= data.union.types[1]
+        || mode == UnionMemberMode::Raw && data.union.types[0] >= data.union.types[1]
         || data.union.resolved_properties.is_some()
         || data.resolved_reduced_type.is_some()
         || data.regular_type.is_some()
@@ -1931,6 +1931,171 @@ mod tests {
             assert_eq!(union_data(&store, union), &published);
             assert!(store.symbol_table(cache).unwrap().is_empty());
             assert_eq!(state(&store), cold);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source fixture checks valid and malformed union order.
+    fn declared_union_members_keep_canonical_alias_order_and_reject_invalid_order() {
+        use ts_ast::{FileId, NodeData};
+        use ts_binder::{
+            CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts,
+            CanonicalSourceLanguage,
+        };
+
+        use crate::semantic::{CanonicalCheckerContext, CanonicalCheckerOptions};
+
+        let file = FileId::new(0);
+        let parsed = ts_parser::parse_source_file(concat!(
+            "type Later = { marker: string };\n",
+            "type Earlier = { marker: number };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/declared-union-order.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let aliases = ["Later", "Earlier"].map(|name| {
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(id, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    matches!(&parsed.arena.get(alias.name)?.data,
+                        NodeData::Identifier(identifier) if identifier.text == name)
+                    .then_some(NodeRef::new(parsed.arena.id(), file, id))
+                })
+                .unwrap();
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            context.store().get_merged_symbol(symbol).unwrap()
+        });
+        let [later, earlier] =
+            aliases.map(|symbol| context.get_declared_type_of_symbol(symbol).unwrap());
+        assert!(context.diagnostics().is_empty());
+        assert!(
+            later < earlier,
+            "resolve the later name before the earlier name"
+        );
+
+        let store = context.store_mut_for_test();
+        for (type_, symbol) in [later, earlier].into_iter().zip(aliases) {
+            assert_eq!(
+                validate_resolved_declared_property_object(store, type_),
+                DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::TypeLiteral)
+            );
+            let alias = store.type_payload(type_).unwrap().alias().unwrap();
+            assert_eq!(store.type_alias(alias).unwrap().symbol(), Some(symbol));
+        }
+        let union = store.literal_union_type(&[later, earlier], None).unwrap();
+        assert_eq!(union_data(store, union).union.types, [earlier, later]);
+        assert!(union_data(store, union).union.types[0] > union_data(store, union).union.types[1]);
+        for type_ in [later, earlier] {
+            assert_eq!(
+                classify_union_constituent(store, union, type_),
+                Ok(UnionMemberMode::Declared)
+            );
+        }
+        assert_eq!(store.validate_cached_union_result(union, None), Ok(()));
+        assert!(union_data(store, union).union.property_cache.is_none());
+        assert!(
+            union_data(store, union)
+                .union
+                .property_cache_without_function_property_augment
+                .is_none()
+        );
+
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let expected = store.literal_union_type(&[string, number], None).unwrap();
+        let property = store
+            .resolved_union_property(union, "marker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(property.type_id(), expected);
+        assert!(!property.is_optional());
+        assert!(!property.is_readonly());
+        assert_eq!(
+            cached_property(store, union, "marker"),
+            Some(property.symbol())
+        );
+        let published = union_data(store, union).clone();
+        let snapshot = |store: &TestStore| {
+            (
+                state(store),
+                store.mapper_len(),
+                store.signature_len(),
+                store.type_alias_len(),
+                store.index_info_len(),
+                store.type_predicate_len(),
+                store.entity_name_len(),
+                store.properties_type_cache_len(),
+            )
+        };
+        let warm = snapshot(store);
+        for _ in 0..2 {
+            assert_eq!(
+                store.resolved_union_property(union, "marker"),
+                Ok(Some(property))
+            );
+            assert_eq!(union_data(store, union), &published);
+            assert_eq!(snapshot(store), warm);
+        }
+
+        for types in [vec![later, earlier], vec![earlier, earlier]] {
+            let invalid = store.alloc_union_type(ObjectFlags::NONE, types).unwrap();
+            let invalid_data = union_data(store, invalid).clone();
+            let before = snapshot(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    store.validate_cached_union_result(invalid, None),
+                    Err(LiteralTypeCacheError::InvalidCachedUnion(invalid))
+                );
+                assert_eq!(
+                    store.resolved_union_property(invalid, "marker"),
+                    Err(UnionPropertyError::TypeCache(
+                        LiteralTypeCacheError::InvalidCachedUnion(invalid)
+                    ))
+                );
+                assert_eq!(union_data(store, invalid), &invalid_data);
+                assert!(union_data(store, invalid).union.property_cache.is_none());
+                assert!(
+                    union_data(store, invalid)
+                        .union
+                        .property_cache_without_function_property_augment
+                        .is_none()
+                );
+                assert_eq!(union_data(store, union), &published);
+                assert_eq!(snapshot(store), before);
+            }
         }
     }
 
