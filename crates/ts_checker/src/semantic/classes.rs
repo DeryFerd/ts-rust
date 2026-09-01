@@ -25,6 +25,8 @@
 //! from the checked implementation. Calls expose only the overload signatures.
 //! Optional primitive parameters and required primitive-array parameters reuse
 //! canonical annotation queries and retain their exact cached types.
+//! Optional named instance-method parameters keep their written annotation and
+//! resolve the separate body value type through the same class query context.
 //! Abstract classes retain annotated abstract members and abstract constructors;
 //! invalid abstract methods retain their exact modifier and implementation errors.
 //! Abstract properties read by later field initializers retain both exact errors.
@@ -248,6 +250,28 @@ pub(super) struct ClassBodyParameterPlan {
     pub(super) initializer: Option<NodeRef>,
     pub(super) type_: ClassBodyParameterType,
     pub(super) optional: bool,
+}
+
+impl ClassBodyParameterPlan {
+    /// Named optional parameters keep their annotation until the header prepares the value type.
+    pub(super) fn resolved_type(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        context: Option<&ClassTypeQueryContext>,
+    ) -> Result<TypeId, ClassError> {
+        let type_ = self.type_.resolved(store)?;
+        if self.optional && matches!(self.type_, ClassBodyParameterType::Annotation(_)) {
+            return optional_constructor_parameter_type_with_context(
+                store,
+                type_,
+                true,
+                self.declaration,
+                context,
+            )?
+            .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyTypeCache(self.declaration)));
+        }
+        Ok(type_)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2799,9 +2823,11 @@ pub(super) fn plan_source_class_members_with_imports(
                             property_symbol: None,
                             annotation: parameter.type_node,
                             initializer: None,
-                            type_: if parameter.optional {
+                            type_: if parameter.optional
+                                && !matches!(parameter.type_, ClassBodyParameterType::Annotation(_))
+                            {
                                 ClassBodyParameterType::Known(class_method_parameter_type(
-                                    store, *parameter,
+                                    store, *parameter, type_context,
                                 )?)
                             } else {
                                 parameter.type_
@@ -3966,12 +3992,14 @@ fn source_class_method_signatures(
 fn class_method_parameter_type(
     store: &CanonicalTypeMapperStore,
     parameter: ClassMethodParameterPlan,
+    context: Option<&ClassTypeQueryContext>,
 ) -> Result<TypeId, ClassError> {
-    optional_constructor_parameter_type(
+    optional_constructor_parameter_type_with_context(
         store,
         parameter.type_.resolved(store)?,
         parameter.optional,
         parameter.declaration,
+        context,
     )?
     .ok_or_else(|| {
         invariant(ClassInvariant::InvalidPropertyTypeCache(
@@ -4648,7 +4676,29 @@ fn validate_source_class_stored_layout(
         }
         for parameter in &method.method.parameters {
             let annotation_type = parameter.type_.resolved(store)?;
-            let parameter_type = class_method_parameter_type(store, *parameter)?;
+            let parameter_type = if parameter.optional
+                && matches!(parameter.type_, ClassBodyParameterType::Annotation(_))
+            {
+                // Saved annotation pairs above prove these constituents.
+                // A member walk here would enter this header again for a self type.
+                let constituents = constructor_parameter_type_constituents(
+                    store,
+                    annotation_type,
+                    true,
+                    parameter.declaration,
+                )?;
+                let invalid = || {
+                    invariant(ClassInvariant::InvalidPropertyTypeCache(
+                        parameter.declaration,
+                    ))
+                };
+                store
+                    .cached_annotation_union_type(&constituents, None)
+                    .map_err(|_| invalid())?
+                    .ok_or_else(invalid)?
+            } else {
+                class_method_parameter_type(store, *parameter, plan.type_query_context.as_ref())?
+            };
             if store.value_symbol_links(parameter.symbol)
                 != Some(&ValueSymbolLinks {
                     resolved_type: Some(parameter_type),
@@ -4946,7 +4996,19 @@ pub(super) fn prepare_source_class_members(
     }
     for method in &plan.methods {
         for parameter in &method.method.parameters {
-            class_method_parameter_type(store, *parameter)?;
+            if parameter.optional
+                && matches!(parameter.type_, ClassBodyParameterType::Annotation(_))
+            {
+                let annotation_type = parameter.type_.resolved(store)?;
+                prepare_constructor_optional_type_with_context(
+                    store,
+                    annotation_type,
+                    true,
+                    parameter.declaration,
+                    plan.type_query_context.as_ref(),
+                )?;
+            }
+            class_method_parameter_type(store, *parameter, plan.type_query_context.as_ref())?;
         }
     }
     let instance = store
@@ -5510,7 +5572,8 @@ pub(super) fn prepare_source_class_members(
             .expect("source method signature capacity was reserved");
         for parameter in &method.method.parameters {
             let annotation_type = parameter.type_.resolved(store)?;
-            let parameter_type = class_method_parameter_type(store, *parameter)?;
+            let parameter_type =
+                class_method_parameter_type(store, *parameter, plan.type_query_context.as_ref())?;
             if let Some(type_node) = parameter.type_node {
                 assert!(store.set_type_node_links(
                     type_node,
@@ -13838,7 +13901,17 @@ fn plan_class_method_parameter_with_body_mode(
                     source_class_method_type_parameter_plan(store, host, owner, type_node)
                         .is_ok_and(|formals| formals.is_some())
                 }));
-        if generic_annotation {
+        let optional_named_annotation = source_body
+            && type_context.is_some()
+            && data.question_token.is_some()
+            && type_record.kind == SyntaxKind::TypeReference
+            && matches!(type_record.data, NodeData::TypeReferenceNode(_))
+            && source_owner.is_some_and(|owner| {
+                matches!(source_class_annotation_role(store, host, owner, type_node),
+                    Ok(Some(SourceClassAnnotationRole::MethodParameter { method: actual, parameter: actual_parameter }))
+                        if actual == method && actual_parameter == parameter)
+            });
+        if generic_annotation || optional_named_annotation {
             (
                 Some(type_node),
                 ClassBodyParameterType::Annotation(type_node),
@@ -13986,18 +14059,24 @@ fn plan_class_method_parameter_with_body_mode(
             return Err(reject());
         }
     }
-    let value_type = cached_type
-        .map(|type_| {
-            optional_constructor_parameter_type(store, type_, optional, parameter)?.ok_or_else(
-                || {
-                    unsupported(ClassUnsupported::PropertyType {
-                        node: type_node.unwrap_or(parameter),
-                        kind: SyntaxKind::Parameter,
-                    })
-                },
-            )
-        })
-        .transpose()?;
+    let value_type = if let Some(cached_type) = cached_type {
+        let value_type = optional_constructor_parameter_type_with_context(
+            store,
+            cached_type,
+            optional,
+            parameter,
+            type_context,
+        )?;
+        if value_type.is_none() && !matches!(type_, ClassBodyParameterType::Annotation(_)) {
+            return Err(unsupported(ClassUnsupported::PropertyType {
+                node: type_node.unwrap_or(parameter),
+                kind: SyntaxKind::Parameter,
+            }));
+        }
+        value_type
+    } else {
+        None
+    };
 
     let symbol = bound_symbol(store, host, parameter)
         .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
@@ -37326,6 +37405,503 @@ mod query_tests {
                 store.index_info_len(),
             ],
         )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the cold annotation and adjacent excluded method forms together.
+    fn optional_named_method_plans_keep_cold_annotations_and_boundaries() {
+        for formals in ["", "<T = unknown>"] {
+            let parsed = parse_source_file(&format!(
+                "interface SendOptions {{ compress?: boolean; }} \
+                 class Sender{formals} {{ send(source: string, options?: SendOptions): void {{}} }}"
+            ));
+            let file = FileId::new(203_277);
+            let mut context = context_with_options(
+                &parsed,
+                file,
+                CanonicalModuleState::Script,
+                CanonicalCheckerOptions {
+                    intrinsic: crate::semantic::IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..crate::semantic::IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let (_, owner) = class(&context, &parsed, file, "Sender");
+            let bound = context.file(file).unwrap().1.clone();
+            let options = context.options();
+            let globals = context.global_types().clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let query = ClassTypeQueryContext::new(&globals, options);
+            let cold = format!("{:?}", context.store());
+            let plan = plan_source_class_members_with_type_context(
+                context.store(),
+                &host,
+                owner,
+                Some(&query),
+            )
+            .unwrap();
+            assert_eq!(format!("{:?}", context.store()), cold);
+            let method = &plan.methods[0].method;
+            let parameter = method.parameters[1];
+            let annotation = parameter.type_node.unwrap();
+            assert!(parameter.optional);
+            assert_eq!(
+                parameter.type_,
+                ClassBodyParameterType::Annotation(annotation)
+            );
+            assert_eq!(plan.bodies[0].parameters[1].type_, parameter.type_);
+            assert_eq!(class_method_minimum(method), Ok(1));
+            assert!(plan.annotation_nodes().contains(&annotation));
+            assert_eq!(
+                source_class_annotation_role(context.store(), &host, owner, annotation),
+                Ok(Some(SourceClassAnnotationRole::MethodParameter {
+                    method: method.declaration,
+                    parameter: parameter.declaration,
+                }))
+            );
+            assert!(context.store().type_node_links(annotation).is_none());
+            assert!(context.store().value_symbol_links(parameter.symbol).is_none());
+            let NodeData::ParameterDeclaration(data) =
+                &parsed.arena.get(parameter.declaration.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let question = parsed.arena.get(data.question_token.unwrap()).unwrap();
+            assert_eq!(question.kind, SyntaxKind::QuestionToken);
+            assert_eq!(question.parent, Some(parameter.declaration.node));
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_source_class_annotation(annotation, owner)
+            .unwrap();
+            let annotation_only = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    plan_source_class_members_with_type_context(
+                        context.store(),
+                        &host,
+                        owner,
+                        Some(&query),
+                    ),
+                    Ok(plan.clone())
+                );
+                assert_eq!(format!("{:?}", context.store()), annotation_only);
+                assert!(context.store().value_symbol_links(parameter.symbol).is_none());
+            }
+            assert!(diagnostics.is_empty());
+            assert!(
+                context
+                    .store()
+                    .source_class_provenance_for_symbol(owner)
+                    .is_none()
+            );
+        }
+
+        for method in [
+            "send(options?: SendOptions[]): void {}",
+            "send(options?: { compress?: boolean }): void {}",
+            "static send(options?: SendOptions): void {}",
+            "send<U>(options?: SendOptions): void {}",
+        ] {
+            let parsed = parse_source_file(&format!(
+                "interface SendOptions {{ compress?: boolean; }} class Sender {{ {method} }}"
+            ));
+            let file = FileId::new(203_278);
+            let context = context(&parsed, file, CanonicalModuleState::Script);
+            let (declaration, owner) = class(&context, &parsed, file, "Sender");
+            let NodeData::ClassDeclaration(class) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let method = NodeRef::new(parsed.arena.id(), file, class.members.nodes[0]);
+            let host = context.declared_type_host().unwrap();
+            let query = ClassTypeQueryContext::new(context.global_types(), context.options());
+            let cold = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    plan_source_class_members_with_type_context(
+                        context.store(),
+                        &host,
+                        owner,
+                        Some(&query),
+                    ),
+                    Err(accessor_member_error(method, SyntaxKind::MethodDeclaration))
+                );
+                assert_eq!(format!("{:?}", context.store()), cold);
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both query orders check named and self types, damaged caches, and restoration.
+    fn optional_named_method_queries_reject_changed_values_and_bindings() {
+        for (source_first, formals, annotation_name) in [
+            (false, "<T = unknown>", "SendOptions"),
+            (true, "<T = unknown>", "SendOptions"),
+            (false, "", "Sender"),
+            (true, "", "Sender"),
+        ] {
+            let parsed = parse_source_file(&format!(
+                "interface SendOptions {{ compress?: boolean; }} \
+                 class Sender{formals} {{ send(options?: {annotation_name}): void {{}} }} \
+                 class Other {{}}"
+            ));
+            let file = FileId::new(203_279);
+            let mut context = context_with_options(
+                &parsed,
+                file,
+                CanonicalModuleState::Script,
+                CanonicalCheckerOptions {
+                    intrinsic: crate::semantic::IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..crate::semantic::IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let (_, owner) = class(&context, &parsed, file, "Sender");
+            let (_, other) = class(&context, &parsed, file, "Other");
+            let bound = context.file(file).unwrap().1.clone();
+            let options = context.options();
+            let globals = context.global_types().clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let query = ClassTypeQueryContext::new(&globals, options);
+            let plan = plan_source_class_members_with_type_context(
+                context.store(),
+                &host,
+                owner,
+                Some(&query),
+            )
+            .unwrap();
+            if !source_first {
+                prepare_source_class_constructor_header(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut InstantiationSession::new(InstantiationLimits::default()),
+                    &mut CanonicalCheckerDiagnostics::default(),
+                    &plan,
+                )
+                .unwrap();
+            }
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let method = &plan.methods[0].method;
+            let parameter = method.parameters[0];
+            let annotation = parameter.type_node.unwrap();
+            let callable = context.get_class_query_member_type(method.symbol).unwrap();
+            let annotation_type = parameter.type_.resolved(context.store()).unwrap();
+            if annotation_name == "Sender" {
+                assert_eq!(
+                    context
+                        .store()
+                        .declared_type_links(owner)
+                        .and_then(|links| links.declared_type),
+                    Some(annotation_type)
+                );
+            }
+            let value_links = context
+                .store()
+                .value_symbol_links(parameter.symbol)
+                .unwrap()
+                .clone();
+            let reference_links = context.store().symbol_node_links(annotation).unwrap().clone();
+            assert_ne!(value_links.resolved_type, Some(annotation_type));
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                (format!("{:?}", context.store()), context.diagnostics().clone())
+            };
+            let warm = snapshot(&context);
+            assert!(matches!(
+                preflight_source_class_annotation(
+                    context.store(),
+                    &host,
+                    &globals,
+                    options.into(),
+                    annotation,
+                    other,
+                ),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node)
+                )) if node == annotation
+            ));
+            assert_eq!(snapshot(&context), warm);
+            for poison in 0..2 {
+                if poison == 0 {
+                    assert!(context.store_mut_for_test().set_value_symbol_links(
+                        parameter.symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(annotation_type),
+                            ..value_links.clone()
+                        }
+                    ));
+                    let rejected = plan_source_class_members_with_type_context(
+                        context.store(),
+                        &host,
+                        owner,
+                        Some(&query),
+                    );
+                    if annotation_name == "Sender" {
+                        assert_eq!(
+                            rejected,
+                            Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                                parameter.declaration
+                            )))
+                        );
+                    } else {
+                        assert_eq!(
+                            rejected,
+                            Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+                                parameter.symbol
+                            )))
+                        );
+                    }
+                } else {
+                    assert!(context.store_mut_for_test().set_symbol_node_links(
+                        annotation,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(other),
+                        },
+                    ));
+                }
+                let damaged = snapshot(&context);
+                for _ in 0..2 {
+                    assert!(matches!(
+                        context.get_class_query_member_type(method.symbol),
+                        Err(ClassError::Invariant(_) | ClassError::DeclaredType(_))
+                    ));
+                    assert_eq!(snapshot(&context), damaged);
+                }
+                assert!(context.store_mut_for_test().set_value_symbol_links(
+                    parameter.symbol,
+                    value_links.clone(),
+                ));
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(annotation, reference_links.clone())
+                );
+                assert_eq!(
+                    context.get_class_query_member_type(method.symbol),
+                    Ok(callable)
+                );
+                assert_eq!(snapshot(&context), warm);
+            }
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(
+                    context.get_class_query_member_type(method.symbol),
+                    Ok(callable)
+                );
+                assert_eq!(snapshot(&context), warm);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the spent caller and array-backed optional annotation in one header query.
+    fn optional_named_method_headers_keep_spent_callers_and_array_authority() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let parsed = parse_source_file(concat!(
+            "interface Seed<S> { value: S; } type SendOptions = number[]; ",
+            "class Sender<T = unknown> { send(options?: SendOptions): void {} }",
+        ));
+        let library_file = FileId::new(203_280);
+        let file = FileId::new(203_281);
+        let mut binder = CanonicalBinder::new();
+        for (source, id, library, path) in [
+            (&library, library_file, true, "\"/lib.d.ts\""),
+            (&parsed, file, false, "\"/optional-method.ts\""),
+        ] {
+            assert!(source.diagnostics.is_empty());
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    id,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        library,
+                        library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&source.arena, id)
+                .unwrap();
+        }
+        let options = CanonicalCheckerOptions {
+            intrinsic: crate::semantic::IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..crate::semantic::IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(library_file, &library.arena), (file, &parsed.arena)],
+            options,
+        )
+        .unwrap();
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, &library_bound), (&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        let (_, owner) = class(&context, &parsed, file, "Sender");
+        let query = ClassTypeQueryContext::new(&globals, options);
+        let plan = plan_source_class_members_with_type_context(
+            context.store(),
+            &host,
+            owner,
+            Some(&query),
+        )
+        .unwrap();
+        let method = &plan.methods[0].method;
+        let parameter = method.parameters[0];
+        let annotation = parameter.type_node.unwrap();
+        let array = context.get_type_from_type_node(annotation).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let reference = context
+            .store()
+            .canonical_array_reference_with_targets(targets, array)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reference.element_type, number);
+        assert!(context.store().value_symbol_links(parameter.symbol).is_none());
+        let formal = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(record.data, NodeData::TypeParameterDeclaration(_)).then(|| {
+                    bound
+                        .symbol(NodeRef::new(parsed.arena.id(), file, node))
+                        .unwrap()
+                })
+            })
+            .unwrap();
+        let formal_type = context.get_declared_type_of_symbol(formal).unwrap();
+        let mut caller = InstantiationSession::new(InstantiationLimits {
+            max_depth: 100,
+            max_count: 1,
+        });
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                context.store_mut_for_test(),
+                formal_type,
+                &[formal_type],
+                &[number],
+                None,
+                &mut caller,
+            ),
+            Ok(number)
+        );
+        let mark = caller.limit_event_mark();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        prepare_source_class_constructor_header(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut caller,
+            &mut diagnostics,
+            &plan,
+        )
+        .unwrap();
+        assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+        assert_eq!(caller.limit_event_mark(), mark);
+        assert!(diagnostics.is_empty());
+        let parameter_type =
+            class_method_parameter_type(context.store(), parameter, Some(&query)).unwrap();
+        assert_ne!(parameter_type, array);
+        assert_eq!(
+            plan.bodies[0].parameters[0].resolved_type(context.store(), Some(&query)),
+            Ok(parameter_type)
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let prepared = context
+            .store()
+            .source_class_provenance_for_symbol(owner)
+            .unwrap()
+            .prepared
+            .clone();
+        let signature = prepared.methods[0].1;
+        let returned = context.store().intrinsic_bootstrap().unwrap().void_type;
+        let warm = format!("{:?}", context.store());
+        let wrong_targets = CanonicalArrayTargets::for_test(
+            globals.readonly_array_type,
+            globals.readonly_array_type,
+        );
+        for supplied in [None, Some(wrong_targets)] {
+            assert_eq!(
+                completed_source_class_method_signature_return_type(
+                    context.store(),
+                    &host,
+                    method.declaration,
+                    signature,
+                    supplied,
+                    options.into(),
+                ),
+                Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                    method.declaration
+                )))
+            );
+            assert_eq!(format!("{:?}", context.store()), warm);
+        }
+        assert_eq!(
+            completed_source_class_method_signature_return_type(
+                context.store(),
+                &host,
+                method.declaration,
+                signature,
+                Some(targets),
+                options.into(),
+            ),
+            Ok(returned)
+        );
+        assert_eq!(
+            ClassValueQuery {
+                store: context.store_mut_for_test(),
+                host: &host,
+                global_types: &globals,
+                options,
+                session: &mut caller,
+                diagnostics: &mut diagnostics,
+            }
+            .member_type(method.symbol),
+            Ok(prepared.methods[0].0)
+        );
+        assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+        assert_eq!(caller.limit_event_mark(), mark);
+        assert_eq!(format!("{:?}", context.store()), warm);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
