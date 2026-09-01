@@ -15,9 +15,10 @@ use serde::{Deserialize, Serialize};
 use ts_ast::NodeRef;
 use ts_compiler::{
     CanonicalCensusAttempt, CanonicalCensusCompletion, CanonicalCensusControl,
-    CanonicalCensusEvent, CanonicalCensusLoadDisposition, CanonicalCensusOutcome,
-    CanonicalCensusPhase, CanonicalCensusSkipReason, CanonicalProgramCheckError,
-    CanonicalProgramCheckFailureClass, CanonicalProgramQueries, Program, ProgramDiagnostic,
+    CanonicalCensusDiagnosticScope, CanonicalCensusDiagnostics, CanonicalCensusEvent,
+    CanonicalCensusLoadDisposition, CanonicalCensusOutcome, CanonicalCensusPhase,
+    CanonicalCensusSkipReason, CanonicalProgramCheckError, CanonicalProgramCheckFailureClass,
+    CanonicalProgramQueries, Program, ProgramDiagnostic,
 };
 use ts_vfs::OsFileSystem;
 
@@ -665,6 +666,137 @@ pub enum ProjectCensusOutcome {
     Unattempted { reason: String },
 }
 
+const CENSUS_PROGRAM_DIAGNOSTIC_POLICY: &str = "Final Program diagnostics in normal output order. Successful checking does not imply an empty diagnostic set.";
+const CENSUS_RAW_CONTEXT_DIAGNOSTIC_POLICY: &str = "Raw full-graph binding and global diagnostics, followed by this context's checker records in issuance order. These records precede comment-directive filtering and are not final TypeScript errors. Cold roots do not run post-source checks. If post-source collection failed, this snapshot omits the collector's local compiler-generated diagnostic prefix.";
+const CENSUS_PARTIAL_PROGRAM_DIAGNOSTIC_POLICY: &str = "The final Program diagnostic snapshot was collected, but the ordinary post-source attempt failed afterward.";
+const CENSUS_UNLOADED_ROOT_REASON: &str =
+    "The requested root was not loaded in the original Program.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectCensusDiagnosticScope {
+    Program,
+    RawContext,
+}
+
+/// A reporting conversion failure, separate from the original checker failure.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCensusDiagnosticConversionError {
+    pub class: String,
+    pub code: String,
+    pub detail: String,
+    pub returned_error: String,
+}
+
+impl From<&CanonicalProgramCheckError> for ProjectCensusDiagnosticConversionError {
+    fn from(error: &CanonicalProgramCheckError) -> Self {
+        Self {
+            class: if error.is_unsupported_boundary() {
+                "unsupported"
+            } else {
+                "invariant"
+            }
+            .to_owned(),
+            code: error.failure_class().code().to_owned(),
+            detail: error.to_string(),
+            returned_error: format!("{error:?}"),
+        }
+    }
+}
+
+/// Completeness applies to this payload, not to a project pass.
+/// Raw context records have not passed through Program comment directives.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ProjectCensusDiagnostics {
+    CompleteProgram {
+        records: Vec<serde_json::Value>,
+        policy: String,
+    },
+    CompleteSourceContext {
+        records: Vec<serde_json::Value>,
+        policy: String,
+    },
+    Partial {
+        scope: ProjectCensusDiagnosticScope,
+        records: Vec<serde_json::Value>,
+        policy: String,
+        conversion_error: Option<ProjectCensusDiagnosticConversionError>,
+    },
+    UnavailableBeforeContext,
+    Skipped {
+        reason: String,
+    },
+    Unattempted {
+        reason: String,
+    },
+    NotRecorded,
+}
+
+fn census_diagnostics(
+    diagnostics: CanonicalCensusDiagnostics,
+) -> io::Result<ProjectCensusDiagnostics> {
+    let records = |diagnostics: Vec<ProgramDiagnostic>| {
+        diagnostics
+            .into_iter()
+            .map(|diagnostic| {
+                serde_json::to_value(ProjectDiagnosticRecord::from(&diagnostic))
+                    .map_err(io::Error::other)
+            })
+            .collect::<io::Result<Vec<_>>>()
+    };
+    Ok(match diagnostics {
+        CanonicalCensusDiagnostics::CompleteProgram { records: values } => {
+            ProjectCensusDiagnostics::CompleteProgram {
+                records: records(values)?,
+                policy: CENSUS_PROGRAM_DIAGNOSTIC_POLICY.to_owned(),
+            }
+        }
+        CanonicalCensusDiagnostics::CompleteSourceContext { records: values } => {
+            ProjectCensusDiagnostics::CompleteSourceContext {
+                records: records(values)?,
+                policy: CENSUS_RAW_CONTEXT_DIAGNOSTIC_POLICY.to_owned(),
+            }
+        }
+        CanonicalCensusDiagnostics::Partial {
+            scope,
+            records: values,
+            conversion_error,
+        } => {
+            let (scope, policy) = match scope {
+                CanonicalCensusDiagnosticScope::Program => (
+                    ProjectCensusDiagnosticScope::Program,
+                    CENSUS_PARTIAL_PROGRAM_DIAGNOSTIC_POLICY,
+                ),
+                CanonicalCensusDiagnosticScope::RawContext => (
+                    ProjectCensusDiagnosticScope::RawContext,
+                    CENSUS_RAW_CONTEXT_DIAGNOSTIC_POLICY,
+                ),
+            };
+            ProjectCensusDiagnostics::Partial {
+                scope,
+                records: records(values)?,
+                policy: policy.to_owned(),
+                conversion_error: conversion_error.as_ref().map(Into::into),
+            }
+        }
+        CanonicalCensusDiagnostics::UnavailableBeforeContext => {
+            ProjectCensusDiagnostics::UnavailableBeforeContext
+        }
+        CanonicalCensusDiagnostics::Skipped(reason) => ProjectCensusDiagnostics::Skipped {
+            reason: census_skip_reason(reason).to_owned(),
+        },
+        CanonicalCensusDiagnostics::Unattempted => ProjectCensusDiagnostics::Unattempted {
+            reason: CENSUS_UNLOADED_ROOT_REASON.to_owned(),
+        },
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "event",
@@ -707,6 +839,8 @@ pub enum ProjectCensusEvent {
     AttemptFinished {
         attempt: ProjectCensusAttempt,
         outcome: ProjectCensusOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostics: Option<ProjectCensusDiagnostics>,
         attempt_elapsed_ms: u64,
     },
     Finished {
@@ -876,7 +1010,7 @@ pub fn run_project_census<W: Write + ?Sized>(
         provenance: serde_json::to_value(&provenance).map_err(io::Error::other)?,
         soft_deadline_ms: options.soft_deadline.map(census_millis).transpose()?,
         unavailable: vec![
-            "Cold-root complete diagnostics and post-source queries are unavailable.".to_owned(),
+            "Cold-root complete diagnostics and post-source queries are unavailable. Recorded cold-root diagnostics contain only raw context records before comment directives.".to_owned(),
             "Type/symbol artifacts, replay and cross-implementation comparison are unavailable.".to_owned(),
             "Source-check completion is not a diagnostic-free root or a project pass.".to_owned(),
         ],
@@ -970,6 +1104,7 @@ pub fn run_project_census<W: Write + ?Sized>(
                 CanonicalCensusEvent::AttemptFinished {
                     attempt,
                     outcome,
+                    diagnostics,
                     elapsed,
                 } => {
                     let attempt = ProjectCensusAttempt::from(attempt);
@@ -988,8 +1123,7 @@ pub fn run_project_census<W: Write + ?Sized>(
                             }
                         }
                         CanonicalCensusOutcome::Unloaded => ProjectCensusOutcome::Unattempted {
-                            reason: "The requested root was not loaded in the original Program."
-                                .to_owned(),
+                            reason: CENSUS_UNLOADED_ROOT_REASON.to_owned(),
                         },
                         CanonicalCensusOutcome::Failure { phase, error } => {
                             let failure = ProjectCensusFailure::from_error(program, phase, &error);
@@ -1001,9 +1135,18 @@ pub fn run_project_census<W: Write + ?Sized>(
                             }
                         }
                     };
+                    let diagnostics = census_diagnostics(diagnostics)?;
+                    has_invariant_failure |= matches!(
+                        &diagnostics,
+                        ProjectCensusDiagnostics::Partial {
+                            conversion_error: Some(error),
+                            ..
+                        } if error.class == "invariant"
+                    );
                     ProjectCensusEvent::AttemptFinished {
                         attempt,
                         outcome,
+                        diagnostics: Some(diagnostics),
                         attempt_elapsed_ms: census_millis(elapsed)?,
                     }
                 }
@@ -1077,6 +1220,7 @@ pub struct ProjectCensusRootResult {
     pub phase_reached: Option<String>,
     pub elapsed_ms: Option<u64>,
     pub outcome: ProjectCensusOutcome,
+    pub diagnostics: ProjectCensusDiagnostics,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1090,6 +1234,7 @@ pub struct ProjectCensusReadback {
     pub roots: Option<Vec<ProjectCensusRootResult>>,
     pub ordinary_started: bool,
     pub ordinary: ProjectCensusOutcome,
+    pub ordinary_diagnostics: ProjectCensusDiagnostics,
     pub records: Vec<ProjectCensusRecord>,
 }
 
@@ -1141,6 +1286,7 @@ pub fn read_project_census(mut reader: impl BufRead) -> io::Result<ProjectCensus
     let mut roots = None::<Vec<ProjectCensusRootResult>>;
     let mut ordinary_started = false;
     let mut ordinary = None;
+    let mut ordinary_diagnostics = None;
     let mut active = None;
     let mut phases = Vec::<String>::new();
     let mut completed_phases = Vec::<String>::new();
@@ -1221,6 +1367,9 @@ pub fn read_project_census(mut reader: impl BufRead) -> io::Result<ProjectCensus
                             phase_reached: None,
                             elapsed_ms: None,
                             outcome: ProjectCensusOutcome::Unattempted {
+                                reason: "No completed root result was recorded.".to_owned(),
+                            },
+                            diagnostics: ProjectCensusDiagnostics::Unattempted {
                                 reason: "No completed root result was recorded.".to_owned(),
                             },
                         })
@@ -1316,6 +1465,7 @@ pub fn read_project_census(mut reader: impl BufRead) -> io::Result<ProjectCensus
             ProjectCensusEvent::AttemptFinished {
                 attempt,
                 outcome,
+                diagnostics,
                 attempt_elapsed_ms,
             } => {
                 if active != Some(*attempt) {
@@ -1391,14 +1541,24 @@ pub fn read_project_census(mut reader: impl BufRead) -> io::Result<ProjectCensus
                         }
                     }
                 }
+                if let Some(diagnostics) = diagnostics {
+                    validate_census_diagnostics(diagnostics, *attempt, outcome, &completed_phases)?;
+                }
+                let diagnostics = diagnostics
+                    .clone()
+                    .unwrap_or(ProjectCensusDiagnostics::NotRecorded);
                 match attempt {
-                    ProjectCensusAttempt::Ordinary => ordinary = Some(outcome.clone()),
+                    ProjectCensusAttempt::Ordinary => {
+                        ordinary = Some(outcome.clone());
+                        ordinary_diagnostics = Some(diagnostics);
+                    }
                     ProjectCensusAttempt::Root { root_index } => {
                         let root = roots
                             .as_mut()
                             .and_then(|roots| roots.get_mut(*root_index))
                             .ok_or_else(|| invalid_census("Unknown root result."))?;
                         root.outcome = outcome.clone();
+                        root.diagnostics = diagnostics;
                         root.elapsed_ms = Some(*attempt_elapsed_ms);
                         if let ProjectCensusOutcome::Unsupported { failure }
                         | ProjectCensusOutcome::Invariant { failure } = outcome
@@ -1497,28 +1657,125 @@ pub fn read_project_census(mut reader: impl BufRead) -> io::Result<ProjectCensus
                 } else {
                     unattempted(root.started)
                 };
+                root.diagnostics = unrecorded_census_diagnostics(&root.outcome);
             }
         }
     }
+    let ordinary = ordinary.unwrap_or_else(|| {
+        if completion.as_deref() == Some("no_check") {
+            ProjectCensusOutcome::SkippedByOriginalPolicy {
+                reason: "no_check".to_owned(),
+            }
+        } else {
+            unattempted(ordinary_started)
+        }
+    });
+    let ordinary_diagnostics =
+        ordinary_diagnostics.unwrap_or_else(|| unrecorded_census_diagnostics(&ordinary));
     Ok(ProjectCensusReadback {
         run_id,
         input_identity,
         has_footer: completion.is_some(),
         truncated_final_record,
-        ordinary: ordinary.unwrap_or_else(|| {
-            if completion.as_deref() == Some("no_check") {
-                ProjectCensusOutcome::SkippedByOriginalPolicy {
-                    reason: "no_check".to_owned(),
-                }
-            } else {
-                unattempted(ordinary_started)
-            }
-        }),
+        ordinary,
+        ordinary_diagnostics,
         ordinary_started,
         roots,
         completion,
         records,
     })
+}
+
+fn unrecorded_census_diagnostics(outcome: &ProjectCensusOutcome) -> ProjectCensusDiagnostics {
+    match outcome {
+        ProjectCensusOutcome::SkippedByOriginalPolicy { reason } => {
+            ProjectCensusDiagnostics::Skipped {
+                reason: reason.clone(),
+            }
+        }
+        ProjectCensusOutcome::Unattempted { reason } => ProjectCensusDiagnostics::Unattempted {
+            reason: reason.clone(),
+        },
+        _ => ProjectCensusDiagnostics::NotRecorded,
+    }
+}
+
+fn validate_census_diagnostics(
+    diagnostics: &ProjectCensusDiagnostics,
+    attempt: ProjectCensusAttempt,
+    outcome: &ProjectCensusOutcome,
+    completed_phases: &[String],
+) -> io::Result<()> {
+    let finished = |phase| completed_phases.iter().any(|completed| completed == phase);
+    let failure_phase = match outcome {
+        ProjectCensusOutcome::Unsupported { failure }
+        | ProjectCensusOutcome::Invariant { failure } => Some(failure.phase.as_str()),
+        _ => None,
+    };
+    let valid = match diagnostics {
+        ProjectCensusDiagnostics::CompleteProgram { policy, .. } => {
+            *policy == CENSUS_PROGRAM_DIAGNOSTIC_POLICY
+                && attempt == ProjectCensusAttempt::Ordinary
+                && matches!(outcome, ProjectCensusOutcome::OrdinaryCheckComplete)
+                && finished("post_source")
+        }
+        ProjectCensusDiagnostics::CompleteSourceContext { policy, .. } => {
+            *policy == CENSUS_RAW_CONTEXT_DIAGNOSTIC_POLICY
+                && matches!(attempt, ProjectCensusAttempt::Root { .. })
+                && matches!(outcome, ProjectCensusOutcome::SourceCheckComplete)
+                && finished("source")
+        }
+        ProjectCensusDiagnostics::Partial {
+            scope,
+            policy,
+            conversion_error,
+            ..
+        } => {
+            if let Some(error) = conversion_error
+                && (!matches!(error.class.as_str(), "unsupported" | "invariant")
+                    || error.code.is_empty()
+                    || error.returned_error.is_empty())
+            {
+                return Err(invalid_census("Invalid diagnostic conversion error."));
+            }
+            match scope {
+                ProjectCensusDiagnosticScope::Program => {
+                    *policy == CENSUS_PARTIAL_PROGRAM_DIAGNOSTIC_POLICY
+                        && attempt == ProjectCensusAttempt::Ordinary
+                        && failure_phase == Some("post_source")
+                        && finished("post_source")
+                        && conversion_error.is_none()
+                }
+                ProjectCensusDiagnosticScope::RawContext => {
+                    *policy == CENSUS_RAW_CONTEXT_DIAGNOSTIC_POLICY
+                        && (failure_phase.is_some_and(|phase| {
+                            matches!(phase, "source" | "post_source") && finished(phase)
+                        }) || matches!(attempt, ProjectCensusAttempt::Root { .. })
+                            && matches!(outcome, ProjectCensusOutcome::SourceCheckComplete)
+                            && finished("source")
+                            && conversion_error.is_some())
+                }
+            }
+        }
+        ProjectCensusDiagnostics::UnavailableBeforeContext => {
+            matches!(failure_phase, Some("preparation" | "binding" | "context"))
+        }
+        ProjectCensusDiagnostics::Skipped { reason } => matches!(
+            outcome,
+            ProjectCensusOutcome::SkippedByOriginalPolicy { reason: actual } if actual == reason
+        ),
+        ProjectCensusDiagnostics::Unattempted { reason } => matches!(
+            outcome,
+            ProjectCensusOutcome::Unattempted { reason: actual } if actual == reason
+        ),
+        ProjectCensusDiagnostics::NotRecorded => false,
+    };
+    if !valid {
+        return Err(invalid_census(
+            "Diagnostic completeness does not match the attempt, outcome or phase.",
+        ));
+    }
+    Ok(())
 }
 
 fn valid_census_phase(phase: &str) -> bool {
