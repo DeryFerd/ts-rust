@@ -6,8 +6,8 @@
 //! declarations before the final return. Expression checking, narrowing, and
 //! return inference stay in the source checker.
 //! The common statement list retains nested blocks and conditional early returns
-//! for synchronous nongeneric functions and arrows. Its leaves use these same
-//! local, expression, condition, and return syntax checks.
+//! for synchronous nongeneric functions, arrows, and object methods. Its leaves
+//! use these same local, expression, condition, and return syntax checks.
 
 use std::collections::HashSet;
 
@@ -5047,6 +5047,47 @@ impl SyntaxPlanner<'_> {
                     && arrow.asterisk_token.is_none() =>
             {
                 self.validate_for_of_arrow_callable()?
+            }
+            NodeData::MethodDeclaration(method)
+                if record.kind == SyntaxKind::MethodDeclaration
+                    && self.callable.family == SourceCallableFamily::ObjectLiteralMethod
+                    && method.body == Some(self.callable.body.node)
+                    && method.type_
+                        == self.callable.return_type.type_node().map(|node| node.node)
+                    && method.type_parameters.is_none()
+                    && method.modifiers.is_none()
+                    && method.asterisk_token.is_none()
+                    && method.postfix_token.is_none() =>
+            {
+                if self.bound.symbol(declaration) != Some(self.callable.owner_symbol)
+                    || !self.store.source_object_literal_method_owner_is_exact(
+                        declaration,
+                        self.callable.owner_symbol,
+                    )
+                    || !method
+                        .parameters
+                        .nodes
+                        .iter()
+                        .copied()
+                        .map(|node| self.reference(node))
+                        .eq(self
+                            .callable
+                            .all_parameters()
+                            .map(|parameter| parameter.declaration))
+                    || self.callable.all_parameters().any(|parameter| {
+                        !source_parameter_declarations_are_exact(
+                            self.store,
+                            declaration,
+                            parameter.declaration,
+                            parameter.symbol,
+                        )
+                    })
+                {
+                    return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(
+                        declaration,
+                    )
+                    .into());
+                }
             }
             NodeData::FunctionExpression(function)
                 if record.kind == SyntaxKind::FunctionExpression
