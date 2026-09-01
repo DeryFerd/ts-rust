@@ -287,7 +287,7 @@ fn snapshot(context: &CanonicalCheckerContext<'_>, parsed: &ParseResult) -> Stri
             ],
             nodes,
             symbols,
-            store.source_file_links(bound.source_file()),
+            store.source_file_links(context.source_file(FILE).unwrap()),
             context.diagnostics(),
         )
     )
