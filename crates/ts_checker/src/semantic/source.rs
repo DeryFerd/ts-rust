@@ -23499,6 +23499,29 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
         let statements = body.statements.nodes.clone();
         self.plan_callable_type_import_annotation_roots(&callable)?;
+        let statement_list =
+            if ordinary_typescript && self.is_direct_top_level_variable_initializer(position)? {
+                match statements.as_slice() {
+                    [] => None,
+                    [statement]
+                        if self.node(self.reference(*statement))?.kind
+                            == SyntaxKind::ReturnStatement =>
+                    {
+                        None
+                    }
+                    _ => match plan_source_callable_statement_list_syntax(
+                        self.arena, self.bound, store, &callable,
+                    ) {
+                        Ok(syntax) => Some(syntax),
+                        Err(SourceFunctionStatementsError::Unsupported(_)) => None,
+                        Err(error) => {
+                            return Err(Self::function_statements_plan_error(&callable, error));
+                        }
+                    },
+                }
+            } else {
+                None
+            };
         let prior_variables = self.prior_variables.clone();
         let readable_variables = self.readable_variables.clone();
         let hoisted_functions = self.hoisted_functions.clone();
@@ -23513,14 +23536,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 self.plan_parameter_initializers_and_enter_scope(&callable)?;
             let mut loop_body = None;
             let mut prototype_this = None;
-            let body = match statements.as_slice() {
-                [] => {
+            let body = match (statement_list, statements.as_slice()) {
+                (Some(syntax), _) => {
+                    let uninitialized = self.assignable_uninitialized_variables.clone();
+                    let assigned = self.assigned_variables.clone();
+                    let body = self.finish_callable_statement_list(syntax);
+                    self.assignable_uninitialized_variables = uninitialized;
+                    self.assigned_variables = assigned;
+                    PlannedArrowBody::StatementList(Box::new(body?))
+                }
+                (None, []) => {
                     if !self.function_empty_body_return_supported(callable.return_type)? {
                         return Err(unsupported());
                     }
                     PlannedArrowBody::Empty
                 }
-                [statement]
+                (None, [statement])
                     if prototype_assignment
                         .as_ref()
                         .is_some_and(|assignment| assignment.property_symbol.is_none())
@@ -23561,7 +23592,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     prototype_this = Some(this);
                     PlannedArrowBody::Empty
                 }
-                [statement]
+                (None, [statement])
                     if self.node(self.reference(*statement))?.kind
                         == SyntaxKind::ReturnStatement =>
                 {
@@ -23594,7 +23625,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         }
                     }
                 }
-                _ => {
+                (None, _) => {
                     if named
                         || !callable.parameters.is_empty()
                         || !callable.return_type.is_inferred()
@@ -23629,7 +23660,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         self.readable_variables = readable_variables;
         self.hoisted_functions = hoisted_functions;
         let expression = result?;
-        if named || callable.parameter_count() != 0 || !callable.return_type.is_inferred() {
+        if named
+            || callable.parameter_count() != 0
+            || !callable.return_type.is_inferred()
+            || matches!(&expression.body, PlannedArrowBody::StatementList(_))
+        {
             self.nested_arrow_callables.push(callable);
         }
         Ok(PlannedExpression::new(
@@ -24410,6 +24445,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 node.kind,
                                 SyntaxKind::FunctionDeclaration
                                     | SyntaxKind::ArrowFunction
+                                    | SyntaxKind::FunctionExpression
                                     | SyntaxKind::MethodDeclaration
                             )
                         })
@@ -39231,10 +39267,17 @@ fn check_planned_arrow_argument(
             .parameters
             .iter()
             .any(|parameter| parameter.is_implicit_any())
-        || host.node(expression).is_none_or(|record| {
-            record.kind != SyntaxKind::ArrowFunction
-                || !matches!(record.data, NodeData::ArrowFunction(_))
-        })
+        || host
+            .node(expression)
+            .is_none_or(|record| match (&record.data, record.kind) {
+                (NodeData::ArrowFunction(_), SyntaxKind::ArrowFunction) => false,
+                (NodeData::FunctionExpression(_), SyntaxKind::FunctionExpression)
+                    if matches!(arrow.body, PlannedArrowBody::StatementList(_)) =>
+                {
+                    false
+                }
+                _ => true,
+            })
         || host
             .bound_file(expression)
             .and_then(BoundFile::source_facts)
@@ -39353,6 +39396,7 @@ fn check_planned_arrow_argument(
     };
     if function_expression
         && !named_function_expression
+        && !matches!(arrow.body, PlannedArrowBody::StatementList(_))
         && arrow.callable.parameter_count() == 0
         && arrow.callable.return_type.is_inferred()
         && arrow
@@ -39578,6 +39622,30 @@ fn check_planned_arrow_argument(
         &arrow.callable,
         type_import_execution.annotation_capabilities,
     )?;
+    let mut contextual_statement_list;
+    let arrow = if function_expression
+        && let PlannedArrowBody::StatementList(body) = &arrow.body
+        && body.syntax.callable != arrow.callable
+    {
+        let (syntax, flow) = body
+            .flow
+            .with_function_expression_statement_list_context(
+                store,
+                host,
+                &body.syntax,
+                &arrow.callable,
+            )
+            .map_err(|error| SourcePlanner::source_flow_plan_error(&arrow.callable, error))?;
+        contextual_statement_list = arrow.clone();
+        let PlannedArrowBody::StatementList(body) = &mut contextual_statement_list.body else {
+            unreachable!("the statement list was matched above");
+        };
+        body.syntax = syntax;
+        body.flow = flow;
+        &contextual_statement_list
+    } else {
+        arrow
+    };
     if options.no_implicit_any {
         let arena = host
             .source(arrow.callable.declaration)
@@ -50872,7 +50940,7 @@ fn check_planned_callable_statement_list(
                 session,
                 &returned.values,
                 returned.has_bare_return,
-                None,
+                callable.contextual_function_expression_return(),
             )
         }
     })();

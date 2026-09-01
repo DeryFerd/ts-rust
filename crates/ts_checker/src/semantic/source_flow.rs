@@ -2334,6 +2334,54 @@ impl SourceFlowPlan {
             && self.statement_list.as_ref() == Some(syntax)
     }
 
+    /// Retains the same flow with an authenticated function-expression context.
+    pub(super) fn with_function_expression_statement_list_context(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        syntax: &SourceCallableStatementListSyntax,
+        callable: &super::source_callables::SourceCallablePlan,
+    ) -> Result<(SourceCallableStatementListSyntax, Self), SourceFlowError> {
+        let declaration = syntax.callable.declaration;
+        let invalid = || SourceFlowInvariant::InvalidCall(declaration);
+        let (arena, _) = host.source(declaration).ok_or_else(invalid)?;
+        let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+        if !self.statement_list_is_exact(syntax)
+            || callable.declaration != declaration
+            || bound.symbol(declaration) != Some(callable.owner_symbol)
+            || arena.get(declaration.node).is_none_or(|record| {
+                record.kind != SyntaxKind::FunctionExpression
+                    || !matches!(
+                        &record.data,
+                        NodeData::FunctionExpression(function) if function.body == callable.body.node
+                    )
+            })
+        {
+            return Err(invalid().into());
+        }
+        let target = callable
+            .contextual_function_expression_target()
+            .ok_or_else(invalid)?;
+        let mut contextual_callable = syntax.callable.clone();
+        if !super::source_callables::apply_function_expression_context(
+            store,
+            host,
+            &mut contextual_callable,
+            target,
+        )
+        .map_err(|_| invalid())?
+            || contextual_callable != *callable
+        {
+            return Err(invalid().into());
+        }
+        let mut syntax = syntax.clone();
+        syntax.callable = contextual_callable;
+        validate_statement_list_source(arena, bound, store, host, &syntax)?;
+        let mut flow = self.clone();
+        flow.statement_list = Some(syntax.clone());
+        Ok((syntax, flow))
+    }
+
     /// Adds exact statement scopes to the existing callable flow worker.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn preflight_statement_list(
@@ -7653,6 +7701,17 @@ fn validate_parameter_assignment_in_list(
             if function.kind == SyntaxKind::FunctionDeclaration =>
         {
             (&function_data.parameters, function_data.body)
+        }
+        NodeData::FunctionExpression(function_data)
+            if function.kind == SyntaxKind::FunctionExpression
+                && statement_list.is_some_and(|syntax| {
+                    syntax.callable.declaration == container
+                        && syntax.callable.family == SourceCallableFamily::ArrowFunction
+                        && syntax.callable.body.node == function_data.body
+                        && bound.symbol(container) == Some(syntax.callable.owner_symbol)
+                }) =>
+        {
+            (&function_data.parameters, Some(function_data.body))
         }
         NodeData::MethodDeclaration(method)
             if function.kind == SyntaxKind::MethodDeclaration
