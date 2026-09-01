@@ -58,7 +58,8 @@ use super::{
         validate_own_class_property_write_target,
     },
     source_statements::{
-        SourceCallableStatementListSyntax, SourceCapturedIterationStatementSyntax,
+        SourceCallableCatchBindingSyntax, SourceCallableStatementListSyntax,
+        SourceCapturedIterationStatementSyntax,
         SourceLinearLogicalStatementSyntax, plan_source_callable_statement_list_syntax,
         plan_source_for_statement_syntax, plan_source_linear_logical_statement_syntax,
     },
@@ -4108,6 +4109,13 @@ struct CompletedInCondition {
     when_false: TypeId,
 }
 
+/// Restores the catch entry without reverting writes to outer variables.
+pub(super) struct SourceCatchFlowScope {
+    symbol: SemanticSymbolId,
+    base: Option<TypeId>,
+    declared: Option<TypeId>,
+}
+
 /// Keeps class initialization queries tied to one prepared body and binder graph.
 pub(super) struct ClassInitializationFrame<'plan, 'graph> {
     access: ClassBodyAccessToken,
@@ -5167,6 +5175,70 @@ impl SourceFlowFrame<'_, '_> {
         self.plan.contains_call(call)
     }
 
+    pub(super) fn enter_catch_binding(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        binding: &SourceCallableCatchBindingSyntax,
+        declared_type: TypeId,
+    ) -> Result<SourceCatchFlowScope, SourceFlowError> {
+        let invalid = || SourceFlowInvariant::InvalidParameterAssignment(binding.declaration);
+        let syntax = self.plan.statement_list.as_ref().ok_or_else(invalid)?;
+        if !syntax.catch_bindings().contains(&binding)
+            || self.bound.symbol(binding.declaration) != Some(binding.symbol)
+            || self.bound.container(binding.declaration) != Some(self.plan.container)
+            || self.bound.block_scope_container(binding.declaration) != Some(binding.clause)
+            || !self.plan.points.contains_key(&binding.clause)
+            || !self.plan.points.contains_key(&binding.name)
+            || (self.plan.assignments.contains_key(&binding.declaration)
+                != binding.initializer.is_some())
+            || store.type_payload(declared_type).is_none()
+            || self.base.type_of(binding.symbol).is_some()
+            || self.declared_types.contains_key(&binding.symbol)
+        {
+            return Err(invalid().into());
+        }
+        let scope = SourceCatchFlowScope {
+            symbol: binding.symbol,
+            base: self.base.type_of(binding.symbol),
+            declared: self.declared_types.insert(binding.symbol, declared_type),
+        };
+        self.base = self.base.with_type(binding.symbol, declared_type);
+        self.memo.clear();
+        Ok(scope)
+    }
+
+    #[allow(clippy::needless_pass_by_value)] // Consume the token to prevent a second restore.
+    pub(super) fn restore_catch_binding(&mut self, scope: SourceCatchFlowScope) {
+        let types = Arc::make_mut(&mut self.base.types);
+        match scope.base {
+            Some(type_) => {
+                types.insert(scope.symbol, type_);
+            }
+            None => {
+                types.remove(&scope.symbol);
+            }
+        }
+        match scope.declared {
+            Some(type_) => {
+                self.declared_types.insert(scope.symbol, type_);
+            }
+            None => {
+                self.declared_types.remove(&scope.symbol);
+            }
+        }
+        self.memo.clear();
+    }
+
+    fn catch_symbol_is_inactive(&self, symbol: SemanticSymbolId) -> bool {
+        !self.declared_types.contains_key(&symbol)
+            && self.plan.statement_list.as_ref().is_some_and(|syntax| {
+                syntax
+                    .catch_bindings()
+                    .iter()
+                    .any(|binding| binding.symbol == symbol)
+            })
+    }
+
     /// Keeps a local's declared type and initial flow type without an assignment node.
     pub(super) fn enter_uninitialized_local(
         &mut self,
@@ -5644,6 +5716,7 @@ impl SourceFlowFrame<'_, '_> {
                     .reference
                     .is_some_and(|symbol| symbol != assignment.symbol)
                     || !prior.reachable
+                    || self.catch_symbol_is_inactive(assignment.symbol)
                 {
                     return Ok(prior);
                 }
@@ -5754,7 +5827,10 @@ impl SourceFlowFrame<'_, '_> {
                 let Some(symbol) = condition.symbol() else {
                     return Ok(prior);
                 };
-                if self.reference.is_some_and(|reference| reference != symbol) || !prior.reachable {
+                if self.reference.is_some_and(|reference| reference != symbol)
+                    || !prior.reachable
+                    || self.catch_symbol_is_inactive(symbol)
+                {
                     return Ok(prior);
                 }
                 let current = prior
@@ -13210,6 +13286,94 @@ mod tests {
             })
             .unwrap();
         (function, parameter, condition, return_statement)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check the real entry, initializer, and later join together.
+    fn catch_scope_restores_both_type_maps_and_excludes_expired_flow_facts() {
+        let parsed = parse_source_file(concat!(
+            "function run(value: number) { try {} catch (error = value) { ",
+            "if (typeof error === 'string') {} } return value; }",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(58_572);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(context.options().name_resolution),
+        ).unwrap();
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let declaration = parsed.arena.iter().find_map(|(node, record)| {
+            (record.kind == SyntaxKind::FunctionDeclaration).then_some(reference(node))
+        }).unwrap();
+        let callable = super::super::source_callables::plan_source_callable(
+            context.store(), &host, declaration, bound.symbol(declaration).unwrap(),
+            Some(CanonicalArrayTargets::from_global_types(&globals)),
+        ).unwrap();
+        let syntax = plan_source_callable_statement_list_syntax(
+            &parsed.arena, &bound, context.store(), &callable,
+        ).unwrap();
+        let binding = *syntax.catch_bindings()[0];
+        let catch_block = match &parsed.arena.get(binding.clause.node).unwrap().data {
+            NodeData::CatchClause(caught) => reference(caught.block),
+            _ => unreachable!(),
+        };
+        let condition = parsed.arena.iter().find_map(|(_, record)| {
+            if let NodeData::IfStatement(branch) = &record.data {
+                Some(reference(branch.expression))
+            } else { None }
+        }).unwrap();
+        let returned = parsed.arena.iter().find_map(|(node, record)| {
+            (record.kind == SyntaxKind::ReturnStatement).then_some(reference(node))
+        }).unwrap();
+        let points = parsed.arena.iter().filter_map(|(node, _)| {
+            let node = reference(node);
+            (bound.flow_container(node) == Some(declaration) && bound.flow_at(node).is_some())
+                .then_some(node)
+        }).collect::<Vec<_>>();
+        let plan = SourceFlowPlan::preflight_statement_list(
+            &parsed.arena, &bound, context.store(), &host, &syntax, points,
+            [SourceFlowCondition::Typeof(SourceTypeofCondition {
+                expression: condition, symbol: binding.symbol, tag: SourceTypeofTag::String,
+                comparison: SourceTypeofComparison::Equal,
+            })],
+            Vec::new(),
+            [SourceFlowAssignment { declaration: binding.declaration, symbol: binding.symbol }],
+            [], [], [], [],
+        ).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let unknown = bootstrap.unknown_type;
+        let parameter = callable.parameters[0].symbol;
+        let mut frame = plan.frame_with_captured_locals(
+            context.store(), &host, &bound, [(parameter, number)].into_iter().collect(),
+        ).unwrap();
+        let base = frame.base.clone();
+        let declared = frame.declared_types.clone();
+        let mut wrong = binding;
+        wrong.symbol = parameter;
+        assert!(matches!(frame.enter_catch_binding(context.store(), &wrong, unknown),
+            Err(SourceFlowError::Invariant(SourceFlowInvariant::InvalidParameterAssignment(node)))
+                if node == binding.declaration));
+        assert_eq!(frame.base, base);
+        assert_eq!(frame.declared_types, declared);
+        let scope = frame.enter_catch_binding(context.store(), &binding, unknown).unwrap();
+        assert_eq!(frame.declared_types.get(&binding.symbol), Some(&unknown));
+        assert_eq!(frame.snapshot_at(context.store_mut_for_test(), &globals, binding.name).unwrap().type_of(binding.symbol), Some(unknown));
+        frame.complete_assignment(binding.declaration, binding.symbol, number).unwrap();
+        assert_eq!(frame.snapshot_at(context.store_mut_for_test(), &globals, catch_block).unwrap().type_of(binding.symbol), Some(number));
+        assert!(!frame.memo.is_empty());
+        frame.restore_catch_binding(scope);
+        assert_eq!(frame.base, base);
+        assert_eq!(frame.declared_types, declared);
+        assert!(frame.memo.is_empty());
+        assert_eq!(frame.assignment_states.get(&binding.declaration), Some(&SourceFlowAssignmentState::Resolved(number)));
+        let after = frame.snapshot_at(context.store_mut_for_test(), &globals, returned).unwrap();
+        assert_eq!(after.type_of(parameter), Some(number));
+        assert_eq!(after.type_of(binding.symbol), None);
+        assert_eq!(frame.snapshot_at(context.store_mut_for_test(), &globals, returned), Ok(after));
     }
 
     #[test]
