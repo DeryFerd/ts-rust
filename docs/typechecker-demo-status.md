@@ -58,9 +58,10 @@ and reviewed at `99597a7b`. The remaining failure needs scalar method-value
 lookup through the existing wrapper-type provider. Its source and tests have
 paired approval and are committed at `4192503d`, including a correction for
 caller-limit cache recovery.
-Neither repair has a runtime result yet. The primary branch still uses the
-previously accepted compiler source. No core candidate is accepted from this
-failed check.
+Both are now combined and source-reviewed at `267cfa91`. Its full test run is
+being prepared. Neither repair has a runtime result yet. The primary branch
+still uses the previously accepted compiler source. No core candidate is
+accepted from this failed check.
 
 The five parser repairs are committed at `b1746a95`, with 28 new tests.
 The shared project run now confirms that all 55 Hono syntax diagnostics and
@@ -106,9 +107,11 @@ pass, the new property control passes, and no old passing test regressed. I
 checked all outcomes against their raw log spans and verified all 22 saved
 payload hashes. Separate cleanup is closed. The
 [latest alias result](../target/wave202-alias-repair-focused-4-runtime.md)
-retains all six failures. This is still a failed gate.
-Two other pairs are fixing written conditional-argument proof and unique-symbol
-property publication. Those source changes have not run.
+and [independent review](../target/wave202-alias-repair-focused-4-runtime-review.md)
+retain all six failures. This is still a failed gate.
+The written conditional-argument proof repair is source-reviewed and committed
+at `2c443dcf`. The unique-symbol property repair is source-reviewed and committed
+at `c79055e9`. Their combined source is being planned. Neither has run.
 
 The first shared project compiler is committed and independently verified at
 `b71b4158`. It combines the repaired library, class work, core, parser and
@@ -148,25 +151,35 @@ did not run the unit tests.
 Separate import fixes are committed at `0a6254d8` and `7074c8c3`. The exact
 source-file setup correction for 14 tests is committed at `3356aa21`.
 All three have independent source review. Their source integration is committed
-and reviewed at `60ab0675`. It contains 7,300 test names. A diagnostic check of
-all 5,368 checker-library tests is being prepared. Its selection includes 356
-required controls. The other 1,932 tests and 230 required controls are outside
-that focused check. These source counts are not passing-test results.
+and reviewed at `60ab0675`. It contains 7,300 test names. Preparation and peer
+review are complete for a diagnostic check of all 5,368 checker-library tests.
+The programs remain disabled. The selection includes 356 required controls.
+The other 1,932 tests and 230 required controls are outside that focused check.
+These source counts are not passing-test results.
 
 The next project compiler batch is committed and independently source-reviewed
 at `a3ef2928`. It combines constructor-owner, merged-interface-call, readonly-array
-and exported-overload repairs. Preparation for the next unchanged Hono and Query
-Core measurement is in progress. Its 7,318 test names are source metadata, not
-test results. The shared function/arrow local-variable repair is also committed
-and reviewed at `76811b77`. It stays outside this next project measurement.
+and exported-overload repairs. Its build failed after 37 seconds with one Rust
+E0599 error. A namespace check calls `is_empty` on an AST `SymbolTable` that is
+a unit struct. Neither Hono nor Query ran. The main and separate cleanup are
+closed. The [saved build result](../target/wave202-demo-shared-project-census-6-result.md)
+and [independent review](../target/wave202-demo-shared-project-census-6-result-review.md)
+retain the failure. All 24 saved output hashes and modes are verified.
+There are no new project outcomes.
+
+The exact one-line correction is in progress in a separate worktree. It keeps
+all real binder and owner checks. The batch's 7,318 test names remain source
+metadata, not test results. The shared function/arrow local-variable repair is
+also committed and reviewed at `76811b77`. It stays outside the next project run.
 
 ## Next work
 
-1. Run the shared checker-library check and the combined core repairs. Keep
-   every old result in the comparison. Use the completed alias run to select
-   its next repair batch.
-2. Run both unchanged project checks on `a3ef2928` with one fixed binary. Use
-   the next actual failure in each source file to choose the following repairs.
+1. Check Rust compilation before combining more source repairs. Then run the
+   shared checker-library check and combined core tests. Keep every old result
+   in the comparison. Use the completed alias run to select its next batch.
+2. Fix the new batch's compile error. Then run both unchanged projects with
+   one fixed binary. Use the next actual failure in each source file to choose
+   the following repairs.
 3. Combine the typed-field and shared function/arrow local-variable work after
    source review, then measure both projects again.
 4. Complete the eight project repairs below and the remaining alias repairs.
@@ -180,27 +193,36 @@ work that is on hold. Eight implementation pairs now have separate worktrees.
 They target 34 distinct first failures. That is not a forecast of 34 completed
 files, because later failures can appear after each repair.
 
-Three of these source repairs are committed and independently reviewed:
-constructor annotations at `d2129b2c`, type reexports at `07fc299c`, and imported
-arrow context at `0dc85701`. None has a runtime result. The imported-arrow barrel
-cases still need the explicit reexport connection and imported class-owner work.
+All eight feature commits now have independent source review and verified
+commit contents. They add 55 controls. None has a runtime result. The generic
+constructor batch has a separate Rust compile error, a question mark applied
+to a bool. Its exact one-byte correction is in progress. Source review is not
+proof that a batch compiles or checks a project.
 
-| Repair pair | Immediate work |
-| --- | --- |
-| Import annotations | Preserve real imported type owners and annotation children. |
-| Generic class fields | Check `new Set<TListener>()` through real declared generic constructor signatures. |
-| Constructor annotations | Publish single-constructor parameter types through the existing query path. |
-| Local class exports | Follow the original class and named export owners. |
-| Type reexports | Follow the full named and star reexport chain. |
-| Arrow context | Use real imported function-type aliases for parameter context. |
-| Typed async arrows | Check written parameter and `Promise<T>` return types. |
-| Equality conditions | Check both operands through the shared statement engine. |
+| Repair pair | Feature commit | Work in the commit |
+| --- | --- | --- |
+| Import annotations | `1bfd3f96` | Preserve real imported type owners and annotation children. |
+| Generic class fields | `3960ebe7` | Check `new Set<TListener>()` through real declared generic constructor signatures. |
+| Constructor annotations | `d2129b2c` | Publish single-constructor parameter types through the existing query path. |
+| Local class exports | `9be223b9` | Follow the original class and named export owners. |
+| Type reexports | `07fc299c` | Follow the full named and star reexport chain. |
+| Arrow context | `0dc85701` | Use real imported function-type aliases for parameter context. |
+| Typed async arrows | `99e04df7` | Check written parameter and `Promise<T>` return types. |
+| Equality conditions | `ce649181` | Check both operands through the shared statement engine. |
+
+The imported-arrow barrel cases still need the explicit reexport connection
+and imported class-owner work. These feature commits do not complete their roots.
 
 The generic-constructor work has a second source/test pair with separate file
 ownership. The imported-arrow work also depends on the import and reexport
 repairs. These dependencies remain explicit. The
 [ownership and priority report](../target/wave202-census-4-failure-priorities.md)
 records the measured failures, separate later limits and original assignment.
+
+The new [early Rust compile protocol](../target/wave202-early-rust-compile-plan.md)
+uses the existing three-job limit. It checks Rust APIs before broad integration,
+including test code when needed. A compile result is not a passing TypeScript
+test or project result.
 
 Small libraries remain possible earlier demo targets, but none is proved
 close to a full check. The cached tiny-invariant, Mitt, UFO, Pathe and
