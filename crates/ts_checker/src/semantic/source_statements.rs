@@ -4902,6 +4902,42 @@ impl SyntaxPlanner<'_> {
             {
                 self.validate_for_of_arrow_callable()?
             }
+            NodeData::FunctionExpression(function)
+                if record.kind == SyntaxKind::FunctionExpression
+                    && self.callable.family == SourceCallableFamily::ArrowFunction
+                    && function.body == self.callable.body.node
+                    && function.type_
+                        == self.callable.return_type.type_node().map(|node| node.node)
+                    && function.type_parameters.is_none()
+                    && function.modifiers.is_none()
+                    && function.asterisk_token.is_none() =>
+            {
+                if self.bound.symbol(declaration) != Some(self.callable.owner_symbol)
+                    || !function
+                        .parameters
+                        .nodes
+                        .iter()
+                        .copied()
+                        .map(|node| self.reference(node))
+                        .eq(self
+                            .callable
+                            .all_parameters()
+                            .map(|parameter| parameter.declaration))
+                    || self.callable.all_parameters().any(|parameter| {
+                        !source_parameter_declarations_are_exact(
+                            self.store,
+                            declaration,
+                            parameter.declaration,
+                            parameter.symbol,
+                        )
+                    })
+                {
+                    return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(
+                        declaration,
+                    )
+                    .into());
+                }
+            }
             _ => {
                 return Err(self.unsupported(
                     declaration,
