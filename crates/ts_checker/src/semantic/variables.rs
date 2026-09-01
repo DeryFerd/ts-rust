@@ -2421,6 +2421,11 @@ fn route_value_symbol(
         if record.flags() != SymbolFlags::EXPORT_VALUE
             || record.check_flags() != CheckFlags::NONE
             || !matches!(record.declarations(), Some([_]))
+                && !record.export_symbol().is_some_and(|target| {
+                    record.declarations().is_some_and(|declarations| {
+                        store.source_exported_overload_local(target, declarations) == Some(resolved)
+                    })
+                })
             || record.value_declaration().is_some()
             || record.members().is_some()
             || record.exports().is_some()

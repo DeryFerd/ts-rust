@@ -298,7 +298,8 @@ use super::{
     },
     source_overloads::{
         MaterializedSourceOverload, ResolvedSourceOverloadSignature, SourceOverloadError,
-        SourceOverloadPlan, plan_source_ambient_overload_group, plan_source_jsdoc_overload_group,
+        SourceOverloadPlan, plan_source_ambient_overload_group,
+        plan_source_exported_overload_group, plan_source_jsdoc_overload_group,
         prepare_source_overload_publication, publish_source_overload_batch,
     },
     source_properties::{
@@ -350,6 +351,7 @@ use super::{
         CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget, TypeNodeUnavailable,
         authenticated_active_recursive_arrow_query, authenticated_recovered_recursive_arrow_return,
         normalize_bigint_literal, normalize_numeric_separators,
+        source_expression_has_const_assertion_context,
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -3197,6 +3199,41 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 is_external_module,
                 facts.is_declaration_file(),
             )?;
+            if let Some(implementation) = overload.implementation {
+                let callable =
+                    overload
+                        .declarations
+                        .last()
+                        .cloned()
+                        .ok_or(SourceCheckError::Function(
+                            SourceFunctionInvariant::Callable(implementation.declaration),
+                        ))?;
+                for signature in &overload.declarations {
+                    for annotation in signature
+                        .parameters
+                        .iter()
+                        .filter_map(|parameter| parameter.explicit_type_node())
+                        .chain(signature.return_type.type_node())
+                    {
+                        self.plan_type_import_annotation_root(annotation)?;
+                    }
+                }
+                if declarations
+                    .iter()
+                    .copied()
+                    .filter(|node| *node != implementation.declaration)
+                    .any(|node| !preplanned_overload_declarations.insert(node))
+                    || preplanned_functions
+                        .insert(implementation.declaration, callable)
+                        .is_some()
+                {
+                    return Err(SourceCheckError::Function(
+                        SourceFunctionInvariant::DuplicateDeclaration(statement),
+                    ));
+                }
+                overloads.push(overload);
+                continue;
+            }
             if declarations
                 .iter()
                 .any(|declaration| !preplanned_overload_declarations.insert(*declaration))
@@ -11157,6 +11194,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .ok_or(SourceCheckError::Function(
                 SourceFunctionInvariant::MissingDeclarations(owner),
             ))?;
+        let exported_implementation = is_external_module
+            && !is_declaration_file
+            && store
+                .source_exported_overload_local(owner, declarations)
+                .is_some();
         if owner_record.flags() != SymbolFlags::FUNCTION {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::NonFunctionSymbol {
@@ -11168,7 +11210,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         if actual_declarations != declarations
             || owner_record.value_declaration() != Some(first)
-            || owner_record.parent().is_some()
+            || owner_record.parent().is_some() && !exported_implementation
             || owner_record.export_symbol().is_some()
             || owner_record.exports().is_some()
         {
@@ -11189,7 +11231,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 is_external_module,
                 is_declaration_file,
             )?;
-            if !matches!(header.modifier_mode, PlannedFunctionModifierMode::Declare)
+            let modifiers_match = if exported_implementation {
+                matches!(header.modifier_mode, PlannedFunctionModifierMode::Export(_))
+            } else {
+                matches!(header.modifier_mode, PlannedFunctionModifierMode::Declare)
+            };
+            if !modifiers_match
                 || expected_name
                     .as_ref()
                     .is_some_and(|name: &String| name != &header.name_text)
@@ -11207,14 +11254,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             expected_name.get_or_insert(header.name_text);
         }
-        let plan = plan_source_ambient_overload_group(
-            store,
-            host,
-            owner,
-            declarations,
-            self.array_targets,
-        )
-        .map_err(|error| Self::overload_plan_error(first, error))?;
+        let planner = if exported_implementation {
+            plan_source_exported_overload_group
+        } else {
+            plan_source_ambient_overload_group
+        };
+        let plan = planner(store, host, owner, declarations, self.array_targets)
+            .map_err(|error| Self::overload_plan_error(first, error))?;
         if !self.hoisted_functions.insert(owner) {
             return Err(SourceCheckError::Function(
                 SourceFunctionInvariant::DuplicateDeclaration(first),
@@ -26598,6 +26644,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 | PlannedExpressionKind::Number { .. }
                 | PlannedExpressionKind::BigInt { .. }
                 | PlannedExpressionKind::Boolean(_)
+                | PlannedExpressionKind::Array(_)
                 | PlannedExpressionKind::Object { .. }
         );
         if const_assertion
@@ -30670,6 +30717,7 @@ fn prepare_const_object_property(
             Ok(PreparedExpression::ClassReceiver)
         }
         (PlannedExpressionKind::Object { .. }, PreparedExpression::Object(_))
+        | (PlannedExpressionKind::Array(_), PreparedExpression::ConstArray { .. })
         | (PlannedExpressionKind::Property(_), PreparedExpression::Property(_))
         | (PlannedExpressionKind::Template(_), PreparedExpression::Template(_))
         | (
@@ -30895,8 +30943,19 @@ where
         (PlannedExpressionKind::Template(_), PreparedExpression::Template(contextual_type)) => {
             check_nested_expression(store, session, expression, *contextual_type, None)
         }
-        (PlannedExpressionKind::Array(elements), PreparedExpression::Array(prepared_elements)) => {
+        (
+            PlannedExpressionKind::Array(elements),
+            PreparedExpression::Array(prepared_elements)
+            | PreparedExpression::ConstArray {
+                elements: prepared_elements,
+                ..
+            },
+        ) => {
             debug_assert_eq!(elements.len(), prepared_elements.len());
+            let const_readonly = match prepared {
+                PreparedExpression::ConstArray { readonly, .. } => Some(*readonly),
+                _ => None,
+            };
             let global_types = global_types.ok_or(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Syntax {
                     node: expression.node,
@@ -30908,7 +30967,7 @@ where
             let mut element_types = Vec::with_capacity(elements.len());
             let mut element_infos = Vec::with_capacity(elements.len());
             for (index, (element, prepared)) in elements.iter().zip(prepared_elements).enumerate() {
-                let checked = execute_expression_types(
+                let mut checked = execute_expression_types(
                     store,
                     Some(global_types),
                     session,
@@ -30919,6 +30978,14 @@ where
                     property_diagnostics,
                     check_nested_expression,
                 )?;
+                if const_readonly.is_some() {
+                    checked.result = prepared_fresh_literal_union_type(
+                        store,
+                        global_types,
+                        checked.raw,
+                        LiteralTreatment::Regular,
+                    )?;
+                }
                 if let Some(spread) = expression.array_spread_node(index) {
                     if let Some(array) =
                         store.canonical_array_reference(global_types, checked.result)?
@@ -30966,7 +31033,16 @@ where
                 }
                 checked_elements.push(checked);
             }
-            let base = if let Some(contextual_tuple) = tuple_contexts.get(&expression.node) {
+            let base = if let Some(readonly) = const_readonly {
+                store
+                    .create_canonical_tuple_type(
+                        CanonicalTupleTypeRequest::new(&element_types, &element_infos, readonly)
+                            .with_array_targets(CanonicalArrayTargets::from_global_types(
+                                global_types,
+                            )),
+                    )
+                    .map_err(|error| source_const_tuple_error(expression.node, error))?
+            } else if let Some(contextual_tuple) = tuple_contexts.get(&expression.node) {
                 let shape = store
                     .canonical_tuple_shape(*contextual_tuple)
                     .map_err(|_| RelationUnavailable::InvalidStructuredMembers(*contextual_tuple))?
@@ -31459,6 +31535,20 @@ fn source_contextual_tuple_error(contextual: TypeId, error: TupleTypeError) -> S
         | TupleTypeError::InvalidPreparedQuery => SourceCheckError::RelationUnavailable(
             RelationUnavailable::InvalidStructuredMembers(contextual),
         ),
+    }
+}
+
+fn source_const_tuple_error(node: NodeRef, error: TupleTypeError) -> SourceCheckError {
+    match error {
+        TupleTypeError::BootstrapUninitialized => {
+            SourceCheckError::LiteralCache(SourceLiteralCacheError::BootstrapUninitialized)
+        }
+        TupleTypeError::ArrayType(error) => SourceCheckError::ArrayType(error),
+        TupleTypeError::LengthType(error) => error.into(),
+        TupleTypeError::Capacity => {
+            SourceCheckError::LiteralCache(SourceLiteralCacheError::Capacity)
+        }
+        error => super::type_nodes::tuple_type_error(error, node).into(),
     }
 }
 
@@ -33628,7 +33718,7 @@ fn check_expression_type_with_capture_context(
                                 | TypeFlags::INTERSECTION,
                         )
                     })
-                }) || template_expression_is_const_asserted(host, expression.node)
+                }) || source_expression_has_const_assertion_context(store, host, expression.node)?
                     || substitutions.iter().all(|substitution| {
                         store.type_payload(*substitution).is_some_and(|record| {
                             record
@@ -35840,7 +35930,11 @@ fn check_expression_type_with_capture_context(
                 current_flow_types,
                 type_import_execution,
                 operand,
-                literal_target,
+                if *const_assertion {
+                    contextual_type
+                } else {
+                    literal_target
+                },
                 deferred,
                 class_flow.as_deref_mut(),
                 arrow_capture,
@@ -35880,6 +35974,26 @@ fn check_expression_type_with_capture_context(
                             PlannedExpressionKind::Object { .. }
                         ) =>
                     {
+                        operand_types.result
+                    }
+                    TypeData::TypeReference(_)
+                        if matches!(
+                            &operand.unparenthesized().kind,
+                            PlannedExpressionKind::Array(_)
+                        ) && record.object_flags().contains(ObjectFlags::ARRAY_LITERAL) =>
+                    {
+                        if store
+                            .canonical_array_reference(global_types, operand_types.result)?
+                            .is_none()
+                            && store
+                                .canonical_tuple_shape(operand_types.result)
+                                .map_err(|error| source_const_tuple_error(operand.node, error))?
+                                .is_none()
+                        {
+                            return Err(SourceCheckError::LiteralCache(
+                                SourceLiteralCacheError::InvalidCachedLiteral(operand_types.result),
+                            ));
+                        }
                         operand_types.result
                     }
                     TypeData::Intrinsic(_)
@@ -39731,63 +39845,6 @@ fn check_uncached_conditional_scalar(
             },
         )),
     }
-}
-
-fn template_expression_is_const_asserted(host: &DeclaredTypeHost<'_>, node: NodeRef) -> bool {
-    let mut current = node;
-    let mut visited = HashSet::new();
-    while visited.insert(current) {
-        let Some(parent) = host
-            .node(current)
-            .and_then(|record| record.parent)
-            .map(|parent| NodeRef::new(current.arena, current.file, parent))
-        else {
-            return false;
-        };
-        let Some(parent_record) = host.node(parent) else {
-            return false;
-        };
-        let annotation = match &parent_record.data {
-            NodeData::AsExpression(assertion) if assertion.expression == current.node => {
-                assertion.type_
-            }
-            NodeData::TypeAssertion(assertion) if assertion.expression == current.node => {
-                assertion.type_
-            }
-            NodeData::ParenthesizedExpression(parenthesized)
-                if parenthesized.expression == current.node =>
-            {
-                current = parent;
-                continue;
-            }
-            NodeData::PropertyAssignment(property) if property.initializer == current.node => {
-                current = parent;
-                continue;
-            }
-            NodeData::ObjectLiteralExpression(object)
-                if object.properties.nodes.contains(&current.node) =>
-            {
-                current = parent;
-                continue;
-            }
-            _ => return false,
-        };
-        let annotation = NodeRef::new(parent.arena, parent.file, annotation);
-        let Some(NodeData::TypeReferenceNode(reference)) =
-            host.node(annotation).map(|record| &record.data)
-        else {
-            return false;
-        };
-        if reference.type_arguments.is_some() {
-            return false;
-        }
-        let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
-        return matches!(
-            host.node(name).map(|record| &record.data),
-            Some(NodeData::Identifier(identifier)) if identifier.text == "const"
-        );
-    }
-    false
 }
 
 fn source_template_expression_error(node: NodeRef, error: &TemplateTypeError) -> SourceCheckError {
@@ -53627,29 +53684,54 @@ fn materialize_source_overloads(
                 }
                 parameter_types.push(parameter_type);
             }
-            let return_node =
-                declaration
-                    .return_type
-                    .type_node()
-                    .ok_or(SourceCheckError::Function(
-                        SourceFunctionInvariant::Callable(declaration.declaration),
-                    ))?;
-            session.reset_query();
-            let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
-            let return_type = CanonicalTypeQuery::new_with_global_types_and_session(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                &mut return_diagnostics,
-            )?
-            .get_type_from_type_node(return_node);
-            merge_retry_diagnostics(diagnostics, return_diagnostics);
+            let return_type = if let Some(return_node) = declaration.return_type.type_node() {
+                session.reset_query();
+                let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
+                let return_type = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut return_diagnostics,
+                )?
+                .get_type_from_type_node(return_node);
+                merge_retry_diagnostics(diagnostics, return_diagnostics);
+                return_type?
+            } else if declaration.return_type.is_inferred()
+                && declaration.body_mode == SourceCallableBodyMode::Present
+                && declaration.type_parameters.is_empty()
+                && !declaration.is_async
+                && overload.implementation.is_some_and(|implementation| {
+                    implementation.declaration == declaration.declaration
+                        && implementation.body == declaration.body
+                        && store.source_empty_overload_implementation_is_exact(
+                            overload.owner_symbol,
+                            implementation,
+                        )
+                })
+            {
+                // The normal body pass below checks this same empty return again.
+                let inferred = empty_source_return_for_context(store, None)?;
+                source_callable_inferred_return_type(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    declaration,
+                    inferred,
+                )?
+            } else {
+                return Err(SourceCheckError::Function(
+                    SourceFunctionInvariant::Callable(declaration.declaration),
+                ));
+            };
             resolved.push(ResolvedSourceOverloadSignature {
                 query_evidence,
                 parameter_types,
-                return_type: return_type?,
+                return_type,
             });
         }
         prepared.push(
@@ -53700,7 +53782,11 @@ fn materialize_source_overloads(
                                 .ok_or(SourceCheckError::MissingDiagnostic(2394))?,
                         ),
                         related_information: vec![CanonicalCheckerRelatedInformation {
-                            node: Some(name),
+                            node: Some(if declaration.export_local.is_some() {
+                                implementation.declaration
+                            } else {
+                                name
+                            }),
                             diagnostic: Diagnostic::new(
                                 message_by_code(2750)
                                     .ok_or(SourceCheckError::MissingDiagnostic(2750))?,

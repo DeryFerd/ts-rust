@@ -158,6 +158,116 @@ pub(super) struct CanonicalTypeQueryOptions {
     pub no_implicit_any: bool,
 }
 
+/// Follows the actual source parents that carry an enclosing const assertion.
+#[allow(clippy::too_many_lines)] // Each parent form proves its own child before the assertion is read.
+pub(super) fn source_expression_has_const_assertion_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<bool, DeclaredTypeError> {
+    let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+    let checked = |node: NodeRef| {
+        let record = preflight_node(store, host, node)?;
+        let parent = record
+            .parent
+            .map_or(super::store::SourceNodeParent::Root, |parent| {
+                super::store::SourceNodeParent::Parent(NodeRef::new(node.arena, node.file, parent))
+            });
+        if store.source_node_kind(node) != Some(record.kind)
+            || store.source_node_parent(node) != Some(parent)
+        {
+            return Err(invalid());
+        }
+        Ok(record)
+    };
+    let mut operand = node;
+    let mut visited = HashSet::new();
+    while visited.insert(operand) {
+        let Some(parent) = checked(operand)?.parent else {
+            return Ok(false);
+        };
+        let parent = NodeRef::new(operand.arena, operand.file, parent);
+        let record = checked(parent)?;
+        let type_node = match (&record.data, record.kind) {
+            (
+                NodeData::ParenthesizedExpression(parenthesized),
+                SyntaxKind::ParenthesizedExpression,
+            ) if parenthesized.expression == operand.node => {
+                operand = parent;
+                continue;
+            }
+            (NodeData::ArrayLiteralExpression(array), SyntaxKind::ArrayLiteralExpression) => {
+                if array
+                    .elements
+                    .nodes
+                    .iter()
+                    .filter(|child| **child == operand.node)
+                    .count()
+                    != 1
+                {
+                    return Err(invalid());
+                }
+                operand = parent;
+                continue;
+            }
+            (NodeData::SpreadElement(spread), SyntaxKind::SpreadElement)
+                if spread.expression == operand.node =>
+            {
+                operand = parent;
+                continue;
+            }
+            (NodeData::PropertyAssignment(property), SyntaxKind::PropertyAssignment)
+                if property.initializer == operand.node =>
+            {
+                let owner = record.parent.ok_or_else(invalid)?;
+                let owner = NodeRef::new(parent.arena, parent.file, owner);
+                let owner_record = checked(owner)?;
+                let NodeData::ObjectLiteralExpression(object) = &owner_record.data else {
+                    return Err(invalid());
+                };
+                if owner_record.kind != SyntaxKind::ObjectLiteralExpression
+                    || !object.properties.nodes.contains(&parent.node)
+                {
+                    return Err(invalid());
+                }
+                operand = owner;
+                continue;
+            }
+            (NodeData::AsExpression(assertion), SyntaxKind::AsExpression)
+                if assertion.expression == operand.node =>
+            {
+                assertion.type_
+            }
+            (NodeData::TypeAssertion(assertion), SyntaxKind::TypeAssertionExpression)
+                if assertion.expression == operand.node =>
+            {
+                assertion.type_
+            }
+            _ => return Ok(false),
+        };
+        let type_node = NodeRef::new(parent.arena, parent.file, type_node);
+        let type_record = checked(type_node)?;
+        if type_record.parent != Some(parent.node) {
+            return Err(invalid());
+        }
+        let NodeData::TypeReferenceNode(reference) = &type_record.data else {
+            return Ok(false);
+        };
+        if type_record.kind != SyntaxKind::TypeReference || reference.type_arguments.is_some() {
+            return Ok(false);
+        }
+        let name = NodeRef::new(type_node.arena, type_node.file, reference.type_name);
+        let name_record = checked(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Ok(false);
+        };
+        return Ok(name_record.kind == SyntaxKind::Identifier
+            && name_record.parent == Some(type_node.node)
+            && identifier.text == "const");
+    }
+    Err(invalid())
+}
+
 /// Checks fixed keyword tuples through the ordinary type-node planner.
 /// This slice needs no generic instantiation or global array capability.
 pub(super) fn preflight_fixed_keyword_tuple_annotation(
@@ -7615,7 +7725,7 @@ fn tuple_type_node_error(error: TupleTypeNodeError) -> DeclaredTypeError {
     }
 }
 
-fn tuple_type_error(error: TupleTypeError, node: NodeRef) -> DeclaredTypeError {
+pub(super) fn tuple_type_error(error: TupleTypeError, node: NodeRef) -> DeclaredTypeError {
     match error {
         TupleTypeError::BootstrapUninitialized => DeclaredTypeError::Unavailable(
             DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
@@ -38593,21 +38703,40 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 callable.declaration,
             ))
         };
-        let group = self
-            .host
-            .source(callable.declaration)
-            .and_then(|(arena, _)| {
-                super::jsdoc::authenticated_jsdoc_overload_group(arena, callable.declaration)
-            })
-            .ok_or_else(invalid)?;
-        let actual = source_callables::plan_source_jsdoc_overload_declaration(
-            self.store,
-            self.host,
-            callable.declaration,
-            callable.owner_symbol,
-            &group.declarations,
-            callable.array_targets,
-        )
+        let actual = if let Some(declarations) = self
+            .store
+            .symbol(callable.owner_symbol)
+            .and_then(|owner| owner.declarations())
+            && self
+                .store
+                .source_exported_overload_local(callable.owner_symbol, declarations)
+                .is_some()
+        {
+            source_callables::plan_source_exported_overload_declaration(
+                self.store,
+                self.host,
+                callable.declaration,
+                callable.owner_symbol,
+                declarations,
+                callable.array_targets,
+            )
+        } else {
+            let group = self
+                .host
+                .source(callable.declaration)
+                .and_then(|(arena, _)| {
+                    super::jsdoc::authenticated_jsdoc_overload_group(arena, callable.declaration)
+                })
+                .ok_or_else(invalid)?;
+            source_callables::plan_source_jsdoc_overload_declaration(
+                self.store,
+                self.host,
+                callable.declaration,
+                callable.owner_symbol,
+                &group.declarations,
+                callable.array_targets,
+            )
+        }
         .map_err(|error| source_callable_error(error, callable.family))?;
         if actual != *callable || !callable.requires_type_query_evidence() {
             return Err(invalid());
@@ -42255,12 +42384,24 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 {
                     return Some(count);
                 }
-                plan.interfaces
+                let count = plan
+                    .interfaces
                     .values()
                     .chain(plan.generic_interfaces.values())
                     .chain(plan.type_literals.values())
                     .try_fold(count, |count, interface| {
-                        count.checked_add(object_members::optional_method_union_operations(
+                        count
+                            .checked_add(object_members::optional_method_union_operations(
+                                interface,
+                            )?)?
+                            .checked_add(object_members::optional_interface_call_union_operations(
+                                interface,
+                            )?)
+                    })?;
+                plan.generic_member_plans
+                    .values()
+                    .try_fold(count, |count, interface| {
+                        count.checked_add(object_members::optional_interface_call_union_operations(
                             interface,
                         )?)
                     })
@@ -42871,6 +43012,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         {
             return Err(invalid());
         }
+        object_members::prepare_interface_call_optional_parameters(
+            self.store,
+            &members,
+            prepared,
+            self.global_types.as_ref(),
+        )
+        .map_err(property_object_error)?;
         object_members::publish_generic_interface_declared_members(
             self.store,
             &members,
@@ -43150,6 +43298,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     return_type,
                 });
             }
+            object_members::prepare_interface_call_optional_parameters(
+                self.store,
+                &interface,
+                prepared,
+                self.global_types.as_ref(),
+            )
+            .map_err(property_object_error)?;
             let method_values = object_members::publish_interface_method_values_prepared(
                 self.store,
                 &interface,
