@@ -37613,8 +37613,7 @@ fn check_planned_class_body(
                 .and_then(|links| links.resolved_type)
                 .ok_or(SourceCheckError::Class(parameter.declaration))?;
             let type_ = parameter
-                .type_
-                .resolved(store)
+                .resolved_type(store, class.source.type_query_context())
                 .map_err(|error| SourcePlanner::class_plan_error(parameter.declaration, error))?;
             if cached != type_ {
                 return Err(SourceCheckError::Class(parameter.declaration));
@@ -37658,8 +37657,7 @@ fn check_planned_class_body(
         let mut parameter_flow = context.state.base_flow_types.clone();
         for (index, parameter) in body.parameters.iter().enumerate() {
             let type_ = parameter
-                .type_
-                .resolved(store)
+                .resolved_type(store, class.source.type_query_context())
                 .map_err(|error| SourcePlanner::class_plan_error(parameter.declaration, error))?;
             if let Some((_, initializer)) = planned
                 .parameter_initializers
