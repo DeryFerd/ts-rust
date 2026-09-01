@@ -13021,12 +13021,16 @@ fn publish_prepared_contextual_source_callable(
             prepared.variable_symbol == Some(prepared.owner_symbol)
                 && prepared.flags == SignatureFlags::NONE
                 && minimum == Some(parameter_count)
-                && target.parameters.len() == parameter_count
-                && target
-                    .parameters
-                    .iter()
-                    .zip(prepared.parameters)
-                    .all(|(expected, actual)| *expected == actual.type_)
+                && object_method_parameter_prefix_is_exact(
+                    store,
+                    prepared.declaration,
+                    prepared.owner_symbol,
+                    &target.parameters,
+                    prepared
+                        .parameters
+                        .iter()
+                        .map(|parameter| (parameter.symbol, parameter.type_)),
+                )
         })
     } else if direct_call_anchor {
         valid_direct_call_contextual_target(store, prepared.contextual_target, prepared.parameters)
@@ -13228,13 +13232,46 @@ pub(super) fn authenticated_object_method_contextual_target(
     owner_symbol: SemanticSymbolId,
     target: TypeId,
 ) -> Option<ValidatedSingleCallable> {
-    if !store.source_object_literal_method_owner_is_exact(declaration, owner_symbol)
-        || store.type_payload(target)?.symbol() == Some(owner_symbol)
-    {
+    if !store.source_object_literal_method_owner_is_exact(declaration, owner_symbol) {
         return None;
     }
+    let record = store.type_payload(target)?;
+    if record.symbol() == Some(owner_symbol) {
+        return None;
+    }
+    let callable_target = if let TypeData::Union(union) = record.data() {
+        let undefined = store.intrinsic_bootstrap()?.undefined_type;
+        let [first, second] = union.union.types.as_slice() else {
+            return None;
+        };
+        let callable = if *first == undefined {
+            *second
+        } else if *second == undefined {
+            *first
+        } else {
+            return None;
+        };
+        if store.type_payload(callable)?.symbol() == Some(owner_symbol) {
+            return None;
+        }
+        if let Some(alias) = record.alias() {
+            store
+                .validate_union_alias_identity(
+                    target,
+                    alias.symbol()?,
+                    alias.type_arguments().unwrap_or(&[]),
+                )
+                .ok()?;
+        }
+        store
+            .validate_cached_union_result(target, record.alias().and_then(|alias| alias.symbol()))
+            .ok()?;
+        callable
+    } else {
+        target
+    };
     let StoredSingleCallableValidation::Valid { callable, .. } =
-        validate_stored_single_callable(store, target)
+        validate_stored_single_callable(store, callable_target)
     else {
         return None;
     };
@@ -13245,6 +13282,41 @@ pub(super) fn authenticated_object_method_contextual_target(
         && callable.rest_parameter.is_none()
         && callable.return_type.is_some())
     .then_some(callable)
+}
+
+/// Checks every actual source parameter against the corresponding contextual type.
+pub(super) fn object_method_parameter_prefix_is_exact(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    contextual_parameters: &[TypeId],
+    parameters: impl Iterator<Item = (SemanticSymbolId, TypeId)>,
+) -> bool {
+    if !store.source_object_literal_method_owner_is_exact(declaration, owner_symbol) {
+        return false;
+    }
+    let Some(children) = store.source_direct_children(declaration) else {
+        return false;
+    };
+    let mut declarations = children
+        .into_iter()
+        .filter(|child| store.source_node_kind(*child) == Some(SyntaxKind::Parameter));
+    for (index, (symbol, type_)) in parameters.enumerate() {
+        let Some(parameter) = declarations.next() else {
+            return false;
+        };
+        if contextual_parameters.get(index).copied() != Some(type_)
+            || store.type_payload(type_).is_none()
+            || store.source_declaration_symbol(parameter) != Some(symbol)
+            || store.source_node_parent(parameter) != Some(SourceNodeParent::Parent(declaration))
+            || store
+                .symbol(symbol)
+                .is_none_or(|record| record.value_declaration() != Some(parameter))
+        {
+            return false;
+        }
+    }
+    declarations.next().is_none()
 }
 
 fn authenticated_contextual_declared_call_target(
@@ -15677,7 +15749,19 @@ pub(super) fn validate_stored_source_callable(
                         target,
                     )
                     .is_some_and(|target| {
-                        expected_parameter_types == Some(target.parameters.as_slice())
+                        expected_parameter_types.is_some_and(|types| {
+                            object_method_parameter_prefix_is_exact(
+                                store,
+                                declaration,
+                                owner_symbol,
+                                &target.parameters,
+                                signature_record
+                                    .parameters()
+                                    .iter()
+                                    .copied()
+                                    .zip(types.iter().copied()),
+                            )
+                        })
                     })
             } else if direct_call_anchor {
                 signature_record.flags() == SignatureFlags::NONE

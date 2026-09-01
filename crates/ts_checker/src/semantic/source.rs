@@ -24293,6 +24293,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 },
             ),
             PlannedFunctionBody::Linear(linear) => (Some(linear), PlannedArrowBody::Empty),
+            PlannedFunctionBody::StatementList(body) => (None, PlannedArrowBody::StatementList(body)),
             _ => return Err(Self::unsupported_function_body(&callable)),
         };
         self.nested_arrow_callables.push(callable.clone());
@@ -41903,7 +41904,9 @@ fn check_contextual_object_literal_method(
     if callable.family != SourceCallableFamily::ObjectLiteralMethod
         || !callable.return_type.is_inferred()
         || !callable.type_parameters.is_empty()
-        || callable.parameters.len() != target.parameters.len()
+        || callable.parameters.len() > target.parameters.len()
+        || callable.flags != SignatureFlags::NONE
+        || usize::try_from(callable.min_argument_count).ok() != Some(callable.parameters.len())
         || callable.parameters.iter().any(|parameter| {
             !parameter.is_implicit_any()
                 || parameter.optional
@@ -41916,8 +41919,11 @@ fn check_contextual_object_literal_method(
         || method.prototype_this.is_some()
         || !matches!(
             method.body,
-            PlannedArrowBody::Empty | PlannedArrowBody::Return { .. }
+            PlannedArrowBody::Empty
+                | PlannedArrowBody::Return { .. }
+                | PlannedArrowBody::StatementList(_)
         )
+        || matches!(method.body, PlannedArrowBody::StatementList(_)) && method.linear_body.is_some()
         || method.linear_body.as_ref().is_some_and(|linear| {
             linear.statements.iter().any(|statement| {
                 matches!(
@@ -41950,6 +41956,19 @@ fn check_contextual_object_literal_method(
             type_: *parameter_type,
         });
     }
+    if !super::source_callables::object_method_parameter_prefix_is_exact(
+        store,
+        callable.declaration,
+        callable.owner_symbol,
+        &target.parameters,
+        parameters
+            .iter()
+            .map(|parameter| (parameter.symbol, parameter.type_)),
+    ) {
+        return Err(SourceCheckError::Function(
+            SourceFunctionInvariant::Callable(callable.declaration),
+        ));
+    }
     let mut local_values = HashMap::new();
     let mut local_order = Vec::new();
     if let Some(linear) = &method.linear_body {
@@ -41978,16 +41997,13 @@ fn check_contextual_object_literal_method(
             outer_capture,
         )?;
     }
-    let body = match &method.body {
-        PlannedArrowBody::Empty => method
-            .linear_body
-            .as_ref()
-            .and_then(|linear| linear.return_expression.as_ref()),
-        PlannedArrowBody::Return { expression, .. } => Some(expression),
-        _ => return Err(unsupported()),
-    };
-    let return_type = if let Some(body) = body {
-        let checked = check_expression_type_with_capture_context(
+    let return_type = if let PlannedArrowBody::StatementList(body) = &method.body {
+        if body.syntax.callable != *callable {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(callable.declaration),
+            ));
+        }
+        check_planned_callable_statement_list_worker(
             store,
             host,
             global_types,
@@ -41995,17 +42011,51 @@ fn check_contextual_object_literal_method(
             options,
             session,
             diagnostics,
-            &flow_types,
+            flow_types,
             type_import_execution,
-            body,
-            target.return_type,
             deferred,
-            None,
+            body,
+            &mut local_values,
+            &mut local_order,
             outer_capture,
-        )?;
-        inferred_source_return_for_context(store, global_types, checked.result, target.return_type)?
+            Some(&parameters),
+            target.return_type,
+        )?
     } else {
-        empty_source_return_for_context(store, target.return_type)?
+        let body = match &method.body {
+            PlannedArrowBody::Empty => method
+                .linear_body
+                .as_ref()
+                .and_then(|linear| linear.return_expression.as_ref()),
+            PlannedArrowBody::Return { expression, .. } => Some(expression),
+            _ => return Err(unsupported()),
+        };
+        if let Some(body) = body {
+            let checked = check_expression_type_with_capture_context(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                &flow_types,
+                type_import_execution,
+                body,
+                target.return_type,
+                deferred,
+                None,
+                outer_capture,
+            )?;
+            inferred_source_return_for_context(
+                store,
+                global_types,
+                checked.result,
+                target.return_type,
+            )?
+        } else {
+            empty_source_return_for_context(store, target.return_type)?
+        }
     };
     let type_ = publish_contextual_source_callable(
         store,
@@ -42310,6 +42360,7 @@ fn check_contextual_direct_call_arrow_worker(
                 &mut statement_value_order,
                 outer_capture,
                 Some(&prepared_parameters),
+                None,
             )?
         }
         PlannedArrowBody::ForOf(_) | PlannedArrowBody::ReturnJsx { .. } => {
@@ -53197,6 +53248,7 @@ struct CallableStatementReturns {
     values: Vec<TypeId>,
     has_bare_return: bool,
     has_return: bool,
+    contextual_return: Option<TypeId>,
 }
 
 fn restore_callable_statement_entries(
@@ -53251,6 +53303,7 @@ fn check_planned_callable_statement_list(
         value_order,
         outer_capture,
         None,
+        None,
     )
 }
 
@@ -53272,6 +53325,7 @@ fn check_planned_callable_statement_list_worker(
     value_order: &mut Vec<SemanticSymbolId>,
     outer_capture: Option<SourceArrowCaptureContext<'_>>,
     contextual_parameters: Option<&[ContextualSourceCallableParameter]>,
+    contextual_return: Option<TypeId>,
 ) -> Result<TypeId, SourceCheckError> {
     let callable = &body.syntax.callable;
     if !body.flow.statement_list_is_exact(&body.syntax) {
@@ -53294,6 +53348,11 @@ fn check_planned_callable_statement_list_worker(
                         || store.type_payload(actual.type_).is_none()
                 }))
     {
+        return Err(SourceCheckError::Arrow(callable.declaration));
+    }
+    if contextual_return.is_some_and(|type_| {
+        contextual_parameters.is_none() || store.type_payload(type_).is_none()
+    }) {
         return Err(SourceCheckError::Arrow(callable.declaration));
     }
     let signature = if callable.return_type.is_inferred() && contextual_parameters.is_none() {
@@ -53363,6 +53422,7 @@ fn check_planned_callable_statement_list_worker(
         let mut returned = CallableStatementReturns {
             declared_entries,
             has_bare_return: body.syntax.has_implicit_return,
+            contextual_return,
             ..CallableStatementReturns::default()
         };
         add_arrow_object_parameter_entries(store, host, callable, &mut returned.declared_entries)?;
@@ -53416,7 +53476,9 @@ fn check_planned_callable_statement_list_worker(
                 session,
                 &returned.values,
                 returned.has_bare_return,
-                callable.contextual_function_expression_return(),
+                returned
+                    .contextual_return
+                    .or_else(|| callable.contextual_function_expression_return()),
             )
         }
     })();
@@ -53894,7 +53956,7 @@ fn check_callable_statement_nodes(
                         snapshot.types(),
                         type_import_execution,
                         expression,
-                        None,
+                        returned.contextual_return,
                         deferred,
                         None,
                         capture,
