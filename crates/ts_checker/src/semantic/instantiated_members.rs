@@ -8143,22 +8143,63 @@ fn validate_declared_target(
     active.push(target);
     let source_class = owner_record.flags().contains(SymbolFlags::CLASS)
         && store.source_class_provenance(target).is_some();
-    let call_edges = if source_class {
-        Vec::new()
-    } else {
+    if !source_class {
         super::object_members::generic_declared_call_signature_edges(store, target)
+            .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
+        let TypeData::Interface(interface) = store
+            .type_payload(target)
             .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?
-    };
-    for type_ in call_edges {
-        member_type_requires_instantiation(store, type_, &mapper_parameters, array_targets)?;
-        validate_nested_reference_targets(
-            store,
-            type_,
-            array_targets,
-            active,
-            validated,
-            &mut HashSet::new(),
-        )?;
+            .data()
+        else {
+            return Err(GenericInterfaceMemberError::InvalidTarget(target));
+        };
+        for &signature in interface
+            .declared_call_signatures
+            .as_deref()
+            .unwrap_or_default()
+        {
+            let record = store
+                .signature(signature)
+                .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
+            // Each call can use its own formals, but not a sibling call's formals.
+            let mut signature_parameters = mapper_parameters.clone();
+            signature_parameters.extend_from_slice(record.type_parameters());
+            let mut edges = store
+                .callable_signature_parameter_types(signature)
+                .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?
+                .to_vec();
+            for &parameter in record.type_parameters() {
+                let Some(TypeData::TypeParameter(data)) =
+                    store.type_payload(parameter).map(super::TypeRecord::data)
+                else {
+                    return Err(GenericInterfaceMemberError::InvalidTarget(target));
+                };
+                edges.push(parameter);
+                edges.extend(data.constraint);
+                edges.extend(data.resolved_default_type);
+            }
+            edges.push(
+                record
+                    .resolved_return_type()
+                    .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?,
+            );
+            for type_ in edges {
+                member_type_requires_instantiation(
+                    store,
+                    type_,
+                    &signature_parameters,
+                    array_targets,
+                )?;
+                validate_nested_reference_targets(
+                    store,
+                    type_,
+                    array_targets,
+                    active,
+                    validated,
+                    &mut HashSet::new(),
+                )?;
+            }
+        }
     }
     let mut base_types = store
         .type_payload(target)
@@ -11537,6 +11578,107 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the saved records next to their corruption and restoration.
+    fn generic_interface_call_domains_reject_sibling_formals() {
+        let parsed = parse_source_file(concat!(
+            "interface Callable<A> { <B>(value: B): A; <C>(value: C): A; } ",
+            "declare const callable: Callable<string>;",
+        ));
+        let file = FileId::new(202_988);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let reference =
+            property_object_alias_variable_type(&parsed, file, &mut context, "callable");
+        let store = context.store_mut_for_test();
+        let target = validate_direct_generic_reference(store, reference)
+            .unwrap()
+            .target;
+        resolve_members_with_array_targets(store, reference, None).unwrap();
+        let healthy = validate_generic_interface_callable(store, reference, None);
+        assert!(matches!(
+            &healthy,
+            Some(StoredCallableSetValidation::Valid { .. })
+        ));
+        let TypeData::Interface(interface) = store.type_payload(target).unwrap().data() else {
+            panic!("the declared call set must retain its interface")
+        };
+        let [first, second] = interface.declared_call_signatures.as_deref().unwrap() else {
+            panic!("the source must retain both call signatures")
+        };
+        let (first, second) = (*first, *second);
+        let sibling = store.signature(second).unwrap().type_parameters()[0];
+        let original_return = store.signature(first).unwrap().resolved_return_type();
+        assert_ne!(
+            store.signature(first).unwrap().type_parameters()[0],
+            sibling
+        );
+        assert_ne!(original_return, Some(sibling));
+        let (annotation, null_literal_identity) =
+            store.function_signature_return_annotation(first).unwrap();
+        assert!(!null_literal_identity);
+        assert_eq!(
+            store.source_node_kind(annotation),
+            Some(SyntaxKind::TypeReference)
+        );
+        let annotation_links = store.type_node_links(annotation).cloned().unwrap();
+        assert_eq!(annotation_links.resolved_type, original_return);
+        let members = store
+            .type_payload(reference)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .clone();
+        let counts = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let warm = counts(store);
+        assert!(store.set_signature_resolved_return_type(first, Some(sibling)));
+        assert!(store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(sibling),
+                ..annotation_links.clone()
+            },
+        ));
+        for _ in 0..2 {
+            assert!(
+                super::super::object_members::generic_declared_call_signature_edges(store, target)
+                    .is_some()
+            );
+            assert_eq!(
+                validate_generic_interface_members(store, reference, None),
+                Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                    sibling
+                )),
+            );
+            assert_eq!(counts(store), warm);
+            assert_eq!(
+                store.type_payload(reference).unwrap().data().structured(),
+                Some(&members),
+            );
+        }
+        assert!(store.set_signature_resolved_return_type(first, original_return));
+        assert!(store.set_type_node_links(annotation, annotation_links));
+        for _ in 0..2 {
+            assert_eq!(
+                validate_generic_interface_callable(store, reference, None),
+                healthy
+            );
+            assert_eq!(counts(store), warm);
+        }
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(counts(context.store()), warm);
     }
 
     #[test]

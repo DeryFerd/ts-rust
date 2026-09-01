@@ -26850,7 +26850,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &self,
         expression: NodeRef,
         target: &PlannedExpression,
-    ) -> Result<SourceFlowNullishAssignment, SourceCheckError> {
+    ) -> Result<(NodeRef, SourceFlowNullishAssignment), SourceCheckError> {
         let (store, host) = self
             .semantic
             .ok_or(SourceCheckError::LogicalOperator(expression))?;
@@ -26883,13 +26883,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         let container = self
             .bound
-            .flow_container(expression)
+            .container(expression)
             .ok_or(SourceCheckError::LogicalOperator(expression))?;
         validate_source_nullish_assignment(
             self.arena, self.bound, store, host, container, assignment,
         )
         .map_err(|error| class_body_flow_error(expression, error))?;
-        Ok(assignment)
+        Ok((container, assignment))
     }
 
     fn validate_nullish_assignment_position(
@@ -27155,7 +27155,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             let nullish_assignment = (operator_kind == SyntaxKind::QuestionQuestionEqualsToken)
                 .then(|| self.plan_nullish_assignment_flow(expression, &left_plan))
                 .transpose()?;
-            if let Some(assignment) = nullish_assignment {
+            if let Some((container, assignment)) = nullish_assignment {
                 if assignment.symbol.is_none() {
                     let member_root = nullish_member_root(&left_plan);
                     let mut pending = vec![&right_plan];
@@ -27180,10 +27180,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         value.eager_children(&mut pending);
                     }
                     if let Some(symbol) = nullish_member_root(&left_plan) {
-                        let container = self
-                            .bound
-                            .flow_container(expression)
-                            .ok_or(SourceCheckError::LogicalOperator(expression))?;
                         self.nullish_member_writes.insert((container, symbol));
                     }
                 }
@@ -27195,7 +27191,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 right: right_plan,
                 parent: None,
                 required_property_statement: false,
-                nullish_assignment,
+                nullish_assignment: nullish_assignment.map(|(_, assignment)| assignment),
             }))
         } else {
             PlannedExpressionKind::Binary(Box::new(PrimitiveBinaryPlan {
@@ -70105,11 +70101,21 @@ pub(super) fn check_source_file(
                 )?;
             }
             PlannedStatement::GenericInterface(interface) => {
-                for annotation in interface.property_type_nodes().chain(
-                    interface
-                        .index_type_nodes()
-                        .flat_map(|(key, value)| [key, value]),
-                ) {
+                for annotation in interface
+                    .property_type_nodes()
+                    .chain(
+                        interface
+                            .index_type_nodes()
+                            .flat_map(|(key, value)| [key, value]),
+                    )
+                    .chain(
+                        interface
+                            .call_signatures
+                            .iter()
+                            .filter(|call| !call.type_parameters.is_empty())
+                            .map(|call| call.return_type),
+                    )
+                {
                     session.reset_query();
                     CanonicalTypeQuery::new_with_global_types_and_session(
                         store,
@@ -72098,6 +72104,27 @@ pub(super) fn check_source_file(
                 let target = target?;
 
                 for call in &interface.call_signatures {
+                    if call
+                        .type_parameters
+                        .iter()
+                        .any(|parameter| parameter.default_type.is_some())
+                    {
+                        session.reset_query();
+                        let mut call_diagnostics = CanonicalCheckerDiagnostics::default();
+                        let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            &mut call_diagnostics,
+                        )
+                        .and_then(|mut query| {
+                            query.check_source_interface_call_type_parameter_defaults(call)
+                        });
+                        merge_retry_diagnostics(diagnostics, call_diagnostics);
+                        result?;
+                    }
                     for annotation in call
                         .parameters
                         .iter()

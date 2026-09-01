@@ -237,7 +237,7 @@ pub(super) fn validate_stored_callable_set_with_array_targets(
         return validation;
     }
 
-    if let Some(validation) = validate_stored_default_library_method_callable_set(store, type_) {
+    if let Some(validation) = validate_stored_global_method_callable_set(store, type_) {
         return validation;
     }
 
@@ -917,6 +917,42 @@ fn valid_untyped_javascript_source_signature(
                         ..ValueSymbolLinks::default()
                     })
         })
+}
+
+/// Parsed methods use the complete declared proof, including in default libraries.
+/// The specialized producer remains a separate proof with retained library facts.
+pub(super) fn validate_stored_global_method_callable_set(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<StoredCallableSetValidation> {
+    let method = store.symbol(store.type_payload(type_)?.symbol()?)?;
+    let [declaration] = method.declarations()? else {
+        return None;
+    };
+    if !method.flags().contains(SymbolFlags::METHOD)
+        || store.source_node_kind(*declaration) != Some(SyntaxKind::MethodSignature)
+        || !matches!(method.name().as_utf8(), Some("toFixed" | "toLowerCase"))
+    {
+        return None;
+    }
+    let ordinary = validate_stored_declared_method_callable_set(store, type_);
+    if matches!(
+        ordinary,
+        Some(
+            StoredCallableSetValidation::Valid { .. } | StoredCallableSetValidation::Pending { .. }
+        )
+    ) {
+        return ordinary;
+    }
+    if store.source_is_default_library_declaration(*declaration)
+        && let Some(specialized @ StoredCallableSetValidation::Valid { .. }) =
+            validate_stored_default_library_method_callable_set(store, type_)
+    {
+        return Some(specialized);
+    }
+    Some(ordinary.unwrap_or(StoredCallableSetValidation::Malformed {
+        family: CallableFamily::DeclaredCallSignatures,
+    }))
 }
 
 #[allow(clippy::too_many_lines)] // Keep the complete wrapper and method proof together.

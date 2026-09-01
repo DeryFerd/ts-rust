@@ -14250,6 +14250,67 @@ pub(super) fn plan_enclosing_generic_interface_methods(
     plan_selected_interface_method_overloads(store, host, owner_symbol, method_symbol)
 }
 
+/// Returns the complete call set for a generic interface's call return annotation.
+pub(super) fn plan_enclosing_generic_interface_calls(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Option<PropertyObjectPlan>, PropertyObjectError> {
+    let Ok(record) = preflight_node(store, host, node) else {
+        return Ok(None);
+    };
+    let Some(parent) = record.parent else {
+        return Ok(None);
+    };
+    let declaration = NodeRef::new(node.arena, node.file, parent);
+    let Ok(call_record) = preflight_node(store, host, declaration) else {
+        return Ok(None);
+    };
+    let NodeData::CallSignatureDeclaration(call) = &call_record.data else {
+        return Ok(None);
+    };
+    if call_record.kind != SyntaxKind::CallSignature || call.type_ != Some(node.node) {
+        return Ok(None);
+    }
+    let Some(owner) = call_record.parent else {
+        return Ok(None);
+    };
+    let owner = NodeRef::new(node.arena, node.file, owner);
+    let Ok(owner_record) = preflight_node(store, host, owner) else {
+        return Ok(None);
+    };
+    let NodeData::InterfaceDeclaration(interface) = &owner_record.data else {
+        return Ok(None);
+    };
+    if interface.type_parameters.is_none()
+        || !interface.members.nodes.iter().any(|member| {
+            let member = NodeRef::new(owner.arena, owner.file, *member);
+            preflight_node(store, host, member).is_ok_and(|record| {
+                matches!(&record.data, NodeData::CallSignatureDeclaration(call)
+                if call.type_parameters.as_ref().is_some_and(|parameters| {
+                    !parameters.nodes.is_empty()
+                }))
+            })
+        })
+    {
+        return Ok(None);
+    }
+    let invalid = || PropertyObjectError::UnsupportedMember {
+        node: declaration,
+        kind: SyntaxKind::CallSignature,
+    };
+    let owner_symbol = bound_symbol(store, host, owner).ok_or_else(invalid)?;
+    let plan = plan_generic_interface(store, host, owner_symbol)?;
+    if !plan.call_signatures.iter().any(|signature| {
+        signature.declaration == declaration
+            && signature.return_type == node
+            && !signature.is_construct()
+    }) {
+        return Err(invalid());
+    }
+    Ok(Some(plan))
+}
+
 /// Checks the interface owner and selects one complete source overload set.
 #[allow(clippy::too_many_lines)] // Merged declarations, parameters, and overload ownership share one proof.
 fn plan_selected_interface_method_overloads(

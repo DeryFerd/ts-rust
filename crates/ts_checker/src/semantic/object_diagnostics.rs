@@ -2040,6 +2040,21 @@ fn generic_assignability_diagnostic(
             session,
         )?;
     }
+    if diagnostic.diagnostic.details.is_empty()
+        && let Some(chain) = target_intersection_mismatch_chain(
+            store,
+            host,
+            global_types,
+            source_type,
+            target_type,
+            flags,
+            options,
+            &mut HashSet::new(),
+            session,
+        )?
+    {
+        diagnostic.diagnostic.details = render_detail_chain(chain, 1);
+    }
     Ok(diagnostic)
 }
 
@@ -3133,6 +3148,90 @@ fn append_diagnostic_property_path(head: &str, tail: &str) -> String {
     let (prefix, suffix) = tail.split_at(offset);
     let separator = if suffix.starts_with('[') { "" } else { "." };
     format!("{prefix}{head}{separator}{suffix}")
+}
+
+/// Retains the first failed target member in the relation's stored order.
+#[allow(clippy::too_many_arguments)] // Target details share the caller and cycle guard.
+fn target_intersection_mismatch_chain(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    active: &mut HashSet<(TypeId, TypeId)>,
+    session: &mut InstantiationSession,
+) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
+    let target = store
+        .type_payload(target_type)
+        .ok_or(RelationUnavailable::Type(target_type))?;
+    if !target.flags().intersects(TypeFlags::INTERSECTION) {
+        return Ok(None);
+    }
+    let arrays = Some(CanonicalArrayTargets::from_global_types(global_types));
+    let target = match store.validate_intersection_type_with_array_targets(target_type, arrays) {
+        Ok(target) => target,
+        Err(_)
+            if store
+                .validate_deferred_intersection_type_with_array_targets(target_type, arrays)
+                .is_ok() =>
+        {
+            return Err(RelationUnavailable::UnresolvedStructuredMembers(target_type).into());
+        }
+        Err(_) => return Err(RelationUnavailable::MalformedIntersection(target_type).into()),
+    };
+    let source = store
+        .type_payload(source_type)
+        .ok_or(RelationUnavailable::Type(source_type))?;
+    // Source unions decompose before target intersections in the relation.
+    if target.reduced_to_never || source.flags().intersects(TypeFlags::UNION) {
+        return Ok(None);
+    }
+    if active.len() >= 64 || !active.insert((source_type, target_type)) {
+        return Ok(None);
+    }
+    let result = (|| {
+        for constituent in target.types {
+            if store.is_type_assignable_to_with_session(
+                source_type,
+                constituent,
+                Some(global_types),
+                Some(options.strict_function_types),
+                session,
+            )? {
+                continue;
+            }
+            let Some(child) = recursive_assignability_child_chain(
+                store,
+                host,
+                global_types,
+                source_type,
+                constituent,
+                flags,
+                options,
+                active,
+                DiagnosticPropertyMode::Declared,
+                session,
+            )?
+            else {
+                return Ok(None);
+            };
+            let mut chain = vec![assignability_message(
+                store,
+                host,
+                global_types,
+                source_type,
+                constituent,
+                flags,
+            )?];
+            chain.extend(child);
+            return Ok(Some(chain));
+        }
+        Ok(None)
+    })();
+    assert!(active.remove(&(source_type, target_type)));
+    result
 }
 
 #[allow(clippy::too_many_arguments)] // The child retains its relation path and caller session.

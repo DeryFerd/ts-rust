@@ -1321,7 +1321,7 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
         let has_this_type = if has_type_parameters {
             true
         } else {
-            self.interface_requires_this_type(&declarations)?
+            self.interface_requires_this_type(symbol, &declarations)?
         };
         let RecursiveInterfacePlanNode::Interface(plan) = &mut self.nodes[node] else {
             unreachable!("interface planning inserted an interface node")
@@ -1335,6 +1335,7 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
 
     fn interface_requires_this_type(
         &mut self,
+        owner: SemanticSymbolId,
         declarations: &[NodeRef],
     ) -> Result<bool, DeclaredTypeError> {
         for declaration in declarations {
@@ -1404,8 +1405,12 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
                         *declaration,
                         expression,
                         &mut HashSet::new(),
-                    )? && self.heritage_requires_this_type(expression)?
-                    {
+                    )? && self.heritage_requires_this_type(
+                        owner,
+                        *declaration,
+                        heritage,
+                        expression,
+                    )? {
                         return Ok(true);
                     }
                 }
@@ -1419,10 +1424,35 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
 
     fn heritage_requires_this_type(
         &mut self,
+        owner: SemanticSymbolId,
+        declaration: NodeRef,
+        heritage: NodeRef,
         expression: NodeRef,
     ) -> Result<bool, DeclaredTypeError> {
-        let mut callback_host = self.host.name_resolver_host(self.store)?;
-        let base_symbol = callback_host.resolve_entity_name(expression, SymbolFlags::TYPE)?;
+        // Cold type imports need the same owner proof as direct heritage planning.
+        let imported = if self.store.source_node_kind(expression) == Some(SyntaxKind::Identifier) {
+            super::source_imports::plan_source_interface_heritage_type_import(
+                self.store,
+                self.host,
+                declaration,
+                owner,
+                heritage,
+            )
+            .map_err(|error| match error {
+                super::source_imports::SourceImportError::DeclaredType(error) => error,
+                _ => unavailable(DeclaredTypeUnavailable::InvalidInterfaceDeclaration(
+                    declaration,
+                )),
+            })?
+        } else {
+            None
+        };
+        let base_symbol = if let Some(imported) = imported {
+            Some(imported)
+        } else {
+            let mut callback_host = self.host.name_resolver_host(self.store)?;
+            callback_host.resolve_entity_name(expression, SymbolFlags::TYPE)?
+        };
         let Some(base_symbol) = base_symbol else {
             return Ok(true);
         };
@@ -3786,5 +3816,221 @@ mod tests {
         ));
         assert_invalid_cached_declared_type_is_atomic(&mut fixture.store, parameter, argument);
         assert_invalid_cached_declared_type_is_atomic(&mut fixture.store, interface, declared_type);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One real import covers failed proof and both provider this states.
+    fn cold_named_import_heritage_keeps_provider_this_and_atomic_failure() {
+        use crate::semantic::links::{AliasSymbolLinks, AliasTargetState};
+        use crate::semantic::module_resolution::{
+            CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+            CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
+            validate_module_resolution_manifest,
+        };
+
+        for (provider_source, has_this) in [
+            ("export interface Base { value: string }", false),
+            ("export interface Base { value: this }", true),
+        ] {
+            let source = parse_source_file(concat!(
+                "import type { Base as ImportedBase } from './base';\n",
+                "interface Plain {}\n",
+                "interface Derived extends Plain, ImportedBase {}\n",
+            ));
+            let provider = parse_source_file(provider_source);
+            let file = FileId::new(17);
+            let provider_file = FileId::new(18);
+            let sources = [
+                (file, &source, "\"/project/derived.ts\""),
+                (provider_file, &provider, "\"/project/base.ts\""),
+            ];
+            let mut binder = CanonicalBinder::new();
+            for (file, parsed, path) in sources {
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source(path),
+                            CanonicalSourceLanguage::TypeScript,
+                            false,
+                            CanonicalModuleState::External,
+                        ),
+                    )
+                    .unwrap();
+            }
+            for (file, parsed, _) in sources {
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let (symbols, files) = binder.finish().try_into_parts().unwrap();
+            let specifier = source
+                .arena
+                .iter()
+                .find_map(|(_, node)| match &node.data {
+                    NodeData::ImportDeclaration(import) => Some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        import.module_specifier,
+                    )),
+                    _ => None,
+                })
+                .unwrap();
+            let manifest = validate_module_resolution_manifest(
+                CanonicalModuleResolutionManifestInput::new([
+                    CanonicalModuleResolutionEntry::resolved(
+                        specifier,
+                        CanonicalResolvedModuleInput::new(
+                            provider_file,
+                            CanonicalModuleResolutionMode::Esm,
+                            CanonicalModuleResolutionMode::Esm,
+                        ),
+                    ),
+                ]),
+                &symbols,
+                sources
+                    .iter()
+                    .map(|(file, parsed, _)| (*file, &parsed.arena, &files[file])),
+            )
+            .unwrap();
+            let mut store = TestStore::from_symbol_store(symbols);
+            for (file, parsed, _) in sources {
+                let source_file = store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .unwrap();
+                assert!(
+                    store.register_source_file_facts(
+                        source_file,
+                        files[&file].source_facts().unwrap(),
+                    )
+                );
+            }
+            store
+                .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+                .unwrap();
+            let find_node = |parsed: &ParseResult, file, kind, name: &str| {
+                let node = parsed
+                    .arena
+                    .iter()
+                    .find_map(|(id, node)| {
+                        (node.kind == kind && declaration_name(&parsed.arena, node) == Some(name))
+                            .then_some(id)
+                    })
+                    .unwrap();
+                NodeRef::new(parsed.arena.id(), file, node)
+            };
+            let plain_node = find_node(&source, file, SyntaxKind::InterfaceDeclaration, "Plain");
+            let derived_node =
+                find_node(&source, file, SyntaxKind::InterfaceDeclaration, "Derived");
+            let base_node = find_node(
+                &provider,
+                provider_file,
+                SyntaxKind::InterfaceDeclaration,
+                "Base",
+            );
+            let import_node = find_node(&source, file, SyntaxKind::ImportSpecifier, "ImportedBase");
+            let symbol = |store: &TestStore, node: NodeRef| {
+                store
+                    .get_merged_symbol(files[&node.file].symbol(node).unwrap())
+                    .unwrap()
+            };
+            let plain = symbol(&store, plain_node);
+            let derived = symbol(&store, derived_node);
+            let base = symbol(&store, base_node);
+            let alias = symbol(&store, import_node);
+            assert_ne!(alias, base);
+            assert_eq!(
+                files[&provider_file].contains_this(base_node),
+                Some(has_this)
+            );
+            let order = [file, provider_file];
+            let host = DeclaredTypeHost::new_after_global_merge(
+                sources
+                    .iter()
+                    .map(|(file, parsed, _)| (&parsed.arena, &files[file])),
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap()
+            .with_module_resolutions(&manifest)
+            .with_program_file_order(&order);
+
+            let cold_alias = AliasSymbolLinks::default();
+            let bad_alias = AliasSymbolLinks {
+                alias_target: AliasTargetState::Resolved(plain),
+                ..cold_alias.clone()
+            };
+            assert!(store.set_alias_symbol_links(alias, bad_alias.clone()));
+            let counts = |store: &TestStore| {
+                (
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.checker_link_allocated_lengths(),
+                )
+            };
+            let failed_counts = counts(&store);
+            for _ in 0..2 {
+                assert_eq!(
+                    store.get_declared_type_of_symbol(&host, derived),
+                    Err(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::InvalidInterfaceDeclaration(derived_node)
+                    )),
+                );
+                assert_eq!(counts(&store), failed_counts);
+                assert_eq!(store.alias_symbol_links(alias), Some(&bad_alias));
+                for symbol in [plain, derived, base] {
+                    assert!(store.declared_type_links(symbol).is_none());
+                }
+            }
+
+            assert!(store.set_alias_symbol_links(alias, cold_alias.clone()));
+            let derived_type = store.get_declared_type_of_symbol(&host, derived).unwrap();
+            let plain_type = store
+                .declared_type_links(plain)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            let base_type = store
+                .declared_type_links(base)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            assert!(interface_data(&store, plain_type).this_type.is_none());
+            for (symbol, type_) in [(derived, derived_type), (base, base_type)] {
+                assert_eq!(store.type_payload(type_).unwrap().symbol(), Some(symbol));
+                let this_type = interface_data(&store, type_).this_type;
+                assert_eq!(this_type.is_some(), has_this);
+                if let Some(this_type) = this_type {
+                    assert_eq!(
+                        store.type_payload(this_type).unwrap().symbol(),
+                        Some(symbol)
+                    );
+                    let parameter = type_parameter_data(&store, this_type);
+                    assert!(parameter.is_this_type);
+                    assert_eq!(parameter.constraint, Some(type_));
+                }
+            }
+            if has_this {
+                assert_ne!(
+                    interface_data(&store, derived_type).this_type,
+                    interface_data(&store, base_type).this_type,
+                );
+            }
+            assert_eq!(store.alias_symbol_links(alias), Some(&cold_alias));
+            let warm_counts = counts(&store);
+            for _ in 0..2 {
+                for (symbol, type_) in [
+                    (derived, derived_type),
+                    (base, base_type),
+                    (plain, plain_type),
+                ] {
+                    assert_eq!(store.get_declared_type_of_symbol(&host, symbol), Ok(type_));
+                }
+                assert_eq!(counts(&store), warm_counts);
+                assert_eq!(store.alias_symbol_links(alias), Some(&cold_alias));
+            }
+        }
     }
 }

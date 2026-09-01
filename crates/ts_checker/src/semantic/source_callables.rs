@@ -204,7 +204,7 @@ impl SourceCallableParameterPlan {
             let mut scanner = ts_scanner::Scanner::new(spelling);
             let token = scanner.scan();
             if token.kind != SyntaxKind::StringLiteral
-                || token.value.as_ref().and_then(ts_core::JsString::as_utf8)
+                || token.value.as_ref().map(ts_ast::encode_js_string).as_deref()
                     != Some(literal.text.as_str())
                 || scanner.scan().kind != SyntaxKind::EndOfFile
                 || !scanner.diagnostics().is_empty()
@@ -1965,6 +1965,19 @@ pub(super) fn materialize_global_wrapper_method(
     else {
         return Ok(None);
     };
+
+    let bound = host
+        .bound_file(plan.declaration)
+        .ok_or_else(|| invariant(SourceCallableInvariant::Publication(plan.declaration)))?;
+    let source = super::links::SourceFileRef::new(store.id(), bound.source_file());
+    if bound
+        .source_facts()
+        .is_none_or(|facts| !store.register_source_file_facts(source, facts))
+    {
+        return Err(invariant(SourceCallableInvariant::Publication(
+            plan.declaration,
+        )));
+    }
 
     if let Some(type_) = validated_global_wrapper_method(store, global_types, plan)? {
         return Ok(Some((plan.symbol, type_)));

@@ -4,8 +4,8 @@ use ts_binder::{
     EscapedName, InternalSymbolName, SemanticSymbolId,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, SignatureId, SourceCheckError, TypeData,
-    TypeId, signatures::SignatureFlags, type_records::StructuredTypeData,
+    CanonicalCheckerContext, CanonicalCheckerOptions, SignatureId, TypeData, TypeId,
+    signatures::SignatureFlags, type_records::StructuredTypeData,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -404,6 +404,152 @@ fn assert_replay(
     }
 }
 
+#[allow(clippy::too_many_lines)] // Check each recovery record before and after full source replay.
+fn assert_recovery_replay(
+    context: &mut CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    calls: &[NodeRef],
+    declared: &DeclaredOverloads,
+    copies: &[SignatureId],
+    failures: &[(NodeRef, &[&[TypeId]], i32)],
+    return_type: TypeId,
+) {
+    let snapshot = |context: &CanonicalCheckerContext<'_>| {
+        let store = context.store();
+        let declaration = store.signature(copies[0]).unwrap().declaration();
+        failures
+            .iter()
+            .map(|&(call, expected_parameters, minimum)| {
+                let selected = signature(context, call);
+                assert!(!copies.contains(&selected));
+                let record = store.signature(selected).unwrap();
+                assert_eq!(
+                    record.flags(),
+                    SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE,
+                );
+                assert_eq!(record.declaration(), declaration);
+                assert_eq!(record.min_argument_count(), minimum);
+                assert_eq!(record.parameters().len(), expected_parameters.len());
+                assert!(record.type_parameters().is_empty());
+                assert_eq!(record.this_parameter(), None);
+                assert_eq!(record.resolved_return_type(), Some(return_type));
+                assert_eq!(record.resolved_type_predicate(), None);
+                assert_eq!(record.target(), None);
+                assert_eq!(record.mapper(), None);
+                assert_eq!(record.isolated_signature_type(), None);
+                assert_eq!(record.composite(), None);
+                assert_eq!(
+                    store.type_node_links(call).unwrap().resolved_type,
+                    Some(return_type),
+                );
+                let parameters = record
+                    .parameters()
+                    .iter()
+                    .zip(expected_parameters)
+                    .enumerate()
+                    .map(|(index, (&parameter, &expected))| {
+                        let source = copies
+                            .iter()
+                            .find_map(|&copy| {
+                                store.signature(copy).unwrap().parameters().get(index)
+                            })
+                            .copied()
+                            .unwrap();
+                        assert_ne!(parameter, source);
+                        assert_eq!(store.get_merged_symbol(parameter), Some(parameter));
+                        let original = store.symbol(source).unwrap();
+                        let combined = store.symbol(parameter).unwrap();
+                        let links = store.value_symbol_links(parameter).unwrap();
+                        let type_ = links.resolved_type.unwrap();
+                        if let [expected] = expected {
+                            assert_eq!(type_, *expected);
+                        } else {
+                            let TypeData::Union(union) = store.type_payload(type_).unwrap().data()
+                            else {
+                                panic!("the recovery parameter must retain its exact union")
+                            };
+                            assert_eq!(union.union.types.len(), expected.len());
+                            assert!(
+                                expected
+                                    .iter()
+                                    .all(|type_| union.union.types.contains(type_))
+                            );
+                        }
+                        assert_eq!(
+                            combined.flags(),
+                            original.flags() | ts_binder::SymbolFlags::TRANSIENT,
+                        );
+                        assert_eq!(
+                            combined.check_flags(),
+                            original.check_flags() & ts_binder::CheckFlags::READONLY,
+                        );
+                        assert_eq!(combined.name(), original.name());
+                        assert_eq!(combined.declarations(), original.declarations());
+                        assert_eq!(combined.value_declaration(), original.value_declaration());
+                        assert_eq!(combined.parent(), original.parent());
+                        assert_eq!(combined.members(), None);
+                        assert_eq!(combined.exports(), None);
+                        assert_eq!(combined.export_symbol(), None);
+                        assert_eq!(
+                            links,
+                            &ts_checker::semantic::links::ValueSymbolLinks {
+                                resolved_type: Some(type_),
+                                target: Some(source),
+                                name_type: store
+                                    .value_symbol_links(source)
+                                    .and_then(|links| links.name_type),
+                                ..ts_checker::semantic::links::ValueSymbolLinks::default()
+                            },
+                        );
+                        (
+                            parameter,
+                            (
+                                combined.flags(),
+                                combined.check_flags(),
+                                combined.name().to_owned(),
+                                combined.declarations().map(<[_]>::to_vec),
+                                combined.value_declaration(),
+                                combined.parent(),
+                                combined.members(),
+                                combined.exports(),
+                                combined.export_symbol(),
+                            ),
+                            links.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    call,
+                    store.type_node_links(call).cloned(),
+                    store.signature_links(call).cloned(),
+                    (
+                        record.id(),
+                        record.flags(),
+                        record.min_argument_count(),
+                        record.resolved_min_argument_count(),
+                        record.declaration(),
+                        record.type_parameters().to_vec(),
+                        record.parameters().to_vec(),
+                    ),
+                    (
+                        record.this_parameter(),
+                        record.resolved_return_type(),
+                        record.resolved_type_predicate(),
+                        record.target(),
+                        record.mapper(),
+                        record.isolated_signature_type(),
+                        record.composite().cloned(),
+                    ),
+                    parameters,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let warm = snapshot(context);
+    assert_replay(context, parsed, calls, &[declared]);
+    assert_eq!(snapshot(context), warm);
+}
+
 #[test]
 fn generic_interface_overloads_keep_arity_specialization_and_replay_identity() {
     let parsed = parse_source_file(concat!(
@@ -543,7 +689,6 @@ fn generic_interface_overloads_report_the_only_matching_arity_argument_error() {
         .unwrap();
     let copies = specialized_signatures(&mut context, &declared, instance, string);
     assert_eq!(signature(&context, calls[0]), copies[0]);
-    assert_eq!(signature(&context, calls[1]), copies[1]);
     for &call in &calls {
         assert_eq!(context.get_type_at_location(call), Ok(string));
     }
@@ -562,7 +707,16 @@ fn generic_interface_overloads_report_the_only_matching_arity_argument_error() {
         diagnostic.diagnostic.render().unwrap(),
         "Argument of type 'boolean' is not assignable to parameter of type 'string'.",
     );
-    assert_replay(&mut context, &parsed, &calls, &[&declared]);
+    let parameters: &[&[TypeId]] = &[&[string], &[string]];
+    assert_recovery_replay(
+        &mut context,
+        &parsed,
+        &calls,
+        &declared,
+        &copies,
+        &[(calls[1], parameters, 1)],
+        string,
+    );
 }
 
 #[test]
@@ -589,8 +743,8 @@ fn generic_interface_overloads_keep_original_parameter_notes_for_arity_errors() 
         .get_type_at_location(callee(&parsed, calls[0]))
         .unwrap();
     let copies = specialized_signatures(&mut context, &declared, instance, string);
+    assert_eq!(signature(&context, calls[0]), copies[0]);
     for &call in &calls {
-        assert_eq!(signature(&context, call), copies[0]);
         assert_eq!(context.get_type_at_location(call), Ok(string));
     }
     let [missing, extra] = context.diagnostics().as_slice() else {
@@ -626,10 +780,21 @@ fn generic_interface_overloads_keep_original_parameter_notes_for_arity_errors() 
             ..usize::try_from(range.end.get()).unwrap()],
         "true",
     );
-    assert_replay(&mut context, &parsed, &calls, &[&declared]);
+    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+    let parameters: &[&[TypeId]] = &[&[string, number]];
+    assert_recovery_replay(
+        &mut context,
+        &parsed,
+        &calls,
+        &declared,
+        &copies,
+        &[(calls[1], parameters, 1), (calls[2], parameters, 1)],
+        string,
+    );
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Check the recovery signature, diagnostics, and complete replay state.
 fn generic_interface_overloads_keep_multiple_argument_failures_unselected() {
     let parsed = parse_source_file(concat!(
         "interface Choice<T> { (value: T): T; (value: number): T; }\n",
@@ -640,9 +805,7 @@ fn generic_interface_overloads_keep_multiple_argument_failures_unselected() {
     let mut context = context(&parsed);
     let calls = nodes(&parsed, SyntaxKind::CallExpression);
     assert_eq!(calls.len(), 2);
-    let error = SourceCheckError::Call(calls[1]);
-    assert_eq!(context.check_source_file(FILE), Err(error));
-    assert!(context.diagnostics().is_empty());
+    assert_eq!(context.check_source_file(FILE), Ok(()));
     let declared = declared_overloads(
         &mut context,
         &parsed,
@@ -666,8 +829,50 @@ fn generic_interface_overloads_keep_multiple_argument_failures_unselected() {
             .resolved_type,
         Some(string),
     );
-    assert!(context.store().signature_links(calls[1]).is_none());
-    assert!(context.store().type_node_links(calls[1]).is_none());
+    let recovery = signature(&context, calls[1]);
+    assert!(!copies.contains(&recovery));
+    assert_eq!(
+        context
+            .store()
+            .type_node_links(calls[1])
+            .unwrap()
+            .resolved_type,
+        Some(string),
+    );
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one failed-overload diagnostic")
+    };
+    let NodeData::CallExpression(bad_call) = &parsed.arena.get(calls[1].node).unwrap().data else {
+        panic!("expected the bad call")
+    };
+    let argument = NodeRef::new(parsed.arena.id(), FILE, bad_call.arguments.nodes[0]);
+    assert_eq!(diagnostic.diagnostic.code(), 2769);
+    assert_eq!(diagnostic.node, Some(argument));
+    assert_eq!(diagnostic.range_override, None);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        concat!(
+            "No overload matches this call.\n",
+            "  The last overload gave the following error.\n",
+            "    Argument of type 'boolean' is not assignable to parameter of type 'number'.",
+        ),
+    );
+    let [related] = diagnostic.related_information.as_slice() else {
+        panic!("the failure must identify the last original overload")
+    };
+    assert_eq!(related.diagnostic.code(), 2771);
+    assert_eq!(
+        related.node,
+        context
+            .store()
+            .signature(declared.signatures[1])
+            .unwrap()
+            .declaration(),
+    );
+    assert_eq!(
+        related.diagnostic.render().unwrap(),
+        "The last overload is declared here.",
+    );
     let snapshot = |context: &CanonicalCheckerContext<'_>| {
         (
             counts(context),
@@ -680,17 +885,36 @@ fn generic_interface_overloads_keep_multiple_argument_failures_unselected() {
     };
     let warm = snapshot(&context);
     for _ in 0..2 {
-        assert_eq!(context.check_source_file(FILE), Err(error));
+        assert_eq!(context.check_source_file(FILE), Ok(()));
         assert_eq!(context.get_type_from_type_node(annotation), Ok(instance));
         assert_eq!(
             specialized_signatures(&mut context, &declared, instance, string),
             copies
         );
         assert_eq!(signature(&context, calls[0]), copies[0]);
-        assert!(context.store().signature_links(calls[1]).is_none());
-        assert!(context.store().type_node_links(calls[1]).is_none());
+        assert_eq!(signature(&context, calls[1]), recovery);
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(calls[1])
+                .unwrap()
+                .resolved_type,
+            Some(string),
+        );
         assert_eq!(snapshot(&context), warm);
     }
+    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+    let parameters: &[&[TypeId]] = &[&[string, number]];
+    assert_recovery_replay(
+        &mut context,
+        &parsed,
+        &calls,
+        &declared,
+        &copies,
+        &[(calls[1], parameters, 1)],
+        string,
+    );
+    assert_eq!(snapshot(&context), warm);
 }
 
 struct CallOwnedOverloads {
@@ -1345,4 +1569,111 @@ fn generic_interface_call_overloads_keep_order_and_minimum_arity() {
         "\"second\""
     );
     assert_call_owned_replay(&mut context, &parsed, &calls, &[&arity, &ordered]);
+}
+
+#[test]
+fn generic_interface_call_return_query_prepares_all_formals_before_source_check() {
+    let parsed = parse_source_file(concat!(
+        "interface Callable<A> {\n",
+        "  <B extends A = A>(value: B): B;\n",
+        "  <C extends A = A>(value: C, other: C): C;\n",
+        "}\n",
+    ));
+    let mut context = context(&parsed);
+    let interface = nodes(&parsed, SyntaxKind::InterfaceDeclaration)[0];
+    let calls = nodes(&parsed, SyntaxKind::CallSignature);
+    assert_eq!(calls.len(), 2);
+    let returns = calls
+        .iter()
+        .map(|call| {
+            let NodeData::CallSignatureDeclaration(call) =
+                &parsed.arena.get(call.node).unwrap().data
+            else {
+                panic!("expected a call signature")
+            };
+            NodeRef::new(parsed.arena.id(), FILE, call.type_.unwrap())
+        })
+        .collect::<Vec<_>>();
+    let signatures_before = context.store().signature_len();
+    let result = context.get_type_from_type_node(returns[1]).unwrap();
+    let store = context.store();
+    let formals = nodes(&parsed, SyntaxKind::TypeParameter);
+    assert_eq!(formals.len(), 3);
+    let types = formals
+        .iter()
+        .map(|formal| {
+            store
+                .declared_type_links(symbol(&context, *formal))
+                .unwrap()
+                .declared_type
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(result, types[2]);
+    assert_ne!(types[0], types[1]);
+    assert_ne!(types[0], types[2]);
+    assert_ne!(types[1], types[2]);
+    for (&formal, &type_) in formals[1..].iter().zip(&types[1..]) {
+        let TypeData::TypeParameter(parameter) = store.type_payload(type_).unwrap().data() else {
+            panic!("expected a source type parameter")
+        };
+        assert_eq!(parameter.constraint, Some(types[0]));
+        assert_eq!(parameter.resolved_default_type, Some(types[0]));
+        assert_eq!(parameter.target, None);
+        assert_eq!(parameter.mapper, None);
+        assert!(!parameter.is_this_type);
+        let NodeData::TypeParameterDeclaration(parameter) =
+            &parsed.arena.get(formal.node).unwrap().data
+        else {
+            panic!("expected a type parameter declaration")
+        };
+        for annotation in [
+            parameter.constraint.unwrap(),
+            parameter.default_type.unwrap(),
+        ] {
+            let annotation = NodeRef::new(parsed.arena.id(), FILE, annotation);
+            assert_eq!(
+                store.type_node_links(annotation).unwrap().resolved_type,
+                Some(types[0])
+            );
+        }
+    }
+    assert_eq!(store.signature_len(), signatures_before);
+    for call in &calls {
+        let resolved = store
+            .signature_links(*call)
+            .and_then(|links| links.resolved_signature.signature());
+        assert_eq!(resolved, None);
+    }
+    if let Some(target) = store
+        .declared_type_links(symbol(&context, interface))
+        .and_then(|links| links.declared_type)
+    {
+        let TypeData::Interface(interface) = store.type_payload(target).unwrap().data() else {
+            panic!("expected a generic interface")
+        };
+        assert!(!interface.declared_members_resolved);
+        assert!(interface.declared_call_signatures.is_none());
+    }
+    let source = NodeRef::new(parsed.arena.id(), FILE, parsed.source_file);
+    assert!(
+        store
+            .source_file_links(source)
+            .is_none_or(|links| !links.type_checked)
+    );
+    let prepared = counts(&context);
+    for (&return_type, &formal) in returns.iter().zip(&types[1..]) {
+        assert_eq!(context.get_type_from_type_node(return_type), Ok(formal));
+    }
+    assert_eq!(counts(&context), prepared);
+
+    context.check_source_file(FILE).unwrap();
+    let declared = call_owned_overloads(&mut context, &parsed, interface);
+    assert_eq!(declared.call_parameters.as_slice(), &types[1..]);
+    assert_call_owned_replay(&mut context, &parsed, &[], &[&declared]);
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
 }

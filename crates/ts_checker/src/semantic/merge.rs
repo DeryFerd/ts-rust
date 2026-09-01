@@ -89,13 +89,22 @@ impl<TypePayload, MapperPayload> SymbolMergeHost<TypePayload, MapperPayload>
 {
 }
 
-/// Dependency-closed merge host that owns TypeScript diagnostic continuations
+/// Selects the primary arguments for duplicate declaration reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DuplicatePrimaryArguments {
+    /// Native reports retain the written source name even for TS2567.
+    NativeSourceSpelling,
+    /// The existing raw host omits the TS2567 argument. This is not native parity.
+    RawHostCompatibility,
+}
+
+/// Raw-location merge host that keeps its existing diagnostic behavior
 /// while leaving alias resolution fail-closed.
 ///
 /// It uses retained raw declaration identities as locations and binder escaped
-/// names as spelling. Plain-JavaScript suppression, declaration-name location
-/// adjustment, and checker `symbolToString` spelling require the later
-/// Program/AST diagnostic host and can implement [`SymbolMergeHost`] directly.
+/// names as spelling. It also omits the source-name argument on TS2567.
+/// Source-aware hosts supply real name nodes and written spelling to the shared
+/// emitter. Plain-JavaScript suppression still needs a host with those facts.
 pub struct CheckerDiagnosticMergeHost<'diagnostics> {
     diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
 }
@@ -121,47 +130,66 @@ impl<'diagnostics> CheckerDiagnosticMergeHost<'diagnostics> {
         let target_declarations = target_record.declarations().unwrap_or_default().to_vec();
         let source_declarations = source_record.declarations().unwrap_or_default().to_vec();
         let symbol_name = display_symbol_name(source_record);
-        let code = if (target_record.flags() | source_record.flags()).intersects(SymbolFlags::ENUM)
-        {
+
+        self.report_incompatible_at_nodes(
+            target_record.flags() | source_record.flags(),
+            &symbol_name,
+            &source_declarations,
+            &target_declarations,
+            DuplicatePrimaryArguments::RawHostCompatibility,
+        );
+        Ok(())
+    }
+
+    pub(super) fn report_incompatible_at_nodes(
+        &mut self,
+        flags: SymbolFlags,
+        symbol_name: &str,
+        source_declarations: &[NodeRef],
+        target_declarations: &[NodeRef],
+        arguments: DuplicatePrimaryArguments,
+    ) {
+        let code = if flags.intersects(SymbolFlags::ENUM) {
             2567
-        } else if (target_record.flags() | source_record.flags())
-            .intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
-        {
+        } else if flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE) {
             2451
         } else {
             2300
         };
+        let message = message_by_code(code).expect("pinned merge diagnostic is in the catalog");
+        let diagnostic = if arguments == DuplicatePrimaryArguments::RawHostCompatibility
+            && code == 2567
+        {
+            Diagnostic::new(message)
+        } else {
+            Diagnostic::with_arguments(message, [symbol_name])
+        };
 
         self.report_duplicate_side(
-            &source_declarations,
-            &target_declarations,
-            code,
-            &symbol_name,
+            source_declarations,
+            target_declarations,
+            &diagnostic,
+            symbol_name,
         );
         self.report_duplicate_side(
-            &target_declarations,
-            &source_declarations,
-            code,
-            &symbol_name,
+            target_declarations,
+            source_declarations,
+            &diagnostic,
+            symbol_name,
         );
-        Ok(())
     }
 
     fn report_duplicate_side(
         &mut self,
         declarations: &[NodeRef],
         related_declarations: &[NodeRef],
-        code: u32,
+        primary: &Diagnostic,
         symbol_name: &str,
     ) {
         for &node in declarations {
-            let message = message_by_code(code).expect("pinned merge diagnostic is in the catalog");
-            let diagnostic = if code == 2567 {
-                Diagnostic::new(message)
-            } else {
-                Diagnostic::with_arguments(message, [symbol_name])
-            };
-            let diagnostic = self.diagnostics.lookup_or_issue(Some(node), diagnostic);
+            let diagnostic = self
+                .diagnostics
+                .lookup_or_issue(Some(node), primary.clone());
             for &related_node in related_declarations {
                 let leading = CanonicalCheckerRelatedInformation {
                     node: Some(related_node),

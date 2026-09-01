@@ -607,11 +607,19 @@ fn in_result_is_boolean_even_when_the_declared_return_type_is_number() {
         "function hasValue(box: { value?: string }): number { return \"value\" in box; }",
     );
     let [binary, left, right] = membership(&parsed);
+    let return_id = parsed.arena.get(binary.node).unwrap().parent.unwrap();
+    let return_record = parsed.arena.get(return_id).unwrap();
+    assert_eq!(return_record.kind, SyntaxKind::ReturnStatement);
+    let NodeData::ReturnStatement(returned) = &return_record.data else {
+        panic!("expected parent return statement");
+    };
+    assert_eq!(returned.expression, Some(binary.node));
+    let return_node = node(&parsed, return_id);
     check_query_orders(&parsed, &[binary, left, right], |context| {
         assert_eq!(
             checked_type(context, binary),
             context.store().intrinsic_bootstrap().unwrap().boolean_type
         );
-        assert_diagnostics(context, &[(2322, binary, &["boolean", "number"])]);
+        assert_diagnostics(context, &[(2322, return_node, &["boolean", "number"])]);
     });
 }

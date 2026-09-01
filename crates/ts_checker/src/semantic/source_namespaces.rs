@@ -5643,16 +5643,13 @@ fn plan_interface_member(
                 heritage,
                 &mut generic.base_interfaces,
             )?;
-        } else if bound
-            .source_facts()
-            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
-            && !(store
-                .symbol(owner)
-                .and_then(|symbol| symbol.name().as_utf8())
-                == Some("JSX")
-                && arena.get(interface.name).is_some_and(|name| {
-                    matches!(&name.data, NodeData::Identifier(name) if name.text == "IntrinsicElements")
-                }))
+        } else if !(store
+            .symbol(owner)
+            .and_then(|symbol| symbol.name().as_utf8())
+            == Some("JSX")
+            && arena.get(interface.name).is_some_and(|name| {
+                matches!(&name.data, NodeData::Identifier(name) if name.text == "IntrinsicElements")
+            }))
         {
             let mut bases = Vec::new();
             plan_namespace_interface_heritage(

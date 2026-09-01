@@ -6830,68 +6830,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
-    fn signature_owns_callable_type(&self, signature: SignatureId) -> bool {
-        if let Some(type_) = self.source_jsdoc_callback_type_for_signature(signature) {
-            return self.type_has_function_type_provenance(type_)
-                && self
-                    .signature(signature)
-                    .is_some_and(|record| record.declaration().is_none())
-                && self
-                    .source_jsdoc_callback_identity(type_)
-                    .is_some_and(|identity| {
-                        self.source_node_kind(identity.owner)
-                            == Some(SyntaxKind::VariableDeclaration)
-                    });
-        }
-        let Some(declaration) = self.signature(signature).and_then(Signature::declaration) else {
-            return false;
-        };
-        if self.signature_links(declaration).is_none_or(|links| {
-            links.resolved_signature != ResolvedSignatureState::Resolved(signature)
-        }) {
-            return false;
-        }
-        let type_ = if self.node_is_function_type(declaration)
-            || self.source_node_kind(declaration) == Some(SyntaxKind::Parameter)
-        {
-            self.type_node_links(declaration)
-                .and_then(|links| links.resolved_type)
-                .filter(|type_| self.type_has_function_type_provenance(*type_))
-        } else if self.node_is_declared_callable_signature(declaration) {
-            self.declared_call_set_types_by_signature
-                .get(&signature)
-                .copied()
-                .filter(|type_| self.type_has_declared_call_set_provenance(*type_))
-        } else if self.node_is_global_interface_method(declaration) {
-            self.global_interface_method_linked_type(signature)
-        } else if self.node_is_interface_method(declaration) {
-            self.interface_method_linked_type(signature)
-        } else if self.node_is_type_literal_method(declaration) {
-            self.type_literal_method_linked_type(signature)
-        } else {
-            self.source_callable_type_for_signature(signature)
-                .filter(|type_| {
-                    self.source_callable_provenance(*type_)
-                        .is_some_and(|provenance| {
-                            provenance.declaration == declaration
-                                && provenance.signature == signature
-                        })
-                })
-                .or_else(|| {
-                    self.source_overload_type_for_signature(signature)
-                        .filter(|type_| {
-                            self.source_overload_provenance(*type_)
-                                .is_some_and(|provenance| {
-                                    provenance.signatures.iter().any(|row| {
-                                        row.declaration == declaration && row.signature == signature
-                                    })
-                                })
-                        })
-                })
-        };
-        type_.is_some()
-    }
-
     #[must_use]
     pub fn types(&self) -> impl ExactSizeIterator<Item = (TypeId, &TypePayload)> {
         self.types.iter()
@@ -9481,85 +9419,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .is_ok()
     }
 
-    /// Publishes immutable semantic parameter identities for exact callables.
-    /// The whole batch is validated before any entry is inserted.
-    pub(super) fn set_callable_signature_parameter_types_batch(
-        &mut self,
-        parameter_types: Vec<(SignatureId, Vec<TypeId>)>,
-    ) -> bool {
-        self.set_callable_signature_parameter_types_with_this_batch(
-            parameter_types
-                .into_iter()
-                .map(|(signature, types)| (signature, None, types))
-                .collect(),
-        )
-    }
-
-    /// Publishes a source receiver without adding it to the signature's value list.
-    pub(super) fn set_callable_signature_parameter_types_with_this_batch(
-        &mut self,
-        parameter_types: Vec<(SignatureId, Option<TypeId>, Vec<TypeId>)>,
-    ) -> bool {
-        let mut signatures = HashSet::with_capacity(parameter_types.len());
-        if parameter_types.iter().any(|(signature, this_type, types)| {
-            !signatures.insert(*signature)
-                || self
-                    .callable_signature_parameter_types
-                    .contains_key(signature)
-                || !self.signature_owns_callable_type(*signature)
-                || self
-                    .signature(*signature)
-                    .is_none_or(|record| record.parameters().len() != types.len())
-                || this_type.is_some_and(|type_| {
-                    self.types.get(type_).is_none()
-                        || self.signature(*signature).is_none_or(|record| {
-                            record.this_parameter().is_none()
-                                || record.declaration().is_none_or(|declaration| {
-                                    !self.node_is_source_callable_declaration(declaration)
-                                })
-                        })
-                })
-                || self.signature(*signature).is_some_and(|record| {
-                    record.declaration().is_some_and(|declaration| {
-                        self.node_is_global_interface_method(declaration)
-                            || self.node_is_interface_method(declaration)
-                            || self.node_is_type_literal_method(declaration)
-                    }) && record.parameters().iter().copied().zip(types).any(
-                        |(parameter, type_)| {
-                            self.value_symbol_links(parameter)
-                                != Some(&ValueSymbolLinks {
-                                    resolved_type: Some(*type_),
-                                    ..ValueSymbolLinks::default()
-                                })
-                        },
-                    )
-                })
-                || !self.valid_optional_types(Some(types))
-        }) {
-            return false;
-        }
-        let relation_dirty = parameter_types
-            .iter()
-            .any(|(signature, _, _)| self.relation_signature_is_observable(*signature));
-        for (signature, this_type, parameters) in parameter_types {
-            let previous = self.callable_signature_parameter_types.insert(
-                signature,
-                CallableSignatureParameterTypes {
-                    this_type,
-                    parameters,
-                },
-            );
-            assert!(
-                previous.is_none(),
-                "callable parameter provenance was prevalidated absent"
-            );
-        }
-        if relation_dirty {
-            self.mark_relation_inputs_dirty();
-        }
-        true
-    }
-
     pub(super) fn callable_signature_parameter_types(
         &self,
         signature: SignatureId,
@@ -11691,6 +11550,155 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
 }
 
 impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    fn signature_owns_callable_type(&self, signature: SignatureId) -> bool {
+        if let Some(type_) = self.source_jsdoc_callback_type_for_signature(signature) {
+            return self.type_has_function_type_provenance(type_)
+                && self
+                    .signature(signature)
+                    .is_some_and(|record| record.declaration().is_none())
+                && self
+                    .source_jsdoc_callback_identity(type_)
+                    .is_some_and(|identity| {
+                        self.source_node_kind(identity.owner)
+                            == Some(SyntaxKind::VariableDeclaration)
+                    });
+        }
+        let Some(declaration) = self.signature(signature).and_then(Signature::declaration) else {
+            return false;
+        };
+        if self.signature_links(declaration).is_none_or(|links| {
+            links.resolved_signature != ResolvedSignatureState::Resolved(signature)
+        }) {
+            return false;
+        }
+        let type_ = if self.node_is_function_type(declaration)
+            || self.source_node_kind(declaration) == Some(SyntaxKind::Parameter)
+        {
+            self.type_node_links(declaration)
+                .and_then(|links| links.resolved_type)
+                .filter(|type_| self.type_has_function_type_provenance(*type_))
+        } else if self.node_is_declared_callable_signature(declaration) {
+            self.declared_call_set_types_by_signature
+                .get(&signature)
+                .copied()
+                .filter(|type_| self.type_has_declared_call_set_provenance(*type_))
+        } else if self.node_is_global_interface_method(declaration) {
+            self.interface_method_linked_type(signature)
+                .or_else(|| self.global_interface_method_linked_type(signature))
+                .filter(|type_| {
+                    matches!(
+                        super::callable_sets::validate_stored_global_method_callable_set(self, *type_),
+                        Some(super::callable_sets::StoredCallableSetValidation::Valid { projection, .. })
+                            if projection.call_signatures.iter().any(|callable| callable.signature == signature)
+                    )
+                })
+        } else if self.node_is_interface_method(declaration) {
+            self.interface_method_linked_type(signature)
+        } else if self.node_is_type_literal_method(declaration) {
+            self.type_literal_method_linked_type(signature)
+        } else {
+            self.source_callable_type_for_signature(signature)
+                .filter(|type_| {
+                    self.source_callable_provenance(*type_)
+                        .is_some_and(|provenance| {
+                            provenance.declaration == declaration
+                                && provenance.signature == signature
+                        })
+                })
+                .or_else(|| {
+                    self.source_overload_type_for_signature(signature)
+                        .filter(|type_| {
+                            self.source_overload_provenance(*type_)
+                                .is_some_and(|provenance| {
+                                    provenance.signatures.iter().any(|row| {
+                                        row.declaration == declaration && row.signature == signature
+                                    })
+                                })
+                        })
+                })
+        };
+        type_.is_some()
+    }
+
+    /// Publishes immutable semantic parameter identities for exact callables.
+    /// The whole batch is validated before any entry is inserted.
+    pub(super) fn set_callable_signature_parameter_types_batch(
+        &mut self,
+        parameter_types: Vec<(SignatureId, Vec<TypeId>)>,
+    ) -> bool {
+        self.set_callable_signature_parameter_types_with_this_batch(
+            parameter_types
+                .into_iter()
+                .map(|(signature, types)| (signature, None, types))
+                .collect(),
+        )
+    }
+
+    /// Publishes a source receiver without adding it to the signature's value list.
+    pub(super) fn set_callable_signature_parameter_types_with_this_batch(
+        &mut self,
+        parameter_types: Vec<(SignatureId, Option<TypeId>, Vec<TypeId>)>,
+    ) -> bool {
+        let mut signatures = HashSet::with_capacity(parameter_types.len());
+        if parameter_types.iter().any(|(signature, this_type, types)| {
+            !signatures.insert(*signature)
+                || self
+                    .callable_signature_parameter_types
+                    .contains_key(signature)
+                || !self.signature_owns_callable_type(*signature)
+                || self
+                    .signature(*signature)
+                    .is_none_or(|record| record.parameters().len() != types.len())
+                || this_type.is_some_and(|type_| {
+                    self.types.get(type_).is_none()
+                        || self.signature(*signature).is_none_or(|record| {
+                            record.this_parameter().is_none()
+                                || record.declaration().is_none_or(|declaration| {
+                                    !self.node_is_source_callable_declaration(declaration)
+                                })
+                        })
+                })
+                || self.signature(*signature).is_some_and(|record| {
+                    record.declaration().is_some_and(|declaration| {
+                        self.node_is_global_interface_method(declaration)
+                            || self.node_is_interface_method(declaration)
+                            || self.node_is_type_literal_method(declaration)
+                    }) && record.parameters().iter().copied().zip(types).any(
+                        |(parameter, type_)| {
+                            self.value_symbol_links(parameter)
+                                != Some(&ValueSymbolLinks {
+                                    resolved_type: Some(*type_),
+                                    ..ValueSymbolLinks::default()
+                                })
+                        },
+                    )
+                })
+                || !self.valid_optional_types(Some(types))
+        }) {
+            return false;
+        }
+        let relation_dirty = parameter_types
+            .iter()
+            .any(|(signature, _, _)| self.relation_signature_is_observable(*signature));
+        for (signature, this_type, parameters) in parameter_types {
+            let previous = self.callable_signature_parameter_types.insert(
+                signature,
+                CallableSignatureParameterTypes {
+                    this_type,
+                    parameters,
+                },
+            );
+            assert!(
+                previous.is_none(),
+                "callable parameter provenance was prevalidated absent"
+            );
+        }
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
+        true
+    }
+
     /// Publishes a dependency-closed batch of local overload groups.
     ///
     /// Every source, binder, cache, and capacity edge is checked before the
@@ -15913,6 +15921,154 @@ mod source_global_owner_tests {
                     .then(|| NodeRef::new(parsed.arena.id(), file, variable.type_.unwrap()))
             })
             .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both parsed library kinds and damaged cache checks on the same method.
+    fn parsed_global_methods_use_complete_declared_ownership() {
+        use crate::semantic::{
+            callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
+            links::ValueSymbolLinks,
+        };
+
+        for kind in [SourceKind::Script, SourceKind::Library] {
+            let parsed = parse_source_file(concat!(
+                "interface Array<T> {} interface ReadonlyArray<T> {} ",
+                "interface Object {} interface Function {} ",
+                "interface CallableFunction {} interface NewableFunction {} ",
+                "interface IArguments {} interface Boolean {} interface RegExp {} ",
+                "interface String {} interface Number { toFixed(digits?: number): string } ",
+                "declare const wrapper: Number;",
+            ));
+            let file = FileId::new(286_099);
+            let mut checker = context(&[(&parsed, file, kind)]);
+            let annotation = variable_annotation(&parsed, file, "wrapper");
+            let wrapper = checker.get_type_from_type_node(annotation).unwrap();
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::MethodSignature).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let bound_method = checker.file(file).unwrap().1.symbol(declaration).unwrap();
+            let store = checker.store_mut_for_test();
+            assert_eq!(
+                store.source_is_default_library_declaration(declaration),
+                matches!(kind, SourceKind::Library)
+            );
+            assert_eq!(
+                store.authenticated_interface_method_owner(bound_method),
+                Some((global(store, "Number"), wrapper))
+            );
+            let signature = store
+                .signature_links(declaration)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            let callable = store
+                .value_symbol_links(bound_method)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert_eq!(
+                store.interface_method_linked_type(signature),
+                Some(callable)
+            );
+            assert_eq!(store.global_interface_method_linked_type(signature), None);
+            assert!(store.signature_owns_callable_type(signature));
+            let parameter = store.signature(signature).unwrap().parameters()[0];
+            assert_eq!(
+                store.symbol(parameter).unwrap().name().as_utf8(),
+                Some("digits")
+            );
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (number, string, undefined) = (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.undefined_type,
+            );
+            let optional = bootstrap.cached_optional_parameter_type(number).unwrap();
+            let TypeData::Union(union) = store.type_payload(optional).unwrap().data() else {
+                panic!("the strict optional parameter must retain its union")
+            };
+            assert_eq!(union.union.types.len(), 2);
+            assert!(union.union.types.contains(&number));
+            assert!(union.union.types.contains(&undefined));
+            assert_eq!(
+                store.callable_signature_parameter_types(signature),
+                Some([optional].as_slice())
+            );
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(store, callable)
+            else {
+                panic!("the complete parsed method proof must validate")
+            };
+            assert_eq!(projection.owner, callable);
+            assert!(projection.construct_signatures.is_empty());
+            assert_eq!(projection.call_signatures.len(), 1);
+            let projected = &projection.call_signatures[0];
+            assert_eq!(projected.signature, signature);
+            assert_eq!(projected.parameters, [optional]);
+            assert_eq!(projected.min_argument_count, 0);
+            assert_eq!(projected.return_type, Some(string));
+
+            let warm = (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            );
+            for wrong in [number, string] {
+                assert!(store.set_value_symbol_links(
+                    parameter,
+                    ValueSymbolLinks {
+                        resolved_type: Some(wrong),
+                        ..ValueSymbolLinks::default()
+                    }
+                ));
+                assert!(!store.signature_owns_callable_type(signature));
+                assert!(matches!(
+                    validate_stored_callable_set(store, callable),
+                    StoredCallableSetValidation::Malformed { .. }
+                ));
+                assert!(store.set_value_symbol_links(
+                    parameter,
+                    ValueSymbolLinks {
+                        resolved_type: Some(optional),
+                        ..ValueSymbolLinks::default()
+                    }
+                ));
+                assert!(store.signature_owns_callable_type(signature));
+                assert!(matches!(
+                    validate_stored_callable_set(store, callable),
+                    StoredCallableSetValidation::Valid { .. }
+                ));
+            }
+            assert!(store.set_type_symbol(callable, Some(global(store, "Number"))));
+            assert!(!store.signature_owns_callable_type(signature));
+            assert!(!matches!(
+                validate_stored_callable_set(store, callable),
+                StoredCallableSetValidation::Valid { .. }
+            ));
+            assert!(store.set_type_symbol(callable, Some(bound_method)));
+            assert!(store.signature_owns_callable_type(signature));
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.signature_len(),
+                    store.symbol_len(),
+                    store.checker_link_allocated_lengths()
+                ),
+                warm
+            );
+            assert_eq!(checker.get_type_from_type_node(annotation), Ok(wrapper));
+        }
     }
 
     #[test]

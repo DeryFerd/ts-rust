@@ -7942,11 +7942,12 @@ fn source_nullish_assignment_proof(
     }
     for node in [assignment.expression, assignment.target] {
         validate_bound_node(bound, bound.flow_graph(), node)?;
-        if bound.flow_container(node) != Some(container) || bound.container(node) != Some(container)
-        {
+        if bound.container(node) != Some(container) {
             return Err(invalid().into());
         }
     }
+    validate_nullish_structural_owner(arena, bound, container, assignment.expression)
+        .map_err(|_| invalid())?;
     let expression = arena.get(assignment.expression.node).ok_or_else(invalid)?;
     let NodeData::BinaryExpression(binary) = &expression.data else {
         return Err(invalid().into());
@@ -8040,6 +8041,15 @@ fn source_nullish_assignment_proof(
         }
         _ => return Err(invalid().into()),
     };
+    if assignment.symbol.is_some() || receiver.is_some() {
+        validate_node_container(bound, bound.flow_graph(), container, assignment.target)?;
+        if bound.flow_at(assignment.target).is_none() {
+            return Err(invalid().into());
+        }
+    } else {
+        validate_nullish_structural_owner(arena, bound, container, assignment.target)
+            .map_err(|_| invalid())?;
+    }
     let mut flow = None;
     for (index, node) in bound.flow_graph().nodes().iter().enumerate() {
         if node.flags.intersects(FlowFlags::ASSIGNMENT)
@@ -8070,6 +8080,126 @@ fn source_nullish_assignment_proof(
         flow,
         revision: arena.revision(),
     })
+}
+
+/// Structural nodes use a real enclosing flow point, not a fabricated node entry.
+fn validate_nullish_structural_owner(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    container: NodeRef,
+    node: NodeRef,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(node);
+    if arena.id() != bound.node_arena_id()
+        || arena.revision() != bound.node_arena_revision()
+        || !container.is_for(arena.id(), bound.file_id())
+    {
+        return Err(invalid().into());
+    }
+    let graph = bound.flow_graph();
+    let scope = bound.block_scope_container(node);
+    let mut current = node;
+    let mut visited = HashSet::new();
+    while visited.insert(current) && visited.len() <= FLOW_DEPTH_LIMIT {
+        validate_bound_node(bound, graph, current)?;
+        let record = arena.get(current.node).ok_or_else(invalid)?;
+        if bound.container(current) != Some(container)
+            || bound.block_scope_container(current) != scope
+        {
+            return Err(invalid().into());
+        }
+        if bound.flow_container(current).is_some() {
+            validate_node_container(bound, graph, container, current)?;
+            let flow = bound.flow_at(current).ok_or_else(invalid)?;
+            flow_node(graph, flow)?;
+            return Ok(());
+        }
+        if !matches!(
+            record.kind,
+            SyntaxKind::BinaryExpression
+                | SyntaxKind::CallExpression
+                | SyntaxKind::PropertyAccessExpression
+                | SyntaxKind::ElementAccessExpression
+                | SyntaxKind::ParenthesizedExpression
+                | SyntaxKind::VariableDeclaration
+                | SyntaxKind::VariableDeclarationList
+        ) {
+            return Err(invalid().into());
+        }
+        let parent = NodeRef::new(node.arena, node.file, record.parent.ok_or_else(invalid)?);
+        let parent_record = arena.get(parent.node).ok_or_else(invalid)?;
+        let child_matches = match &parent_record.data {
+            NodeData::BinaryExpression(binary)
+                if parent_record.kind == SyntaxKind::BinaryExpression =>
+            {
+                binary.left == current.node || binary.right == current.node
+            }
+            NodeData::CallExpression(call) if parent_record.kind == SyntaxKind::CallExpression => {
+                call.expression == current.node
+                    || call
+                        .arguments
+                        .nodes
+                        .iter()
+                        .filter(|child| **child == current.node)
+                        .count()
+                        == 1
+            }
+            NodeData::PropertyAccessExpression(access)
+                if parent_record.kind == SyntaxKind::PropertyAccessExpression =>
+            {
+                access.expression == current.node
+            }
+            NodeData::ElementAccessExpression(access)
+                if parent_record.kind == SyntaxKind::ElementAccessExpression =>
+            {
+                access.expression == current.node || access.argument_expression == current.node
+            }
+            NodeData::ParenthesizedExpression(wrapper)
+                if parent_record.kind == SyntaxKind::ParenthesizedExpression =>
+            {
+                wrapper.expression == current.node
+            }
+            NodeData::VariableDeclaration(variable)
+                if parent_record.kind == SyntaxKind::VariableDeclaration =>
+            {
+                variable.initializer == Some(current.node)
+            }
+            NodeData::VariableDeclarationList(list)
+                if parent_record.kind == SyntaxKind::VariableDeclarationList =>
+            {
+                list.declarations
+                    .nodes
+                    .iter()
+                    .filter(|child| **child == current.node)
+                    .count()
+                    == 1
+            }
+            NodeData::VariableStatement(statement)
+                if parent_record.kind == SyntaxKind::VariableStatement =>
+            {
+                statement.declaration_list == current.node
+            }
+            NodeData::ExpressionStatement(statement)
+                if parent_record.kind == SyntaxKind::ExpressionStatement =>
+            {
+                statement.expression == current.node
+            }
+            NodeData::ReturnStatement(statement)
+                if parent_record.kind == SyntaxKind::ReturnStatement =>
+            {
+                statement.expression == Some(current.node)
+            }
+            _ => false,
+        };
+        if !child_matches
+            || record.range.start < parent_record.range.start
+            || record.range.end > parent_record.range.end
+        {
+            return Err(invalid().into());
+        }
+        current = parent;
+    }
+    Err(invalid().into())
 }
 
 fn nullish_member_receiver(
@@ -8118,10 +8248,11 @@ fn nullish_member_receiver(
         if arena
             .get(receiver.node)
             .is_none_or(|record| record.parent != Some(current.node))
-            || bound.flow_container(receiver) != Some(container)
         {
             return Err(invalid().into());
         }
+        validate_nullish_structural_owner(arena, bound, container, receiver)
+            .map_err(|_| invalid())?;
         current = receiver;
     }
     Err(invalid().into())
@@ -8152,7 +8283,6 @@ fn validate_nullish_call(
         || data.symbol.is_some()
         || data.facts != 0
         || bound.container(call) != Some(container)
-        || bound.flow_container(call) != Some(container)
         || arena.get(data.expression).is_none_or(|callee| {
             callee.parent != Some(call.node)
                 || !matches!(
@@ -8163,6 +8293,7 @@ fn validate_nullish_call(
     {
         return Err(invalid().into());
     }
+    validate_nullish_structural_owner(arena, bound, container, call).map_err(|_| invalid())?;
     let mut statement = call;
     let mut visited = HashSet::new();
     loop {
@@ -8170,7 +8301,10 @@ fn validate_nullish_call(
             return Err(invalid().into());
         }
         let record = arena.get(statement.node).ok_or_else(invalid)?;
-        if bound.flow_container(statement) != Some(container)
+        if bound.container(statement) != Some(container)
+            || bound
+                .flow_container(statement)
+                .is_some_and(|owner| owner != container)
             || bound.block_scope_container(statement) != bound.block_scope_container(call)
         {
             return Err(invalid().into());
@@ -8911,7 +9045,8 @@ fn validate_parameter_assignment_in_list(
             if function.kind == SyntaxKind::FunctionExpression
                 && statement_list.is_some_and(|syntax| {
                     syntax.callable.declaration == container
-                        && syntax.callable.family == SourceCallableFamily::ArrowFunction
+                        && syntax.callable.family
+                            == super::source_callables::SourceCallableFamily::ArrowFunction
                         && syntax.callable.body.node == function_data.body
                         && bound.symbol(container) == Some(syntax.callable.owner_symbol)
                 }) =>
@@ -9325,8 +9460,13 @@ fn validate_planned_call_container(
         if *expected != antecedent
             || !bound.contains(call)
             || bound.container(call) != Some(plan.container)
-            || bound.flow_container(call) != Some(plan.container)
+            || bound
+                .flow_container(call)
+                .is_some_and(|owner| owner != plan.container)
+            || bound.container(statement) != Some(plan.container)
             || bound.flow_container(statement) != Some(plan.container)
+            || bound.flow_at(statement).is_none()
+            || bound.block_scope_container(call) != bound.block_scope_container(statement)
             || plan.calls.get(&call) != Some(&statement)
         {
             return Err(SourceFlowInvariant::InvalidCall(call).into());
@@ -16778,6 +16918,279 @@ mod tests {
                 after.type_of(symbol),
                 Some(if readonly { undefined } else { number })
             );
+        }
+    }
+
+    #[test]
+    fn nullish_structural_owners_keep_real_entries_and_call_antecedents() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let state = |context: &CanonicalCheckerContext<'_>, parsed: &ParseResult, file: FileId| {
+            let store = context.store();
+            (
+                [
+                    store.type_len(),
+                    store.type_alias_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.index_info_len(),
+                    store.type_resolution_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+                parsed
+                    .arena
+                    .iter()
+                    .map(|(id, _)| {
+                        let node = NodeRef::new(parsed.arena.id(), file, id);
+                        (
+                            node,
+                            store.node_links(node).cloned(),
+                            store.type_node_links(node).cloned(),
+                            store.symbol_node_links(node).cloned(),
+                            store.signature_links(node).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                store
+                    .symbol_store()
+                    .symbols()
+                    .map(|(symbol, _)| (symbol, store.value_symbol_links(symbol).cloned()))
+                    .collect::<Vec<_>>(),
+                store
+                    .source_file_links(context.source_file(file).unwrap())
+                    .cloned(),
+                context.file(file).unwrap().1.flow_graph().clone(),
+                context.diagnostics().clone(),
+            )
+        };
+        let parsed = parse_source_file(concat!(
+            "declare function effect(): number;\n",
+            "function owner(value: number | undefined): void {\n",
+            "  value ??= (effect(), 1); value;\n",
+            "}\n",
+            "function foreign(other: number | undefined): void { other; }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(32_294);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let (owner, declaration, statements) = linear_function_nodes(&parsed, file, "owner");
+        let (foreign, _, _) = linear_function_nodes(&parsed, file, "foreign");
+        let expression = expression_statement_expression(&parsed, file, statements[0]);
+        let NodeData::BinaryExpression(binary) = &parsed.arena.get(expression.node).unwrap().data
+        else {
+            panic!("expected the actual nullish assignment");
+        };
+        let target = NodeRef::new(parsed.arena.id(), file, binary.left);
+        let assignment = SourceFlowNullishAssignment {
+            expression,
+            target,
+            declaration: Some(declaration),
+            symbol: bound.symbol(declaration),
+            readonly: false,
+        };
+        let call = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                (node.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    id,
+                ))
+            })
+            .unwrap();
+        assert_eq!(bound.flow_container(expression), None);
+        assert_eq!(bound.flow_at(expression), None);
+        assert_eq!(bound.container(expression), Some(owner));
+        assert_eq!(bound.flow_container(target), Some(owner));
+        assert!(bound.flow_at(target).is_some());
+        assert_eq!(bound.flow_container(call), None);
+        let call_rows = bound
+            .flow_graph()
+            .nodes()
+            .iter()
+            .filter(|node| {
+                node.flags.contains(FlowFlags::CALL)
+                    && node.payload == Some(FlowNodePayload::Ast(call))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(call_rows.len(), 1);
+        let antecedent = call_rows[0].antecedent.unwrap();
+        let globals = context.global_types().clone();
+        let (number, undefined) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.undefined_type)
+        };
+        let optional = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[number, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let before = state(&context, &parsed, file);
+        let mut plan = SourceFlowPlan::preflight_linear_with_nullish_assignments(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            owner,
+            statements.iter().copied().chain([target]),
+            [],
+            [],
+            [],
+            [call],
+            [],
+            [],
+            [],
+            [assignment],
+        )
+        .unwrap();
+        assert_eq!(plan.nullish_calls.get(&call), Some(&antecedent));
+        {
+            let symbol = assignment.symbol.unwrap();
+            let frame = plan
+                .frame_with_captured_locals(
+                    context.store(),
+                    &host,
+                    &bound,
+                    [(symbol, optional)].into_iter().collect(),
+                )
+                .unwrap();
+            assert_eq!(frame.declared_types.get(&symbol), Some(&optional));
+        }
+        assert_eq!(state(&context, &parsed, file), before);
+        assert_eq!(
+            validate_nullish_call(&parsed.arena, &bound, owner, call, &[assignment]),
+            Ok(Some((statements[0], antecedent))),
+        );
+        assert_eq!(state(&context, &parsed, file), before);
+        for wrong_owner in [foreign, bound.source_file()] {
+            assert_eq!(
+                validate_source_nullish_assignment(
+                    &parsed.arena,
+                    &bound,
+                    context.store(),
+                    &host,
+                    wrong_owner,
+                    assignment,
+                ),
+                Err(SourceFlowInvariant::InvalidParameterAssignment(target).into()),
+            );
+            assert_eq!(
+                validate_nullish_call(&parsed.arena, &bound, wrong_owner, call, &[assignment]),
+                Err(SourceFlowInvariant::InvalidCall(call).into()),
+            );
+            assert_eq!(state(&context, &parsed, file), before);
+        }
+        let other_target = expression_statement_expression(&parsed, file, statements[1]);
+        assert_eq!(
+            validate_source_nullish_assignment(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                &host,
+                owner,
+                SourceFlowNullishAssignment {
+                    target: other_target,
+                    ..assignment
+                },
+            ),
+            Err(SourceFlowInvariant::InvalidParameterAssignment(other_target).into()),
+        );
+        assert_eq!(state(&context, &parsed, file), before);
+        let wrong_antecedent = bound.flow_at(target).unwrap();
+        assert_ne!(wrong_antecedent, antecedent);
+        plan.nullish_calls.insert(call, wrong_antecedent);
+        assert_eq!(
+            plan.frame_with_captured_locals(context.store(), &host, &bound, SourceFlowTypes::new())
+                .err(),
+            Some(SourceFlowInvariant::InvalidCall(call).into()),
+        );
+        assert_eq!(state(&context, &parsed, file), before);
+
+        // A literal key retains a mutation even on a temporary receiver. A call key does not.
+        for (index, key) in ["index()", "'x'"].into_iter().enumerate() {
+            let parsed = parse_source_file(&format!(
+                "declare function receiver(): {{ [key: string]: number | undefined }}; \
+                 declare function index(): string; \
+                 function owner(unused: number): void {{ receiver()[{key}] ??= 1; }}",
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(32_295 + u32::try_from(index).unwrap());
+            let context = loop_context(&parsed, file);
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let (owner, _, statements) = linear_function_nodes(&parsed, file, "owner");
+            let expression = expression_statement_expression(&parsed, file, statements[0]);
+            let NodeData::BinaryExpression(binary) =
+                &parsed.arena.get(expression.node).unwrap().data
+            else {
+                panic!("expected the actual member assignment");
+            };
+            let target = NodeRef::new(parsed.arena.id(), file, binary.left);
+            let NodeData::ElementAccessExpression(element) =
+                &parsed.arena.get(target.node).unwrap().data
+            else {
+                panic!("expected the actual element target");
+            };
+            let receiver = NodeRef::new(parsed.arena.id(), file, element.expression);
+            let assignment = SourceFlowNullishAssignment {
+                expression,
+                target,
+                declaration: None,
+                symbol: None,
+                readonly: false,
+            };
+            assert_eq!(bound.flow_container(expression), None);
+            assert_eq!(bound.flow_container(receiver), None);
+            let writes = bound
+                .flow_graph()
+                .nodes()
+                .iter()
+                .filter(|node| {
+                    node.flags.contains(FlowFlags::ASSIGNMENT)
+                        && node.payload == Some(FlowNodePayload::Ast(target))
+                })
+                .count();
+            assert_eq!(writes, index);
+            assert_eq!(bound.flow_container(target), (index == 1).then_some(owner));
+            let before = state(&context, &parsed, file);
+            assert_eq!(
+                validate_source_nullish_assignment(
+                    &parsed.arena,
+                    &bound,
+                    context.store(),
+                    &host,
+                    owner,
+                    assignment,
+                ),
+                if index == 0 {
+                    Ok(())
+                } else {
+                    Err(SourceFlowUnsupported::PropertyWrite(target).into())
+                },
+            );
+            assert_eq!(state(&context, &parsed, file), before);
+            assert_eq!(
+                validate_nullish_call(&parsed.arena, &bound, owner, receiver, &[assignment]),
+                Err(SourceFlowInvariant::InvalidCall(receiver).into()),
+            );
+            assert_eq!(state(&context, &parsed, file), before);
         }
     }
 

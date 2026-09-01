@@ -1107,3 +1107,104 @@ fn primitive_empty_intersections_reject_null_and_undefined_with_strict_null_chec
         );
     }
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn target_intersection_diagnostics_keep_the_first_failed_member_and_replay() {
+    let source = concat!(
+        "type Count = { value: number };\n",
+        "type Tag = { tag: string };\n",
+        "type Both = Count & Tag;\n",
+        "type Reversed = Tag & Count;\n",
+        "type WrongCount = { value: string; tag: string };\n",
+        "type WrongTag = { value: number; tag: number };\n",
+        "declare const wrongCount: WrongCount;\n",
+        "declare const wrongTag: WrongTag;\n",
+        "const badCount: Both = wrongCount;\n",
+        "const badReversed: Reversed = wrongCount;\n",
+        "const badTag: Both = wrongTag;\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(1_933);
+    for source_first in [false, true] {
+        let mut context = strict_intersection_context(&parsed, file);
+        if source_first {
+            context.check_source_file(file).unwrap();
+        }
+        let aliases = ["Both", "Reversed"].map(|name| {
+            (
+                name,
+                query_intersection_alias(&mut context, &parsed, file, name),
+            )
+        });
+        let [count, tag, wrong_count, wrong_tag] = ["Count", "Tag", "WrongCount", "WrongTag"]
+            .map(|name| query_intersection_alias(&mut context, &parsed, file, name));
+        assert_eq!(
+            intersection_data(&context, aliases[0].1).intersection.types,
+            [count, tag],
+        );
+        assert_eq!(
+            intersection_data(&context, aliases[1].1).intersection.types,
+            [tag, count],
+        );
+        context.check_source_file(file).unwrap();
+        for (source, target, expected) in [
+            (wrong_count, count, false),
+            (wrong_count, tag, true),
+            (wrong_tag, count, true),
+            (wrong_tag, tag, false),
+        ] {
+            assert_eq!(context.is_type_assignable_to(source, target), Ok(expected));
+        }
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+        for (diagnostic, (name, source, target, member, property, actual, expected)) in
+            diagnostics.iter().zip([
+                (
+                    "badCount",
+                    "WrongCount",
+                    "Both",
+                    "Count",
+                    "value",
+                    "string",
+                    "number",
+                ),
+                (
+                    "badReversed",
+                    "WrongCount",
+                    "Reversed",
+                    "Count",
+                    "value",
+                    "string",
+                    "number",
+                ),
+                (
+                    "badTag", "WrongTag", "Both", "Tag", "tag", "number", "string",
+                ),
+            ])
+        {
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(diagnostic.diagnostic.arguments, [source, target]);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!(
+                    "Type '{source}' is not assignable to type '{target}'.\n  Type '{source}' is not assignable to type '{member}'.\n    Types of property '{property}' are incompatible.\n      Type '{actual}' is not assignable to type '{expected}'."
+                ),
+            );
+            let node = declaration(&parsed, file, SyntaxKind::VariableDeclaration, name);
+            let NodeData::VariableDeclaration(variable) =
+                &parsed.arena.get(node.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                diagnostic.node,
+                Some(NodeRef::new(node.arena, file, variable.name))
+            );
+            assert_eq!(diagnostic.range_override, None);
+            assert!(diagnostic.related_information.is_empty());
+        }
+        assert_intersection_replay(&mut context, &parsed, file, &aliases, &[]);
+    }
+}

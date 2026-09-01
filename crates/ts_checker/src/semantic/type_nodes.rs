@@ -15643,6 +15643,23 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(())
     }
 
+    fn plan_enclosing_generic_interface_call_dependencies(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<object_members::PropertyObjectPlan>, DeclaredTypeError> {
+        let calls =
+            object_members::plan_enclosing_generic_interface_calls(self.store, self.host, node)
+                .map_err(property_object_error)?;
+        if let Some(calls) = &calls {
+            for annotation in calls.call_type_nodes() {
+                if annotation != node {
+                    self.plan_type_node(annotation)?;
+                }
+            }
+        }
+        Ok(calls)
+    }
+
     fn preflight_selected_method_type_parameters(
         &self,
         methods: &[object_members::PlannedInterfaceMethod],
@@ -37186,6 +37203,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             object_members::plan_enclosing_generic_interface_methods(self.store, self.host, node)
                 .map_err(property_object_error)?;
         planner.plan_interface_method_dependencies(&methods, node)?;
+        planner.plan_enclosing_generic_interface_call_dependencies(node)?;
         planner.plan_type_node_with_alias_operand(node)?;
         drop(planner.finish());
         Ok(())
@@ -37862,6 +37880,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             object_members::plan_enclosing_generic_interface_methods(self.store, self.host, node)
                 .map_err(property_object_error)?;
         planner.plan_interface_method_dependencies(&methods, node)?;
+        let calls = planner.plan_enclosing_generic_interface_call_dependencies(node)?;
         let source_operand = planner.plan_type_node_with_alias_operand(node)?;
         let header = planner.plan_required_source_callable_header()?;
         let plan = planner.finish();
@@ -37943,13 +37962,27 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 &plan,
                 &mut prepared,
             )?;
-            self.execute_interface_method_type_parameters(&methods, &[], &plan, &mut prepared)?;
+            self.execute_interface_method_type_parameters(
+                &methods,
+                calls
+                    .as_ref()
+                    .map_or(&[], |calls| calls.call_signatures.as_slice()),
+                &plan,
+                &mut prepared,
+            )?;
             for method in &methods {
                 for parameter in &method.parameters {
                     self.execute_type_node(parameter.type_node, &plan, &mut prepared)?;
                 }
                 if method.return_type != node {
                     self.execute_type_node(method.return_type, &plan, &mut prepared)?;
+                }
+            }
+            if let Some(calls) = &calls {
+                for annotation in calls.call_type_nodes() {
+                    if annotation != node {
+                        self.execute_type_node(annotation, &plan, &mut prepared)?;
+                    }
                 }
             }
             let result = match direct_callable_alias
@@ -39100,6 +39133,82 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             current = NodeRef::new(current.arena, current.file, parent);
         }
         Ok(false)
+    }
+
+    /// Checks written call defaults before source value and return annotations.
+    pub(super) fn check_source_interface_call_type_parameter_defaults(
+        &mut self,
+        call: &object_members::PlannedCallSignature,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(call.declaration));
+        self.require_type_reference_alias_root_capability(call.declaration)?;
+        if !self.pending_function_parameters.is_empty() || self.instantiation_session.is_none() {
+            return Err(invalid());
+        }
+        let targets = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types)
+            .ok_or_else(invalid)?;
+        let mut checked = HashSet::new();
+        for parameter in &call.type_parameters {
+            preflight_type_parameter_symbol(self.store, self.host, parameter.symbol, &mut checked)?;
+        }
+        let mut planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            Some(targets),
+            self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
+        )
+        .with_source_globals(self.global_types.as_ref());
+        planner.source_context = Some(self.source_query_context()?);
+        planner.source_heritage_identity = true;
+        planner.replay_cached_annotations = true;
+        for parameter in &call.type_parameters {
+            for annotation in [parameter.constraint, parameter.default_type]
+                .into_iter()
+                .flatten()
+            {
+                planner.plan_type_node(annotation)?;
+            }
+        }
+        let plan = planner.finish();
+        let mut prepared = self.prepare_literal_types(&plan)?;
+        if let Err(error) = self.seed_pending_function_parameters(&plan, &mut prepared) {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return Err(error);
+        }
+        let result = (|| {
+            self.execute_declared_signature_type_parameters(
+                call.type_parameters.iter(),
+                &plan,
+                &mut prepared,
+            )?;
+            let formals = object_members::resolved_declared_signature_type_parameters(
+                self.store,
+                call.declaration,
+                &call.type_parameters,
+            )
+            .ok_or_else(invalid)?;
+            for (parameter, type_) in call.type_parameters.iter().zip(formals) {
+                let Some(default_node) = parameter.default_type else {
+                    continue;
+                };
+                let Some(TypeData::TypeParameter(data)) =
+                    self.store.type_payload(type_).map(TypeRecord::data)
+                else {
+                    return Err(invalid());
+                };
+                let default_type = data.resolved_default_type.ok_or_else(invalid)?;
+                self.check_source_type_parameter_default(type_, default_type, default_node)?;
+            }
+            Ok(())
+        })();
+        self.complete_type_query(result, &plan, &mut prepared)
     }
 
     fn check_source_type_parameter_default(

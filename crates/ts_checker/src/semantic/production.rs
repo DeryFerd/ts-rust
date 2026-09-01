@@ -50,7 +50,10 @@ use super::{
     },
     global_types::initialize_global_library_types,
     instantiate::{InstantiationLimits, InstantiationSession},
-    merge::{CheckerDiagnosticMergeHost, SymbolMergeDiagnostic, SymbolMergeHost},
+    merge::{
+        CheckerDiagnosticMergeHost, DuplicatePrimaryArguments, SymbolMergeDiagnostic,
+        SymbolMergeDiagnosticKind, SymbolMergeHost,
+    },
     module_resolution::validate_module_resolution_manifest,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
     relater::SourceRelationError,
@@ -2574,7 +2577,8 @@ fn initialize_globals<'source, 'arena>(
                 {
                     pending_ambient_modules.push(symbol);
                 } else {
-                    store.merge_global_symbol(globals, symbol)?;
+                    let mut host = ScriptGlobalMergeHost { files, diagnostics };
+                    store.merge_global_symbol_with_host(&mut host, globals, symbol)?;
                 }
             }
         }
@@ -3064,68 +3068,197 @@ fn merge_named_ambient_module_augmentation(
     Ok(())
 }
 
-struct ModuleAugmentationMergeHost<'borrow, 'arena> {
+/// Reports authenticated TypeScript declaration names without querying types.
+struct ScriptGlobalMergeHost<'borrow, 'arena> {
     files: &'borrow ProductionAliasSourceRegistry<'arena>,
     diagnostics: &'borrow mut CanonicalCheckerDiagnostics,
 }
 
-impl ModuleAugmentationMergeHost<'_, '_> {
-    fn declaration_name(
+impl<'arena> ScriptGlobalMergeHost<'_, 'arena> {
+    fn declaration_names(
         &self,
         store: &CanonicalTypeMapperStore,
-        declaration: NodeRef,
-    ) -> Result<NodeRef, SymbolMergeError> {
-        let invalid = || SymbolMergeError::StoreInvariant("merge declaration has no source");
-        let (arena, bound) = self.files.snapshot(declaration.file).ok_or_else(invalid)?;
-        if !declaration.is_for(arena.id(), bound.file_id())
-            || !bound.contains(declaration)
-            || !store.contains_node_ref(declaration)
-        {
-            return Err(invalid());
-        }
-        let record = arena.get(declaration.node).ok_or_else(invalid)?;
-        let name = match &record.data {
-            NodeData::ClassDeclaration(data) => data.name,
-            NodeData::ClassExpression(data) => data.name,
-            NodeData::FunctionDeclaration(data) => data.name,
-            NodeData::FunctionExpression(data) => data.name,
-            NodeData::BindingElement(data) => data.name,
-            NodeData::ImportClause(data) => data.name,
-            NodeData::EnumDeclaration(data) => Some(data.name),
-            NodeData::EnumMember(data) => Some(data.name),
-            NodeData::InterfaceDeclaration(data) => Some(data.name),
-            NodeData::ModuleDeclaration(data) => Some(data.name),
-            NodeData::TypeAliasDeclaration(data) => Some(data.name),
-            NodeData::TypeParameterDeclaration(data) => Some(data.name),
-            NodeData::VariableDeclaration(data) => Some(data.name),
-            NodeData::ParameterDeclaration(data) => Some(data.name),
-            NodeData::PropertyDeclaration(data) => Some(data.name),
-            NodeData::PropertySignatureDeclaration(data) => Some(data.name),
-            NodeData::MethodDeclaration(data) => Some(data.name),
-            NodeData::MethodSignatureDeclaration(data) => Some(data.name),
-            NodeData::GetAccessorDeclaration(data) => Some(data.name),
-            NodeData::SetAccessorDeclaration(data) => Some(data.name),
-            NodeData::ExportSpecifier(data) => Some(data.name),
-            NodeData::ImportSpecifier(data) => Some(data.name),
-            NodeData::ImportEqualsDeclaration(data) => Some(data.name),
-            NodeData::NamespaceImport(data) => Some(data.name),
-            NodeData::NamespaceExport(data) => Some(data.name),
-            _ => None,
+        symbol: SemanticSymbolId,
+        diagnostic: SymbolMergeDiagnostic,
+    ) -> Result<(Vec<NodeRef>, &'arena str), SymbolMergeError> {
+        let unavailable = || SymbolMergeError::DiagnosticRequired {
+            kind: diagnostic.kind,
+            target: diagnostic.target,
+            source: diagnostic.source,
         };
-        let Some(name) = name else {
-            return Ok(declaration);
-        };
-        let name = NodeRef::new(declaration.arena, declaration.file, name);
-        if !bound.contains(name)
-            || !store.contains_node_ref(name)
-            || arena
-                .get(name.node)
-                .is_none_or(|record| record.parent != Some(declaration.node))
-        {
-            return Err(invalid());
+        let record = store
+            .symbol(symbol)
+            .ok_or(SymbolMergeError::InvalidSymbol(symbol))?;
+        let declarations = record
+            .declarations()
+            .filter(|declarations| !declarations.is_empty())
+            .ok_or_else(unavailable)?;
+        let symbol_name = record.name().as_utf8().ok_or_else(unavailable)?;
+        let mut names = Vec::with_capacity(declarations.len());
+        let mut spelling = None;
+        for &declaration in declarations {
+            let name = merge_declaration_name(self.files, store, declaration)?;
+            if name == declaration {
+                return Err(unavailable());
+            }
+            let (arena, bound) = self.files.snapshot(declaration.file).ok_or(
+                SymbolMergeError::StoreInvariant("script merge declaration has no source"),
+            )?;
+            let facts = bound.source_facts().ok_or(SymbolMergeError::StoreInvariant(
+                "script merge declaration has no source facts",
+            ))?;
+            if facts.is_javascript_file() {
+                return Err(unavailable());
+            }
+            if ![bound.symbol(declaration), bound.local_symbol(declaration)]
+                .into_iter()
+                .flatten()
+                .any(|owner| store.get_merged_symbol(owner) == Some(symbol))
+            {
+                return Err(SymbolMergeError::StoreInvariant(
+                    "script merge declaration has a different symbol owner",
+                ));
+            }
+            let name_record = arena.get(name.node).ok_or(SymbolMergeError::StoreInvariant(
+                "script merge declaration has no name node",
+            ))?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Err(unavailable());
+            };
+            if name_record.kind != SyntaxKind::Identifier {
+                return Err(unavailable());
+            }
+            if identifier.text != symbol_name {
+                return Err(SymbolMergeError::StoreInvariant(
+                    "script merge declaration name differs from its symbol",
+                ));
+            }
+            let invalid_text = || {
+                SymbolMergeError::StoreInvariant(
+                    "script merge declaration name has no source text",
+                )
+            };
+            let declaration_record = arena.get(declaration.node).ok_or_else(invalid_text)?;
+            if name_record.range.start.get() < declaration_record.range.start.get()
+                || name_record.range.end.get() > declaration_record.range.end.get()
+                || name_record.range.start.get() >= name_record.range.end.get()
+            {
+                return Err(invalid_text());
+            }
+            let start = usize::try_from(name_record.range.start.get())
+                .map_err(|_| invalid_text())?;
+            let end = usize::try_from(name_record.range.end.get()).map_err(|_| invalid_text())?;
+            let written = arena
+                .source_text()
+                .and_then(|text| text.get(start..end))
+                .ok_or_else(invalid_text)?;
+            spelling.get_or_insert(written);
+            names.push(name);
         }
-        Ok(name)
+        Ok((names, spelling.ok_or_else(unavailable)?))
     }
+}
+
+impl SymbolMergeHost<super::TypeRecord, super::TypeMapper> for ScriptGlobalMergeHost<'_, '_> {
+    fn report_merge_diagnostic(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        diagnostic: SymbolMergeDiagnostic,
+    ) -> Result<(), SymbolMergeError> {
+        if diagnostic.kind != SymbolMergeDiagnosticKind::IncompatibleDeclarations {
+            return Err(SymbolMergeError::DiagnosticRequired {
+                kind: diagnostic.kind,
+                target: diagnostic.target,
+                source: diagnostic.source,
+            });
+        }
+        let target = store
+            .symbol(diagnostic.target)
+            .ok_or(SymbolMergeError::InvalidSymbol(diagnostic.target))?;
+        let source = store
+            .symbol(diagnostic.source)
+            .ok_or(SymbolMergeError::InvalidSymbol(diagnostic.source))?;
+        if self.files.store_id() != store.id() {
+            return Err(SymbolMergeError::StoreInvariant(
+                "script merge sources belong to a different store",
+            ));
+        }
+
+        // Check both complete lists before the first diagnostic is issued.
+        let (source_names, source_spelling) =
+            self.declaration_names(store, diagnostic.source, diagnostic)?;
+        let (target_names, _) = self.declaration_names(store, diagnostic.target, diagnostic)?;
+        CheckerDiagnosticMergeHost::new(self.diagnostics).report_incompatible_at_nodes(
+            target.flags() | source.flags(),
+            source_spelling,
+            &source_names,
+            &target_names,
+            DuplicatePrimaryArguments::NativeSourceSpelling,
+        );
+        Ok(())
+    }
+}
+
+fn merge_declaration_name(
+    files: &ProductionAliasSourceRegistry<'_>,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> Result<NodeRef, SymbolMergeError> {
+    let invalid = || SymbolMergeError::StoreInvariant("merge declaration has no source");
+    let (arena, bound) = files.snapshot(declaration.file).ok_or_else(invalid)?;
+    if !declaration.is_for(arena.id(), bound.file_id())
+        || !bound.contains(declaration)
+        || !store.contains_node_ref(declaration)
+    {
+        return Err(invalid());
+    }
+    let record = arena.get(declaration.node).ok_or_else(invalid)?;
+    let name = match &record.data {
+        NodeData::ClassDeclaration(data) => data.name,
+        NodeData::ClassExpression(data) => data.name,
+        NodeData::FunctionDeclaration(data) => data.name,
+        NodeData::FunctionExpression(data) => data.name,
+        NodeData::BindingElement(data) => data.name,
+        NodeData::ImportClause(data) => data.name,
+        NodeData::EnumDeclaration(data) => Some(data.name),
+        NodeData::EnumMember(data) => Some(data.name),
+        NodeData::InterfaceDeclaration(data) => Some(data.name),
+        NodeData::ModuleDeclaration(data) => Some(data.name),
+        NodeData::TypeAliasDeclaration(data) => Some(data.name),
+        NodeData::TypeParameterDeclaration(data) => Some(data.name),
+        NodeData::VariableDeclaration(data) => Some(data.name),
+        NodeData::ParameterDeclaration(data) => Some(data.name),
+        NodeData::PropertyDeclaration(data) => Some(data.name),
+        NodeData::PropertySignatureDeclaration(data) => Some(data.name),
+        NodeData::MethodDeclaration(data) => Some(data.name),
+        NodeData::MethodSignatureDeclaration(data) => Some(data.name),
+        NodeData::GetAccessorDeclaration(data) => Some(data.name),
+        NodeData::SetAccessorDeclaration(data) => Some(data.name),
+        NodeData::ExportSpecifier(data) => Some(data.name),
+        NodeData::ImportSpecifier(data) => Some(data.name),
+        NodeData::ImportEqualsDeclaration(data) => Some(data.name),
+        NodeData::NamespaceImport(data) => Some(data.name),
+        NodeData::NamespaceExport(data) => Some(data.name),
+        _ => None,
+    };
+    let Some(name) = name else {
+        return Ok(declaration);
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, name);
+    if !bound.contains(name)
+        || !store.contains_node_ref(name)
+        || arena
+            .get(name.node)
+            .is_none_or(|record| record.parent != Some(declaration.node))
+    {
+        return Err(invalid());
+    }
+    Ok(name)
+}
+
+struct ModuleAugmentationMergeHost<'borrow, 'arena> {
+    files: &'borrow ProductionAliasSourceRegistry<'arena>,
+    diagnostics: &'borrow mut CanonicalCheckerDiagnostics,
 }
 
 impl SymbolMergeHost<super::TypeRecord, super::TypeMapper> for ModuleAugmentationMergeHost<'_, '_> {
@@ -3140,12 +3273,12 @@ impl SymbolMergeHost<super::TypeRecord, super::TypeMapper> for ModuleAugmentatio
         for mut diagnostic in reported.into_vec() {
             diagnostic.node = diagnostic
                 .node
-                .map(|node| self.declaration_name(store, node))
+                .map(|node| merge_declaration_name(self.files, store, node))
                 .transpose()?;
             for related in &mut diagnostic.related_information {
                 related.node = related
                     .node
-                    .map(|node| self.declaration_name(store, node))
+                    .map(|node| merge_declaration_name(self.files, store, node))
                     .transpose()?;
             }
             source::merge_retry_diagnostic(self.diagnostics, diagnostic);
@@ -4069,7 +4202,8 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        AliasTargetState, CanonicalCheckerDiagnosticRange, CanonicalModuleResolutionEntry,
+        AliasTargetState, CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange,
+        CanonicalCheckerRelatedInformation, CanonicalModuleResolutionEntry,
         CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
         CanonicalResolvedModuleInput, DeclaredTypeUnavailable, TypeData, TypeResolutionTarget,
         TypeResolutionTargetError, TypeSystemPropertyName,
@@ -7733,6 +7867,477 @@ mod tests {
                 .symbol(bootstrap.global_this_symbol)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn script_duplicate_capture_keeps_both_alias_query_identities() {
+        let first = parsed("type Repeated = { first: number };");
+        let second = parsed("type Repeated = { second: string };");
+        let first_file = FileId::new(8_241);
+        let second_file = FileId::new(8_242);
+        let bodies = [
+            type_alias_body(&first, first_file, "Repeated"),
+            type_alias_body(&second, second_file, "Repeated"),
+        ];
+        let declarations = [(&first, bodies[0]), (&second, bodies[1])].map(|(parsed, body)| {
+            NodeRef::new(
+                body.arena,
+                body.file,
+                parsed.arena.get(body.node).unwrap().parent.unwrap(),
+            )
+        });
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(&[(first_file, &first), (second_file, &second)]),
+            vec![(first_file, &first.arena), (second_file, &second.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let aliases = declarations.map(|declaration| {
+            context
+                .file(declaration.file)
+                .unwrap()
+                .1
+                .symbol(declaration)
+                .unwrap()
+        });
+        assert_ne!(aliases[0], aliases[1]);
+        assert_eq!(global_symbol(&context, "Repeated"), Some(aliases[0]));
+        for (alias, declaration) in aliases.into_iter().zip(declarations) {
+            assert_eq!(context.store().get_merged_symbol(alias), Some(alias));
+            assert_eq!(
+                context.store().symbol(alias).unwrap().declarations(),
+                Some([declaration].as_slice()),
+            );
+        }
+
+        let captured = |context: &CanonicalCheckerContext<'_>| {
+            let bindings = context.store().source_global_bindings().unwrap();
+            let binding = bindings
+                .get(EscapedName::source("Repeated").as_ref())
+                .unwrap();
+            (
+                bindings.table,
+                binding.table_symbol,
+                binding.symbol,
+                binding.flags,
+                binding.declarations().map(<[NodeRef]>::to_vec),
+            )
+        };
+        let before = captured(&context);
+        assert_eq!(
+            before,
+            (
+                context.globals(),
+                aliases[0],
+                aliases[0],
+                SymbolFlags::TYPE_ALIAS,
+                Some(vec![declarations[0]]),
+            ),
+        );
+        assert!(
+            context
+                .store()
+                .source_global_bindings()
+                .unwrap()
+                .iter()
+                .all(|binding| {
+                    binding.symbol != aliases[1] && binding.table_symbol != aliases[1]
+                })
+        );
+        let diagnostics = context.diagnostics().clone();
+        assert_eq!(diagnostics.len(), 2);
+        let types = bodies.map(|body| context.get_type_from_type_node(body).unwrap());
+        assert_ne!(types[0], types[1]);
+        for (alias, type_) in aliases.into_iter().zip(types) {
+            assert_eq!(context.get_declared_type_of_symbol(alias), Ok(type_));
+            let type_alias = context
+                .store()
+                .type_payload(type_)
+                .unwrap()
+                .alias()
+                .unwrap();
+            assert_eq!(
+                context.store().type_alias(type_alias).unwrap().symbol(),
+                Some(alias),
+            );
+        }
+        assert_eq!(captured(&context), before);
+        let allocations = (
+            context.store().type_len(),
+            context.store().type_alias_len(),
+            context.store().symbol_len(),
+            context.store().merged_symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for _ in 0..2 {
+            for ((alias, body), type_) in aliases.into_iter().zip(bodies).zip(types) {
+                assert_eq!(context.get_type_from_type_node(body), Ok(type_));
+                assert_eq!(context.get_declared_type_of_symbol(alias), Ok(type_));
+                assert_eq!(context.store().get_merged_symbol(alias), Some(alias));
+            }
+            assert_eq!(captured(&context), before);
+            assert_eq!(global_symbol(&context, "Repeated"), Some(aliases[0]));
+            for (alias, declaration) in aliases.into_iter().zip(declarations) {
+                assert_eq!(
+                    context.store().symbol(alias).unwrap().declarations(),
+                    Some([declaration].as_slice()),
+                );
+            }
+            assert_eq!(context.diagnostics(), &diagnostics);
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().type_alias_len(),
+                    context.store().symbol_len(),
+                    context.store().merged_symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                allocations,
+            );
+        }
+    }
+
+    #[test]
+    fn script_duplicate_reporter_checks_names_limits_and_foreign_ownership() {
+        fn declaration_names(
+            parsed: &ParseResult,
+            file: FileId,
+            kind: SyntaxKind,
+        ) -> Vec<(NodeRef, NodeRef)> {
+            parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    if record.kind != kind {
+                        return None;
+                    }
+                    let name = match &record.data {
+                        NodeData::VariableDeclaration(data) => data.name,
+                        NodeData::ClassDeclaration(data) => data.name?,
+                        NodeData::EnumDeclaration(data) => data.name,
+                        _ => return None,
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, node),
+                        NodeRef::new(parsed.arena.id(), file, name),
+                    ))
+                })
+                .collect()
+        }
+
+        let primary = |node, code, arguments: Vec<String>, related_information| {
+            CanonicalCheckerDiagnostic {
+                node: Some(node),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(message_by_code(code).unwrap(), arguments),
+                related_information,
+            }
+        };
+        let leading = |node, spelling: &str| CanonicalCheckerRelatedInformation {
+            node: Some(node),
+            diagnostic: Diagnostic::with_arguments(message_by_code(6203).unwrap(), [spelling]),
+        };
+        let variables = parsed(concat!(
+            "declare var Item: number;\n",
+            "declare var Item: number;\n",
+            "declare var Item: number;\n",
+            "declare var Item: number;\n",
+            "declare var Item: number;\n",
+            "declare var Item: number;\n",
+        ));
+        let class = parsed(r"declare class \u0049tem {}");
+        let variable_file = FileId::new(8_243);
+        let class_file = FileId::new(8_244);
+        let variable_names =
+            declaration_names(&variables, variable_file, SyntaxKind::VariableDeclaration);
+        let class_names = declaration_names(&class, class_file, SyntaxKind::ClassDeclaration);
+        assert_eq!(variable_names.len(), 6);
+        let [(class_declaration, class_name)] = class_names.as_slice() else {
+            panic!("expected the one named class");
+        };
+        let (class_declaration, class_name) = (*class_declaration, *class_name);
+        assert_eq!(
+            class.arena.get(class_name.node).unwrap().range,
+            TextRange::new(TextPos::new(14), TextPos::new(23)),
+        );
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(&[(variable_file, &variables), (class_file, &class)]),
+            vec![(variable_file, &variables.arena), (class_file, &class.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let target = global_symbol(&context, "Item").unwrap();
+        let source = context
+            .file(class_file)
+            .unwrap()
+            .1
+            .symbol(class_declaration)
+            .unwrap();
+        let spelling = r"\u0049tem";
+        let mut expected = vec![primary(
+            class_name,
+            2300,
+            vec![spelling.to_owned()],
+            variable_names
+                .iter()
+                .take(5)
+                .enumerate()
+                .map(|(index, &(_, name))| {
+                    if index == 0 {
+                        leading(name, spelling)
+                    } else {
+                        CanonicalCheckerRelatedInformation {
+                            node: Some(name),
+                            diagnostic: Diagnostic::new(message_by_code(6204).unwrap()),
+                        }
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )];
+        expected.extend(variable_names.iter().map(|&(_, name)| {
+            primary(
+                name,
+                2300,
+                vec![spelling.to_owned()],
+                vec![leading(class_name, spelling)],
+            )
+        }));
+        assert_eq!(context.diagnostics().as_slice(), expected.as_slice());
+        let original_diagnostics = context.diagnostics().clone();
+        let diagnostic = SymbolMergeDiagnostic {
+            kind: SymbolMergeDiagnosticKind::IncompatibleDeclarations,
+            target,
+            source,
+        };
+        let allocations = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().merged_symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        let mut reported = CanonicalCheckerDiagnostics::default();
+        ScriptGlobalMergeHost {
+            files: &context.files,
+            diagnostics: &mut reported,
+        }
+        .report_merge_diagnostic(context.store(), diagnostic)
+        .unwrap();
+        assert_eq!(reported, original_diagnostics);
+
+        let foreign_class = parsed("declare class Item {}");
+        let foreign = CanonicalCheckerContext::new(
+            completed_bindings(&[(class_file, &foreign_class)]),
+            vec![(class_file, &foreign_class.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let foreign_symbol = global_symbol(&foreign, "Item").unwrap();
+        for invalid in [
+            SymbolMergeDiagnostic {
+                source: foreign_symbol,
+                ..diagnostic
+            },
+            SymbolMergeDiagnostic {
+                target: foreign_symbol,
+                ..diagnostic
+            },
+        ] {
+            assert_eq!(
+                ScriptGlobalMergeHost {
+                    files: &context.files,
+                    diagnostics: &mut reported,
+                }
+                .report_merge_diagnostic(context.store(), invalid),
+                Err(SymbolMergeError::InvalidSymbol(foreign_symbol)),
+            );
+            assert_eq!(reported, original_diagnostics);
+        }
+        let foreign_declaration = foreign
+            .store()
+            .symbol(foreign_symbol)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        assert_eq!(
+            merge_declaration_name(&context.files, context.store(), foreign_declaration),
+            Err(SymbolMergeError::StoreInvariant(
+                "merge declaration has no source",
+            )),
+        );
+
+        // A valid first name must not hide a later declaration with a different owner.
+        for (symbol, wrong_declaration) in
+            [(target, class_declaration), (source, variable_names[0].0)]
+        {
+            let record = context.store().symbol(symbol).unwrap();
+            let original = record.declarations().unwrap().to_vec();
+            let value = record.value_declaration();
+            let mut invalid = original.clone();
+            invalid.push(wrong_declaration);
+            assert!(
+                context.store.set_symbol_declarations(symbol, Some(invalid), value)
+            );
+            assert_eq!(
+                ScriptGlobalMergeHost {
+                    files: &context.files,
+                    diagnostics: &mut reported,
+                }
+                .report_merge_diagnostic(context.store(), diagnostic),
+                Err(SymbolMergeError::StoreInvariant(
+                    "script merge declaration has a different symbol owner",
+                )),
+            );
+            assert_eq!(reported, original_diagnostics);
+            assert!(
+                context.store.set_symbol_declarations(symbol, Some(original), value)
+            );
+        }
+        assert_eq!(context.diagnostics(), &original_diagnostics);
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().merged_symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            allocations,
+        );
+
+        let enum_source = parsed("enum Choice { First }");
+        let block_source = parsed(r"let \u0043hoice = 1;");
+        let enum_file = FileId::new(8_245);
+        let block_file = FileId::new(8_246);
+        let (enum_declaration, enum_name) =
+            declaration_names(&enum_source, enum_file, SyntaxKind::EnumDeclaration)[0];
+        let (block_declaration, block_name) =
+            declaration_names(&block_source, block_file, SyntaxKind::VariableDeclaration)[0];
+        let enum_context = CanonicalCheckerContext::new(
+            completed_bindings(&[(enum_file, &enum_source), (block_file, &block_source)]),
+            vec![
+                (enum_file, &enum_source.arena),
+                (block_file, &block_source.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let target = enum_context
+            .file(enum_file)
+            .unwrap()
+            .1
+            .symbol(enum_declaration)
+            .unwrap();
+        let source = enum_context
+            .file(block_file)
+            .unwrap()
+            .1
+            .symbol(block_declaration)
+            .unwrap();
+        let flags = enum_context.store().symbol(target).unwrap().flags()
+            | enum_context.store().symbol(source).unwrap().flags();
+        let spelling = r"\u0043hoice";
+        let mut native = CanonicalCheckerDiagnostics::default();
+        let mut compatibility = CanonicalCheckerDiagnostics::default();
+        for (reported, mode) in [
+            (&mut native, DuplicatePrimaryArguments::NativeSourceSpelling),
+            (
+                &mut compatibility,
+                DuplicatePrimaryArguments::RawHostCompatibility,
+            ),
+        ] {
+            CheckerDiagnosticMergeHost::new(reported).report_incompatible_at_nodes(
+                flags,
+                spelling,
+                &[block_name],
+                &[enum_name],
+                mode,
+            );
+        }
+        assert_eq!(enum_context.diagnostics(), &native);
+        for (native, compatibility) in native.as_slice().iter().zip(compatibility.as_slice()) {
+            assert_eq!(native.diagnostic.code(), 2567);
+            assert_eq!(native.diagnostic.arguments, [spelling]);
+            assert!(compatibility.diagnostic.arguments.is_empty());
+            assert_eq!(native.node, compatibility.node);
+            assert_eq!(native.range_override, compatibility.range_override);
+            assert_eq!(native.related_information, compatibility.related_information);
+            assert_eq!(native.diagnostic.render(), compatibility.diagnostic.render());
+            assert_eq!(
+                native.diagnostic.render().unwrap(),
+                "Enum declarations can only merge with namespace or other enum declarations.",
+            );
+            assert_ne!(native, compatibility);
+        }
+        assert_eq!(
+            native.as_slice(),
+            &[
+                primary(
+                    block_name,
+                    2567,
+                    vec![spelling.to_owned()],
+                    vec![leading(enum_name, spelling)],
+                ),
+                primary(
+                    enum_name,
+                    2567,
+                    vec![spelling.to_owned()],
+                    vec![leading(block_name, spelling)],
+                ),
+            ],
+        );
+
+        let mut raw = CanonicalCheckerDiagnostics::default();
+        CheckerDiagnosticMergeHost::new(&mut raw)
+            .report_merge_diagnostic(
+                enum_context.store(),
+                SymbolMergeDiagnostic {
+                    kind: SymbolMergeDiagnosticKind::IncompatibleDeclarations,
+                    target,
+                    source,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            raw.as_slice(),
+            &[
+                primary(
+                    block_declaration,
+                    2567,
+                    Vec::new(),
+                    vec![leading(enum_declaration, "Choice")],
+                ),
+                primary(
+                    enum_declaration,
+                    2567,
+                    Vec::new(),
+                    vec![leading(block_declaration, "Choice")],
+                ),
+            ],
+        );
+
+        let mut isolated = CanonicalCheckerDiagnostics::default();
+        let primaries = [
+            native.as_slice()[0].diagnostic.clone(),
+            compatibility.as_slice()[0].diagnostic.clone(),
+        ];
+        for primary in &primaries {
+            isolated.lookup_or_issue(Some(block_name), primary.clone());
+        }
+        assert_eq!(isolated.len(), 2);
+        assert!(
+            isolated
+                .as_slice()
+                .iter()
+                .all(|diagnostic| diagnostic.related_information.is_empty())
+        );
+        for primary in primaries {
+            isolated
+                .lookup_or_issue(Some(block_name), primary)
+                .append_related(leading(enum_name, spelling));
+        }
+        assert_eq!(isolated.len(), 2);
+        assert_eq!(isolated.as_slice()[0], native.as_slice()[0]);
+        assert_eq!(isolated.as_slice()[1], compatibility.as_slice()[0]);
+        assert_ne!(isolated.as_slice()[0], isolated.as_slice()[1]);
     }
 
     #[test]
