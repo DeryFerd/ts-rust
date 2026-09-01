@@ -193,6 +193,9 @@ pub(super) enum SourceArrowBodyPlan {
     LinearBlock {
         block: NodeRef,
     },
+    StatementBlock {
+        block: NodeRef,
+    },
     ForOfBlock {
         block: NodeRef,
     },
@@ -2580,6 +2583,23 @@ fn plan_body(
             }
         }
         return Ok(SourceArrowBodyPlan::LinearBlock { block: body });
+    }
+    if synchronous_typescript
+        && block.statements.nodes.iter().any(|statement| {
+            matches!(
+                store.source_node_kind(NodeRef::new(body.arena, body.file, *statement)),
+                Some(SyntaxKind::IfStatement | SyntaxKind::Block)
+            )
+        })
+        && let Some((arena, bound)) = host.source(callable.declaration)
+    {
+        match super::source_statements::plan_source_callable_statement_list_syntax(
+            arena, bound, store, callable,
+        ) {
+            Ok(_) => return Ok(SourceArrowBodyPlan::StatementBlock { block: body }),
+            Err(super::source_statements::SourceFunctionStatementsError::Unsupported(_)) => {}
+            Err(_) => return Err(invariant(SourceArrowInvariant::InvalidBody(body))),
+        }
     }
     match block.statements.nodes.as_slice() {
         [] => Ok(SourceArrowBodyPlan::EmptyBlock { block: body }),

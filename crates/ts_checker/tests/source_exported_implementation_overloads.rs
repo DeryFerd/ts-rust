@@ -457,3 +457,85 @@ fn compatible_exported_overloads_still_check_the_implementation_body() {
     let queries = declarations.into_iter().chain([call]).collect::<Vec<_>>();
     assert_replay(&mut context, &queries);
 }
+
+#[test]
+fn exported_multistatement_implementation_keeps_its_original_body_route() {
+    let parsed = parse_source_file(concat!(
+        "const before = read();\n",
+        "export function read(): number;\n",
+        "export function read(): number { ; return 0; }\n",
+        "const after = read();\n",
+    ));
+    let mut context = context(&parsed);
+    let declarations = nodes(&parsed, SyntaxKind::FunctionDeclaration);
+    assert_eq!(declarations.len(), 2);
+    let NodeData::FunctionDeclaration(implementation) =
+        &parsed.arena.get(declarations[1].node).unwrap().data
+    else {
+        panic!("the last declaration must be the real implementation")
+    };
+    let body = implementation.body.unwrap();
+    let body_node = parsed.arena.get(body).unwrap();
+    assert_eq!(body_node.parent, Some(declarations[1].node));
+    let NodeData::Block(block) = &body_node.data else {
+        panic!("the implementation must retain its written block")
+    };
+    let [empty, returned] = block.statements.nodes.as_slice() else {
+        panic!("the body must contain the semicolon and final return")
+    };
+    for (statement, kind) in [
+        (*empty, SyntaxKind::EmptyStatement),
+        (*returned, SyntaxKind::ReturnStatement),
+    ] {
+        let record = parsed.arena.get(statement).unwrap();
+        assert_eq!(record.kind, kind);
+        assert_eq!(record.parent, Some(body));
+    }
+
+    context.check_source_file(FILE).unwrap();
+    assert!(context.diagnostics().is_empty());
+    let signatures = assert_exported_group(&context, &parsed, &declarations);
+    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+    for (declaration, signature) in declarations.iter().zip(&signatures) {
+        let NodeData::FunctionDeclaration(function) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the group must retain its function declarations")
+        };
+        let annotation = NodeRef::new(declaration.arena, declaration.file, function.type_.unwrap());
+        assert_eq!(context.get_type_from_type_node(annotation), Ok(number));
+        let record = context.store().signature(*signature).unwrap();
+        assert!(record.parameters().is_empty());
+        assert_eq!(record.min_argument_count(), 0);
+        assert_eq!(record.resolved_return_type(), Some(number));
+    }
+    let calls = nodes(&parsed, SyntaxKind::CallExpression);
+    assert_eq!(calls.len(), 2);
+    assert!(
+        parsed.arena.get(calls[0].node).unwrap().range.start
+            < parsed.arena.get(declarations[0].node).unwrap().range.start
+    );
+    assert!(
+        parsed.arena.get(calls[1].node).unwrap().range.start
+            > parsed.arena.get(declarations[1].node).unwrap().range.end
+    );
+    for call in &calls {
+        assert_eq!(signature(&context, *call), signatures[0]);
+        assert_eq!(context.get_type_at_location(*call), Ok(number));
+        let NodeData::CallExpression(data) = &parsed.arena.get(call.node).unwrap().data else {
+            panic!("the written call must keep its callee")
+        };
+        let callee = NodeRef::new(call.arena, call.file, data.expression);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(callee)
+                .unwrap()
+                .resolved_symbol,
+            context.file(FILE).unwrap().1.local_symbol(declarations[0])
+        );
+    }
+    assert!(context.diagnostics().is_empty());
+    let queries = declarations.into_iter().chain(calls).collect::<Vec<_>>();
+    assert_replay(&mut context, &queries);
+}
