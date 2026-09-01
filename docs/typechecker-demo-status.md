@@ -1,13 +1,19 @@
 # Typechecker demo status
 
-Updated 2026-08-31. No complete real-world project has passed in Rust yet.
+Updated 2026-09-01. No complete real-world project has passed in Rust yet.
 
 ## Targets
 
-Use Pathe for the first small complete demo and Hono for the main integration
-target. Pathe's original typecheck includes nine roots, with all four test files.
+Use Pathe for the first small complete demo, UFO for the second, and Hono for
+the larger integration target. Pathe's original typecheck includes nine roots,
+with all four test files.
 It already uses TypeScript-Go and has a supported modern module configuration.
-Its tools and locked dependencies are being prepared. It has no Rust result yet.
+Its unchanged source, Node and pnpm files are acquired and verified. The isolated
+dependency install and reference checks are next. It has no Rust result yet.
+
+The latest core check passed 6,557 of 6,559 tests. All 19 earlier failures now
+pass, but two old passes regressed. The alias check also found regressions.
+These are separate candidate builds, not one accepted combined compiler.
 
 Keep TanStack Query core as a cross-project check. Hono and Query have prepared
 dependencies, fixed original configurations and complete first-failure records.
@@ -66,28 +72,18 @@ config stays unchanged. Tiny-invariant is no longer the first clean-demo target.
 An earlier core check passed 6,422 Rust tests on `57e743da`.
 The selected original corpus has 423 exact diagnostic results in 511 executions
 and 62 exact semantic results in 95 executions. These are limited test sets,
-not complete TypeScript compatibility. The latest core/parser check on
-`4a09da42` completed all 6,550 tests in 162 harnesses. It passed 6,531 and failed
-19. Formatting and Clippy passed. All 363 parser tests passed. The failures
-include 15 previously passing tests and four new controls. The
-[complete core/parser result](../target/wave202-core-parser-combined-full-3-quality-report.md)
-and [independent review](../target/wave202-core-parser-combined-full-3-quality-runtime-review.md)
-retain every failure. Both runtime and separate cleanup are closed.
+not complete TypeScript compatibility.
 
-Eighteen failures share a namespace export-owner check. The repair is committed
-and reviewed at `99597a7b`. The remaining failure needs scalar method-value
-lookup through the existing wrapper-type provider. Its source and tests have
-paired approval and are committed at `4192503d`, including a correction for
-caller-limit cache recovery.
-Both are now combined and source-reviewed at `267cfa91`. Its next check passed
-formatting, then Clippy stopped on Rust error E0609 in a new scalar-method test.
-The helper uses `question_token`, but the AST field is `postfix_token`.
-All 6,559 selected tests remain unrun. Separate cleanup and independent review
-are closed. The [failed check](../target/wave202-core-parser-combined-full-4-quality-report.md)
-retains the complete error. The exact field-name correction is committed and
-independently verified at `c70de1f9`. The next check's preparation is reviewed.
-New active copies are being prepared for the same 6,559-test selection.
-The primary branch still uses the previously accepted compiler source.
+The latest core/parser check on `c70de1f9` ran all 6,559 tests in 163 harnesses.
+It passed 6,557 and failed two. All 275 required controls passed. No test was
+ignored, filtered or left unrun. Formatting, Clippy and the fixture build passed.
+All 19 failures from the earlier 6,550-test run now pass. Nine new controls also
+pass, but two previously passing contextual object-property arrow tests fail.
+The related source work remains on hold. The
+[complete core/parser result](../target/wave202-core-parser-combined-full-5-quality-report.md)
+and [independent review](../target/wave202-core-parser-combined-full-5-quality-runtime-review.md)
+retain the full comparison. Runtime, separate cleanup and review are closed.
+The gate is failed. The primary branch still uses the previously accepted source.
 
 The five parser repairs are committed at `b1746a95`, with 28 new tests.
 The shared project run now confirms that all 55 Hono syntax diagnostics and
@@ -141,7 +137,19 @@ at `c79055e9`. Their source integration is committed and independently reviewed
 at `f9b477c4`. Its next check failed compilation on three calls to an absent
 `EscapedName::is_late_bound` method. All 5,107 tests remain unrun. Separate cleanup
 and saved-result review are closed. The three exact `.as_ref()` corrections are
-committed and independently reviewed at `979dfe7b`. A fresh check is in preparation.
+committed and independently reviewed at `979dfe7b`. Its fresh check ran all
+5,107 tests: 5,060 passed and 47 failed. All four public tests passed. Required
+controls split 51 passes and one failure. Forty old passes regressed, all six
+old failures remain, and one of the two new controls fails. Separate cleanup
+passed. The [saved-result review](../target/wave202-alias-repair-focused-6-runtime-review.md)
+is closed. The complete
+[failure blocks](../target/wave202-alias-repair-focused-6-failure-blocks.md)
+remain available. The [conditional regression plan](../target/wave202-alias-focused-6-conditional-regressions-plan.md)
+and its review found a new collector using the wrong planning-membership set.
+The first stop is proved in two old tests and the new control. A separate pair
+is implementing a one-file repair with one focused control. It preserves the
+old callable checks and all existing test inputs and assertions. The other
+38 regressions and all later checks still need measurement.
 The [failed build](../target/wave202-alias-repair-focused-5-runtime.md) remains
 separate from the older 5,099 passing and six failing test outcomes.
 
@@ -206,20 +214,24 @@ are in the table above. The batch's 7,318 test names remain source metadata,
 not test results. The shared function/arrow local-variable repair at `76811b77`
 is now combined with typed fields and the compile correction at `d1762098`.
 Both source intervals have independent review. Its 7,346 selected tests have
-not run. A finite Rust compile request is prepared for that source.
+not run. The Rust library-and-tests check at `b2b33bad` failed with two more
+test-code API errors. Seven of nine required artifacts compiled. No test body
+ran, and separate cleanup passed. Both exact corrections are committed and
+independently verified at `589725e1`. They change only a test import and one
+private validator call. The TypeScript inputs and assertions stay unchanged.
 
 ## Next work
 
 1. Prepare and measure all nine Pathe roots with the original config, dependencies
    and generated declarations. Record both its pinned reference and the port's
    pinned Go reference. Do not call it close before measuring its failures.
-2. Apply the shared Rust test API correction, then compile and test the project
-   repairs before combining them. Keep all original tests and failures.
+2. Compile the corrected project repair branches. Combine reviewed changes and
+   test the combined source. Keep all original tests and failures.
 3. Finish the measured Hono repairs and combine the shared statement work.
    Rerun Hono and Query with their complete unchanged graphs.
-4. Run the repaired core and alias checks. Preserve every old result in the
-   comparison and finish the remaining failures before accepting those batches.
-5. Retain complete ordinary project diagnostics in the census reporter. Compare
+4. Fix the measured alias regressions. Keep the two held core regressions visible.
+   Preserve every old result before accepting either batch.
+5. Test the complete ordinary diagnostic payloads in the census reporter. Compare
    the full project result with the reference, then show a deliberate type error
    in a separate copy with its correct code, message and location.
 
@@ -240,12 +252,24 @@ is corrected and independently verified at `fcaf8610`. Rust compile checks for
 all eight batches are prepared or in final preparation review. The first actual
 generic-class check stopped on four Rust API errors in an inherited public test
 file. Its normal library compiled, but its required test targets were not reached.
-No TypeScript test ran. The same failing test file exists in all eight batches
-and the statement/field integration. The shared test-only correction is committed
-and independently reviewed at `36a3e127`. The same exact one-file patch is being
-applied to all nine isolated bases. It changes no TS input or assertion.
-The import-annotation request timed out before execution. The constructor-annotation
-request was not submitted. Both are on hold until the shared correction is ready.
+No TypeScript test ran. The shared test-only correction at `36a3e127` is now
+applied and independently verified on all nine isolated bases.
+The next import-annotation and generic-class Rust checks both failed on another
+shared test API mismatch. Their required feature targets compiled, but the whole
+checks failed. Both raw errors and separate cleanups are retained.
+
+The second correction at `b2b33bad` changes one snapshot argument to the existing
+registered source-file API. It preserves every TS input, option and assertion.
+The same exact one-line patch is now committed and independently verified on
+P1 through P7. P8 does not contain that test and remains unchanged. The
+[application report](../target/wave202-shared-source-file-ref-test-api-applications.md)
+and [independent review](../target/wave202-shared-source-file-ref-test-api-applications-review.md)
+record all seven complete source identities. The corrected P1 and P2 checks
+now compile successfully, including all enabled checker tests and all four and
+five required artifacts. Separate cleanup and saved-result review are next.
+No test body ran. P3 through P6 requests are source-reviewed. P8's first request
+stopped at an environment check before Cargo or target creation. Its new request
+binds the actual recorded environment without changing it. P7 remains on hold.
 Source review is not proof that a batch compiles or checks a project.
 
 | Repair pair | Feature commit | Work in the commit |
@@ -262,23 +286,36 @@ Source review is not proof that a batch compiles or checks a project.
 The imported-arrow barrel cases still need the explicit reexport connection
 and imported class-owner work. These feature commits do not complete their roots.
 
-Three further Hono repairs have complete source review and signed commits:
-empty derived classes at `a2f0ea80`, optional named method parameters at
-`c3444fc0`, and typed arrow object parameters at `7aad3ef5`. They have no runtime
-result yet. Predicate arrows, contextual overloads, contextual arrow bodies and
-shared `for...of` statements have separate implementation and test owners.
+Nine further bounded Hono and Query repairs have independent source approval.
+They cover empty derived classes, optional method parameters, typed arrow object
+parameters, predicate arrows, contextual overloads, contextual arrow bodies,
+shared `for...of`, named library constraints and defaulted implementation parameters.
+The first four are combined and source-reviewed at `3023dea1`, with 27 added
+control groups. Their source changes and controls have no runtime acceptance
+yet. Preparation now covers their combination with the diagnostic reporter and
+the latest API corrections. Separate pairs are checking the remaining joins.
+Each repair can expose a later unsupported operation in its original project file.
 
 The shared try/catch/throw implementation is committed and independently closed
 at `0ddc0f07`. Typed synchronous returned arrows are committed at `381a3191`
-after source/test review. Neither has run. Callable alias heritage remains under
-review. Duplicate script-global recovery is independently closed at `907b67dc`,
+after source/test review. Neither has run. Callable alias heritage is independently
+closed at `6146022d`. Duplicate script-global recovery is closed at `907b67dc`,
 also without a runtime result. These source changes must not increase the
 measured project counts until the combined project check executes.
 
-The diagnostic-payload implementation has a source/test pair. It will preserve
-complete ordinary diagnostics and mark cold or failed snapshots as partial.
-It must keep the first checker failure and must not run extra type queries just
-to fill the report. Its failed post-source collector limit remains explicit.
+The diagnostic-payload implementation is committed at `d96b2801` and combined
+with the newer source at `362ad62f`. Source and test review are closed. It keeps
+complete ordinary diagnostics and marks cold or failed snapshots as partial.
+It retains the first checker failure without extra type queries. The failed
+post-source collector limit remains explicit.
+
+Its focused check compiled and listed all 297 compiler tests, then the evidence
+reader confused two distinct Cargo outputs. All 310 selected tests remain unrun.
+Separate cleanup and the [failed-result review](../target/wave202-census-diagnostic-payloads-focused-1-result-review.md)
+are closed. The corrected fresh packet has passed activation review and its
+main check is released. No new test outcome is available yet.
+It separates actual output paths while keeping every artifact and test check.
+The failed result stays unchanged.
 
 The generic-constructor work has a second source/test pair with separate file
 ownership. The imported-arrow work also depends on the import and reexport
@@ -299,6 +336,20 @@ has an original `@ts-nocheck` file, which must not count as checked code.
 Mitt and sourcemap-codec select the same removed Node10 option as tiny-invariant.
 Their configs stay unchanged. No smaller root list or omitted ambient package
 counts as a complete project check.
+
+Pathe's [input acquisition](../target/wave202-pathe-input-acquisition-1.md) and
+[independent review](../target/wave202-pathe-input-acquisition-1-review.md) are
+closed. Its first system-only isolation probe failed on incompatible `findmnt`
+flags. Cleanup and complete input checks passed. No package tool ran. The
+corrected probe is prepared and must pass before dependency installation.
+The [ordinary Go CLI plan](../target/wave202-pathe-go-cli-preparation.md) uses one
+offline build of the exact pinned compiler. The existing instrumented test binary
+will not replace the ordinary reference command. That build has not run.
+UFO's [input plan](../target/wave202-ufo-input-preparation-plan.md) and review are
+closed. Its [acquisition report](../target/wave202-ufo-input-acquisition-1.md)
+records all 39 original files and both verified tool archives in a separate
+directory. Independent acquisition review is next. No package tool ran.
+It keeps its own Node, pnpm, build and type-test requirements.
 
 Source workers have separate worktrees and test partners. Shared merge work
 has explicit file ownership and one Git coordinator. At most three Cargo
