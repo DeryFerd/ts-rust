@@ -48,8 +48,12 @@ two Rust compile errors. Its failed result and cleanup are closed. Both errors
 are fixed in reviewed commit `7c6cda70`. The
 [compile repair](../target/wave202-pathe-demo-compile-repair-handoff.md) and
 [review](../target/wave202-pathe-demo-compile-repair-review.md) preserve all tests.
-A fresh binary build is next. Computed-key source review is also in progress.
-None of these changes has a new Pathe project result yet.
+The repaired build passed in 79.302 seconds. Its ordinary executable, all source
+files and all 94 emitted files have closed resource and independent reviews.
+The [new build result](../target/wave202-pathe-next-bin-2-result.md) and
+[review](../target/wave202-pathe-next-bin-2-result-review.md) are complete.
+The next step is the unchanged nine-root Pathe census. No new Pathe project
+result exists yet.
 
 The corrected six-feature compiler at `a89c891b` builds successfully. The build
 took 77.385 seconds, with no Rust errors. Separate cleanup and independent review
@@ -65,12 +69,21 @@ details. The
 [complete test log](../target/wave202-demo-next-source-focused-2.cargo.log)
 retains every result. Separate cleanup and final result review are closed.
 
-Eleven reviewed repairs and the two-error compile fix are combined in a separate
-source branch. Independent integration review is in progress. The planned check
-retains 407 tests across the binder, checker, parser and project-error reporting.
-These are selected tests, not passing results. A separate one-test run exposed
-the remaining optional-property error as an invalid-union check. Its source
-repair is in progress. The diagnostic-only source will not be integrated.
+Thirteen repair commits are combined at `dd5e09f9` in a separate source branch.
+The [source handoff](../target/wave202-pathe-focused-union-order-handoff.md) and
+[independent review](../target/wave202-pathe-focused-union-order-review.md)
+are closed. The planned check retains 408 tests across the binder, checker,
+parser and project-error reporting. These are selected tests, not passing results.
+This includes the optional-property repair. It keeps canonical declared-union
+order instead of incorrectly requiring numeric type-ID order. The original
+failing test stays unchanged. The diagnostic-only source is excluded.
+
+Computed-key review found a separate bug: missing index evidence can reach an
+incorrect `any` result. A small repair and focused test are in progress before
+that code joins the candidate. Pathe also needs argument-bearing computed keys
+with real `String.raw` tags. The existing computed-key subset does not support
+that full expression. The next composition test must use the actual imported
+helper and bundled libraries, without replacement declarations.
 
 The first build failed on two Rust E0308 errors because two calls omitted `Some`
 around an optional session. That failed attempt and its cleanup remain in the
