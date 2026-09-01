@@ -8,8 +8,11 @@ Use Pathe for the first small complete demo, UFO for the second, and Hono for
 the larger integration target. Pathe's original typecheck includes nine roots,
 with all four test files.
 It already uses TypeScript-Go and has a supported modern module configuration.
-Its unchanged source, Node and pnpm files are acquired and verified. The isolated
-dependency install and reference checks are next. It has no Rust result yet.
+Its unchanged source, Node and pnpm files are acquired and verified. Its locked
+dependency install exited successfully. Full installed-file review is still in
+progress, so it is not ready for its build yet. The ordinary pinned Go compiler
+has built and passed independent review. Pathe's build, reference checks and
+first Rust measurement remain. It has no Rust result yet.
 
 The latest core check passed 6,557 of 6,559 tests. All 19 earlier failures now
 pass, but two old passes regressed. The alias check also found regressions.
@@ -17,8 +20,11 @@ These are separate candidate builds, not one accepted combined compiler.
 
 Keep TanStack Query core as a cross-project check. Hono and Query have prepared
 dependencies, fixed original configurations and complete first-failure records.
-Neither is proved close to a full pass. UFO is the second small candidate, but
-its separate type-test contract must also run before a complete demo claim.
+Neither is proved close to a full pass. UFO is the second small candidate. Its
+seven source roots and 14 separate test files need their original checks,
+including Vitest type tests. Its source and tools are verified. Install controls
+are approved and its isolation wrapper is in preparation. No UFO package tool
+has run.
 
 | Project | Original source roots | Completed source checks | Unsupported | Other results | Load syntax diagnostics |
 | --- | ---: | ---: | ---: | --- | ---: |
@@ -146,10 +152,12 @@ is closed. The complete
 [failure blocks](../target/wave202-alias-repair-focused-6-failure-blocks.md)
 remain available. The [conditional regression plan](../target/wave202-alias-focused-6-conditional-regressions-plan.md)
 and its review found a new collector using the wrong planning-membership set.
-The first stop is proved in two old tests and the new control. A separate pair
-is implementing a one-file repair with one focused control. It preserves the
-old callable checks and all existing test inputs and assertions. The other
-38 regressions and all later checks still need measurement.
+The first stop is proved in two old tests and the new control. The one-file
+membership repair is committed at `7ad6a0b9`, with one new control and a closed
+[commit review](../target/wave202-alias-written-plan-membership-repair-commit-review.md).
+It preserves the old callable checks and all existing test inputs and assertions.
+The fresh 5,108-test check is prepared but has not run. The other 38 regressions
+and all later checks still need measurement. No repaired pass count is available.
 The [failed build](../target/wave202-alias-repair-focused-5-runtime.md) remains
 separate from the older 5,099 passing and six failing test outcomes.
 
@@ -222,18 +230,22 @@ private validator call. The TypeScript inputs and assertions stay unchanged.
 
 ## Next work
 
-1. Prepare and measure all nine Pathe roots with the original config, dependencies
-   and generated declarations. Record both its pinned reference and the port's
-   pinned Go reference. Do not call it close before measuring its failures.
-2. Compile the corrected project repair branches. Combine reviewed changes and
-   test the combined source. Keep all original tests and failures.
+1. Finish Pathe's installed-file review, then measure all nine roots with the
+   original config and dependencies. Static import checks support running its
+   original typecheck before the build. Record the actual graph, then compare
+   it again after the original build. Record both its pinned reference and the
+   port's pinned Go reference. Prepare UFO's separate checks in parallel.
+2. Build the project-checking tool at `0b8e389d` for the first measurement.
+   Prepare full test verification separately, so linking every test executable
+   does not delay that measurement. Neither new build has run. Keep the original
+   inputs and earlier failed outcomes.
 3. Finish the measured Hono repairs and combine the shared statement work.
    Rerun Hono and Query with their complete unchanged graphs.
 4. Fix the measured alias regressions. Keep the two held core regressions visible.
    Preserve every old result before accepting either batch.
-5. Test the complete ordinary diagnostic payloads in the census reporter. Compare
-   the full project result with the reference, then show a deliberate type error
-   in a separate copy with its correct code, message and location.
+5. Use the reporter's now-passing focused tests to proceed to a full project
+   diagnostic comparison. Show a deliberate type error in a separate copy with
+   its correct code, message and location.
 
 The next demo must show a complete ordinary project check, not just cold-root
 coverage. Missing diagnostics, unchecked declarations and unsupported operations
@@ -246,7 +258,7 @@ They target 34 distinct first failures. That is not a forecast of 34 completed
 files, because later failures can appear after each repair.
 
 All eight feature commits now have independent source review and verified
-commit contents. They add 55 controls. None has a runtime result. The generic
+commit contents. They add 55 controls. Those controls have not run. The generic
 constructor batch's separate Rust error, a question mark applied to a bool,
 is corrected and independently verified at `fcaf8610`. Rust compile checks for
 all eight batches are prepared or in final preparation review. The first actual
@@ -266,7 +278,10 @@ P1 through P7. P8 does not contain that test and remains unchanged. The
 and [independent review](../target/wave202-shared-source-file-ref-test-api-applications-review.md)
 record all seven complete source identities. The corrected P1 and P2 checks
 now compile successfully, including all enabled checker tests and all four and
-five required artifacts. Separate cleanup and saved-result review are next.
+five required artifacts. A separate [recovery audit](../target/wave202-p1-p2-build-recovery.md)
+verified unchanged inputs and no remaining owned processes, services or locks.
+The original cleanup commands remain unrun and their saved packets remain
+incomplete. That history is not replaced by the later closure check.
 No test body ran. P3 through P6 requests are source-reviewed. P8's first request
 stopped at an environment check before Cargo or target creation. Its new request
 binds the actual recorded environment without changing it. P7 remains on hold.
@@ -290,11 +305,23 @@ Nine further bounded Hono and Query repairs have independent source approval.
 They cover empty derived classes, optional method parameters, typed arrow object
 parameters, predicate arrows, contextual overloads, contextual arrow bodies,
 shared `for...of`, named library constraints and defaulted implementation parameters.
-The first four are combined and source-reviewed at `3023dea1`, with 27 added
-control groups. Their source changes and controls have no runtime acceptance
-yet. Preparation now covers their combination with the diagnostic reporter and
-the latest API corrections. Separate pairs are checking the remaining joins.
+The first four were combined at `3023dea1`, with 27 added control groups. They
+are now combined with the diagnostic reporter and latest API corrections at
+`0b8e389d`. The [source handoff](../target/wave202-demo-first-four-reporter-integration-handoff.md)
+and [independent review](../target/wave202-demo-first-four-reporter-integration-review.md)
+verify that combination. Its project-tool build and full test verification are
+in preparation. Neither has run.
+These controls have no passing result on the combined source. Separate pairs
+are checking the remaining joins.
 Each repair can expose a later unsupported operation in its original project file.
+
+Six new source/test pairs have separate worktrees for 11 distinct measured first
+failures. They cover `!`, `in`, `string & {}`, inherited interface properties,
+generic interface call parameters and `??=`. The
+[repair tasks](../target/wave202-next-project-repair-candidates.md) record exact
+errors, file ownership and positive and negative tests. Eleven first failures
+do not predict 11 passing roots. Only one exact existing interface test has
+approval to change its expected unsupported result to a normal type diagnostic.
 
 The shared try/catch/throw implementation is committed and independently closed
 at `0ddc0f07`. Typed synchronous returned arrows are committed at `381a3191`
@@ -309,13 +336,18 @@ complete ordinary diagnostics and marks cold or failed snapshots as partial.
 It retains the first checker failure without extra type queries. The failed
 post-source collector limit remains explicit.
 
-Its focused check compiled and listed all 297 compiler tests, then the evidence
-reader confused two distinct Cargo outputs. All 310 selected tests remain unrun.
+Its first focused check compiled and listed all 297 compiler tests, then the
+evidence reader confused two distinct Cargo outputs. That attempt left all
+310 selected tests unrun.
 Separate cleanup and the [failed-result review](../target/wave202-census-diagnostic-payloads-focused-1-result-review.md)
-are closed. The corrected fresh packet has passed activation review and its
-main check is released. No new test outcome is available yet.
-It separates actual output paths while keeping every artifact and test check.
-The failed result stays unchanged.
+are closed. The fresh check passed all 310 tests: 297 compiler tests, three
+public diagnostic tests and 10 project-report tests. None failed or was skipped.
+The [result account](../target/wave202-census-diagnostic-payloads-focused-2-result-account.md)
+records all outcomes and a separate audit of source, artifacts and actual
+process, service and lock closure. The original terminal tool receipt is
+missing and the original post-close step remains unrun. Those limits and the
+earlier failed result stay explicit. This is not a full project diagnostic
+comparison or a result for the newer combined compiler.
 
 The generic-constructor work has a second source/test pair with separate file
 ownership. The imported-arrow work also depends on the import and reexport
@@ -340,16 +372,27 @@ counts as a complete project check.
 Pathe's [input acquisition](../target/wave202-pathe-input-acquisition-1.md) and
 [independent review](../target/wave202-pathe-input-acquisition-1-review.md) are
 closed. Its first system-only isolation probe failed on incompatible `findmnt`
-flags. Cleanup and complete input checks passed. No package tool ran. The
-corrected probe is prepared and must pass before dependency installation.
+flags. Cleanup and complete input checks passed. No package tool ran in that
+attempt. The later locked dependency install exited 0. Its
+[saved result](../target/project-inputs/wave202-pathe-inputs-1/evidence/package-isolation-2-install/result)
+records command, cleanup and input statuses of 0, with `closed=1`. Full installed
+dependency integrity review is still running. Installation exit 0 alone does
+not make Pathe ready for its build or prove that every required payload exists.
 The [ordinary Go CLI plan](../target/wave202-pathe-go-cli-preparation.md) uses one
 offline build of the exact pinned compiler. The existing instrumented test binary
-will not replace the ordinary reference command. That build has not run.
+will not replace the ordinary reference command. That ordinary build passed,
+and its [independent review](../target/wave202-pathe-go-cli-build-1-result-review.md)
+verified the compiler artifact, unchanged inputs and closed cleanup. No project
+reference check ran in that build.
 UFO's [input plan](../target/wave202-ufo-input-preparation-plan.md) and review are
 closed. Its [acquisition report](../target/wave202-ufo-input-acquisition-1.md)
 records all 39 original files and both verified tool archives in a separate
-directory. Independent acquisition review is next. No package tool ran.
-It keeps its own Node, pnpm, build and type-test requirements.
+directory. [Independent acquisition review](../target/wave202-ufo-input-acquisition-1-review.md)
+is closed. The exact pnpm 10 [install controls](../target/wave202-ufo-pnpm-controls.md)
+have [independent approval](../target/wave202-ufo-pnpm-controls-review.md).
+The UFO-specific isolation wrapper is in preparation. Its probe and install
+remain separate next steps. No UFO package tool ran. It keeps its own Node,
+pnpm, build and type-test requirements.
 
 Source workers have separate worktrees and test partners. Shared merge work
 has explicit file ownership and one Git coordinator. At most three Cargo
