@@ -2794,12 +2794,7 @@ impl PlannedSourceCondition {
                 conditions.extend(right.flow_conditions());
                 conditions
             }
-            Self::Expression { expression, .. }
-                if matches!(
-                    &expression.unparenthesized().kind,
-                    PlannedExpressionKind::Call(_)
-                ) =>
-            {
+            Self::Expression { expression, .. } => {
                 vec![SourceFlowCondition::Unchanged(expression.node)]
             }
             _ => self.flow_condition().into_iter().collect(),
