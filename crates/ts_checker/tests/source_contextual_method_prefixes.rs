@@ -272,7 +272,7 @@ fn method_state(
     let reader_owner = symbol(checker, reader);
     let reader_target = checker.get_declared_type_of_symbol(reader_owner).unwrap();
     let generic_context = checker.get_type_at_location(reader_name).unwrap();
-    let TypeData::Reference(reference) = checker
+    let TypeData::TypeReference(reference) = checker
         .store()
         .type_payload(generic_context)
         .unwrap()
