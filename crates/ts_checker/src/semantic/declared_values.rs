@@ -759,7 +759,6 @@ fn plan_global_augmentation_parent(
         || ambient.flow_node.is_some()
         || ambient.end_flow_node.is_some()
         || ambient.next_container.is_some()
-        || !ambient.locals.is_empty()
         || parent_node.flags.0 != 0
         || block
             .statements
