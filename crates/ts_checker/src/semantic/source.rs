@@ -9996,8 +9996,27 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         return Ok(false);
                     };
                     let function_record = self.node(function)?;
-                    let NodeData::FunctionDeclaration(declaration) = &function_record.data else {
-                        return Ok(false);
+                    let callable_body_matches = match (&function_record.data, function_record.kind) {
+                        (
+                            NodeData::FunctionDeclaration(declaration),
+                            SyntaxKind::FunctionDeclaration,
+                        ) => declaration.body == Some(body.node),
+                        (NodeData::ArrowFunction(arrow), SyntaxKind::ArrowFunction) => {
+                            arrow.body == body.node
+                                && arrow.modifiers.is_none()
+                                && arrow.type_parameters.is_none()
+                                && arrow.asterisk_token.is_none()
+                        }
+                        (
+                            NodeData::FunctionExpression(expression),
+                            SyntaxKind::FunctionExpression,
+                        ) => {
+                            expression.body == body.node
+                                && expression.modifiers.is_none()
+                                && expression.type_parameters.is_none()
+                                && expression.asterisk_token.is_none()
+                        }
+                        _ => false,
                     };
                     return Ok(record.flags.0 == 0
                         && statement.flow_node.is_none()
@@ -10005,8 +10024,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         && body_record.kind == SyntaxKind::Block
                         && body_record.flags.0 == 0
                         && block.statements.nodes.contains(&parent.node)
-                        && function_record.kind == SyntaxKind::FunctionDeclaration
-                        && declaration.body == Some(body.node)
+                        && callable_body_matches
                         && self.bound.container(current) == Some(function)
                         && self.bound.flow_container(parent) == Some(function));
                 }
