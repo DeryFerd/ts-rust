@@ -2373,6 +2373,10 @@ pub(super) fn check_class_receiver(
 }
 
 impl SourcePropertyPlan {
+    pub(super) fn name_node(&self) -> NodeRef {
+        self.name_node
+    }
+
     pub(super) fn is_call_callee_for(&self, call: NodeRef, name: NodeRef) -> bool {
         self.name_node == name && self.position == SourcePropertyPosition::CallCallee(call)
     }

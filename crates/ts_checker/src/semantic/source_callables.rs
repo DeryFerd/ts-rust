@@ -5161,7 +5161,7 @@ impl SourceDirectCallResolution {
             || store.source_node_kind(reference.callback) != Some(SyntaxKind::ArrowFunction)
             || store.source_identifier_text(reference.receiver).is_none()
             || store.symbol(reference.symbol).is_none_or(|symbol| {
-                Some(symbol.name()) != store.source_identifier_text(reference.receiver)
+                symbol.name().as_utf8() != store.source_identifier_text(reference.receiver)
                     || symbol.check_flags() != CheckFlags::NONE
             })
             || store

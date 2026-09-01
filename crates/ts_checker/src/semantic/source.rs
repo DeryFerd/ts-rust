@@ -179,6 +179,7 @@ use super::{
         resolve_planned_jsdoc_type, resolve_source_jsdoc_function_type,
         resolve_source_jsdoc_satisfies_signature, resolve_source_jsdoc_type,
     },
+    links::SignatureLinks,
     logical_operators::{
         LogicalBinaryError, LogicalBinaryInvariant, LogicalBinaryRequest, LogicalBinaryUnsupported,
         TruthinessAssumption, check_logical_binary, check_logical_not, narrow_by_truthiness,
@@ -355,6 +356,7 @@ use super::{
         plan_source_unused_iteration_statement_syntax,
         plan_source_void_switch_function_statements_syntax, source_control_branch_is_empty,
     },
+    store::SourceNodeParent,
     template_types::TemplateTypeError,
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_nodes::{
@@ -1173,7 +1175,298 @@ enum CheckedSourceComputedObjectKeyInput {
         read: PlannedIdentifierRead,
         callee_type: TypeNodeLinks,
         signature: SignatureLinks,
+        arguments: Vec<CheckedSourceComputedCallArgument>,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CheckedSourceComputedCallArgument {
+    node: NodeRef,
+    kind: SyntaxKind,
+    type_links: TypeNodeLinks,
+    input: CheckedSourceComputedCallArgumentInput,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CheckedSourceComputedCallArgumentInput {
+    Scalar,
+    Identifier(PlannedIdentifierRead),
+    Call {
+        callee: Box<CheckedSourceComputedCallArgument>,
+        signature: SignatureLinks,
+        arguments: Vec<CheckedSourceComputedCallArgument>,
+    },
+    Property {
+        receiver: Box<CheckedSourceComputedCallArgument>,
+        name: NodeRef,
+        symbol: SemanticSymbolId,
+        owner: Option<SemanticSymbolId>,
+    },
+}
+
+fn computed_object_key_identifier_is_current(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    read: &PlannedIdentifierRead,
+) -> bool {
+    store.source_node_kind(node) == Some(SyntaxKind::Identifier)
+        && store.get_merged_symbol(read.resolved_symbol) == Some(read.resolved_symbol)
+        && store.get_merged_symbol(read.value_symbol) == Some(read.value_symbol)
+        && store.symbol_node_links(node)
+            == Some(&SymbolNodeLinks {
+                resolved_symbol: Some(read.resolved_symbol),
+            })
+}
+
+fn computed_call_dependency_is_plain(expression: &PlannedExpression) -> bool {
+    expression.array_spreads.is_empty()
+        && expression.object_spreads.is_empty()
+        && expression.object_computed_keys.is_empty()
+        && !expression.non_null_assertion
+        && !expression.awaited
+        && expression.promise_call.is_none()
+        && expression.jsdoc_type.is_none()
+        && expression.nullish_source_flow.is_none()
+}
+
+fn computed_call_identifier_is_supported(read: &PlannedIdentifierRead, callee: bool) -> bool {
+    matches!(
+        read.kind,
+        PlannedIdentifierReadKind::Variable
+            | PlannedIdentifierReadKind::DeclaredValue
+            | PlannedIdentifierReadKind::Import
+    ) || (callee && read.kind == PlannedIdentifierReadKind::Function)
+}
+
+fn computed_call_callee_is_supported(
+    expression: &PlannedExpression,
+    call: NodeRef,
+    kind: &impl Fn(NodeRef) -> Option<SyntaxKind>,
+) -> bool {
+    if !computed_call_dependency_is_plain(expression) {
+        return false;
+    }
+    match &expression.kind {
+        PlannedExpressionKind::Identifier(read) => {
+            kind(expression.node) == Some(SyntaxKind::Identifier)
+                && computed_call_identifier_is_supported(read, true)
+        }
+        PlannedExpressionKind::Property(property) => {
+            property.node == expression.node
+                && kind(expression.node) == Some(SyntaxKind::PropertyAccessExpression)
+                && kind(property.name_node()) == Some(SyntaxKind::Identifier)
+                && property.is_call_callee_for(call, property.name_node())
+                && property.class_access_context().is_none()
+                && computed_call_argument_is_supported(&property.receiver, kind)
+        }
+        _ => false,
+    }
+}
+
+fn computed_call_argument_is_supported(
+    expression: &PlannedExpression,
+    kind: &impl Fn(NodeRef) -> Option<SyntaxKind>,
+) -> bool {
+    if !computed_call_dependency_is_plain(expression) {
+        return false;
+    }
+    match (&expression.kind, kind(expression.node)) {
+        (PlannedExpressionKind::Null, Some(SyntaxKind::NullKeyword))
+        | (
+            PlannedExpressionKind::String(_),
+            Some(SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral),
+        )
+        | (
+            PlannedExpressionKind::Number {
+                unary_operand: None,
+                ..
+            },
+            Some(SyntaxKind::NumericLiteral),
+        )
+        | (
+            PlannedExpressionKind::BigInt {
+                unary_operand: None,
+                ..
+            },
+            Some(SyntaxKind::BigIntLiteral),
+        )
+        | (
+            PlannedExpressionKind::Boolean(_),
+            Some(SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword),
+        ) => true,
+        (PlannedExpressionKind::Identifier(read), Some(SyntaxKind::Identifier)) => {
+            computed_call_identifier_is_supported(read, false)
+        }
+        (
+            PlannedExpressionKind::Call(call),
+            Some(call_kind @ (SyntaxKind::CallExpression | SyntaxKind::TaggedTemplateExpression)),
+        ) => {
+            // Substitutions have template-span parents. Keep this form substitution-free.
+            call.node == expression.node
+                && (call_kind != SyntaxKind::TaggedTemplateExpression || call.arguments.is_empty())
+                && computed_call_callee_is_supported(&call.callee, call.node, kind)
+                && call
+                    .arguments
+                    .iter()
+                    .all(|argument| computed_call_argument_is_supported(argument, kind))
+        }
+        _ => false,
+    }
+}
+
+impl CheckedSourceComputedCallArgument {
+    fn is_current(&self, store: &CanonicalTypeMapperStore, parent: NodeRef, callee: bool) -> bool {
+        let Some(type_) = self.type_links.resolved_type else {
+            return false;
+        };
+        if store.source_node_kind(self.node) != Some(self.kind)
+            || store.source_node_parent(self.node) != Some(SourceNodeParent::Parent(parent))
+            || store.type_node_links(self.node) != Some(&self.type_links)
+            || self.type_links.outer_type_parameters.is_some()
+            || store.validate_union_constituent(type_).is_err()
+        {
+            return false;
+        }
+        match &self.input {
+            CheckedSourceComputedCallArgumentInput::Scalar => {
+                !callee
+                    && matches!(
+                        self.kind,
+                        SyntaxKind::NullKeyword
+                            | SyntaxKind::StringLiteral
+                            | SyntaxKind::NoSubstitutionTemplateLiteral
+                            | SyntaxKind::NumericLiteral
+                            | SyntaxKind::BigIntLiteral
+                            | SyntaxKind::TrueKeyword
+                            | SyntaxKind::FalseKeyword
+                    )
+            }
+            CheckedSourceComputedCallArgumentInput::Identifier(read) => {
+                computed_call_identifier_is_supported(read, callee)
+                    && computed_object_key_identifier_is_current(store, self.node, read)
+            }
+            CheckedSourceComputedCallArgumentInput::Call {
+                callee: call_callee,
+                signature,
+                arguments,
+            } => {
+                !callee
+                    && matches!(
+                        self.kind,
+                        SyntaxKind::CallExpression | SyntaxKind::TaggedTemplateExpression
+                    )
+                    && (self.kind != SyntaxKind::TaggedTemplateExpression || arguments.is_empty())
+                    && super::source_calls::preflight_call_links(store, self.node).is_ok()
+                    && store.signature_links(self.node) == Some(signature)
+                    && signature
+                        .resolved_signature
+                        .signature()
+                        .and_then(|signature| store.signature(signature))
+                        .is_some_and(|signature| signature.resolved_return_type() == Some(type_))
+                    && call_callee.is_current(store, self.node, true)
+                    && arguments
+                        .iter()
+                        .all(|argument| argument.is_current(store, self.node, false))
+            }
+            CheckedSourceComputedCallArgumentInput::Property {
+                receiver,
+                name,
+                symbol,
+                owner,
+            } => {
+                // A later name query can add links after the access node was checked.
+                callee
+                    && self.kind == SyntaxKind::PropertyAccessExpression
+                    && store.source_node_kind(*name) == Some(SyntaxKind::Identifier)
+                    && store.source_node_parent(*name) == Some(SourceNodeParent::Parent(self.node))
+                    && store.get_merged_symbol(*symbol) == Some(*symbol)
+                    && store.symbol_node_links(self.node)
+                        == Some(&SymbolNodeLinks {
+                            resolved_symbol: Some(*symbol),
+                        })
+                    && store
+                        .symbol(*symbol)
+                        .is_some_and(|record| match record.parent() {
+                            Some(parent) => {
+                                store.get_merged_symbol(parent) == *owner
+                                    && owner.is_some_and(|owner| {
+                                        store.get_merged_symbol(owner) == Some(owner)
+                                    })
+                            }
+                            None => owner.is_none(),
+                        })
+                    && store.symbol_node_links(*name).is_none_or(|links| {
+                        links
+                            .resolved_symbol
+                            .is_none_or(|actual| store.get_merged_symbol(actual) == Some(*symbol))
+                    })
+                    && receiver.is_current(store, self.node, false)
+            }
+        }
+    }
+}
+
+fn checked_source_computed_call_argument(
+    store: &CanonicalTypeMapperStore,
+    expression: &PlannedExpression,
+) -> Option<CheckedSourceComputedCallArgument> {
+    if !computed_call_argument_is_supported(expression, &|node| store.source_node_kind(node)) {
+        return None;
+    }
+    capture_computed_call_dependency(store, expression)
+}
+
+fn capture_computed_call_dependency(
+    store: &CanonicalTypeMapperStore,
+    expression: &PlannedExpression,
+) -> Option<CheckedSourceComputedCallArgument> {
+    let input = match &expression.kind {
+        PlannedExpressionKind::Null
+        | PlannedExpressionKind::String(_)
+        | PlannedExpressionKind::Number {
+            unary_operand: None,
+            ..
+        }
+        | PlannedExpressionKind::BigInt {
+            unary_operand: None,
+            ..
+        }
+        | PlannedExpressionKind::Boolean(_) => CheckedSourceComputedCallArgumentInput::Scalar,
+        PlannedExpressionKind::Identifier(read) => {
+            CheckedSourceComputedCallArgumentInput::Identifier(*read)
+        }
+        PlannedExpressionKind::Call(call) if call.node == expression.node => {
+            CheckedSourceComputedCallArgumentInput::Call {
+                callee: Box::new(capture_computed_call_dependency(store, &call.callee)?),
+                signature: store.signature_links(expression.node)?.clone(),
+                arguments: call
+                    .arguments
+                    .iter()
+                    .map(|argument| capture_computed_call_dependency(store, argument))
+                    .collect::<Option<Vec<_>>>()?,
+            }
+        }
+        PlannedExpressionKind::Property(property) if property.node == expression.node => {
+            let symbol = store.symbol_node_links(expression.node)?.resolved_symbol?;
+            let owner = match store.symbol(symbol)?.parent() {
+                Some(parent) => Some(store.get_merged_symbol(parent)?),
+                None => None,
+            };
+            CheckedSourceComputedCallArgumentInput::Property {
+                receiver: Box::new(capture_computed_call_dependency(store, &property.receiver)?),
+                name: property.name_node(),
+                symbol,
+                owner,
+            }
+        }
+        _ => return None,
+    };
+    Some(CheckedSourceComputedCallArgument {
+        node: expression.node,
+        kind: store.source_node_kind(expression.node)?,
+        type_links: store.type_node_links(expression.node)?.clone(),
+        input,
+    })
 }
 
 impl CheckedSourceComputedObjectKey {
@@ -1185,15 +1478,6 @@ impl CheckedSourceComputedObjectKey {
     }
 
     pub(super) fn is_current(&self, store: &CanonicalTypeMapperStore) -> bool {
-        let valid_read = |node, read: &PlannedIdentifierRead| {
-            store.source_node_kind(node) == Some(SyntaxKind::Identifier)
-                && store.get_merged_symbol(read.resolved_symbol) == Some(read.resolved_symbol)
-                && store.get_merged_symbol(read.value_symbol) == Some(read.value_symbol)
-                && store.symbol_node_links(node)
-                    == Some(&SymbolNodeLinks {
-                        resolved_symbol: Some(read.resolved_symbol),
-                    })
-        };
         if store.type_node_links(self.node)
             != Some(&TypeNodeLinks {
                 resolved_type: Some(self.type_),
@@ -1214,18 +1498,20 @@ impl CheckedSourceComputedObjectKey {
                 )
             ),
             CheckedSourceComputedObjectKeyInput::Identifier(read) => {
-                read.kind == PlannedIdentifierReadKind::Variable && valid_read(self.node, read)
+                read.kind == PlannedIdentifierReadKind::Variable
+                    && computed_object_key_identifier_is_current(store, self.node, read)
             }
             CheckedSourceComputedObjectKeyInput::Call {
                 callee,
                 read,
                 callee_type,
                 signature,
+                arguments,
             } => {
                 store.source_node_kind(self.node) == Some(SyntaxKind::CallExpression)
                     && store.source_node_parent(*callee)
                         == Some(SourceNodeParent::Parent(self.node))
-                    && valid_read(*callee, read)
+                    && computed_object_key_identifier_is_current(store, *callee, read)
                     && store.type_node_links(*callee) == Some(callee_type)
                     && callee_type.outer_type_parameters.is_none()
                     && callee_type
@@ -1239,6 +1525,9 @@ impl CheckedSourceComputedObjectKey {
                         .is_some_and(|signature| {
                             signature.resolved_return_type() == Some(self.type_)
                         })
+                    && arguments
+                        .iter()
+                        .all(|argument| argument.is_current(store, self.node, false))
             }
         }
     }
@@ -1259,7 +1548,7 @@ fn checked_source_computed_object_key(
         PlannedExpressionKind::Identifier(read) => {
             CheckedSourceComputedObjectKeyInput::Identifier(*read)
         }
-        PlannedExpressionKind::Call(call) if call.arguments.is_empty() => {
+        PlannedExpressionKind::Call(call) => {
             let PlannedExpressionKind::Identifier(read) = &call.callee.kind else {
                 return Err(invalid());
             };
@@ -1273,6 +1562,12 @@ fn checked_source_computed_object_key(
                 signature: store
                     .signature_links(expression.node)
                     .cloned()
+                    .ok_or_else(invalid)?,
+                arguments: call
+                    .arguments
+                    .iter()
+                    .map(|argument| checked_source_computed_call_argument(store, argument))
+                    .collect::<Option<Vec<_>>>()
                     .ok_or_else(invalid)?,
             }
         }
@@ -22740,8 +23035,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let key_record = self.node(key)?;
         let valid_key = match &key_record.data {
             NodeData::CallExpression(call) if key_record.kind == SyntaxKind::CallExpression => {
-                call.arguments.nodes.is_empty()
-                    && !call.arguments.has_trailing_comma
+                !call.arguments.has_trailing_comma
                     && call.type_arguments.is_none()
                     && self.node(self.reference(call.expression))?.kind == SyntaxKind::Identifier
             }
@@ -22771,8 +23065,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let planned = self.plan_expression(key)?;
         let valid_key = match &planned.kind {
             PlannedExpressionKind::Call(call) => {
-                call.arguments.is_empty()
-                    && matches!(call.callee.kind, PlannedExpressionKind::Identifier(_))
+                matches!(call.callee.kind, PlannedExpressionKind::Identifier(_))
+                    && call.arguments.iter().all(|argument| {
+                        computed_call_argument_is_supported(argument, &|node| {
+                            self.node(node).ok().map(|record| record.kind)
+                        })
+                    })
             }
             PlannedExpressionKind::Identifier(read) => {
                 read.kind == PlannedIdentifierReadKind::Variable
