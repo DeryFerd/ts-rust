@@ -56,7 +56,8 @@ retain every failure. Both runtime and separate cleanup are closed.
 Eighteen failures share a namespace export-owner check. The repair is committed
 and reviewed at `99597a7b`. The remaining failure needs scalar method-value
 lookup through the existing wrapper-type provider. Its source and tests have
-paired approval, including a correction for caller-limit cache recovery.
+paired approval and are committed at `4192503d`, including a correction for
+caller-limit cache recovery.
 Neither repair has a runtime result yet. The primary branch still uses the
 previously accepted compiler source. No core candidate is accepted from this
 failed check.
@@ -99,9 +100,15 @@ Separate cleanup is closed. The
 [new alias result](../target/wave202-alias-five-repair-focused-3-runtime.md)
 has independent review. This batch is not accepted yet. Three test setup
 repairs and the generic partial-property repair are now combined and reviewed
-at `d5f0d448`. A fresh 5,105-test diagnostic check is being prepared. Two other
-pairs are fixing written conditional-argument proof and unique-symbol property
-publication. Those source changes have not run.
+at `d5f0d448`. Its fresh diagnostic check completed all 5,105 tests, with 5,099
+passes and six failures. All 50 required controls passed. Four old failures now
+pass, the new property control passes, and no old passing test regressed. I
+checked all outcomes against their raw log spans and verified all 22 saved
+payload hashes. Separate cleanup is closed. The
+[latest alias result](../target/wave202-alias-repair-focused-4-runtime.md)
+retains all six failures. This is still a failed gate.
+Two other pairs are fixing written conditional-argument proof and unique-symbol
+property publication. Those source changes have not run.
 
 The first shared project compiler is committed and independently verified at
 `b71b4158`. It combines the repaired library, class work, core, parser and
@@ -146,16 +153,23 @@ all 5,368 checker-library tests is being prepared. Its selection includes 356
 required controls. The other 1,932 tests and 230 required controls are outside
 that focused check. These source counts are not passing-test results.
 
+The next project compiler batch is committed and independently source-reviewed
+at `a3ef2928`. It combines constructor-owner, merged-interface-call, readonly-array
+and exported-overload repairs. Preparation for the next unchanged Hono and Query
+Core measurement is in progress. Its 7,318 test names are source metadata, not
+test results. The shared function/arrow local-variable repair is also committed
+and reviewed at `76811b77`. It stays outside this next project measurement.
+
 ## Next work
 
-1. Run the shared checker-library and alias diagnostic checks on their fixed
-   source batches. Keep every old result in the comparison.
-2. Combine the reviewed project repairs for constructor owners, merged
-   interface calls, readonly arrays and exported overloads. Add the typed-field
-   and shared function/arrow local-variable work after their source reviews.
-3. Repeat both unchanged project checks with one fixed binary. Use the next
-   actual failure in each source file to choose the following repairs.
-4. Complete the eight project repair pairs below and the two core repairs.
+1. Run the shared checker-library check and the combined core repairs. Keep
+   every old result in the comparison. Use the completed alias run to select
+   its next repair batch.
+2. Run both unchanged project checks on `a3ef2928` with one fixed binary. Use
+   the next actual failure in each source file to choose the following repairs.
+3. Combine the typed-field and shared function/arrow local-variable work after
+   source review, then measure both projects again.
+4. Complete the eight project repairs below and the remaining alias repairs.
    Require tests before accepting their source.
 5. Compare complete project diagnostics with TypeScript-Go. Then show one
    deliberate type error in a separate copy with its correct location.
@@ -165,6 +179,11 @@ rows, 160 have a located source cause, 18 remain unresolved and three overlap
 work that is on hold. Eight implementation pairs now have separate worktrees.
 They target 34 distinct first failures. That is not a forecast of 34 completed
 files, because later failures can appear after each repair.
+
+Three of these source repairs are committed and independently reviewed:
+constructor annotations at `d2129b2c`, type reexports at `07fc299c`, and imported
+arrow context at `0dc85701`. None has a runtime result. The imported-arrow barrel
+cases still need the explicit reexport connection and imported class-owner work.
 
 | Repair pair | Immediate work |
 | --- | --- |
