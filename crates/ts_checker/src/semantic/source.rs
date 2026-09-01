@@ -44429,24 +44429,55 @@ fn check_callable_parameter_initializers_with_capture_context(
                 // Hoisted return inference runs before the initializer source's statement.
                 flow_types.entry(read.value_symbol).or_insert(body_type);
             }
-            let assignment = check_planned_assignment_with_capture_context(
-                store,
-                host,
-                global_types,
-                source,
-                options,
-                session,
-                diagnostics,
-                &flow_types,
-                type_import_execution,
-                deferred,
-                parameter.type_node,
-                &[],
-                &planned.expression,
-                parameter.declaration,
-                None,
-                arrow_capture,
-            )?;
+            let assignment = if parameter.has_string_default_type() {
+                parameter.string_default_value(store, host).map_err(|_| {
+                    callable_parameter_execution_error(callable, parameter.declaration)
+                })?;
+                if parameter.base_type(store) != Some(body_type) {
+                    return Err(callable_parameter_execution_error(
+                        callable,
+                        parameter.declaration,
+                    ));
+                }
+                check_assignment_to_type_with_capture_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &flow_types,
+                    type_import_execution,
+                    deferred,
+                    body_type,
+                    None,
+                    &planned.expression,
+                    parameter.declaration,
+                    None,
+                    None,
+                    arrow_capture,
+                )?
+            } else {
+                check_planned_assignment_with_capture_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &flow_types,
+                    type_import_execution,
+                    deferred,
+                    parameter.type_node,
+                    &[],
+                    &planned.expression,
+                    parameter.declaration,
+                    None,
+                    arrow_capture,
+                )?
+            };
             if assignment.declared_type != body_type {
                 return Err(callable_parameter_execution_error(
                     callable,

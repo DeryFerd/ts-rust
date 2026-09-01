@@ -9207,6 +9207,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
         }
         for parameter in callable.all_parameters() {
+            parameter
+                .string_default_value(self.store, self.host)
+                .map_err(|error| source_callable_error(error, callable.family))?;
             if let Some(annotation) = parameter.explicit_type_node() {
                 self.plan_type_node(annotation)?;
             }
@@ -39369,6 +39372,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let (cold_source_types, source_optional_unions) =
             source_callables::reserve_source_callable_capacities(self.store, &[&callable])
                 .map_err(|error| source_callable_error(error, callable.family))?;
+        let string_default_types = self.source_callable_string_default_types(&callable)?;
         let mut prepared = self.prepare_literal_types_with_additional(
             &plan,
             source_optional_unions,
@@ -39517,6 +39521,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
 
         let mut base_types = Vec::with_capacity(callable.parameter_count());
         for parameter in callable.all_parameters() {
+            if let Some(type_) = string_default_types.get(&parameter.symbol) {
+                base_types.push(*type_);
+                continue;
+            }
             if let Some(resolution) = callable
                 .alias_resolutions()
                 .iter()
@@ -39577,6 +39585,57 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         prepared.clear_pending_function_types();
         publication?;
         Ok(pending.type_)
+    }
+
+    /// Infers real default expressions before the callable shell is published.
+    fn source_callable_string_default_types(
+        &mut self,
+        callable: &SourceCallablePlan,
+    ) -> Result<BTreeMap<SemanticSymbolId, TypeId>, DeclaredTypeError> {
+        let mut defaults = Vec::new();
+        for parameter in callable.all_parameters() {
+            if let Some(value) = parameter
+                .string_default_value(self.store, self.host)
+                .map_err(|error| source_callable_error(error, callable.family))?
+            {
+                defaults.push((*parameter, value));
+            }
+        }
+        if defaults.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let values = defaults
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        self.store
+            .prepare_regular_literal_types(&values, &[], &[])
+            .map_err(Self::literal_cache_error)?;
+        let mut types = BTreeMap::new();
+        for (parameter, value) in defaults {
+            let regular = self
+                .store
+                .regular_string_literal_type(value)
+                .map_err(Self::literal_cache_error)?;
+            let fresh = self
+                .store
+                .fresh_type_of_literal_type(regular)
+                .map_err(Self::literal_cache_error)?;
+            let type_ =
+                super::source::widened_fresh_literal_type(self.store, fresh).map_err(|_| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(
+                        callable.declaration,
+                    ))
+                })?;
+            if parameter.base_type(self.store) != Some(type_)
+                || types.insert(parameter.symbol, type_).is_some()
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionType(callable.declaration),
+                ));
+            }
+        }
+        Ok(types)
     }
 
     /// Publishes or validates the complete type/value/member graph for one
