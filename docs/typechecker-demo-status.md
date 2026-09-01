@@ -2,6 +2,44 @@
 
 Updated 2026-09-01. No complete real-world project has passed in Rust yet.
 
+## Current result
+
+Pathe is the first demo target. The latest complete census uses its unchanged
+source, configuration and dependencies. All 277 loaded files now parse without
+errors, down from 35 parser diagnostics. Typechecking still stops in all nine
+roots: eight unsupported results and one internal checker error. Five roots
+now report different first stops. This is progress, not a complete project pass.
+The [comparison](../target/wave202-pathe-census2-progress-comparison.md),
+[result](../target/wave202-pathe-root-census-2-result.md) and
+[review](../target/wave202-pathe-root-census-2-result-review.md) are closed.
+
+The next source has thirteen combined repairs and a one-line test compile fix
+at `38b8e0f1`. Its 408-test rerun is prepared, not yet measured. The previous
+attempt stopped during compilation, so it produced no passing or failing tests.
+Do not combine this source with the older test counts below.
+
+The immediate work is split across separate branches with source, test and
+review owners. These are diagnosed causes, not new runtime results.
+
+| Work | Pathe code it addresses |
+| --- | --- |
+| Conditional writes to initialized locals | `normalizeWindowsPath`, also used by computed keys |
+| Compound writes to parameters | `path += "/"` in `normalize` |
+| Object destructuring in callable bodies | `const { children } = parent` in `_pushToLeaves` |
+| Generic library constructors | The real `SetConstructor` declarations used by `new Set(...)` |
+| Contextual callback parameters and bodies | The local `Register` and nested `Assert` callbacks |
+| Computed keys and their stored type evidence | Literal keys first, then real `String.raw` and helper calls |
+
+The remaining loop and callback errors lose their original cause in error
+conversion. They need better failure detail before a semantic fix. The Proxy
+expression also needs its casted arrow-return position and handler checked.
+
+The demo is complete only when the original whole-project check finishes and
+matches the reference diagnostics, including the four test roots. Focused
+invalid programs must still report real type errors. UFO remains the second
+small target, but its dependency install still needs network approval. Hono
+and TanStack Query remain broader checks, not near-complete demo claims.
+
 ## Targets
 
 Use Pathe for the first small complete demo, UFO for the second, and Hono for
@@ -36,7 +74,7 @@ The corrected reader now passes all 66 saved-data controls. It keeps parser
 diagnostics, partial checker results and full-project results separate. The
 [reader checks](../target/wave202-pathe-root-census-2-reader-controls-result.md)
 and [review](../target/wave202-pathe-root-census-2-reader-controls-result-review.md)
-are closed. The corrected reader still needs a live project run.
+are closed. The corrected reader passed the later live census described above.
 Pathe is not one fix away from a demonstrated pass. Its original build and
 project-pinned compiler check also remain separate requirements.
 
@@ -52,8 +90,8 @@ The repaired build passed in 79.302 seconds. Its ordinary executable, all source
 files and all 94 emitted files have closed resource and independent reviews.
 The [new build result](../target/wave202-pathe-next-bin-2-result.md) and
 [review](../target/wave202-pathe-next-bin-2-result-review.md) are complete.
-The next step is the unchanged nine-root Pathe census. No new Pathe project
-result exists yet.
+The unchanged nine-root Pathe census is now complete. It removed the 35 parser
+diagnostics but did not complete a root's typecheck.
 
 The corrected six-feature compiler at `a89c891b` builds successfully. The build
 took 77.385 seconds, with no Rust errors. Separate cleanup and independent review
@@ -72,18 +110,29 @@ retains every result. Separate cleanup and final result review are closed.
 Thirteen repair commits are combined at `dd5e09f9` in a separate source branch.
 The [source handoff](../target/wave202-pathe-focused-union-order-handoff.md) and
 [independent review](../target/wave202-pathe-focused-union-order-review.md)
-are closed. The planned check retains 408 tests across the binder, checker,
-parser and project-error reporting. These are selected tests, not passing results.
+are closed. The check retains 408 tests across the binder, checker, parser and
+project-error reporting. Its first attempt stopped at an E0308 in a new public
+test. Three package builds succeeded, but no test ran. The
+[failed gate](../target/wave202-pathe-focused-repairs-1-closure.md) and
+[review](../target/wave202-pathe-focused-repairs-1-result-review.md) are closed.
+The [one-line fix](../target/wave202-pathe-focused-repairs-compile-fix-handoff.md)
+and [review](../target/wave202-pathe-focused-repairs-compile-fix-review.md) are
+closed at `38b8e0f1`. It uses the registered `SourceFileRef` without changing
+the fixture, assertions or selected tests. Its rerun is pending.
 This includes the optional-property repair. It keeps canonical declared-union
 order instead of incorrectly requiring numeric type-ID order. The original
 failing test stays unchanged. The diagnostic-only source is excluded.
 
 Computed-key review found a separate bug: missing index evidence can reach an
-incorrect `any` result. A small repair and focused test are in progress before
-that code joins the candidate. Pathe also needs argument-bearing computed keys
+incorrect `any` result. The repair and focused test are reviewed and committed
+at `220334d0`, but have not run. Integration review found another conflict:
+contextual widening rejects a valid computed property's real name. That
+compatibility repair is now in progress. Pathe also needs argument-bearing computed keys
 with real `String.raw` tags. The existing computed-key subset does not support
 that full expression. The next composition test must use the actual imported
-helper and bundled libraries, without replacement declarations.
+helper and bundled libraries, without replacement declarations. That control
+is committed at `f4b568f5`. It retains the exact helper and 93 real library files.
+It is an unrun test, not implemented support for the full expression.
 
 The first build failed on two Rust E0308 errors because two calls omitted `Some`
 around an optional session. That failed attempt and its cleanup remain in the
@@ -92,8 +141,8 @@ around an optional session. That failed attempt and its cleanup remain in the
 The first 248-test parser command also stopped before compilation because
 `cargo test` rejects `--keep-going`. The corrected command passed all 248 tests,
 including the three new keyword-tuple-label tests. No test was ignored or filtered.
-Separate cleanup and final result review are closed. A passing parser test does
-not prove that Pathe's 35 loaded-file diagnostics are gone.
+Separate cleanup and final result review are closed. The later unchanged-input
+Pathe census now separately confirms that its 35 loaded-file diagnostics are gone.
 
 The latest core check passed 6,557 of 6,559 tests. All 19 earlier failures now
 pass, but two old passes regressed. The latest alias check passed 5,103 of 5,108
