@@ -1923,6 +1923,9 @@ fn census_source_error_node(error: &ts_checker::semantic::SourceCheckError) -> O
             | U::Element(node)
             | U::New(node),
         ) => Some(*node),
+        E::Unsupported(U::Variable(
+            ts_checker::semantic::VariableUnsupported::IdentifierNotPrior { node, .. },
+        )) => Some(*node),
         E::DeclaredType(error) => census_declared_error_node(error),
         E::Unsupported(U::Function(error)) => {
             use ts_checker::semantic::SourceFunctionUnsupported as F;

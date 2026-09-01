@@ -4,7 +4,7 @@ use ts_binder::{
     EscapedName,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, ObjectFlags,
+    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, types::ObjectFlags,
     TypeData, TypeId,
 };
 use ts_parser::{ParseResult, parse_source_file};

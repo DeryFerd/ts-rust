@@ -9996,8 +9996,27 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         return Ok(false);
                     };
                     let function_record = self.node(function)?;
-                    let NodeData::FunctionDeclaration(declaration) = &function_record.data else {
-                        return Ok(false);
+                    let callable_body_matches = match (&function_record.data, function_record.kind) {
+                        (
+                            NodeData::FunctionDeclaration(declaration),
+                            SyntaxKind::FunctionDeclaration,
+                        ) => declaration.body == Some(body.node),
+                        (NodeData::ArrowFunction(arrow), SyntaxKind::ArrowFunction) => {
+                            arrow.body == body.node
+                                && arrow.modifiers.is_none()
+                                && arrow.type_parameters.is_none()
+                                && arrow.asterisk_token.is_none()
+                        }
+                        (
+                            NodeData::FunctionExpression(expression),
+                            SyntaxKind::FunctionExpression,
+                        ) => {
+                            expression.body == body.node
+                                && expression.modifiers.is_none()
+                                && expression.type_parameters.is_none()
+                                && expression.asterisk_token.is_none()
+                        }
+                        _ => false,
                     };
                     return Ok(record.flags.0 == 0
                         && statement.flow_node.is_none()
@@ -10005,8 +10024,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         && body_record.kind == SyntaxKind::Block
                         && body_record.flags.0 == 0
                         && block.statements.nodes.contains(&parent.node)
-                        && function_record.kind == SyntaxKind::FunctionDeclaration
-                        && declaration.body == Some(body.node)
+                        && callable_body_matches
                         && self.bound.container(current) == Some(function)
                         && self.bound.flow_container(parent) == Some(function));
                 }
@@ -15665,12 +15683,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     ) -> Result<PlannedCallableStatementList, SourceCheckError> {
         let callable = &syntax.callable;
         let mut locals = Vec::new();
-        let statements = self.finish_callable_statements(
-            callable,
-            &syntax.statements,
-            &mut locals,
-            CallableLocalWrites::Linear,
-        )?;
+        let statements = self
+            .finish_callable_statements(
+                callable,
+                &syntax.statements,
+                &mut locals,
+                CallableLocalWrites::Linear,
+            )
+            .map_err(|error| {
+                trace_callable_body_error(
+                    "body.statement-plan",
+                    callable.body,
+                    self.node(callable.body).ok(),
+                );
+                error
+            })?;
         let nodes = callable_statement_nodes(&statements);
         let mut points = Vec::new();
         let mut conditions = Vec::new();
@@ -15870,7 +15897,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             mutations,
             nullish,
         )
-        .map_err(|error| Self::source_flow_plan_error(callable, error))?;
+        .map_err(|error| {
+            trace_callable_body_error(
+                "body.flow-preflight",
+                callable.body,
+                self.node(callable.body).ok(),
+            );
+            Self::source_flow_plan_error(callable, error)
+        })?;
         Ok(PlannedCallableStatementList {
             syntax,
             locals,
@@ -53055,6 +53089,8 @@ fn check_planned_source_condition_with_capture_context(
                     .and_then(|signature| store.signature(signature))
                     .is_some_and(|signature| signature.resolved_type_predicate().is_some())
             {
+                let call = expression.unparenthesized().node;
+                trace_callable_body_error("body.condition-predicate", call, host.node(call));
                 return Err(SourcePlanner::unsupported_function_body(callable));
             }
             emit_truthiness_operand_diagnostics(
@@ -53205,6 +53241,17 @@ fn check_planned_truthiness_condition(
             &mut HashSet::new(),
         )?
     {
+        trace_callable_body_error(
+            "body.truthiness-proof",
+            condition.node,
+            host.node(condition.node),
+        );
+        trace_first_error(format_args!(
+            "PATHE_BODY_FACT stage=body.truthiness-proof node={:?} reference={:?} location={:?} flow_matches={flow_matches}\n",
+            condition.node,
+            reference.node,
+            host.node(reference.node).map(|node| (node.kind, node.range)),
+        ));
         return Err(SourceCheckError::Unsupported(
             UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(
                 callable.body,
@@ -53712,6 +53759,17 @@ fn restore_callable_statement_entries(
     returned.declared_entries = outer;
 }
 
+fn trace_first_error(arguments: std::fmt::Arguments<'_>) {
+    let _ = std::io::Write::write_fmt(&mut std::io::stderr().lock(), arguments);
+}
+
+fn trace_callable_body_error(stage: &str, reference: NodeRef, node: Option<&Node>) {
+    trace_first_error(format_args!(
+        "PATHE_BODY_ERROR stage={stage} node={reference:?} location={:?}\n",
+        node.map(|node| (node.kind, node.range)),
+    ));
+}
+
 /// Replays every statement before publishing the callable's own return type.
 #[allow(clippy::too_many_arguments)]
 fn check_planned_callable_statement_list(
@@ -53805,6 +53863,15 @@ fn check_planned_callable_statement_list_worker(
         let (SourceCallableState::AwaitingInferredReturn { signature, .. }
         | SourceCallableState::Resolved { signature, .. }) = state
         else {
+            trace_callable_body_error(
+                "body.callable-state",
+                callable.body,
+                host.node(callable.body),
+            );
+            trace_first_error(format_args!(
+                "PATHE_BODY_FACT stage=body.callable-state node={:?} state={state:?}\n",
+                callable.body,
+            ));
             return Err(SourcePlanner::unsupported_function_body(callable));
         };
         super::source_callables::validate_inferred_source_callable_return(
@@ -53923,6 +53990,14 @@ fn check_planned_callable_statement_list_worker(
                     .contextual_return
                     .or_else(|| callable.contextual_function_expression_return()),
             )
+            .map_err(|error| {
+                trace_callable_body_error(
+                    "body.return-inference",
+                    callable.body,
+                    host.node(callable.body),
+                );
+                error
+            })
         }
     })();
     let Some(signature) = signature else {
@@ -54007,6 +54082,7 @@ fn check_callable_statement_nodes(
                 )?;
                 check_callable_statement_expression_effects(
                     store,
+                    host,
                     callable,
                     &binding.initializer,
                 )?;
@@ -54059,7 +54135,36 @@ fn check_callable_statement_nodes(
                     staged_value_types,
                     value_order,
                     capture,
-                )?;
+                )
+                .map_err(|error| {
+                    let node = match leaf {
+                        PlannedLinearFunctionStatement::Local(index) => body
+                            .locals
+                            .get(*index)
+                            .and_then(|local| match &local.initializer {
+                                PlannedVariableInitializer::Expression(expression) => {
+                                    Some(expression.node)
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or(callable.body),
+                        PlannedLinearFunctionStatement::Expression { expression, .. } => {
+                            expression.node
+                        }
+                        PlannedLinearFunctionStatement::CapturedAssignment(assignment) => {
+                            assignment.right.node
+                        }
+                        PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
+                            assignment.right.node
+                        }
+                        PlannedLinearFunctionStatement::CompoundParameterAssignment(assignment) => {
+                            assignment.right.node
+                        }
+                        _ => callable.body,
+                    };
+                    trace_callable_body_error("body.statement-check", node, host.node(node));
+                    error
+                })?;
                 match leaf {
                     PlannedLinearFunctionStatement::Local(index) => {
                         let local = body
@@ -54070,7 +54175,7 @@ fn check_callable_statement_nodes(
                             &local.initializer
                         {
                             check_callable_statement_expression_effects(
-                                store, callable, expression,
+                                store, host, callable, expression,
                             )?;
                         }
                         let shared_parameter = callable
@@ -54092,11 +54197,14 @@ fn check_callable_statement_nodes(
                         }
                     }
                     PlannedLinearFunctionStatement::Expression { expression, .. } => {
-                        check_callable_statement_expression_effects(store, callable, expression)?
+                        check_callable_statement_expression_effects(
+                            store, host, callable, expression,
+                        )?
                     }
                     PlannedLinearFunctionStatement::CapturedAssignment(assignment) => {
                         check_callable_statement_expression_effects(
                             store,
+                            host,
                             callable,
                             &assignment.right,
                         )?
@@ -54104,6 +54212,7 @@ fn check_callable_statement_nodes(
                     PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
                         check_callable_statement_expression_effects(
                             store,
+                            host,
                             callable,
                             &assignment.right,
                         )?
@@ -54111,6 +54220,7 @@ fn check_callable_statement_nodes(
                     PlannedLinearFunctionStatement::CompoundParameterAssignment(assignment) => {
                         check_callable_statement_expression_effects(
                             store,
+                            host,
                             callable,
                             &assignment.right,
                         )?
@@ -54161,8 +54271,13 @@ fn check_callable_statement_nodes(
                     callable,
                     condition,
                     capture,
-                )?;
-                check_callable_statement_condition_effects(store, callable, condition)?;
+                )
+                .map_err(|error| {
+                    let node = condition.expression_node();
+                    trace_callable_body_error("body.condition-check", node, host.node(node));
+                    error
+                })?;
+                check_callable_statement_condition_effects(store, host, callable, condition)?;
                 for branch in [then_statements, else_statements] {
                     let entries = returned.declared_entries.clone();
                     let result = check_callable_statement_nodes(
@@ -54211,7 +54326,7 @@ fn check_callable_statement_nodes(
                     snapshot.types(), type_import_execution, expression, None, deferred,
                     None, capture,
                 )?;
-                check_callable_statement_expression_effects(store, callable, expression)?;
+                check_callable_statement_expression_effects(store, host, callable, expression)?;
             }
             PlannedCallableStatement::ForOf {
                 header,
@@ -54237,7 +54352,7 @@ fn check_callable_statement_nodes(
                     None,
                     capture,
                 )?;
-                check_callable_statement_expression_effects(store, callable, iterable)?;
+                check_callable_statement_expression_effects(store, host, callable, iterable)?;
                 let iteration_type = check_source_for_of_iteration(
                     store,
                     host,
@@ -54418,7 +54533,7 @@ fn check_callable_statement_nodes(
                     expression,
                     snapshot.types(),
                 )?;
-                check_callable_statement_expression_effects(store, callable, expression)?;
+                check_callable_statement_expression_effects(store, host, callable, expression)?;
                 returned.values.push(actual);
             }
         }
@@ -54502,7 +54617,7 @@ fn check_callable_catch(
                 let current_type = current_flow_type_after_assignment(
                     store, host, global_types, options, session, diagnostics, assignment,
                 )?;
-                check_callable_statement_expression_effects(store, callable, initializer)?;
+                check_callable_statement_expression_effects(store, host, callable, initializer)?;
                 frame.complete_assignment(syntax.declaration, syntax.symbol, current_type)
                     .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
             }
@@ -60001,33 +60116,35 @@ fn infer_callable_statement_return(
 
 fn check_callable_statement_condition_effects(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     callable: &SourceCallablePlan,
     condition: &PlannedSourceCondition,
 ) -> Result<(), SourceCheckError> {
     match condition {
         PlannedSourceCondition::Logical { left, right, .. } => {
-            check_callable_statement_condition_effects(store, callable, left)?;
-            check_callable_statement_condition_effects(store, callable, right)
+            check_callable_statement_condition_effects(store, host, callable, left)?;
+            check_callable_statement_condition_effects(store, host, callable, right)
         }
         PlannedSourceCondition::Expression { expression, .. }
         | PlannedSourceCondition::Truthiness { expression, .. } => {
-            check_callable_statement_expression_effects(store, callable, expression)
+            check_callable_statement_expression_effects(store, host, callable, expression)
         }
         PlannedSourceCondition::Typeof(condition) => {
-            check_callable_statement_expression_effects(store, callable, &condition.identifier)
+            check_callable_statement_expression_effects(store, host, callable, &condition.identifier)
         }
         PlannedSourceCondition::Equality(condition) => {
-            check_callable_statement_expression_effects(store, callable, &condition.operand)?;
-            check_callable_statement_expression_effects(store, callable, &condition.value)
+            check_callable_statement_expression_effects(store, host, callable, &condition.operand)?;
+            check_callable_statement_expression_effects(store, host, callable, &condition.value)
         }
         PlannedSourceCondition::In(condition) => {
-            check_callable_statement_expression_effects(store, callable, &condition.expression)
+            check_callable_statement_expression_effects(store, host, callable, &condition.expression)
         }
     }
 }
 
 fn check_callable_statement_expression_effects(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     callable: &SourceCallablePlan,
     expression: &PlannedExpression,
 ) -> Result<(), SourceCheckError> {
@@ -60049,12 +60166,26 @@ fn check_callable_statement_expression_effects(
                         )
                     })
                 });
-            if assertion
-                || signature
-                    .resolved_return_type()
+            let mut return_effect = None;
+            if assertion || {
+                let return_type = signature.resolved_return_type();
+                let flags = return_type
                     .and_then(|type_| store.type_payload(type_))
-                    .is_none_or(|record| record.flags().intersects(TypeFlags::NEVER))
+                    .map(|record| record.flags());
+                let rejected = flags.is_none_or(|flags| flags.intersects(TypeFlags::NEVER));
+                return_effect = Some((return_type, flags));
+                rejected
+            }
             {
+                trace_callable_body_error(
+                    "body.call-effects",
+                    expression.node,
+                    host.node(expression.node),
+                );
+                trace_first_error(format_args!(
+                    "PATHE_BODY_FACT stage=body.call-effects node={:?} assertion={assertion} return_effect={return_effect:?}\n",
+                    expression.node,
+                ));
                 return Err(SourcePlanner::unsupported_function_body(callable));
             }
         }
