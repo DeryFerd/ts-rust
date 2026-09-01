@@ -4026,7 +4026,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 .ok_or(SourceCheckError::Provenance(
                                     SourceCheckProvenanceError::MissingDeclarationSymbol(statement),
                                 ))?;
-                        if class.members.nodes.is_empty() {
+                        // Heritage needs the base and constructor proof from the class planner.
+                        if class.members.nodes.is_empty() && class.heritage_clauses.is_none() {
                             let empty = self.plan_exported_empty_class(statement, symbol)?;
                             if !self.planned_classes.insert(empty.symbol) {
                                 return Err(SourceCheckError::Class(statement));
@@ -83788,6 +83789,160 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    const EMPTY_DERIVED_CONSTRUCTOR_DECLARATIONS: &str = concat!(
+        "interface Product { message: string; }\n",
+        "interface ProductFactory { new(message?: string): Product; readonly prototype: Product; }\n",
+        "declare const Build: ProductFactory;\n",
+    );
+
+    #[test]
+    fn exported_empty_derived_class_plan_uses_declared_constructor_provider() {
+        let library = parsed(EMPTY_DERIVED_CONSTRUCTOR_DECLARATIONS);
+        let source = parsed("export class EmptyProduct extends Build {}");
+        let library_file = FileId::new(58_570);
+        let file = FileId::new(58_571);
+        let context = context_with_cross_file_global(
+            library_file,
+            &library,
+            file,
+            &source,
+            CanonicalModuleState::Script,
+            CanonicalModuleState::External,
+            false,
+        );
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration)
+                    .then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .unwrap();
+        let owner = bound.symbol(declaration).unwrap();
+        let local = bound.local_symbol(declaration).unwrap();
+        assert_ne!(owner, local);
+        assert_eq!(
+            context.store().symbol(local).unwrap().export_symbol(),
+            Some(owner)
+        );
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, &library_bound), (&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let before = observable_state(&context, file);
+        let plan = SourcePlanner::new_semantic_with_global_types(
+            &source.arena,
+            &bound,
+            context.source_file(file).unwrap(),
+            context.store(),
+            &host,
+            &globals,
+            options,
+        )
+        .finish()
+        .unwrap();
+        let [PlannedStatement::SourceClass(class)] = plan.statements.as_slice() else {
+            panic!("empty derived classes must retain the normal source class plan")
+        };
+        assert_eq!(class.source.declaration(), declaration);
+        assert_eq!(class.source.symbol(), owner);
+        assert!(class.source.has_constructor_value_base());
+        assert!(class.source.has_public_inherited_constructor());
+        assert!(!class.source.has_own_default_constructor());
+        assert!(class.source.type_parameters().is_empty());
+        assert!(class.source.bodies().is_empty());
+        assert!(class.bodies.is_empty());
+        assert_eq!(
+            class.source.type_query_context(),
+            Some(&ClassTypeQueryContext::new(&globals, options))
+        );
+        assert_eq!(observable_state(&context, file), before);
+    }
+
+    #[test]
+    fn exported_empty_derived_class_rejects_foreign_heritage_type_cache() {
+        let library = parsed(EMPTY_DERIVED_CONSTRUCTOR_DECLARATIONS);
+        let source = parsed("export class EmptyProduct extends Build {}");
+        let library_file = FileId::new(58_572);
+        let file = FileId::new(58_573);
+        let mut context = context_with_cross_file_global(
+            library_file,
+            &library,
+            file,
+            &source,
+            CanonicalModuleState::Script,
+            CanonicalModuleState::External,
+            false,
+        );
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration)
+                    .then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .unwrap();
+        let expression = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ExpressionWithTypeArguments(base) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(source.arena.id(), file, base.expression))
+            })
+            .unwrap();
+        let wrong = TypeNodeLinks {
+            resolved_type: Some(context.store().intrinsic_bootstrap().unwrap().number_type),
+            ..TypeNodeLinks::default()
+        };
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(expression, wrong.clone())
+        );
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, &library_bound), (&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let poisoned = observable_state(&context, file);
+        for _ in 0..2 {
+            let result = SourcePlanner::new_semantic_with_global_types(
+                &source.arena,
+                &bound,
+                context.source_file(file).unwrap(),
+                context.store(),
+                &host,
+                &globals,
+                options,
+            )
+            .finish();
+            assert_eq!(result.map(|_| ()), Err(SourceCheckError::Class(declaration)));
+            assert_eq!(context.store().type_node_links(expression), Some(&wrong));
+            assert_eq!(observable_state(&context, file), poisoned);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(expression, TypeNodeLinks::default())
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let completed = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), completed);
     }
 
     #[test]
