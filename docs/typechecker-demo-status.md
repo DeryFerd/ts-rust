@@ -111,7 +111,7 @@ and [independent review](../target/wave202-alias-repair-focused-4-runtime-review
 retain all six failures. This is still a failed gate.
 The written conditional-argument proof repair is source-reviewed and committed
 at `2c443dcf`. The unique-symbol property repair is source-reviewed and committed
-at `c79055e9`. Their combined source is being planned. Neither has run.
+at `c79055e9`. Their reviewed source integration is now in progress. Neither has run.
 
 The first shared project compiler is committed and independently verified at
 `b71b4158`. It combines the repaired library, class work, core, parser and
@@ -167,23 +167,25 @@ and [independent review](../target/wave202-demo-shared-project-census-6-result-r
 retain the failure. All 24 saved output hashes and modes are verified.
 There are no new project outcomes.
 
-The exact one-line correction is in progress in a separate worktree. It keeps
-all real binder and owner checks. The batch's 7,318 test names remain source
+The exact one-line correction is committed and independently verified at
+`6d7a5f06`. It keeps all real binder and owner checks. The next unchanged-project
+run is being prepared on that source. The batch's 7,318 test names remain source
 metadata, not test results. The shared function/arrow local-variable repair is
-also committed and reviewed at `76811b77`. It stays outside the next project run.
+also committed and reviewed at `76811b77`. Its integration with typed fields is
+now in progress, including the compile correction. It stays outside the next
+project run.
 
 ## Next work
 
 1. Check Rust compilation before combining more source repairs. Then run the
    shared checker-library check and combined core tests. Keep every old result
    in the comparison. Use the completed alias run to select its next batch.
-2. Fix the new batch's compile error. Then run both unchanged projects with
-   one fixed binary. Use the next actual failure in each source file to choose
-   the following repairs.
+2. Run the corrected batch on both unchanged projects with one fixed binary.
+   Use the next actual failure in each source file to choose the following repairs.
 3. Combine the typed-field and shared function/arrow local-variable work after
    source review, then measure both projects again.
-4. Complete the eight project repairs below and the remaining alias repairs.
-   Require tests before accepting their source.
+4. Compile and test the eight project repairs below, then combine them. Finish
+   the remaining alias repairs. Require tests before accepting their source.
 5. Compare complete project diagnostics with TypeScript-Go. Then show one
    deliberate type error in a separate copy with its correct location.
 
@@ -195,9 +197,10 @@ files, because later failures can appear after each repair.
 
 All eight feature commits now have independent source review and verified
 commit contents. They add 55 controls. None has a runtime result. The generic
-constructor batch has a separate Rust compile error, a question mark applied
-to a bool. Its exact one-byte correction is in progress. Source review is not
-proof that a batch compiles or checks a project.
+constructor batch's separate Rust error, a question mark applied to a bool,
+is corrected and independently verified at `fcaf8610`. Rust compile checks for
+all eight batches are being prepared. Source review is not proof that a batch
+compiles or checks a project.
 
 | Repair pair | Feature commit | Work in the commit |
 | --- | --- | --- |
