@@ -2932,7 +2932,7 @@ pub(super) fn check_nullish_property_assignment_target(
             plan.node,
             &[property.type_, undefined],
             Some(property.symbol),
-            session,
+            Some(session),
         )?
     } else {
         property.type_
@@ -2944,7 +2944,7 @@ pub(super) fn check_nullish_property_assignment_target(
             plan.node,
             &[write, undefined],
             Some(property.symbol),
-            session,
+            Some(session),
         )?
     } else {
         write
