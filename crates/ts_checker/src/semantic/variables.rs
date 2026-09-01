@@ -672,6 +672,28 @@ pub(super) fn plan_function_object_parameter_bindings(
     function: NodeRef,
     parameter: NodeRef,
 ) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
+    plan_callable_object_parameter_bindings(arena, bound, store, function, parameter, false)
+}
+
+/// Proves written object parameters without changing the contextual arrow route.
+pub(super) fn plan_typed_arrow_object_parameter_bindings(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    arrow: NodeRef,
+    parameter: NodeRef,
+) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
+    plan_callable_object_parameter_bindings(arena, bound, store, arrow, parameter, true)
+}
+
+fn plan_callable_object_parameter_bindings(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    function: NodeRef,
+    parameter: NodeRef,
+    typed_arrow: bool,
+) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
     if bound.node_arena_id() != arena.id()
         || bound.node_arena_revision() != arena.revision()
         || !function.is_for(arena.id(), bound.file_id())
@@ -688,6 +710,10 @@ pub(super) fn plan_function_object_parameter_bindings(
         || bound
             .source_facts()
             .is_none_or(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+        || typed_arrow
+            && bound
+                .source_facts()
+                .is_none_or(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
     {
         return Err(VariablePlanError::Unsupported(
             VariableUnsupported::BindingPattern(function),
@@ -695,7 +721,7 @@ pub(super) fn plan_function_object_parameter_bindings(
     }
     let (parameters, body, modifiers, contextual_arrow) = match &function_record.data {
         NodeData::FunctionDeclaration(data)
-            if function_record.kind == SyntaxKind::FunctionDeclaration =>
+            if function_record.kind == SyntaxKind::FunctionDeclaration && !typed_arrow =>
         {
             if data.type_parameters.is_some()
                 || data.asterisk_token.is_some()
@@ -728,7 +754,7 @@ pub(super) fn plan_function_object_parameter_bindings(
             if data.type_parameters.is_some()
                 || data.modifiers.is_some()
                 || data.asterisk_token.is_some()
-                || data.type_.is_some()
+                || !typed_arrow && data.type_.is_some()
             {
                 return Err(VariablePlanError::Unsupported(
                     VariableUnsupported::BindingPattern(function),
@@ -743,7 +769,7 @@ pub(super) fn plan_function_object_parameter_bindings(
             {
                 return Err(VariableInvariant::InvalidBindingPattern(function).into());
             }
-            (&data.parameters, data.body, None, true)
+            (&data.parameters, data.body, None, !typed_arrow)
         }
         _ => {
             return Err(VariablePlanError::Unsupported(
@@ -894,7 +920,7 @@ pub(super) fn plan_function_object_parameter_bindings(
     };
     let body = NodeRef::new(function.arena, function.file, body);
     let body_record = binding_child_node(arena, store, body, function)?;
-    if !contextual_arrow
+    if function_record.kind == SyntaxKind::FunctionDeclaration
         && (body_record.kind != SyntaxKind::Block
             || !matches!(body_record.data, NodeData::Block(_)))
     {
@@ -970,6 +996,11 @@ pub(super) fn plan_function_object_parameter_bindings(
             let property = NodeRef::new(element.arena, element.file, property);
             let property_record = binding_child_node(arena, store, property, element)?;
             if let NodeData::ComputedPropertyName(computed) = &property_record.data {
+                if typed_arrow {
+                    return Err(VariablePlanError::Unsupported(
+                        VariableUnsupported::BindingPattern(property),
+                    ));
+                }
                 let key = NodeRef::new(property.arena, property.file, computed.expression);
                 let key_record = binding_child_node(arena, store, key, property)?;
                 if !matches!(
@@ -3656,6 +3687,214 @@ mod tests {
                 poisoned,
             );
         }
+    }
+
+    fn arrow_object_parameters(fixture: &BindingFixture) -> Vec<(NodeRef, NodeRef)> {
+        fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::ArrowFunction(arrow) = &record.data else {
+                    return None;
+                };
+                let parameter = arrow.parameters.nodes.iter().find(|parameter| {
+                    let Some(NodeData::ParameterDeclaration(parameter)) = fixture
+                        .parsed
+                        .arena
+                        .get(**parameter)
+                        .map(|record| &record.data)
+                    else {
+                        return false;
+                    };
+                    fixture
+                        .parsed
+                        .arena
+                        .get(parameter.name)
+                        .is_some_and(|record| record.kind == SyntaxKind::ObjectBindingPattern)
+                })?;
+                Some((
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, *parameter),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn typed_arrow_object_parameters_preserve_parent_and_leaf_owners() {
+        let fixture = binding_fixture(
+            concat!(
+                "const read = (prefix: number, ",
+                "{ value, renamed: alias }: { value: number; renamed?: string }, ",
+                "fallback: number = value): number => fallback;",
+            ),
+            202_901,
+        );
+        let parameters = arrow_object_parameters(&fixture);
+        let [(arrow, parameter)] = parameters.as_slice() else {
+            panic!("expected one arrow object parameter")
+        };
+        let (arrow, parameter) = (*arrow, *parameter);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        let planned = plan_typed_arrow_object_parameter_bindings(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            arrow,
+            parameter,
+        )
+        .unwrap();
+        let parent = fixture.bound.symbol(parameter).unwrap();
+        let owner = fixture.store.symbol(parent).unwrap();
+        assert_eq!(owner.name().as_utf8(), Some("__1"));
+        assert_eq!(owner.declarations(), Some(&[parameter][..]));
+        assert_eq!(owner.value_declaration(), Some(parameter));
+        assert_eq!(
+            fixture.store.source_node_kind(arrow),
+            Some(SyntaxKind::ArrowFunction),
+        );
+        assert_eq!(fixture.bound.container(parameter), Some(arrow));
+        assert_eq!(fixture.bound.block_scope_container(parameter), Some(arrow));
+        let locals = fixture
+            .bound
+            .locals(arrow)
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .unwrap();
+        for (binding, property, name) in [
+            (&planned[0], "value", "value"),
+            (&planned[1], "renamed", "alias"),
+        ] {
+            assert_eq!(binding.property_name, property);
+            assert_ne!(binding.symbol, parent);
+            assert_eq!(fixture.bound.symbol(binding.element), Some(binding.symbol));
+            assert_eq!(fixture.bound.container(binding.name), Some(arrow));
+            assert_eq!(
+                fixture.bound.block_scope_container(binding.name),
+                Some(arrow),
+            );
+            assert_eq!(locals.get_source(name), Some(binding.symbol));
+            assert_eq!(
+                fixture.store.symbol(binding.symbol).unwrap().declarations(),
+                Some(&[binding.element][..]),
+            );
+            assert!(binding.computed_key.is_none());
+            assert!(binding.initializer.is_none());
+            assert!(fixture.store.value_symbol_links(binding.symbol).is_none());
+        }
+        assert!(
+            plan_function_object_parameter_bindings(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                arrow,
+                parameter,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn typed_arrow_object_parameters_reject_foreign_leaf_and_cache_links() {
+        let mut fixture = binding_fixture(
+            concat!(
+                "const read = ({ value }: { value: number }): number => value; ",
+                "const other = ({ value }: { value: string }): string => value;",
+            ),
+            202_902,
+        );
+        let parameters = arrow_object_parameters(&fixture);
+        let [(arrow, parameter), (other_arrow, other_parameter)] = parameters.as_slice() else {
+            panic!("expected two distinct arrow parameters")
+        };
+        let bindings = plan_typed_arrow_object_parameter_bindings(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            *arrow,
+            *parameter,
+        )
+        .unwrap();
+        let other_bindings = plan_typed_arrow_object_parameter_bindings(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            *other_arrow,
+            *other_parameter,
+        )
+        .unwrap();
+        let binding = &bindings[0];
+        let other = other_bindings[0].symbol;
+        assert_ne!(binding.symbol, other);
+        let locals = fixture.bound.locals(*arrow).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(locals, EscapedName::source("value"), other),
+            Some(Some(binding.symbol)),
+        );
+        let before = fixture.store.checker_link_allocated_lengths();
+        assert_eq!(
+            plan_typed_arrow_object_parameter_bindings(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                *arrow,
+                *parameter,
+            ),
+            Err(VariablePlanError::Invariant(
+                VariableInvariant::InvalidBindingPattern(binding.element),
+            )),
+        );
+        assert_eq!(fixture.store.checker_link_allocated_lengths(), before);
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(locals, EscapedName::source("value"), binding.symbol),
+            Some(Some(other)),
+        );
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let poisoned = ValueSymbolLinks {
+            resolved_type: Some(number),
+            write_type: Some(number),
+            ..ValueSymbolLinks::default()
+        };
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(binding.symbol, poisoned.clone())
+        );
+        let before = fixture.store.checker_link_allocated_lengths();
+        assert_eq!(
+            plan_typed_arrow_object_parameter_bindings(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                *arrow,
+                *parameter,
+            ),
+            Err(VariablePlanError::Invariant(
+                VariableInvariant::InvalidValueLinks(binding.symbol),
+            )),
+        );
+        assert_eq!(fixture.store.checker_link_allocated_lengths(), before);
+        assert_eq!(
+            fixture.store.value_symbol_links(binding.symbol),
+            Some(&poisoned),
+        );
+        assert!(fixture.store.value_symbol_links(other).is_none());
     }
 
     #[test]

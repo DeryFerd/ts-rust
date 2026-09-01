@@ -9642,12 +9642,31 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     }
 
     /// Reports fixed-target arity only after constructor and static requirements are proven.
+    #[allow(dead_code)] // Keep the existing entry for internal callers without a session.
     pub(super) fn constructor_arity_mismatch(
         &mut self,
         source: TypeId,
         target: TypeId,
         global_types: &CanonicalGlobalTypes,
         strict_function_types: bool,
+    ) -> Result<Option<(usize, usize)>, RelationUnavailable> {
+        self.constructor_arity_mismatch_with_optional_session(
+            source,
+            target,
+            global_types,
+            strict_function_types,
+            None,
+        )
+    }
+
+    /// Keeps diagnostic static-property comparisons in the supplied caller's query.
+    pub(super) fn constructor_arity_mismatch_with_optional_session(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        global_types: &CanonicalGlobalTypes,
+        strict_function_types: bool,
+        instantiation_session: Option<&mut InstantiationSession>,
     ) -> Result<Option<(usize, usize)>, RelationUnavailable> {
         for type_ in [source, target] {
             match validate_stored_callable_set_with_array_targets(
@@ -9715,12 +9734,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 });
             }
             let bootstrap = self.relation_bootstrap_facts()?;
-            let mut session = RelaterSession::new_with_global_types_and_options(
+            let mut session = RelaterSession::new_with_global_types_options_and_session(
                 self,
                 RelationKind::Assignable,
                 bootstrap,
                 Some(RelationGlobalTypes::from_global_types(global_types)),
                 Some(strict_function_types),
+                instantiation_session,
             )
             .with_global_this_hint(Some(global_types.global_this_value_type));
             session.observe_type_surface(source);

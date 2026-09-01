@@ -4026,7 +4026,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 .ok_or(SourceCheckError::Provenance(
                                     SourceCheckProvenanceError::MissingDeclarationSymbol(statement),
                                 ))?;
-                        if class.members.nodes.is_empty() {
+                        // Heritage needs the base and constructor proof from the class planner.
+                        if class.members.nodes.is_empty() && class.heritage_clauses.is_none() {
                             let empty = self.plan_exported_empty_class(statement, symbol)?;
                             if !self.planned_classes.insert(empty.symbol) {
                                 return Err(SourceCheckError::Class(statement));
@@ -13182,19 +13183,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 parameter.declaration,
             ));
         };
+        if matches!(
+            callable.family,
+            SourceCallableFamily::FunctionDeclaration | SourceCallableFamily::ArrowFunction
+        ) && name_record.kind == SyntaxKind::ObjectBindingPattern
+        {
+            let bindings = authenticated_function_object_parameter_bindings(
+                store,
+                host,
+                callable.declaration,
+                parameter.declaration,
+            )
+            .ok_or_else(|| callable_parameter_execution_error(callable, parameter.declaration))?;
+            return Ok(bindings.into_iter().map(|binding| binding.symbol).collect());
+        }
         if callable.family == SourceCallableFamily::FunctionDeclaration {
-            if name_record.kind == SyntaxKind::ObjectBindingPattern {
-                let bindings = authenticated_function_object_parameter_bindings(
-                    store,
-                    host,
-                    callable.declaration,
-                    parameter.declaration,
-                )
-                .ok_or_else(|| {
-                    callable_parameter_execution_error(callable, parameter.declaration)
-                })?;
-                return Ok(bindings.into_iter().map(|binding| binding.symbol).collect());
-            }
             let bindings = authenticated_function_array_parameter_bindings(
                 store,
                 host,
@@ -37612,8 +37615,7 @@ fn check_planned_class_body(
                 .and_then(|links| links.resolved_type)
                 .ok_or(SourceCheckError::Class(parameter.declaration))?;
             let type_ = parameter
-                .type_
-                .resolved(store)
+                .resolved_type(store, class.source.type_query_context())
                 .map_err(|error| SourcePlanner::class_plan_error(parameter.declaration, error))?;
             if cached != type_ {
                 return Err(SourceCheckError::Class(parameter.declaration));
@@ -37657,8 +37659,7 @@ fn check_planned_class_body(
         let mut parameter_flow = context.state.base_flow_types.clone();
         for (index, parameter) in body.parameters.iter().enumerate() {
             let type_ = parameter
-                .type_
-                .resolved(store)
+                .resolved_type(store, class.source.type_query_context())
                 .map_err(|error| SourcePlanner::class_plan_error(parameter.declaration, error))?;
             if let Some((_, initializer)) = planned
                 .parameter_initializers
@@ -39636,6 +39637,7 @@ fn check_planned_arrow_argument(
         &[],
         arrow_capture,
     )?;
+    add_arrow_object_parameter_entries(store, host, &arrow.callable, &mut captured_entry_types)?;
     let mut linear_values = HashMap::new();
     let mut linear_value_order = Vec::new();
     let flow_types = if let Some(statements) = &arrow.linear_body {
@@ -44458,7 +44460,10 @@ fn check_callable_parameter_initializers_with_capture_context(
                 VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
             ));
         }
-        if callable.family != SourceCallableFamily::FunctionDeclaration {
+        if !matches!(
+            callable.family,
+            SourceCallableFamily::FunctionDeclaration | SourceCallableFamily::ArrowFunction
+        ) {
             continue;
         }
         let NodeData::ParameterDeclaration(parameter_syntax) = &host
@@ -44480,9 +44485,43 @@ fn check_callable_parameter_initializers_with_capture_context(
             .node(pattern)
             .is_some_and(|record| record.kind == SyntaxKind::ObjectBindingPattern)
         {
-            let planned = object_bindings.get(object_binding_index).ok_or_else(|| {
-                callable_parameter_execution_error(callable, parameter.declaration)
-            })?;
+            let arrow_bindings;
+            let planned = if callable.family == SourceCallableFamily::ArrowFunction {
+                let bindings = authenticated_function_object_parameter_bindings(
+                    store,
+                    host,
+                    callable.declaration,
+                    parameter.declaration,
+                )
+                .ok_or_else(|| {
+                    callable_parameter_execution_error(callable, parameter.declaration)
+                })?;
+                // Named keys have no expressions to plan. Reuse the function binding check.
+                if bindings.iter().any(|binding| binding.computed_key.is_some()) {
+                    return Err(callable_parameter_execution_error(
+                        callable,
+                        parameter.declaration,
+                    ));
+                }
+                arrow_bindings = PlannedObjectParameterBindings {
+                    parameter: *parameter,
+                    elements: bindings
+                        .into_iter()
+                        .map(|binding| PlannedObjectVariableElement {
+                            binding,
+                            computed_key: None,
+                            initializer: None,
+                        })
+                        .collect(),
+                };
+                &arrow_bindings
+            } else {
+                let planned = object_bindings.get(object_binding_index).ok_or_else(|| {
+                    callable_parameter_execution_error(callable, parameter.declaration)
+                })?;
+                object_binding_index += 1;
+                planned
+            };
             if planned.parameter != *parameter {
                 return Err(callable_parameter_execution_error(
                     callable,
@@ -44504,7 +44543,9 @@ fn check_callable_parameter_initializers_with_capture_context(
                 planned,
                 body_type,
             )?;
-            object_binding_index += 1;
+            continue;
+        }
+        if callable.family != SourceCallableFamily::FunctionDeclaration {
             continue;
         }
         let Some(bindings) = authenticated_function_array_parameter_bindings(
@@ -48984,6 +49025,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
     captured_entry_types: &mut HashMap<SemanticSymbolId, TypeId>,
     outer_capture: Option<SourceArrowCaptureContext<'_>>,
 ) -> Result<HashMap<SemanticSymbolId, TypeId>, SourceCheckError> {
+    add_arrow_object_parameter_entries(store, host, callable, captured_entry_types)?;
     let mut base_flow_types = base_flow_types;
     for index in &statements.deferred_local_arrows {
         let local = statements
@@ -50788,6 +50830,7 @@ fn check_planned_callable_statement_list(
             has_bare_return: body.syntax.has_implicit_return,
             ..CallableStatementReturns::default()
         };
+        add_arrow_object_parameter_entries(store, host, callable, &mut returned.declared_entries)?;
         check_callable_statement_nodes(
             store,
             host,
@@ -55620,8 +55663,104 @@ fn materialize_checked_source_callable(
         .and_then(|mut query| query.get_return_type_of_signature(signature));
         merge_retry_diagnostics(diagnostics, return_diagnostics);
         return_result?;
+        check_stored_arrow_type_predicate(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            callable,
+            signature,
+        )?;
     }
     Ok(MaterializedSourceCallable { type_, signature })
+}
+
+/// Checks the written narrowing against the actual stored arrow parameter.
+#[allow(clippy::too_many_arguments)] // Predicate relations keep the source caller's session.
+fn check_stored_arrow_type_predicate(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    callable: &SourceCallablePlan,
+    signature: SignatureId,
+) -> Result<(), SourceCheckError> {
+    let Some(predicate) = callable.type_predicate else {
+        return Ok(());
+    };
+    if callable.family != SourceCallableFamily::ArrowFunction
+        || source_array_filter_predicate_arrow_is_exact(store, host, callable.declaration)
+            .map_err(SourcePlanner::callable_plan_error)?
+    {
+        return Ok(());
+    }
+    let invalid = || SourceCheckError::Arrow(callable.declaration);
+    let narrowed = predicate.narrowed_type.ok_or_else(invalid)?;
+    let parameter_index = usize::try_from(predicate.parameter_index).map_err(|_| invalid())?;
+    let record = store.signature(signature).ok_or_else(invalid)?;
+    if predicate.owner != callable.declaration
+        || predicate.kind != TypePredicateKind::Identifier
+        || record.declaration() != Some(predicate.owner)
+        || record.parameters().get(parameter_index) != Some(&predicate.parameter_symbol)
+        || !super::source_callables::valid_planned_callable_type_predicate(
+            store,
+            record,
+            callable.return_type.type_node(),
+            Some(predicate),
+        )
+    {
+        return Err(invalid());
+    }
+    let narrowed_type = record
+        .resolved_type_predicate()
+        .and_then(|predicate| store.type_predicate(predicate))
+        .and_then(super::signatures::TypePredicate::type_id)
+        .ok_or_else(invalid)?;
+    let parameter_type = store
+        .value_symbol_links(predicate.parameter_symbol)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    let limit_mark = session.limit_event_mark();
+    let assignable = source_type_is_assignable_to(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        narrowed_type,
+        parameter_type,
+    )?;
+    let assignability_diagnostic = if assignable {
+        None
+    } else {
+        let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+        if options.no_error_truncation {
+            flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+        }
+        Some(super::object_diagnostics::type_predicate_assignability_diagnostic(
+            store,
+            host,
+            global_types,
+            narrowed_type,
+            parameter_type,
+            narrowed,
+            flags,
+            options,
+            session,
+        )?)
+    };
+    if session.limit_event_occurred_since(limit_mark) {
+        issue_node_diagnostic(diagnostics, narrowed, 2589)?;
+    }
+    if let Some(diagnostic) = assignability_diagnostic {
+        merge_retry_diagnostic(diagnostics, diagnostic);
+    }
+    Ok(())
 }
 
 fn source_callable_type_import_capabilities(
@@ -56038,13 +56177,16 @@ fn publish_checked_source_callable_return_with_contextual_return(
     } else {
         contextual_return
     };
-    let parameter_entries = if arrow_capture.is_none()
+    let mut parameter_entries = if arrow_capture.is_none()
         && expression.is_some_and(expression_has_deferred_object_members)
     {
         Some(source_arrow_parameter_entry_types(store, callable)?)
     } else {
         None
     };
+    if let Some(entries) = &mut parameter_entries {
+        add_arrow_object_parameter_entries(store, host, callable, entries)?;
+    }
     let arrow_capture = arrow_capture.or_else(|| {
         parameter_entries
             .as_ref()
@@ -57096,6 +57238,29 @@ fn source_arrow_capture_can_keep_narrowing(
         return Ok(true);
     }
     if record.kind == SyntaxKind::BindingElement {
+        if store.source_node_kind(parent) == Some(SyntaxKind::ObjectBindingPattern)
+            && let Some(super::store::SourceNodeParent::Parent(parameter)) =
+                store.source_node_parent(parent)
+            && store.source_node_kind(parameter) == Some(SyntaxKind::Parameter)
+            && let Some(super::store::SourceNodeParent::Parent(arrow)) =
+                store.source_node_parent(parameter)
+            && store.source_node_kind(arrow) == Some(SyntaxKind::ArrowFunction)
+            && host.node(parameter).is_some_and(|record| {
+                matches!(
+                    &record.data,
+                    NodeData::ParameterDeclaration(syntax) if syntax.type_.is_some()
+                )
+            })
+        {
+            return authenticated_function_object_parameter_bindings(store, host, arrow, parameter)
+                .filter(|bindings| {
+                    bindings.iter().any(|binding| {
+                        binding.element == declaration && binding.symbol == symbol
+                    })
+                })
+                .map(|_| true)
+                .ok_or_else(invalid);
+        }
         return source_for_of_let_capture_is_exact(store, host, symbol, declaration);
     }
     if record.kind != SyntaxKind::VariableDeclaration
@@ -57378,6 +57543,58 @@ fn source_arrow_parameter_entry_types(
             Ok((parameter.symbol, declared))
         })
         .collect()
+}
+
+/// Adds checked binding leaves to the caller's existing deferred-body entries.
+fn add_arrow_object_parameter_entries(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    callable: &SourceCallablePlan,
+    entries: &mut HashMap<SemanticSymbolId, TypeId>,
+) -> Result<(), SourceCheckError> {
+    if callable.family != SourceCallableFamily::ArrowFunction {
+        return Ok(());
+    }
+    for parameter in &callable.parameters {
+        let invalid = || callable_parameter_execution_error(callable, parameter.declaration);
+        let record = host.node(parameter.declaration).ok_or_else(invalid)?;
+        let NodeData::ParameterDeclaration(syntax) = &record.data else {
+            return Err(invalid());
+        };
+        let name = NodeRef::new(
+            parameter.declaration.arena,
+            parameter.declaration.file,
+            syntax.name,
+        );
+        if syntax.type_.is_none()
+            || host
+                .node(name)
+                .is_none_or(|record| record.kind != SyntaxKind::ObjectBindingPattern)
+        {
+            continue;
+        }
+        let bindings = authenticated_function_object_parameter_bindings(
+            store,
+            host,
+            callable.declaration,
+            parameter.declaration,
+        )
+        .ok_or_else(invalid)?;
+        for binding in bindings {
+            let type_ = store
+                .value_symbol_links(binding.symbol)
+                .and_then(|links| links.resolved_type)
+                .ok_or_else(invalid)?;
+            if entries
+                .get(&binding.symbol)
+                .is_some_and(|existing| *existing != type_)
+            {
+                return Err(invalid());
+            }
+            entries.insert(binding.symbol, type_);
+        }
+    }
+    Ok(())
 }
 
 /// Retains writes from nested bodies and parameter initializers in this callable.
@@ -71374,7 +71591,7 @@ pub(super) fn check_source_file(
                         callable.declaration,
                         &current_flow_types,
                     )?;
-                    let for_of_entries = matches!(arrow.body, PlannedArrowBody::ForOf(_))
+                    let mut for_of_entries = matches!(arrow.body, PlannedArrowBody::ForOf(_))
                         .then(|| source_arrow_parameter_entry_types(store, &callable))
                         .transpose()?;
                     let for_of_capture = match (&arrow.body, for_of_entries.as_ref()) {
@@ -71432,6 +71649,22 @@ pub(super) fn check_source_file(
                             &[],
                             arrow_capture,
                         )?;
+                    if let Some(entries) = &mut for_of_entries {
+                        add_arrow_object_parameter_entries(store, host, &callable, entries)?;
+                    }
+                    let for_of_capture = match (&arrow.body, for_of_entries.as_ref()) {
+                        (PlannedArrowBody::ForOf(iteration), Some(entries)) => {
+                            Some(SourceArrowCaptureContext {
+                                declared_types: entries,
+                                mutable_symbols: None,
+                                outer: Some(&source_capture),
+                                flow: None,
+                                assignments: &iteration.capture_assignments,
+                                value_exports: &[],
+                            })
+                        }
+                        _ => None,
+                    };
                     let body_flow_types = if let Some(statements) = &arrow.linear_body {
                         check_planned_linear_function_statements_with_capture_entries(
                             bound,
@@ -75433,7 +75666,7 @@ pub(super) fn check_source_file(
             arrow.source.callable.declaration,
             &current_flow_types,
         )?;
-        let for_of_entries = matches!(arrow.body, PlannedArrowBody::ForOf(_))
+        let mut for_of_entries = matches!(arrow.body, PlannedArrowBody::ForOf(_))
             .then(|| source_arrow_parameter_entry_types(store, &arrow.source.callable))
             .transpose()?;
         let for_of_capture = match (&arrow.body, for_of_entries.as_ref()) {
@@ -75465,6 +75698,22 @@ pub(super) fn check_source_file(
             &[],
             for_of_capture,
         )?;
+        if let Some(entries) = &mut for_of_entries {
+            add_arrow_object_parameter_entries(store, host, &arrow.source.callable, entries)?;
+        }
+        let for_of_capture = match (&arrow.body, for_of_entries.as_ref()) {
+            (PlannedArrowBody::ForOf(iteration), Some(entries)) => {
+                Some(SourceArrowCaptureContext {
+                    declared_types: entries,
+                    mutable_symbols: None,
+                    outer: Some(&source_capture),
+                    flow: None,
+                    assignments: &iteration.capture_assignments,
+                    value_exports: &[],
+                })
+            }
+            _ => None,
+        };
         if let Some(statements) = &arrow.linear_body {
             check_planned_linear_function_statements(
                 bound,
@@ -76734,6 +76983,264 @@ mod tests {
         assert_eq!(adequate.query_count(), 0);
         assert_eq!(observable_state(&context, file), warm);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the same lazy predicate relation under both caller modes.
+    fn stored_arrow_predicate_relations_keep_spent_callers_arrays_and_recovery() {
+        use crate::semantic::instantiate::instantiate_type_with_vector_and_session;
+
+        for recovering in [false, true] {
+            let library = parsed(concat!(
+                "interface Array<T> {} interface ReadonlyArray<T> {} ",
+                "interface Base<T> { value: T; [index: number]: Array<number>; }",
+            ));
+            let source = parsed(concat!(
+                "interface Derived extends Base<number> {} ",
+                "interface Plain { value: number; } ",
+                "const guard = (value: Plain): value is Derived => true;",
+            ));
+            let library_file = FileId::new(203_182);
+            let file = FileId::new(203_183);
+            let mut context = context_with_cross_file_global(
+                library_file,
+                &library,
+                file,
+                &source,
+                CanonicalModuleState::Script,
+                CanonicalModuleState::Script,
+                false,
+            );
+            let library_bound = context.file(library_file).unwrap().1.clone();
+            let bound = context.file(file).unwrap().1.clone();
+            let options = context.options();
+            let globals = context.global_types().clone();
+            let arrays = Some(CanonicalArrayTargets::from_global_types(&globals));
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&library.arena, &library_bound), (&source.arena, &bound)],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let declaration = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction)
+                        .then_some(NodeRef::new(source.arena.id(), file, node))
+                })
+                .unwrap();
+            let owner = bound.symbol(declaration).unwrap();
+            let callable =
+                plan_source_callable(context.store(), &host, declaration, owner, arrays).unwrap();
+            let predicate = callable.type_predicate.unwrap();
+            let narrowed = predicate.narrowed_type.unwrap();
+            let (boolean, number, error_type) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (bootstrap.boolean_type, bootstrap.number_type, bootstrap.error_type)
+            };
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut prepared = InstantiationSession::new(InstantiationLimits::default());
+            let callable_type = CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut prepared,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_of_source_callable(declaration, owner)
+            .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable_type)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut prepared,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_return_type_of_signature(signature),
+                Ok(boolean),
+            );
+            let predicate_id = context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_type_predicate()
+                .unwrap();
+            let derived = context
+                .store()
+                .type_predicate(predicate_id)
+                .unwrap()
+                .type_id()
+                .unwrap();
+            let TypeData::Interface(data) = context.store().type_payload(derived).unwrap().data()
+            else {
+                panic!("the predicate must retain its actual inherited interface");
+            };
+            let proxy = context
+                .store()
+                .symbol_table(data.reference.object.structured.members.unwrap())
+                .unwrap()
+                .get_source("value")
+                .unwrap();
+            let array = context
+                .store()
+                .index_info(data.reference.object.structured.index_infos.as_ref().unwrap()[0])
+                .unwrap()
+                .value_type();
+            assert_eq!(
+                context.store().canonical_array_element_type(&globals, array),
+                Ok(Some(number)),
+            );
+            assert!(
+                context.store().value_symbol_links(proxy).unwrap().resolved_type.is_none()
+            );
+            let base = context
+                .store()
+                .declared_type_links(global_symbol(&context, "Base"))
+                .unwrap()
+                .declared_type
+                .unwrap();
+            let TypeData::Interface(base_data) = context.store().type_payload(base).unwrap().data()
+            else {
+                unreachable!();
+            };
+            let parameter = base_data.reference.resolved_type_arguments.as_ref().unwrap()[0];
+            let limits = InstantiationLimits {
+                max_count: 1,
+                ..InstantiationLimits::default()
+            };
+            let mut spent = if recovering {
+                InstantiationSession::new_recovering(context.store(), limits, error_type).unwrap()
+            } else {
+                InstantiationSession::new(limits)
+            };
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    context.store_mut_for_test(),
+                    parameter,
+                    &[parameter],
+                    &[number],
+                    arrays,
+                    &mut spent,
+                ),
+                Ok(number),
+            );
+            let mark = spent.limit_event_mark();
+            let result = check_stored_arrow_type_predicate(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut spent,
+                &mut diagnostics,
+                &callable,
+                signature,
+            );
+            assert!(spent.limit_event_occurred_since(mark));
+            assert_eq!(
+                (spent.query_count(), spent.total_count(), spent.limit_event_count()),
+                (1, 1, 1),
+            );
+            assert_eq!(spent.recovery_error_type(), recovering.then_some(error_type));
+            let mut adequate = InstantiationSession::new(InstantiationLimits::default());
+            let replay_session = if recovering {
+                assert_eq!(result, Ok(()));
+                assert_eq!(
+                    context.store().value_symbol_links(proxy).unwrap().resolved_type,
+                    Some(error_type),
+                );
+                let [diagnostic] = diagnostics.as_slice() else {
+                    panic!("the recovered relation must issue one limit diagnostic");
+                };
+                assert_eq!(diagnostic.node, Some(narrowed));
+                assert_eq!(diagnostic.range_override, None);
+                assert_eq!(diagnostic.diagnostic.code(), 2589);
+                assert!(diagnostic.related_information.is_empty());
+                &mut spent
+            } else {
+                assert_eq!(
+                    result,
+                    Err(SourceCheckError::RelationUnavailable(
+                        RelationUnavailable::UnsupportedProperty(proxy),
+                    )),
+                );
+                assert!(
+                    context.store().value_symbol_links(proxy).unwrap().resolved_type.is_none()
+                );
+                assert!(diagnostics.is_empty());
+                check_stored_arrow_type_predicate(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut adequate,
+                    &mut diagnostics,
+                    &callable,
+                    signature,
+                )
+                .unwrap();
+                assert!(adequate.total_count() > 0);
+                assert_eq!(adequate.limit_event_count(), 0);
+                assert_eq!(
+                    context.store().value_symbol_links(proxy).unwrap().resolved_type,
+                    Some(number),
+                );
+                &mut adequate
+            };
+            assert_eq!(context.store().type_resolution_len(), 0);
+            assert!(!is_type_checked(&context, file));
+            let record = context.store().signature(signature).unwrap();
+            assert_eq!(record.resolved_return_type(), Some(boolean));
+            assert_eq!(record.resolved_type_predicate(), Some(predicate_id));
+            assert!(super::super::source_callables::valid_planned_callable_type_predicate(
+                context.store(),
+                record,
+                callable.return_type.type_node(),
+                Some(predicate),
+            ));
+            let warm = (observable_state(&context, file), context.store().type_predicate_len());
+            let work = (
+                replay_session.query_count(),
+                replay_session.total_count(),
+                replay_session.limit_event_count(),
+                replay_session.recovery_error_type(),
+            );
+            let issued = diagnostics.clone();
+            check_stored_arrow_type_predicate(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                replay_session,
+                &mut diagnostics,
+                &callable,
+                signature,
+            )
+            .unwrap();
+            assert_eq!(
+                (observable_state(&context, file), context.store().type_predicate_len()),
+                warm,
+            );
+            assert_eq!(
+                (
+                    replay_session.query_count(),
+                    replay_session.total_count(),
+                    replay_session.limit_event_count(),
+                    replay_session.recovery_error_type(),
+                ),
+                work,
+            );
+            assert_eq!(diagnostics, issued);
+        }
     }
 
     #[test]
@@ -83788,6 +84295,160 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    const EMPTY_DERIVED_CONSTRUCTOR_DECLARATIONS: &str = concat!(
+        "interface Product { message: string; }\n",
+        "interface ProductFactory { new(message?: string): Product; readonly prototype: Product; }\n",
+        "declare const Build: ProductFactory;\n",
+    );
+
+    #[test]
+    fn exported_empty_derived_class_plan_uses_declared_constructor_provider() {
+        let library = parsed(EMPTY_DERIVED_CONSTRUCTOR_DECLARATIONS);
+        let source = parsed("export class EmptyProduct extends Build {}");
+        let library_file = FileId::new(58_570);
+        let file = FileId::new(58_571);
+        let context = context_with_cross_file_global(
+            library_file,
+            &library,
+            file,
+            &source,
+            CanonicalModuleState::Script,
+            CanonicalModuleState::External,
+            false,
+        );
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration)
+                    .then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .unwrap();
+        let owner = bound.symbol(declaration).unwrap();
+        let local = bound.local_symbol(declaration).unwrap();
+        assert_ne!(owner, local);
+        assert_eq!(
+            context.store().symbol(local).unwrap().export_symbol(),
+            Some(owner)
+        );
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, &library_bound), (&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let before = observable_state(&context, file);
+        let plan = SourcePlanner::new_semantic_with_global_types(
+            &source.arena,
+            &bound,
+            context.source_file(file).unwrap(),
+            context.store(),
+            &host,
+            &globals,
+            options,
+        )
+        .finish()
+        .unwrap();
+        let [PlannedStatement::SourceClass(class)] = plan.statements.as_slice() else {
+            panic!("empty derived classes must retain the normal source class plan")
+        };
+        assert_eq!(class.source.declaration(), declaration);
+        assert_eq!(class.source.symbol(), owner);
+        assert!(class.source.has_constructor_value_base());
+        assert!(class.source.has_public_inherited_constructor());
+        assert!(!class.source.has_own_default_constructor());
+        assert!(class.source.type_parameters().is_empty());
+        assert!(class.source.bodies().is_empty());
+        assert!(class.bodies.is_empty());
+        assert_eq!(
+            class.source.type_query_context(),
+            Some(&ClassTypeQueryContext::new(&globals, options))
+        );
+        assert_eq!(observable_state(&context, file), before);
+    }
+
+    #[test]
+    fn exported_empty_derived_class_rejects_foreign_heritage_type_cache() {
+        let library = parsed(EMPTY_DERIVED_CONSTRUCTOR_DECLARATIONS);
+        let source = parsed("export class EmptyProduct extends Build {}");
+        let library_file = FileId::new(58_572);
+        let file = FileId::new(58_573);
+        let mut context = context_with_cross_file_global(
+            library_file,
+            &library,
+            file,
+            &source,
+            CanonicalModuleState::Script,
+            CanonicalModuleState::External,
+            false,
+        );
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration)
+                    .then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .unwrap();
+        let expression = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ExpressionWithTypeArguments(base) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(source.arena.id(), file, base.expression))
+            })
+            .unwrap();
+        let wrong = TypeNodeLinks {
+            resolved_type: Some(context.store().intrinsic_bootstrap().unwrap().number_type),
+            ..TypeNodeLinks::default()
+        };
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(expression, wrong.clone())
+        );
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, &library_bound), (&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let poisoned = observable_state(&context, file);
+        for _ in 0..2 {
+            let result = SourcePlanner::new_semantic_with_global_types(
+                &source.arena,
+                &bound,
+                context.source_file(file).unwrap(),
+                context.store(),
+                &host,
+                &globals,
+                options,
+            )
+            .finish();
+            assert_eq!(result.map(|_| ()), Err(SourceCheckError::Class(declaration)));
+            assert_eq!(context.store().type_node_links(expression), Some(&wrong));
+            assert_eq!(observable_state(&context, file), poisoned);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(expression, TypeNodeLinks::default())
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let completed = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), completed);
     }
 
     #[test]
@@ -118223,6 +118884,130 @@ class Foo2 {
         assert_eq!(
             context.store().value_symbol_links(*second),
             Some(&second_links)
+        );
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn typed_arrow_object_parameters_publish_leaf_types_as_one_batch() {
+        let source = parsed(
+            "const read = ({ first, second }: { first: number; second: string }): void => {};",
+        );
+        let file = FileId::new(202_903);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let arrow = variable_initializer(&source, file, "read");
+        let NodeData::ArrowFunction(syntax) = &source.arena.get(arrow.node).unwrap().data else {
+            panic!("expected the original arrow")
+        };
+        let parameter = NodeRef::new(source.arena.id(), file, syntax.parameters.nodes[0]);
+        let (_, bound) = context.file(file).unwrap();
+        let parent = bound.symbol(parameter).unwrap();
+        let owner = bound.symbol(arrow).unwrap();
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .family,
+            SourceCallableFamily::ArrowFunction,
+        );
+        let symbols = source
+            .arena
+            .iter()
+            .filter(|(_, record)| record.kind == SyntaxKind::BindingElement)
+            .map(|(node, _)| {
+                bound
+                    .symbol(NodeRef::new(source.arena.id(), file, node))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let [first, second] = symbols.as_slice() else {
+            panic!("expected two arrow binding leaves")
+        };
+        let first_links = context.store().value_symbol_links(*first).unwrap().clone();
+        let second_links = context.store().value_symbol_links(*second).unwrap().clone();
+        let parent_links = context.store().value_symbol_links(parent).unwrap().clone();
+        {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let plan = plan_source_callable(
+                context.store(),
+                &host,
+                arrow,
+                owner,
+                Some(CanonicalArrayTargets::from_global_types(
+                    context.global_types(),
+                )),
+            )
+            .unwrap();
+            let mut entries = source_arrow_parameter_entry_types(context.store(), &plan).unwrap();
+            assert_eq!(entries.len(), 1);
+            add_arrow_object_parameter_entries(context.store(), &host, &plan, &mut entries).unwrap();
+            assert_eq!(entries.len(), 3);
+            assert_eq!(entries.get(&parent).copied(), parent_links.resolved_type);
+            assert_eq!(entries.get(first).copied(), first_links.resolved_type);
+            assert_eq!(entries.get(second).copied(), second_links.resolved_type);
+            for symbol in [*first, *second] {
+                assert_eq!(
+                    source_arrow_capture_can_keep_narrowing(context.store(), &host, symbol, &[]),
+                    Ok(true),
+                );
+            }
+        }
+        let poisoned = ValueSymbolLinks {
+            resolved_type: Some(context.store().intrinsic_bootstrap().unwrap().number_type),
+            ..ValueSymbolLinks::default()
+        };
+        assert_ne!(second_links, poisoned);
+        mark_source_unchecked(&mut context, file);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(*first, ValueSymbolLinks::default())
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(*second, poisoned.clone())
+        );
+        let before = observable_state(&context, file);
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Arrow(parameter)),
+            );
+            assert_eq!(observable_state(&context, file), before);
+            assert_eq!(
+                context.store().value_symbol_links(*first),
+                Some(&ValueSymbolLinks::default()),
+            );
+            assert_eq!(context.store().value_symbol_links(*second), Some(&poisoned));
+            assert_eq!(
+                context.store().value_symbol_links(parent),
+                Some(&parent_links),
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(*second, second_links)
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(context.store().value_symbol_links(*first), Some(&first_links));
+        assert_eq!(
+            context.store().source_callable_type_for_owner(owner),
+            Some(callable),
         );
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();

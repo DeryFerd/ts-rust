@@ -59,7 +59,10 @@ use super::{
         TypeRecord,
     },
     types::{ObjectFlags, TypeFlags},
-    variables::{PlannedObjectBindingElement, plan_function_object_parameter_bindings},
+    variables::{
+        PlannedObjectBindingElement, plan_function_object_parameter_bindings,
+        plan_typed_arrow_object_parameter_bindings,
+    },
 };
 
 #[cfg(test)]
@@ -3606,7 +3609,8 @@ fn plan_source_callable_with_owner_shape(
                 format!("__{source_index}")
             }
             (NodeData::BindingPattern(_), SyntaxKind::ObjectBindingPattern)
-                if view.family == SourceCallableFamily::FunctionDeclaration
+                if (view.family == SourceCallableFamily::FunctionDeclaration
+                    || record.kind == SyntaxKind::ArrowFunction && !is_async)
                     && body_mode == SourceCallableBodyMode::Present
                     && type_parameters.is_empty()
                     && authenticated_function_object_parameter_bindings(
@@ -3951,8 +3955,21 @@ fn plan_source_callable_with_owner_shape(
         }
         let identity_node = peel_parenthesized_type(store, host, type_node)?;
         if preflight_node(store, host, identity_node)?.kind == SyntaxKind::TypePredicate {
+            let stored_predicate_arrow = record.kind == SyntaxKind::ArrowFunction
+                && !is_async
+                && type_parameters.is_empty()
+                && identity_node == type_node
+                && bound
+                    .source_facts()
+                    .is_some_and(|facts| !facts.is_javascript_file())
+                && matches!(
+                    &return_record.data,
+                    NodeData::TypePredicateNode(predicate) if predicate.asserts_modifier.is_none()
+                )
+                && is_direct_noncontextual_source_arrow(store, host, declaration)?;
             if view.family != SourceCallableFamily::FunctionDeclaration
                 && !array_filter_predicate_arrow
+                && !stored_predicate_arrow
                 || matches!(owner_shape, SourceCallableOwnerShape::AmbientOverload(_))
             {
                 return Err(SourceCallableError::Unsupported(
@@ -5846,9 +5863,13 @@ pub(super) fn authenticated_function_object_parameter_bindings(
     parameter: NodeRef,
 ) -> Option<Vec<PlannedObjectBindingElement>> {
     let (arena, bound) = host.source(declaration)?;
-    let bindings =
+    let bindings = if host.node(declaration)?.kind == SyntaxKind::ArrowFunction {
+        plan_typed_arrow_object_parameter_bindings(arena, bound, store, declaration, parameter)
+            .ok()?
+    } else {
         plan_function_object_parameter_bindings(arena, bound, store, declaration, parameter)
-            .ok()?;
+            .ok()?
+    };
     let NodeData::ParameterDeclaration(syntax) = &host.node(parameter)?.data else {
         return None;
     };
@@ -20709,6 +20730,207 @@ mod tests {
             ),
             before,
         );
+    }
+
+    #[test]
+    fn stored_arrow_predicates_keep_parameter_identity_and_warm_queries() {
+        let mut fixture = QueryFixture::new(
+            "const guard = (index: number, value: unknown): value is string => true;",
+            FileId::new(203_180),
+        );
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let variable = fixture
+            .store
+            .source_node_parent(declaration)
+            .and_then(|parent| match parent {
+                SourceNodeParent::Parent(parent) => fixture.bound.symbol(parent),
+                SourceNodeParent::Root => None,
+            })
+            .unwrap();
+        assert_ne!(owner, variable);
+        let plan = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let before = generic_transaction_state(&fixture.store);
+            let plan =
+                plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+            assert_eq!(generic_transaction_state(&fixture.store), before);
+            plan
+        };
+        let predicate = plan.type_predicate.unwrap();
+        assert_eq!(predicate.owner, declaration);
+        assert_eq!(predicate.parameter_index, 1);
+        assert_eq!(predicate.parameter_symbol, plan.parameters[1].symbol);
+        assert_eq!(predicate.kind, TypePredicateKind::Identifier);
+        assert_eq!(plan.return_type.type_node(), Some(predicate.node));
+        assert_eq!(
+            fixture
+                .store
+                .source_node_kind(predicate.narrowed_type.unwrap()),
+            Some(SyntaxKind::StringKeyword),
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let boolean = fixture.store.intrinsic_bootstrap().unwrap().boolean_type;
+        assert_eq!(
+            fixture.query_return(signature, &mut diagnostics),
+            Ok(boolean),
+        );
+        let record = fixture.store.signature(signature).unwrap();
+        assert_eq!(record.declaration(), Some(declaration));
+        assert_eq!(record.parameters()[1], predicate.parameter_symbol);
+        assert_eq!(record.resolved_return_type(), Some(boolean));
+        assert!(valid_planned_callable_type_predicate(
+            &fixture.store,
+            record,
+            plan.return_type.type_node(),
+            Some(predicate),
+        ));
+        assert_eq!(
+            fixture.store.symbol_node_links(predicate.parameter_name),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(predicate.parameter_symbol),
+            }),
+        );
+        let warm = (
+            generic_transaction_state(&fixture.store),
+            fixture.store.type_predicate_len(),
+        );
+        assert_eq!(
+            fixture.query_return(signature, &mut diagnostics),
+            Ok(boolean),
+        );
+        assert_eq!(
+            fixture.query_callable(declaration, owner, &mut diagnostics),
+            Ok(callable),
+        );
+        assert_eq!(
+            (
+                generic_transaction_state(&fixture.store),
+                fixture.store.type_predicate_len(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn stored_arrow_predicates_reject_forged_metadata_and_recover() {
+        for wrong_index in [false, true] {
+            let mut fixture = QueryFixture::new(
+                "const guard = (index: number, value: unknown): value is string => true;",
+                FileId::new(203_181),
+            );
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap();
+            let signature = fixture
+                .store
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let boolean = fixture.query_return(signature, &mut diagnostics).unwrap();
+            let original = fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_type_predicate();
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let narrowed = if wrong_index {
+                bootstrap.string_type
+            } else {
+                bootstrap.number_type
+            };
+            let forged = fixture
+                .store
+                .alloc_type_predicate(
+                    TypePredicateKind::Identifier,
+                    if wrong_index { 0 } else { 1 },
+                    "value",
+                    Some(narrowed),
+                )
+                .unwrap();
+            assert!(
+                fixture
+                    .store
+                    .set_signature_resolved_type_predicate(signature, Some(forged))
+            );
+            let before = (
+                generic_transaction_state(&fixture.store),
+                fixture.store.type_predicate_len(),
+            );
+            assert!(matches!(
+                fixture.query_return(signature, &mut diagnostics),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidFunctionSignature(cached),
+                )) if cached == signature
+            ));
+            assert_eq!(
+                (
+                    generic_transaction_state(&fixture.store),
+                    fixture.store.type_predicate_len(),
+                ),
+                before,
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_signature_resolved_type_predicate(signature, original)
+            );
+            assert_eq!(
+                fixture.query_return(signature, &mut diagnostics),
+                Ok(boolean),
+            );
+            assert_eq!(
+                fixture.query_callable(declaration, owner, &mut diagnostics),
+                Ok(callable),
+            );
+            assert_eq!(
+                (
+                    generic_transaction_state(&fixture.store),
+                    fixture.store.type_predicate_len(),
+                ),
+                before,
+            );
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]

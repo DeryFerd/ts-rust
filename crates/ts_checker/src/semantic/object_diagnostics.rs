@@ -1520,12 +1520,14 @@ fn constructor_assignability_details(
     source_type: TypeId,
     target_type: TypeId,
     strict_function_types: bool,
+    session: &mut InstantiationSession,
 ) -> Result<Vec<String>, SourceCheckError> {
-    let Some((required, available)) = store.constructor_arity_mismatch(
+    let Some((required, available)) = store.constructor_arity_mismatch_with_optional_session(
         source_type,
         target_type,
         global_types,
         strict_function_types,
+        Some(session),
     )?
     else {
         return Ok(Vec::new());
@@ -1897,6 +1899,51 @@ pub(super) fn missing_declared_property_diagnostic(
     .map(Some)
 }
 
+/// Keeps the native relation detail and related locations under TS2677.
+#[allow(clippy::too_many_arguments)] // The predicate check retains its active source caller.
+pub(super) fn type_predicate_assignability_diagnostic(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    node: NodeRef,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
+    let detail = match missing_declared_property_diagnostic(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        node,
+        flags,
+    )? {
+        Some(diagnostic) => diagnostic,
+        None => generic_assignability_diagnostic(
+            store,
+            host,
+            global_types,
+            source_type,
+            target_type,
+            node,
+            flags,
+            options,
+            session,
+        )?,
+    };
+    let rendered = detail
+        .diagnostic
+        .render()
+        .map_err(|_| SourceCheckError::MissingDiagnostic(detail.diagnostic.message.code()))?;
+    let mut diagnostic = primary(2677, node, Vec::new())?;
+    diagnostic.diagnostic.details = rendered.lines().map(|line| format!("  {line}")).collect();
+    diagnostic.related_information = detail.related_information;
+    Ok(diagnostic)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn generic_assignability_diagnostic(
     store: &mut CanonicalTypeMapperStore,
@@ -1927,6 +1974,7 @@ fn generic_assignability_diagnostic(
         target_type,
         flags,
         options,
+        session,
     )? {
         details
     } else {
@@ -1966,11 +2014,13 @@ fn generic_assignability_diagnostic(
             source_type,
             target_type,
             options.strict_function_types,
+            session,
         )?;
     }
     Ok(diagnostic)
 }
 
+#[allow(clippy::too_many_arguments)] // Reuse the caller for the nested parameter relation.
 fn tuple_rest_parameter_mismatch_details(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1979,6 +2029,7 @@ fn tuple_rest_parameter_mismatch_details(
     target_type: TypeId,
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
 ) -> Result<Option<Vec<String>>, SourceCheckError> {
     if !options.strict_function_types
         || !matches!(
@@ -2015,11 +2066,12 @@ fn tuple_rest_parameter_mismatch_details(
             &target_parameter.name,
             target_parameter.value_type,
         )?
-        || store.is_type_assignable_to_with_global_types_and_strict_function_types(
+        || store.is_type_assignable_to_with_session(
             target_parameter.value_type,
             source_parameter.value_type,
-            global_types,
-            options.strict_function_types,
+            Some(global_types),
+            Some(options.strict_function_types),
+            session,
         )?
     {
         return Ok(None);
