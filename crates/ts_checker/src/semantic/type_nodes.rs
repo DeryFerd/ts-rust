@@ -10136,7 +10136,21 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         };
         result?;
         if let Some(cached) = cached {
-            if source_return_child && (record.kind == SyntaxKind::UnionType || union_constituent) {
+            if let Some(reference) = self.plan.references.get(&node)
+                && reference.arity == PlannedTypeReferenceArity::Valid
+                && reference.type_arguments.is_empty()
+                && self.plan.class_type_queries.contains_key(&reference.symbol)
+            {
+                // The exact member plan will complete this class before union construction.
+                self.validate_cached_class_or_interface_reference(
+                    reference.symbol,
+                    node,
+                    reference.symbol,
+                    cached,
+                )?;
+            } else if source_return_child
+                && (record.kind == SyntaxKind::UnionType || union_constituent)
+            {
                 let callable = self
                     .source_callable_scope
                     .as_deref()
@@ -22862,6 +22876,32 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(())
     }
 
+    fn plan_class_union_reference(
+        &mut self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        let class = match plan_nongeneric_class_member_query(self.store, self.host, symbol) {
+            Ok(class) => class,
+            Err(super::classes::ClassError::Unsupported(_)) => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedUnionConstituent(node),
+                ));
+            }
+            Err(error) => return Err(source_class_type_query_error(error, node, symbol)),
+        };
+        preflight_nongeneric_class_member_query(self.store, self.host, &class)
+            .map_err(|error| source_class_type_query_error(error, node, symbol))?;
+        if let Some(previous) = self.plan.class_type_queries.insert(symbol, class.clone())
+            && previous != class
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        Ok(())
+    }
+
     fn plan_type_reference(
         &mut self,
         node: NodeRef,
@@ -23575,11 +23615,21 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 None
             };
             if union_constituent
+                && flags.contains(SymbolFlags::CLASS)
+                && local_count == 0
+                && type_arguments.is_empty()
+                && self.source_class_annotation.is_none()
+                && !super::classes::completed_class_symbol(self.store, symbol)
+            {
+                self.plan_class_union_reference(node, symbol)?;
+            }
+            if union_constituent
                 && (flags.contains(SymbolFlags::CLASS)
                     && !(local_count == 0
                         && type_arguments.is_empty()
                         && (self.source_class_annotation.is_some()
-                            || super::classes::completed_class_symbol(self.store, symbol)))
+                            || super::classes::completed_class_symbol(self.store, symbol)
+                            || self.plan.class_type_queries.contains_key(&symbol)))
                     || local_count != 0
                         && (exact_import.is_some()
                             || type_arguments.len() != local_count
@@ -43790,6 +43840,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 DeclaredTypeUnavailable::AliasMergedWithDeclaredSymbol(symbol),
             ));
         }
+        if flags.contains(SymbolFlags::CLASS)
+            && let Some(class) = plan.class_type_queries.get(&symbol)
+        {
+            let members = execute_nongeneric_class_member_query(self.store, self.host, class)
+                .map_err(|error| {
+                    source_class_type_query_error(error, class.declaration(), symbol)
+                })?;
+            return Ok(members.shells().instance_type());
+        }
         if let Some(declared_type) =
             get_declared_class_interface_or_type_parameter(self.store, self.host, symbol, flags)?
         {
@@ -49340,6 +49399,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             && !planned_reference.is_some_and(|reference| {
                 reference.import_alias.is_some()
                     || plan.source_replay_aliases.contains(&reference.symbol)
+                    || plan.class_type_queries.contains_key(&reference.symbol)
                     || plan.interface_headers.contains_key(&reference.symbol)
                     || reference.global_array_target.is_some()
                     || reference.direct_generic
