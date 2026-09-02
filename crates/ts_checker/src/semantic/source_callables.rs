@@ -13932,9 +13932,7 @@ pub(super) fn begin_source_callable(
         }
         None => plan.requires_type_query_evidence(),
     } {
-        return Err(invariant(SourceCallableInvariant::Publication(
-            plan.declaration,
-        )));
+        return Err(source_callable_publication_error(plan.declaration));
     }
     match source_callable_state(store, plan, true)? {
         SourceCallableState::AwaitingInferredReturn { type_, .. }
@@ -13957,9 +13955,7 @@ pub(super) fn begin_source_callable(
                     || resolved.provenance.default_type != planned.default_type
             })
     {
-        return Err(invariant(SourceCallableInvariant::Publication(
-            plan.declaration,
-        )));
+        return Err(source_callable_publication_error(plan.declaration));
     }
     if !resolved_type_parameters.is_empty() {
         let return_annotation = plan.return_type.annotation_identity();
@@ -13995,12 +13991,12 @@ pub(super) fn begin_source_callable(
                     .map(|index| resolved_type_parameters[index].provenance.type_parameter),
                 array_targets: plan.array_targets,
             })
-            .ok_or_else(|| invariant(SourceCallableInvariant::Publication(plan.declaration)))?;
+            .ok_or_else(|| source_callable_publication_error(plan.declaration))?;
         return Ok(Ok(PendingSourceCallable { type_, signature }));
     }
     let type_ = store
         .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.owner_symbol))
-        .ok_or_else(|| invariant(SourceCallableInvariant::Publication(plan.declaration)))?;
+        .ok_or_else(|| source_callable_publication_error(plan.declaration))?;
     let signature = store
         .alloc_signature(
             plan.flags,
@@ -14015,7 +14011,7 @@ pub(super) fn begin_source_callable(
             None,
             plan.min_argument_count,
         )
-        .ok_or_else(|| invariant(SourceCallableInvariant::Publication(plan.declaration)))?;
+        .ok_or_else(|| source_callable_publication_error(plan.declaration))?;
     let provenance = store.set_contextual_source_callable_provenance(
         type_,
         &SourceCallableProvenance {
@@ -14070,11 +14066,18 @@ pub(super) fn begin_source_callable(
             },
         )
     {
-        return Err(invariant(SourceCallableInvariant::Publication(
-            plan.declaration,
-        )));
+        return Err(source_callable_publication_error(plan.declaration));
     }
     Ok(Ok(PendingSourceCallable { type_, signature }))
+}
+
+#[track_caller]
+fn source_callable_publication_error(node: NodeRef) -> SourceCallableError {
+    eprintln!(
+        "source_callable_publication_failure location={} node={node:?}",
+        std::panic::Location::caller(),
+    );
+    invariant(SourceCallableInvariant::Publication(node))
 }
 
 /// Installs the exact source-function call surface: nil members/properties and
@@ -14093,9 +14096,7 @@ pub(super) fn finalize_source_callable_structure(
             return Ok(());
         }
         _ => {
-            return Err(invariant(SourceCallableInvariant::Publication(
-                plan.declaration,
-            )));
+            return Err(source_callable_publication_error(plan.declaration));
         }
     }
     if !store.set_structured_type_members(
@@ -14106,9 +14107,7 @@ pub(super) fn finalize_source_callable_structure(
         None,
         None,
     ) {
-        return Err(invariant(SourceCallableInvariant::Publication(
-            plan.declaration,
-        )));
+        return Err(source_callable_publication_error(plan.declaration));
     }
     if plan.parameter_count() == 0 {
         let published = store
@@ -14227,7 +14226,7 @@ pub(super) fn publish_source_callable_parameter_types(
     };
     let strict = store
         .intrinsic_bootstrap()
-        .ok_or_else(|| invariant(SourceCallableInvariant::Publication(first.plan.declaration)))?
+        .ok_or_else(|| source_callable_publication_error(first.plan.declaration))?
         .options
         .strict_null_checks;
     let undefined = store
@@ -14245,16 +14244,12 @@ pub(super) fn publish_source_callable_parameter_types(
     let mut parameter_symbols = HashSet::with_capacity(parameter_count);
     for callable in pending {
         if callable.base_types.len() != callable.plan.parameter_count() {
-            return Err(invariant(SourceCallableInvariant::Publication(
-                callable.plan.declaration,
-            )));
+            return Err(source_callable_publication_error(callable.plan.declaration));
         }
         let SourceCallableState::ActiveParameters { signature, .. } =
             source_callable_state(store, &callable.plan, true)?
         else {
-            return Err(invariant(SourceCallableInvariant::Publication(
-                callable.plan.declaration,
-            )));
+            return Err(source_callable_publication_error(callable.plan.declaration));
         };
         if !owners.insert(callable.plan.owner_symbol)
             || !declarations.insert(callable.plan.declaration)
@@ -14269,9 +14264,7 @@ pub(super) fn publish_source_callable_parameter_types(
         } else {
             Some(
                 planned_type_parameter_ids(store, &callable.plan).ok_or_else(|| {
-                    invariant(SourceCallableInvariant::Publication(
-                        callable.plan.declaration,
-                    ))
+                    source_callable_publication_error(callable.plan.declaration)
                 })?,
             )
         };
@@ -14280,9 +14273,7 @@ pub(super) fn publish_source_callable_parameter_types(
                 validated_source_callable_type_query(store, signature)
                     .filter(|evidence| evidence.matches_plan(&callable.plan))
                     .ok_or_else(|| {
-                        invariant(SourceCallableInvariant::Publication(
-                            callable.plan.declaration,
-                        ))
+                        source_callable_publication_error(callable.plan.declaration)
                     })?,
             )
         } else {
@@ -14297,9 +14288,7 @@ pub(super) fn publish_source_callable_parameter_types(
             if store.type_payload(*base).is_none()
                 || !default_parameter_links(store, parameter.symbol)
             {
-                return Err(invariant(SourceCallableInvariant::Publication(
-                    parameter.declaration,
-                )));
+                return Err(source_callable_publication_error(parameter.declaration));
             }
             let cached = match query_evidence {
                 Some(evidence) => evidence.annotation_type(parameter.type_node),
