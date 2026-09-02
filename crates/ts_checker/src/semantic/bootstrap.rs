@@ -5436,9 +5436,38 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         array_visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
+        let mut stage = "union_constituent.payload";
+        let result = self.validate_union_constituent_observed(
+            type_,
+            array_validation,
+            visiting,
+            array_visited,
+            allowed_pending,
+            &mut stage,
+        );
+        if matches!(
+            &result,
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(failed)) if *failed == type_
+        ) {
+            self.trace_cached_union_failure(stage, type_, &result);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)] // The trace borrows the existing validation state.
+    fn validate_union_constituent_observed(
+        &self,
+        type_: TypeId,
+        array_validation: UnionArrayValidation<'_>,
+        visiting: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
+        allowed_pending: &HashSet<TypeId>,
+        stage: &mut &'static str,
+    ) -> Result<(), LiteralTypeCacheError> {
         let Some(record) = self.type_payload(type_) else {
             return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
         };
+        *stage = "union_constituent.enum";
         if record.flags().intersects(TypeFlags::ENUM_LIKE) {
             return validate_enum_type_union_constituent(self, type_).ok_or_else(|| {
                 if matches!(record.data(), TypeData::Literal(_)) {
@@ -5448,7 +5477,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
             });
         }
+        *stage = "union_constituent.class_declarations";
         self.validate_union_class_declarations(type_, record)?;
+        *stage = "union_constituent.class_scope_targets";
         if let Some(targets) = super::classes::source_class_annotation_scope_targets(self, type_) {
             return if array_validation.targets() == Some(targets) {
                 Ok(())
@@ -5456,6 +5487,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
             };
         }
+        *stage = "union_constituent.type_kind";
         match record.data() {
             TypeData::Intrinsic(data) => {
                 self.validate_supported_intrinsic(type_, record, &data.intrinsic_name)
@@ -5700,6 +5732,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
             }
             TypeData::Interface(interface) => {
+                *stage = "union_constituent.interface_source_identity";
                 if let Some(edges) = self.source_interface_condition_identity_edges(
                     type_,
                     array_validation,
@@ -5719,6 +5752,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     return Ok(());
                 }
+                *stage = "union_constituent.interface_native_heritage";
                 if let Some(edges) = self.native_global_heritage_interface_edges(
                     type_,
                     record,
@@ -5740,6 +5774,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     return Ok(());
                 }
+                *stage = "union_constituent.interface_lazy_library";
                 if let Some(edges) = self.lazy_default_library_interface_union_edges(
                     type_,
                     record,
@@ -5759,6 +5794,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     return Ok(());
                 }
+                *stage = "union_constituent.interface_callable";
                 match validate_stored_callable_set(self, type_) {
                     StoredCallableSetValidation::Valid { edges, .. } => {
                         if !visiting.insert(type_) {
@@ -5792,6 +5828,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     StoredCallableSetValidation::NotCallable => {}
                 }
+                *stage = "union_constituent.interface_class_heritage";
                 match validate_class_heritage_members(self, type_) {
                     ClassHeritageMembersValidation::Valid => {
                         return self.validate_cached_array_capability_worker(
@@ -5812,6 +5849,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     ClassHeritageMembersValidation::NotClass => {}
                 }
+                *stage = "union_constituent.interface_heritage";
                 if self.direct_interface_heritage_provenance(type_).is_some() {
                     if validate_interface_heritage_members_with_array_targets(
                         self,
@@ -5828,6 +5866,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         allowed_pending,
                     );
                 }
+                *stage = "union_constituent.interface_property_graph";
                 match object_members::validate_resolved_declared_property_object(self, type_) {
                     object_members::DeclaredPropertyObjectValidation::Valid(_) => self
                         .validate_cached_array_capability_worker(
@@ -5849,6 +5888,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                                 )
                             }
                             object_members::DeclaredPropertyTypeGraphValidation::Opaque => {
+                                *stage = "union_constituent.interface_opaque";
                                 Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
                             }
                             object_members::DeclaredPropertyTypeGraphValidation::Malformed => {

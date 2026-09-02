@@ -10082,6 +10082,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     || self.is_authenticated_bivariant_method_indexed_access(node)?
                 {
                     self.plan_concrete_indexed_access_type(node, alias_owner)
+                } else if self.try_plan_named_interface_keyof_indexed_access(node, alias_owner)? {
+                    Ok(())
                 } else {
                     Err(type_node_unavailable(
                         TypeNodeUnavailable::UnsupportedUnionConstituent(node),
@@ -13511,6 +13513,31 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if self.try_plan_recovered_indexed_access_type(node)? {
             return Ok(());
         }
+        if self.try_plan_named_interface_keyof_indexed_access(node, alias_owner)? {
+            return Ok(());
+        }
+        let planned = plan_concrete_indexed_access(self.store, self.host, node)
+            .map_err(|error| indexed_access_error(error, node))?;
+        if let Some(existing) = self.plan.indexed_accesses.get(&node) {
+            if existing != &planned {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidIndexedAccessType(node),
+                ));
+            }
+            if !replay_imported {
+                return Ok(());
+            }
+        }
+        self.plan.indexed_accesses.insert(node, planned.clone());
+        self.plan_type_node_in_context(planned.object(), None, false)?;
+        self.plan_type_node_in_context(planned.index(), None, false)
+    }
+
+    fn try_plan_named_interface_keyof_indexed_access(
+        &mut self,
+        node: NodeRef,
+        alias_owner: Option<SemanticSymbolId>,
+    ) -> Result<bool, DeclaredTypeError> {
         if let Some(planned) = plan_named_interface_keyof_indexed_access(
             self.store,
             self.host,
@@ -13533,23 +13560,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.plan_property_interface(planned.symbol())?;
             self.plan_type_node_in_context(planned.object(), None, false)?;
             self.plan_type_node_in_context(planned.index(), None, false)?;
-            return Ok(());
+            return Ok(true);
         }
-        let planned = plan_concrete_indexed_access(self.store, self.host, node)
-            .map_err(|error| indexed_access_error(error, node))?;
-        if let Some(existing) = self.plan.indexed_accesses.get(&node) {
-            if existing != &planned {
-                return Err(type_node_unavailable(
-                    TypeNodeUnavailable::InvalidIndexedAccessType(node),
-                ));
-            }
-            if !replay_imported {
-                return Ok(());
-            }
-        }
-        self.plan.indexed_accesses.insert(node, planned.clone());
-        self.plan_type_node_in_context(planned.object(), None, false)?;
-        self.plan_type_node_in_context(planned.index(), None, false)
+        Ok(false)
     }
 
     /// Keeps a written `Model[Key]` return on the existing deferred producer.
