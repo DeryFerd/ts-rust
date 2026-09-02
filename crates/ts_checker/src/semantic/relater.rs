@@ -13389,7 +13389,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 }
 
 // Read existing identities only after a relation failure. Do not demand members.
-fn observe_invalid_structured_members(
+pub(super) fn observe_invalid_structured_members(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     type_id: TypeId,
     site: &str,

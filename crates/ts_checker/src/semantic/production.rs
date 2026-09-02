@@ -1991,6 +1991,17 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         if active.pop() != Some(source_file) {
             return Err(SourceCheckError::Import(source_file.node_ref()));
         }
+        if let Err(SourceCheckError::RelationUnavailable(
+            super::relater::RelationUnavailable::InvalidStructuredMembers(type_id),
+        )) = &result
+        {
+            super::relater::observe_invalid_structured_members(
+                &self.store,
+                *type_id,
+                "source.check_source_file_with_class_imports",
+                None,
+            );
+        }
         result
     }
 
