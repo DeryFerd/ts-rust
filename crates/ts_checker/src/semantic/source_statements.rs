@@ -168,6 +168,20 @@ pub(super) struct SourceLocalObjectBindingSyntax {
     pub(super) binding: VariableBindingKind,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceLocalArrayBindingSyntax {
+    pub(super) statement: NodeRef,
+    pub(super) list: NodeRef,
+    pub(super) declaration: NodeRef,
+    pub(super) pattern: NodeRef,
+    pub(super) initializer: NodeRef,
+    pub(super) callable: NodeRef,
+    pub(super) statement_parent: NodeRef,
+    pub(super) block_scope: NodeRef,
+    pub(super) binding: VariableBindingKind,
+    pub(super) elements: Vec<super::variables::PlannedArrayBindingElement>,
+}
+
 /// One exact `if` arm ending in a value-returning `return`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceReturnBranchSyntax {
@@ -510,6 +524,7 @@ pub(super) struct SourceCallableStatementListSyntax {
 pub(super) enum SourceCallableStatementSyntax {
     Leaf(SourceLinearFunctionStatementSyntax),
     ObjectBinding(SourceLocalObjectBindingSyntax),
+    ArrayBinding(SourceLocalArrayBindingSyntax),
     Empty(NodeRef),
     Block {
         block: NodeRef,
@@ -709,6 +724,7 @@ impl SourceCallableStatementListSyntax {
                     SourceLinearFunctionStatementSyntax::Local(local),
                 ) => local.statement,
                 SourceCallableStatementSyntax::ObjectBinding(binding) => binding.statement,
+                SourceCallableStatementSyntax::ArrayBinding(binding) => binding.statement,
                 SourceCallableStatementSyntax::Leaf(
                     SourceLinearFunctionStatementSyntax::Expression { statement, .. }
                     | SourceLinearFunctionStatementSyntax::Throw { statement, .. },
@@ -5399,6 +5415,67 @@ impl SyntaxPlanner<'_> {
         }))
     }
 
+    fn plan_callable_array_binding_statement(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        scope: NodeRef,
+    ) -> Result<Option<SourceLocalArrayBindingSyntax>, SourceFunctionStatementsError> {
+        let NodeData::VariableStatement(variable) = &self.node(statement)?.data else {
+            return Ok(None);
+        };
+        let list = self.reference(variable.declaration_list);
+        let NodeData::VariableDeclarationList(declarations) = &self.node(list)?.data else {
+            return Ok(None);
+        };
+        let [declaration] = declarations.declarations.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let declaration = self.reference(*declaration);
+        let NodeData::VariableDeclaration(variable) = &self.node(declaration)?.data else {
+            return Ok(None);
+        };
+        let pattern = self.reference(variable.name);
+        if self.node(pattern)?.kind != SyntaxKind::ArrayBindingPattern {
+            return Ok(None);
+        }
+        let (binding, elements) = super::variables::plan_callable_array_binding_elements(
+            self.arena,
+            self.bound,
+            self.store,
+            declaration,
+            self.callable.declaration,
+            parent,
+            scope,
+        )?;
+        let initializer = variable
+            .initializer
+            .map(|node| self.reference(node))
+            .ok_or_else(|| {
+                self.unsupported(
+                    declaration,
+                    SyntaxKind::VariableDeclaration,
+                    SourceFunctionStatementsRole::LocalInitializer,
+                )
+            })?;
+        self.validate_container(statement, self.callable.declaration)?;
+        self.validate_block_scope_container(statement, scope)?;
+        self.validate_container(list, self.callable.declaration)?;
+        self.validate_block_scope_container(list, scope)?;
+        Ok(Some(SourceLocalArrayBindingSyntax {
+            statement,
+            list,
+            declaration,
+            pattern,
+            initializer,
+            callable: self.callable.declaration,
+            statement_parent: parent,
+            block_scope: scope,
+            binding,
+            elements,
+        }))
+    }
+
     #[allow(clippy::too_many_lines)] // Each admitted statement uses its existing source proof.
     fn plan_callable_statement(
         &self,
@@ -5415,6 +5492,11 @@ impl SyntaxPlanner<'_> {
                     self.plan_callable_object_binding_statement(statement, parent, scope)?
                 {
                     return Ok(vec![SourceCallableStatementSyntax::ObjectBinding(binding)]);
+                }
+                if let Some(binding) =
+                    self.plan_callable_array_binding_statement(statement, parent, scope)?
+                {
+                    return Ok(vec![SourceCallableStatementSyntax::ArrayBinding(binding)]);
                 }
                 return self
                     .plan_local_statement(statement, parent, callable)
@@ -5819,6 +5901,13 @@ impl SyntaxPlanner<'_> {
                 SourceCallableStatementSyntax::Leaf(
                     SourceLinearFunctionStatementSyntax::Local(local),
                 ) if local.binding != VariableBindingKind::Var => Some(local.name),
+                SourceCallableStatementSyntax::ArrayBinding(binding) => Some(
+                    binding
+                        .elements
+                        .first()
+                        .ok_or(SourceFunctionStatementsInvariant::MissingLocals(binding.pattern))?
+                        .name,
+                ),
                 SourceCallableStatementSyntax::Leaf(
                     SourceLinearFunctionStatementSyntax::Expression { statement, .. },
                 )

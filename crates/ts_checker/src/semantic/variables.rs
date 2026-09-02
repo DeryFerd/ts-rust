@@ -617,6 +617,46 @@ pub(super) fn plan_callable_object_binding_elements(
     statement_parent: NodeRef,
     block_scope: NodeRef,
 ) -> Result<(VariableBindingKind, Vec<PlannedObjectBindingElement>), VariablePlanError> {
+    let (binding, pattern) = plan_callable_binding_declaration(
+        arena, bound, store, declaration, callable, statement_parent, block_scope,
+    )?;
+    let elements = plan_object_binding_elements_at_scope(
+        arena,
+        bound,
+        store,
+        declaration,
+        binding,
+        false,
+        ObjectBindingScope {
+            statement_parent,
+            container: callable,
+            block_scope,
+        },
+    )?;
+    if elements.is_empty()
+        || elements.iter().any(|element| {
+            element.initializer.is_some()
+                || element.computed_key.is_some()
+                || !element.parent_properties.is_empty()
+        })
+    {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(pattern),
+        ));
+    }
+    Ok((binding, elements))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn plan_callable_binding_declaration(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    callable: NodeRef,
+    statement_parent: NodeRef,
+    block_scope: NodeRef,
+) -> Result<(VariableBindingKind, NodeRef), VariablePlanError> {
     if bound.node_arena_id() != arena.id()
         || bound.node_arena_revision() != arena.revision()
         || [declaration, callable, statement_parent, block_scope]
@@ -704,31 +744,7 @@ pub(super) fn plan_callable_object_binding_elements(
     {
         return Err(VariableInvariant::InvalidBindingPattern(declaration).into());
     }
-    let elements = plan_object_binding_elements_at_scope(
-        arena,
-        bound,
-        store,
-        declaration,
-        binding,
-        false,
-        ObjectBindingScope {
-            statement_parent,
-            container: callable,
-            block_scope,
-        },
-    )?;
-    if elements.is_empty()
-        || elements.iter().any(|element| {
-            element.initializer.is_some()
-                || element.computed_key.is_some()
-                || !element.parent_properties.is_empty()
-        })
-    {
-        return Err(VariablePlanError::Unsupported(
-            VariableUnsupported::BindingPattern(pattern),
-        ));
-    }
-    Ok((binding, elements))
+    Ok((binding, pattern))
 }
 
 /// Reuses the scoped binding proof for a write to one actual binding element.
@@ -1727,6 +1743,88 @@ pub(super) fn plan_top_level_array_binding_elements(
     binding: VariableBindingKind,
     exported: bool,
 ) -> Result<Vec<PlannedArrayBindingElement>, VariablePlanError> {
+    let source = bound.source_file();
+    plan_array_binding_elements_at_scope(
+        arena,
+        bound,
+        store,
+        declaration,
+        binding,
+        exported,
+        ArrayBindingScope {
+            statement_parent: source,
+            container: source,
+            block_scope: source,
+        },
+    )
+}
+
+/// Proves flat const array bindings without omissions, defaults, or rest.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_callable_array_binding_elements(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    callable: NodeRef,
+    statement_parent: NodeRef,
+    block_scope: NodeRef,
+) -> Result<(VariableBindingKind, Vec<PlannedArrayBindingElement>), VariablePlanError> {
+    let (binding, pattern) = plan_callable_binding_declaration(
+        arena, bound, store, declaration, callable, statement_parent, block_scope,
+    )?;
+    if binding != VariableBindingKind::Const {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(pattern),
+        ));
+    }
+    let elements = plan_array_binding_elements_at_scope(
+        arena,
+        bound,
+        store,
+        declaration,
+        binding,
+        false,
+        ArrayBindingScope {
+            statement_parent,
+            container: callable,
+            block_scope,
+        },
+    )?;
+    let Some(NodeData::BindingPattern(pattern_data)) =
+        arena.get(pattern.node).map(|record| &record.data)
+    else {
+        return Err(VariableInvariant::InvalidBindingPattern(pattern).into());
+    };
+    if elements.is_empty()
+        || elements.len() != pattern_data.elements.nodes.len()
+        || elements.iter().enumerate().any(|(index, element)| {
+            element.index != index || element.initializer.is_some() || element.rest
+        })
+    {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(pattern),
+        ));
+    }
+    Ok((binding, elements))
+}
+
+struct ArrayBindingScope {
+    statement_parent: NodeRef,
+    container: NodeRef,
+    block_scope: NodeRef,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_array_binding_elements_at_scope(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    binding: VariableBindingKind,
+    exported: bool,
+    scope: ArrayBindingScope,
+) -> Result<Vec<PlannedArrayBindingElement>, VariablePlanError> {
     if bound.node_arena_id() != arena.id()
         || bound.node_arena_revision() != arena.revision()
         || !declaration.is_for(arena.id(), bound.file_id())
@@ -1752,8 +1850,7 @@ pub(super) fn plan_top_level_array_binding_elements(
         .parent
         .map(|node| NodeRef::new(list.arena, list.file, node))
         .ok_or(VariableInvariant::InvalidBindingPattern(list))?;
-    let source = bound.source_file();
-    let statement_record = binding_child_node(arena, store, statement, source)?;
+    let statement_record = binding_child_node(arena, store, statement, scope.statement_parent)?;
     let NodeData::VariableStatement(statement_data) = &statement_record.data else {
         return Err(VariableInvariant::InvalidBindingPattern(statement).into());
     };
@@ -1909,10 +2006,10 @@ pub(super) fn plan_top_level_array_binding_elements(
         )?;
         let local = bound.local_symbol(element).unwrap_or(symbol);
         if !names.insert(symbol)
-            || bound.container(element) != Some(source)
-            || bound.block_scope_container(element) != Some(source)
+            || bound.container(element) != Some(scope.container)
+            || bound.block_scope_container(element) != Some(scope.block_scope)
             || bound
-                .locals(source)
+                .locals(scope.block_scope)
                 .and_then(|locals| store.symbol_table(locals))
                 .and_then(|locals| locals.get_source(&identifier.text))
                 != Some(local)

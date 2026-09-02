@@ -338,7 +338,7 @@ use super::{
         SourceJoinedFunctionStatementsInvariant, SourceJoinedFunctionStatementsSyntax,
         SourceIterationHeaderSyntax,
         SourceLinearFunctionStatementSyntax, SourceLinearFunctionStatementsSyntax,
-        SourceLocalDeclarationSyntax, SourceLocalObjectBindingSyntax,
+        SourceLocalArrayBindingSyntax, SourceLocalDeclarationSyntax, SourceLocalObjectBindingSyntax,
         SourceLoopFunctionStatementSyntax,
         SourceLoopFunctionStatementsSyntax, SourceReturnBranchSyntax,
         SourceSwitchArrayBindingSyntax, SourceSwitchFunctionStatementsSyntax,
@@ -3239,9 +3239,16 @@ struct PlannedCallableObjectBinding {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedCallableArrayBinding {
+    syntax: SourceLocalArrayBindingSyntax,
+    initializer: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
 enum PlannedCallableStatement {
     Leaf(PlannedLinearFunctionStatement),
     ObjectBinding(Box<PlannedCallableObjectBinding>),
+    ArrayBinding(Box<PlannedCallableArrayBinding>),
     Block(Vec<Self>),
     If {
         condition: Box<PlannedSourceCondition>,
@@ -3318,6 +3325,9 @@ impl PlannedCallableStatementList {
             }
             match node {
                 PlannedCallableStatement::ObjectBinding(binding) => {
+                    expressions.push(&binding.initializer);
+                }
+                PlannedCallableStatement::ArrayBinding(binding) => {
                     expressions.push(&binding.initializer);
                 }
                 PlannedCallableStatement::Leaf(PlannedLinearFunctionStatement::Expression {
@@ -17499,7 +17509,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let mut mutations = Vec::new();
         let mut catch_initializers = Vec::new();
         let mut iteration_assignments = Vec::new();
-        let mut object_assignments = Vec::new();
+        let mut binding_assignments = Vec::new();
         let mut updates = Vec::new();
         let (store, host) = self
             .semantic
@@ -17514,7 +17524,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 PlannedCallableStatement::ObjectBinding(binding) => {
                     for element in &binding.elements {
                         points.push(element.name);
-                        object_assignments.push(SourceFlowAssignment {
+                        binding_assignments.push(SourceFlowAssignment {
+                            declaration: element.element,
+                            symbol: element.symbol,
+                        });
+                    }
+                    collect_eager_logical_truthiness_conditions(
+                        &binding.initializer,
+                        &mut logical_conditions,
+                    );
+                }
+                PlannedCallableStatement::ArrayBinding(binding) => {
+                    for element in &binding.syntax.elements {
+                        points.push(element.name);
+                        binding_assignments.push(SourceFlowAssignment {
                             declaration: element.element,
                             symbol: element.symbol,
                         });
@@ -17681,6 +17704,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         for node in callable_statement_nodes(&statements) {
             let expression = match node {
                 PlannedCallableStatement::ObjectBinding(binding) => Some(&binding.initializer),
+                PlannedCallableStatement::ArrayBinding(binding) => Some(&binding.initializer),
                 PlannedCallableStatement::Leaf(PlannedLinearFunctionStatement::Expression {
                     expression,
                     ..
@@ -17721,7 +17745,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 })
                 .chain(catch_initializers)
                 .chain(iteration_assignments)
-                .chain(object_assignments),
+                .chain(binding_assignments),
             parameters,
             calls,
             captures,
@@ -17773,6 +17797,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceCallableStatementSyntax::ObjectBinding(binding) => {
                     PlannedCallableStatement::ObjectBinding(Box::new(
                         self.finish_callable_object_binding(callable, *binding)?,
+                    ))
+                }
+                SourceCallableStatementSyntax::ArrayBinding(binding) => {
+                    PlannedCallableStatement::ArrayBinding(Box::new(
+                        self.finish_callable_array_binding(callable, binding.clone())?,
                     ))
                 }
                 SourceCallableStatementSyntax::Leaf(
@@ -18118,6 +18147,58 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(PlannedCallableObjectBinding {
             syntax,
             elements,
+            initializer,
+        })
+    }
+
+    fn finish_callable_array_binding(
+        &mut self,
+        callable: &SourceCallablePlan,
+        syntax: SourceLocalArrayBindingSyntax,
+    ) -> Result<PlannedCallableArrayBinding, SourceCheckError> {
+        let invalid = || {
+            SourceCheckError::Variable(VariableInvariant::InvalidBindingPattern(syntax.declaration))
+        };
+        let (store, _) = self
+            .semantic
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        let (binding, elements) = super::variables::plan_callable_array_binding_elements(
+            self.arena,
+            self.bound,
+            store,
+            syntax.declaration,
+            syntax.callable,
+            syntax.statement_parent,
+            syntax.block_scope,
+        )
+        .map_err(Self::variable_plan_error)?;
+        let declaration = self.node(syntax.declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration.data else {
+            return Err(invalid());
+        };
+        if binding != syntax.binding
+            || elements != syntax.elements
+            || syntax.callable != callable.declaration
+            || declaration.parent != Some(syntax.list.node)
+            || self.node(syntax.list)?.parent != Some(syntax.statement.node)
+            || variable.name != syntax.pattern.node
+            || variable.initializer != Some(syntax.initializer.node)
+        {
+            return Err(invalid());
+        }
+        let initializer = self.plan_expression(syntax.initializer)?;
+        self.preflight_array_binding_iteration(syntax.pattern, None, Some(&initializer))?;
+        for element in &syntax.elements {
+            if !self.prior_variables.insert(element.symbol)
+                || !self.readable_variables.insert(element.symbol)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(element.symbol),
+                ));
+            }
+        }
+        Ok(PlannedCallableArrayBinding {
+            syntax,
             initializer,
         })
     }
@@ -35025,6 +35106,14 @@ fn preflight_inferred_function_return_dependencies(
             PlannedCallableStatement::ObjectBinding(binding) => {
                 expression_is_closed(&binding.initializer, parameters, locals, functions)
                     && binding
+                        .elements
+                        .iter()
+                        .all(|element| locals.insert(element.symbol))
+            }
+            PlannedCallableStatement::ArrayBinding(binding) => {
+                expression_is_closed(&binding.initializer, parameters, locals, functions)
+                    && binding
+                        .syntax
                         .elements
                         .iter()
                         .all(|element| locals.insert(element.symbol))
@@ -58553,6 +58642,86 @@ fn check_callable_statement_nodes(
                     if !binding.syntax.binding.is_const() {
                         returned.declared_entries.insert(element.symbol, type_);
                     }
+                }
+            }
+            PlannedCallableStatement::ArrayBinding(binding) => {
+                let first = binding.syntax.elements.first().ok_or(
+                    SourceCheckError::Variable(VariableInvariant::InvalidBindingPattern(
+                        binding.syntax.pattern,
+                    )),
+                )?;
+                let snapshot = frame
+                    .snapshot_at(store, global_types, first.name)
+                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                let checked = check_expression_type_with_capture_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    snapshot.types(),
+                    type_import_execution,
+                    &binding.initializer,
+                    None,
+                    deferred,
+                    None,
+                    capture,
+                )?;
+                complete_nullish_assignment_effects(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    frame,
+                    type_import_execution,
+                    &binding.initializer,
+                    snapshot.types(),
+                )?;
+                check_callable_statement_expression_effects(
+                    store,
+                    host,
+                    callable,
+                    &binding.initializer,
+                )?;
+                let iteration_type = source_array_binding_iteration_type(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    binding.syntax.pattern,
+                    checked.result,
+                )?;
+                for element in &binding.syntax.elements {
+                    let element_type = check_planned_array_binding_element(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        element,
+                        checked.result,
+                        iteration_type,
+                    )?;
+                    if let Some(diagnostic) = element_type.diagnostic {
+                        merge_retry_diagnostic(diagnostics, diagnostic);
+                    }
+                    stage_value_type(
+                        store,
+                        staged_value_types,
+                        value_order,
+                        element.symbol,
+                        element_type.type_,
+                    )?;
+                    frame
+                        .complete_assignment(element.element, element.symbol, element_type.type_)
+                        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
                 }
             }
             PlannedCallableStatement::Leaf(leaf) => {
