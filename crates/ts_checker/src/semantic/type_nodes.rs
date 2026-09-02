@@ -47865,7 +47865,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .as_deref_mut()
             .unwrap_or(&mut owned_session);
         for (property, &declared_type) in literal.properties.iter().zip(property_types) {
-            if property.name.is_late_bound() || property.name.is_private_identifier() {
+            if property.name.as_ref().is_late_bound()
+                || property.name.as_ref().is_private_identifier()
+            {
                 continue;
             }
             let name = property.name.as_utf8().ok_or_else(invalid)?.to_owned();
