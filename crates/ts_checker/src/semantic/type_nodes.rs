@@ -21487,19 +21487,31 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         reference: NodeRef,
     ) -> Result<Vec<NodeRef>, DeclaredTypeError> {
         let record = preflight_node(self.store, self.host, reference)?;
-        let NodeData::TypeReferenceNode(reference_data) = &record.data else {
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::InvalidTypeReference(reference),
-            ));
+        let (name, arguments) = match &record.data {
+            NodeData::TypeReferenceNode(data) => (data.type_name, data.type_arguments.as_ref()),
+            NodeData::ExpressionWithTypeArguments(data)
+                if self.source_class_heritage == Some(reference) =>
+            {
+                let owner = self.source_class_annotation.ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(reference))
+                })?;
+                preflight_source_class_heritage_owner(self.store, self.host, reference, owner)?;
+                (data.expression, data.type_arguments.as_ref())
+            }
+            _ => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(reference),
+                ));
+            }
         };
-        let name = NodeRef::new(reference.arena, reference.file, reference_data.type_name);
+        let name = NodeRef::new(reference.arena, reference.file, name);
         let name_node = preflight_node(self.store, self.host, name)?;
         if name_node.parent != Some(reference.node) {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidTypeReference(reference),
             ));
         }
-        let Some(arguments) = &reference_data.type_arguments else {
+        let Some(arguments) = arguments else {
             return Ok(Vec::new());
         };
         if arguments.nodes.is_empty()

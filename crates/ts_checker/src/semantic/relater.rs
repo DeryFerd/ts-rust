@@ -2112,7 +2112,7 @@ impl<'store> RelaterSession<'store> {
         if self.overflow {
             let key = self
                 .store
-                .relation_key_if_available(
+                .relation_key_with_source_class_parameters(
                     source,
                     target,
                     IntersectionState::NONE,
@@ -4009,7 +4009,7 @@ impl<'store> RelaterSession<'store> {
         }
         let built_key = self
             .store
-            .relation_key_if_available(
+            .relation_key_with_source_class_parameters(
                 source,
                 target,
                 intersection_state,
@@ -4051,7 +4051,7 @@ impl<'store> RelaterSession<'store> {
         if built_key.constrained() {
             let broadest = self
                 .store
-                .relation_key_if_available(
+                .relation_key_with_source_class_parameters(
                     source,
                     target,
                     intersection_state,
@@ -12670,7 +12670,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             )
         {
             let key = self
-                .relation_key_if_available(
+                .relation_key_with_source_class_parameters(
                     source,
                     target,
                     IntersectionState::NONE,
