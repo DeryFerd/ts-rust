@@ -1423,7 +1423,7 @@ fn validate_source_mapped_lookup_argument(
     argument: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), MappedTypeError> {
-    validate_supported_mapped_alias_source(store, argument, array_targets)?;
+    validate_supported_mapped_alias_source(store, argument, array_targets, None)?;
     if cached_ordinary_type_parameter_owner(store, argument).is_none() {
         return Err(MappedTypeError::UnsupportedTemplate(origin.template));
     }
@@ -1693,7 +1693,27 @@ pub(super) fn supported_mapped_alias_projection(
     type_: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<SupportedMappedAliasProjection>, MappedTypeError> {
-    supported_mapped_alias_projection_worker(store, type_, array_targets, &mut HashSet::new())
+    supported_mapped_alias_projection_with_source(store, type_, array_targets, None)
+}
+
+pub(super) fn supported_mapped_alias_projection_with_source(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+) -> Result<Option<SupportedMappedAliasProjection>, MappedTypeError> {
+    if source.is_some_and(|(globals, _)| {
+        array_targets != Some(CanonicalArrayTargets::from_global_types(globals))
+    }) {
+        return Err(MappedTypeError::InvalidMappedType(type_));
+    }
+    supported_mapped_alias_projection_worker(
+        store,
+        type_,
+        array_targets,
+        &mut HashSet::new(),
+        source,
+    )
 }
 
 fn supported_mapped_alias_projection_worker(
@@ -1701,11 +1721,13 @@ fn supported_mapped_alias_projection_worker(
     type_: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
     active: &mut HashSet<TypeId>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<Option<SupportedMappedAliasProjection>, MappedTypeError> {
     if !active.insert(type_) {
         return Err(MappedTypeError::InvalidMappedType(type_));
     }
-    let result = supported_mapped_alias_projection_inner(store, type_, array_targets, active);
+    let result =
+        supported_mapped_alias_projection_inner(store, type_, array_targets, active, source);
     active.remove(&type_);
     result
 }
@@ -1715,6 +1737,7 @@ fn supported_mapped_alias_projection_inner(
     type_: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
     active: &mut HashSet<TypeId>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<Option<SupportedMappedAliasProjection>, MappedTypeError> {
     let invalid = || MappedTypeError::InvalidMappedType(type_);
     let record = store.type_payload(type_).ok_or_else(invalid)?;
@@ -1849,7 +1872,13 @@ fn supported_mapped_alias_projection_inner(
     } else {
         type_parameters.to_vec()
     };
-    validate_supported_mapped_alias_source_worker(store, arguments[0], array_targets, active)?;
+    validate_supported_mapped_alias_source_worker(
+        store,
+        arguments[0],
+        array_targets,
+        active,
+        source,
+    )?;
     kind.validate_instantiation(
         store,
         alias,
@@ -1860,7 +1889,7 @@ fn supported_mapped_alias_projection_inner(
     )
     .map_err(|error| selection_alias_cache_error(type_, error))?;
     let identity = store
-        .mapped_alias_display_identity(type_, alias)
+        .mapped_alias_display_identity_with_source(type_, alias, array_targets, source)
         .map_err(|error| selection_alias_cache_error(type_, error))?;
     if identity.symbol == alias && identity.arguments != arguments {
         return Err(invalid());
@@ -2005,8 +2034,15 @@ fn validate_supported_mapped_alias_source(
     store: &CanonicalTypeMapperStore,
     source: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
+    query: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<(), MappedTypeError> {
-    validate_supported_mapped_alias_source_worker(store, source, array_targets, &mut HashSet::new())
+    validate_supported_mapped_alias_source_worker(
+        store,
+        source,
+        array_targets,
+        &mut HashSet::new(),
+        query,
+    )
 }
 
 fn validate_supported_mapped_alias_source_worker(
@@ -2014,6 +2050,7 @@ fn validate_supported_mapped_alias_source_worker(
     source: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
     active: &mut HashSet<TypeId>,
+    query: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<(), MappedTypeError> {
     let record = store
         .type_payload(source)
@@ -2034,7 +2071,7 @@ fn validate_supported_mapped_alias_source_worker(
                 .map_err(|_| MappedTypeError::InvalidSource(source));
         }
         TypeData::Mapped(_) => {
-            supported_mapped_alias_projection_worker(store, source, array_targets, active)?
+            supported_mapped_alias_projection_worker(store, source, array_targets, active, query)?
                 .ok_or(MappedTypeError::UnsupportedSource(source))?;
             return validate_mapped_utility_source(store, source);
         }
@@ -2086,8 +2123,15 @@ fn validate_supported_mapped_alias_instance_request(
     arguments: &[TypeId],
     identity: (SemanticSymbolId, &[TypeId]),
     array_targets: Option<CanonicalArrayTargets>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<CacheHashKey, MappedTypeError> {
-    if supported_mapped_alias_projection(store, projection.type_, array_targets)?.as_ref()
+    if supported_mapped_alias_projection_with_source(
+        store,
+        projection.type_,
+        array_targets,
+        source,
+    )?
+    .as_ref()
         != Some(projection)
         || arguments.len() != projection.type_parameters.len()
     {
@@ -2106,6 +2150,7 @@ fn validate_supported_mapped_alias_instance_request(
                 identity.0,
                 identity.1,
                 array_targets,
+                source,
             )? != arguments
         {
             return Err(MappedTypeError::InvalidMappedType(projection.type_));
@@ -2118,7 +2163,7 @@ fn validate_supported_mapped_alias_instance_request(
             identity.1,
         ))
     };
-    validate_supported_mapped_alias_source(store, arguments[0], array_targets)?;
+    validate_supported_mapped_alias_source(store, arguments[0], array_targets, source)?;
     projection
         .kind
         .validate_request(
@@ -2140,12 +2185,31 @@ pub(super) fn cached_supported_mapped_alias_instance(
     identity: (SemanticSymbolId, &[TypeId]),
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<TypeId>, MappedTypeError> {
+    cached_supported_mapped_alias_instance_with_source(
+        store,
+        projection,
+        arguments,
+        identity,
+        array_targets,
+        None,
+    )
+}
+
+pub(super) fn cached_supported_mapped_alias_instance_with_source(
+    store: &CanonicalTypeMapperStore,
+    projection: &SupportedMappedAliasProjection,
+    arguments: &[TypeId],
+    identity: (SemanticSymbolId, &[TypeId]),
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+) -> Result<Option<TypeId>, MappedTypeError> {
     let key = validate_supported_mapped_alias_instance_request(
         store,
         projection,
         arguments,
         identity,
         array_targets,
+        source,
     )?;
     if arguments == projection.arguments
         && identity.0 == projection.identity_symbol
@@ -2176,7 +2240,7 @@ pub(super) fn cached_supported_mapped_alias_instance(
         )
         .map_err(|error| selection_alias_cache_error(cached, error))?;
     let actual = store
-        .mapped_alias_display_identity(cached, projection.alias)
+        .mapped_alias_display_identity_with_source(cached, projection.alias, array_targets, source)
         .map_err(|error| selection_alias_cache_error(cached, error))?;
     if actual.symbol != identity.0 || actual.arguments != identity.1 {
         return Err(MappedTypeError::InvalidMappedType(cached));
@@ -2200,6 +2264,7 @@ pub(super) fn instantiate_supported_mapped_alias_instance(
         identity,
         array_targets,
         None,
+        None,
     )
 }
 
@@ -2218,6 +2283,27 @@ pub(super) fn instantiate_supported_mapped_alias_instance_with_session(
         identity,
         array_targets,
         Some(session),
+        None,
+    )
+}
+
+pub(super) fn instantiate_supported_mapped_alias_instance_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    projection: &SupportedMappedAliasProjection,
+    arguments: &[TypeId],
+    identity: (SemanticSymbolId, &[TypeId]),
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+) -> Result<TypeId, MappedTypeError> {
+    instantiate_supported_mapped_alias_instance_worker(
+        store,
+        projection,
+        arguments,
+        identity,
+        array_targets,
+        Some(session),
+        source,
     )
 }
 
@@ -2228,13 +2314,15 @@ fn instantiate_supported_mapped_alias_instance_worker(
     identity: (SemanticSymbolId, &[TypeId]),
     array_targets: Option<CanonicalArrayTargets>,
     session: Option<&mut InstantiationSession>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<TypeId, MappedTypeError> {
-    if let Some(cached) = cached_supported_mapped_alias_instance(
+    if let Some(cached) = cached_supported_mapped_alias_instance_with_source(
         store,
         projection,
         arguments,
         identity,
         array_targets,
+        source,
     )? {
         return Ok(cached);
     }
@@ -2244,6 +2332,7 @@ fn instantiate_supported_mapped_alias_instance_worker(
         arguments,
         identity,
         array_targets,
+        source,
     )?;
     if identity.0 != projection.alias && arguments == projection.type_parameters {
         return Err(MappedTypeError::UnsupportedSource(projection.type_));
@@ -5134,14 +5223,27 @@ impl CanonicalTypeMapperStore {
         &self,
         type_: TypeId,
     ) -> Result<Option<ResolvedMappedTypeMembers>, MappedTypeError> {
+        self.validate_mapped_type_relation_endpoint_with_source(type_, None, None)
+    }
+
+    pub(super) fn validate_mapped_type_relation_endpoint_with_source(
+        &self,
+        type_: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+        source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+    ) -> Result<Option<ResolvedMappedTypeMembers>, MappedTypeError> {
         if source_mapped_lookup_origin(self, type_)?.is_some() {
             reject_deferred_conditional_mapped_demand(self, type_)?;
         }
-        validate_mapped_relation_identity(self, type_)?;
+        validate_mapped_relation_identity_with_source(self, type_, array_targets, source)?;
         validate_mapped_member_dependencies(self, type_, &mut HashSet::new())?;
-        if let Some(source) = mapped_member_dependency(self, type_)
+        if let Some(dependency) = mapped_member_dependency(self, type_)
             && self
-                .validate_mapped_type_relation_endpoint(source)?
+                .validate_mapped_type_relation_endpoint_with_source(
+                    dependency,
+                    array_targets,
+                    source,
+                )?
                 .is_none()
         {
             validate_unresolved_mapped_members(self, type_)?;
@@ -5150,7 +5252,13 @@ impl CanonicalTypeMapperStore {
         let shape = validate_mapped_shape(self, type_)?;
         let modifiers = self.declared_mapped_modifiers(type_)?;
         let (properties, indexes) = plan_mapped_members(self, &shape, modifiers)?;
-        validate_warm_mapped_members(self, &shape, &properties, &indexes)
+        validate_warm_mapped_members_with_array_targets(
+            self,
+            &shape,
+            &properties,
+            &indexes,
+            array_targets,
+        )
     }
 
     /// Reads Record arguments only after its source, mapper, and alias cache agree.
@@ -5208,6 +5316,16 @@ impl CanonicalTypeMapperStore {
         type_: TypeId,
         alias: SemanticSymbolId,
     ) -> Result<MappedAliasDisplayIdentity, MappedTypeError> {
+        self.mapped_alias_display_identity_with_source(type_, alias, None, None)
+    }
+
+    pub(super) fn mapped_alias_display_identity_with_source(
+        &self,
+        type_: TypeId,
+        alias: SemanticSymbolId,
+        array_targets: Option<CanonicalArrayTargets>,
+        source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+    ) -> Result<MappedAliasDisplayIdentity, MappedTypeError> {
         let invalid = || MappedTypeError::InvalidMappedType(type_);
         let record = self.type_payload(type_).ok_or_else(invalid)?;
         let TypeData::Mapped(mapped) = record.data() else {
@@ -5226,7 +5344,7 @@ impl CanonicalTypeMapperStore {
             return Err(invalid());
         }
         if mapped.object.target.is_some() {
-            validate_mapped_relation_identity(self, type_)?;
+            validate_mapped_relation_identity_with_source(self, type_, array_targets, source)?;
             let template = mapped
                 .template_type
                 .and_then(|template| self.type_payload(template))
@@ -7347,8 +7465,35 @@ fn forwarded_mapped_alias_arguments(
     alias: SemanticSymbolId,
     arguments: &[TypeId],
     array_targets: Option<CanonicalArrayTargets>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<Vec<TypeId>, MappedTypeError> {
+    forwarded_mapped_alias_arguments_worker(
+        store,
+        target,
+        alias,
+        arguments,
+        array_targets,
+        source,
+        None,
+    )
+    .map(|(arguments, _)| arguments)
+}
+
+fn forwarded_mapped_alias_arguments_worker(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    alias: SemanticSymbolId,
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+    expected: Option<&[TypeId]>,
+) -> Result<(Vec<TypeId>, bool), MappedTypeError> {
     let invalid = || MappedTypeError::InvalidMappedType(target);
+    if source.is_some_and(|(globals, _)| {
+        array_targets != Some(CanonicalArrayTargets::from_global_types(globals))
+    }) {
+        return Err(invalid());
+    }
     let header =
         property_object_alias_identity_source_header(store, alias).map_err(|_| invalid())?;
     let links = store.type_alias_links(alias).ok_or_else(invalid)?;
@@ -7388,7 +7533,7 @@ fn forwarded_mapped_alias_arguments(
     }
     // This is the declaration-only wrapper case below. It does not recurse
     // through a concrete wrapper's instantiation cache.
-    validate_mapped_relation_identity(store, declared)?;
+    validate_mapped_relation_identity_with_source(store, declared, array_targets, source)?;
     let TypeData::Mapped(original) = store.type_payload(target).ok_or_else(invalid)?.data() else {
         return Err(invalid());
     };
@@ -7397,40 +7542,117 @@ fn forwarded_mapped_alias_arguments(
         return Err(invalid());
     };
     let owner = store.source_declaration_symbol(owner).ok_or_else(invalid)?;
-    let source = store.type_alias_links(owner).ok_or_else(invalid)?;
-    if source.declared_type != Some(target) {
+    let source_links = store.type_alias_links(owner).ok_or_else(invalid)?;
+    if source_links.declared_type != Some(target) {
         return Err(invalid());
     }
-    let formals = source.type_parameters.as_deref().ok_or_else(invalid)?;
+    let formals = source_links
+        .type_parameters
+        .as_deref()
+        .ok_or_else(invalid)?;
     let mapper = wrapper.object.mapper.ok_or_else(invalid)?;
     let Some(TypeMapperApplication::Composite { second, .. }) =
         store.mapper_application(mapper, original.type_parameter.ok_or_else(invalid)?)
     else {
         return Err(invalid());
     };
-    formals
-        .iter()
-        .map(|formal| {
-            let symbolic = store.map_type(second, *formal).ok_or_else(invalid)?;
-            cached_instantiation_with_vector(
-                store,
-                symbolic,
-                parameters,
-                arguments,
-                array_targets,
-                None,
-            )
+    if expected.is_some_and(|expected| expected.len() != formals.len()) {
+        return Err(invalid());
+    }
+    let mut result = Vec::with_capacity(formals.len());
+    let mut needs_source_proof = false;
+    for (index, formal) in formals.iter().enumerate() {
+        let symbolic = store.map_type(second, *formal).ok_or_else(invalid)?;
+        let mapped = match source {
+            Some((globals, source))
+                if expected.is_some()
+                    && matches!(
+                        store.type_payload(symbolic).map(TypeRecord::data),
+                        Some(TypeData::Conditional(_))
+                    ) =>
+            {
+                use super::conditional_types::SourceConditionalRemapLookup;
+                match super::instantiate::cached_conditional_instantiation_with_vector_and_source_lookup(
+                    store, symbolic, parameters, arguments, globals, source,
+                ).map_err(|_| invalid())? {
+                    SourceConditionalRemapLookup::Hit(type_) => type_,
+                    SourceConditionalRemapLookup::NeedsSourceProof(type_) => {
+                        needs_source_proof = true;
+                        type_
+                    }
+                    SourceConditionalRemapLookup::Cold => return Err(invalid()),
+                }
+            }
+            _ => match source {
+                Some((globals, source)) => {
+                    super::instantiate::cached_instantiation_with_vector_and_source(
+                        store, symbolic, parameters, arguments, globals, source,
+                    )
+                }
+                None => cached_instantiation_with_vector(
+                    store,
+                    symbolic,
+                    parameters,
+                    arguments,
+                    array_targets,
+                    None,
+                ),
+            }
             .map_err(|_| invalid())?
-            .ok_or(MappedTypeError::UnsupportedSource(symbolic))
-        })
-        .collect()
+            .ok_or(MappedTypeError::UnsupportedSource(symbolic))?,
+        };
+        if expected.is_some_and(|expected| expected[index] != mapped) {
+            return Err(invalid());
+        }
+        result.push(mapped);
+    }
+    Ok((result, needs_source_proof))
 }
 
 fn validate_mapped_relation_identity(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> Result<(), MappedTypeError> {
+    validate_mapped_relation_identity_with_source(store, type_, None, None)
+}
+
+fn validate_mapped_relation_identity_with_source(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+) -> Result<(), MappedTypeError> {
+    validate_mapped_relation_identity_worker(store, type_, array_targets, source, false).map(|_| ())
+}
+
+pub(super) fn mapped_alias_source_proof_is_pending(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<bool, MappedTypeError> {
+    validate_mapped_relation_identity_worker(
+        store,
+        type_,
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+        Some((globals, source)),
+        true,
+    )
+}
+
+fn validate_mapped_relation_identity_worker(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+    allow_source_pending: bool,
+) -> Result<bool, MappedTypeError> {
     let invalid = || MappedTypeError::InvalidMappedType(type_);
+    if source.is_some_and(|(globals, _)| {
+        array_targets != Some(CanonicalArrayTargets::from_global_types(globals))
+    }) {
+        return Err(invalid());
+    }
     let record = store.type_payload(type_).ok_or_else(invalid)?;
     let TypeData::Mapped(mapped) = record.data() else {
         return Err(invalid());
@@ -7439,12 +7661,12 @@ fn validate_mapped_relation_identity(
     if matches!(store.type_payload(target).map(TypeRecord::data),
         Some(TypeData::Mapped(original)) if matches!(original.object.instantiations, TypeCacheState::Allocated(_)))
     {
-        return generic_mapped_type_projection(store, type_, None)?
-            .map(|_| ())
+        return generic_mapped_type_projection(store, type_, array_targets)?
+            .map(|_| false)
             .ok_or_else(invalid);
     }
     let Some(target) = mapped.object.target else {
-        return validate_source_mapped_relation_identity(store, type_, false);
+        return validate_source_mapped_relation_identity(store, type_, false).map(|_| false);
     };
     validate_source_mapped_relation_identity(store, target, true)?;
     let declaration = mapped.declaration.ok_or_else(invalid)?;
@@ -7507,6 +7729,7 @@ fn validate_mapped_relation_identity(
         .ok_or_else(invalid)?;
     let owner = identity.symbol().ok_or_else(invalid)?;
     let owner_arguments = identity.type_arguments().ok_or_else(invalid)?;
+    let mut needs_source_proof = false;
     let key = if owner == alias {
         if owner_arguments != arguments {
             return Err(invalid());
@@ -7526,22 +7749,42 @@ fn validate_mapped_relation_identity(
         {
             return Err(invalid());
         }
+        let global = store
+            .symbol_store()
+            .assigned_global_symbol_id(owner)
+            .ok_or_else(invalid)?;
+        let key = type_alias_instantiation_cache_key(&arguments, Some((global, owner_arguments)));
+        // Check the physical row before a missing source proof can request replay.
+        if links
+            .instantiations
+            .as_ref()
+            .and_then(|entries| entries.get(&key))
+            != Some(&type_)
+        {
+            return Err(invalid());
+        }
         if owner_links.declared_type == Some(type_) {
             if owner_links.type_parameters.as_deref().unwrap_or_default() != owner_arguments
                 || !store.source_direct_type_annotation_is_exact(body, type_)
             {
                 return Err(invalid());
             }
-        } else if forwarded_mapped_alias_arguments(store, target, owner, owner_arguments, None)?
-            != arguments
-        {
-            return Err(invalid());
+        } else {
+            let (forwarded, pending) = forwarded_mapped_alias_arguments_worker(
+                store,
+                target,
+                owner,
+                owner_arguments,
+                array_targets,
+                source,
+                allow_source_pending.then_some(arguments.as_slice()),
+            )?;
+            if forwarded != arguments {
+                return Err(invalid());
+            }
+            needs_source_proof = pending;
         }
-        let global = store
-            .symbol_store()
-            .assigned_global_symbol_id(owner)
-            .ok_or_else(invalid)?;
-        type_alias_instantiation_cache_key(&arguments, Some((global, owner_arguments)))
+        key
     };
     if links
         .instantiations
@@ -7551,7 +7794,7 @@ fn validate_mapped_relation_identity(
     {
         return Err(invalid());
     }
-    Ok(())
+    Ok(needs_source_proof)
 }
 
 fn mapped_type_parameter_owner(

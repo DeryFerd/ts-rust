@@ -1516,6 +1516,7 @@ fn source_alias_base_metadata(
     store: &CanonicalTypeMapperStore,
     request: &SourceInterfaceAliasBaseRequest,
     array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
 ) -> Result<
     (
         Option<TypeId>,
@@ -1525,7 +1526,12 @@ fn source_alias_base_metadata(
     DeclaredTypeError,
 > {
     if request.reference.is_some() {
-        let cached = cached_interface_alias_reference(store, request, array_targets)?;
+        let cached = cached_interface_alias_reference_with_query_context(
+            store,
+            request,
+            array_targets,
+            query,
+        )?;
         return Ok((cached, cached.into_iter().collect(), None));
     }
     let invalid = || source_heritage_error(request.rhs);
@@ -1598,7 +1604,7 @@ pub(super) fn source_interface_alias_base_state(
 ) -> Result<SourceInterfaceAliasBaseState, DeclaredTypeError> {
     let invalid = || source_heritage_error(request.rhs);
     let (cached, mut edges, conditional) =
-        source_alias_base_metadata(store, request, array_targets)?;
+        source_alias_base_metadata(store, request, array_targets, query)?;
     if request.reference.is_some() {
         let Some(type_) = cached else {
             return Ok(SourceInterfaceAliasBaseState::Pending { edges, conditional });
@@ -1610,7 +1616,9 @@ pub(super) fn source_interface_alias_base_state(
             }
             .into());
         }
-        if interface_alias_base_members(store, type_, array_targets)?.is_none() {
+        if interface_alias_base_members_with_query_context(store, type_, array_targets, query)?
+            .is_none()
+        {
             return Ok(SourceInterfaceAliasBaseState::Pending { edges, conditional });
         }
         return Ok(SourceInterfaceAliasBaseState::Ready { type_, edges });
@@ -1704,7 +1712,43 @@ pub(super) fn cached_interface_alias_reference(
     request: &SourceInterfaceAliasBaseRequest,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<TypeId>, DeclaredTypeError> {
+    cached_interface_alias_reference_with_query_context(store, request, array_targets, None)
+}
+
+pub(super) fn cached_interface_alias_reference_with_query_context(
+    store: &CanonicalTypeMapperStore,
+    request: &SourceInterfaceAliasBaseRequest,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Result<Option<TypeId>, DeclaredTypeError> {
+    cached_interface_alias_reference_worker(store, request, array_targets, query, false)
+        .map(|(type_, _)| type_)
+}
+
+pub(super) fn interface_alias_reference_source_proof_is_pending(
+    store: &CanonicalTypeMapperStore,
+    request: &SourceInterfaceAliasBaseRequest,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: &SourceInterfaceHeritageQueryContext<'_>,
+) -> Result<bool, DeclaredTypeError> {
+    cached_interface_alias_reference_worker(store, request, array_targets, Some(query), true)
+        .map(|(_, pending)| pending)
+}
+
+fn cached_interface_alias_reference_worker(
+    store: &CanonicalTypeMapperStore,
+    request: &SourceInterfaceAliasBaseRequest,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+    allow_source_pending: bool,
+) -> Result<(Option<TypeId>, bool), DeclaredTypeError> {
     let invalid = || source_heritage_error(request.root);
+    if query.is_some_and(|query| {
+        query.array_targets != array_targets
+            || array_targets != Some(CanonicalArrayTargets::from_global_types(query.globals))
+    }) {
+        return Err(invalid());
+    }
     let reference = request.reference.ok_or_else(invalid)?;
     if source_interface_alias_reference_request(store, request.symbol, reference)? != *request {
         return Err(invalid());
@@ -1713,7 +1757,7 @@ pub(super) fn cached_interface_alias_reference(
         .type_node_links(reference)
         .and_then(|links| links.resolved_type)
     else {
-        return Ok(None);
+        return Ok((None, false));
     };
     if store
         .symbol_node_links(reference)
@@ -1761,7 +1805,7 @@ pub(super) fn cached_interface_alias_reference(
             }
         }
         if arguments.len() < required || arguments.len() > parameters.len() {
-            return Ok(Some(type_));
+            return Ok((Some(type_), false));
         }
     }
     let provided = arguments.clone();
@@ -1774,21 +1818,31 @@ pub(super) fn cached_interface_alias_reference(
             .and_then(|annotations| annotations.default_type)
             .and_then(|node| super::object_members::cached_planned_type_identity(store, node))
             .ok_or_else(invalid)?;
-        let value = super::instantiate::cached_instantiation_with_vector(
-            store,
-            default,
-            &parameters[..arguments.len()],
-            &arguments,
-            array_targets,
-            None,
-        )
-        .map_err(|_| invalid())?
-        .ok_or_else(invalid)?;
+        let value = match query {
+            Some(query) => super::instantiate::cached_instantiation_with_vector_and_source(
+                store,
+                default,
+                &parameters[..arguments.len()],
+                &arguments,
+                query.globals,
+                query.source,
+            ),
+            None => super::instantiate::cached_instantiation_with_vector(
+                store,
+                default,
+                &parameters[..arguments.len()],
+                &arguments,
+                array_targets,
+                None,
+            ),
+        }
+        .map_err(|_| invalid())?;
+        let value = value.ok_or_else(invalid)?;
         arguments.push(value);
     }
     if parameters.is_empty() {
         return if declared == type_ && links.instantiations.is_none() {
-            Ok(Some(type_))
+            Ok((Some(type_), false))
         } else {
             Err(invalid())
         };
@@ -1799,20 +1853,57 @@ pub(super) fn cached_interface_alias_reference(
         .as_ref()
         .and_then(|instances| instances.get(&key))
         != Some(&type_)
-        || super::instantiate::cached_instantiation_with_vector(
+    {
+        return Err(invalid());
+    }
+    if allow_source_pending
+        && let Some(query) = query
+        && let Some(record) = store.type_payload(type_)
+        && matches!(record.data(), TypeData::Mapped(_))
+    {
+        let identity = record
+            .alias()
+            .and_then(|alias| store.type_alias(alias))
+            .ok_or_else(invalid)?;
+        if identity.symbol() != Some(request.symbol)
+            || identity.type_arguments() != Some(arguments.as_slice())
+        {
+            return Err(invalid());
+        }
+        if super::mapped_types::mapped_alias_source_proof_is_pending(
+            store,
+            type_,
+            query.globals,
+            query.source,
+        )
+        .map_err(|_| invalid())?
+        {
+            return Ok((Some(type_), true));
+        }
+    }
+    let instantiated = match query {
+        Some(query) => super::instantiate::cached_instantiation_with_vector_and_source(
+            store,
+            declared,
+            parameters,
+            &arguments,
+            query.globals,
+            query.source,
+        ),
+        None => super::instantiate::cached_instantiation_with_vector(
             store,
             declared,
             parameters,
             &arguments,
             array_targets,
             None,
-        )
-        .map_err(|_| invalid())?
-            != Some(type_)
-    {
+        ),
+    }
+    .map_err(|_| invalid())?;
+    if instantiated != Some(type_) {
         return Err(invalid());
     }
-    Ok(Some(type_))
+    Ok((Some(type_), false))
 }
 
 fn interface_alias_result_is_ignored(
@@ -1833,10 +1924,20 @@ pub(super) fn source_interface_alias_base_is_ignored(
     request: &SourceInterfaceAliasBaseRequest,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<bool, DeclaredTypeError> {
+    source_interface_alias_base_is_ignored_with_query_context(store, request, array_targets, None)
+}
+
+pub(super) fn source_interface_alias_base_is_ignored_with_query_context(
+    store: &CanonicalTypeMapperStore,
+    request: &SourceInterfaceAliasBaseRequest,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Result<bool, DeclaredTypeError> {
     if request.reference.is_none() {
         return Ok(false);
     }
-    match cached_interface_alias_reference(store, request, array_targets)? {
+    match cached_interface_alias_reference_with_query_context(store, request, array_targets, query)?
+    {
         Some(type_) => interface_alias_result_is_ignored(store, type_),
         None => Ok(false),
     }
@@ -1849,6 +1950,15 @@ pub(super) fn effective_interface_heritage_bases<'a>(
     plan: &'a DirectInterfaceHeritagePlan,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Vec<&'a DirectInterfaceBasePlan>, DeclaredTypeError> {
+    effective_interface_heritage_bases_with_query_context(store, plan, array_targets, None)
+}
+
+pub(super) fn effective_interface_heritage_bases_with_query_context<'a>(
+    store: &CanonicalTypeMapperStore,
+    plan: &'a DirectInterfaceHeritagePlan,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Result<Vec<&'a DirectInterfaceBasePlan>, DeclaredTypeError> {
     let mut bases = Vec::with_capacity(plan.bases.len());
     for base in &plan.bases {
         if base.kind.is_instantiated_alias() {
@@ -1856,7 +1966,12 @@ pub(super) fn effective_interface_heritage_bases<'a>(
             if request.arguments() != base.type_arguments.as_slice() || !base.defaults.is_empty() {
                 return Err(source_heritage_error(base.node));
             }
-            if source_interface_alias_base_is_ignored(store, &request, array_targets)? {
+            if source_interface_alias_base_is_ignored_with_query_context(
+                store,
+                &request,
+                array_targets,
+                query,
+            )? {
                 continue;
             }
         }
@@ -1870,10 +1985,24 @@ pub(super) fn effective_source_interface_heritage_bases<'a>(
     header: &'a SourceInterfaceHeritageHeader,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Vec<&'a SourceInterfaceHeritageBase>, DeclaredTypeError> {
+    effective_source_interface_heritage_bases_with_query_context(store, header, array_targets, None)
+}
+
+pub(super) fn effective_source_interface_heritage_bases_with_query_context<'a>(
+    store: &CanonicalTypeMapperStore,
+    header: &'a SourceInterfaceHeritageHeader,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Result<Vec<&'a SourceInterfaceHeritageBase>, DeclaredTypeError> {
     let mut bases = Vec::with_capacity(header.bases.len());
     for base in &header.bases {
         if let Some(request) = base.alias.as_ref()
-            && source_interface_alias_base_is_ignored(store, request, array_targets)?
+            && source_interface_alias_base_is_ignored_with_query_context(
+                store,
+                request,
+                array_targets,
+                query,
+            )?
         {
             continue;
         }
@@ -1987,7 +2116,7 @@ pub(super) fn validated_instantiated_interface_base_members(
     {
         return None;
     }
-    interface_alias_base_members(store, type_, array_targets).ok()?
+    interface_alias_base_members_with_query_context(store, type_, array_targets, query).ok()?
 }
 
 /// Reads only members proved by their existing object, mapped, or intersection provider.
@@ -1995,6 +2124,15 @@ pub(super) fn interface_alias_base_members(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<InterfaceAliasBaseMembers>, DeclaredTypeError> {
+    interface_alias_base_members_with_query_context(store, type_, array_targets, None)
+}
+
+pub(super) fn interface_alias_base_members_with_query_context(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
 ) -> Result<Option<InterfaceAliasBaseMembers>, DeclaredTypeError> {
     let invalid = || {
         DeclaredTypeError::from(TypeNodeUnavailable::UnsupportedIntersectionConstituentType(
@@ -2005,7 +2143,11 @@ pub(super) fn interface_alias_base_members(
     let properties = match record.data() {
         TypeData::Mapped(_) => {
             let Some(members) = store
-                .validate_mapped_type_relation_endpoint(type_)
+                .validate_mapped_type_relation_endpoint_with_source(
+                    type_,
+                    array_targets,
+                    query.map(|query| (query.globals, query.source)),
+                )
                 .map_err(|_| invalid())?
             else {
                 return Ok(None);
@@ -2088,12 +2230,29 @@ pub(super) fn resolve_interface_alias_base_members(
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut super::instantiate::InstantiationSession,
 ) -> Result<InterfaceAliasBaseMembers, DeclaredTypeError> {
+    resolve_interface_alias_base_members_with_query_context(
+        store,
+        type_,
+        array_targets,
+        session,
+        None,
+    )
+}
+
+pub(super) fn resolve_interface_alias_base_members_with_query_context(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut super::instantiate::InstantiationSession,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Result<InterfaceAliasBaseMembers, DeclaredTypeError> {
     fn resolve(
         store: &mut CanonicalTypeMapperStore,
         type_: TypeId,
         array_targets: Option<CanonicalArrayTargets>,
         session: &mut super::instantiate::InstantiationSession,
         active: &mut HashSet<TypeId>,
+        query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
     ) -> Result<(), DeclaredTypeError> {
         let invalid = || {
             DeclaredTypeError::from(TypeNodeUnavailable::UnsupportedIntersectionConstituentType(
@@ -2107,7 +2266,7 @@ pub(super) fn resolve_interface_alias_base_members(
         if let TypeData::Intersection(intersection) = record.data() {
             let types = intersection.intersection.types.clone();
             for part in types {
-                resolve(store, part, array_targets, session, active)?;
+                resolve(store, part, array_targets, session, active, query)?;
             }
             store
                 .materialize_deferred_intersection_type_with_array_targets(type_, array_targets)
@@ -2155,12 +2314,20 @@ pub(super) fn resolve_interface_alias_base_members(
                 .map_err(|_| invalid())?;
             }
         }
-        interface_alias_base_members(store, type_, array_targets)?.ok_or_else(invalid)?;
+        interface_alias_base_members_with_query_context(store, type_, array_targets, query)?
+            .ok_or_else(invalid)?;
         assert!(active.remove(&type_));
         Ok(())
     }
-    resolve(store, type_, array_targets, session, &mut HashSet::new())?;
-    interface_alias_base_members(store, type_, array_targets)?
+    resolve(
+        store,
+        type_,
+        array_targets,
+        session,
+        &mut HashSet::new(),
+        query,
+    )?;
+    interface_alias_base_members_with_query_context(store, type_, array_targets, query)?
         .ok_or_else(|| TypeNodeUnavailable::UnsupportedIntersectionConstituentType(type_).into())
 }
 
@@ -2170,6 +2337,58 @@ pub(super) fn validate_source_interface_heritage_header(
     actual_type: TypeId,
     header: &SourceInterfaceHeritageHeader,
     array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Vec<TypeId>, DeclaredTypeError> {
+    validate_source_interface_heritage_header_with_query_context(
+        store,
+        actual_type,
+        header,
+        array_targets,
+        None,
+    )
+}
+
+pub(super) fn validate_source_interface_heritage_header_with_query_context(
+    store: &CanonicalTypeMapperStore,
+    actual_type: TypeId,
+    header: &SourceInterfaceHeritageHeader,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Result<Vec<TypeId>, DeclaredTypeError> {
+    validate_source_interface_heritage_header_worker(
+        store,
+        actual_type,
+        header,
+        array_targets,
+        query,
+        false,
+    )
+}
+
+/// Checks cache dependencies without granting access to a pending alias value.
+pub(super) fn validate_source_interface_heritage_cache_edges(
+    store: &CanonicalTypeMapperStore,
+    actual_type: TypeId,
+    header: &SourceInterfaceHeritageHeader,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Result<Vec<TypeId>, DeclaredTypeError> {
+    validate_source_interface_heritage_header_worker(
+        store,
+        actual_type,
+        header,
+        array_targets,
+        query,
+        true,
+    )
+}
+
+fn validate_source_interface_heritage_header_worker(
+    store: &CanonicalTypeMapperStore,
+    actual_type: TypeId,
+    header: &SourceInterfaceHeritageHeader,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+    allow_source_pending: bool,
 ) -> Result<Vec<TypeId>, DeclaredTypeError> {
     let invalid = || {
         DeclaredTypeError::from(DeclaredTypeUnavailable::InvalidCachedDeclaredType {
@@ -2247,9 +2466,22 @@ pub(super) fn validate_source_interface_heritage_header(
             if request.symbol != base.symbol {
                 return Err(invalid());
             }
-            let (cached, pending, _) = source_alias_base_metadata(store, request, array_targets)?;
-            edges.extend(pending);
-            cached
+            if allow_source_pending && request.reference.is_some() {
+                let (cached, _) = cached_interface_alias_reference_worker(
+                    store,
+                    request,
+                    array_targets,
+                    query,
+                    true,
+                )?;
+                edges.extend(cached);
+                cached
+            } else {
+                let (cached, pending, _) =
+                    source_alias_base_metadata(store, request, array_targets, query)?;
+                edges.extend(pending);
+                cached
+            }
         } else {
             let owner = store.symbol(base.symbol).ok_or_else(invalid)?;
             let declarations = owner.declarations().ok_or_else(invalid)?;
@@ -2350,8 +2582,19 @@ pub(super) fn validate_source_interface_heritage_complete_bases(
             declared_type: actual_type,
         })
     };
-    validate_source_interface_heritage_header(store, actual_type, header, array_targets)?;
-    let source_bases = effective_source_interface_heritage_bases(store, header, array_targets)?;
+    validate_source_interface_heritage_header_with_query_context(
+        store,
+        actual_type,
+        header,
+        array_targets,
+        query,
+    )?;
+    let source_bases = effective_source_interface_heritage_bases_with_query_context(
+        store,
+        header,
+        array_targets,
+        query,
+    )?;
     if bases.len() != source_bases.len() {
         return Err(invalid());
     }
@@ -2390,7 +2633,13 @@ pub(super) fn validate_source_interface_heritage_complete_bases(
         }
     }
     // Recheck the source receipt after the borrowed conditional validators return.
-    validate_source_interface_heritage_header(store, actual_type, header, array_targets)?;
+    validate_source_interface_heritage_header_with_query_context(
+        store,
+        actual_type,
+        header,
+        array_targets,
+        query,
+    )?;
     Ok(())
 }
 

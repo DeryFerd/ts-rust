@@ -148,9 +148,13 @@ fn validate_source_instantiated_alias_base_property_object(
     {
         return None;
     }
-    let members =
-        super::interface_heritage::interface_alias_base_members(store, type_, array_targets)
-            .ok()??;
+    let members = super::interface_heritage::interface_alias_base_members_with_query_context(
+        store,
+        type_,
+        array_targets,
+        query,
+    )
+    .ok()??;
     Some(ValidatedInterfaceSurface {
         owner: request.symbol(),
         declared_properties: Vec::new(),
@@ -370,11 +374,14 @@ fn planned_interface_base_sequence_is_exact(
     let Some(heritage) = &plan.heritage else {
         return false;
     };
-    let Ok(effective_bases) = super::interface_heritage::effective_interface_heritage_bases(
-        store,
-        heritage,
-        array_targets,
-    ) else {
+    let Ok(effective_bases) =
+        super::interface_heritage::effective_interface_heritage_bases_with_query_context(
+            store,
+            heritage,
+            array_targets,
+            query,
+        )
+    else {
         return false;
     };
     if heritage.bases.is_empty() || effective_bases.len() != base_types.len() {
@@ -651,12 +658,14 @@ pub(super) fn resolve_direct_interface_members_with_declared_indexes(
     if !planned_interface_base_sequence_is_exact(store, plan, base_types, array_targets, query) {
         return Err(invalid(plan, type_));
     }
-    let effective_bases = super::interface_heritage::effective_interface_heritage_bases(
-        store,
-        heritage,
-        array_targets,
-    )
-    .map_err(|_| invalid(plan, type_))?;
+    let effective_bases =
+        super::interface_heritage::effective_interface_heritage_bases_with_query_context(
+            store,
+            heritage,
+            array_targets,
+            query,
+        )
+        .map_err(|_| invalid(plan, type_))?;
     let planned_base = effective_bases.first().copied();
     let legacy_alias_heritage = heritage
         .bases
@@ -1354,11 +1363,14 @@ pub(super) fn validate_planned_interface_heritage_members_with_query_context(
     if !planned_interface_base_sequence_is_exact(store, plan, base_types, array_targets, query) {
         return false;
     }
-    let Ok(effective_bases) = super::interface_heritage::effective_interface_heritage_bases(
-        store,
-        heritage,
-        array_targets,
-    ) else {
+    let Ok(effective_bases) =
+        super::interface_heritage::effective_interface_heritage_bases_with_query_context(
+            store,
+            heritage,
+            array_targets,
+            query,
+        )
+    else {
         return false;
     };
     let Some(provenance) = store.direct_interface_heritage_provenance(type_) else {
@@ -1930,10 +1942,11 @@ fn validate_property_interface_worker(
     let source_bases = heritage_provenance
         .and_then(|provenance| provenance.source.as_ref())
         .map(|header| {
-            super::interface_heritage::effective_source_interface_heritage_bases(
+            super::interface_heritage::effective_source_interface_heritage_bases_with_query_context(
                 store,
                 header,
                 array_targets,
+                query,
             )
         })
         .transpose()

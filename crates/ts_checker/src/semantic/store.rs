@@ -14071,7 +14071,30 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         header: SourceInterfaceHeritageHeader,
         array_targets: Option<CanonicalArrayTargets>,
     ) -> bool {
-        if validate_source_interface_heritage_header(self, type_, &header, array_targets).is_err() {
+        self.publish_source_interface_heritage_header_with_query_context(
+            type_,
+            header,
+            array_targets,
+            None,
+        )
+    }
+
+    pub(super) fn publish_source_interface_heritage_header_with_query_context(
+        &mut self,
+        type_: TypeId,
+        header: SourceInterfaceHeritageHeader,
+        array_targets: Option<CanonicalArrayTargets>,
+        query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+    ) -> bool {
+        if super::interface_heritage::validate_source_interface_heritage_header_with_query_context(
+            self,
+            type_,
+            &header,
+            array_targets,
+            query,
+        )
+        .is_err()
+        {
             return false;
         }
         if let Some(state) = self.direct_interface_heritage_provenance.get(&type_) {

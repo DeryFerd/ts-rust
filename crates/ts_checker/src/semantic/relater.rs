@@ -898,12 +898,20 @@ fn validate_global_this_relation_inputs(
             } else {
                 // A cache scan must not demand a later alias value before the
                 // ordinary unmatched-property pass can reject the pair.
-                validate_source_interface_heritage_header(store, type_, header, array_targets)
-                    .map_err(|error| {
-                        RelationUnavailable::CanonicalGlobalType(
-                            CanonicalGlobalTypeInitializationError::DeclaredType(error),
-                        )
-                    })?
+                super::interface_heritage::validate_source_interface_heritage_cache_edges(
+                    store,
+                    type_,
+                    header,
+                    array_targets,
+                    context
+                        .as_ref()
+                        .and_then(|context| context.heritage.as_ref()),
+                )
+                .map_err(|error| {
+                    RelationUnavailable::CanonicalGlobalType(
+                        CanonicalGlobalTypeInitializationError::DeclaredType(error),
+                    )
+                })?
             };
             depends_on_global_this = true;
             types.extend(edges);
@@ -1037,7 +1045,57 @@ fn source_interface_heritage_relation_edges(
             CanonicalGlobalTypeInitializationError::DeclaredType(error),
         )
     };
-    let mut edges = validate_source_interface_heritage_header(store, type_, header, array_targets)
+    if let Some(query) = query {
+        super::interface_heritage::validate_source_interface_heritage_cache_edges(
+            store,
+            type_,
+            header,
+            array_targets,
+            Some(query),
+        )
+        .map_err(error)?;
+        for alias in header.bases().iter().filter_map(|base| base.alias()) {
+            let Some(reference) = alias.reference() else {
+                continue;
+            };
+            let cached = store
+                .type_node_links(reference)
+                .and_then(|links| links.resolved_type);
+            if cached.is_some_and(|cached| {
+                matches!(
+                    store.type_payload(cached).map(|record| record.data()),
+                    Some(TypeData::Mapped(_))
+                )
+            }) && super::interface_heritage::interface_alias_reference_source_proof_is_pending(
+                store,
+                alias,
+                array_targets,
+                query,
+            )
+            .map_err(error)?
+            {
+                return Err(
+                    if store.direct_interface_heritage_provenance(type_).is_some() {
+                        RelationUnavailable::SourceInterfaceAliasDemand {
+                            receiver: type_,
+                            alias: alias.symbol(),
+                            root: alias.root(),
+                        }
+                    } else {
+                        RelationUnavailable::SourceInterfaceHeaderDemand { receiver: type_ }
+                    },
+                );
+            }
+        }
+    }
+    let mut edges =
+        super::interface_heritage::validate_source_interface_heritage_header_with_query_context(
+            store,
+            type_,
+            header,
+            array_targets,
+            query,
+        )
         .map_err(error)?;
     if store.direct_interface_heritage_provenance(type_).is_none() {
         return Err(if query.is_some() {
@@ -7595,9 +7653,20 @@ impl<'store> RelaterSession<'store> {
         }
         if let Some(receiver) = self.mapped_property_receivers.get(&symbol).copied() {
             self.store
-                .validate_mapped_type_relation_endpoint(receiver)
+                .validate_mapped_type_relation_endpoint_with_source(
+                    receiver,
+                    self.global_types.map(|globals| globals.array_targets),
+                    self.heritage_query
+                        .as_ref()
+                        .map(|query| (query.globals, query.source)),
+                )
                 .map_err(|error| {
-                    observed_mapped_relation_error(self.store, receiver, error, "mapped_property.validate")
+                    observed_mapped_relation_error(
+                        self.store,
+                        receiver,
+                        error,
+                        "mapped_property.validate",
+                    )
                 })?
                 .filter(|members| members.properties().contains(&symbol))
                 .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
@@ -8162,9 +8231,20 @@ impl<'store> RelaterSession<'store> {
         }
         if let ObjectPropertyOrigin::Mapped(receiver) = origin {
             self.store
-                .validate_mapped_type_relation_endpoint(receiver)
+                .validate_mapped_type_relation_endpoint_with_source(
+                    receiver,
+                    self.global_types.map(|globals| globals.array_targets),
+                    self.heritage_query
+                        .as_ref()
+                        .map(|query| (query.globals, query.source)),
+                )
                 .map_err(|error| {
-                    observed_mapped_relation_error(self.store, receiver, error, "mapped_symbol.validate")
+                    observed_mapped_relation_error(
+                        self.store,
+                        receiver,
+                        error,
+                        "mapped_symbol.validate",
+                    )
                 })?
                 .filter(|members| members.properties().contains(&symbol))
                 .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
@@ -8994,10 +9074,12 @@ impl<'store> RelaterSession<'store> {
             RelationInstantiationSession::Owned(_)
         );
         let limit_mark = self.instantiation_session.as_mut().limit_event_mark();
-        let members = prepare_general_mapped_relation_endpoint(
+        let members = prepare_general_mapped_relation_endpoint_with_query_context(
             self.store,
             type_id,
             self.instantiation_session.as_mut(),
+            self.global_types.map(|globals| globals.array_targets),
+            self.heritage_query.as_ref(),
         )?;
         if owned
             && self
@@ -14008,6 +14090,16 @@ pub(super) fn prepare_general_mapped_relation_endpoint(
     type_id: TypeId,
     session: &mut InstantiationSession,
 ) -> Result<Option<ResolvedMappedTypeMembers>, RelationUnavailable> {
+    prepare_general_mapped_relation_endpoint_with_query_context(store, type_id, session, None, None)
+}
+
+fn prepare_general_mapped_relation_endpoint_with_query_context(
+    store: &mut SemanticStore<TypeRecord, TypeMapper>,
+    type_id: TypeId,
+    session: &mut InstantiationSession,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Result<Option<ResolvedMappedTypeMembers>, RelationUnavailable> {
     if !matches!(
         store.type_payload(type_id).map(TypeRecord::data),
         Some(TypeData::Mapped(_))
@@ -14015,17 +14107,31 @@ pub(super) fn prepare_general_mapped_relation_endpoint(
         return Ok(None);
     }
     if let Some(members) = store
-        .validate_mapped_type_relation_endpoint(type_id)
-        .map_err(|error| observed_mapped_relation_error(store, type_id, error, "mapped_endpoint.before_resolve"))?
+        .validate_mapped_type_relation_endpoint_with_source(
+            type_id,
+            array_targets,
+            query.map(|query| (query.globals, query.source)),
+        )
+        .map_err(|error| {
+            observed_mapped_relation_error(store, type_id, error, "mapped_endpoint.before_resolve")
+        })?
     {
         return Ok(Some(members));
     }
     store
         .resolve_mapped_type_members_with_session(type_id, MappedTypeModifiers::NONE, session)
-        .map_err(|error| observed_mapped_relation_error(store, type_id, error, "mapped_endpoint.resolve"))?;
+        .map_err(|error| {
+            observed_mapped_relation_error(store, type_id, error, "mapped_endpoint.resolve")
+        })?;
     store
-        .validate_mapped_type_relation_endpoint(type_id)
-        .map_err(|error| observed_mapped_relation_error(store, type_id, error, "mapped_endpoint.after_resolve"))?
+        .validate_mapped_type_relation_endpoint_with_source(
+            type_id,
+            array_targets,
+            query.map(|query| (query.globals, query.source)),
+        )
+        .map_err(|error| {
+            observed_mapped_relation_error(store, type_id, error, "mapped_endpoint.after_resolve")
+        })?
         .map(Some)
         .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))
 }

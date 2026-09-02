@@ -25,8 +25,9 @@ use super::{
     conditional_types::{
         ConditionalAliasIdentity, ConditionalBranchSource, ConditionalRemapLookup,
         ConditionalRemapProjection, ConditionalRemapResult, ConditionalTypeError,
-        cached_conditional_remap_with_source, cached_deferred_conditional_remap,
-        cached_signature_conditional_result, conditional_alias_projection_with_array_targets,
+        SourceConditionalRemapLookup, cached_conditional_remap_with_source,
+        cached_deferred_conditional_remap, cached_signature_conditional_result,
+        conditional_alias_projection_with_array_targets,
         conditional_remap_projection_with_array_targets, conditional_remap_projection_with_source,
         conditional_signature_projection_with_array_targets, is_signature_conditional_source,
         remap_conditional_with_source, remap_deferred_conditional_with_session,
@@ -1855,6 +1856,11 @@ fn instantiate_type_with_alias_input_and_operand(
         session,
         |store| instantiation_cache_key_for_input(store, type_, alias),
         |store, key, cached| {
+            let source_mapped = source.borrow().is_some()
+                && matches!(
+                    store.type_payload(type_).map(TypeRecord::data),
+                    Some(TypeData::Mapped(_))
+                );
             if operand.is_none()
                 && !matches!(
                     store.type_payload(type_).map(TypeRecord::data),
@@ -1862,6 +1868,7 @@ fn instantiate_type_with_alias_input_and_operand(
                 )
                 && source_callable_function_type_owner(store, type_).is_none()
                 && !store.type_has_function_type_provenance(type_)
+                && !source_mapped
             {
                 return Ok(());
             }
@@ -4013,6 +4020,37 @@ pub(super) fn cached_instantiation_with_vector_and_source(
     )
 }
 
+pub(super) fn cached_conditional_instantiation_with_vector_and_source_lookup(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<SourceConditionalRemapLookup, InstantiationError> {
+    if sources.len() != targets.len() {
+        return Err(InstantiationError::InvalidType(template));
+    }
+    for endpoint in sources.iter().chain(targets) {
+        if store.type_payload(*endpoint).is_none() {
+            return Err(InstantiationError::InvalidType(*endpoint));
+        }
+    }
+    let array_targets = Some(CanonicalArrayTargets::from_global_types(globals));
+    let projection =
+        conditional_remap_projection_with_source(store, template, source, array_targets)
+            .map_err(|error| conditional_remap_error(store, template, error))?;
+    cached_instantiated_deferred_conditional_lookup(
+        store,
+        &projection,
+        InstantiationMapping::Vector { sources, targets },
+        array_targets,
+        None,
+        &mut HashSet::from([template]),
+        Some((globals, source)),
+    )
+}
+
 #[allow(clippy::too_many_arguments)] // Cached replay receives the same source capability as work.
 fn cached_instantiated_type_with_source_worker(
     store: &CanonicalTypeMapperStore,
@@ -4133,8 +4171,13 @@ fn cached_instantiated_type_with_operand_worker(
                 .map_err(|error| mapped_indexed_access_error(template, error));
             }
             if let Some(projection) =
-                supported_mapped_alias_projection(store, template, array_targets)
-                    .map_err(|error| mapped_indexed_access_error(template, error))?
+                super::mapped_types::supported_mapped_alias_projection_with_source(
+                    store,
+                    template,
+                    array_targets,
+                    source,
+                )
+                .map_err(|error| mapped_indexed_access_error(template, error))?
             {
                 return cached_instantiated_mapped_alias(
                     store,
@@ -4143,6 +4186,7 @@ fn cached_instantiated_type_with_operand_worker(
                     array_targets,
                     alias_override,
                     active,
+                    source,
                 );
             }
             let projection = generic_mapped_type_projection(store, template, array_targets)
@@ -4676,6 +4720,32 @@ fn cached_instantiated_deferred_conditional(
     active: &mut HashSet<TypeId>,
     source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<Option<TypeId>, InstantiationError> {
+    Ok(
+        match cached_instantiated_deferred_conditional_lookup(
+            store,
+            projection,
+            mapping,
+            array_targets,
+            alias_override,
+            active,
+            source,
+        )? {
+            SourceConditionalRemapLookup::Hit(type_) => Some(type_),
+            SourceConditionalRemapLookup::Cold
+            | SourceConditionalRemapLookup::NeedsSourceProof(_) => None,
+        },
+    )
+}
+
+fn cached_instantiated_deferred_conditional_lookup(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+    active: &mut HashSet<TypeId>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+) -> Result<SourceConditionalRemapLookup, InstantiationError> {
     validate_conditional_alias_override(store, projection, alias_override)?;
     let mut arguments = Vec::with_capacity(projection.arguments().len());
     for (parameter, argument) in projection.parameters().iter().zip(projection.arguments()) {
@@ -4693,7 +4763,7 @@ fn cached_instantiated_deferred_conditional(
             )?
         };
         let Some(mapped) = mapped else {
-            return Ok(None);
+            return Ok(SourceConditionalRemapLookup::Cold);
         };
         arguments.push(mapped);
     }
@@ -4710,7 +4780,7 @@ fn cached_instantiated_deferred_conditional(
                 source,
             )?
             else {
-                return Ok(None);
+                return Ok(SourceConditionalRemapLookup::Cold);
             };
             alias_arguments.push(mapped);
         }
@@ -4725,7 +4795,7 @@ fn cached_instantiated_deferred_conditional(
         return Err(InstantiationError::UnsupportedType(projection.type_id()));
     }
     if let Some((globals, source)) = source {
-        return cached_conditional_remap_with_source(
+        return super::conditional_types::cached_conditional_remap_with_source_lookup(
             store, projection, &arguments, alias, globals, source,
         )
         .map_err(|error| conditional_remap_error(store, projection.type_id(), error));
@@ -4733,8 +4803,8 @@ fn cached_instantiated_deferred_conditional(
     match cached_deferred_conditional_remap(store, projection, &arguments, alias, array_targets)
         .map_err(|error| conditional_remap_error(store, projection.type_id(), error))?
     {
-        ConditionalRemapLookup::Cold => Ok(None),
-        ConditionalRemapLookup::Hit(type_) => Ok(Some(type_)),
+        ConditionalRemapLookup::Cold => Ok(SourceConditionalRemapLookup::Cold),
+        ConditionalRemapLookup::Hit(type_) => Ok(SourceConditionalRemapLookup::Hit(type_)),
         ConditionalRemapLookup::NeedsSourceEvaluation => {
             Err(InstantiationError::UnsupportedType(projection.type_id()))
         }
@@ -4748,6 +4818,7 @@ fn cached_instantiated_mapped_alias(
     array_targets: Option<CanonicalArrayTargets>,
     alias_override: Option<(SemanticSymbolId, &[TypeId])>,
     active: &mut HashSet<TypeId>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<Option<TypeId>, InstantiationError> {
     if !could_contain_installed_type_variables(store, projection.type_, array_targets)? {
         return Ok(Some(projection.type_));
@@ -4760,13 +4831,14 @@ fn cached_instantiated_mapped_alias(
     }
     let mut arguments = Vec::with_capacity(projection.arguments.len());
     for argument in &projection.arguments {
-        let Some(mapped) = cached_instantiated_type_worker(
+        let Some(mapped) = cached_instantiated_type_with_source_worker(
             store,
             *argument,
             mapping,
             array_targets,
             None,
             active,
+            source,
         )?
         else {
             return Ok(None);
@@ -4780,13 +4852,14 @@ fn cached_instantiated_mapped_alias(
     } else {
         let mut arguments = Vec::with_capacity(projection.identity_arguments.len());
         for argument in &projection.identity_arguments {
-            let Some(mapped) = cached_instantiated_type_worker(
+            let Some(mapped) = cached_instantiated_type_with_source_worker(
                 store,
                 *argument,
                 mapping,
                 array_targets,
                 None,
                 active,
+                source,
             )?
             else {
                 return Ok(None);
@@ -4795,12 +4868,13 @@ fn cached_instantiated_mapped_alias(
         }
         (projection.identity_symbol, arguments)
     };
-    cached_supported_mapped_alias_instance(
+    super::mapped_types::cached_supported_mapped_alias_instance_with_source(
         store,
         projection,
         &arguments,
         (identity_symbol, &identity_arguments),
         array_targets,
+        source,
     )
     .map_err(|error| mapped_indexed_access_error(projection.type_, error))
 }
@@ -5611,8 +5685,15 @@ fn instantiate_type_worker(
                     .map_err(|error| mapped_indexed_access_error(type_, error));
                 }
                 if let Some(projection) =
-                    supported_mapped_alias_projection(store, type_, array_targets)
-                        .map_err(|error| mapped_indexed_access_error(type_, error))?
+                    super::mapped_types::supported_mapped_alias_projection_with_source(
+                        store,
+                        type_,
+                        array_targets,
+                        source
+                            .as_ref()
+                            .map(|source| (source.globals, &*source.branches)),
+                    )
+                    .map_err(|error| mapped_indexed_access_error(type_, error))?
                 {
                     InstantiationWork::SupportedMappedAlias(projection)
                 } else {
@@ -5861,6 +5942,7 @@ fn instantiate_type_worker(
             array_targets,
             alias,
             session,
+            source.as_deref_mut(),
         ),
         InstantiationWork::GenericMappedType(projection) => {
             let mut arguments = Vec::with_capacity(projection.arguments.len());
@@ -6253,6 +6335,7 @@ fn instantiate_supported_mapped_alias(
     array_targets: Option<CanonicalArrayTargets>,
     alias_override: Option<(SemanticSymbolId, &[TypeId])>,
     session: &mut InstantiationSession,
+    mut source: Option<&mut InstantiationSource<'_>>,
 ) -> Result<TypeId, InstantiationError> {
     if let Some((symbol, arguments)) = alias_override {
         validate_borrowed_alias_input(store, projection.type_, symbol, arguments)?;
@@ -6263,8 +6346,16 @@ fn instantiate_supported_mapped_alias(
     let mut arguments = Vec::with_capacity(projection.arguments.len());
     for argument in &projection.arguments {
         let mark = session.limit_event_mark();
-        let mapped =
-            instantiate_type_with_alias(store, *argument, mapping, array_targets, None, session)?;
+        let mapped = instantiate_type_with_alias_input_and_source(
+            store,
+            *argument,
+            mapping,
+            array_targets,
+            None,
+            session,
+            None,
+            source.as_deref_mut(),
+        )?;
         // A limit result belongs to this request. It is not an ordinary alias
         // instance and must not enter the producer's persistent cache.
         if session.limit_event_occurred_since(mark)
@@ -6282,13 +6373,15 @@ fn instantiate_supported_mapped_alias(
         let mut arguments = Vec::with_capacity(projection.identity_arguments.len());
         for argument in &projection.identity_arguments {
             let mark = session.limit_event_mark();
-            let mapped = instantiate_type_with_alias(
+            let mapped = instantiate_type_with_alias_input_and_source(
                 store,
                 *argument,
                 mapping,
                 array_targets,
                 None,
                 session,
+                None,
+                source.as_deref_mut(),
             )?;
             if session.limit_event_occurred_since(mark)
                 && let Some(error) = session.recovery_error_type()
@@ -6299,13 +6392,16 @@ fn instantiate_supported_mapped_alias(
         }
         (projection.identity_symbol, arguments)
     };
-    instantiate_supported_mapped_alias_instance_with_session(
+    super::mapped_types::instantiate_supported_mapped_alias_instance_with_source(
         store,
         projection,
         &arguments,
         (identity_symbol, &identity_arguments),
         array_targets,
         session,
+        source
+            .as_ref()
+            .map(|source| (source.globals, &*source.branches)),
     )
     .map_err(|error| mapped_indexed_access_error(projection.type_, error))
 }

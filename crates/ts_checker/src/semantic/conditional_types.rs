@@ -634,6 +634,14 @@ pub(super) enum ConditionalRemapLookup {
     NeedsSourceEvaluation,
 }
 
+/// A retained result still needs the current source proof before use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceConditionalRemapLookup {
+    Cold,
+    Hit(TypeId),
+    NeedsSourceProof(TypeId),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ConditionalRemapResult {
     Deferred(TypeId),
@@ -3584,6 +3592,25 @@ pub(super) fn cached_conditional_remap_with_source(
     globals: &CanonicalGlobalTypes,
     source: &dyn ConditionalBranchSource,
 ) -> Result<Option<TypeId>, ConditionalTypeError> {
+    Ok(
+        match cached_conditional_remap_with_source_lookup(
+            store, projection, arguments, alias, globals, source,
+        )? {
+            SourceConditionalRemapLookup::Hit(type_) => Some(type_),
+            SourceConditionalRemapLookup::Cold
+            | SourceConditionalRemapLookup::NeedsSourceProof(_) => None,
+        },
+    )
+}
+
+pub(super) fn cached_conditional_remap_with_source_lookup(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    arguments: &[TypeId],
+    alias: Option<ConditionalAliasIdentity<'_>>,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<SourceConditionalRemapLookup, ConditionalTypeError> {
     validate_conditional_remap_inputs_worker(
         store,
         projection,
@@ -3602,7 +3629,7 @@ pub(super) fn cached_conditional_remap_with_source(
     )?;
     if source.source_query_options().is_some() {
         let Some(cached) = cached else {
-            return Ok(None);
+            return Ok(SourceConditionalRemapLookup::Cold);
         };
         let key = ConditionalQueryKey::Instantiation(
             projection.production.definition.root,
@@ -3617,7 +3644,7 @@ pub(super) fn cached_conditional_remap_with_source(
                 })
                 .flatten()
         }) else {
-            return Ok(None);
+            return Ok(SourceConditionalRemapLookup::NeedsSourceProof(cached));
         };
         validate_source_conditional_result(store, proof, globals, source)?;
         if proof.result() != cached {
@@ -3625,7 +3652,7 @@ pub(super) fn cached_conditional_remap_with_source(
                 projection.production.definition.root,
             ));
         }
-        return Ok(Some(cached));
+        return Ok(SourceConditionalRemapLookup::Hit(cached));
     }
     if cached.is_some() {
         let definition = &projection.production.definition;
@@ -3646,7 +3673,10 @@ pub(super) fn cached_conditional_remap_with_source(
             }
         }
     }
-    Ok(cached)
+    Ok(match cached {
+        Some(type_) => SourceConditionalRemapLookup::Hit(type_),
+        None => SourceConditionalRemapLookup::Cold,
+    })
 }
 
 /// Uses the normal root cache and evaluator with lazily supplied source branches.

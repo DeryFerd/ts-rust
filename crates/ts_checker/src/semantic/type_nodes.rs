@@ -38314,8 +38314,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .global_types
             .as_ref()
             .map(CanonicalArrayTargets::from_global_types);
-        super::interface_heritage::validate_source_interface_heritage_header(
-            self.store, receiver, &header, arrays,
+        self.prepare_cached_mapped_interface_aliases(receiver, &header)?;
+        let context = self.source_query_context()?;
+        super::interface_heritage::validate_source_interface_heritage_header_with_query_context(
+            self.store,
+            receiver,
+            &header,
+            arrays,
+            Some(&context.heritage()),
         )?;
         if !self.active_source_heritage.insert(request) {
             return Err(type_node_unavailable(
@@ -38364,12 +38370,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .global_types
             .as_ref()
             .map(CanonicalArrayTargets::from_global_types);
-        if super::interface_heritage::source_interface_alias_base_is_ignored(
-            self.store, request, arrays,
+        let context = self.source_query_context()?;
+        if super::interface_heritage::source_interface_alias_base_is_ignored_with_query_context(
+            self.store,
+            request,
+            arrays,
+            Some(&context.heritage()),
         )? {
             return Ok(());
         }
-        let context = self.source_query_context()?;
         if !matches!(
             super::interface_heritage::source_interface_alias_base_state(
                 self.store,
@@ -38382,6 +38391,60 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidTypeReference(request.root()),
             ));
+        }
+        Ok(())
+    }
+
+    // Replay source-dependent mapped arguments before the full cached-header check.
+    // The caller still validates every header, member and cache after this query.
+    fn prepare_cached_mapped_interface_aliases(
+        &mut self,
+        receiver: TypeId,
+        header: &super::interface_heritage::SourceInterfaceHeritageHeader,
+    ) -> Result<(), DeclaredTypeError> {
+        if self.global_types.is_none() || self.instantiation_session.is_none() {
+            return Ok(());
+        }
+        let cached = header
+            .bases()
+            .iter()
+            .filter_map(|base| {
+                let alias = base.alias()?;
+                let reference = alias.reference()?;
+                let type_ = self.store.type_node_links(reference)?.resolved_type?;
+                matches!(self.store.type_payload(type_)?.data(), TypeData::Mapped(_))
+                    .then_some((alias, reference, type_))
+            })
+            .collect::<Vec<_>>();
+        if cached.is_empty() {
+            return Ok(());
+        }
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery);
+        if super::interface_heritage::plan_source_interface_heritage_header(
+            self.store,
+            self.host,
+            header.owner_symbol(),
+        )?
+        .as_ref()
+            != Some(header)
+            || cached_interface_type(self.store, header.owner_symbol())? != Some(receiver)
+        {
+            return Err(invalid());
+        }
+        for (alias, reference, cached) in cached {
+            let request = SourceInterfaceHeritageRequest::Alias {
+                receiver,
+                alias: alias.symbol(),
+                root: alias.root(),
+            };
+            if !self.active_source_heritage.insert(request) {
+                return Err(invalid());
+            }
+            let result = self.get_type_from_type_node(reference);
+            self.active_source_heritage.remove(&request);
+            if result? != cached {
+                return Err(invalid());
+            }
         }
         Ok(())
     }
@@ -38437,12 +38500,23 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::InvalidTypeReference(node),
             ));
         }
-        super::interface_heritage::validate_source_interface_heritage_header(
-            self.store, receiver, &header, arrays,
+        self.prepare_cached_mapped_interface_aliases(receiver, &header)?;
+        let context = self.source_query_context()?;
+        super::interface_heritage::validate_source_interface_heritage_header_with_query_context(
+            self.store,
+            receiver,
+            &header,
+            arrays,
+            Some(&context.heritage()),
         )?;
-        for base in super::interface_heritage::effective_source_interface_heritage_bases(
-            self.store, &header, arrays,
-        )? {
+        for base in
+            super::interface_heritage::effective_source_interface_heritage_bases_with_query_context(
+                self.store,
+                &header,
+                arrays,
+                Some(&context.heritage()),
+            )?
+        {
             let Some(alias) = base.alias() else {
                 continue;
             };
@@ -38542,10 +38616,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                                 self.host,
                                 header.owner_symbol(),
                             )?;
-                        if current.as_ref() != Some(&header)
-                            || !self
-                                .store
-                                .publish_source_interface_heritage_header(receiver, header, arrays)
+                        if current.as_ref() != Some(&header) {
+                            return Err(invalid());
+                        }
+                        self.prepare_cached_mapped_interface_aliases(receiver, &header)?;
+                        let context = self.source_query_context()?;
+                        if !self
+                            .store
+                            .publish_source_interface_heritage_header_with_query_context(
+                                receiver,
+                                header,
+                                arrays,
+                                Some(&context.heritage()),
+                            )
                         {
                             return Err(invalid());
                         }
@@ -38598,16 +38681,22 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let type_ =
             get_declared_class_interface_or_type_parameter(self.store, self.host, symbol, flags)?
                 .ok_or_else(invalid)?;
-        if let Some(header) = header
-            && !self.store.publish_source_interface_heritage_header(
-                type_,
-                header,
-                self.global_types
-                    .as_ref()
-                    .map(CanonicalArrayTargets::from_global_types),
-            )
-        {
-            return Err(invalid());
+        if let Some(header) = header {
+            self.prepare_cached_mapped_interface_aliases(type_, &header)?;
+            let context = self.source_query_context()?;
+            if !self
+                .store
+                .publish_source_interface_heritage_header_with_query_context(
+                    type_,
+                    header,
+                    self.global_types
+                        .as_ref()
+                        .map(CanonicalArrayTargets::from_global_types),
+                    Some(&context.heritage()),
+                )
+            {
+                return Err(invalid());
+            }
         }
         Ok(type_)
     }
@@ -44102,11 +44191,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 self.store, self.host, symbol, flags,
             )?
             .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery))?;
-            if !self.store.publish_source_interface_heritage_header(
-                identity,
-                header.clone(),
-                arrays,
-            ) {
+            self.prepare_cached_mapped_interface_aliases(identity, &header)?;
+            let context = self.source_query_context()?;
+            if !self
+                .store
+                .publish_source_interface_heritage_header_with_query_context(
+                    identity,
+                    header.clone(),
+                    arrays,
+                    Some(&context.heritage()),
+                )
+            {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::InvalidPreparedTypeQuery,
                 ));
@@ -45374,13 +45469,26 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         {
             if flags.contains(SymbolFlags::INTERFACE) && !flags.contains(SymbolFlags::CLASS) {
                 if let Some(header) = plan.interface_headers.get(&symbol) {
-                    if !self.store.publish_source_interface_heritage_header(
-                        declared_type,
-                        header.clone(),
-                        self.global_types
-                            .as_ref()
-                            .map(CanonicalArrayTargets::from_global_types),
-                    ) {
+                    self.prepare_cached_mapped_interface_aliases(declared_type, header)?;
+                    let context = if self.global_types.is_some() {
+                        Some(self.source_query_context()?)
+                    } else {
+                        None
+                    };
+                    if !self
+                        .store
+                        .publish_source_interface_heritage_header_with_query_context(
+                            declared_type,
+                            header.clone(),
+                            self.global_types
+                                .as_ref()
+                                .map(CanonicalArrayTargets::from_global_types),
+                            context
+                                .as_ref()
+                                .map(SourceTypeQueryContext::heritage)
+                                .as_ref(),
+                        )
+                    {
                         return Err(type_node_unavailable(
                             TypeNodeUnavailable::InvalidPreparedTypeQuery,
                         ));
@@ -45566,14 +45674,23 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .global_types
             .as_ref()
             .map(CanonicalArrayTargets::from_global_types);
+        let context = if self.global_types.is_some() {
+            Some(self.source_query_context()?)
+        } else {
+            None
+        };
         let mut fallback = InstantiationSession::new(InstantiationLimits::default());
-        super::interface_heritage::resolve_interface_alias_base_members(
+        super::interface_heritage::resolve_interface_alias_base_members_with_query_context(
             self.store,
             type_,
             arrays,
             self.instantiation_session
                 .as_deref_mut()
                 .unwrap_or(&mut fallback),
+            context
+                .as_ref()
+                .map(SourceTypeQueryContext::heritage)
+                .as_ref(),
         )?;
         Ok(Some(type_))
     }
@@ -53386,21 +53503,55 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         },
                     ));
                 }
+                let source_context =
+                    if self.global_types.is_some() && self.instantiation_session.is_some() {
+                        Some(self.source_query_context()?)
+                    } else {
+                        None
+                    };
                 let mut fallback = InstantiationSession::new(InstantiationLimits::default());
                 let session = self
                     .instantiation_session
                     .as_deref_mut()
                     .unwrap_or(&mut fallback);
                 let mark = session.limit_event_mark();
-                let instantiated = super::instantiate::instantiate_type_with_vector_and_session(
-                    self.store,
-                    declared_type,
-                    &type_parameters,
-                    &type_arguments,
-                    arrays,
-                    session,
-                )
-                .map_err(|_| invalid_cache())?;
+                let result = if let Some(context) = source_context {
+                    let globals = context.globals.clone();
+                    let mut source = SourceTypeQueryAdapter {
+                        context,
+                        diagnostics: self.diagnostics,
+                    };
+                    let result = super::instantiate::instantiate_type_with_vector_and_source(
+                        self.store,
+                        declared_type,
+                        &type_parameters,
+                        &type_arguments,
+                        &globals,
+                        session,
+                        &mut source,
+                    );
+                    self.global_this_members = source.context.members;
+                    self.completed_source_conditionals = source.context.completed;
+                    self.new_source_conditionals.extend(source.context.produced);
+                    self.completed_global_values = source.context.values;
+                    self.source_branch_recoveries = source.context.recoveries;
+                    self.source_conditional_recoveries = source.context.semantic_results;
+                    self.completed_source_returns = source.context.returns;
+                    result
+                } else {
+                    super::instantiate::instantiate_type_with_vector_and_session(
+                        self.store,
+                        declared_type,
+                        &type_parameters,
+                        &type_arguments,
+                        arrays,
+                        session,
+                    )
+                };
+                let instantiated = result.map_err(|error| match error {
+                    super::instantiate::InstantiationError::Declared(error) => error,
+                    _ => invalid_cache(),
+                })?;
                 if session.limit_event_occurred_since(mark) {
                     return Ok(instantiated);
                 }
