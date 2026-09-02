@@ -6621,7 +6621,7 @@ fn instantiate_function_member_type(
         .as_ref()
         .map_or(Some(ObjectFlags::ANONYMOUS), |arguments| {
             function_alias_instance_flags(store, arguments)
-                .map(|flags| flags.without(ObjectFlags::MEMBERS_RESOLVED))
+                .map(|flags| flags & !ObjectFlags::MEMBERS_RESOLVED)
         })
         .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(source))?;
     let callable = store
