@@ -25,14 +25,15 @@ The evidence reader passed. The independent result review and separate
 resource check are closed for this project run.
 
 The newer compiler build failed with Rust error E0308. A function-body parent
-check compares a `SourceNodeParent` with a `NodeRef`. The small repair must
-wrap the node in `SourceNodeParent::Parent` and retain the identity check.
+check compares a `SourceNodeParent` with a `NodeRef`. The one-line repair is
+committed and reviewed. It wraps the node in `SourceNodeParent::Parent` and
+retains the identity check. A new build has not verified this repair yet.
 The duplicate 510-test build is on hold. It was not submitted.
 
 | Measurement | Result |
 | --- | --- |
 | [Combined tests 11](../target/wave202-pathe-demo-tests-11-result.md), `2f8ae108` | All 500 ran. 425 pass, 75 fail. Four earlier failures fixed, no earlier pass lost. Main and resource reviews are closed. |
-| [Ordinary compiler build 11](../target/wave202-pathe-demo-bin-11-main-result.md), `84f3a17a` | Build failed with E0308 after 37.648 seconds. No tests or project checks ran. The separate resource check is pending. |
+| [Ordinary compiler build 11](../target/wave202-pathe-demo-bin-11-main-result.md), `84f3a17a` | Build failed with E0308 after 37.648 seconds. No tests or project checks ran. The resource audit ran. Its evidence review is pending. |
 | [Ordinary compiler build 10](../target/wave202-pathe-demo-bin-10-main-result.md), `c9258a43` | Build passed in 74.660 seconds. Main and separate resource reviews are closed. A build is not a project pass. |
 | [Pathe census 10](../target/wave202-pathe-demo-census-10-result.md), `c9258a43` | Zero of nine roots complete. All nine and the ordinary attempt are unsupported. The oracle stage took 22.584 seconds. Main and resource reviews are closed. |
 | [Previous combined tests 10](../target/wave202-pathe-demo-tests-10-result.md), `c9258a43` | 419 of 496 passed. Main and separate resource reviews are closed. This is the comparison set for Tests11. |
@@ -74,21 +75,24 @@ route to a complete demo. Neither Pathe nor UFO is a proved near-pass yet.
    still stops in arrows, function bodies, a binary expression, an import and
    cold alias resolution. Check which pending changes address those exact
    paths. Do not infer a cause from the outer error label.
-2. Fix the parent-node comparison before another build. Keep the failed
-   source and its evidence unchanged. The compiler repair has a separate
-   worktree and a one-line scope.
-3. Prepare the next combined source. The reviewed `d6133d80` batch has 526
+2. Verify the committed parent-node repair in the next build. Keep the failed
+   source and its evidence unchanged.
+3. Assemble the next combined source. The reviewed `d6133d80` batch has 526
    selected test names. It includes computed-property writes, nullish
    diagnostic text, optional top-level reads and two test-helper repairs.
    It also retains the earlier typed-arrow, loop-local, function-expression,
    namespace and callable-intersection changes. No tests have run on this
-   source. Add the parent-node repair, counted-loop cycle repair and corrected
-   throw-parameter test helper. Keep all existing tests.
+   source. The next reviewed plan combines five complete changes: the parent
+   repair, counted-loop repair, throw-parameter helper, import error records
+   and parameter-default error records. It retains all 526 tests and adds
+   eight loop controls, for a planned selection of 534 tests. Integration
+   is in progress. No result from that batch is available yet.
 4. Build that source, run its retained tests, then check unchanged Pathe.
    Import and parameter-default error records will help locate failures
    that currently lose their inner cause. These records are not semantic
    fixes. A separate diagnosis also finds an unsupported owner path for
-   nested conditional returns. Template branches remain a separate limit.
+   nested conditional returns. That repair and three focused tests are
+   written and under review. Template branches remain a separate limit.
 5. After dependency approval, measure unchanged UFO with the pinned Go and
    Rust compilers. Use its actual first failures to confirm or reject it as
    the second demo target.
@@ -138,8 +142,13 @@ passed independent source review. Its first offline self-check ran once:
 245 checks passed, four failed and one lacked the required historical input.
 These are runner checks, not typechecker tests. The failures cover saved
 command parsing, one negative-test setup and two quote/newline controls.
-The result review and repairs are pending. No compiler pilot has run, no
-current gate changed and no time saving has been measured yet.
+The result review is closed and confirms the failures. A repair plan is in
+progress. No compiler pilot has run, no current gate changed and no time
+saving has been measured yet.
+
+For the next source batch, one combined source-and-stage review replaces two
+separate review steps. Build, test and project-run preparation also proceeds
+in parallel. These changes reduce handoffs. Their time saving is not measured.
 
 ## Demo pass conditions
 
