@@ -11935,10 +11935,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 preflight_class_property_condition_reads(&statements)?;
             }
             for (_, initializer) in &parameter_initializers {
-                collect_class_expression_flow(initializer, &mut points)?;
+                collect_class_expression_flow(initializer, &mut points, &mut conditions)?;
             }
             if let Some(initializer) = &initializer {
-                collect_class_expression_flow(initializer, &mut points)?;
+                collect_class_expression_flow(initializer, &mut points, &mut conditions)?;
             }
             let flow = SourceFlowPlan::preflight_class_body_with_conditions(
                 self.arena,
@@ -33030,7 +33030,7 @@ fn collect_class_statement_flow(
             }
         }
         for expression in expressions {
-            collect_class_expression_flow(expression, points)?;
+            collect_class_expression_flow(expression, points, conditions)?;
         }
     }
     Ok(())
@@ -33066,6 +33066,7 @@ fn preflight_class_property_condition_reads(
 fn collect_class_expression_flow(
     expression: &PlannedExpression,
     points: &mut Vec<NodeRef>,
+    conditions: &mut Vec<SourceFlowCondition>,
 ) -> Result<(), SourceCheckError> {
     for expression in class_expression_nodes(expression)? {
         if matches!(
@@ -33078,6 +33079,18 @@ fn collect_class_expression_flow(
         }
         if let PlannedExpressionKind::New(construction) = &expression.kind {
             points.push(construction.constructor());
+        }
+        if let PlannedExpressionKind::Property(property) = &expression.kind
+            && let Some(nodes) = property.optional_read_flow_conditions()
+        {
+            for node in nodes {
+                if !conditions
+                    .iter()
+                    .any(|condition| condition.expression() == node)
+                {
+                    conditions.push(SourceFlowCondition::Unchanged(node));
+                }
+            }
         }
     }
     Ok(())

@@ -219,6 +219,14 @@ pub(super) struct SourcePropertyPlan {
     class_access: Option<ClassAccessContext>,
 }
 
+impl SourcePropertyPlan {
+    /// These read-only optional-chain branches do not change surrounding values.
+    pub(super) fn optional_read_flow_conditions(&self) -> Option<[NodeRef; 2]> {
+        (self.optional && matches!(self.receiver.kind, PlannedExpressionKind::Identifier(_)))
+            .then_some([self.receiver.node, self.node])
+    }
+}
+
 /// Class receiver facts proven from the registered source and binder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ClassAccessContext {
