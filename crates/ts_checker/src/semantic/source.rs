@@ -11768,6 +11768,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 self.source_class_imports,
             )
         };
+        if let Err(error) = &source {
+            eprintln!(
+                "source_class_plan_failure source={:?} declaration={declaration:?} symbol={symbol:?} error={error:?}",
+                self.source.node_ref(),
+            );
+        }
         let source = match source {
             Ok(source) => source,
             Err(
