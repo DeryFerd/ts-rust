@@ -2368,7 +2368,7 @@ fn plan_identifier_read_worker(
             },
         ));
     }
-    if variable_binding_flags(flags).is_none() {
+    if authenticated_variable_binding_flags(store, routed.target).is_none() {
         return Err(VariablePlanError::Unsupported(
             VariableUnsupported::NonVariableSymbol {
                 node,
@@ -2667,6 +2667,7 @@ fn route_value_symbol(
                 && !record.export_symbol().is_some_and(|target| {
                     record.declarations().is_some_and(|declarations| {
                         store.source_exported_overload_local(target, declarations) == Some(resolved)
+                            || merged_type_value_export_local_is_exact(store, resolved, target)
                     })
                 })
             || record.value_declaration().is_some()
@@ -2723,7 +2724,7 @@ fn validate_variable_target(
     let record = store
         .symbol(symbol)
         .ok_or(VariableInvariant::InvalidSymbol(symbol))?;
-    if variable_binding_flags(record.flags()) != Some(expected_flags) {
+    if authenticated_variable_binding_flags(store, symbol) != Some(expected_flags) {
         return Err(VariablePlanError::Unsupported(
             VariableUnsupported::NonVariableSymbol {
                 node: declaration,
@@ -2796,6 +2797,128 @@ fn variable_binding_flags(flags: SymbolFlags) -> Option<SymbolFlags> {
     (flags.without(allowed) == SymbolFlags::NONE).then_some(binding)
 }
 
+/// Selects the two namespaces without changing the binder's flags or declaration order.
+pub(super) fn merged_type_value_declarations(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> Option<(NodeRef, NodeRef)> {
+    let record = store.symbol(symbol)?;
+    let binding = record.flags().without(SymbolFlags::TYPE_ALIAS);
+    if !record.flags().contains(SymbolFlags::TYPE_ALIAS)
+        || !matches!(
+            binding,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE
+        )
+        || record.check_flags() != CheckFlags::NONE
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || !store.source_symbol_declarations_match(symbol)
+        || store.source_symbol_flags(symbol) != Some(record.flags())
+    {
+        return None;
+    }
+    let [first, second] = record.declarations()? else {
+        return None;
+    };
+    let (value, alias) = match (
+        store.source_node_kind(*first)?,
+        store.source_node_kind(*second)?,
+    ) {
+        (SyntaxKind::VariableDeclaration, SyntaxKind::TypeAliasDeclaration) => (*first, *second),
+        (SyntaxKind::TypeAliasDeclaration, SyntaxKind::VariableDeclaration) => (*second, *first),
+        _ => return None,
+    };
+    if !value.is_for(alias.arena, alias.file) || record.value_declaration() != Some(value) {
+        return None;
+    }
+    for declaration in [value, alias] {
+        let name = store
+            .source_direct_children(declaration)?
+            .into_iter()
+            .find(|child| store.source_node_kind(*child) == Some(SyntaxKind::Identifier))?;
+        if store.source_node_parent(name) != Some(SourceNodeParent::Parent(declaration))
+            || store.source_identifier_text(name) != record.name().as_utf8()
+        {
+            return None;
+        }
+    }
+    let SourceNodeParent::Parent(source) = store.source_node_parent(alias)? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(list) = store.source_node_parent(value)? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(statement) = store.source_node_parent(list)? else {
+        return None;
+    };
+    if store.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+        || store.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+        || store.source_node_kind(statement) != Some(SyntaxKind::VariableStatement)
+        || store.source_node_parent(statement) != Some(SourceNodeParent::Parent(source))
+    {
+        return None;
+    }
+    Some((value, alias))
+}
+
+fn authenticated_variable_binding_flags(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> Option<SymbolFlags> {
+    let flags = store.symbol(symbol)?.flags();
+    variable_binding_flags(flags).or_else(|| {
+        merged_type_value_declarations(store, symbol).map(|_| flags & SymbolFlags::VARIABLE)
+    })
+}
+
+fn merged_type_value_export_local_is_exact(
+    store: &CanonicalTypeMapperStore,
+    local: SemanticSymbolId,
+    target: SemanticSymbolId,
+) -> bool {
+    let Some((_, _)) = merged_type_value_declarations(store, target) else {
+        return false;
+    };
+    let Some(local_record) = store.symbol(local) else {
+        return false;
+    };
+    local_record.flags() == SymbolFlags::EXPORT_VALUE
+        && local_record.export_symbol() == Some(target)
+        && local_record.declarations()
+            == store.symbol(target).and_then(|record| record.declarations())
+        && store.source_symbol_declarations_match(local)
+        && store.source_symbol_flags(local) == Some(SymbolFlags::EXPORT_VALUE)
+}
+
+pub(super) fn merged_type_value_read(
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    resolved: SemanticSymbolId,
+) -> Option<PlannedIdentifierRead> {
+    let routed = route_value_symbol(store, node, resolved).ok()?;
+    let (value, alias) = merged_type_value_declarations(store, routed.target)?;
+    if !value.is_for(bound.source_file().arena, bound.source_file().file)
+        || bound.symbol(value) != Some(routed.target)
+        || bound.symbol(alias) != Some(routed.target)
+        || bound.local_symbol(value) != routed.export_local
+        || bound.local_symbol(alias) != routed.export_local
+    {
+        return None;
+    }
+    if let Some(local) = routed.export_local {
+        let name = store.symbol(routed.target)?.name().as_utf8()?;
+        validate_export_local(store, local, value, routed.target, name).ok()?;
+    }
+    validate_target_parent(bound, store, routed.target, routed.export_local.is_some()).ok()?;
+    Some(PlannedIdentifierRead {
+        resolved_symbol: resolved,
+        value_symbol: routed.target,
+    })
+}
+
 fn is_nonambient_variable_declaration(
     bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
@@ -2835,6 +2958,11 @@ fn single_variable_declaration(
     allow_parameter: bool,
     allow_recovered_redeclarations: bool,
 ) -> Result<NodeRef, VariablePlanError> {
+    if flags.contains(SymbolFlags::TYPE_ALIAS) {
+        return merged_type_value_declarations(store, symbol)
+            .map(|(value, _)| value)
+            .ok_or_else(|| VariableInvariant::InvalidSymbolShape(symbol).into());
+    }
     if allow_parameter
         && flags == SymbolFlags::FUNCTION_SCOPED_VARIABLE
         && let Some(parameter) = declarations.first().copied()
@@ -2903,6 +3031,7 @@ fn validate_export_local(
         || record.check_flags() != CheckFlags::NONE
         || record.name().as_bytes() != name.as_bytes()
         || record.declarations() != Some(&[declaration])
+            && !merged_type_value_export_local_is_exact(store, local, target)
         || record.value_declaration().is_some()
         || record.members().is_some()
         || record.exports().is_some()

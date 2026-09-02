@@ -3032,7 +3032,7 @@ impl TypeQueryPlan {
                 && (store
                     .symbol_node_links(query.name)
                     .and_then(|links| links.resolved_symbol)
-                    != Some(query.symbol)
+                    != Some(query.resolved_symbol)
                     || query.type_.is_some_and(|expected| expected != type_))
             {
                 return Err(invalid());
@@ -4718,6 +4718,20 @@ impl SourceAliasOperandSource {
     }
 }
 
+fn type_alias_declaration(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> Option<NodeRef> {
+    if store.symbol(symbol)?.flags().intersects(SymbolFlags::VARIABLE) {
+        return super::variables::merged_type_value_declarations(store, symbol)
+            .map(|(_, alias)| alias);
+    }
+    let [declaration] = store.symbol(symbol)?.declarations()? else {
+        return None;
+    };
+    Some(*declaration)
+}
+
 fn plan_type_alias_header(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -4731,12 +4745,11 @@ fn plan_type_alias_header(
             TypeNodeUnavailable::InvalidTypeAliasSymbol(symbol),
         ));
     }
-    let Some([declaration]) = record.declarations() else {
+    let Some(declaration) = type_alias_declaration(store, symbol) else {
         return Err(type_node_unavailable(
             TypeNodeUnavailable::InvalidTypeAliasSymbol(symbol),
         ));
     };
-    let declaration = *declaration;
     let invalid = || {
         type_node_unavailable(TypeNodeUnavailable::InvalidTypeAliasDeclaration(
             declaration,
@@ -6931,6 +6944,7 @@ struct PlannedArrayType {
 struct PlannedValueTypeQuery {
     name: NodeRef,
     symbol: SemanticSymbolId,
+    resolved_symbol: SemanticSymbolId,
     source_node: Option<NodeRef>,
     type_: Option<TypeId>,
 }
@@ -8197,11 +8211,7 @@ fn cached_type_alias_worker(
     let Some(links) = store.type_alias_links(symbol) else {
         return Ok(None);
     };
-    if store
-        .symbol(symbol)
-        .and_then(|symbol| symbol.declarations())
-        .is_none_or(|declarations| declarations.len() != 1)
-    {
+    if type_alias_declaration(store, symbol).is_none() {
         return Err(type_node_unavailable(
             TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
         ));
@@ -8414,14 +8424,9 @@ fn cached_alias_parameter_symbols(
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
 ) -> Result<Option<Vec<SemanticSymbolId>>, DeclaredTypeError> {
-    let declaration = store
-        .symbol(symbol)
-        .and_then(|symbol| symbol.declarations())
-        .and_then(|declarations| declarations.first())
-        .copied()
-        .ok_or_else(|| {
-            type_node_unavailable(TypeNodeUnavailable::MissingTypeAliasDeclaration(symbol))
-        })?;
+    let declaration = type_alias_declaration(store, symbol).ok_or_else(|| {
+        type_node_unavailable(TypeNodeUnavailable::MissingTypeAliasDeclaration(symbol))
+    })?;
     if host.source(declaration).is_none() {
         return Ok(None);
     }
@@ -18411,13 +18416,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
             ));
         }
-        let Some(declaration) = self
-            .store
-            .symbol(symbol)
-            .and_then(|symbol| symbol.declarations())
-            .and_then(|declarations| declarations.first())
-            .copied()
-        else {
+        let Some(declaration) = type_alias_declaration(self.store, symbol) else {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
             ));
@@ -19280,13 +19279,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
                 return self.validate_empty_host_alias_source(root_symbol, symbol);
             }
-            let declaration = self
-                .store
-                .symbol(symbol)
-                .and_then(|record| record.declarations())
-                .and_then(|declarations| declarations.first())
-                .copied()
-                .expect("the current alias declaration is available");
+            let declaration = type_alias_declaration(self.store, symbol).ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
+            })?;
             let alias =
                 authenticated_type_alias_declaration(self.store, self.host, declaration, symbol)?
                     .ok_or_else(|| {
@@ -21514,20 +21509,29 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             Err(error) => return Err(error.into()),
         };
+        let resolved_symbol = symbol;
+        let merged_read = super::variables::merged_type_value_read(bound, self.store, name, symbol);
+        let symbol = merged_read.map_or(symbol, |read| read.value_symbol);
         let symbol_record = self.store.symbol(symbol).ok_or_else(invalid)?;
         if symbol_record.flags().intersects(SymbolFlags::ALIAS) {
             return self.plan_namespace_alias_type_query(node, name, symbol);
         }
-        let Some([declaration]) = symbol_record.declarations() else {
-            return Err(unsupported());
+        let declaration = if merged_read.is_some() {
+            super::variables::merged_type_value_declarations(self.store, symbol)
+                .ok_or_else(unsupported)?
+                .0
+        } else {
+            let Some([declaration]) = symbol_record.declarations() else {
+                return Err(unsupported());
+            };
+            *declaration
         };
-        let declaration = *declaration;
         let class_symbol = symbol_record.flags() == SymbolFlags::CLASS;
         if !declaration.is_for(node.arena, node.file)
             || symbol_record.value_declaration() != Some(declaration)
             || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
             || symbol_record.check_flags() != ts_binder::CheckFlags::NONE
-            || symbol_record.parent().is_some()
+            || symbol_record.parent().is_some() && merged_read.is_none()
             || !class_symbol
                 && (symbol_record.members().is_some() || symbol_record.exports().is_some())
             || symbol_record.export_symbol().is_some()
@@ -21567,7 +21571,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         };
 
         let mut annotation_identity = None;
-        let (source_node, type_) = match (&declaration_record.data, symbol_record.flags()) {
+        let value_flags = if merged_read.is_some() {
+            symbol_record.flags() & SymbolFlags::VARIABLE
+        } else {
+            symbol_record.flags()
+        };
+        let (source_node, type_) = match (&declaration_record.data, value_flags) {
             (NodeData::ClassDeclaration(_), SymbolFlags::CLASS)
                 if declaration_record.kind == SyntaxKind::ClassDeclaration
                     && declaration_record.parent == Some(bound.source_file().node) =>
@@ -21830,7 +21839,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .symbol_node_links(node)
                 .is_some_and(|links| links.resolved_symbol.is_some())
             || cached_type.is_some_and(|cached| Some(cached) != type_.or(annotation_identity))
-            || cached_symbol.is_some_and(|cached| cached != symbol)
+            || cached_symbol.is_some_and(|cached| cached != resolved_symbol)
             || cached_type.is_some() != cached_symbol.is_some()
         {
             return Err(invalid());
@@ -21839,6 +21848,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let planned = PlannedValueTypeQuery {
             name,
             symbol,
+            resolved_symbol,
             source_node,
             type_,
         };
@@ -22267,6 +22277,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let query = PlannedValueTypeQuery {
             name,
             symbol: alias,
+            resolved_symbol: alias,
             source_node: None,
             type_,
         };
@@ -22615,6 +22626,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let planned = PlannedValueTypeQuery {
             name,
             symbol,
+            resolved_symbol: symbol,
             source_node: Some(annotation),
             type_: annotation_type,
         };
@@ -22729,6 +22741,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let query = PlannedValueTypeQuery {
             name,
             symbol,
+            resolved_symbol: symbol,
             source_node: None,
             type_,
         };
@@ -33376,7 +33389,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 type_node_unavailable(TypeNodeUnavailable::MissingTypeAliasDeclaration(symbol))
             })?
             .to_vec();
-        if declarations.len() != 1 {
+        if declarations.len() != 1
+            && super::variables::merged_type_value_declarations(self.store, symbol).is_none()
+        {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidTypeAliasSymbol(symbol),
             ));
@@ -42699,12 +42714,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         symbol: SemanticSymbolId,
     ) -> Result<TypeId, DeclaredTypeError> {
-        if let Some([declaration]) = self
-            .store
-            .symbol(symbol)
-            .and_then(|record| record.declarations())
+        if let Some(declaration) = type_alias_declaration(self.store, symbol)
             && let Some(alias) =
-                authenticated_type_alias_declaration(self.store, self.host, *declaration, symbol)?
+                authenticated_type_alias_declaration(self.store, self.host, declaration, symbol)?
         {
             self.check_type_node_declaration_children(NodeRef::new(
                 declaration.arena,
@@ -48794,7 +48806,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .symbol_node_links(node)
             .is_some_and(|links| links.resolved_symbol.is_some())
             || cached_type.is_some_and(|cached| cached != expected)
-            || cached_symbol.is_some_and(|cached| cached != query.symbol)
+            || cached_symbol.is_some_and(|cached| cached != query.resolved_symbol)
             || cached_type.is_some() != cached_symbol.is_some()
         {
             return Err(invalid());
@@ -48808,7 +48820,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .symbol_node_links(query.name)
             .cloned()
             .unwrap_or_default();
-        symbol_links.resolved_symbol = Some(query.symbol);
+        symbol_links.resolved_symbol = Some(query.resolved_symbol);
         if !self.store.set_symbol_node_links(query.name, symbol_links) {
             return Err(invalid());
         }
