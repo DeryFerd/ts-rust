@@ -2752,6 +2752,7 @@ struct ClassBodyExecutionContext<'plan, 'graph, 'execution> {
     flow: ClassInitializationFrame<'plan, 'graph>,
     state: &'execution mut ClassBodyExecutionState<'plan>,
     property_diagnostics: &'execution mut Vec<DeferredClassPropertyDiagnostic>,
+    is_async: bool,
 }
 
 #[derive(Default)]
@@ -28460,6 +28461,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SyntaxKind::FunctionDeclaration
                     | SyntaxKind::FunctionExpression
                     | SyntaxKind::ArrowFunction
+                    | SyntaxKind::MethodDeclaration
             ) {
                 break parent;
             }
@@ -28472,17 +28474,33 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             current = parent;
         };
-        let owner = self.bound.symbol(callable).ok_or_else(|| {
-            self.unsupported(
-                expression,
-                SyntaxKind::AwaitExpression,
-                SourceSyntaxRole::VariableInitializer,
-            )
-        })?;
-        let planned = plan_source_callable(store, host, callable, owner, self.array_targets)
-            .map_err(Self::callable_plan_error)?;
-        if !planned.is_async
-            || planned.body_mode != SourceCallableBodyMode::Present
+        let is_async = if self.node(callable)?.kind == SyntaxKind::MethodDeclaration {
+            let Some(body) = self
+                .class_body
+                .as_ref()
+                .filter(|body| body.declaration == callable)
+            else {
+                return Err(self.unsupported(
+                    expression,
+                    SyntaxKind::AwaitExpression,
+                    SourceSyntaxRole::VariableInitializer,
+                ));
+            };
+            super::classes::source_class_body_is_async(store, host, body)
+                .map_err(|error| Self::class_plan_error(callable, error))?
+        } else {
+            let owner = self.bound.symbol(callable).ok_or_else(|| {
+                self.unsupported(
+                    expression,
+                    SyntaxKind::AwaitExpression,
+                    SourceSyntaxRole::VariableInitializer,
+                )
+            })?;
+            let planned = plan_source_callable(store, host, callable, owner, self.array_targets)
+                .map_err(Self::callable_plan_error)?;
+            planned.is_async && planned.body_mode == SourceCallableBodyMode::Present
+        };
+        if !is_async
             || self.bound.container(expression) != Some(callable)
             || self.bound.container(operand) != Some(callable)
         {
@@ -32953,7 +32971,12 @@ fn class_expression_nodes(
     let mut pending = vec![expression];
     let mut nodes = Vec::new();
     while let Some(expression) = pending.pop() {
-        if expression.awaited || expression.promise_call.is_some() {
+        if expression.promise_call.is_some()
+            || expression.awaited
+                && (!matches!(expression.kind, PlannedExpressionKind::Parenthesized(_))
+                    || expression.non_null_assertion
+                    || expression.jsdoc_type.is_some())
+        {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Class(expression.node),
             ));
@@ -38392,7 +38415,11 @@ fn check_expression_type_with_capture_context(
             class_flow.as_deref_mut(),
             arrow_capture,
         )?;
-        let awaited = source_awaited_expression_type(store, expression.node, checked.result)?;
+        let awaited = if class_flow.as_ref().is_some_and(|context| context.is_async) {
+            source_class_awaited_expression_type(store, expression.node, checked.result)?
+        } else {
+            source_awaited_expression_type(store, expression.node, checked.result)?
+        };
         preflight_source_expression_cache(store, expression.node, awaited)?;
         publish_expression_type(store, expression.node, awaited)?;
         return Ok(CheckedExpressionTypes::leaf(awaited, awaited));
@@ -42078,10 +42105,13 @@ fn check_planned_class_body(
         }
         let flow = ClassInitializationFrame::new(body, &planned.flow, bound, access.clone(), base)
             .map_err(|error| class_body_flow_error(body.declaration, error))?;
+        let is_async = super::classes::source_class_body_is_async(store, host, body)
+            .map_err(|error| SourcePlanner::class_plan_error(body.declaration, error))?;
         let mut context = ClassBodyExecutionContext {
             flow,
             state: &mut *state,
             property_diagnostics: &mut body_diagnostics.properties,
+            is_async,
         };
         let mut parameter_flow = context.state.base_flow_types.clone();
         for (index, parameter) in body.parameters.iter().enumerate() {
@@ -42134,6 +42164,13 @@ fn check_planned_class_body(
                 .map_err(SourceCheckError::from)
             })
             .transpose()?;
+        let return_type = if is_async {
+            return_type
+                .map(|declared| source_async_class_return_type(store, body, declared))
+                .transpose()?
+        } else {
+            return_type
+        };
         let property_type = if let Some(initializer) = &planned.initializer {
             let flow_types = context.state.base_flow_types.clone();
             let type_ = if let Some(target) = return_type {
@@ -42297,7 +42334,20 @@ fn check_planned_class_body(
                     UnionReduction::Subtype,
                 )?
             };
-            Some(inferred)
+            Some(if is_async {
+                source_async_inferred_return_type(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    body.declaration,
+                    inferred,
+                )?
+            } else {
+                inferred
+            })
         } else {
             if let Some(type_) = return_type
                 && !matches!(body.kind, ClassBodyKind::PropertyInitializer { .. })
@@ -42864,7 +42914,42 @@ fn check_class_statements(
                     .snapshot_at(store, global_types, *statement)
                     .map_err(|error| class_body_flow_error(*statement, error))?;
                 if let Some(expression) = expression {
-                    let type_ = if let Some(target) = return_type {
+                    let type_ = if context.is_async {
+                        let checked = check_expression_type_with_class_context(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            snapshot.types(),
+                            type_import_execution,
+                            expression,
+                            return_type,
+                            deferred,
+                            Some(&mut *context),
+                        )?;
+                        let actual = source_class_awaited_expression_type(
+                            store,
+                            expression.node,
+                            checked.result,
+                        )?;
+                        if let Some(expected) = return_type {
+                            check_callable_statement_bare_return(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                session,
+                                diagnostics,
+                                *statement,
+                                actual,
+                                expected,
+                            )?;
+                        }
+                        actual
+                    } else if let Some(target) = return_type {
                         check_assignment_to_type_with_class_context(
                             store,
                             host,
@@ -63695,7 +63780,89 @@ fn source_callable_inferred_return_type(
         return Ok(inferred);
     }
 
-    let inferred = source_awaited_expression_type(store, callable.declaration, inferred)?;
+    source_async_inferred_return_type(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        callable.declaration,
+        inferred,
+    )
+}
+
+fn source_async_class_return_type(
+    store: &CanonicalTypeMapperStore,
+    body: &ClassBodyPlan,
+    declared: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let invalid =
+        || SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(body.declaration));
+    let promise = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("Promise"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let reference = validate_direct_generic_reference(store, declared).map_err(|_| invalid())?;
+    if reference.type_arguments.len() != 1
+        || store
+            .type_payload(reference.target)
+            .and_then(TypeRecord::symbol)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(promise)
+        || store
+            .declared_type_links(promise)
+            .and_then(|links| links.declared_type)
+            != Some(reference.target)
+    {
+        return Err(invalid());
+    }
+    source_class_awaited_expression_type(store, body.declaration, declared)
+}
+
+/// Keep class async checking within the existing Promise resolver's proven
+/// cases. Objects, type parameters and Promise unions need general Awaited support.
+fn source_class_awaited_expression_type(
+    store: &CanonicalTypeMapperStore,
+    expression: NodeRef,
+    type_: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let awaited = source_awaited_expression_type(store, expression, type_)?;
+    let scalar = |type_| {
+        store.type_payload(type_).is_some_and(|record| {
+            record.flags().intersects(
+                TypeFlags::PRIMITIVE | TypeFlags::ANY | TypeFlags::UNKNOWN | TypeFlags::NEVER,
+            )
+        })
+    };
+    if scalar(awaited)
+        || store.type_payload(awaited).is_some_and(|record| {
+            matches!(record.data(), TypeData::Union(union)
+                if union.union.types.iter().copied().all(scalar))
+        })
+    {
+        Ok(awaited)
+    } else {
+        Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Class(expression),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_async_inferred_return_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    declaration: NodeRef,
+    inferred: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let inferred = source_awaited_expression_type(store, declaration, inferred)?;
     session.reset_query();
     let mut promise_diagnostics = CanonicalCheckerDiagnostics::default();
     let promise = CanonicalTypeQuery::new_with_global_types_and_session(

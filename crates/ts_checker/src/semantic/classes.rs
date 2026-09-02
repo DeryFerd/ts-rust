@@ -10768,6 +10768,27 @@ fn class_property_modifiers(
     modifiers: Option<&ts_ast::ModifierList>,
     auto_accessor: Option<MergedAutoAccessorClass>,
 ) -> Result<(ClassPropertySide, bool), ClassError> {
+    class_member_modifiers(
+        store,
+        host,
+        declaration,
+        name,
+        modifiers,
+        auto_accessor,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn class_member_modifiers(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    name: NodeRef,
+    modifiers: Option<&ts_ast::ModifierList>,
+    auto_accessor: Option<MergedAutoAccessorClass>,
+    allow_async_method: bool,
+) -> Result<(ClassPropertySide, bool), ClassError> {
     let Some(modifiers) = modifiers else {
         return Ok((ClassPropertySide::Instance, false));
     };
@@ -10793,6 +10814,17 @@ fn class_property_modifiers(
         [SyntaxKind::PublicKeyword | SyntaxKind::PrivateKeyword | SyntaxKind::ProtectedKeyword] => {
             (ClassPropertySide::Instance, false)
         }
+        [SyntaxKind::AsyncKeyword]
+        | [
+            SyntaxKind::PublicKeyword | SyntaxKind::PrivateKeyword | SyntaxKind::ProtectedKeyword,
+            SyntaxKind::AsyncKeyword,
+        ] if allow_async_method => (ClassPropertySide::Instance, false),
+        [SyntaxKind::StaticKeyword, SyntaxKind::AsyncKeyword]
+        | [
+            SyntaxKind::PublicKeyword | SyntaxKind::PrivateKeyword | SyntaxKind::ProtectedKeyword,
+            SyntaxKind::StaticKeyword,
+            SyntaxKind::AsyncKeyword,
+        ] if allow_async_method => (ClassPropertySide::Static, false),
         [SyntaxKind::AbstractKeyword]
         | [
             SyntaxKind::PublicKeyword | SyntaxKind::ProtectedKeyword,
@@ -10902,6 +10934,52 @@ fn class_property_modifiers(
         return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
     }
     Ok(supported)
+}
+
+/// Reads async status only for the method represented by this checked body.
+pub(super) fn source_class_body_is_async(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    body: &ClassBodyPlan,
+) -> Result<bool, ClassError> {
+    let ClassBodyKind::Method { symbol, side } = body.kind else {
+        return Ok(false);
+    };
+    let invalid = || invariant(ClassInvariant::InvalidDeclaration(body.declaration));
+    let record = preflight_node(store, host, body.declaration)?;
+    let NodeData::MethodDeclaration(method) = &record.data else {
+        return Err(invalid());
+    };
+    if record.kind != SyntaxKind::MethodDeclaration
+        || record.parent != Some(body.class_declaration.node)
+        || method.body != Some(body.body.node)
+        || bound_symbol(store, host, body.declaration) != Some(symbol)
+        || !class_member_parent_matches(store, symbol, body.class_symbol)
+    {
+        return Err(invalid());
+    }
+    let (actual_side, readonly) = class_member_modifiers(
+        store,
+        host,
+        body.declaration,
+        NodeRef::new(body.declaration.arena, body.declaration.file, method.name),
+        method.modifiers.as_ref(),
+        None,
+        true,
+    )?;
+    if actual_side != side || readonly {
+        return Err(invalid());
+    }
+    Ok(method.modifiers.as_ref().is_some_and(|modifiers| {
+        modifiers.list.nodes.iter().any(|modifier| {
+            host.node(NodeRef::new(
+                body.declaration.arena,
+                body.declaration.file,
+                *modifier,
+            ))
+            .is_some_and(|modifier| modifier.kind == SyntaxKind::AsyncKeyword)
+        })
+    }))
 }
 
 fn class_constructor_visibility(
@@ -14842,13 +14920,14 @@ fn plan_method_with_body_mode(
     {
         return Err(invariant(ClassInvariant::InvalidName(name_node)));
     }
-    let (side, readonly) = class_property_modifiers(
+    let (side, readonly) = class_member_modifiers(
         store,
         host,
         declaration,
         name_node,
         method.modifiers.as_ref(),
         None,
+        source_body && !ambient,
     )?;
     if readonly
         || private
