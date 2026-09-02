@@ -2368,6 +2368,8 @@ fn interface_heritage_property_mismatch_chain_inner(
     if source_property.name() != target_property.name() {
         return Err(invalid_structure(source_type));
     }
+    let method_failure = source_property.flags().contains(SymbolFlags::METHOD)
+        || target_property.flags().contains(SymbolFlags::METHOD);
     let name = target_property
         .name()
         .as_utf8()
@@ -2421,8 +2423,8 @@ fn interface_heritage_property_mismatch_chain_inner(
                     vec![component_display.source, component_display.target],
                 )?);
             }
-            if target.types().contains(&target.declared_type()) {
-                let nested = recursive_assignability_child_chain(
+            let nested = if target.types().contains(&target.declared_type()) {
+                recursive_assignability_child_chain(
                     store,
                     host,
                     global_types,
@@ -2433,10 +2435,17 @@ fn interface_heritage_property_mismatch_chain_inner(
                     active,
                     DiagnosticPropertyMode::InterfaceHeritage,
                     session,
-                )?;
-                if let Some(nested) = nested {
-                    chain.extend(nested);
-                }
+                )?
+            } else {
+                None
+            };
+            if let Some(nested) = nested {
+                chain.extend(nested);
+            } else if method_failure {
+                // A method mismatch needs its actual callable failure detail.
+                return Err(
+                    RelationUnavailable::UnsupportedProperty(failure.source_property).into(),
+                );
             }
             prepend_interface_heritage_property_detail(&mut chain, &name)?;
             chain

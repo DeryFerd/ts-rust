@@ -878,12 +878,15 @@ pub(super) fn resolve_direct_interface_members_with_declared_indexes(
     if let Some(symbol) = own_index_symbol {
         expected_entries.push((InternalSymbolName::Index.as_ref().to_owned(), symbol));
     }
+    let declared_names = seen_names.clone();
     for (planned, surface) in effective_bases.iter().zip(&base_surfaces) {
         for &property in &surface.properties {
             let record = store.symbol(property).ok_or_else(|| invalid(plan, type_))?;
             let name = record.name().to_owned();
             if let Some(previous) = inherited_by_name.get(&name).copied() {
-                if !matching_inherited_property_contract(store, previous, property) {
+                if !declared_names.contains(&name)
+                    && !matching_inherited_property_contract(store, previous, property)
+                {
                     return Err(PropertyObjectError::UnsupportedMember {
                         node: planned.node,
                         kind: SyntaxKind::ExpressionWithTypeArguments,
@@ -931,15 +934,11 @@ pub(super) fn resolve_direct_interface_members_with_declared_indexes(
                 && !base_method
                 && (!property.optional || base_optional)
                 && source_alias_override_types_are_exact(store, own_type, base_type)
-        } else if own_method && base_method {
-            (!property.optional || base_optional)
-                && matching_interface_method_contract(store, property.symbol, base_property)
-        } else if own_method || base_method {
+        } else if own_method != base_method {
             false
         } else {
-            // A declared type must keep its own property even when extension
-            // checking reports an error. The source checker compares the
-            // completed interfaces with its options and caller session.
+            // Keep declared properties and method overloads. The source checker
+            // compares each completed base with its options and caller session.
             true
         };
         if !supported {
@@ -1923,6 +1922,11 @@ fn validate_property_interface_worker(
     let mut inherited_index_infos = Vec::new();
     let mut inherited_call_signatures = Vec::new();
     let mut inherited_by_name = HashMap::new();
+    let declared_names = declared
+        .properties
+        .iter()
+        .map(|property| store.symbol(*property).map(|record| record.name().to_owned()))
+        .collect::<Option<HashSet<_>>>()?;
     let source_bases = heritage_provenance
         .and_then(|provenance| provenance.source.as_ref())
         .map(|header| {
@@ -1987,7 +1991,9 @@ fn validate_property_interface_worker(
         for property in base.properties {
             let name = store.symbol(property)?.name().to_owned();
             if let Some(previous) = inherited_by_name.get(&name).copied() {
-                if !matching_inherited_property_contract(store, previous, property) {
+                if !declared_names.contains(&name)
+                    && !matching_inherited_property_contract(store, previous, property)
+                {
                     return None;
                 }
                 continue;

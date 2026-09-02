@@ -8656,6 +8656,11 @@ pub(super) fn plan_interface(
             )?;
             for previous in &effective_base_properties {
                 for property in &properties {
+                    if find_planned_heritage_property(store, host, &plan.properties, property)?
+                        .is_some()
+                    {
+                        continue;
+                    }
                     let Some(inherited) =
                         find_planned_heritage_property(store, host, previous, property)?
                     else {
@@ -8734,20 +8739,9 @@ pub(super) fn plan_interface(
                 let base_method = store
                     .symbol(base_property.symbol)
                     .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::METHOD));
-                // Property annotations are checked by the source relation after
-                // both interfaces have their real member types. Syntax does not
-                // determine whether a literal satisfies an inherited alias.
-                if (own_method || base_method)
-                    && (!own_method
-                        || !base_method
-                        || property.optional && !base_property.optional
-                        || !matching_planned_interface_method_contract(
-                            store,
-                            host,
-                            property,
-                            base_property,
-                        ))
-                {
+                // Declared properties keep their own types and method overloads.
+                // The source relation checks them against each completed base.
+                if own_method != base_method {
                     return Err(PropertyObjectError::UnsupportedMember {
                         node: property.declaration,
                         kind: store
@@ -8806,7 +8800,7 @@ pub(super) fn check_source_interface_property_heritage(
         )
         .into());
     }
-    // Alias-base and method-only providers still enforce their existing rules.
+    // Alias-base providers still enforce their existing rules.
     if heritage
         .bases
         .iter()
@@ -8859,13 +8853,11 @@ pub(super) fn check_source_interface_property_heritage(
         };
         let table = store.symbol_table(table).ok_or_else(invalid)?;
         let overrides_property = plan.properties.iter().any(|property| {
-            store
-                .symbol(property.symbol)
-                .is_some_and(|record| !record.flags().contains(SymbolFlags::METHOD))
+            store.symbol(property.symbol).is_some()
                 && planned_declared_property_key(store, property)
                     .and_then(|key| table.get(key))
                     .and_then(|symbol| store.symbol(symbol))
-                    .is_some_and(|record| !record.flags().contains(SymbolFlags::METHOD))
+                    .is_some()
         });
         if !overrides_property {
             continue;
