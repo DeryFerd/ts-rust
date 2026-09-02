@@ -11,6 +11,10 @@ use super::super::{
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
     callables::ValidatedSingleCallable,
     calls::{DirectCallError, try_get_type_at_position},
+    classes::{
+        ClassError, execute_nongeneric_class_member_query, plan_nongeneric_class_member_query,
+        preflight_nongeneric_class_member_query,
+    },
     intersection_types::IntersectionTypeError,
     object_members::{
         resolve_object_property_by_key, resolve_object_property_by_key_with_source,
@@ -23,8 +27,9 @@ use super::super::{
 };
 use super::{
     CanonicalCheckerOptions, CanonicalTypeQuery, CanonicalTypeQueryOptions, DeclaredTypeError,
-    SignatureId, TypeId, TypeNodeUnavailable, TypeQueryPlanner, cached_ordinary_type_parameter_owner,
-    preflight_class_or_interface_reference, type_node_unavailable,
+    SignatureId, TypeId, TypeNodeUnavailable, TypeQueryPlanner,
+    cached_ordinary_type_parameter_owner, preflight_class_or_interface_reference,
+    source_class_type_query_error, type_node_unavailable,
 };
 
 /// Semantic failures stay separate from unsupported or invalid checker state.
@@ -271,18 +276,69 @@ impl CanonicalTypeQuery<'_, '_, '_, '_> {
         types: &[TypeId],
         reduction: UnionReduction,
     ) -> Result<TypeId, AwaitedTypeError> {
-        self.store
-            .expression_union_type_with_global_types_and_session(
-                self.global_types
-                    .as_ref()
-                    .expect("the caller supplied globals"),
-                types,
-                reduction,
-                self.instantiation_session
-                    .as_deref_mut()
-                    .expect("the caller supplied a session"),
-            )
-            .map_err(Into::into)
+        let mut demanded = HashSet::new();
+        loop {
+            let result = self
+                .store
+                .expression_union_type_with_global_types_and_session(
+                    self.global_types
+                        .as_ref()
+                        .expect("the caller supplied globals"),
+                    types,
+                    reduction,
+                    self.instantiation_session
+                        .as_deref_mut()
+                        .expect("the caller supplied a session"),
+                );
+            match result {
+                Ok(type_) => return Ok(type_),
+                Err(error @ LiteralTypeCacheError::UnsupportedUnionConstituent(type_)) => {
+                    if !demanded.insert(type_) || !self.prepare_awaited_union_class(type_)? {
+                        return Err(error.into());
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// Callback values can reach a class before an annotation union prepares its members.
+    fn prepare_awaited_union_class(&mut self, type_: TypeId) -> Result<bool, AwaitedTypeError> {
+        let record = self
+            .store
+            .type_payload(type_)
+            .ok_or(AwaitedTypeError::InvalidType(type_))?;
+        if !matches!(record.data(), TypeData::Interface(_))
+            || record.object_flags() != (ObjectFlags::CLASS | ObjectFlags::REFERENCE)
+        {
+            return Ok(false);
+        }
+        let owner = record
+            .symbol()
+            .ok_or(AwaitedTypeError::InvalidType(type_))?;
+        if self.get_declared_type_of_symbol(owner)? != type_ {
+            return Err(AwaitedTypeError::InvalidType(type_));
+        }
+        let declaration = self
+            .store
+            .symbol(owner)
+            .and_then(|owner| owner.value_declaration())
+            .ok_or(AwaitedTypeError::InvalidType(type_))?;
+        let plan = match plan_nongeneric_class_member_query(self.store, self.host, owner) {
+            Ok(plan) => plan,
+            Err(ClassError::Unsupported(_)) => return Ok(false),
+            Err(error) => {
+                return Err(source_class_type_query_error(error, declaration, owner).into());
+            }
+        };
+        preflight_nongeneric_class_member_query(self.store, self.host, &plan)
+            .map_err(|error| source_class_type_query_error(error, declaration, owner))?;
+        let members = execute_nongeneric_class_member_query(self.store, self.host, &plan)
+            .map_err(|error| source_class_type_query_error(error, declaration, owner))?;
+        if members.shells().instance_type() != type_ {
+            return Err(AwaitedTypeError::InvalidType(type_));
+        }
+        Ok(true)
     }
 
     fn awaited_is_primitive_intersection(
