@@ -21,7 +21,7 @@ use super::{
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callable_sets::{
         StoredCallableSetValidation, validate_stored_callable_set,
-        validate_stored_callable_set_with_array_targets,
+        validate_stored_callable_set_with_array_targets, validate_stored_declared_method_callable_set,
     },
     callables::ValidatedSingleCallable,
     classes::{
@@ -2335,6 +2335,18 @@ fn source_this_parameter_type(
     let Some(parameter) = signature.this_parameter() else {
         return Ok(None);
     };
+    if let Some(validation) = validate_stored_declared_method_callable_set(store, callable.owner) {
+        let StoredCallableSetValidation::Valid { projection, .. } = validation else {
+            return Err(DirectCallInvariant::InvalidThisParameter(callable.signature).into());
+        };
+        if !projection.call_signatures.contains(callable) {
+            return Err(DirectCallInvariant::InvalidThisParameter(callable.signature).into());
+        }
+        return store
+            .declared_method_this_parameter_type(signature)
+            .filter(Option::is_some)
+            .ok_or_else(|| DirectCallInvariant::InvalidThisParameter(callable.signature).into());
+    }
     let provenance = store.source_callable_provenance(callable.owner).ok_or(
         DirectCallUnsupported::ExplicitThisParameter(callable.signature),
     )?;

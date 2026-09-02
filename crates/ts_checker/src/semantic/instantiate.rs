@@ -1833,7 +1833,7 @@ fn instantiate_type_with_alias_input_and_operand(
             .map_err(|_| InstantiationError::InvalidType(type_))?
     } else if let Some(source) = conditional_source {
         conditional_remap_projection_with_source(store, type_, source.branches, array_targets)
-            .map_err(|error| conditional_remap_error(type_, error))?;
+            .map_err(|error| conditional_remap_error(store, type_, error))?;
         true
     } else {
         could_contain_installed_type_variables(store, type_, array_targets)?
@@ -2080,13 +2080,13 @@ fn mapping_invariant_object_type(
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<bool, InstantiationError> {
     if closed_declared_property_object_is_mapping_invariant(store, type_)
-        .map_err(|error| closed_mapping_identity_error(type_, error))?
+        .map_err(|error| closed_mapping_identity_error(store, type_, error))?
     {
         return Ok(true);
     }
     if store.type_has_function_type_provenance(type_) {
         return closed_declared_function_type(store, type_, array_targets)
-            .map_err(|error| closed_mapping_identity_error(type_, error));
+            .map_err(|error| closed_mapping_identity_error(store, type_, error));
     }
     Ok(false)
 }
@@ -2105,27 +2105,59 @@ pub(super) fn function_instantiation_shape(
     store: &CanonicalTypeMapperStore,
     source: TypeId,
 ) -> Result<FunctionInstantiationShape, InstantiationError> {
-    let invalid = || InstantiationError::InvalidType(source);
+    let invalid = |stage| {
+        let error = InstantiationError::InvalidType(source);
+        observe_instantiation_failure(store, source, stage, &error);
+        error
+    };
     if !store.type_has_function_type_provenance(source) {
+        observe_instantiation_failure(
+            store,
+            source,
+            "function_provenance",
+            &InstantiationError::UnsupportedType(source),
+        );
         return Err(InstantiationError::UnsupportedType(source));
     }
     match validate_stored_function_type(store, source) {
         StoredFunctionTypeValidation::Valid(_) => {}
         StoredFunctionTypeValidation::Pending => {
+            observe_instantiation_failure(
+                store,
+                source,
+                "function_pending",
+                &InstantiationError::UnsupportedType(source),
+            );
             return Err(InstantiationError::UnsupportedType(source));
         }
-        _ => return Err(invalid()),
+        validation => {
+            observe_instantiation_failure(store, source, "function_validation", &validation);
+            return Err(InstantiationError::InvalidType(source));
+        }
     }
-    let record = store.type_payload(source).ok_or_else(invalid)?;
-    let structured = record.data().structured().ok_or_else(invalid)?;
+    let record = store
+        .type_payload(source)
+        .ok_or_else(|| invalid("function_record"))?;
+    let structured = record
+        .data()
+        .structured()
+        .ok_or_else(|| invalid("function_structured"))?;
     let Some([signature]) = structured.signatures.as_deref() else {
-        return Err(invalid());
+        return Err(invalid("function_signature_count"));
     };
-    let signature_record = store.signature(*signature).ok_or_else(invalid)?;
+    let signature_record = store
+        .signature(*signature)
+        .ok_or_else(|| invalid("function_signature"))?;
     if !signature_record.type_parameters().is_empty()
         || signature_record.resolved_type_predicate().is_some()
         || record.alias().is_some()
     {
+        observe_instantiation_failure(
+            store,
+            source,
+            "function_generic_predicate_alias",
+            &InstantiationError::UnsupportedType(source),
+        );
         return Err(InstantiationError::UnsupportedType(source));
     }
     if signature_record.target().is_some()
@@ -2134,26 +2166,91 @@ pub(super) fn function_instantiation_shape(
         || signature_record.flags().contains(SignatureFlags::CONSTRUCT)
         || structured.call_signature_count != 1
     {
-        return Err(invalid());
+        return Err(invalid("function_signature_shape"));
     }
     let parameters = store
         .callable_signature_parameter_types(*signature)
-        .ok_or_else(invalid)?;
+        .ok_or_else(|| invalid("function_parameters"))?;
     let this_type = store.callable_signature_this_parameter_type(*signature);
     if parameters.len() != signature_record.parameters().len()
         || this_type.is_some() != signature_record.this_parameter().is_some()
     {
-        return Err(invalid());
+        return Err(invalid("function_parameter_slots"));
     }
     Ok(FunctionInstantiationShape {
         signature: *signature,
-        symbol: record.symbol().ok_or_else(invalid)?,
+        symbol: record.symbol().ok_or_else(|| invalid("function_symbol"))?,
         this_type,
         parameters: parameters.to_vec(),
-        return_type: signature_record
-            .resolved_return_type()
-            .ok_or(InstantiationError::UnsupportedType(source))?,
+        return_type: signature_record.resolved_return_type().ok_or_else(|| {
+            observe_instantiation_failure(
+                store,
+                source,
+                "function_return_pending",
+                &InstantiationError::UnsupportedType(source),
+            );
+            InstantiationError::UnsupportedType(source)
+        })?,
     })
+}
+
+#[track_caller]
+fn observe_instantiation_failure(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    stage: &str,
+    error: &impl std::fmt::Debug,
+) {
+    if store.relation_read_observation_is_active() {
+        return;
+    }
+    let location = std::panic::Location::caller();
+    let record = store.type_payload(type_);
+    let declaration = record
+        .and_then(TypeRecord::symbol)
+        .and_then(|symbol| store.symbol(symbol))
+        .and_then(|symbol| symbol.declarations())
+        .and_then(|declarations| match declarations {
+            [declaration] => Some(*declaration),
+            _ => None,
+        });
+    let signature = record
+        .and_then(|record| record.data().structured())
+        .and_then(|structured| structured.signatures.as_deref())
+        .and_then(|signatures| match signatures {
+            [signature] => Some(*signature),
+            _ => None,
+        });
+    let signature_metadata = signature.and_then(|id| {
+        store.signature(id).map(|signature| {
+            (
+                id,
+                signature.target(),
+                signature.mapper(),
+                signature.resolved_return_type(),
+                signature.type_parameters().len(),
+                signature.this_parameter().is_some(),
+                signature.has_rest_parameter(),
+            )
+        })
+    });
+    super::source::observe_call_failure_detail(
+        "instantiation_producer",
+        format_args!(
+            "stage={stage} line={} type={type_:?} raw_error={error:?} kind={:?} declaration={:?} signature={signature_metadata:?}",
+            location.line(),
+            record.map(|record| (
+                record.data().kind(),
+                record.flags().bits(),
+                record.object_flags().bits()
+            )),
+            declaration.map(|node| (
+                node,
+                store.source_node_kind(node),
+                store.source_node_start(node)
+            )),
+        ),
+    );
 }
 
 fn function_mapper_matches(
@@ -2614,11 +2711,14 @@ fn instantiate_function_type(
     Ok(actual)
 }
 
+#[track_caller]
 fn closed_mapping_identity_error(
+    store: &CanonicalTypeMapperStore,
     type_: TypeId,
     error: super::relater::RelationUnavailable,
 ) -> InstantiationError {
     use super::relater::RelationUnavailable;
+    observe_instantiation_failure(store, type_, "closed_mapping_identity", &error);
     match error {
         RelationUnavailable::UnsupportedStructuredType(_)
         | RelationUnavailable::UnavailableCanonicalArrayTarget(_)
@@ -2735,7 +2835,7 @@ fn could_contain_installed_type_variables_worker(
         }
         TypeData::Object(_) => {
             if let Some(alias) = generic_function_alias_projection(store, type_)
-                .map_err(|error| closed_mapping_identity_error(type_, error))?
+                .map_err(|error| closed_mapping_identity_error(store, type_, error))?
             {
                 store.validate_cached_array_capability_with_pending_functions(
                     array_targets,
@@ -2867,7 +2967,7 @@ fn could_contain_installed_type_variables_worker(
         TypeData::Conditional(_) => {
             conditional_remap_projection_with_array_targets(store, type_, array_targets)
                 .map(|_| true)
-                .map_err(|error| conditional_remap_error(type_, error))
+                .map_err(|error| conditional_remap_error(store, type_, error))
         }
         TypeData::TemplateLiteral(template) => {
             if template.types.is_empty() || template.texts.len() != template.types.len() + 1 {
@@ -3339,7 +3439,7 @@ fn validate_instantiable_member_type_worker(
         TypeData::Conditional(_) if is_signature_conditional_source(store, type_) => {
             let (projection, _) =
                 conditional_signature_projection_with_array_targets(store, type_, array_targets)
-                    .map_err(|error| conditional_remap_error(type_, error))?;
+                    .map_err(|error| conditional_remap_error(store, type_, error))?;
             projection.arguments().iter().try_for_each(|argument| {
                 validate_instantiable_member_type_worker(
                     store,
@@ -3352,7 +3452,7 @@ fn validate_instantiable_member_type_worker(
         }
         TypeData::Object(_) => {
             if let Some(alias) = generic_function_alias_projection(store, type_)
-                .map_err(|error| closed_mapping_identity_error(type_, error))?
+                .map_err(|error| closed_mapping_identity_error(store, type_, error))?
             {
                 alias.arguments.iter().try_for_each(|argument| {
                     validate_instantiable_member_type_worker(
@@ -3662,7 +3762,7 @@ fn instantiated_member_type_matches_worker(
                     record.object_flags().contains(ObjectFlags::INSTANTIATED)
                 });
             if generic_function_alias_projection(store, template)
-                .map_err(|error| closed_mapping_identity_error(template, error))?
+                .map_err(|error| closed_mapping_identity_error(store, template, error))?
                 .is_some()
             {
                 cached_instantiated_member_type(
@@ -3796,7 +3896,7 @@ fn cached_signature_conditional_type(
 ) -> Result<Option<TypeId>, InstantiationError> {
     let (projection, _) =
         conditional_signature_projection_with_array_targets(store, template, array_targets)
-            .map_err(|error| conditional_remap_error(template, error))?;
+            .map_err(|error| conditional_remap_error(store, template, error))?;
     let mapping = InstantiationMapping::Stored(mapper);
     let mut arguments = Vec::with_capacity(projection.arguments().len());
     for (parameter, argument) in projection.parameters().iter().zip(projection.arguments()) {
@@ -3811,7 +3911,7 @@ fn cached_signature_conditional_type(
         arguments.push(resolved);
     }
     cached_signature_conditional_result(store, &projection, &arguments, array_targets)
-        .map_err(|error| conditional_remap_error(template, error))
+        .map_err(|error| conditional_remap_error(store, template, error))
 }
 
 fn cached_instantiated_member_type(
@@ -4069,7 +4169,7 @@ fn cached_instantiated_type_with_operand_worker(
                     conditional_remap_projection_with_array_targets(store, template, array_targets)
                 }
             }
-            .map_err(|error| conditional_remap_error(template, error))?;
+            .map_err(|error| conditional_remap_error(store, template, error))?;
             cached_instantiated_deferred_conditional(
                 store,
                 &projection,
@@ -4323,7 +4423,7 @@ fn cached_instantiated_type_with_operand_worker(
         }
         TypeData::Object(_) => {
             if let Some(source) = generic_function_alias_projection(store, template)
-                .map_err(|error| closed_mapping_identity_error(template, error))?
+                .map_err(|error| closed_mapping_identity_error(store, template, error))?
             {
                 if alias_override.is_some() {
                     return Err(InstantiationError::UnsupportedType(template));
@@ -4503,7 +4603,13 @@ fn cached_instantiated_type_with_operand_worker(
     result
 }
 
-fn conditional_remap_error(source: TypeId, error: ConditionalTypeError) -> InstantiationError {
+#[track_caller]
+fn conditional_remap_error(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    error: ConditionalTypeError,
+) -> InstantiationError {
+    observe_instantiation_failure(store, source, "conditional_remap", &error);
     match error {
         ConditionalTypeError::Instantiation(error) => error,
         ConditionalTypeError::Declared(error) => InstantiationError::Declared(error),
@@ -4515,13 +4621,19 @@ fn conditional_remap_error(source: TypeId, error: ConditionalTypeError) -> Insta
     }
 }
 
-fn conditional_source_error(source: TypeId, error: ConditionalTypeError) -> InstantiationError {
+#[track_caller]
+fn conditional_source_error(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    error: ConditionalTypeError,
+) -> InstantiationError {
     match error {
         ConditionalTypeError::UnsupportedInference { .. }
         | ConditionalTypeError::TailRecursionLimit { .. } => {
+            observe_instantiation_failure(store, source, "conditional_source", &error);
             InstantiationError::UnsupportedType(source)
         }
-        _ => conditional_remap_error(source, error),
+        _ => conditional_remap_error(store, source, error),
     }
 }
 
@@ -4604,10 +4716,10 @@ fn cached_instantiated_deferred_conditional(
         return cached_conditional_remap_with_source(
             store, projection, &arguments, alias, globals, source,
         )
-        .map_err(|error| conditional_remap_error(projection.type_id(), error));
+        .map_err(|error| conditional_remap_error(store, projection.type_id(), error));
     }
     match cached_deferred_conditional_remap(store, projection, &arguments, alias, array_targets)
-        .map_err(|error| conditional_remap_error(projection.type_id(), error))?
+        .map_err(|error| conditional_remap_error(store, projection.type_id(), error))?
     {
         ConditionalRemapLookup::Cold => Ok(None),
         ConditionalRemapLookup::Hit(type_) => Ok(Some(type_)),
@@ -5514,7 +5626,7 @@ fn instantiate_type_worker(
                         conditional_remap_projection_with_array_targets(store, type_, array_targets)
                     }
                 }
-                .map_err(|error| conditional_remap_error(type_, error))?;
+                .map_err(|error| conditional_remap_error(store, type_, error))?;
                 InstantiationWork::DeferredConditional(Box::new(projection))
             }
             TypeData::IndexedAccess(indexed) => InstantiationWork::IndexedAccess {
@@ -5534,7 +5646,7 @@ fn instantiate_type_worker(
             TypeData::Interface(_) => InstantiationWork::Identity,
             TypeData::Object(_) => {
                 if let Some(projection) = generic_function_alias_projection(store, type_)
-                    .map_err(|error| closed_mapping_identity_error(type_, error))?
+                    .map_err(|error| closed_mapping_identity_error(store, type_, error))?
                 {
                     if alias.is_some() {
                         return Err(InstantiationError::UnsupportedType(type_));
@@ -6101,7 +6213,7 @@ fn instantiate_deferred_conditional(
             session,
             source.branches,
         )
-        .map_err(|error| conditional_source_error(projection.type_id(), error));
+        .map_err(|error| conditional_source_error(store, projection.type_id(), error));
     }
     match remap_deferred_conditional_with_session(
         store,
@@ -6111,7 +6223,7 @@ fn instantiate_deferred_conditional(
         array_targets,
         session,
     )
-    .map_err(|error| conditional_remap_error(projection.type_id(), error))?
+    .map_err(|error| conditional_remap_error(store, projection.type_id(), error))?
     {
         ConditionalRemapResult::Deferred(type_) | ConditionalRemapResult::Recovered(type_) => {
             Ok(type_)
