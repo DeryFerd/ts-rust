@@ -77918,10 +77918,13 @@ fn check_source_plan(
             .and_then(|callable| {
                 store
                     .source_callable_provenance(callable)
-                    .filter(|provenance| provenance.contextual_target.is_some())
-                    .map(|provenance| (callable, provenance.contextual_variable))
+                    .and_then(|provenance| {
+                        provenance.contextual_target.map(|target| {
+                            (callable, provenance.contextual_variable, target)
+                        })
+                    })
             });
-        if let Some((callable, anchor)) = warm_contextual_property {
+        if let Some((callable, anchor, target)) = warm_contextual_property {
             let valid_anchor = match anchor {
                 Some(anchor) if arrow.family == SourceCallableFamily::ObjectLiteralMethod => {
                     anchor == arrow.owner_symbol
@@ -77950,6 +77953,12 @@ fn check_source_plan(
                                 target,
                             )
                         })
+                        || super::source_callables::stored_object_parameter_default_arrow_is_exact(
+                            store,
+                            arrow.declaration,
+                            arrow.owner_symbol,
+                            target,
+                        )
                         || source_direct_call_argument_arrow_is_exact(store, host, arrow.declaration)
                         .map_err(SourcePlanner::callable_plan_error)?
                         || source_promise_constructor_argument_arrow_is_exact(

@@ -3780,6 +3780,7 @@ impl<'store> RelaterSession<'store> {
                 }
                 if source_flags.intersects(TypeFlags::INTERSECTION)
                     && !intersection_state.intersects(IntersectionState::SOURCE)
+                    && !intersection_state.intersects(IntersectionState::TARGET)
                     && target_flags.intersects(TypeFlags::OBJECT)
                     && self.relation != RelationKind::Comparable
                     && self.weak_target_lacks_common_properties(source, target)?
@@ -3880,6 +3881,7 @@ impl<'store> RelaterSession<'store> {
                     return Ok(Ternary::False);
                 }
                 if self.relation != RelationKind::Comparable
+                    && !intersection_state.intersects(IntersectionState::TARGET)
                     && self.weak_target_lacks_common_properties(source, target)?
                 {
                     return Ok(Ternary::False);
