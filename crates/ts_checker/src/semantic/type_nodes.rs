@@ -45785,13 +45785,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }) {
                 self.prepare_interface_alias_base_sources(source, plan, prepared, active)?;
             }
-        } else if let Some(source) =
-            super::object_aliases::source_property_object_projection(self.store, type_)
-                .map_err(|_| invalid())?
+        } else if super::object_aliases::source_property_object_projection(self.store, type_)
+            .map_err(|_| invalid())?
+            .is_some()
         {
-            for property in source.properties() {
-                self.execute_type_node(property.type_node, plan, prepared)?;
-            }
+            // Lazy alias annotations belong to the source property query below.
             let arrays = self
                 .global_types
                 .as_ref()
