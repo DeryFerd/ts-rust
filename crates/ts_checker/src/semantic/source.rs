@@ -39894,6 +39894,9 @@ fn check_expression_type_with_capture_context(
                 && (super::source_properties::is_cold_direct_nongeneric_interface(
                     store,
                     receiver.result,
+                ) || super::source_properties::is_direct_generic_interface(
+                    store,
+                    receiver.result,
                 ) || super::source_properties::is_source_class_method_receiver(
                     store,
                     host,

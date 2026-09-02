@@ -3619,6 +3619,40 @@ fn cold_inherited_interface_owner(
     Ok(Some(owner))
 }
 
+/// Selects source member demand without changing a reference's owner or arguments.
+pub(super) fn is_direct_generic_interface(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+) -> bool {
+    let Some(record) = store.type_payload(receiver) else {
+        return false;
+    };
+    let target = match record.data() {
+        TypeData::TypeReference(reference) => reference.object.target,
+        TypeData::Interface(interface)
+            if record.object_flags().contains(ObjectFlags::REFERENCE) =>
+        {
+            interface.reference.object.target
+        }
+        _ => None,
+    };
+    let Some(target) = target else {
+        return false;
+    };
+    let Some(record) = store.type_payload(target) else {
+        return false;
+    };
+    if record.object_flags().contains(ObjectFlags::CLASS)
+        || !matches!(record.data(), TypeData::Interface(interface)
+            if interface.reference.resolved_type_arguments.as_ref()
+                .is_some_and(|parameters| !parameters.is_empty()))
+    {
+        return false;
+    }
+    super::reference_types::validate_direct_generic_reference(store, receiver)
+        .is_ok_and(|reference| reference.target == target)
+}
+
 pub(super) fn is_cold_direct_nongeneric_interface(
     store: &CanonicalTypeMapperStore,
     receiver: TypeId,
