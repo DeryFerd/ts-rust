@@ -4,20 +4,20 @@ Updated 2026-09-02. Neither Query nor Hono has passed a full Rust type check.
 
 ## Latest measured result
 
-Query has one new complete isolated root. Hono has no new completed result.
+Query has one new complete isolated root. The latest Hono census timed out.
 Neither project is ready for a full typechecking demo.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
 | Query core, census 22 | 2 of 23 isolated roots complete | `subscribable.ts` is newly complete, no loss |
 | Hono, census 22 | 33 of 188 isolated roots complete | No gain or loss |
-| Focused tests, run 37 | 143 pass, 24 fail | Five unchanged tests recovered since run 36 |
-| Checker library, run 2 | 5,071 pass, 366 fail | First completed broad library run for this batch |
+| Focused tests, run 39 | 144 pass, 27 fail | One old test recovered since run 37, no old pass lost, four new tests fail |
+| Checker library, run 3 | 5,069 pass, 368 fail | Two passes lost since run 2, no recovered failure |
 
-Query 22 and focused run 37 use `96d3fa91cb239624d8a80e1d486776f76f22bdb6`.
+Query 22 uses `96d3fa91cb239624d8a80e1d486776f76f22bdb6`.
 Hono 22 uses the earlier `bbfd62521499c8cf7375c1be95076fe1a6576483`.
-Library 2 uses the same production code as run 37 with a separate test API
-correction. Those measured processes and their exact services are closed.
+Focused run 39 and library run 3 use `f7e41298b0bfc543264a53bfa02a8c0579e2bee1`.
+Those measured processes and their exact services are closed.
 Project source, roots, dependencies, options and libraries stayed fixed.
 Isolated roots are not full-project passes or a percentage of compiler support.
 
@@ -31,53 +31,66 @@ at the `ContentfulStatusCode` reference in `http-exception.ts`. It has
 148 unsupported roots, six internal errors and one original policy skip.
 Only two first stops changed. No complete root was lost.
 
-[Tests 37](../target/wave202-query-hono-combined-tests-37-result.md)
-compiled all 58 targets and ran all 167 tests. Five unchanged tests recovered.
-They cover generic and variadic `bind`, imported augmentation conflicts and
-buffer constraint errors. No old pass was lost.
+[Tests 39](../target/wave202-query-hono-combined-tests-39-result.md)
+compiled all 60 targets and ran all 171 tests. One old generic-alias error test
+recovered since run 37. No old pass was lost. Run 37 had recovered five unchanged
+tests since run 36, covering `bind`, augmentation conflicts and buffer errors.
 
-The 157 byte-unchanged tests have 138 passes and 19 failures. Eight cases in
-corrected test files have five passes and three failures. Both new JWT tests
-fail. The five corrected-case passes are not unchanged checker gains. Generic
-defaults, imported JWT context, returned class callbacks and cache replay still
-have failures.
+The 167 tests already present in run 37 now have 144 passes and 23 failures.
+All four new DOM overload and generic-callback tests fail. The historical eight
+cases in corrected test files still have five passes and three failures. Those
+test corrections do not count as unchanged checker gains. Generic defaults,
+imported JWT context, returned class callbacks and cache replay still fail.
 
-The [checker-library run](../target/wave202-query-hono-checker-lib-2-result.md)
-compiled and ran all 5,437 tests. It passed 5,071 and failed 366, with no ignored
-or filtered tests. All complete failure records are retained. These are current
-failures, not 366 proven new regressions. The previous attempt did not compile,
-and the accepted 4,839-test selection predates later tests. We must separate
-missing features, stale expectations and real regressions before acceptance.
+Checker-library run 3 ran the same 5,437 tests as run 2. It passed 5,069 and
+failed 368, with no ignored or filtered tests. All 366 old failures remain, and
+two old passes now fail. Their complete snapshots differ only in map display
+order. Both maps keep the same keys and values. The cause of the order change
+and the snapshot contract still need checking. No lost type information is
+visible in those two failures.
 
-### Current runs
+A [comparison with the accepted checkpoint](../target/wave202-query-hono-library2-accepted-name-comparison.md)
+also found that 225 of run 2's failures had the same names passing before.
+That comparison did not inspect test bodies. It is not proof of 225 unchanged
+tests or 225 compiler regressions, but it identifies more work to check.
 
-Hono 23 took 1,444.768 seconds to return its ordinary project error. It now
-reports `SymbolNotOwned` in `http-exception.ts`. Its isolated-root census is
-still running. Hono 22 finished its whole census in about 10 minutes. This is
-a measured slowdown, not a gain. The original timeout and inputs are unchanged.
+### Current work
+
+[Hono 23](../target/wave202-hono-combined-census-23-result.md) took 1,444.768
+seconds to return `SymbolNotOwned` in `http-exception.ts`. The census then hit
+the unchanged 30-minute limit. Only four root attempts finished. All four match
+the old unsupported results. The other 184 roots have no new outcome. Hono 22
+finished its whole census in about 10 minutes. This is a measured slowdown.
 
 Focused run 38 failed compilation on a wrong `TypeFlags` import in a new test.
 All 171 tests are unrun. The process and service are closed. The import repair
-does not change test inputs or assertions. Run 39 has now compiled all 60
-targets and is running the 171 tests. Library run 3 is released on that same
-frozen candidate.
+does not change test inputs or assertions. Run 39 and library run 3 are now
+closed. Their results are recorded above.
+
+Run 40 also failed compilation before any tests ran. Two call-signature uses
+had not been updated after the receiver-predicate change made a symbol optional.
+All 179 tests remain unrun. The two-use repair is prepared for the next run.
 
 Each source repair has one writer, one reviewer and an isolated worktree.
 One separate pair now combines ready changes while the runtime owners run
-the tests. Root releases the runs and checks their results. The next useful
-result is another completed project root,
-then an ordinary project check with native diagnostic parity.
+the tests. Root releases the runs and checks their results. Thirteen reviewed
+fixes are combined and have passed the final combined source review. The build
+repair must pass before their 64 targets and 179 tests can run.
 
-The next test candidate includes `Omit` alias replay, generic Promise callbacks
-and DOM global generic overloads. Later reviewed fixes cover async callback
-identity, Node timer bases, generic defaults, JWT annotations and array
-destructuring inside returned async functions.
+The next candidate adds async callback identity, Node timer bases, generic
+defaults, JWT annotations, receiver predicates and array destructuring inside
+returned async functions. The earlier `Omit`, Promise and DOM work is measured
+in run 39. It does not yet pass all its controls.
 
 The seven new Query class failures share an imported generic base-class guard.
 That fix is committed and reviewed. The constructor callback fix for private
 manager fields is also committed and reviewed. Both are in the next integration
 batch with six new Query class tests. Fixing these guards does not establish
 that all seven roots pass.
+
+Query is the next demo target. Run its original census after the combined test
+build passes. For Hono, first measure the repeated planning work and record the
+exact ownership-error origin. The saved logs do not yet prove either cause.
 
 No repair batch is accepted on primary. The unchanged corpus, broader tests
 and removal of temporary error traces still apply.
