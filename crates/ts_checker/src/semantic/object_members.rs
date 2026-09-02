@@ -5586,9 +5586,13 @@ fn signature_uses_interface_call_optional_types(
         && store
             .source_direct_children(declaration)
             .is_some_and(|children| {
+                // Generic predicates keep their existing bare-formal parameter contract.
                 children
                     .iter()
                     .all(|&child| store.source_node_kind(child) != Some(SyntaxKind::TypeParameter))
+                    || children.iter().all(|&child| {
+                        store.source_node_kind(child) != Some(SyntaxKind::TypePredicate)
+                    })
             })
 }
 
@@ -17020,7 +17024,11 @@ pub(super) fn plan_call_signature(
             let constructor_parameter = constructor_interface && type_parameters.is_empty()
                 || generic_constructor_interface
                 || signature_uses_type_literal_construct_optional_types(store, declaration);
-            let interface_parameter = ordinary_interface_call && type_parameters.is_empty();
+            let interface_parameter = ordinary_interface_call && type_parameters.is_empty()
+                || !is_construct
+                    && !type_parameters.is_empty()
+                    && !interface_predicate_call
+                    && store.source_interface_call_owner(declaration) == Some(owner_symbol);
             if !is_construct
                 && !type_literal_call
                 && !boolean_constructor
@@ -23937,7 +23945,7 @@ pub(super) fn optional_interface_call_union_operations(plan: &PropertyObjectPlan
     }
     plan.call_signatures
         .iter()
-        .filter(|call| call.type_parameters.is_empty())
+        .filter(|call| call.type_parameters.is_empty() || call.type_predicate.is_none())
         .try_fold(0usize, |count, call| {
             count.checked_add(
                 call.parameters
@@ -23967,7 +23975,7 @@ pub(super) fn prepare_interface_call_optional_parameters(
     let undefined = bootstrap.undefined_type;
     let mut missing = Vec::new();
     for call in &plan.call_signatures {
-        if !call.type_parameters.is_empty() {
+        if !call.type_parameters.is_empty() && call.type_predicate.is_some() {
             continue;
         }
         if !signature_uses_interface_call_optional_types(store, call.declaration) {
