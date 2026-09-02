@@ -6666,7 +6666,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         signature: &Signature,
     ) -> Option<Option<TypeId>> {
         let source = self.declared_method_this_parameter_source(signature.declaration()?)?;
-        let (symbol, annotation) = match (source, signature.this_parameter()) {
+        let (symbol, mut annotation) = match (source, signature.this_parameter()) {
             (None, None) => return Some(None),
             (Some((symbol, annotation)), Some(actual))
                 if symbol == actual && !signature.parameters().contains(&symbol) =>
@@ -6683,8 +6683,35 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 ..ValueSymbolLinks::default()
             })
             || self.types.get(type_).is_none()
-            || !self.source_direct_type_annotation_is_exact(annotation, type_)
         {
+            return None;
+        }
+        let exact_annotation_links = TypeNodeLinks {
+            resolved_type: Some(type_),
+            outer_type_parameters: None,
+        };
+        let mut seen = HashSet::new();
+        while self.source_node_kind(annotation) == Some(SyntaxKind::ParenthesizedType) {
+            if !seen.insert(annotation)
+                || self.type_node_links(annotation).is_some_and(|links| {
+                    links != &TypeNodeLinks::default() && links != &exact_annotation_links
+                })
+                || self
+                    .symbol_node_links(annotation)
+                    .is_some_and(|links| links != &SymbolNodeLinks::default())
+            {
+                return None;
+            }
+            let children = self.source_direct_children(annotation)?;
+            let [inner] = children.as_slice() else {
+                return None;
+            };
+            if self.source_node_parent(*inner) != Some(SourceNodeParent::Parent(annotation)) {
+                return None;
+            }
+            annotation = *inner;
+        }
+        if !self.source_direct_type_annotation_is_exact(annotation, type_) {
             return None;
         }
         Some(Some(type_))
