@@ -7426,7 +7426,9 @@ impl<'store> RelaterSession<'store> {
         if let Some(receiver) = self.mapped_property_receivers.get(&symbol).copied() {
             self.store
                 .validate_mapped_type_relation_endpoint(receiver)
-                .map_err(|error| mapped_relation_error(receiver, error))?
+                .map_err(|error| {
+                    observed_mapped_relation_error(self.store, receiver, error, "mapped_property.validate")
+                })?
                 .filter(|members| members.properties().contains(&symbol))
                 .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
             let owned = matches!(
@@ -7440,7 +7442,9 @@ impl<'store> RelaterSession<'store> {
                     symbol,
                     self.instantiation_session.as_mut(),
                 )
-                .map_err(|error| mapped_relation_error(receiver, error))?;
+                .map_err(|error| {
+                    observed_mapped_relation_error(self.store, receiver, error, "mapped_property.resolve")
+                })?;
             if owned
                 && self
                     .instantiation_session
@@ -7906,7 +7910,9 @@ impl<'store> RelaterSession<'store> {
         if let ObjectPropertyOrigin::Mapped(receiver) = origin {
             self.store
                 .validate_mapped_type_relation_endpoint(receiver)
-                .map_err(|error| mapped_relation_error(receiver, error))?
+                .map_err(|error| {
+                    observed_mapped_relation_error(self.store, receiver, error, "mapped_symbol.validate")
+                })?
                 .filter(|members| members.properties().contains(&symbol))
                 .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
             self.mapped_property_receivers.insert(symbol, receiver);
@@ -11922,7 +11928,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         instantiation_session: Option<&'query mut InstantiationSession>,
         global_this: Option<GlobalThisRelationContext<'query>>,
     ) -> Result<bool, RelationUnavailable> {
-        let related = self
+        let result = self
             .is_type_related_to_with_optional_global_types_options_session_and_source_worker(
                 source,
                 target,
@@ -11932,7 +11938,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 strict_function_types,
                 instantiation_session,
                 global_this,
-            )?;
+            );
+        if let Err(RelationUnavailable::InvalidStructuredMembers(type_id)) = &result {
+            observe_invalid_structured_members(self, *type_id, "relation.worker", None);
+        }
+        let related = result?;
         if related {
             validate_global_this_relation_inputs(
                 self,
@@ -13378,6 +13388,85 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     }
 }
 
+// Read existing identities only after a relation failure. Do not demand members.
+fn observe_invalid_structured_members(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    type_id: TypeId,
+    site: &str,
+    inner: Option<&MappedTypeError>,
+) {
+    let record = store.type_payload(type_id);
+    let owner = record.and_then(TypeRecord::symbol);
+    let canonical_owner = owner.and_then(|owner| store.get_merged_symbol(owner));
+    let owner_record = canonical_owner.and_then(|owner| store.symbol(owner));
+    let alias = record.and_then(TypeRecord::alias);
+    let alias_owner = alias
+        .and_then(|alias| store.type_alias(alias))
+        .and_then(|alias| alias.symbol());
+    let object = record.and_then(|record| match record.data() {
+        TypeData::Object(object) => Some(object),
+        TypeData::TypeReference(reference) => Some(&reference.object),
+        TypeData::Interface(interface) => Some(&interface.reference.object),
+        TypeData::Tuple(tuple) => Some(&tuple.interface.reference.object),
+        TypeData::InstantiationExpression(expression) => Some(&expression.object),
+        TypeData::Mapped(mapped) => Some(&mapped.object),
+        TypeData::ReverseMapped(mapped) => Some(&mapped.object),
+        TypeData::EvolvingArray(array) => Some(&array.object),
+        _ => None,
+    });
+    let mapped = record.and_then(|record| match record.data() {
+        TypeData::Mapped(mapped) => Some((
+            mapped.declaration,
+            mapped.type_parameter,
+            mapped.constraint_type,
+            mapped.template_type,
+        )),
+        _ => None,
+    });
+    let cache = record
+        .and_then(|record| record.data().structured())
+        .map(|data| {
+            (
+                data.members,
+                data.members
+                    .and_then(|members| store.symbol_table(members))
+                    .map(|table| table.len()),
+                data.properties.as_ref().map(Vec::len),
+                data.signatures.as_ref().map(Vec::len),
+                data.call_signature_count,
+                data.index_infos.as_ref().map(Vec::len),
+            )
+        });
+    eprintln!(
+        "structured_member_failure site={site} type={type_id:?} inner={inner:?} kind={:?} flags={:?} object_flags={:?} owner={owner:?} canonical_owner={canonical_owner:?} owner_flags={:?} first_declaration={:?} declaration_count={:?} alias={alias:?} alias_owner={alias_owner:?} target={:?} mapper={:?} mapped_declaration_parameter_constraint_template={mapped:?} cache_members_tablelen_properties_signatures_calls_indexes={cache:?}",
+        record.map(|record| record.data().kind()),
+        record.map(TypeRecord::flags),
+        record.map(TypeRecord::object_flags),
+        owner_record.map(|owner| owner.flags()),
+        owner_record
+            .and_then(|owner| owner.declarations())
+            .and_then(|declarations| declarations.first()),
+        owner_record
+            .and_then(|owner| owner.declarations())
+            .map(|declarations| declarations.len()),
+        object.and_then(|object| object.target),
+        object.and_then(|object| object.mapper),
+    );
+}
+
+fn observed_mapped_relation_error(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    type_id: TypeId,
+    error: MappedTypeError,
+    site: &str,
+) -> RelationUnavailable {
+    let converted = mapped_relation_error(type_id, error);
+    if matches!(converted, RelationUnavailable::InvalidStructuredMembers(_)) {
+        observe_invalid_structured_members(store, type_id, site, Some(&error));
+    }
+    converted
+}
+
 fn mapped_relation_error(type_id: TypeId, error: MappedTypeError) -> RelationUnavailable {
     match error {
         MappedTypeError::BootstrapUninitialized => RelationUnavailable::MissingBootstrap,
@@ -13419,7 +13508,7 @@ fn validate_general_mapped_relation_endpoint(
     }
     store
         .validate_mapped_type_relation_endpoint(type_id)
-        .map_err(|error| mapped_relation_error(type_id, error))?;
+        .map_err(|error| observed_mapped_relation_error(store, type_id, error, "mapped_endpoint.validate"))?;
     Ok(true)
 }
 
@@ -13436,16 +13525,16 @@ fn prepare_general_mapped_relation_endpoint(
     }
     if let Some(members) = store
         .validate_mapped_type_relation_endpoint(type_id)
-        .map_err(|error| mapped_relation_error(type_id, error))?
+        .map_err(|error| observed_mapped_relation_error(store, type_id, error, "mapped_endpoint.before_resolve"))?
     {
         return Ok(Some(members));
     }
     store
         .resolve_mapped_type_members_with_session(type_id, MappedTypeModifiers::NONE, session)
-        .map_err(|error| mapped_relation_error(type_id, error))?;
+        .map_err(|error| observed_mapped_relation_error(store, type_id, error, "mapped_endpoint.resolve"))?;
     store
         .validate_mapped_type_relation_endpoint(type_id)
-        .map_err(|error| mapped_relation_error(type_id, error))?
+        .map_err(|error| observed_mapped_relation_error(store, type_id, error, "mapped_endpoint.after_resolve"))?
         .map(Some)
         .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))
 }
