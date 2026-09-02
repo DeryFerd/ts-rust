@@ -1879,14 +1879,21 @@ fn rest_parameter_shape(
                     _ => None,
                 })
                 .ok_or_else(invalid)?;
-            let constraint = parameter.constraint.ok_or(
-                DirectCallUnsupported::RestSignature(signature),
-            )?;
-            let annotation = store.source_direct_type_annotation(declaration).ok_or_else(invalid)?;
+            let constraint = parameter
+                .constraint
+                .ok_or(DirectCallUnsupported::RestSignature(signature))?;
+            let annotation = store
+                .source_direct_type_annotation(declaration)
+                .ok_or_else(invalid)?;
             if !store.source_direct_type_annotation_is_exact(annotation, constraint) {
                 return Err(invalid());
             }
-            return rest_parameter_shape(store, array_targets, signature, constraint, active);
+            let constrained =
+                rest_parameter_shape(store, array_targets, signature, constraint, active)?;
+            return match constrained {
+                RestParameterShape::Array { .. } => Ok(constrained),
+                _ => Err(DirectCallUnsupported::RestSignature(signature).into()),
+            };
         }
         if let Some(targets) = array_targets
             && let Some(array) = store

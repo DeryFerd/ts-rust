@@ -3238,8 +3238,21 @@ pub(super) fn plan_enclosing_source_callable_annotation(
             let owner = host
                 .bound_file(current)
                 .and_then(|bound| bound.symbol(current))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
                 .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(current)))?;
-            let plan = if let Some(group) = host.source(current).and_then(|(arena, _)| {
+            let plan = if let Some(declarations) =
+                store.source_global_function_namespace_declarations(owner)
+                && declarations.contains(&current)
+            {
+                plan_source_ambient_overload_declaration(
+                    store,
+                    host,
+                    current,
+                    owner,
+                    &declarations,
+                    array_targets,
+                )?
+            } else if let Some(group) = host.source(current).and_then(|(arena, _)| {
                 super::jsdoc::authenticated_jsdoc_overload_group(arena, current)
             }) {
                 plan_source_jsdoc_overload_declaration(
@@ -9856,6 +9869,8 @@ fn validate_exact_generic_annotation_shape(
                         parameter.identity_node,
                         &plan.type_parameters,
                         targets,
+                    )? || is_exact_global_rest_type_parameter_annotation(
+                        store, host, plan, parameter, targets,
                     )?,
                     None => false,
                 };
@@ -10372,6 +10387,89 @@ enum SourceGenericParameterCacheState {
 enum SourceGenericArraySyntax {
     ArrayType,
     TypeReference,
+}
+
+/// Keeps a global rest formal separate from its written array constraint.
+fn is_exact_global_rest_type_parameter_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceCallablePlan,
+    parameter: &SourceCallableParameterPlan,
+    array_targets: CanonicalArrayTargets,
+) -> Result<bool, SourceCallableError> {
+    if plan.family != SourceCallableFamily::FunctionDeclaration
+        || plan.body_mode != SourceCallableBodyMode::AmbientDeclaration
+        || plan.array_targets != Some(array_targets)
+        || plan.export_local.is_none()
+        || store.source_global_callable_augmentation_local(plan.owner_symbol, plan.declaration)
+            != plan.export_local
+        || store
+            .source_global_function_namespace_declarations(plan.owner_symbol)
+            .is_none_or(|declarations| !declarations.contains(&plan.declaration))
+        || plan.parameters.last() != Some(parameter)
+        || !parameter.rest
+        || parameter.optional
+        || parameter.initializer.is_some()
+        || parameter.explicit_type_node() != Some(parameter.identity_node)
+    {
+        return Ok(false);
+    }
+    for formal in &plan.type_parameters {
+        if !is_naked_source_type_parameter_annotation(
+            store,
+            host,
+            parameter.identity_node,
+            formal,
+        )? {
+            continue;
+        }
+        let Some(constraint) = formal.constraint else {
+            return Ok(false);
+        };
+        let Some((SourceGenericArraySyntax::ArrayType, element)) =
+            exact_source_generic_array_syntax(store, host, constraint)?
+        else {
+            return Ok(false);
+        };
+        let invalid = || invariant(SourceCallableInvariant::InvalidTypeCache(constraint));
+        let constraint_record = preflight_node(store, host, constraint)?;
+        let element_record = preflight_node(store, host, element)?;
+        let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+        let element_type = match element_record.kind {
+            SyntaxKind::AnyKeyword => bootstrap.any_type,
+            SyntaxKind::UnknownKeyword => bootstrap.unknown_type,
+            _ => return Ok(false),
+        };
+        if constraint_record.parent != Some(formal.declaration.node)
+            || constraint_record.flags.0 != 0
+            || element_record.flags.0 != 0
+            || !store.source_direct_type_annotation_is_exact(element, element_type)
+        {
+            return Err(invalid());
+        }
+        let constraint_state = validate_source_generic_array_annotation_cache(
+            store,
+            constraint,
+            SourceGenericArraySyntax::ArrayType,
+            SourceGenericParameterCacheState::Warm(element_type),
+            array_targets,
+        )?;
+        if let SourceGenericParameterCacheState::Warm(type_parameter) =
+            source_type_parameter_annotation_cache_state(store, parameter.identity_node, formal)?
+        {
+            let SourceGenericParameterCacheState::Warm(constraint_type) = constraint_state else {
+                return Err(invalid());
+            };
+            if !matches!(
+                store.type_payload(type_parameter).map(TypeRecord::data),
+                Some(TypeData::TypeParameter(data)) if data.constraint == Some(constraint_type)
+            ) {
+                return Err(invalid());
+            }
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Admits an exact, nonempty chain of mutable `T[]` and `Array<T>` wrappers
