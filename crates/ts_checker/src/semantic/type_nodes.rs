@@ -37591,7 +37591,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 || target != capability.target
                 || immediate_target != capability.immediate_target
                 || (target_flags != SymbolFlags::TYPE_ALIAS
-                    && target_flags != SymbolFlags::INTERFACE)
+                    && target_flags != SymbolFlags::INTERFACE
+                    && target_flags != SymbolFlags::CLASS)
                 || (immediate_target != target && immediate_flags != SymbolFlags::ALIAS)
                 || links.immediate_target != Some(immediate_target)
                 || links.alias_target != super::AliasTargetState::Resolved(target)
@@ -37599,6 +37600,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     && !authenticated_default_import_interface_return(
                         self.store, self.host, capability, target,
                     ))
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidImportAliasTarget {
+                        node: capability.reference,
+                        alias: capability.alias,
+                        target: capability.target,
+                    },
+                ));
+            }
+            if target_flags == SymbolFlags::CLASS
+                && super::classes::source_class_import_owner(self.store, self.host, target)
+                    .map_err(|error| {
+                        source_class_type_query_error(error, capability.reference, target)
+                    })?
+                    .is_none()
             {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::InvalidImportAliasTarget {
