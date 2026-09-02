@@ -175,10 +175,10 @@ impl CanonicalTypeMapperStore {
             self.append_intersection_constituent(*type_, &mut types, array_targets)?;
         }
         self.validate_branded_string_intersection(&types)?;
-        if let Some(primitive) = self.primitive_empty_intersection_constituents(&types)?
+        if let Some(reduced) = self.primitive_intersection_constituents(&types)?
             && !no_supertype_reduction
         {
-            return Ok(primitive);
+            return Ok(reduced);
         }
         if types.is_empty() {
             return Ok(unknown_type);
@@ -1071,8 +1071,8 @@ impl CanonicalTypeMapperStore {
         .then_some(primitive)
     }
 
-    /// Other primitive intersections still need their own reduction rules.
-    fn primitive_empty_intersection_constituents(
+    /// Reduces validated scalar constituents and empty objects.
+    fn primitive_intersection_constituents(
         &self,
         constituents: &[TypeId],
     ) -> Result<Option<TypeId>, IntersectionTypeError> {
@@ -1088,15 +1088,27 @@ impl CanonicalTypeMapperStore {
         };
         self.validate_union_constituent(primitive)
             .map_err(|_| IntersectionTypeError::MalformedConstituent(primitive))?;
+        let mut primitives = vec![primitive];
         for &constituent in constituents {
             if constituent == primitive {
+                continue;
+            }
+            if self.type_payload(constituent).is_some_and(|record| {
+                matches!(
+                    record.flags(),
+                    TypeFlags::STRING | TypeFlags::NUMBER | TypeFlags::BIG_INT
+                )
+            }) {
+                self.validate_union_constituent(constituent)
+                    .map_err(|_| IntersectionTypeError::MalformedConstituent(constituent))?;
+                primitives.push(constituent);
                 continue;
             }
             if !self.empty_type_literal_intersection_constituent(constituent)? {
                 return Err(IntersectionTypeError::UnsupportedConstituent(constituent));
             }
         }
-        Ok(Some(primitive))
+        intersect_property_types(self, &primitives).map(Some)
     }
 
     fn empty_type_literal_intersection_constituent(
@@ -1221,7 +1233,7 @@ impl CanonicalTypeMapperStore {
         for &type_ in input {
             self.append_intersection_constituent(type_, &mut constituents, array_targets)?;
         }
-        self.primitive_empty_intersection_constituents(&constituents)
+        self.primitive_intersection_constituents(&constituents)
     }
 
     /// Union and relation consumers use the complete stored pair, not its flags.
@@ -1429,7 +1441,7 @@ impl CanonicalTypeMapperStore {
             }
         }
         if self
-            .primitive_empty_intersection_constituents(&key.types)
+            .primitive_intersection_constituents(&key.types)
             .map_err(|_| invalid())?
             .is_some()
             && self.source_primitive_empty_pair(&key.types).is_none()
