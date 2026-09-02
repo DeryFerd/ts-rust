@@ -11848,8 +11848,13 @@ pub(super) fn plan_generic_interface_identity(
     let owner = store
         .symbol(symbol)
         .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
-    let declarations = owner
-        .declarations()
+    let mixed_owner = store
+        .source_global_interface_value_owner(symbol)
+        .map_err(|_| PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+    let declarations = mixed_owner
+        .as_ref()
+        .map(|owner| owner.interfaces())
+        .or_else(|| owner.declarations())
         .filter(|declarations| !declarations.is_empty())
         .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
     let node = declarations[0];
@@ -11861,9 +11866,10 @@ pub(super) fn plan_generic_interface_identity(
         .members()
         .and_then(|members| store.symbol_table(members))
         .ok_or_else(invalid)?;
-    if owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+    if mixed_owner.is_none()
+        && (owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || owner.value_declaration().is_some())
         || owner.check_flags() != CheckFlags::NONE
-        || owner.value_declaration().is_some()
         || owner.exports().is_some()
         || owner.export_symbol().is_some()
     {
@@ -11982,8 +11988,13 @@ pub(super) fn plan_generic_interface(
     let symbol_record = store
         .symbol(symbol)
         .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
-    let Some(declarations) = symbol_record
-        .declarations()
+    let mixed_owner = store
+        .source_global_interface_value_owner(symbol)
+        .map_err(|_| PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+    let Some(declarations) = mixed_owner
+        .as_ref()
+        .map(|owner| owner.interfaces())
+        .or_else(|| symbol_record.declarations())
         .filter(|declarations| !declarations.is_empty())
     else {
         return Err(PropertyObjectError::InvalidInterfaceSymbol(symbol));
@@ -11995,13 +12006,10 @@ pub(super) fn plan_generic_interface(
     };
     let raw_members = symbol_record.members().ok_or_else(invalid)?;
     let raw_table = store.symbol_table(raw_members).ok_or_else(invalid)?;
-    if !symbol_record.flags().contains(SymbolFlags::INTERFACE)
-        || symbol_record
-            .flags()
-            .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
-            != SymbolFlags::NONE
+    if mixed_owner.is_none()
+        && (symbol_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || symbol_record.value_declaration().is_some())
         || symbol_record.check_flags() != CheckFlags::NONE
-        || symbol_record.value_declaration().is_some()
         || symbol_record.exports().is_some()
         || symbol_record.export_symbol().is_some()
     {
@@ -26295,8 +26303,13 @@ fn valid_generic_publication_target(
     let Some(owner) = store.symbol(plan.symbol) else {
         return false;
     };
-    let Some(owner_declarations) = owner
-        .declarations()
+    let Ok(mixed_owner) = store.source_global_interface_value_owner(plan.symbol) else {
+        return false;
+    };
+    let Some(owner_declarations) = mixed_owner
+        .as_ref()
+        .map(|owner| owner.interfaces())
+        .or_else(|| owner.declarations())
         .filter(|declarations| !declarations.is_empty())
     else {
         return false;
@@ -26336,15 +26349,12 @@ fn valid_generic_publication_target(
         || !(record.object_flags() & !allowed_flags).is_empty()
         || record.symbol() != Some(plan.symbol)
         || record.alias().is_some()
-        || !owner.flags().contains(SymbolFlags::INTERFACE)
-        || owner
-            .flags()
-            .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
-            != SymbolFlags::NONE
+        || mixed_owner.is_none()
+            && (owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+                || owner.value_declaration().is_some())
         || owner.check_flags() != CheckFlags::NONE
         || owner_declarations != plan.declarations.as_slice()
         || plan.declarations.first().copied() != Some(plan.node)
-        || owner.value_declaration().is_some()
         || owner.members() != Some(raw_members)
         || owner.exports().is_some()
         || owner.export_symbol().is_some()

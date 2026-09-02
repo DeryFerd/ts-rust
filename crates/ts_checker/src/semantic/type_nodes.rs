@@ -43647,9 +43647,6 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let raw_members = owner_record
             .members()
             .and_then(|members| self.store.symbol_table(members))?;
-        let declarations = owner_record
-            .declarations()
-            .filter(|declarations| !declarations.is_empty())?;
         let variable_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
             | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
         let reference_flags = ObjectFlags::REFERENCE
@@ -43675,22 +43672,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             || interface.declared_call_signatures.is_some()
             || interface.declared_construct_signatures.is_some()
             || interface.declared_index_infos.is_some()
-            || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
             || owner_record.check_flags() != CheckFlags::NONE
-            || owner_record.value_declaration().is_some()
             || owner_record.exports().is_some()
             || owner_record.export_symbol().is_some()
             || self.store.get_merged_symbol(owner) != Some(owner)
             || self.store.declared_type_initialization_in_progress(owner)
             || raw_members.get(InternalSymbolName::Call.as_ref()).is_some()
             || raw_members.get(InternalSymbolName::New.as_ref()).is_some()
-            || declarations.iter().any(|declaration| {
-                !matches!(
-                    self.host.node(*declaration).map(|node| &node.data),
-                    Some(NodeData::InterfaceDeclaration(interface))
-                        if interface.heritage_clauses.is_none()
-                )
-            })
         {
             return None;
         }

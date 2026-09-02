@@ -41118,7 +41118,8 @@ fn check_expression_type_with_capture_context(
                             Ok(prepared) => break prepared,
                             Err(error @ SourceNewError::Call {
                                 error: super::calls::DirectCallError::Relation(
-                                    RelationUnavailable::InvalidStructuredMembers(target),
+                                    RelationUnavailable::InvalidStructuredMembers(target)
+                                    | RelationUnavailable::UnsupportedStructuredType(target),
                                 ),
                                 ..
                             }) if construction.is_generic_library_constructor()
@@ -41150,75 +41151,6 @@ fn check_expression_type_with_capture_context(
                                 }
                             }
                             Err(error) => {
-                                if !store.relation_read_observation_is_active()
-                                    && construction.is_generic_library_constructor()
-                                    && let SourceNewError::Call {
-                                        error: super::calls::DirectCallError::Relation(
-                                            RelationUnavailable::UnsupportedStructuredType(type_),
-                                        ),
-                                        ..
-                                    } = &error
-                                {
-                                    for (stage, type_) in std::iter::once((
-                                        "generic_new_unavailable_type",
-                                        *type_,
-                                    ))
-                                    .chain(argument_types.first().copied().map(|argument| {
-                                        ("generic_new_unavailable_first_argument", argument)
-                                    })) {
-                                        let record = store.type_payload(type_);
-                                        let target = record.and_then(|record| match record.data() {
-                                            TypeData::Interface(interface) => {
-                                                interface.reference.object.target
-                                            }
-                                            TypeData::TypeReference(reference) => {
-                                                reference.object.target
-                                            }
-                                            _ => None,
-                                        });
-                                        for (role, observed) in [
-                                            ("type", Some(type_)),
-                                            ("target", target.filter(|target| *target != type_)),
-                                        ] {
-                                            let Some(observed) = observed else {
-                                                continue;
-                                            };
-                                            let record = store.type_payload(observed);
-                                            let owner = record.and_then(TypeRecord::symbol);
-                                            let symbol = owner.and_then(|owner| store.symbol(owner));
-                                            let declaration = symbol
-                                                .and_then(|symbol| symbol.declarations())
-                                                .and_then(|declarations| declarations.first())
-                                                .copied();
-                                            let member_state = record.and_then(|record| {
-                                                match record.data() {
-                                                    TypeData::Interface(interface) => Some((
-                                                        interface.base_types_resolved,
-                                                        interface.declared_members_resolved,
-                                                        record.object_flags().contains(
-                                                            ObjectFlags::MEMBERS_RESOLVED,
-                                                        ),
-                                                    )),
-                                                    _ => None,
-                                                }
-                                            });
-                                            observe_call_failure_detail(
-                                                stage,
-                                                format_args!(
-                                                    "expression={:?} role={role} type={observed:?} kind={:?} target={target:?} owner={owner:?} owner_flags={:?} object_flags={:?} member_state={member_state:?} name={:?} declaration={declaration:?} declaration_kind={:?} value_declaration={:?} argument_count={}",
-                                                    construction.node(),
-                                                    record.map(|record| record.data().kind()),
-                                                    symbol.map(|symbol| symbol.flags().bits()),
-                                                    record.map(|record| record.object_flags().bits()),
-                                                    symbol.map(|symbol| symbol.name()),
-                                                    declaration.and_then(|node| store.source_node_kind(node)),
-                                                    symbol.and_then(|symbol| symbol.value_declaration()),
-                                                    argument_types.len(),
-                                                ),
-                                            );
-                                        }
-                                    }
-                                }
                                 return Err(SourcePlanner::new_plan_error(
                                     construction.node(),
                                     error,
@@ -49789,7 +49721,7 @@ fn source_type_is_assignable_to(
     }
 }
 
-/// Prepares a cold non-array target and reports whether its members became ready.
+/// Prepares a cold interface required by a canonical array relation.
 #[allow(clippy::too_many_arguments)] // Member demand retains the caller's complete query state.
 fn prepare_source_array_relation_target(
     store: &mut CanonicalTypeMapperStore,
@@ -49816,21 +49748,27 @@ fn prepare_source_array_relation_target(
     if source_record.flags() != TypeFlags::OBJECT || target_record.flags() != TypeFlags::OBJECT {
         return Ok(false);
     }
-    let (TypeData::TypeReference(source_reference), TypeData::TypeReference(target_reference)) =
-        (source_record.data(), target_record.data())
-    else {
+    let TypeData::TypeReference(source_reference) = source_record.data() else {
         return Ok(false);
     };
     let arrays = [
         Some(global_types.array_type),
         Some(global_types.readonly_array_type),
     ];
-    if !arrays.contains(&source_reference.object.target)
-        || arrays.contains(&target_reference.object.target)
-    {
+    if !arrays.contains(&source_reference.object.target) {
         return Ok(false);
     }
-    let target_id = target_reference.object.target;
+    let (reference, target_id) = match target_record.data() {
+        TypeData::TypeReference(target_reference)
+            if !arrays.contains(&target_reference.object.target) =>
+        {
+            (target, target_reference.object.target)
+        }
+        TypeData::Interface(_) if source_reference.object.target == Some(target) => {
+            (source, Some(target))
+        }
+        _ => return Ok(false),
+    };
     let Some(target_origin) = target_id.and_then(|target| store.type_payload(target)) else {
         return Ok(false);
     };
@@ -49876,7 +49814,7 @@ fn prepare_source_array_relation_target(
         session,
         &mut member_diagnostics,
     )?
-    .prepare_generic_interface_declared_members(target);
+    .prepare_generic_interface_declared_members(reference);
     merge_retry_diagnostics(diagnostics, member_diagnostics);
     prepared?;
     Ok(target_id
