@@ -290,8 +290,19 @@ pub(in crate::semantic) fn source_class_annotation_role(
                 || clause_record.kind != SyntaxKind::HeritageClause
                 || clause_record.flags.0 != 0
                 || clause_record.parent != Some(declaration.node)
-                || heritage.token != SyntaxKind::ExtendsKeyword
-                || heritage.types.nodes.as_slice() != [parent.node]
+                || !matches!(
+                    heritage.token,
+                    SyntaxKind::ExtendsKeyword | SyntaxKind::ImplementsKeyword
+                )
+                || heritage.token == SyntaxKind::ExtendsKeyword
+                    && heritage.types.nodes.as_slice() != [parent.node]
+                || heritage
+                    .types
+                    .nodes
+                    .iter()
+                    .filter(|&&node| node == parent.node)
+                    .count()
+                    != 1
                 || class.heritage_clauses.as_ref().is_none_or(|clauses| {
                     clauses
                         .nodes

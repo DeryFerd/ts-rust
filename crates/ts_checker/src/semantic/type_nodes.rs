@@ -572,8 +572,19 @@ fn preflight_source_class_heritage_owner(
         || clause_record.kind != SyntaxKind::HeritageClause
         || clause_record.flags.0 != 0
         || clause_record.parent != Some(declaration.node)
-        || data.token != SyntaxKind::ExtendsKeyword
-        || data.types.nodes.as_slice() != [heritage.node]
+        || !matches!(
+            data.token,
+            SyntaxKind::ExtendsKeyword | SyntaxKind::ImplementsKeyword
+        )
+        || data.token == SyntaxKind::ExtendsKeyword
+            && data.types.nodes.as_slice() != [heritage.node]
+        || data
+            .types
+            .nodes
+            .iter()
+            .filter(|&&node| node == heritage.node)
+            .count()
+            != 1
         || class.heritage_clauses.as_ref().is_none_or(|clauses| {
             clauses
                 .nodes
@@ -588,7 +599,100 @@ fn preflight_source_class_heritage_owner(
     Ok(())
 }
 
-/// The extends node retains its own role and the complete direct-reference plan.
+/// Finds an implements reference through its actual clause and class owner.
+fn source_class_implementation_owner(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Option<SemanticSymbolId>, DeclaredTypeError> {
+    let record = preflight_node(store, host, node)?;
+    if record.kind != SyntaxKind::ExpressionWithTypeArguments {
+        return Ok(None);
+    }
+    let Some(clause) = record
+        .parent
+        .map(|parent| NodeRef::new(node.arena, node.file, parent))
+    else {
+        return Ok(None);
+    };
+    let clause_record = preflight_node(store, host, clause)?;
+    let NodeData::HeritageClause(heritage) = &clause_record.data else {
+        return Ok(None);
+    };
+    if heritage.token != SyntaxKind::ImplementsKeyword {
+        return Ok(None);
+    }
+    let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+    let declaration = clause_record
+        .parent
+        .map(|parent| NodeRef::new(node.arena, node.file, parent))
+        .ok_or_else(&invalid)?;
+    let owner = host
+        .bound_file(declaration)
+        .and_then(|bound| bound.symbol(declaration))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(&invalid)?;
+    preflight_source_class_heritage_owner(store, host, node, owner)?;
+    Ok(Some(owner))
+}
+
+/// Uses the ordinary import chain for a class's type-only heritage reference.
+fn plan_source_class_implementation_import(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Option<OrdinaryImportAliasChain>, DeclaredTypeError> {
+    if source_class_implementation_owner(store, host, node)?.is_none() {
+        return Ok(None);
+    }
+    let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+    let record = preflight_node(store, host, node)?;
+    let NodeData::ExpressionWithTypeArguments(reference) = &record.data else {
+        return Err(invalid());
+    };
+    let name = NodeRef::new(node.arena, node.file, reference.expression);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(type_node_unavailable(
+            TypeNodeUnavailable::QualifiedTypeReference(node),
+        ));
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(node.node)
+        || name_record.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || name_record.range.start < record.range.start
+        || name_record.range.end > record.range.end
+    {
+        return Err(invalid());
+    }
+    let (arena, bound) = host.source(node).ok_or_else(&invalid)?;
+    let mut callback_host = host.name_resolver_host(store)?;
+    let raw = CanonicalNameResolver::new(
+        arena,
+        bound,
+        store.symbol_store(),
+        &mut callback_host,
+    )?
+    .resolve(
+        Some(CanonicalResolutionLocation::Bound(name)),
+        &identifier.text,
+        SymbolFlags::TYPE,
+        None,
+        false,
+        false,
+    )?
+    .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::MissingTypeReference(node)))?;
+    if store
+        .symbol(raw)
+        .is_none_or(|symbol| symbol.flags() != SymbolFlags::ALIAS)
+    {
+        return Ok(None);
+    }
+    ordinary_import_alias_chain(store, host, node, raw).map(Some)
+}
+
+/// The heritage node retains its own role and complete direct-reference plan.
 pub(super) fn preflight_source_class_heritage_type(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -612,6 +716,7 @@ pub(super) fn preflight_source_class_heritage_type(
     planner.replay_cached_annotations = true;
     planner.plan_type_node(heritage)?;
     let plan = planner.finish();
+    let implementation = source_class_implementation_owner(store, host, heritage)?.is_some();
     if !plan.recovered_missing_references.is_empty()
         || !plan.recovered_missing_reference_diagnostics.is_empty()
         || plan
@@ -621,7 +726,10 @@ pub(super) fn preflight_source_class_heritage_type(
         || plan.references.get(&heritage).is_none_or(|reference| {
             store
                 .symbol(reference.symbol)
-                .is_none_or(|symbol| symbol.flags() != SymbolFlags::CLASS)
+                .is_none_or(|symbol| {
+                    symbol.flags() != SymbolFlags::CLASS
+                        && !(implementation && symbol.flags() == SymbolFlags::INTERFACE)
+                })
         })
     {
         return Err(type_node_unavailable(
@@ -2282,7 +2390,27 @@ impl TypeQueryPlan {
             .and_then(|links| links.resolved_type);
         let mut needs_node_cache = true;
         let expected = if let Some(reference) = self.references.get(&node) {
-            let cold_property_import = if let Some(class) = &reference.class_annotation_import {
+            let cold_property_import = if let Some(import) = &reference.implementation_import {
+                let alias = import
+                    .steps
+                    .first()
+                    .map(|step| step.source.alias())
+                    .ok_or_else(&invalid)?;
+                if reference.import_alias != Some(alias)
+                    || reference.symbol != import.target()
+                    || reference.property_import.is_some()
+                    || reference.alias_body_import.is_some()
+                    || reference.class_annotation_import.is_some()
+                    || store.source_node_kind(node)
+                        != Some(SyntaxKind::ExpressionWithTypeArguments)
+                {
+                    return Err(invalid());
+                }
+                validate_ordinary_import_alias_links(store, node, import, cached.is_some())?;
+                store
+                    .alias_symbol_links(alias)
+                    .is_none_or(|links| !links.alias_target.has_property())
+            } else if let Some(class) = &reference.class_annotation_import {
                 if class.reference() != node
                     || Some(class.alias_symbol()) != reference.import_alias
                     || class.target_symbol() != reference.symbol
@@ -3409,6 +3537,14 @@ impl TypeQueryPlan {
         active: &mut HashSet<NodeRef>,
     ) -> Result<Option<TypeId>, DeclaredTypeError> {
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        if let Some(import) = self
+            .references
+            .get(&node)
+            .and_then(|reference| reference.implementation_import.as_ref())
+            && plan_source_class_implementation_import(store, host, node)?.as_ref() != Some(import)
+        {
+            return Err(invalid());
+        }
         if let Some(class) = self
             .references
             .get(&node)
@@ -3421,9 +3557,11 @@ impl TypeQueryPlan {
             return Err(invalid());
         }
         if self.references.get(&node).is_some_and(|reference| {
-            self.aliases
-                .get(&reference.symbol)
-                .is_some_and(|alias| !alias.type_parameters.is_empty())
+            reference.implementation_import.is_some()
+                || self
+                    .aliases
+                    .get(&reference.symbol)
+                    .is_some_and(|alias| !alias.type_parameters.is_empty())
         }) {
             if store
                 .constructor_annotation_binding(node)
@@ -5563,6 +5701,7 @@ fn cached_ordinary_intersection_alias_request_matches(
 struct PlannedTypeReference {
     symbol: SemanticSymbolId,
     import_alias: Option<SemanticSymbolId>,
+    implementation_import: Option<OrdinaryImportAliasChain>,
     property_import: Option<SourcePropertyTypeImportPlan>,
     alias_body_import: Option<SourceAliasBodyTypeImportPlan>,
     class_annotation_import: Option<source_imports::SourceClassAnnotationTypeImportPlan>,
@@ -23222,6 +23361,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && name_text == "Array"
             && type_arguments.len() == 1;
         let source_class_heritage = record_heritage && self.source_class_heritage == Some(node);
+        let source_class_implementation = source_class_heritage
+            && source_class_implementation_owner(self.store, self.host, node)?.is_some();
         if record_heritage
             && !array_heritage
             && !source_class_heritage
@@ -23285,6 +23426,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             source_imports::plan_source_class_annotation_type_import(self.store, self.host, node)
                 .map_err(|error| property_type_import_error(node, error))?
         };
+        let implementation_import = if source_class_implementation {
+            plan_source_class_implementation_import(self.store, self.host, node)?
+        } else {
+            None
+        };
         let (alias_body_import, lexical_resolution) = if qualified
             || record_heritage
             || property_import.is_some()
@@ -23323,6 +23469,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && property_import.is_none()
             && alias_body_import.is_none()
             && class_annotation_import.is_none()
+            && implementation_import.is_none()
             && (cached_type.is_some() || cached_symbol.is_some())
         {
             match lexical_resolution {
@@ -23391,6 +23538,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && property_import.is_none()
             && alias_body_import.is_none()
             && class_annotation_import.is_none()
+            && implementation_import.is_none()
             && let Some(cached) = cached_type
             && !cached_array_capability_missing
             && !cached_pending_function
@@ -23433,7 +23581,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let possible_global_array_name = !qualified
             && self.array_targets.is_some()
             && matches!(name_text, "Array" | "ReadonlyArray");
-        let symbol = if let Some(class) = &class_annotation_import {
+        let symbol = if let Some(import) = &implementation_import {
+            if exact_import.is_some()
+                || property_import.is_some()
+                || alias_body_import.is_some()
+                || class_annotation_import.is_some()
+                || cached_symbol.is_some_and(|symbol| symbol != import.target())
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+            import.target()
+        } else if let Some(class) = &class_annotation_import {
             if class.reference() != node
                 || class.arguments() != type_arguments
                 || self
@@ -23685,6 +23845,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if record_heritage
             && if source_class_heritage {
                 flags != SymbolFlags::CLASS
+                    && !(source_class_implementation && flags == SymbolFlags::INTERFACE)
             } else if array_heritage {
                 global_array_target != self.array_targets.map(CanonicalArrayTargets::array_type)
                     || !self.global_symbol_has_name(symbol, "Array")
@@ -23755,7 +23916,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if global_array_target.is_none() || type_arguments.len() == 1 {
             let previous_replay = self.replay_cached_annotations;
             let previous_arguments = self.checking_imported_arguments;
-            if alias_body_import.is_some() || class_annotation_import.is_some() {
+            if alias_body_import.is_some()
+                || class_annotation_import.is_some()
+                || implementation_import.is_some()
+            {
                 self.replay_cached_annotations = true;
                 self.checking_imported_arguments = true;
             }
@@ -24224,7 +24388,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         .as_ref()
                         .map(|class| class.alias_symbol())
                 })
-                .or_else(|| exact_import.map(|capability| capability.alias)),
+                .or_else(|| exact_import.map(|capability| capability.alias))
+                .or_else(|| {
+                    implementation_import
+                        .as_ref()
+                        .and_then(|chain| chain.steps.first())
+                        .map(|step| step.source.alias())
+                }),
+            implementation_import,
             class_annotation_import,
             property_import,
             alias_body_import,
@@ -30316,7 +30487,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     .as_utf8()
                     .is_none_or(|name| !self.global_symbol_has_name(symbol, name)))
         {
-            let imported = if let Some(target) = self.type_reference_alias_targets.get(&node) {
+            let imported = if self.source_class_heritage == Some(node)
+                && let Some(import) =
+                    plan_source_class_implementation_import(self.store, self.host, node)?
+            {
+                import.target() == symbol
+            } else if let Some(target) = self.type_reference_alias_targets.get(&node) {
                 target.reference == node && target.target == symbol
             } else if let Some(body) =
                 source_imports::plan_source_alias_body_type_import(self.store, self.host, node)
@@ -33005,6 +33181,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         &self,
         node: NodeRef,
     ) -> Result<SemanticSymbolId, DeclaredTypeError> {
+        if self.source_class_heritage == Some(node)
+            && let Some(import) =
+                plan_source_class_implementation_import(self.store, self.host, node)?
+        {
+            if self.plan.references.get(&node).is_some_and(|reference| {
+                reference.implementation_import.as_ref() != Some(&import)
+                    || reference.symbol != import.target()
+            }) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+            return Ok(import.target());
+        }
         if let Some(class) =
             source_imports::plan_source_class_annotation_type_import(self.store, self.host, node)
                 .map_err(|error| property_type_import_error(node, error))?
@@ -37935,6 +38125,20 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::InvalidFunctionType(node),
             ));
         }
+        if let Some(owner) = source_class_implementation_owner(self.store, self.host, node)? {
+            let globals = self.global_types.as_ref().ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+            })?;
+            return preflight_source_class_heritage_type(
+                self.store,
+                self.host,
+                globals,
+                self.options,
+                node,
+                owner,
+            )
+            .map(|_| ());
+        }
         if let Some(owner) = source_class_method_annotation_owner(self.store, self.host, node)? {
             let globals = self.global_types.as_ref().ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
@@ -37990,6 +38194,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         node: NodeRef,
     ) -> Result<TypeId, DeclaredTypeError> {
+        if let Some(owner) = source_class_implementation_owner(self.store, self.host, node)? {
+            return self.get_source_class_heritage_type(node, owner);
+        }
         let type_ = match source_class_method_annotation_owner(self.store, self.host, node)? {
             Some(owner) => self.get_type_from_source_class_annotation(node, owner)?,
             None => self.get_type_from_type_node_worker(node, false, false)?,
@@ -38214,7 +38421,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(type_)
     }
 
-    /// Queries the actual extends node without changing its base declaration identity.
+    /// Queries the actual heritage node without changing its target declaration identity.
     pub(super) fn get_source_class_heritage_type(
         &mut self,
         heritage: NodeRef,
@@ -43710,7 +43917,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if plan
             .references
             .values()
-            .any(|reference| reference.class_annotation_import.is_some())
+            .any(|reference| {
+                reference.class_annotation_import.is_some()
+                    || reference.implementation_import.is_some()
+            })
         {
             for node in &plan.nodes {
                 plan.cached_type_query_result(
@@ -43742,6 +43952,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
         // Validate every declaration-owned route before publishing cold import links.
         for (&node, reference) in &plan.references {
+            if let Some(import) = &reference.implementation_import {
+                if plan_source_class_implementation_import(self.store, self.host, node)?.as_ref()
+                    != Some(import)
+                    || reference.symbol != import.target()
+                    || reference.import_alias
+                        != import.steps.first().map(|step| step.source.alias())
+                    || reference.property_import.is_some()
+                    || reference.alias_body_import.is_some()
+                    || reference.class_annotation_import.is_some()
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(node),
+                    ));
+                }
+            }
             if let Some(class) = &reference.class_annotation_import {
                 let current = source_imports::plan_source_class_annotation_type_import(
                     self.store, self.host, node,
@@ -43794,6 +44019,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
         }
         for (&node, reference) in &plan.references {
+            if let Some(import) = &reference.implementation_import {
+                let alias = reference.import_alias.ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+                })?;
+                self.resolve_ordinary_import_alias_chain(node, alias, import)?;
+            }
             if let Some(class) = &reference.class_annotation_import {
                 source_imports::prepare_source_class_annotation_type_import(
                     self.store, self.host, class,
@@ -44423,6 +44654,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let reference = PlannedTypeReference {
                 symbol: base.symbol,
                 import_alias: None,
+                implementation_import: None,
                 property_import: None,
                 alias_body_import: None,
                 class_annotation_import: None,

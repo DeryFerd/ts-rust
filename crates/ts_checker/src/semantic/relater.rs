@@ -10737,37 +10737,102 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }));
         }
 
-        if matches!(
-            self.type_payload(type_id).map(TypeRecord::data),
-            Some(TypeData::TypeReference(_))
-        ) {
-            let reference = validate_direct_generic_reference(self, type_id)
-                .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?;
+        if self.type_payload(type_id).is_some_and(|record| {
+            matches!(record.data(), TypeData::TypeReference(_))
+                || matches!(record.data(), TypeData::Interface(_))
+                    && record.object_flags().contains(ObjectFlags::CLASS)
+        }) {
+            let target_type = if matches!(
+                self.type_payload(type_id).map(TypeRecord::data),
+                Some(TypeData::TypeReference(_))
+            ) {
+                validate_direct_generic_reference(self, type_id)
+                    .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?
+                    .target
+            } else {
+                type_id
+            };
             let target = self
-                .type_payload(reference.target)
+                .type_payload(target_type)
                 .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
-            if !matches!(target.data(), TypeData::Interface(_))
-                || target.object_flags().contains(ObjectFlags::CLASS)
-            {
+            if !matches!(target.data(), TypeData::Interface(_)) {
                 return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
             }
             let owner = target
                 .symbol()
                 .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
-            let plan = super::object_members::plan_generic_interface(self, host, owner)
-                .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?;
-            if plan.heritage.is_some()
-                || !plan.methods.is_empty()
-                || !plan.accessors.is_empty()
-                || !plan.indexes.is_empty()
-                || !plan.call_signatures.is_empty()
-                || plan.properties.iter().any(|property| {
-                    self.source_node_kind(property.name_node)
-                        == Some(SyntaxKind::ComputedPropertyName)
-                })
-            {
-                return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
-            }
+            let properties = if target.object_flags().contains(ObjectFlags::CLASS) {
+                match validate_class_heritage_members(self, target_type) {
+                    ClassHeritageMembersValidation::Valid => {}
+                    ClassHeritageMembersValidation::Malformed => {
+                        return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                    }
+                    ClassHeritageMembersValidation::NotClass => {
+                        return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
+                    }
+                }
+                let structured = target
+                    .data()
+                    .structured()
+                    .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                if structured
+                    .index_infos
+                    .as_ref()
+                    .is_some_and(|indexes| !indexes.is_empty())
+                {
+                    return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
+                }
+                structured
+                    .properties
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|&symbol| {
+                        let record = self
+                            .symbol(symbol)
+                            .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                        let declaration = record
+                            .value_declaration()
+                            .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                        if record.parent() != Some(owner) {
+                            return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
+                        }
+                        Ok((
+                            symbol,
+                            record.name().to_owned(),
+                            declaration,
+                            record.flags().contains(SymbolFlags::OPTIONAL),
+                            record.check_flags().contains(CheckFlags::READONLY),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                let plan = super::object_members::plan_generic_interface(self, host, owner)
+                    .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                if plan.heritage.is_some()
+                    || !plan.accessors.is_empty()
+                    || !plan.indexes.is_empty()
+                    || !plan.call_signatures.is_empty()
+                    || plan.properties.iter().any(|property| {
+                        self.source_node_kind(property.name_node)
+                            == Some(SyntaxKind::ComputedPropertyName)
+                    })
+                {
+                    return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
+                }
+                plan.properties
+                    .into_iter()
+                    .map(|property| {
+                        (
+                            property.symbol,
+                            property.name,
+                            property.declaration,
+                            property.optional,
+                            property.readonly,
+                        )
+                    })
+                    .collect()
+            };
 
             let bootstrap = self.relation_bootstrap_facts()?;
             let mut session = RelaterSession::new_with_global_types_options_and_session(
@@ -10782,51 +10847,54 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             let resolved = session.resolved_object_members(type_id, false)?;
             if !matches!(
                 resolved.property_origin,
-                ObjectPropertyOrigin::GenericReference(receiver) if receiver == type_id
-            ) || resolved.properties.len() != plan.properties.len()
+                ObjectPropertyOrigin::GenericReference(receiver)
+                    | ObjectPropertyOrigin::ValidatedClass(receiver) if receiver == type_id
+            ) || resolved.properties.len() != properties.len()
                 || !resolved.index_infos.is_empty()
                 || !resolved.call_signatures.is_empty()
                 || resolved.exact_callable
             {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
             }
-            let mut properties = Vec::with_capacity(plan.properties.len());
-            let mut by_name = HashMap::with_capacity(plan.properties.len());
-            for (symbol, planned) in resolved.properties.into_iter().zip(&plan.properties) {
+            let mut mapped_properties = Vec::with_capacity(properties.len());
+            let mut by_name = HashMap::with_capacity(properties.len());
+            for (symbol, (original, name, declaration, optional, readonly)) in
+                resolved.properties.into_iter().zip(properties)
+            {
                 let record = session.property_symbol(symbol, resolved.property_origin)?;
-                if record.name() != planned.name.as_ref()
-                    || record.value_declaration() != Some(planned.declaration)
-                    || record.flags().contains(SymbolFlags::OPTIONAL) != planned.optional
-                    || record.check_flags().contains(CheckFlags::READONLY) != planned.readonly
+                if record.name() != name.as_ref()
+                    || record.value_declaration() != Some(declaration)
+                    || record.flags().contains(SymbolFlags::OPTIONAL) != optional
+                    || record.check_flags().contains(CheckFlags::READONLY) != readonly
                 {
                     return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                 }
-                if !host.symbol_matches(session.store, planned.declaration, planned.symbol)
-                    || symbol != planned.symbol
+                if !host.symbol_matches(session.store, declaration, original)
+                    || symbol != original
                         && session
                             .store
                             .value_symbol_links(symbol)
                             .and_then(|links| links.target)
-                            != Some(planned.symbol)
+                            != Some(original)
                 {
                     return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                 }
                 // Read the instance through its mapper. The declaration keeps its template type.
                 let type_ = session.property_type(symbol, resolved.property_origin)?;
-                let index = properties.len();
-                if by_name.insert(planned.name.clone(), index).is_some() {
+                let index = mapped_properties.len();
+                if by_name.insert(name.clone(), index).is_some() {
                     return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                 }
-                properties.push(ResolvedDeclaredProperty {
+                mapped_properties.push(ResolvedDeclaredProperty {
                     symbol,
-                    name: planned.name.clone(),
+                    name,
                     type_,
-                    optional: planned.optional,
-                    declaration: planned.declaration,
+                    optional,
+                    declaration,
                 });
             }
             return Ok(Some(ResolvedDeclaredPropertyObject {
-                properties,
+                properties: mapped_properties,
                 by_name,
             }));
         }

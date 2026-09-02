@@ -8219,8 +8219,14 @@ pub(super) fn check_class_implementation_compatibility(
     }) {
         return Ok(());
     }
-    let header = plan_class_declaration_header(store, host, members.shells.symbol, true)
-        .map_err(|_| SourceCheckError::Class(declaration))?;
+    let header = plan_class_declaration_header_with_source_types(
+        store,
+        host,
+        members.shells.symbol,
+        true,
+        true,
+    )
+    .map_err(|_| SourceCheckError::Class(declaration))?;
     let source_type = members.shells.instance_type;
     if header.declaration != declaration
         || header.base.as_ref().map(|base| base.symbol) != members.base.map(|base| base.symbol)
@@ -8237,28 +8243,67 @@ pub(super) fn check_class_implementation_compatibility(
         flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
     }
     for implementation in header.implementations {
-        // The existing class-target path admits only empty instance types.
-        if store
+        let class_target = store
             .symbol(implementation.symbol)
-            .is_some_and(|symbol| symbol.flags() == SymbolFlags::CLASS)
-        {
+            .is_some_and(|symbol| symbol.flags() == SymbolFlags::CLASS);
+        // The legacy shell query proves that its class target has no instance members.
+        if class_target && !implementation.source_type {
             continue;
         }
-        let target_type = CanonicalTypeQuery::new_with_global_types_and_session(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            diagnostics,
-        )?
-        .get_declared_type_of_symbol(implementation.symbol)?;
+        let target_type = {
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?;
+            if implementation.source_type {
+                query.get_source_class_heritage_type(implementation.node, members.shells.symbol)?
+            } else {
+                query.get_declared_type_of_symbol(implementation.symbol)?
+            }
+        };
         if store.type_payload(target_type).and_then(TypeRecord::symbol)
             != Some(implementation.symbol)
         {
             return Err(SourceCheckError::Class(implementation.expression));
         }
-        if let Some(method) = &implementation.method {
+        let mut required_methods = implementation.method.into_iter().collect::<Vec<_>>();
+        if implementation.source_type && !class_target {
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .prepare_generic_interface_declared_members(target_type)?;
+            if let Some(table) = store
+                .symbol(implementation.symbol)
+                .and_then(Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+            {
+                for (_, symbol) in table.iter() {
+                    let record = store
+                        .symbol(symbol)
+                        .ok_or(SourceCheckError::Class(implementation.expression))?;
+                    if record.flags().contains(SymbolFlags::METHOD) {
+                        required_methods.push(ImplementedClassMethodPlan {
+                            symbol,
+                            name: record
+                                .name()
+                                .as_utf8()
+                                .ok_or(SourceCheckError::Class(implementation.expression))?
+                                .to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+        for method in &required_methods {
             let method_type = CanonicalTypeQuery::new_with_global_types_and_session(
                 store,
                 host,
@@ -8309,6 +8354,15 @@ pub(super) fn check_class_implementation_compatibility(
                 .get_return_type_of_signature(signature)?;
             }
         }
+        let target_members = store
+            .resolved_declared_property_object_with_global_types_and_session(
+                host,
+                target_type,
+                global_types,
+                Some(options.strict_function_types),
+                session,
+            )?
+            .ok_or(SourceCheckError::Class(implementation.expression))?;
         if store.is_type_assignable_to_with_session(
             source_type,
             target_type,
@@ -8318,9 +8372,6 @@ pub(super) fn check_class_implementation_compatibility(
         )? {
             continue;
         }
-        let target_members = store
-            .resolved_declared_property_object_with_global_types(host, target_type, global_types)?
-            .ok_or(SourceCheckError::Class(implementation.expression))?;
         let source_properties = members
             .instance_properties()
             .iter()
@@ -8418,11 +8469,12 @@ pub(super) fn check_class_implementation_compatibility(
                         .any(|source| source.name == target.name)
             })
             .collect::<Vec<_>>();
+        let code = if class_target { 2720 } else { 2420 };
         let mut diagnostic = CanonicalCheckerDiagnostic {
             node: Some(name),
             range_override: None,
             diagnostic: Diagnostic::with_arguments(
-                message_by_code(2420).ok_or(SourceCheckError::MissingDiagnostic(2420))?,
+                message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
                 [names.source, names.target],
             ),
             related_information: Vec::new(),
@@ -10251,6 +10303,7 @@ struct DirectClassImplementationPlan {
     expression: NodeRef,
     symbol: SemanticSymbolId,
     method: Option<ImplementedClassMethodPlan>,
+    source_type: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16869,7 +16922,7 @@ fn plan_direct_class_base_with_source_types(
     let clause = if let [clause_id] = clauses.nodes.as_slice() {
         NodeRef::new(declaration.arena, declaration.file, *clause_id)
     } else if let Some((base, _)) =
-        combined_class_heritage_clauses(store, host, declaration, clauses)?
+        combined_class_heritage_clauses(store, host, declaration, clauses, source_types)?
     {
         base
     } else {
@@ -17216,6 +17269,7 @@ fn combined_class_heritage_clauses(
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
     clauses: &ts_ast::NodeList,
+    source_types: bool,
 ) -> Result<Option<(NodeRef, NodeRef)>, ClassError> {
     let [base, implementations] = clauses.nodes.as_slice() else {
         return Ok(None);
@@ -17225,7 +17279,7 @@ fn combined_class_heritage_clauses(
         return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
     };
     if clauses.has_trailing_comma
-        || class.type_parameters.is_some()
+        || !source_types && class.type_parameters.is_some()
         || clauses.range.start < declaration_record.range.start
         || clauses.range.end > class.members.range.start
     {
@@ -17259,6 +17313,66 @@ fn combined_class_heritage_clauses(
         previous_end = record.range.end;
     }
     Ok(Some((base, implementations)))
+}
+
+/// Direct references do not yet carry the implementing class's extra this argument.
+fn preflight_implementation_member_annotations(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    expression: NodeRef,
+) -> Result<(), ClassError> {
+    let mut pending = store
+        .symbol(symbol)
+        .and_then(Symbol::declarations)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(expression)))?
+        .to_vec();
+    let mut visited = HashSet::new();
+    while let Some(node) = pending.pop() {
+        if !visited.insert(node) {
+            return Err(invariant(ClassInvariant::InvalidHeritage(node)));
+        }
+        let record = preflight_node(store, host, node)?;
+        if record.kind == SyntaxKind::Block {
+            continue;
+        }
+        let modifiers = match &record.data {
+            NodeData::MethodDeclaration(member) => member.modifiers.as_ref(),
+            NodeData::PropertyDeclaration(member) => member.modifiers.as_ref(),
+            NodeData::GetAccessorDeclaration(member) => member.modifiers.as_ref(),
+            NodeData::SetAccessorDeclaration(member) => member.modifiers.as_ref(),
+            _ => None,
+        };
+        let mut is_static = false;
+        if let Some(modifiers) = modifiers {
+            for modifier in &modifiers.list.nodes {
+                let modifier = NodeRef::new(node.arena, node.file, *modifier);
+                let modifier_record = preflight_node(store, host, modifier)?;
+                if modifier_record.parent != Some(node.node) || modifier_record.flags.0 != 0 {
+                    return Err(invariant(ClassInvariant::InvalidHeritage(modifier)));
+                }
+                is_static |= modifier_record.kind == SyntaxKind::StaticKeyword;
+            }
+        }
+        if is_static {
+            continue;
+        }
+        if record.kind == SyntaxKind::ThisType
+            || matches!(&record.data,
+                NodeData::MethodDeclaration(method) if method.type_.is_none())
+            || matches!(&record.data,
+                NodeData::PropertyDeclaration(property) if property.type_.is_none())
+            || matches!(&record.data,
+                NodeData::GetAccessorDeclaration(accessor) if accessor.type_.is_none())
+        {
+            // An inferred class member can also contain its polymorphic this type.
+            return Err(unsupported(ClassUnsupported::Heritage(expression)));
+        }
+        record.for_each_child(|child| {
+            pending.push(NodeRef::new(node.arena, node.file, child));
+        });
+    }
+    Ok(())
 }
 
 fn plan_implemented_interface_method(
@@ -17298,8 +17412,10 @@ fn plan_class_implementations(
     declaration: NodeRef,
     owner: SemanticSymbolId,
     clauses: &ts_ast::NodeList,
+    source_types: bool,
 ) -> Result<Vec<DirectClassImplementationPlan>, ClassError> {
-    let combined = combined_class_heritage_clauses(store, host, declaration, clauses)?;
+    let combined =
+        combined_class_heritage_clauses(store, host, declaration, clauses, source_types)?;
     let clause = if let Some((_, implementations)) = combined {
         implementations
     } else if let [clause_id] = clauses.nodes.as_slice() {
@@ -17341,7 +17457,7 @@ fn plan_class_implementations(
             || record.range.start < previous_end
             || record.range.end > data.types.range.end
             || target.facts != 0
-            || target.type_arguments.is_some()
+            || !source_types && target.type_arguments.is_some()
         {
             return Err(unsupported(ClassUnsupported::Heritage(node)));
         }
@@ -17379,9 +17495,38 @@ fn plan_class_implementations(
                 )
                 .map_err(|_| unsupported(ClassUnsupported::Heritage(expression)))?
                 .ok_or_else(|| unsupported(ClassUnsupported::Heritage(expression)))?;
-        let symbol = store
+        let mut symbol = store
             .get_merged_symbol(raw)
             .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(expression)))?;
+        if source_types {
+            if store
+                .symbol(symbol)
+                .is_some_and(|symbol| symbol.flags() == SymbolFlags::ALIAS)
+            {
+                symbol = super::type_nodes::plan_ordinary_import_alias_target(
+                    store, host, node, symbol,
+                )?;
+            }
+            let target = store
+                .symbol(symbol)
+                .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(expression)))?;
+            if symbol == owner
+                || !matches!(target.flags(), SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+            {
+                return Err(unsupported(ClassUnsupported::Heritage(expression)));
+            }
+            preflight_class_or_interface_reference(store, host, symbol, target.flags())?;
+            preflight_implementation_member_annotations(store, host, symbol, expression)?;
+            implementations.push(DirectClassImplementationPlan {
+                clause,
+                node,
+                expression,
+                symbol,
+                method: None,
+                source_type: true,
+            });
+            continue;
+        }
         let target_record = store
             .symbol(symbol)
             .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(expression)))?;
@@ -17450,6 +17595,7 @@ fn plan_class_implementations(
             expression,
             symbol,
             method: implemented_method,
+            source_type: false,
         });
     }
     Ok(implementations)
@@ -19552,7 +19698,14 @@ fn plan_class_declaration_header_with_imports(
                 (
                     None,
                     None,
-                    plan_class_implementations(store, host, declaration, symbol, clauses)?,
+                    plan_class_implementations(
+                        store,
+                        host,
+                        declaration,
+                        symbol,
+                        clauses,
+                        source_types && !ambient,
+                    )?,
                 )
             } else if allow_direct_base {
                 (
@@ -19567,9 +19720,23 @@ fn plan_class_declaration_header_with_imports(
                         imports,
                     )?),
                     None,
-                    if combined_class_heritage_clauses(store, host, declaration, clauses)?.is_some()
+                    if combined_class_heritage_clauses(
+                        store,
+                        host,
+                        declaration,
+                        clauses,
+                        source_types && !ambient,
+                    )?
+                    .is_some()
                     {
-                        plan_class_implementations(store, host, declaration, symbol, clauses)?
+                        plan_class_implementations(
+                            store,
+                            host,
+                            declaration,
+                            symbol,
+                            clauses,
+                            source_types && !ambient,
+                        )?
                     } else {
                         Vec::new()
                     },
