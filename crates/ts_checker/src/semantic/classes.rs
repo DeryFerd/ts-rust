@@ -10765,7 +10765,11 @@ fn class_property_modifiers(
         [SyntaxKind::PublicKeyword | SyntaxKind::PrivateKeyword | SyntaxKind::ProtectedKeyword] => {
             (ClassPropertySide::Instance, false)
         }
-        [SyntaxKind::AbstractKeyword] => {
+        [SyntaxKind::AbstractKeyword]
+        | [
+            SyntaxKind::PublicKeyword | SyntaxKind::ProtectedKeyword,
+            SyntaxKind::AbstractKeyword,
+        ] => {
             let declaration_record = preflight_node(store, host, declaration)?;
             let owner = declaration_record
                 .parent
@@ -14662,15 +14666,14 @@ fn plan_method_with_body_mode(
     let NodeData::MethodDeclaration(method) = &record.data else {
         return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
     };
-    let abstract_method = method.modifiers.as_ref().is_some_and(|modifiers| {
-        matches!(
-            modifiers.list.nodes.as_slice(),
-            [modifier]
-                if host
-                    .node(NodeRef::new(declaration.arena, declaration.file, *modifier))
-                    .is_some_and(|modifier| modifier.kind == SyntaxKind::AbstractKeyword)
-        )
-    });
+    let (arena, _) = host
+        .source(declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(declaration)))?;
+    let abstract_method = ts_binder::canonical_has_syntactic_modifier(
+        arena,
+        declaration.node,
+        SyntaxKind::AbstractKeyword,
+    );
     let ambient = ambient || abstract_method;
     if record.kind != SyntaxKind::MethodDeclaration
         || record.flags.0 != 0
@@ -15695,15 +15698,14 @@ fn plan_property_with_body_mode(
         property.modifiers.as_ref(),
         merged_auto_accessor,
     )?;
-    let abstract_property = property.modifiers.as_ref().is_some_and(|modifiers| {
-        matches!(
-            modifiers.list.nodes.as_slice(),
-            [modifier]
-                if host
-                    .node(NodeRef::new(member.arena, member.file, *modifier))
-                    .is_some_and(|modifier| modifier.kind == SyntaxKind::AbstractKeyword)
-        )
-    });
+    let (arena, _) = host
+        .source(member)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(member)))?;
+    let abstract_property = ts_binder::canonical_has_syntactic_modifier(
+        arena,
+        member.node,
+        SyntaxKind::AbstractKeyword,
+    );
     if abstract_property && (private || property.initializer.is_some()) {
         return Err(unsupported(ClassUnsupported::PropertyModifiers(member)));
     }
@@ -26218,11 +26220,23 @@ fn plan_abstract_class_method_diagnostics(
         return None;
     };
     let modifiers = method.modifiers.as_ref()?;
-    let [modifier] = modifiers.list.nodes.as_slice() else {
-        return None;
+    let expected = match modifiers.list.nodes.as_slice() {
+        [_] => &[SyntaxKind::AbstractKeyword][..],
+        [visibility, _] => match host
+            .node(NodeRef::new(member.arena, member.file, *visibility))?
+            .kind
+        {
+            SyntaxKind::PublicKeyword => {
+                &[SyntaxKind::PublicKeyword, SyntaxKind::AbstractKeyword][..]
+            }
+            SyntaxKind::ProtectedKeyword => {
+                &[SyntaxKind::ProtectedKeyword, SyntaxKind::AbstractKeyword][..]
+            }
+            _ => return None,
+        },
+        _ => return None,
     };
-    let modifier = NodeRef::new(member.arena, member.file, *modifier);
-    let modifier_record = preflight_node(store, host, modifier).ok()?;
+    let modifier = NodeRef::new(member.arena, member.file, *modifiers.list.nodes.last()?);
     let (name, name_text) = accessor_name(store, host, member, method.name).ok()?;
     let name_record = preflight_node(store, host, name).ok()?;
     let source = host
@@ -26247,20 +26261,36 @@ fn plan_abstract_class_method_diagnostics(
         || modifiers.list.has_trailing_comma
         || modifiers.list.range.start != record.range.start
         || modifiers.list.range.end > name_record.range.start
-        || modifier_record.kind != SyntaxKind::AbstractKeyword
-        || modifier_record.flags.0 != 0
-        || modifier_record.parent != Some(member.node)
-        || !matches!(modifier_record.data, NodeData::Token(_))
-        || modifier_record.range.start != record.range.start
-        || modifier_record.range.end > modifiers.list.range.end
-        || source.get(
-            usize::try_from(modifier_record.range.start.get()).ok()?
-                ..usize::try_from(modifier_record.range.end.get()).ok()?,
-        ) != Some("abstract")
         || name_record.flags.0 != 0
         || name_record.range.end > method.parameters.range.start
     {
         return None;
+    }
+    let mut previous_end = record.range.start;
+    for (index, (&node, &kind)) in modifiers.list.nodes.iter().zip(expected).enumerate() {
+        let node = NodeRef::new(member.arena, member.file, node);
+        let modifier_record = preflight_node(store, host, node).ok()?;
+        let spelling = match kind {
+            SyntaxKind::PublicKeyword => "public",
+            SyntaxKind::ProtectedKeyword => "protected",
+            SyntaxKind::AbstractKeyword => "abstract",
+            _ => unreachable!("only visibility and abstract modifiers are planned"),
+        };
+        if modifier_record.kind != kind
+            || modifier_record.flags.0 != 0
+            || modifier_record.parent != Some(member.node)
+            || !matches!(modifier_record.data, NodeData::Token(_))
+            || modifier_record.range.start < previous_end
+            || index == 0 && modifier_record.range.start != record.range.start
+            || modifier_record.range.end > modifiers.list.range.end
+            || source.get(
+                usize::try_from(modifier_record.range.start.get()).ok()?
+                    ..usize::try_from(modifier_record.range.end.get()).ok()?,
+            ) != Some(spelling)
+        {
+            return None;
+        }
+        previous_end = modifier_record.range.end;
     }
 
     let symbol = bound_symbol(store, host, member)?;
