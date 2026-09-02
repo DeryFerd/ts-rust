@@ -40306,25 +40306,43 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .string_default_value(self.store, self.host)
                 .map_err(|error| source_callable_error(error, callable.family))?
             {
-                defaults.push((*parameter, value));
+                let number = match parameter
+                    .initializer
+                    .and_then(|initializer| self.store.source_node_kind(initializer))
+                {
+                    Some(SyntaxKind::StringLiteral) => None,
+                    Some(SyntaxKind::NumericLiteral) => Some(ts_jsnum::from_string(&value)),
+                    _ => {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidFunctionType(callable.declaration),
+                        ));
+                    }
+                };
+                defaults.push((*parameter, value, number));
             }
         }
         if defaults.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let values = defaults
+        let strings = defaults
             .iter()
-            .map(|(_, value)| value.clone())
+            .filter(|(_, _, number)| number.is_none())
+            .map(|(_, value, _)| value.clone())
+            .collect::<Vec<_>>();
+        let numbers = defaults
+            .iter()
+            .filter_map(|(_, _, number)| *number)
             .collect::<Vec<_>>();
         self.store
-            .prepare_regular_literal_types(&values, &[], &[])
+            .prepare_regular_literal_types(&strings, &numbers, &[])
             .map_err(Self::literal_cache_error)?;
         let mut types = BTreeMap::new();
-        for (parameter, value) in defaults {
-            let regular = self
-                .store
-                .regular_string_literal_type(value)
-                .map_err(Self::literal_cache_error)?;
+        for (parameter, value, number) in defaults {
+            let regular = match number {
+                Some(number) => self.store.regular_number_literal_type(number),
+                None => self.store.regular_string_literal_type(value),
+            }
+            .map_err(Self::literal_cache_error)?;
             let fresh = self
                 .store
                 .fresh_type_of_literal_type(regular)

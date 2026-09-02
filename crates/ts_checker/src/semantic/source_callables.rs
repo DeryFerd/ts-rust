@@ -127,14 +127,15 @@ impl SourceCallableParameterPlan {
     /// Returns the written, inferred, contextual, implicit `any`, or implicit `any[]` type.
     pub(super) fn base_type(self, store: &CanonicalTypeMapperStore) -> Option<TypeId> {
         if let Some(origin) = self.string_default {
-            return origin
-                .matches_parameter(store, self)
-                .then(|| {
-                    store
-                        .intrinsic_bootstrap()
-                        .map(|bootstrap| bootstrap.string_type)
-                })
-                .flatten();
+            if !origin.matches_parameter(store, self) {
+                return None;
+            }
+            let bootstrap = store.intrinsic_bootstrap()?;
+            return match store.source_node_kind(origin.initializer) {
+                Some(SyntaxKind::StringLiteral) => Some(bootstrap.string_type),
+                Some(SyntaxKind::NumericLiteral) => Some(bootstrap.number_type),
+                _ => None,
+            };
         }
         if let Some(type_) = self.contextual_type {
             return Some(type_);
@@ -181,8 +182,14 @@ impl SourceCallableParameterPlan {
         };
         let name = preflight_node(store, host, origin.name)?;
         let initializer = preflight_node(store, host, origin.initializer)?;
-        let NodeData::StringLiteral(literal) = &initializer.data else {
-            return Err(invalid());
+        let (text, token_flags) = match (&initializer.data, initializer.kind) {
+            (NodeData::StringLiteral(literal), SyntaxKind::StringLiteral) => {
+                (&literal.text, literal.token_flags.0)
+            }
+            (NodeData::NumericLiteral(literal), SyntaxKind::NumericLiteral) => {
+                (&literal.text, literal.token_flags.0)
+            }
+            _ => return Err(invalid()),
         };
         if syntax.name != origin.name.node
             || syntax.type_.is_some()
@@ -191,13 +198,22 @@ impl SourceCallableParameterPlan {
             || syntax.dot_dot_dot_token.is_some()
             || syntax.modifiers.is_some()
             || initializer.flags.0 != 0
-            || literal.token_flags.0 != 0
+            || token_flags != 0
             || initializer.range.start < name.range.end
             || initializer.range.end != parameter.range.end
             || !host.symbol_matches(store, self.declaration, self.symbol)
         {
             return Err(invalid());
         }
+        let number = if initializer.kind == SyntaxKind::NumericLiteral {
+            let value = ts_jsnum::from_string(text);
+            if value.is_nan() {
+                return Err(invalid());
+            }
+            Some(value)
+        } else {
+            None
+        };
         if let Some(source) = host
             .source(origin.initializer)
             .and_then(|(arena, _)| arena.source_text())
@@ -205,15 +221,24 @@ impl SourceCallableParameterPlan {
             let spelling = source
                 .get(initializer.range.start.get() as usize..initializer.range.end.get() as usize)
                 .ok_or_else(invalid)?;
-            let mut scanner = ts_scanner::Scanner::new(spelling);
-            let token = scanner.scan();
-            if token.kind != SyntaxKind::StringLiteral
-                || token.value.as_ref().map(ts_ast::encode_js_string).as_deref()
-                    != Some(literal.text.as_str())
-                || scanner.scan().kind != SyntaxKind::EndOfFile
-                || !scanner.diagnostics().is_empty()
-            {
-                return Err(invalid());
+            if let Some(value) = number {
+                let spelling = super::type_nodes::normalize_numeric_separators(spelling)
+                    .ok_or_else(invalid)?;
+                let source_value = ts_jsnum::from_string(&spelling);
+                if source_value.is_nan() || source_value != value {
+                    return Err(invalid());
+                }
+            } else {
+                let mut scanner = ts_scanner::Scanner::new(spelling);
+                let token = scanner.scan();
+                if token.kind != SyntaxKind::StringLiteral
+                    || token.value.as_ref().map(ts_ast::encode_js_string).as_deref()
+                        != Some(text.as_str())
+                    || scanner.scan().kind != SyntaxKind::EndOfFile
+                    || !scanner.diagnostics().is_empty()
+                {
+                    return Err(invalid());
+                }
             }
         }
         if let Some(cached) = store
@@ -222,7 +247,10 @@ impl SourceCallableParameterPlan {
         {
             let expected = store
                 .intrinsic_bootstrap()
-                .and_then(|bootstrap| bootstrap.cached_string_literal_type(&literal.text))
+                .and_then(|bootstrap| match number {
+                    Some(value) => bootstrap.cached_number_literal_type(value),
+                    None => bootstrap.cached_string_literal_type(text),
+                })
                 .and_then(|regular| store.fresh_type_of_literal_type(regular).ok());
             if expected != Some(cached) {
                 return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
@@ -230,7 +258,7 @@ impl SourceCallableParameterPlan {
                 )));
             }
         }
-        Ok(Some(literal.text.clone()))
+        Ok(Some(text.clone()))
     }
 
     pub(super) const fn has_jsdoc_function_type(self) -> bool {
@@ -244,6 +272,11 @@ impl SourceCallableStringDefault {
         store: &CanonicalTypeMapperStore,
         parameter: SourceCallableParameterPlan,
     ) -> bool {
+        let literal_flags = match store.source_node_kind(self.initializer) {
+            Some(SyntaxKind::StringLiteral) => Some(TypeFlags::STRING_LITERAL),
+            Some(SyntaxKind::NumericLiteral) => Some(TypeFlags::NUMBER_LITERAL),
+            _ => None,
+        };
         let cache_valid = store.symbol_node_links(self.initializer)
             .is_none_or(|links| links == &SymbolNodeLinks::default())
             && store.type_node_links(self.initializer).is_none_or(|links| {
@@ -251,7 +284,7 @@ impl SourceCallableStringDefault {
                     || links.resolved_type.is_some_and(|cached| {
                         links == &TypeNodeLinks { resolved_type: Some(cached), ..TypeNodeLinks::default() }
                             && store.type_payload(cached).is_some_and(|record| {
-                                record.flags() == TypeFlags::STRING_LITERAL
+                                Some(record.flags()) == literal_flags
                                     && matches!(record.data(), TypeData::Literal(literal)
                                         if literal.fresh_type == Some(cached) && literal.regular_type != cached)
                             })
@@ -275,7 +308,7 @@ impl SourceCallableStringDefault {
                 == Some(SourceNodeParent::Parent(self.function))
             && store.source_node_kind(self.name) == Some(SyntaxKind::Identifier)
             && store.source_node_parent(self.name) == Some(SourceNodeParent::Parent(self.parameter))
-            && store.source_node_kind(self.initializer) == Some(SyntaxKind::StringLiteral)
+            && literal_flags.is_some()
             && store.source_node_parent(self.initializer)
                 == Some(SourceNodeParent::Parent(self.parameter))
             && store
@@ -3910,7 +3943,12 @@ fn plan_source_callable_with_owner_shape(
             .filter(|initializer| {
                 view.family == SourceCallableFamily::FunctionDeclaration
                     && body_mode == SourceCallableBodyMode::Present
-                    && matches!(&owner_shape, SourceCallableOwnerShape::Unique)
+                    && (matches!(&owner_shape, SourceCallableOwnerShape::Unique)
+                        || store.source_node_kind(*initializer) == Some(SyntaxKind::NumericLiteral)
+                            && matches!(
+                                &owner_shape,
+                                SourceCallableOwnerShape::ExportedImplementationOverload(_)
+                            ))
                     && type_parameters.is_empty()
                     && !is_async
                     && name_record.kind == SyntaxKind::Identifier
@@ -3921,7 +3959,10 @@ fn plan_source_callable_with_owner_shape(
                     && bound
                         .source_facts()
                         .is_some_and(|facts| !facts.is_javascript_file())
-                    && store.source_node_kind(*initializer) == Some(SyntaxKind::StringLiteral)
+                    && matches!(
+                        store.source_node_kind(*initializer),
+                        Some(SyntaxKind::StringLiteral | SyntaxKind::NumericLiteral)
+                    )
             })
             .map(|initializer| SourceCallableStringDefault {
                 function: declaration,
@@ -4619,7 +4660,14 @@ fn plan_source_callable_with_owner_shape(
                 || plan.owner_parent.is_none()
                 || plan.is_async
                 || plan.parameters.iter().any(|parameter| {
-                    parameter.rest || parameter.initializer.is_some() || parameter.is_implicit_any()
+                    parameter.rest
+                        || parameter.initializer.is_some()
+                            && !parameter.string_default.is_some_and(|origin| {
+                                store.source_node_kind(origin.initializer)
+                                    == Some(SyntaxKind::NumericLiteral)
+                                    && origin.matches_parameter(store, *parameter)
+                            })
+                        || parameter.is_implicit_any()
                 })
             {
                 return Err(SourceCallableError::Unsupported(
