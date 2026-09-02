@@ -4404,6 +4404,10 @@ fn trace_declared_call_set_failure(
 ) {
     use std::io::Write as _;
 
+    if store.relation_read_observation_is_active() {
+        return;
+    }
+
     let record = store.type_payload(type_);
     let owner = record.and_then(TypeRecord::symbol);
     let owner_record = owner.and_then(|owner| store.symbol(owner));
