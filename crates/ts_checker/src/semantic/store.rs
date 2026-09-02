@@ -2924,7 +2924,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         Some(local)
     }
 
-    /// Retains the function rows of a global ambient function and namespace merge.
+    /// Retains global ambient overloads, with or without a namespace merge.
     /// Each row and export must still belong to its original binder contribution.
     pub(super) fn source_global_function_namespace_declarations(
         &self,
@@ -2936,7 +2936,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let declarations = owner.declarations()?;
         let flags = owner.flags().without(SymbolFlags::TRANSIENT);
         if !flags.contains(SymbolFlags::FUNCTION)
-            || !flags.intersects(SymbolFlags::MODULE)
             || flags.bits() & !(SymbolFlags::FUNCTION | SymbolFlags::MODULE).bits() != 0
             || owner.flags() != original.flags
             || declarations != original.declarations()?
@@ -2972,10 +2971,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 _ => return None,
             }
         }
-        if functions.is_empty()
-            || namespaces.is_empty()
-            || owner.value_declaration() != functions.first().copied()
-        {
+        let valid_group = if flags.intersects(SymbolFlags::MODULE) {
+            !functions.is_empty() && !namespaces.is_empty()
+        } else {
+            functions.len() >= 2 && namespaces.is_empty() && owner.exports().is_none()
+        };
+        if !valid_group || owner.value_declaration() != functions.first().copied() {
             return None;
         }
         let mut expected_exports = HashMap::new();
