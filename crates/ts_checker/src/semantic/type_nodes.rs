@@ -23550,7 +23550,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && self.type_node_contains_builtin_array_reference(node, &mut HashSet::new())?;
         let exact_import = self.type_reference_alias_targets.get(&node).copied();
         let exact_import = if exact_import.is_none() && !qualified && !record_heritage {
-            self.cached_function_parameter_type_import(node)?
+            self.cached_source_callable_type_import(node)?
         } else {
             exact_import
         };
@@ -32564,41 +32564,55 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
     }
 
-    fn cached_function_parameter_type_import(
+    #[allow(clippy::too_many_lines)] // Keep annotation, callable, and import ownership checks together.
+    fn cached_source_callable_type_import(
         &self,
         node: NodeRef,
     ) -> Result<Option<CanonicalTypeReferenceAliasTarget>, DeclaredTypeError> {
-        if self
+        let Some(cached) = self
             .store
             .type_node_links(node)
             .and_then(|links| links.resolved_type)
-            .is_none()
-        {
+        else {
             return Ok(None);
-        }
+        };
         let record = preflight_node(self.store, self.host, node)?;
-        let Some(parameter) = record.parent else {
+        let Some(holder) = record.parent else {
             return Ok(None);
         };
-        let parameter = NodeRef::new(node.arena, node.file, parameter);
-        let parameter_node = preflight_node(self.store, self.host, parameter)?;
-        let NodeData::ParameterDeclaration(syntax) = &parameter_node.data else {
-            return Ok(None);
+        let holder = NodeRef::new(node.arena, node.file, holder);
+        let holder_node = preflight_node(self.store, self.host, holder)?;
+        let returned = match (&holder_node.data, holder_node.kind) {
+            (NodeData::FunctionDeclaration(function), SyntaxKind::FunctionDeclaration) => {
+                function.type_ == Some(node.node)
+            }
+            (NodeData::ArrowFunction(function), SyntaxKind::ArrowFunction) => {
+                function.type_ == Some(node.node)
+            }
+            (NodeData::FunctionExpression(function), SyntaxKind::FunctionExpression) => {
+                function.type_ == Some(node.node)
+            }
+            _ => false,
         };
-        let Some(declaration) = parameter_node.parent else {
-            return Ok(None);
-        };
-        let declaration = NodeRef::new(node.arena, node.file, declaration);
-        if syntax.type_ != Some(node.node)
-            || super::source_callables::authenticated_function_object_parameter_bindings(
-                self.store,
-                self.host,
-                declaration,
-                parameter,
-            )
-            .is_none()
-        {
-            return Ok(None);
+        if !returned {
+            let NodeData::ParameterDeclaration(syntax) = &holder_node.data else {
+                return Ok(None);
+            };
+            let Some(declaration) = holder_node.parent else {
+                return Ok(None);
+            };
+            let declaration = NodeRef::new(node.arena, node.file, declaration);
+            if syntax.type_ != Some(node.node)
+                || source_callables::authenticated_function_object_parameter_bindings(
+                    self.store,
+                    self.host,
+                    declaration,
+                    holder,
+                )
+                .is_none()
+            {
+                return Ok(None);
+            }
         }
         let Some(resolved) =
             source_imports::plan_source_named_type_import_target(self.store, self.host, node)
@@ -32609,9 +32623,73 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if self
             .store
             .symbol(resolved.target_symbol)
-            .is_none_or(|target| target.flags() != SymbolFlags::INTERFACE)
+            .is_none_or(|target| {
+                target.flags() != SymbolFlags::INTERFACE
+                    && !(returned && target.flags() == SymbolFlags::TYPE_ALIAS)
+            })
         {
             return Ok(None);
+        }
+        if returned {
+            let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+            let owner = self
+                .host
+                .bound_file(holder)
+                .and_then(|bound| bound.symbol(holder))
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                .ok_or_else(invalid)?;
+            let Some(type_) = self.store.source_callable_type_for_owner(owner) else {
+                return Ok(None);
+            };
+            let provenance = self
+                .store
+                .source_callable_provenance(type_)
+                .ok_or_else(invalid)?;
+            if provenance.declaration != holder
+                || provenance.owner_symbol != owner
+                || provenance.array_targets != self.array_targets
+                || !self.host.symbol_matches(self.store, holder, owner)
+                || !self.store.source_return_annotation_belongs_to(holder, node)
+                || self
+                    .store
+                    .source_direct_children(holder)
+                    .is_none_or(|children| {
+                        children.iter().filter(|child| **child == node).count() != 1
+                    })
+                || self
+                    .store
+                    .function_signature_return_annotation(provenance.signature)
+                    != Some((node, false))
+            {
+                return Err(invalid());
+            }
+            let callable = source_callables::plan_source_callable(
+                self.store,
+                self.host,
+                holder,
+                owner,
+                self.array_targets,
+            )
+            .map_err(|error| source_callable_error(error, provenance.family))?;
+            if callable.return_type.annotation_identity() != Some((node, false)) {
+                return Err(invalid());
+            }
+            source_callables::validate_source_callable_signature_identity(
+                self.store,
+                &callable,
+                provenance.signature,
+            )
+            .map_err(|error| source_callable_error(error, provenance.family))?;
+            if source_callables::validate_lazy_source_callable_return(
+                self.store,
+                &callable,
+                provenance.signature,
+            )
+            .map_err(|error| source_callable_error(error, provenance.family))?
+                != Some(cached)
+            {
+                return Err(invalid());
+            }
         }
         source_imports::plan_source_type_import_reference(
             self.store, self.host, &resolved, node, node,
@@ -48905,7 +48983,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             debug_assert!(removed, "the source signature guard stays balanced");
             result?;
         }
-        self.resolve_function_alias_return(signature)?;
+        let function = plan.functions.get(&declaration).ok_or_else(invalid)?;
+        self.resolve_function_alias_return(signature, function)?;
         functions::generic_function_alias_projection(self.store, type_)
             .map_err(|_| invalid())?
             .ok_or_else(invalid)?;
@@ -48916,9 +48995,34 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     fn resolve_function_alias_return(
         &mut self,
         signature: SignatureId,
+        function: &functions::FunctionTypePlan,
     ) -> Result<TypeId, DeclaredTypeError> {
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature));
+        if function.alias_symbol.is_none()
+            || function.alias_parameters.is_empty()
+            || functions::plan_function_type(
+                self.store,
+                self.host,
+                function.node,
+                function.alias_symbol,
+                true,
+                self.global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types),
+            )
+            .map_err(|error| function_signature_error(error, signature))?
+                != *function
+        {
+            return Err(invalid());
+        }
+        functions::validate_function_type_signature_identity(self.store, function, signature)
+            .map_err(|error| function_signature_error(error, signature))?;
+        // The provider owns this return query. Its alias body proves its imports.
+        // The caller's annotation capabilities stay on the caller's query.
         if self.global_types.is_some() && self.instantiation_session.is_some() {
             let mut context = self.source_query_context()?;
+            context.aliases = HashMap::new();
             let result = context.query(
                 self.store,
                 self.instantiation_session
@@ -48941,9 +49045,6 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             nested.array_type = self.array_type;
             nested.global_types.clone_from(&self.global_types);
             nested.instantiation_session = self.instantiation_session.as_deref_mut();
-            nested
-                .type_reference_alias_targets
-                .clone_from(&self.type_reference_alias_targets);
             nested.jsdoc_import_type_target = self.jsdoc_import_type_target;
             nested
                 .resolving_property_interfaces
