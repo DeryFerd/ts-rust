@@ -418,8 +418,20 @@ fn checked_state(
     let TypeData::TypeParameter(parameter) = record.data() else {
         panic!("TData is the enclosing function's actual type parameter")
     };
-    assert!(parameter.constraint.is_none());
-    assert!(parameter.resolved_default_type.is_none());
+    let NodeData::TypeParameterDeclaration(declaration) =
+        &source.arena.get(parts.formal.node).unwrap().data
+    else {
+        panic!("TData must retain its source type parameter declaration")
+    };
+    assert!(declaration.constraint.is_none());
+    assert!(declaration.default_type.is_none());
+    let no_constraint = checker
+        .store()
+        .intrinsic_bootstrap()
+        .unwrap()
+        .no_constraint_type;
+    assert_eq!(parameter.constraint, Some(no_constraint));
+    assert_eq!(parameter.resolved_default_type, Some(no_constraint));
     assert_eq!(
         checker.get_type_from_type_node(parts.type_argument),
         Ok(formal)
