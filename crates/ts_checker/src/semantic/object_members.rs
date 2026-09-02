@@ -4459,7 +4459,12 @@ pub(super) fn validate_stored_declared_call_set(
                     && owner_record.check_flags() == CheckFlags::NONE
                     && owner_record.name().as_utf8().is_some()
                     && (owner_record.value_declaration().is_none() || merged_interface_owner)
-                    && owner_record.members() == interface.declared_members
+                    // Computed keys use a resolved table separate from binder members.
+                    && super::structured_members::valid_declared_member_table(
+                        store,
+                        owner,
+                        interface.declared_members,
+                    )
                     && owner_record.exports().is_none()
                     && owner_record.export_symbol().is_none()
                     && store.get_merged_symbol(owner) == Some(owner)
@@ -4525,7 +4530,7 @@ pub(super) fn validate_stored_declared_call_set(
                 (
                     *declaration,
                     &interface.reference.object.structured,
-                    owner_record.members(),
+                    interface.declared_members,
                     exact,
                     inherited_base,
                     own_signature_count,
@@ -5091,7 +5096,30 @@ fn validate_declared_call_set_member_edges(
             && (!record.flags().contains(SymbolFlags::TRANSIENT)
                 || store.source_merged_method_has_exact_declarations(*property));
         let accessor = record.flags().intersects(SymbolFlags::ACCESSOR);
-        let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::ACCESSOR;
+        let late_property = !method && !accessor && record.name().is_late_bound();
+        let links = store.value_symbol_links(*property)?;
+        if late_property
+            && (store.source_node_kind(owner_declaration)
+                != Some(SyntaxKind::InterfaceDeclaration)
+                || !super::structured_members::valid_late_bound_unique_symbol_member(
+                    store,
+                    owner,
+                    *property,
+                    declarations,
+                    links,
+                    Some(members),
+                ))
+        {
+            return None;
+        }
+        let allowed_flags = SymbolFlags::PROPERTY
+            | SymbolFlags::OPTIONAL
+            | SymbolFlags::ACCESSOR
+            | if late_property {
+                SymbolFlags::TRANSIENT
+            } else {
+                SymbolFlags::NONE
+            };
         if !seen_properties.insert(*property)
             || method
                 && !matches!(
@@ -5105,11 +5133,13 @@ fn validate_declared_call_set_member_edges(
                 && (!record.flags().contains(SymbolFlags::PROPERTY) && !accessor
                     || record.flags().without(allowed_flags) != SymbolFlags::NONE)
             || method && record.check_flags() != CheckFlags::NONE
-            || !method && record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
+            || !method
+                && !late_property
+                && record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
             || accessor && record.check_flags() != CheckFlags::NONE
-            || record.name().is_reserved_member_name()
+            || !late_property && record.name().is_reserved_member_name()
             || record.name().is_private_identifier()
-            || record.name().is_late_bound()
+            || !late_property && record.name().is_late_bound()
             || record.name().as_utf8().is_none()
             || record.value_declaration() != Some(declaration)
             || store.get_parent_of_symbol(*property) != Some(owner)
@@ -5142,12 +5172,12 @@ fn validate_declared_call_set_member_edges(
         {
             return None;
         }
-        let links = store.value_symbol_links(*property)?;
         let property_type = links.resolved_type?;
         if links
             != &(ValueSymbolLinks {
                 resolved_type: Some(property_type),
                 write_type: links.write_type,
+                name_type: if late_property { links.name_type } else { None },
                 ..ValueSymbolLinks::default()
             })
             || links.write_type.is_some_and(|write_type| {
@@ -5193,6 +5223,9 @@ fn validate_declared_call_set_member_edges(
         }
         edges.push(property_type);
         edges.extend(links.write_type);
+        if late_property {
+            edges.extend(links.name_type);
+        }
         previous_declaration = Some(declaration_order);
     }
 
