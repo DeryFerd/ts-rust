@@ -150,6 +150,7 @@ impl Fixture {
                     NodeData::VariableDeclaration(data) => data.name,
                     NodeData::BindingElement(data) => data.name?,
                     NodeData::ParameterDeclaration(data) => data.name,
+                    NodeData::PropertyDeclaration(data) => data.name,
                     NodeData::PropertySignatureDeclaration(data) => data.name,
                     _ => return None,
                 };
