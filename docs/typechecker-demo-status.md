@@ -4,32 +4,38 @@ Updated 2026-09-01. No complete real-world project has passed in Rust yet.
 
 ## Current result
 
-The Pathe demo is not ready. The latest ordinary compiler build passed on the
-new source batch. The latest project run still completes zero of nine roots.
-The 474-test batch stopped on three Rust test-API compile errors. A separate
-18-test loop check ran all tests, with six passes and twelve failures.
+The Pathe demo is not ready. The latest selected test run compiled and ran all
+474 tests. It passed 393 and failed 81. The checker accounts for all 81 failures:
+131 of its 212 selected tests pass. Binder, parser and fixture tests all pass.
+This is a selected batch, not the full Rust or TypeScript test suite.
+
+The latest Pathe run still records zero complete roots out of nine. Its evidence
+reader failed on three JSON trace lines, so the original report remains invalid.
+The raw typecheck output is intact. It can guide repairs, but it cannot establish
+project acceptance. The last valid census also completed zero roots.
 
 | Measurement | Latest result |
 | --- | --- |
-| [Pathe census 6](../target/wave202-pathe-demo-census-6-result.md), `5f7ad5e3` | All nine original roots attempted. Zero complete, eight unsupported, one internal checker error. All 277 loaded files parse. The ordinary project check also fails. The measured stage took 22.903 seconds. |
-| [Ordinary compiler build 8](../target/wave202-pathe-demo-bin-8-main-result.md), `41599a0f` | Build passed in 77.182 seconds. Its saved result and independent review are closed. The separate resource check is pending. A build is not a TypeScript project pass. |
+| [Pathe census 8](../target/wave202-pathe-demo-census-8-result.md), `41599a0f` | Raw records show all nine roots attempted: zero complete, eight unsupported, one internal checker error. The ordinary attempt also fails. The measured oracle stage took 22.259 seconds. Evidence validation failed on trace JSON. The review of that failed result is closed. The separate resource check is pending. |
+| [Combined tests 8](../target/wave202-pathe-demo-tests-8-result.md), `50aa180a` | All four compile commands and all four test-list commands pass. All 474 tests ran: 393 pass, 81 fail, none unrun. The independent result review is closed. The separate resource check is pending. |
+| [Ordinary compiler build 8](../target/wave202-pathe-demo-bin-8-main-result.md), `41599a0f` | Build passed in 77.182 seconds. The result review and separate resource check are closed. A build is not a TypeScript project pass. |
+| [Pathe census 6](../target/wave202-pathe-demo-census-6-result.md), `5f7ad5e3` | Last valid census. All nine original roots attempted: zero complete, eight unsupported, one internal checker error. All 277 loaded files parse. The ordinary project check also fails. |
 | [Focused condition tests](../target/wave202-pathe-logical-condition-registry-focus-5-result.md), `65612688` | Compile and listing passed. All eight tests ran. Seven pass, including the new condition test. The original Pathe normalizer still fails with `FunctionBody`. |
-| [Combined tests 7](../target/wave202-pathe-demo-tests-7-result.md), `41599a0f` | Binder, parser and fixture compilation passed. Checker test-library compilation failed on flag imports, a missing cache observer and a stale callable-write argument. All 474 tests remain unrun. |
-| [Pathe source batch](../target/wave202-pathe-diagnostic-integration-handoff.md), `41599a0f` | Seven complete changes are committed and source-reviewed. They include the public ObjectFlags repair, callable throws, object-method statements, error locations and three diagnostic traces. The ordinary CLI builds. Tests and project acceptance remain unresolved. |
-| [Loop tests](../target/wave202-pathe-callable-counted-for-focus-1-result.md), `972e05d9` | Compile and listing passed. All 18 tests ran. Six passed and twelve failed. Both counted-loop passes are rejection controls. All four positive counted-loop tests failed. This code remains separate from the Pathe batch. |
+| [Loop tests](../target/wave202-pathe-callable-counted-for-focus-1-result.md), `972e05d9` | Compile and listing passed. All 18 tests ran: six pass, twelve fail. Both counted-loop passes are rejection controls. All four positive counted-loop tests fail. The result review and separate resource check are closed. This code remains separate from the Pathe batch. |
 
 The earlier condition-focused result has a closed [independent review](../target/wave202-pathe-logical-condition-registry-focus-5-result-review.md).
 Its original seven tests still have six passes and one failure. The new eighth
 test passes. Do not describe that addition as a fixed original test.
 
-The latest [combined-test review](../target/wave202-pathe-demo-tests-7-result-review.md)
+The latest [combined-test review](../target/wave202-pathe-demo-tests-8-result-review.md)
 and [loop-test review](../target/wave202-pathe-callable-counted-for-focus-1-result-review.md)
 are closed. The loop failures include six array-element errors and two callable
 errors in retained tests. Their earlier passing baseline is not established.
-Do not describe them as new regressions. The separate resource checks remain
-pending. Neither result proves a complete project pass.
+Do not describe them as new regressions. Neither result proves a complete
+project pass. The earlier Tests7 compile failure remains a failed result. Its
+three API repairs now compile successfully in Tests8.
 
-The latest project run retains the same original roots, all 277 loaded-file
+The latest raw project records retain the same original roots, all 277 loaded-file
 records, and all 13 explicit compiler options. The apparent const-enum option
 difference is [stored versus effective reporting](../target/wave202-pathe-preserve-const-enums-diagnosis.md).
 Both compilers derive preservation as true. Complete effective-option and final
@@ -47,33 +53,37 @@ compiler options, or supply permissive stub types to produce a demo.
 
 ## Current fix priorities
 
-The next Pathe batch has a closed [source review](../target/wave202-pathe-diagnostic-integration-review.md).
-Its ordinary CLI build passed. The combined test run stopped at compilation.
-Keep source review, passing tests and complete project checks separate.
+The [failure inventory](../target/wave202-pathe-tests8-failure-inventory.md)
+groups all 81 failed tests. Four repeated error classes account for 44 failures:
+17 unsupported property relations, 13 callable invariants, eight unsupported
+generic references and six element errors. These are symptoms, not 44 proved
+independent defects. Workers first identify a returning guard in a public test.
+Private test expectations stay unchanged.
 
 | Failure | Next action |
 | --- | --- |
-| Three Rust test-API compile errors | Apply the exact import, cache-observer and callable-argument repairs in a new worktree. Keep all 474 tests and their assertions unchanged. Then repeat compile, listing and execution. |
-| Proxy handler in `src/index.ts` | Object-method statement support is committed with three new controls. Run the original root. The focused fixtures do not prove that its imported namespace and final fallback work. |
-| `throw new Error(...)` in `test/glob.spec.ts` | The [constructor position repair](../target/wave202-pathe-callable-throw-new-handoff.md) is committed with four new tests. Constructor argument checks and the complete original root still need runtime evidence. |
+| Proxy handler in `src/index.ts` | Fix the proved object-method start mismatch. The binder retains the method node, but the checker expects no payload. Change only the authenticated family predicate and retain the exact start checks. Six existing public controls provide the first test target. The saved outer error does not prove this is the first inner failure. |
+| Import aliases in three test files | The new traces record missing alias links for `it` and `describe`. Check import preparation before source planning. Use the canonical resolver on demand, preserve unused-import and cycle behavior, and do not substitute fallback types. |
+| `new Set(...)` in `src/utils.ts` | The new trace stops at an unsupported computed member during named constructor planning, before generic argument inference. Authenticate that member and use the existing computed-key machinery. Do not skip the member or replace Set's declarations. |
+| Variable reference in `src/_path.ts` | The measured identifier is `isAbsolute` inside `normalize`'s function body. Its constant declaration is later in the file. Compare deferred-function preparation with Go while retaining real immediate use-before-declaration errors. |
 | Counted loop in `src/_glob.ts` | Diagnose the four failing positive counted-loop tests and eight failing retained loop controls. The outer errors do not identify the internal operation. Do not merge this source yet. |
-| `new Set(...)` in `src/utils.ts` | Error-only traces now record constructor preparation and signature readiness. Use the next census to identify the first failed operation before changing semantics. |
-| Variable reference in `src/_path.ts` | The reporter now exposes an already-retained node. Measure the actual location. The declaration-order rule has not changed. |
-| Import aliases in three test files | Error-only traces now record the retained alias state and declarations. Use the result to distinguish missing preparation from cycles. Alias resolution has not changed. |
-| Original normalizer | New error-only traces identify the failed checker stage. The original function and all eight tests remain intact. Its most recent focused result still fails. |
+| `throw new Error(...)` in `test/glob.spec.ts` | Keep the committed constructor-position repair and its four tests. Tests8 still has five `Unsupported.New` cases. Compare their actual guards rather than assuming Error and Set fail for the same reason. |
+| Original normalizer | The original function still fails with `FunctionBody` in Tests8. Retain its original source and the passing condition control. A focused fixture is not a complete Pathe root. |
+| Census evidence reader | Classify the three bounded alias trace records separately from Cargo events. Preserve the failed original result and raw log. Full validation still needs authenticated source and graph identities. |
 
-The [474-test selection](../target/wave202-pathe-demo-tests-7-request.template.md)
-retains all 465 old tests and adds nine. Its run stopped before listing or test
-execution. The ordinary compiler build on the same frozen source passed.
-The counted-loop check used a separate source commit and output directory.
-Use at most three Cargo lanes in total. Separate workers can prepare source
-repairs and diagnose failures while the Pathe project check moves forward.
+The [474-test selection](../target/wave202-pathe-demo-tests-8-selection.canonical.tsv)
+retains all 465 old tests and adds nine. Tests8 ran every selected test. Keep this
+selection and its assertions when testing the next combined repair. Use focused
+public tests first for individual repairs. The counted-loop check uses a separate
+source commit and output directory. Its new failure-only trace commit is
+`b95d23fb`. Its immutable source review is closed. The next 18-test run is pending.
 
-After the ordinary build and its resource check finish, run the unchanged
-Pathe project and all nine cold roots. That diagnostic run need not wait for
-the 474-test check, but it must retain and report any test failure. This source
-has temporary traces. Final acceptance still requires the unchanged original
-corpus and an ordinary project check with those traces removed.
+Use at most three Cargo lanes. Source workers use separate worktrees with one
+writer per file. Diagnosis, source review and result review can proceed in
+parallel. Recheck unchanged Pathe after a combined repair builds and its required
+checks close. Keep every test failure visible. These sources contain temporary
+traces. Final acceptance requires the unchanged corpus and an ordinary project
+check with those traces removed.
 
 The [later counted-loop join plan](../target/wave202-pathe-counted-integration-plan.md)
 retains all 480 tests in 41 groups. The failed loop check blocks that join.
