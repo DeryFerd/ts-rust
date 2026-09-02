@@ -6434,6 +6434,21 @@ fn preflight_generic_new_arguments(
 }
 
 fn generic_constructor_error(node: NodeRef, error: GenericMethodCallError) -> SourceNewError {
+    let mut record = [0u8; 1024];
+    let length = {
+        let mut buffer = &mut record[..1023];
+        let _ = std::io::Write::write_fmt(
+            &mut buffer,
+            format_args!(
+                "ts-rust-generic-constructor-error expression={node:?} raw_error={error:?}"
+            ),
+        );
+        1023 - buffer.len()
+    };
+    let length = std::str::from_utf8(&record[..length])
+        .map_or_else(|error| error.valid_up_to(), |_| length);
+    record[length] = b'\n';
+    let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &record[..=length]);
     match error {
         GenericMethodCallError::Relation(error)
         | GenericMethodCallError::Direct(super::calls::DirectCallError::Relation(error))
