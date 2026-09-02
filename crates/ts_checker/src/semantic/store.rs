@@ -4461,7 +4461,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         Some(SyntaxKind::ExpressionStatement)
                     )
             )
-            || !lexical && self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || !lexical
+                && self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+                && !(self.source_node_kind(call) == Some(SyntaxKind::CallExpression)
+                    && self.source_node_kind(container) == Some(SyntaxKind::ExpressionStatement)
+                    && super::source_callables::source_direct_call_statement_container(
+                        self, container,
+                    )
+                    .is_some())
             || owner.flags() != SymbolFlags::FUNCTION
             || owner.check_flags() != CheckFlags::NONE
             || owner.name() != InternalSymbolName::Function.as_ref()

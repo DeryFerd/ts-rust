@@ -7688,8 +7688,8 @@ pub(super) fn stored_captured_assignment_callback_is_exact<TypePayload, MapperPa
 }
 
 /// Keeps a direct callback statement tied to its registered lexical body owner.
-fn source_direct_call_statement_container(
-    store: &CanonicalTypeMapperStore,
+pub(super) fn source_direct_call_statement_container<TypePayload, MapperPayload>(
+    store: &SemanticStore<TypePayload, MapperPayload>,
     statement: NodeRef,
 ) -> Option<NodeRef> {
     let SourceNodeParent::Parent(parent) = store.source_node_parent(statement)? else {
