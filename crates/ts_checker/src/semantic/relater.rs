@@ -57,7 +57,10 @@ use super::{
     global_types::{GlobalThisMembers, is_global_this_type_candidate},
     ids::{IndexInfoId, SignatureId, TypeId},
     indexed_access_types::{is_template_pattern_index_key, template_pattern_index_matches_name},
-    instantiate::{InstantiationLimitEventMark, InstantiationLimits, InstantiationSession},
+    instantiate::{
+        InstantiationLimitEventMark, InstantiationLimits, InstantiationSession,
+        validate_instantiated_function_callable,
+    },
     instantiated_members::{
         GenericInterfaceMemberError, class_reference_field_target,
         completed_source_class_origin_member_mapping, demand_instantiated_property_type,
@@ -8892,6 +8895,22 @@ impl<'store> RelaterSession<'store> {
                     ) => Err(RelationUnavailable::InvalidStructuredMembers(type_id)),
                 };
             }
+        }
+        if record.object_flags().contains(ObjectFlags::INSTANTIATED)
+            && matches!(
+                validate_instantiated_function_callable(
+                    self.store,
+                    type_id,
+                    self.global_types.map(|globals| globals.array_targets),
+                ),
+                Some(StoredCallableSetValidation::Valid {
+                    family: CallableFamily::FunctionType,
+                    ..
+                })
+            )
+        {
+            // The mapped function keeps this flag after all mapped edges are checked.
+            return Ok(());
         }
         match validate_class_heritage_members(self.store, type_id) {
             ClassHeritageMembersValidation::Valid => return Ok(()),
