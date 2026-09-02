@@ -1755,8 +1755,7 @@ fn validate_property_interface_worker(
         .symbol()
         .is_some_and(|owner| authenticated_nongeneric_global_interface_owner(store, owner));
     let value_owner = library_owner || global_owner;
-    let reference_identity = (requires_direct_base || value_owner)
-        && validate_nongeneric_interface_argument_origin(store, type_).is_ok();
+    let reference_identity = validate_nongeneric_interface_argument_origin(store, type_).is_ok();
     if record.object_flags().contains(ObjectFlags::REFERENCE) && !reference_identity {
         let result = validate_generic_base_property_interface(store, type_, array_targets);
         assert!(active.remove(&type_));
