@@ -109,8 +109,8 @@ use super::{
         resolve_nongeneric_keyof_type, resolve_nongeneric_keyof_type_with_session,
     },
     links::{
-        ResolvedSignatureState, SignatureLinks, SymbolNodeLinks, TypeAliasLinks, TypeNodeLinks,
-        ValueSymbolLinks,
+        ResolvedSignatureState, SignatureLinks, SourceFileRef, SymbolNodeLinks, TypeAliasLinks,
+        TypeNodeLinks, ValueSymbolLinks,
     },
     mapped_types::{
         MappedTypeDeclarationPlan, MappedTypeError, MappedTypeKeys, MappedTypeModifiers,
@@ -32742,7 +32742,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             let bound = self.host.bound_file(holder).ok_or_else(invalid)?;
             if self
                 .store
-                .source_file_links(bound.source_file())
+                .source_file_links(SourceFileRef::new(self.store.id(), bound.source_file()))
                 .is_none_or(|links| !links.type_checked)
             {
                 return Ok(None);
