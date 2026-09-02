@@ -5539,6 +5539,31 @@ fn materialize_global_promise_constructor(
         signature
     };
 
+    let executor_plan =
+        plan_function_type(store, host, global.parameter_annotation, None, false, None)
+            .map_err(|_| invalid())?;
+    let [resolve, reject] = executor_plan.parameters.as_slice() else {
+        return Err(invalid());
+    };
+    for annotation in [
+        global.parameter_annotation,
+        resolve.type_node,
+        reject.type_node,
+    ] {
+        let signature = exact_signature_cache(store, annotation)
+            .map_err(|()| invalid())?
+            .ok_or_else(invalid)?;
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_return_type_of_signature(signature)?;
+    }
+
     let key = type_list_key(&[argument_type]);
     match store.cached_signature(base, key, &[argument_type]) {
         CachedSignatureLookup::Hit(signature) => {
