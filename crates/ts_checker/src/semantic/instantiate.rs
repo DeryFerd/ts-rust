@@ -3,10 +3,11 @@
 //! This is the first exact slice of pinned `instantiateTypeWorker`. It covers
 //! primitive and literal leaves, direct type-parameter mapping, canonical
 //! Array/ReadonlyArray references under an explicit target capability, fixed
-//! canonical tuples, direct full-arity generic class/interface references,
-//! indexed accesses, generic `keyof` indexes, authenticated selection-shaped
-//! mapped aliases, deferred intersections, template literals, intrinsic string
-//! mappings, ordinary property-object aliases, inline intersection objects,
+//! canonical tuples, closed Record instances, direct full-arity generic
+//! class/interface references, indexed accesses, generic `keyof` indexes,
+//! authenticated selection-shaped mapped aliases, deferred intersections,
+//! template literals, intrinsic string mappings, ordinary property-object
+//! aliases, inline intersection objects,
 //! authenticated deferred conditionals, closed declaration-owned values, and
 //! unions with canonical alias arguments and union origins. Other object and
 //! signature instantiation needs its owning caches and is rejected.
@@ -2209,8 +2210,22 @@ fn could_contain_installed_type_variables_worker(
             could_contain_installed_type_variables_worker(store, target, array_targets, seen)
         }
         TypeData::Mapped(_) => {
-            if let Some(projection) = source_mapped_lookup_projection(store, type_, array_targets)
+            if let Some(edges) = store
+                .record_mapped_alias_type_edges(type_)
                 .map_err(|error| mapped_indexed_access_error(type_, error))?
+            {
+                edges.iter().try_fold(false, |contains, edge| {
+                    Ok(contains
+                        | could_contain_installed_type_variables_worker(
+                            store,
+                            *edge,
+                            array_targets,
+                            seen,
+                        )?)
+                })
+            } else if let Some(projection) =
+                source_mapped_lookup_projection(store, type_, array_targets)
+                    .map_err(|error| mapped_indexed_access_error(type_, error))?
             {
                 projection
                     .arguments
@@ -2626,9 +2641,19 @@ fn supported_instantiable_union_constituent(
         Some(TypeData::Index(_)) => validate_generic_keyof_index_type(store, type_)
             .map(|_| true)
             .map_err(|error| instantiated_keyof_error(type_, error)),
-        Some(TypeData::Mapped(_)) => supported_mapped_alias_projection(store, type_, array_targets)
-            .map(|projection| projection.is_some())
-            .map_err(|error| mapped_indexed_access_error(type_, error)),
+        Some(TypeData::Mapped(_)) => {
+            if store
+                .record_mapped_alias_type_edges(type_)
+                .map_err(|error| mapped_indexed_access_error(type_, error))?
+                .is_some()
+            {
+                return could_contain_installed_type_variables(store, type_, array_targets)
+                    .map(|contains| !contains);
+            }
+            supported_mapped_alias_projection(store, type_, array_targets)
+                .map(|projection| projection.is_some())
+                .map_err(|error| mapped_indexed_access_error(type_, error))
+        }
         Some(TypeData::IndexedAccess(_)) => Ok(store.validate_union_constituent(type_).is_ok()),
         Some(TypeData::TypeReference(_) | TypeData::Tuple(_)) => {
             Ok(
@@ -2744,22 +2769,34 @@ fn validate_instantiable_member_type_worker(
             )
         }
         TypeData::Mapped(_) => {
-            let projection = supported_mapped_alias_projection(store, type_, array_targets)
+            if store
+                .record_mapped_alias_type_edges(type_)
                 .map_err(|error| mapped_indexed_access_error(type_, error))?
-                .ok_or(InstantiationError::UnsupportedType(type_))?;
-            projection
-                .arguments
-                .iter()
-                .chain(&projection.identity_arguments)
-                .try_for_each(|argument| {
-                    validate_instantiable_member_type_worker(
-                        store,
-                        *argument,
-                        mapper_parameters,
-                        array_targets,
-                        active,
-                    )
-                })
+                .is_some()
+            {
+                if could_contain_installed_type_variables(store, type_, array_targets)? {
+                    Err(InstantiationError::UnsupportedType(type_))
+                } else {
+                    Ok(())
+                }
+            } else {
+                let projection = supported_mapped_alias_projection(store, type_, array_targets)
+                    .map_err(|error| mapped_indexed_access_error(type_, error))?
+                    .ok_or(InstantiationError::UnsupportedType(type_))?;
+                projection
+                    .arguments
+                    .iter()
+                    .chain(&projection.identity_arguments)
+                    .try_for_each(|argument| {
+                        validate_instantiable_member_type_worker(
+                            store,
+                            *argument,
+                            mapper_parameters,
+                            array_targets,
+                            active,
+                        )
+                    })
+            }
         }
         TypeData::IndexedAccess(indexed) => {
             if record.flags() != TypeFlags::INDEXED_ACCESS
@@ -3252,6 +3289,17 @@ fn cached_instantiated_type_with_operand_worker(
                 .map_err(|error| instantiated_keyof_error(template, error))
         }
         TypeData::Mapped(_) => {
+            if store
+                .record_mapped_alias_type_edges(template)
+                .map_err(|error| mapped_indexed_access_error(template, error))?
+                .is_some()
+            {
+                return if could_contain_installed_type_variables(store, template, array_targets)? {
+                    Err(InstantiationError::UnsupportedType(template))
+                } else {
+                    Ok(Some(template))
+                };
+            }
             if let Some(projection) =
                 source_mapped_lookup_projection(store, template, array_targets)
                     .map_err(|error| mapped_indexed_access_error(template, error))?

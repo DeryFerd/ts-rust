@@ -4600,6 +4600,55 @@ impl CanonicalTypeMapperStore {
         validate_warm_mapped_members(self, &shape, &properties, &indexes)
     }
 
+    /// Reads Record arguments only after its source, mapper, and alias cache agree.
+    pub(super) fn record_mapped_alias_type_edges(
+        &self,
+        type_: TypeId,
+    ) -> Result<Option<Vec<TypeId>>, MappedTypeError> {
+        let invalid = || MappedTypeError::InvalidMappedType(type_);
+        let record = self.type_payload(type_).ok_or_else(invalid)?;
+        let TypeData::Mapped(mapped) = record.data() else {
+            return Ok(None);
+        };
+        if !record
+            .object_flags()
+            .contains(ObjectFlags::INSTANTIATED_MAPPED)
+        {
+            return Ok(None);
+        }
+        let declaration = mapped.declaration.ok_or_else(invalid)?;
+        let Some(SourceNodeParent::Parent(alias_declaration)) =
+            self.source_node_parent(declaration)
+        else {
+            return Ok(None);
+        };
+        if self.source_node_kind(alias_declaration) != Some(SyntaxKind::TypeAliasDeclaration) {
+            return Ok(None);
+        }
+        let alias = self
+            .source_declaration_symbol(alias_declaration)
+            .ok_or_else(invalid)?;
+        if self.symbol(alias).ok_or_else(invalid)?.name().as_utf8() != Some("Record") {
+            return Ok(None);
+        }
+        let target = mapped.object.target.ok_or_else(invalid)?;
+        let arguments = [
+            mapped.constraint_type.ok_or_else(invalid)?,
+            mapped.template_type.ok_or_else(invalid)?,
+        ];
+        let parameters = self
+            .type_alias_links(alias)
+            .and_then(|links| links.type_parameters.as_deref())
+            .ok_or_else(invalid)?;
+        self.validate_record_mapped_alias_instantiation(
+            alias, target, parameters, &arguments, type_,
+        )?;
+        let identity = self.mapped_alias_display_identity(type_, alias)?;
+        Ok(Some(
+            arguments.into_iter().chain(identity.arguments).collect(),
+        ))
+    }
+
     /// Checks alias and mapper identity without demanding cold mapped members.
     pub(super) fn mapped_alias_display_identity(
         &self,

@@ -5065,6 +5065,60 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         array_visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
+        match self.validate_supported_callable_record_union_constituent(
+            type_,
+            record,
+            mapped,
+            array_validation,
+            visiting,
+            array_visited,
+            allowed_pending,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(rejected))
+                if rejected == type_ => {}
+            Err(error) => return Err(error),
+        }
+        // Callable Records retain the signature checks on their existing path.
+        if mapped.template_type.is_none_or(|value| {
+            !matches!(
+                validate_stored_callable_set(self, value),
+                StoredCallableSetValidation::NotCallable
+            )
+        }) {
+            return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+        }
+        let edges = self
+            .record_mapped_alias_type_edges(type_)
+            .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+        if !visiting.insert(type_) {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+        }
+        let result = edges.into_iter().try_for_each(|edge| {
+            self.validate_union_constituent_worker(
+                edge,
+                array_validation,
+                visiting,
+                array_visited,
+                allowed_pending,
+            )
+        });
+        visiting.remove(&type_);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)] // Structural cycles and member visits need separate sets.
+    fn validate_supported_callable_record_union_constituent(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+        mapped: &super::type_records::MappedTypeData,
+        array_validation: UnionArrayValidation<'_>,
+        visiting: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
+        allowed_pending: &HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
         let invalid = || LiteralTypeCacheError::InvalidCachedUnion(type_);
         let unsupported = || LiteralTypeCacheError::UnsupportedUnionConstituent(type_);
         if !record
