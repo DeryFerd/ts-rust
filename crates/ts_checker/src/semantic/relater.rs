@@ -1937,6 +1937,98 @@ impl PendingRelationCache {
     }
 }
 
+fn relation_cache_observation_counts(
+    store: &CanonicalTypeMapperStore,
+    relation: RelationKind,
+) -> (usize, usize) {
+    let snapshot = store.relation_state_snapshot();
+    let physical = match relation {
+        RelationKind::Subtype => snapshot.subtype,
+        RelationKind::StrictSubtype => snapshot.strict_subtype,
+        RelationKind::Assignable => snapshot.assignable,
+        RelationKind::Comparable => snapshot.comparable,
+        RelationKind::Identity => snapshot.identity,
+    };
+    (store.relation_cache_size(relation), physical.entries)
+}
+
+#[derive(Clone, Copy)]
+struct RelationCacheSourceOwner {
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+}
+
+fn relation_cache_source_owner(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<RelationCacheSourceOwner> {
+    if store.relation_read_observation_is_active() {
+        return None;
+    }
+    let record = store.type_payload(type_)?;
+    let (symbol, declaration, owner) = match record.data() {
+        TypeData::Interface(_) | TypeData::TypeReference(_) => {
+            let symbol = record.symbol()?;
+            let [declaration] = store.symbol(symbol)?.declarations()? else {
+                return None;
+            };
+            (symbol, *declaration, symbol)
+        }
+        TypeData::Object(object) => {
+            let [signature] = object.structured.signatures.as_deref()? else {
+                return None;
+            };
+            let declaration = store.signature(*signature)?.declaration()?;
+            let symbol = store.source_declaration_symbol(declaration)?;
+            let symbol_record = store.symbol(symbol)?;
+            let SourceNodeParent::Parent(parent) = store.source_node_parent(declaration)? else {
+                return None;
+            };
+            let owner = store.source_declaration_symbol(parent)?;
+            if !symbol_record.flags().contains(SymbolFlags::METHOD)
+                || !store.source_symbol_declarations_match(symbol)
+                || symbol_record.parent() != Some(owner)
+                || !matches!(
+                    store.source_node_kind(declaration),
+                    Some(SyntaxKind::MethodDeclaration | SyntaxKind::MethodSignature)
+                )
+            {
+                return None;
+            }
+            (symbol, declaration, owner)
+        }
+        _ => return None,
+    };
+    let owner_record = store.symbol(owner)?;
+    let [owner_declaration] = owner_record.declarations()? else {
+        return None;
+    };
+    let owner_kind = store.source_node_kind(*owner_declaration)?;
+    let class = owner_record.flags().contains(SymbolFlags::CLASS)
+        && owner_kind == SyntaxKind::ClassDeclaration;
+    let interface = owner_record.flags().contains(SymbolFlags::INTERFACE)
+        && owner_kind == SyntaxKind::InterfaceDeclaration;
+    if !(class || interface)
+        || !store.source_symbol_declarations_match(owner)
+        || store.source_declaration_symbol(*owner_declaration) != Some(owner)
+        || store.source_is_default_library_declaration(*owner_declaration)
+        || store.source_is_script_declaration_file(*owner_declaration)
+        || symbol != owner
+            && store.source_node_parent(declaration)
+                != Some(SourceNodeParent::Parent(*owner_declaration))
+    {
+        return None;
+    }
+    Some(RelationCacheSourceOwner {
+        symbol,
+        declaration,
+        owner,
+        owner_declaration: *owner_declaration,
+    })
+}
+
 enum RelationInstantiationSession<'session> {
     Borrowed(&'session mut InstantiationSession),
     Owned(InstantiationSession),
@@ -1970,6 +2062,7 @@ struct RelaterSession<'store> {
     instantiation_session: RelationInstantiationSession<'store>,
     observation: RelationObservationToken,
     pending: PendingRelationCache,
+    cache_misses: [Option<(CacheHashKey, TypeId, TypeId)>; 16],
     maybe_keys: Vec<CacheHashKey>,
     maybe_keys_set: HashSet<CacheHashKey>,
     source_stack: Vec<TypeId>,
@@ -2097,6 +2190,7 @@ impl<'store> RelaterSession<'store> {
             instantiation_session: RelationInstantiationSession::Owned(instantiation_session),
             observation,
             pending: PendingRelationCache::default(),
+            cache_misses: [None; 16],
             maybe_keys: Vec::new(),
             maybe_keys_set: HashSet::new(),
             source_stack: Vec::new(),
@@ -2205,12 +2299,62 @@ impl<'store> RelaterSession<'store> {
             // that did not publish a physical relation-cache entry.
             return;
         }
+        let (valid_before, physical_before) =
+            relation_cache_observation_counts(self.store, self.relation);
+        let observed_writes = self.cache_misses.map(|miss| {
+            let (key, source, target) = miss?;
+            let result = self.pending.latest.get(&key).copied()?;
+            let previous = self.store.relation_cache_get(self.relation, key);
+            Some((key, source, target, previous, result))
+        });
         let committed = self.store.commit_relation_cache_writes(
             self.observation,
             self.relation,
             std::mem::take(&mut self.pending.writes),
         );
         assert!(committed, "the active relation observation must commit");
+        // Owner reads must not become inputs to the relation just committed.
+        if self.store.relation_read_observation_is_active() {
+            return;
+        }
+        let (valid_after, physical_after) =
+            relation_cache_observation_counts(self.store, self.relation);
+        for (key, source, target, previous, result) in observed_writes.into_iter().flatten() {
+            let (Some(source_owner), Some(target_owner)) = (
+                relation_cache_source_owner(self.store, source),
+                relation_cache_source_owner(self.store, target),
+            ) else {
+                continue;
+            };
+            super::source::observe_call_failure_detail(
+                "relation_cache_write",
+                format_args!(
+                    "relation={:?} key={:032x} source={source:?} target={target:?} previous={previous:?} result={result:?} batch_valid_before={valid_before} batch_physical_before={physical_before} batch_valid_after={valid_after} batch_physical_after={physical_after}",
+                    self.relation,
+                    key.get(),
+                ),
+            );
+            for (side, endpoint) in [("source", source_owner), ("target", target_owner)] {
+                super::source::observe_call_failure_detail(
+                    "relation_cache_owner",
+                    format_args!(
+                        "relation={:?} key={:032x} side={side} symbol={:?} name={:?} declaration={:?} kind={:?} start={:?} owner={:?} owner_name={:?} owner_declaration={:?} owner_kind={:?} owner_start={:?}",
+                        self.relation,
+                        key.get(),
+                        endpoint.symbol,
+                        self.store.symbol(endpoint.symbol).map(|symbol| symbol.name()),
+                        endpoint.declaration,
+                        self.store.source_node_kind(endpoint.declaration),
+                        self.store.source_node_start(endpoint.declaration),
+                        endpoint.owner,
+                        self.store.symbol(endpoint.owner).map(|symbol| symbol.name()),
+                        endpoint.owner_declaration,
+                        self.store.source_node_kind(endpoint.owner_declaration),
+                        self.store.source_node_start(endpoint.owner_declaration),
+                    ),
+                );
+            }
+        }
     }
 
     fn cache_get(&self, key: CacheHashKey) -> RelationComparisonResult {
@@ -4135,6 +4279,17 @@ impl<'store> RelaterSession<'store> {
         // the pinned cache/active/depth checks, so cached answers remain usable
         // even for structural families outside this slice.
         self.ensure_supported_recursive_pair(source, target)?;
+
+        // Keep only raw IDs until the relation read observation has ended.
+        if !self
+            .cache_misses
+            .iter()
+            .flatten()
+            .any(|(seen, _, _)| *seen == key)
+            && let Some(slot) = self.cache_misses.iter_mut().find(|slot| slot.is_none())
+        {
+            *slot = Some((key, source, target));
+        }
 
         let maybe_start = self.maybe_keys.len();
         self.maybe_keys.push(key);
