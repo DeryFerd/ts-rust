@@ -13586,6 +13586,35 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 NodeData::ParenthesizedTypeNode(parenthesized)
                     if record.kind == SyntaxKind::ParenthesizedType
                         && parenthesized.type_ == current.node => {}
+                NodeData::ParameterDeclaration(parameter)
+                    if record.kind == SyntaxKind::Parameter
+                        && parameter.type_ == Some(current.node) =>
+                {
+                    let Some(signature) = record.parent else {
+                        return Ok(false);
+                    };
+                    let signature = NodeRef::new(parent.arena, parent.file, signature);
+                    let signature_record = preflight_node(self.store, self.host, signature)?;
+                    let NodeData::FunctionTypeNode(function) = &signature_record.data else {
+                        return Ok(false);
+                    };
+                    if signature_record.kind != SyntaxKind::FunctionType
+                        || function
+                            .parameters
+                            .nodes
+                            .iter()
+                            .filter(|&&parameter| parameter == parent.node)
+                            .count()
+                            != 1
+                    {
+                        return Ok(false);
+                    }
+                    current = signature;
+                    continue;
+                }
+                NodeData::FunctionTypeNode(function)
+                    if record.kind == SyntaxKind::FunctionType
+                        && function.type_ == Some(current.node) => {}
                 NodeData::PropertyDeclaration(property)
                     if matches!(
                         record.kind,
