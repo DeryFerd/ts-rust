@@ -1716,6 +1716,7 @@ impl PlannedExpression {
         match &self.kind {
             PlannedExpressionKind::Parenthesized(inner)
             | PlannedExpressionKind::LogicalNot(inner)
+            | PlannedExpressionKind::TypeOf(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => pending.push(inner),
             PlannedExpressionKind::Array(elements) => pending.extend(elements),
             PlannedExpressionKind::Object { properties, .. } => {
@@ -1942,6 +1943,7 @@ pub(super) enum PlannedExpressionKind {
     },
     Boolean(bool),
     LogicalNot(Box<PlannedExpression>),
+    TypeOf(Box<PlannedExpression>),
     GlobalUndefined,
     Identifier(PlannedIdentifierRead),
     ClassReceiver(ClassAccessContext),
@@ -20060,7 +20062,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 self.condition_expression_flow_point(&property.receiver, entry)
             }
             PlannedExpressionKind::Parenthesized(inner)
-            | PlannedExpressionKind::LogicalNot(inner) => {
+            | PlannedExpressionKind::LogicalNot(inner)
+            | PlannedExpressionKind::TypeOf(inner) => {
                 self.condition_expression_flow_point(inner, entry)
             }
             _ => entry,
@@ -28032,6 +28035,34 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 Ok(planned)
             }
             SyntaxKind::AwaitExpression => self.plan_await_expression(expression),
+            SyntaxKind::TypeOfExpression => {
+                let record = self.node(expression)?;
+                let NodeData::TypeOfExpression(type_of) = &record.data else {
+                    return Err(self.unsupported(
+                        expression,
+                        kind,
+                        SourceSyntaxRole::VariableInitializer,
+                    ));
+                };
+                let operand = self.reference(type_of.expression);
+                let operand_record = self.node(operand)?;
+                if record.flags.0 != 0
+                    || operand_record.parent != Some(expression.node)
+                    || operand_record.range.start <= record.range.start
+                    || operand_record.range.end != record.range.end
+                {
+                    return Err(self.unsupported(
+                        expression,
+                        kind,
+                        SourceSyntaxRole::VariableInitializer,
+                    ));
+                }
+                self.primitive_binary_position_roots.insert(operand);
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::TypeOf(Box::new(self.plan_expression(operand)?)),
+                ))
+            }
             SyntaxKind::BinaryExpression => self.plan_binary(expression),
             SyntaxKind::ConditionalExpression => self.plan_conditional(expression),
             SyntaxKind::PrefixUnaryExpression => self.plan_prefix_unary(expression),
@@ -33141,6 +33172,7 @@ fn class_expression_nodes(
         match &expression.kind {
             PlannedExpressionKind::Parenthesized(inner)
             | PlannedExpressionKind::LogicalNot(inner)
+            | PlannedExpressionKind::TypeOf(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => pending.push(inner),
             PlannedExpressionKind::Property(property) => pending.push(&property.receiver),
             PlannedExpressionKind::Element(element) => {
@@ -33519,6 +33551,7 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
         | PlannedExpressionKind::LogicalNot(_)
+        | PlannedExpressionKind::TypeOf(_)
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::Call(_)
         | PlannedExpressionKind::ImportCall(_)
@@ -33560,6 +33593,7 @@ fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) 
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
         | PlannedExpressionKind::Object { .. }
+        | PlannedExpressionKind::TypeOf(_)
         | PlannedExpressionKind::Conditional(_) => true,
         PlannedExpressionKind::Identifier(read) => matches!(
             read.kind,
@@ -33714,6 +33748,7 @@ fn collect_eager_logical_truthiness_conditions(
             }
             PlannedExpressionKind::Parenthesized(inner)
             | PlannedExpressionKind::LogicalNot(inner)
+            | PlannedExpressionKind::TypeOf(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => pending.push(inner),
             PlannedExpressionKind::Array(elements) => pending.extend(elements),
             PlannedExpressionKind::Object { properties, .. } => {
@@ -33795,6 +33830,7 @@ fn expression_has_deferred_object_members(expression: &PlannedExpression) -> boo
         }
         PlannedExpressionKind::Parenthesized(inner)
         | PlannedExpressionKind::LogicalNot(inner)
+        | PlannedExpressionKind::TypeOf(inner)
         | PlannedExpressionKind::Assertion { operand: inner, .. } => {
             expression_has_deferred_object_members(inner)
         }
@@ -33888,7 +33924,9 @@ fn comma_left_is_side_effect_free(expression: &PlannedExpression) -> bool {
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
         | PlannedExpressionKind::Arrow(_) => true,
-        PlannedExpressionKind::LogicalNot(operand) => comma_left_is_side_effect_free(operand),
+        PlannedExpressionKind::LogicalNot(operand) | PlannedExpressionKind::TypeOf(operand) => {
+            comma_left_is_side_effect_free(operand)
+        }
         PlannedExpressionKind::Binary(binary) => {
             !binary.operator.is_assignment_operator()
                 && comma_left_is_side_effect_free(&binary.left)
@@ -34404,6 +34442,7 @@ fn preflight_inferred_function_return_dependencies(
             }
             PlannedExpressionKind::Parenthesized(inner)
             | PlannedExpressionKind::LogicalNot(inner)
+            | PlannedExpressionKind::TypeOf(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => {
                 expression_is_closed(inner, parameters, locals, functions)
             }
@@ -35464,7 +35503,8 @@ fn prepare_source_property_diagnostic_sink(
     fn capacity(expression: &PlannedExpression) -> Option<usize> {
         match &expression.kind {
             PlannedExpressionKind::Parenthesized(inner)
-            | PlannedExpressionKind::LogicalNot(inner) => capacity(inner),
+            | PlannedExpressionKind::LogicalNot(inner)
+            | PlannedExpressionKind::TypeOf(inner) => capacity(inner),
             PlannedExpressionKind::Array(elements) => {
                 elements.iter().try_fold(0usize, |count, element| {
                     count.checked_add(capacity(element)?)
@@ -35520,6 +35560,7 @@ fn prepare_const_object_property(
             PlannedExpressionKind::Null
             | PlannedExpressionKind::GlobalUndefined
             | PlannedExpressionKind::RegularExpression(_)
+            | PlannedExpressionKind::TypeOf(_)
             | PlannedExpressionKind::ImportMeta(_),
             PreparedExpression::Literal(_),
         ) => Ok(prepared.clone()),
@@ -35559,7 +35600,7 @@ where
 {
     let types = match (&expression.kind, prepared) {
         (
-            PlannedExpressionKind::ImportMeta(_),
+            PlannedExpressionKind::ImportMeta(_) | PlannedExpressionKind::TypeOf(_),
             PreparedExpression::Literal(LiteralTreatment::Identity),
         ) => check_nested_expression(store, session, expression, None, None),
         (PlannedExpressionKind::ClassReceiver(_), PreparedExpression::ClassReceiver) => {
@@ -37458,6 +37499,7 @@ fn emit_uninitialized_variable_read_diagnostics(
         }
         PlannedExpressionKind::Parenthesized(inner)
         | PlannedExpressionKind::LogicalNot(inner)
+        | PlannedExpressionKind::TypeOf(inner)
         | PlannedExpressionKind::Assertion { operand: inner, .. } => {
             emit_uninitialized_variable_read_diagnostics(
                 store,
@@ -37820,6 +37862,7 @@ fn emit_enum_use_before_declaration_diagnostics(
         }
         PlannedExpressionKind::Parenthesized(inner)
         | PlannedExpressionKind::LogicalNot(inner)
+        | PlannedExpressionKind::TypeOf(inner)
         | PlannedExpressionKind::Assertion { operand: inner, .. } => {
             emit_enum_use_before_declaration_diagnostics(store, host, options, diagnostics, inner)?;
         }
@@ -39772,6 +39815,32 @@ fn check_expression_type_with_capture_context(
                 merge_retry_diagnostic(diagnostics, diagnostic);
             }
             Ok(CheckedExpressionTypes::leaf(checked.type_, checked.type_))
+        }
+        PlannedExpressionKind::TypeOf(operand) => {
+            check_expression_type_with_capture_context(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                current_flow_types,
+                type_import_execution,
+                operand,
+                None,
+                deferred,
+                class_flow.as_deref_mut(),
+                arrow_capture,
+            )?;
+            let result = store
+                .intrinsic_bootstrap()
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?
+                .typeof_type;
+            publish_expression_type(store, expression.node, result)?;
+            Ok(CheckedExpressionTypes::leaf(result, result))
         }
         PlannedExpressionKind::LogicalNot(operand) => {
             let checked = check_expression_type_with_capture_context(
@@ -47043,7 +47112,9 @@ fn issue_invalid_const_enum_value_diagnostic(
             }
             return Ok(());
         }
-        PlannedExpressionKind::Parenthesized(inner) | PlannedExpressionKind::LogicalNot(inner) => {
+        PlannedExpressionKind::Parenthesized(inner)
+        | PlannedExpressionKind::LogicalNot(inner)
+        | PlannedExpressionKind::TypeOf(inner) => {
             return issue_invalid_const_enum_value_diagnostic(store, host, diagnostics, inner);
         }
         PlannedExpressionKind::Identifier(read) => read,
@@ -47321,6 +47392,7 @@ fn syntactic_truthiness(
         ),
         PlannedExpressionKind::Boolean(_)
         | PlannedExpressionKind::LogicalNot(_)
+        | PlannedExpressionKind::TypeOf(_)
         | PlannedExpressionKind::Template(_)
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::TypeImportValueUse(_)
@@ -47405,6 +47477,7 @@ fn syntactic_nullishness(
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
         | PlannedExpressionKind::LogicalNot(_)
+        | PlannedExpressionKind::TypeOf(_)
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
         | PlannedExpressionKind::Arrow(_)
@@ -65028,6 +65101,7 @@ fn validate_getter_capture_entries(
             }
             PlannedExpressionKind::Parenthesized(inner)
             | PlannedExpressionKind::LogicalNot(inner)
+            | PlannedExpressionKind::TypeOf(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => pending.push(inner),
             PlannedExpressionKind::Array(elements) => pending.extend(elements),
             PlannedExpressionKind::Object { properties, .. } => {

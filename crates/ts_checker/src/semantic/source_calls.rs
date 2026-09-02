@@ -4458,6 +4458,19 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
         | SyntaxKind::BigIntLiteral => true,
         SyntaxKind::MetaProperty => matches!(&record.data,
             NodeData::MetaProperty(meta) if meta.keyword_token == SyntaxKind::ImportKeyword),
+        SyntaxKind::TypeOfExpression => {
+            let NodeData::TypeOfExpression(type_of) = &record.data else {
+                return false;
+            };
+            let operand = NodeRef::new(node.arena, node.file, type_of.expression);
+            record.flags.0 == 0
+                && arena.get(operand.node).is_some_and(|inner| {
+                    inner.parent == Some(node.node)
+                        && inner.range.start > record.range.start
+                        && inner.range.end == record.range.end
+                        && is_supported_call_argument_syntax(arena, operand)
+                })
+        }
         SyntaxKind::NonNullExpression => {
             let NodeData::NonNullExpression(non_null) = &record.data else {
                 return false;
@@ -5182,6 +5195,7 @@ fn is_context_insensitive_primitive_binary_operand_syntax(
             })
         }
         SyntaxKind::ElementAccessExpression => is_context_insensitive_element_syntax(arena, node),
+        SyntaxKind::TypeOfExpression => is_supported_call_argument_syntax(arena, node),
         SyntaxKind::PropertyAccessExpression => is_supported_call_argument_syntax(arena, node),
         SyntaxKind::BinaryExpression => is_context_insensitive_primitive_binary_syntax(arena, node),
         _ => false,
@@ -5222,7 +5236,9 @@ fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
         PlannedExpressionKind::Assertion { operand, .. } => {
             is_supported_call_argument_plan(operand)
         }
-        PlannedExpressionKind::Parenthesized(inner) | PlannedExpressionKind::LogicalNot(inner) => {
+        PlannedExpressionKind::Parenthesized(inner)
+        | PlannedExpressionKind::LogicalNot(inner)
+        | PlannedExpressionKind::TypeOf(inner) => {
             is_supported_call_argument_plan(inner)
         }
         PlannedExpressionKind::Binary(binary) => {
@@ -5269,7 +5285,9 @@ fn is_context_insensitive_primitive_binary_operand_plan(expression: &PlannedExpr
         PlannedExpressionKind::Parenthesized(inner) => {
             is_context_insensitive_primitive_binary_operand_plan(inner)
         }
-        PlannedExpressionKind::LogicalNot(operand) => is_supported_call_argument_plan(operand),
+        PlannedExpressionKind::LogicalNot(operand) | PlannedExpressionKind::TypeOf(operand) => {
+            is_supported_call_argument_plan(operand)
+        }
         PlannedExpressionKind::Binary(binary) => {
             let (left, right) = binary.operands();
             binary.node() == expression.node

@@ -519,6 +519,7 @@ fn prepare_expression(
         PlannedExpressionKind::Null
         | PlannedExpressionKind::GlobalUndefined
         | PlannedExpressionKind::RegularExpression(_)
+        | PlannedExpressionKind::TypeOf(_)
         | PlannedExpressionKind::ImportMeta(_) => {
             PreparedExpression::Literal(LiteralTreatment::Identity)
         }
