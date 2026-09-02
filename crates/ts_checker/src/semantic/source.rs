@@ -11754,6 +11754,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         error: super::classes::ClassError,
     ) -> SourceCheckError {
         let node = error.node().unwrap_or(declaration);
+        eprintln!("source_class_error declaration={declaration:?} node={node:?} error={error:?}");
         match error {
             super::classes::ClassError::Unsupported(_) => {
                 SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(node))
@@ -33083,6 +33084,7 @@ fn collect_class_expression_flow(
 }
 
 fn class_body_flow_error(node: NodeRef, error: SourceFlowError) -> SourceCheckError {
+    eprintln!("source_class_flow_error node={node:?} error={error:?}");
     match error {
         SourceFlowError::Array(error) => error.into(),
         SourceFlowError::Relation(error) => error.into(),
