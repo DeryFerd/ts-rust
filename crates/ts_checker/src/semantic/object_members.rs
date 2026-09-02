@@ -25935,8 +25935,9 @@ pub(super) fn publish_declared_members(
                 .narrowed_type
                 .and_then(|node| cached_planned_type_identity(store, node))
                 .expect("the declared predicate plan validated its narrowed type");
-            let parameter_name = store
-                .symbol(predicate.parameter_symbol)
+            let parameter_name = predicate
+                .parameter_symbol
+                .and_then(|symbol| store.symbol(symbol))
                 .and_then(|symbol| symbol.name().as_utf8())
                 .expect("the declared predicate plan validated its parameter")
                 .to_owned();
@@ -25951,7 +25952,7 @@ pub(super) fn publish_declared_members(
             assert!(store.set_symbol_node_links(
                 predicate.parameter_name,
                 SymbolNodeLinks {
-                    resolved_symbol: Some(predicate.parameter_symbol),
+                    resolved_symbol: predicate.parameter_symbol,
                 },
             ));
             let boolean = store
