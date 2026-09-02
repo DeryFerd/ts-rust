@@ -11769,8 +11769,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             )
         };
         if let Err(error) = &source {
+            let location = match error {
+                super::classes::ClassError::Unsupported(
+                    super::classes::ClassUnsupported::PropertyType { node, .. },
+                ) => host.node(*node).map(|record| (record.kind, record.range)),
+                _ => None,
+            };
             eprintln!(
-                "source_class_plan_failure source={:?} declaration={declaration:?} symbol={symbol:?} error={error:?}",
+                "source_class_plan_failure source={:?} declaration={declaration:?} symbol={symbol:?} error={error:?} location={location:?}",
                 self.source.node_ref(),
             );
         }
