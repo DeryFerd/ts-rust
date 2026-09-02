@@ -17,7 +17,7 @@ use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, MinArgumentCountFlags, RelationKind,
     RelationUnavailable, SignatureId, TypeId,
-    array_types::CanonicalArrayTargets,
+    array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callable_sets::{
         StoredCallableSetValidation, validate_stored_callable_set,
@@ -649,6 +649,27 @@ fn resolve_direct_call_candidates_with_receiver(
         )? {
             return Ok(candidate);
         }
+        if request.form == DirectCallForm::Call
+            && !argument_failures.is_empty()
+            && can_synthesize_overload_failure(
+                store,
+                CanonicalArrayTargets::from_global_types(global_types),
+                &callables,
+            )?
+        {
+            return recover_fixed_call_overload(
+                store,
+                global_types,
+                strict_function_types,
+                request,
+                &callables,
+                original_callables,
+                &candidates,
+                &argument_failures,
+                existing_signature,
+                session,
+            );
+        }
         Err(DirectCallUnsupported::OverloadFailureRecovery(request.callee).into())
     })()?;
     if let Some(existing) = existing_signature
@@ -934,7 +955,22 @@ fn choose_applicable_overload(
     Ok(None)
 }
 
-/// Mirrors the fixed, non-generic part of `getCandidateForOverloadFailure`.
+fn can_synthesize_overload_failure(
+    store: &CanonicalTypeMapperStore,
+    array_targets: CanonicalArrayTargets,
+    callables: &[&ValidatedSingleCallable],
+) -> Result<bool, DirectCallError> {
+    for callable in callables {
+        if let Some(rest) = callable_rest_shape(store, Some(array_targets), callable)?
+            && !matches!(rest, RestParameterShape::Array { .. })
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Mirrors non-generic overload failure with fixed or array-rest parameters.
 #[allow(clippy::too_many_arguments)]
 fn recover_fixed_call_overload(
     store: &mut CanonicalTypeMapperStore,
@@ -1098,6 +1134,95 @@ fn overload_failure_return_type(
     }
 }
 
+fn overload_failure_parameter_types(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    callee: TypeId,
+    callables: &[&ValidatedSingleCallable],
+    fixed_count: usize,
+    has_rest: bool,
+    session: &mut InstantiationSession,
+) -> Result<Vec<(SemanticSymbolId, TypeId)>, DirectCallError> {
+    let first = callables
+        .first()
+        .ok_or(DirectCallInvariant::MalformedCallable(callee))?;
+    let array_targets = CanonicalArrayTargets::from_global_types(global_types);
+    let mut parameters = Vec::with_capacity(fixed_count + usize::from(has_rest));
+    for index in 0..fixed_count {
+        let mut types = Vec::new();
+        let mut source = None;
+        for callable in callables {
+            let rest = callable_rest_shape(store, Some(array_targets), callable)?;
+            let position =
+                position_types(store, Some(array_targets), callable, rest.as_ref(), index)?;
+            if position.is_empty() {
+                continue;
+            }
+            types.extend(position);
+            let symbol = store
+                .signature(callable.signature)
+                .and_then(|signature| {
+                    signature
+                        .parameters()
+                        .get(index.min(callable.parameters.len()))
+                })
+                .copied()
+                .ok_or(DirectCallInvariant::InvalidSignature(callable.signature))?;
+            source.get_or_insert(symbol);
+        }
+        let source = source.ok_or(DirectCallInvariant::InvalidSignature(first.signature))?;
+        let reduced = store
+            .expression_union_type_with_global_types_and_session(
+                global_types,
+                &types,
+                UnionReduction::Subtype,
+                session,
+            )
+            .map_err(|error| overload_failure_type_error(callee, first.signature, error))?;
+        parameters.push((source, reduced));
+    }
+    if has_rest {
+        let mut elements = Vec::new();
+        let mut source = None;
+        for callable in callables {
+            let Some(rest) = callable_rest_shape(store, Some(array_targets), callable)? else {
+                continue;
+            };
+            let RestParameterShape::Array { element, .. } = rest else {
+                return Err(DirectCallUnsupported::OverloadFailureRecovery(callee).into());
+            };
+            elements.push(element);
+            let symbol = store
+                .signature(callable.signature)
+                .and_then(|signature| signature.parameters().last())
+                .copied()
+                .ok_or(DirectCallInvariant::InvalidSignature(callable.signature))?;
+            source.get_or_insert(symbol);
+        }
+        let source = source.ok_or(DirectCallInvariant::InvalidSignature(first.signature))?;
+        let element = store
+            .expression_union_type_with_global_types_and_session(
+                global_types,
+                &elements,
+                UnionReduction::Subtype,
+                session,
+            )
+            .map_err(|error| overload_failure_type_error(callee, first.signature, error))?;
+        let rest = store
+            .create_canonical_array_type_with_targets(array_targets, element, false)
+            .map_err(|error| match error {
+                ArrayTypeError::Capacity(_) => DirectCallError::Invariant(
+                    DirectCallInvariant::ParameterProjectionCapacity(first.signature),
+                ),
+                _ => DirectCallError::Invariant(
+                    DirectCallInvariant::InvalidOverloadFailureSignature(first.signature),
+                ),
+            })?;
+        parameters.push((source, rest));
+    }
+    Ok(parameters)
+}
+
 fn get_fixed_overload_failure_signature(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
@@ -1140,7 +1265,6 @@ fn get_fixed_overload_failure_signature(
     for callable in callables {
         let signature = validate_signature_parameters(store, callable)?;
         if callable.owner != callee
-            || callable.rest_parameter.is_some()
             || !signature.type_parameters().is_empty()
             || signature.this_parameter().is_some()
             || signature.flags().intersects(
@@ -1151,8 +1275,14 @@ fn get_fixed_overload_failure_signature(
             return Err(DirectCallUnsupported::OverloadFailureRecovery(callee).into());
         }
         flags |= signature.flags() & SignatureFlags::HAS_LITERAL_TYPES;
-        minimum = minimum.min(signature.parameters().len());
-        maximum = maximum.max(signature.parameters().len());
+        if let Some(rest) = callable_rest_shape(store, Some(array_targets), callable)? {
+            if !matches!(rest, RestParameterShape::Array { .. }) {
+                return Err(DirectCallUnsupported::OverloadFailureRecovery(callee).into());
+            }
+            flags |= SignatureFlags::HAS_REST_PARAMETER;
+        }
+        minimum = minimum.min(callable.parameters.len());
+        maximum = maximum.max(callable.parameters.len());
         let return_type =
             callable
                 .return_type
@@ -1172,35 +1302,19 @@ fn get_fixed_overload_failure_signature(
         .declaration();
     let minimum_argument_count = i32::try_from(minimum)
         .map_err(|_| DirectCallInvariant::ParameterProjectionCapacity(first.signature))?;
-    let mut parameter_types = Vec::with_capacity(maximum);
-    for index in 0..maximum {
-        let mut types = Vec::new();
-        let mut source = None;
-        for callable in callables {
-            if let Some(&type_) = callable.parameters.get(index) {
-                types.push(type_);
-                let symbol = store
-                    .signature(callable.signature)
-                    .and_then(|signature| signature.parameters().get(index))
-                    .copied()
-                    .ok_or(DirectCallInvariant::InvalidSignature(callable.signature))?;
-                source.get_or_insert(symbol);
-            }
-        }
-        let source = source.ok_or(DirectCallInvariant::InvalidSignature(first.signature))?;
-        let reduced = store
-            .expression_union_type_with_global_types_and_session(
-                global_types,
-                &types,
-                UnionReduction::Subtype,
-                session,
-            )
-            .map_err(|error| overload_failure_type_error(callee, first.signature, error))?;
-        parameter_types.push((source, reduced));
-    }
+    let parameter_types = overload_failure_parameter_types(
+        store,
+        global_types,
+        callee,
+        callables,
+        maximum,
+        flags.contains(SignatureFlags::HAS_REST_PARAMETER),
+        session,
+    )?;
+    let parameter_count = parameter_types.len();
     if !store.try_reserve_signatures(1)
-        || !store.try_reserve_checker_symbol_allocations(maximum, 0)
-        || !store.try_reserve_value_symbol_links(maximum)
+        || !store.try_reserve_checker_symbol_allocations(parameter_count, 0)
+        || !store.try_reserve_value_symbol_links(parameter_count)
         || store.overload_failure_signatures.try_reserve(1).is_err()
         || store
             .overload_failure_signature_keys
@@ -1209,7 +1323,7 @@ fn get_fixed_overload_failure_signature(
     {
         return Err(DirectCallInvariant::ParameterProjectionCapacity(first.signature).into());
     }
-    let mut parameters = Vec::with_capacity(maximum);
+    let mut parameters = Vec::with_capacity(parameter_count);
     for (source, type_) in parameter_types {
         let original = store
             .symbol(source)
@@ -1287,15 +1401,23 @@ fn get_fixed_overload_failure_signature(
 
 impl OverloadFailureSignature {
     fn callable(&self, owner: TypeId) -> ValidatedSingleCallable {
+        let rest_parameter = self
+            .flags
+            .contains(SignatureFlags::HAS_REST_PARAMETER)
+            .then(|| self.parameters.last())
+            .flatten()
+            .map(|parameter| parameter.type_);
+        let fixed_count = self.parameters.len() - usize::from(rest_parameter.is_some());
         ValidatedSingleCallable {
             owner,
             signature: self.signature,
             parameters: self
                 .parameters
                 .iter()
+                .take(fixed_count)
                 .map(|parameter| parameter.type_)
                 .collect(),
-            rest_parameter: None,
+            rest_parameter,
             min_argument_count: usize::try_from(self.minimum_argument_count)
                 .expect("the recovery minimum was checked before publication"),
             return_type: Some(self.return_type),
@@ -1316,6 +1438,8 @@ fn overload_failure_signature_is_exact(
         || signature.min_argument_count() != receipt.minimum_argument_count
         || signature.resolved_return_type() != Some(receipt.return_type)
         || signature.parameters().len() != receipt.parameters.len()
+        || receipt.flags.contains(SignatureFlags::HAS_REST_PARAMETER)
+            && receipt.parameters.is_empty()
         || !signature.type_parameters().is_empty()
         || signature.this_parameter().is_some()
         || signature.target().is_some()
