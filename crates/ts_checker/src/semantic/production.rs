@@ -25,7 +25,7 @@ use ts_binder::{
 };
 
 use super::{
-    AssignabilityErrorDisplay, CanonicalCheckerDiagnostics, CanonicalEnumSemantics,
+    AssignabilityErrorDisplay, AwaitedTypeError, CanonicalCheckerDiagnostics, CanonicalEnumSemantics,
     CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, CanonicalModuleResolutionLookup,
     CanonicalModuleResolutionManifest, CanonicalModuleResolutionManifestError,
     CanonicalModuleResolutionManifestInput, CanonicalTypeFormatFlags, CanonicalTypeMapperStore,
@@ -1853,6 +1853,46 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             diagnostics,
         )?
         .get_type_from_type_node(node)
+    }
+
+    /// Unwraps promises and structural thenables without creating an `Awaited<T>` alias.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed errors for invalid thenables, cycles, unsupported types,
+    /// or a failed canonical type query.
+    pub fn get_awaited_type_no_alias(
+        &mut self,
+        type_: TypeId,
+    ) -> Result<TypeId, AwaitedTypeError> {
+        let Self {
+            options,
+            files,
+            store,
+            instantiation_session,
+            diagnostics,
+            global_types,
+            module_resolutions,
+            ..
+        } = self;
+        instantiation_session.reset_query();
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
+            GlobalMergeCompletion::new(options.name_resolution),
+        )
+        .map_err(DeclaredTypeError::from)?
+        .with_program_file_order(&self.file_order)
+        .with_module_resolutions(module_resolutions);
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            &host,
+            global_types,
+            *options,
+            instantiation_session,
+            diagnostics,
+        )?
+        .get_awaited_type_no_alias(type_, *options)
     }
 
     /// Resolves the lazy return type of one exact annotated function-type

@@ -11,6 +11,10 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_jsnum::{Number, PseudoBigInt};
 use xxhash_rust::xxh3::Xxh3;
 
+#[path = "awaited_types.rs"]
+mod awaited_types;
+pub use awaited_types::AwaitedTypeError;
+
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
     CanonicalCheckerRelatedInformation, CanonicalGlobalTypes, CanonicalTypeFormatFlags,

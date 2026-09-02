@@ -193,7 +193,7 @@ pub use source_meta::SourceMetaError;
 pub use store::SemanticStore;
 pub use symbol_display::SymbolDisplayError;
 pub use tuple_types::EmptyTupleTypeError;
-pub use type_nodes::TypeNodeUnavailable;
+pub use type_nodes::{AwaitedTypeError, TypeNodeUnavailable};
 pub use type_records::{CacheHashKey, CanonicalSemanticStore, TypeData, TypeDataKind, TypeRecord};
 pub use types::VarianceFlags;
 pub use variables::{VariableInvariant, VariableUnsupported};
