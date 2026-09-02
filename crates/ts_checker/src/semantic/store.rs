@@ -12987,13 +12987,25 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         true
     }
 
-    /// Checks mapped Array.sort callbacks before storing their source identity.
+    /// Checks mapped callbacks and returned arrows before storing their source identity.
     #[allow(clippy::too_many_lines)] // The callee, source parameters, and mapped target form one proof.
     pub(super) fn set_contextual_source_callable_provenance(
         &mut self,
         type_: TypeId,
         provenance: &SourceCallableProvenance,
     ) -> bool {
+        let returned_target_is_exact = provenance.family == SourceCallableFamily::ArrowFunction
+            && provenance.contextual_variable.is_none()
+            && provenance.captured_assignment.is_none()
+            && provenance.contextual_target.is_some_and(|target| {
+                target != type_
+                    && super::source_callables::stored_returned_arrow_context_is_exact(
+                        self,
+                        provenance.declaration,
+                        provenance.owner_symbol,
+                        target,
+                    )
+            });
         let sort_target_is_exact = (|| {
             let target = provenance.contextual_target?;
             let SourceNodeParent::Parent(call) = self.source_node_parent(provenance.declaration)?
@@ -13099,7 +13111,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             Some(())
         })()
         .is_some();
-        if sort_target_is_exact {
+        if returned_target_is_exact || sort_target_is_exact {
             self.set_source_callable_provenance_with_context(type_, provenance, true)
         } else {
             self.set_source_callable_provenance(type_, provenance)

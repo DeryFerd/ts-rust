@@ -2517,7 +2517,7 @@ impl SourceFlowPlan {
             && self.statement_list.as_ref() == Some(syntax)
     }
 
-    /// Retains the same flow with an authenticated function-expression context.
+    /// Retains the same flow with an authenticated callable annotation context.
     pub(super) fn with_function_expression_statement_list_context(
         &self,
         store: &CanonicalTypeMapperStore,
@@ -2533,11 +2533,15 @@ impl SourceFlowPlan {
             || callable.declaration != declaration
             || bound.symbol(declaration) != Some(callable.owner_symbol)
             || arena.get(declaration.node).is_none_or(|record| {
-                record.kind != SyntaxKind::FunctionExpression
-                    || !matches!(
-                        &record.data,
-                        NodeData::FunctionExpression(function) if function.body == callable.body.node
-                    )
+                !matches!(
+                    (&record.data, record.kind),
+                    (NodeData::FunctionExpression(function), SyntaxKind::FunctionExpression)
+                        if function.body == callable.body.node
+                ) && !matches!(
+                    (&record.data, record.kind),
+                    (NodeData::ArrowFunction(function), SyntaxKind::ArrowFunction)
+                        if function.body == callable.body.node
+                )
             })
         {
             return Err(invalid().into());

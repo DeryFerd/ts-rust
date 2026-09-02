@@ -26091,7 +26091,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     if record.kind == SyntaxKind::ReturnStatement
                         && return_statement.expression == Some(argument.node) =>
                 {
-                    if !self.anonymous_function_return_is_exact(parent, argument)? {
+                    if !self.anonymous_function_return_is_exact(parent, argument)?
+                        && super::source_callables::source_returned_arrow_context_annotation(
+                            store, host, declaration,
+                        )
+                        .map_err(Self::callable_plan_error)?
+                        .is_none()
+                    {
                         return Err(SourceCheckError::Unsupported(
                             UnsupportedSourceSyntax::Arrow(declaration),
                         ));
@@ -26166,6 +26172,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && !javascript_object_property_arrow
             && !contextual_object_property_arrow
             && !contextual_direct_call_arrow
+            && super::source_callables::source_returned_arrow_context_annotation(
+                store, host, declaration,
+            )
+            .map_err(Self::callable_plan_error)?
+            .is_none()
         {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Arrow(declaration),
@@ -43633,6 +43644,16 @@ fn check_planned_arrow_argument(
         })
         && store
             .source_object_literal_method_owner_is_exact(expression, arrow.callable.owner_symbol);
+    let returned_arrow = super::source_callables::source_returned_arrow_context_annotation(
+        store, host, expression,
+    )
+    .map_err(SourcePlanner::callable_plan_error)?
+    .is_some();
+    if returned_arrow && contextual_type.is_none() {
+        return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(
+            expression,
+        )));
+    }
     let contextual_statement_arrow = matches!(arrow.body, PlannedArrowBody::StatementList(_))
         && contextual_type.is_some()
         && arrow
@@ -43640,8 +43661,9 @@ fn check_planned_arrow_argument(
             .parameters
             .iter()
             .any(|parameter| parameter.is_implicit_any())
-        && source_direct_call_argument_arrow_is_exact(store, host, expression)
-            .map_err(SourcePlanner::callable_plan_error)?;
+        && (returned_arrow
+            || source_direct_call_argument_arrow_is_exact(store, host, expression)
+                .map_err(SourcePlanner::callable_plan_error)?);
     if matches!(
         arrow.body,
         PlannedArrowBody::StatementList(_) | PlannedArrowBody::ForOf(_)
@@ -43721,7 +43743,7 @@ fn check_planned_arrow_argument(
     };
     let current_flow_types = closure_flow_types.as_ref().unwrap_or(current_flow_types);
     let mut contextual_arrow;
-    let arrow = if function_expression
+    let arrow = if (function_expression || returned_arrow)
         && (arrow.callable.return_type.is_inferred()
             || arrow
                 .callable
@@ -43766,11 +43788,12 @@ fn check_planned_arrow_argument(
                 &contextual_arrow
             }
             StoredSingleCallableValidation::NotCallable
-                if store.type_payload(target).is_some_and(|record| {
-                    !record.flags().intersects(
-                        TypeFlags::UNION | TypeFlags::INTERSECTION | TypeFlags::TYPE_PARAMETER,
-                    )
-                }) =>
+                if !returned_arrow
+                    && store.type_payload(target).is_some_and(|record| {
+                        !record.flags().intersects(
+                            TypeFlags::UNION | TypeFlags::INTERSECTION | TypeFlags::TYPE_PARAMETER,
+                        )
+                    }) =>
             {
                 arrow
             }
@@ -44025,7 +44048,7 @@ fn check_planned_arrow_argument(
         type_import_execution.annotation_capabilities,
     )?;
     let mut contextual_statement_list;
-    let arrow = if function_expression
+    let arrow = if (function_expression || returned_arrow)
         && let PlannedArrowBody::StatementList(body) = &arrow.body
         && body.syntax.callable != arrow.callable
     {
