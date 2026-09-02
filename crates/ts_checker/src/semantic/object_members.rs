@@ -22515,7 +22515,7 @@ fn synthetic_object_literal_matches_plan(
 }
 
 fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyObjectPlan) -> bool {
-    plan.properties.iter().all(|property| {
+    plan.properties.iter().enumerate().all(|(index, property)| {
         let Some(record) = store.symbol(property.symbol) else {
             return false;
         };
@@ -22648,10 +22648,45 @@ fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyOb
             let Some(receiver) = receiver else {
                 return false;
             };
-            return matches!(
+            let Some(record) = store.type_payload(receiver) else {
+                return false;
+            };
+            let selected = if let TypeData::Interface(interface) = record.data()
+                && interface
+                    .reference
+                    .resolved_type_arguments
+                    .as_ref()
+                    .is_some_and(|arguments| !arguments.is_empty())
+            {
+                // A generic field cache retains the written template type and its source proof.
+                if plan.kind != PropertyObjectKind::Interface
+                    || record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
+                    || !valid_cold_declared_member_cache(interface)
+                    || !valid_generic_publication_target(store, plan, receiver, record, interface)
+                {
+                    return false;
+                }
+                let Some(SourceNodeParent::Parent(declaration)) =
+                    store.source_node_parent(property.declaration)
+                else {
+                    return false;
+                };
+                super::declared_values::selected_planned_declared_property(
+                    store,
+                    receiver,
+                    declaration,
+                    plan.symbol,
+                    &plan.properties,
+                    index,
+                )
+                .map(Some)
+            } else {
                 super::declared_values::selected_declared_property(
                     store, receiver, property.name.as_ref(),
-                ),
+                )
+            };
+            return matches!(
+                selected,
                 Ok(Some(super::declared_values::SelectedDeclaredProperty::Resolved(selected)))
                     if selected.symbol == property.symbol
                         && selected.optional == property.optional

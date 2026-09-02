@@ -1459,7 +1459,7 @@ pub(super) fn selected_property_object_alias_property(
     projection: &PropertyObjectAliasProjection,
     index: usize,
 ) -> Result<SelectedDeclaredProperty, RelationUnavailable> {
-    selected_planned_property_object_property(
+    selected_planned_declared_property(
         store,
         projection.target,
         projection.declaration,
@@ -1478,7 +1478,7 @@ pub(super) fn selected_source_property_object_property(
     if let Some(alias) = projection.as_direct_alias() {
         return selected_property_object_alias_property(store, alias, index);
     }
-    selected_planned_property_object_property(
+    selected_planned_declared_property(
         store,
         projection.target(),
         projection.declaration(),
@@ -1488,7 +1488,8 @@ pub(super) fn selected_source_property_object_property(
     )
 }
 
-fn selected_planned_property_object_property(
+/// Checks one planned property's source and cached value after owner validation.
+pub(super) fn selected_planned_declared_property(
     store: &CanonicalTypeMapperStore,
     target: TypeId,
     declaration: NodeRef,
