@@ -145,10 +145,20 @@ fn property_declaration(parsed: &ParseResult, owner: NodeRef, name: &str) -> Nod
         .nodes
         .iter()
         .find_map(|&id| {
-            let NodeData::PropertySignatureDeclaration(property) = &parsed.arena.get(id)?.data else {
-                return None;
+            let record = parsed.arena.get(id)?;
+            let property_name = match (&record.data, record.kind) {
+                (
+                    NodeData::PropertySignatureDeclaration(property),
+                    SyntaxKind::PropertySignature,
+                ) => property.name,
+                (NodeData::PropertyDeclaration(property), SyntaxKind::PropertyDeclaration)
+                    if property.initializer.is_none() =>
+                {
+                    property.name
+                }
+                _ => return None,
             };
-            let NodeData::Identifier(actual) = &parsed.arena.get(property.name)?.data else {
+            let NodeData::Identifier(actual) = &parsed.arena.get(property_name)?.data else {
                 return None;
             };
             (actual.text == name).then_some(node(parsed, id))
@@ -222,14 +232,20 @@ fn assert_contextual_rhs(
     let signature = callable_signature(checker, type_);
     let target_signature = callable_signature(checker, target);
     assert_ne!(signature, target_signature);
-    let NodeData::PropertySignatureDeclaration(property) =
-        &parsed.arena.get(target_declaration.node).unwrap().data
-    else {
-        unreachable!();
+    let record = parsed.arena.get(target_declaration.node).unwrap();
+    let annotation = match (&record.data, record.kind) {
+        (NodeData::PropertySignatureDeclaration(property), SyntaxKind::PropertySignature) => {
+            property.type_
+        }
+        (NodeData::PropertyDeclaration(property), SyntaxKind::PropertyDeclaration) => {
+            assert!(property.initializer.is_none());
+            property.type_.expect("the interface property has a type annotation")
+        }
+        _ => panic!("expected an interface property"),
     };
     assert_eq!(
         checker.store().signature(target_signature).unwrap().declaration(),
-        Some(node(parsed, property.type_)),
+        Some(node(parsed, annotation)),
     );
     assert_eq!(
         checker.store().signature_links(right).unwrap().resolved_signature.signature(),
