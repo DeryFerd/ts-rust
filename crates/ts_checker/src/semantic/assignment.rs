@@ -3782,7 +3782,7 @@ impl AssignmentPlanner<'_, '_> {
             .store
             .symbol(class_symbol)
             .ok_or(AssignmentInvariant::InvalidSymbol(class_symbol))?;
-        if owner.flags() != SymbolFlags::CLASS || owner.parent().is_some() {
+        if owner.flags() != SymbolFlags::CLASS {
             return Ok(None);
         }
         let Some([class_declaration]) = owner.declarations() else {
@@ -3809,6 +3809,22 @@ impl AssignmentPlanner<'_, '_> {
             || class.heritage_clauses.is_some()
         {
             return Ok(None);
+        }
+        if owner.parent().is_some() {
+            match super::classes::source_class_type_owner_declaration(
+                self.store,
+                self.host,
+                class_symbol,
+            ) {
+                Ok(declaration) if declaration == *class_declaration => {}
+                Err(super::classes::ClassError::Unsupported(_)) => return Ok(None),
+                Err(super::classes::ClassError::DeclaredType(error)) => {
+                    return Err(AssignmentPlanError::DeclaredType(error));
+                }
+                Ok(_) | Err(super::classes::ClassError::Invariant(_)) => {
+                    return Err(AssignmentInvariant::InvalidSymbolShape(class_symbol).into());
+                }
+            }
         }
         Ok(Some(OwnClassPropertyAssignmentPlan {
             statement,
