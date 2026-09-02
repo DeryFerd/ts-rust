@@ -82,6 +82,7 @@ mod source_meta;
 mod source_meta_invariants_wave152;
 mod source_namespaces;
 mod source_new;
+mod source_object_rest;
 mod source_overloads;
 mod source_properties;
 mod source_statements;

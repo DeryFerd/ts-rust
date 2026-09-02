@@ -2518,6 +2518,28 @@ fn plan_body(
         }
         return Ok(SourceArrowBodyPlan::ForOfBlock { block: body });
     }
+    let contains_object_binding = block.statements.nodes.iter().any(|statement| {
+        let statement = NodeRef::new(body.arena, body.file, *statement);
+        let Some(NodeData::VariableStatement(variable)) = host.node(statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let list = NodeRef::new(body.arena, body.file, variable.declaration_list);
+        let Some(NodeData::VariableDeclarationList(list)) = host.node(list).map(|node| &node.data)
+        else {
+            return false;
+        };
+        list.declarations.nodes.iter().any(|declaration| {
+            let declaration = NodeRef::new(body.arena, body.file, *declaration);
+            let Some(NodeData::VariableDeclaration(variable)) =
+                host.node(declaration).map(|node| &node.data)
+            else {
+                return false;
+            };
+            store.source_node_kind(NodeRef::new(body.arena, body.file, variable.name))
+                == Some(SyntaxKind::ObjectBindingPattern)
+        })
+    });
     let linear_statement = |statement| {
         let statement = NodeRef::new(body.arena, body.file, statement);
         let Some(record) = host.node(statement) else {
@@ -2556,6 +2578,7 @@ fn plan_body(
         }
     };
     if synchronous_typescript
+        && !contains_object_binding
         && block
             .statements
             .nodes
@@ -2585,15 +2608,16 @@ fn plan_body(
         return Ok(SourceArrowBodyPlan::LinearBlock { block: body });
     }
     if synchronous_typescript
-        && block.statements.nodes.iter().any(|statement| {
-            matches!(
-                store.source_node_kind(NodeRef::new(body.arena, body.file, *statement)),
-                Some(
-                    SyntaxKind::IfStatement | SyntaxKind::Block | SyntaxKind::ForStatement
-                        | SyntaxKind::TryStatement | SyntaxKind::ThrowStatement
+        && (contains_object_binding
+            || block.statements.nodes.iter().any(|statement| {
+                matches!(
+                    store.source_node_kind(NodeRef::new(body.arena, body.file, *statement)),
+                    Some(
+                        SyntaxKind::IfStatement | SyntaxKind::Block | SyntaxKind::ForStatement
+                            | SyntaxKind::TryStatement | SyntaxKind::ThrowStatement
+                    )
                 )
-            )
-        })
+            }))
         && let Some((arena, bound)) = host.source(callable.declaration)
     {
         match super::source_statements::plan_source_callable_statement_list_syntax(
@@ -2602,6 +2626,9 @@ fn plan_body(
             Ok(_) => return Ok(SourceArrowBodyPlan::StatementBlock { block: body }),
             Err(super::source_statements::SourceFunctionStatementsError::Unsupported(_)) => {
                 return Err(unsupported(SourceArrowUnsupported::ComplexBlock(body)));
+            }
+            Err(super::source_statements::SourceFunctionStatementsError::Variable(error)) => {
+                return Err(map_variable_error(error));
             }
             Err(_) => return Err(invariant(SourceArrowInvariant::InvalidBody(body))),
         }

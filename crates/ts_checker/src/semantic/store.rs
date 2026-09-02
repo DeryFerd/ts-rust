@@ -919,6 +919,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     synthetic_namespace_property_origins:
         HashMap<SemanticSymbolId, SyntheticNamespacePropertyState>,
     object_literal_getter_origins: HashMap<SemanticSymbolId, ObjectLiteralGetterOrigin>,
+    source_object_rest_origins: HashMap<TypeId, super::source_object_rest::SourceObjectRestOrigin>,
     object_literal_getter_return_proofs: HashMap<SemanticSymbolId, ObjectLiteralGetterReturnProof>,
     source_file_namespace_identities: HashMap<SemanticSymbolId, SourceFileNamespaceIdentity>,
     source_file_namespace_wrappers: HashMap<SemanticSymbolId, SourceFileNamespaceWrapper>,
@@ -1125,6 +1126,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             object_literal_property_clone_origins: HashMap::new(),
             synthetic_namespace_property_origins: HashMap::new(),
             object_literal_getter_origins: HashMap::new(),
+            source_object_rest_origins: HashMap::new(),
             object_literal_getter_return_proofs: HashMap::new(),
             source_file_namespace_identities: HashMap::new(),
             source_file_namespace_wrappers: HashMap::new(),
@@ -5291,6 +5293,29 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.object_literal_property_clone_origins
             .try_reserve(additional)
             .is_ok()
+    }
+
+    pub(super) fn source_object_rest_origin(
+        &self,
+        type_: TypeId,
+    ) -> Option<&super::source_object_rest::SourceObjectRestOrigin> {
+        self.source_object_rest_origins.get(&type_)
+    }
+
+    pub(super) fn record_source_object_rest_origin(
+        &mut self,
+        origin: super::source_object_rest::SourceObjectRestOrigin,
+    ) -> bool {
+        if self.source_object_rest_origins.try_reserve(1).is_err() {
+            return false;
+        }
+        match self.source_object_rest_origins.entry(origin.result()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get() == &origin,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(origin);
+                true
+            }
+        }
     }
 
     pub(super) fn record_object_literal_property_clone_origin(
@@ -10164,6 +10189,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_symbol(symbol) {
             return false;
         }
+        let rest_index_changed = self
+            .index_info(id)
+            .is_some_and(|index| index.index_symbol() != symbol)
+            && self
+                .source_object_rest_origins
+                .values()
+                .any(|origin| origin.references_index(id));
         let relation_dirty = self
             .index_info(id)
             .is_some_and(|index| index.index_symbol().is_some() && index.index_symbol() != symbol);
@@ -10177,10 +10209,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         for recovery in self.instantiated_index_recoveries.values_mut() {
             recovery_invalidated |= recovery.invalidate_for_index_write(id);
         }
-        if relation_dirty || recovery_invalidated {
+        if relation_dirty || recovery_invalidated || rest_index_changed {
             self.mark_relation_inputs_dirty();
         }
-        if recovery_invalidated {
+        if recovery_invalidated || rest_index_changed {
             self.mark_union_cache_validation_dirty();
         }
         true

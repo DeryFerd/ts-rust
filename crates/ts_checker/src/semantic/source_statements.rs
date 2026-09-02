@@ -165,6 +165,7 @@ pub(super) struct SourceLocalObjectBindingSyntax {
     pub(super) callable: NodeRef,
     pub(super) statement_parent: NodeRef,
     pub(super) block_scope: NodeRef,
+    pub(super) binding: VariableBindingKind,
 }
 
 /// One exact `if` arm ending in a value-returning `return`.
@@ -5318,7 +5319,7 @@ impl SyntaxPlanner<'_> {
         if self.node(pattern)?.kind != SyntaxKind::ObjectBindingPattern {
             return Ok(None);
         }
-        super::variables::plan_callable_object_binding_elements(
+        let (binding, _) = super::variables::plan_callable_object_binding_elements(
             self.arena,
             self.bound,
             self.store,
@@ -5350,6 +5351,7 @@ impl SyntaxPlanner<'_> {
             callable: self.callable.declaration,
             statement_parent: parent,
             block_scope: scope,
+            binding,
         }))
     }
 

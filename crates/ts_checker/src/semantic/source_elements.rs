@@ -3089,7 +3089,7 @@ fn enum_has_numeric_index(
     Ok(false)
 }
 
-fn unchecked_index_read_type(
+pub(super) fn unchecked_index_read_type(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
     options: CanonicalCheckerOptions,
@@ -3204,6 +3204,7 @@ fn resolved_index_signature_surface(
     store: &CanonicalTypeMapperStore,
     receiver_type: TypeId,
 ) -> Result<Option<ResolvedIndexSignatures>, SourceElementError> {
+    let indexed_rest = super::source_object_rest::validate(store, receiver_type)?;
     let record = store
         .type_payload(receiver_type)
         .ok_or(SourceElementError::InvalidType(receiver_type))?;
@@ -3222,7 +3223,7 @@ fn resolved_index_signature_surface(
     let Some(index_infos) = object.structured.index_infos.as_deref() else {
         return Ok(None);
     };
-    if computed {
+    if computed || indexed_rest {
         let bootstrap = store
             .intrinsic_bootstrap()
             .ok_or(RelationUnavailable::MissingBootstrap)?;

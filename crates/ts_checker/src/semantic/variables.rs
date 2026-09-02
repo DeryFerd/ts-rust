@@ -616,7 +616,7 @@ pub(super) fn plan_callable_object_binding_elements(
     callable: NodeRef,
     statement_parent: NodeRef,
     block_scope: NodeRef,
-) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
+) -> Result<(VariableBindingKind, Vec<PlannedObjectBindingElement>), VariablePlanError> {
     if bound.node_arena_id() != arena.id()
         || bound.node_arena_revision() != arena.revision()
         || [declaration, callable, statement_parent, block_scope]
@@ -659,6 +659,17 @@ pub(super) fn plan_callable_object_binding_elements(
     let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
         return Err(VariableInvariant::InvalidBindingPattern(list).into());
     };
+    let binding = match list_record.flags.0 {
+        flags if flags == VariableBindingKind::Const.declaration_flags() => {
+            VariableBindingKind::Const
+        }
+        flags if flags == VariableBindingKind::Let.declaration_flags() => VariableBindingKind::Let,
+        _ => {
+            return Err(VariablePlanError::Unsupported(
+                VariableUnsupported::BindingPattern(declaration),
+            ));
+        }
+    };
     if statement_record.kind != SyntaxKind::VariableStatement
         || statement_record.flags.0 != 0
         || statement_data.declaration_list != list.node
@@ -666,7 +677,6 @@ pub(super) fn plan_callable_object_binding_elements(
         || statement_data.flow_node.is_some()
         || statement_data.facts != 0
         || list_record.kind != SyntaxKind::VariableDeclarationList
-        || list_record.flags.0 != VariableBindingKind::Const.declaration_flags()
         || list_data.declarations.nodes.as_slice() != [declaration.node]
         || list_data.declarations.range != list_record.range
         || list_data.declarations.has_trailing_comma
@@ -699,7 +709,7 @@ pub(super) fn plan_callable_object_binding_elements(
         bound,
         store,
         declaration,
-        VariableBindingKind::Const,
+        binding,
         false,
         ObjectBindingScope {
             statement_parent,
@@ -709,8 +719,7 @@ pub(super) fn plan_callable_object_binding_elements(
     )?;
     if elements.is_empty()
         || elements.iter().any(|element| {
-            element.rest
-                || element.initializer.is_some()
+            element.initializer.is_some()
                 || element.computed_key.is_some()
                 || !element.parent_properties.is_empty()
         })
@@ -719,7 +728,70 @@ pub(super) fn plan_callable_object_binding_elements(
             VariableUnsupported::BindingPattern(pattern),
         ));
     }
-    Ok(elements)
+    Ok((binding, elements))
+}
+
+/// Reuses the scoped binding proof for a write to one actual binding element.
+pub(super) fn plan_callable_object_binding_element(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    element: NodeRef,
+    callable: NodeRef,
+) -> Result<(VariableBindingKind, PlannedObjectBindingElement), VariablePlanError> {
+    let invalid = || VariableInvariant::InvalidBindingPattern(element);
+    if !element.is_for(arena.id(), bound.file_id())
+        || bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+    {
+        return Err(invalid().into());
+    }
+    let record = arena.get(element.node).ok_or_else(invalid)?;
+    let NodeData::BindingElement(binding) = &record.data else {
+        return Err(invalid().into());
+    };
+    let reference = |node| NodeRef::new(element.arena, element.file, node);
+    let pattern = reference(record.parent.ok_or_else(invalid)?);
+    let pattern_record = arena.get(pattern.node).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::BindingElement
+        || pattern_record.kind != SyntaxKind::ObjectBindingPattern
+    {
+        return Err(invalid().into());
+    }
+    let declaration = reference(pattern_record.parent.ok_or_else(invalid)?);
+    let list = arena
+        .get(declaration.node)
+        .and_then(|node| node.parent)
+        .ok_or_else(invalid)?;
+    let statement = arena
+        .get(list)
+        .and_then(|node| node.parent)
+        .ok_or_else(invalid)?;
+    let parent = arena
+        .get(statement)
+        .and_then(|node| node.parent)
+        .ok_or_else(invalid)?;
+    let scope = bound
+        .block_scope_container(declaration)
+        .ok_or_else(invalid)?;
+    let (kind, elements) = plan_callable_object_binding_elements(
+        arena,
+        bound,
+        store,
+        declaration,
+        callable,
+        reference(parent),
+        scope,
+    )?;
+    let element = elements
+        .into_iter()
+        .find(|planned| {
+            planned.element == element
+                && Some(planned.name.node) == binding.name
+                && bound.symbol(element) == Some(planned.symbol)
+        })
+        .ok_or_else(invalid)?;
+    Ok((kind, element))
 }
 
 pub(super) fn plan_class_object_binding_elements(

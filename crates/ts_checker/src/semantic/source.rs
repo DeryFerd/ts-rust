@@ -17547,7 +17547,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let (store, _) = self
             .semantic
             .ok_or_else(|| Self::unsupported_function_body(callable))?;
-        let elements = super::variables::plan_callable_object_binding_elements(
+        let (binding, elements) = super::variables::plan_callable_object_binding_elements(
             self.arena,
             self.bound,
             store,
@@ -17561,7 +17561,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let NodeData::VariableDeclaration(variable) = &declaration.data else {
             return Err(invalid());
         };
-        if syntax.callable != callable.declaration
+        if binding != syntax.binding
+            || syntax.callable != callable.declaration
             || declaration.parent != Some(syntax.list.node)
             || self.node(syntax.list)?.parent != Some(syntax.statement.node)
             || variable.name != syntax.pattern.node
@@ -18596,7 +18597,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             &name,
         )
         .map_err(Self::variable_plan_error)?;
-        let Some(local) = locals.iter().find(|local| {
+        let local = locals.iter().find(|local| {
             local.symbol == read.value_symbol
                 && !local.evolving_array
                 && matches!(local.initializer, PlannedVariableInitializer::Expression(_))
@@ -18604,10 +18605,37 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     .parameters
                     .iter()
                     .any(|parameter| parameter.symbol == local.symbol)
-        }) else {
-            return Ok(None);
+        });
+        let declaration = if let Some(local) = local {
+            local.declaration
+        } else {
+            let Some(declaration) = store
+                .symbol(read.value_symbol)
+                .and_then(|symbol| symbol.value_declaration())
+                .filter(|declaration| {
+                    self.bound.container(*declaration) == Some(callable.declaration)
+                        && self
+                            .arena
+                            .get(declaration.node)
+                            .is_some_and(|record| record.kind == SyntaxKind::BindingElement)
+                })
+            else {
+                return Ok(None);
+            };
+            let (_, binding) = super::variables::plan_callable_object_binding_element(
+                self.arena,
+                self.bound,
+                store,
+                declaration,
+                callable.declaration,
+            )
+            .map_err(Self::variable_plan_error)?;
+            if binding.symbol != read.value_symbol {
+                return Err(Self::unsupported_function_body(callable));
+            }
+            binding.element
         };
-        if self.bound.container(local.declaration) != Some(callable.declaration)
+        if self.bound.container(declaration) != Some(callable.declaration)
             || self.bound.container(target) != Some(callable.declaration)
         {
             return Err(Self::unsupported_function_body(callable));
@@ -18620,8 +18648,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             expression,
             flow: SourceFlowParameterAssignment {
                 target,
-                parameter: local.declaration,
-                symbol: local.symbol,
+                parameter: declaration,
+                symbol: read.value_symbol,
             },
             right,
         }))
@@ -56794,22 +56822,40 @@ fn check_callable_statement_nodes(
                     callable,
                     &binding.initializer,
                 )?;
+                prepare_callable_object_binding_source(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    checked.result,
+                )?;
                 for element in &binding.elements {
-                    let type_ = object_binding_property_type(
-                        store,
-                        host,
-                        global_types,
-                        options,
-                        diagnostics,
-                        checked.result,
-                        element.property,
-                        &element.property_name,
-                        false,
-                    )?;
+                    let type_ = if element.rest {
+                        object_binding_rest_type_with_indexes(
+                            store,
+                            element,
+                            checked.result,
+                            Some((global_types, &mut *session)),
+                        )?
+                    } else {
+                        callable_object_binding_property_type(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            diagnostics,
+                            checked.result,
+                            element.property,
+                            &element.property_name,
+                        )?
+                    };
                     let type_ = inferred_variable_type(
                         store,
                         global_types,
-                        VariableBindingKind::Const,
+                        binding.syntax.binding,
                         type_,
                     )?;
                     stage_value_type(
@@ -56822,6 +56868,9 @@ fn check_callable_statement_nodes(
                     frame
                         .complete_assignment(element.element, element.symbol, type_)
                         .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                    if !binding.syntax.binding.is_const() {
+                        returned.declared_entries.insert(element.symbol, type_);
+                    }
                 }
             }
             PlannedCallableStatement::Leaf(leaf) => {
@@ -57930,7 +57979,29 @@ fn check_planned_parameter_assignment(
                     | PlannedVariableInitializer::Expression(_)
             )
     });
-    let declared_type = if local.is_some() {
+    let object_binding = if host
+        .node(assignment.flow.parameter)
+        .is_some_and(|record| record.kind == SyntaxKind::BindingElement)
+    {
+        let (arena, bound) = host
+            .source(callable.declaration)
+            .ok_or_else(|| SourcePlanner::unsupported_function_body(callable))?;
+        let (binding, element) = super::variables::plan_callable_object_binding_element(
+            arena,
+            bound,
+            store,
+            assignment.flow.parameter,
+            callable.declaration,
+        )
+        .map_err(SourcePlanner::variable_plan_error)?;
+        if element.symbol != assignment.flow.symbol {
+            return Err(SourcePlanner::unsupported_function_body(callable));
+        }
+        Some(binding)
+    } else {
+        None
+    };
+    let declared_type = if local.is_some() || object_binding.is_some() {
         staged_value_types.get(&assignment.flow.symbol).copied()
     } else {
         store
@@ -57940,7 +58011,8 @@ fn check_planned_parameter_assignment(
     .ok_or(SourceCheckError::Variable(
         VariableInvariant::MissingCurrentFlowType(assignment.flow.symbol),
     ))?;
-    let readonly = local.is_some_and(|local| local.binding.is_const());
+    let readonly = local.is_some_and(|local| local.binding.is_const())
+        || object_binding.is_some_and(|binding| binding.is_const());
     let target_type = if readonly {
         let target = host
             .node(assignment.flow.target)
@@ -61027,10 +61099,160 @@ fn primitive_union_object_binding_lacks_property(
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn prepare_callable_object_binding_source(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    receiver: TypeId,
+) -> Result<(), SourceCheckError> {
+    if matches!(
+        store.type_payload(receiver).map(TypeRecord::data),
+        Some(TypeData::Mapped(_))
+    ) {
+        super::relater::prepare_general_mapped_relation_endpoint(store, receiver, session)?;
+        return Ok(());
+    }
+    let Some(record) = store.type_payload(receiver) else {
+        return Err(RelationUnavailable::Type(receiver).into());
+    };
+    if !record
+        .data()
+        .structured()
+        .is_some_and(|data| data.index_infos.is_some())
+    {
+        return Ok(());
+    }
+    let declaration = record
+        .symbol()
+        .and_then(|symbol| store.symbol(symbol))
+        .and_then(|symbol| symbol.declarations())
+        .and_then(|declarations| match declarations {
+            [declaration] => Some(*declaration),
+            _ => None,
+        })
+        .filter(|declaration| {
+            host.node(*declaration)
+                .is_some_and(|node| node.kind == SyntaxKind::TypeLiteral)
+        })
+        .ok_or(RelationUnavailable::UnsupportedStructuredType(receiver))?;
+    let checked = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        globals,
+        options,
+        session,
+        diagnostics,
+    )?
+    .get_type_from_type_node(declaration)?;
+    if checked != receiver
+        || !store.type_payload(receiver).is_some_and(|record| {
+            record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        })
+    {
+        return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
+    }
+    super::object_members::resolve_object_property_by_key(
+        store,
+        Some(globals),
+        receiver,
+        ts_binder::EscapedNameRef::source(""),
+        session,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn callable_object_binding_property_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    receiver: TypeId,
+    node: NodeRef,
+    name: &str,
+) -> Result<TypeId, SourceCheckError> {
+    let indexes = store
+        .type_payload(receiver)
+        .and_then(|record| record.data().structured())
+        .and_then(|data| data.index_infos.clone());
+    if let Some(indexes) = indexes {
+        if let Some(property) = super::object_members::resolve_object_property_by_key(
+            store,
+            Some(globals),
+            receiver,
+            ts_binder::EscapedNameRef::source(name),
+            session,
+        )? {
+            return object_binding_property_read_type(store, globals, options, property);
+        }
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?;
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        let mut string_value = None;
+        let mut number_value = None;
+        for index in indexes {
+            let info = store
+                .index_info(index)
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+            if info.key_type() == string && string_value.is_none() {
+                string_value = Some(info.value_type());
+            } else if info.key_type() == number && number_value.is_none() {
+                number_value = Some(info.value_type());
+            } else {
+                return Err(RelationUnavailable::UnsupportedStructuredType(receiver).into());
+            }
+        }
+        let indexed = if ts_jsnum::from_string(name).to_string() == name {
+            number_value.or(string_value)
+        } else {
+            string_value
+        };
+        if let Some(type_) = indexed {
+            return super::source_elements::unchecked_index_read_type(
+                store,
+                Some(globals),
+                options,
+                node,
+                type_,
+            )
+            .map_err(|error| SourcePlanner::element_plan_error(node, error));
+        }
+    }
+    object_binding_property_type(
+        store,
+        host,
+        globals,
+        options,
+        diagnostics,
+        receiver,
+        node,
+        name,
+        false,
+    )
+}
+
 fn object_binding_rest_type(
     store: &mut CanonicalTypeMapperStore,
     binding: &PlannedObjectBindingElement,
     receiver: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    object_binding_rest_type_with_indexes(store, binding, receiver, None)
+}
+
+fn object_binding_rest_type_with_indexes(
+    store: &mut CanonicalTypeMapperStore,
+    binding: &PlannedObjectBindingElement,
+    receiver: TypeId,
+    mut prepared_indexes: Option<(&CanonicalGlobalTypes, &mut InstantiationSession)>,
 ) -> Result<TypeId, SourceCheckError> {
     let (any, error, empty) = store
         .intrinsic_bootstrap()
@@ -61070,9 +61292,12 @@ fn object_binding_rest_type(
     }
     let record = store.type_payload(receiver).ok_or_else(unsupported)?;
     let structured = record.data().structured().ok_or_else(unsupported)?;
-    if structured.signatures.is_some() || structured.index_infos.is_some() {
+    if structured.signatures.is_some()
+        || prepared_indexes.is_none() && structured.index_infos.is_some()
+    {
         return Err(unsupported());
     }
+    let index_infos = structured.index_infos.clone();
     let symbols = structured.properties.clone().unwrap_or_default();
     let mut retained = Vec::with_capacity(symbols.len());
     for symbol in symbols {
@@ -61084,15 +61309,23 @@ fn object_binding_rest_type(
         if excluded_properties.contains(&name) {
             continue;
         }
-        let property = store
-            .resolved_own_property(receiver, &name)?
-            .ok_or_else(unsupported)?;
+        let property = match prepared_indexes.as_mut() {
+            Some((globals, session)) => super::object_members::resolve_object_property_by_key(
+                store,
+                Some(*globals),
+                receiver,
+                ts_binder::EscapedNameRef::source(&name),
+                session,
+            )?,
+            None => store.resolved_own_property(receiver, &name)?,
+        }
+        .ok_or_else(unsupported)?;
         if property.symbol != symbol {
             return Err(unsupported());
         }
         retained.push((name, property.type_, property.optional));
     }
-    if retained.is_empty() {
+    if retained.is_empty() && index_infos.as_ref().is_none_or(Vec::is_empty) {
         return Ok(empty);
     }
 
@@ -61103,7 +61336,8 @@ fn object_binding_rest_type(
         let record = store.type_payload(cached).ok_or_else(unsupported)?;
         let structured = record.data().structured().ok_or_else(unsupported)?;
         let symbols = structured.properties.as_deref().ok_or_else(unsupported)?;
-        if symbols.len() != retained.len()
+        if structured.index_infos != index_infos
+            || symbols.len() != retained.len()
             || symbols.iter().zip(&retained).any(|(symbol, expected)| {
                 let Some(record) = store.symbol(*symbol) else {
                     return true;
@@ -61124,6 +61358,9 @@ fn object_binding_rest_type(
                     expected: receiver,
                 },
             ));
+        }
+        if index_infos.is_some() && !super::source_object_rest::validate(store, cached)? {
+            return Err(unsupported());
         }
         return Ok(cached);
     }
@@ -61161,8 +61398,31 @@ fn object_binding_rest_type(
     let rest = store
         .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
         .ok_or_else(unsupported)?;
-    if !store.set_structured_type_members(rest, Some(members), Some(symbols), None, None, None) {
+    if !store.set_structured_type_members(
+        rest,
+        Some(members),
+        Some(symbols),
+        None,
+        None,
+        index_infos.clone(),
+    ) {
         return Err(unsupported());
+    }
+    if index_infos.is_some() {
+        let origin = super::source_object_rest::SourceObjectRestOrigin::new(
+            store,
+            rest,
+            receiver,
+            binding.element,
+            binding.symbol,
+            excluded_properties,
+        )
+        .ok_or_else(unsupported)?;
+        if !store.record_source_object_rest_origin(origin) {
+            return Err(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::Capacity,
+            ));
+        }
     }
     Ok(rest)
 }

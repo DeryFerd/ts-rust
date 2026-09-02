@@ -1577,6 +1577,7 @@ pub(super) fn validated_synthetic_structural_property(
     let links = store.value_symbol_links(symbol).ok_or_else(invalid)?;
     let property_type = links.resolved_type.ok_or_else(invalid)?;
     let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT;
+    let indexed_rest = super::source_object_rest::validate(store, receiver)?;
     if owner.flags() == TypeFlags::OBJECT
         && owner.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
         && owner.symbol().is_none()
@@ -1591,7 +1592,7 @@ pub(super) fn validated_synthetic_structural_property(
             .is_none()
         && object.structured.signatures.is_none()
         && object.structured.call_signature_count == 0
-        && object.structured.index_infos.is_none()
+        && (object.structured.index_infos.is_none() || indexed_rest)
         && !properties.is_empty()
         && properties.contains(&symbol)
         && table.get(record.name()) == Some(symbol)
@@ -3150,6 +3151,10 @@ impl<'store> RelaterSession<'store> {
         recursion_flags: RecursionFlags,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
+        super::source_object_rest::validate(self.store, original_source)?;
+        if original_target != original_source {
+            super::source_object_rest::validate(self.store, original_target)?;
+        }
         validate_global_this_relation_inputs(
             self.store,
             original_source,
@@ -9122,6 +9127,7 @@ impl<'store> RelaterSession<'store> {
         type_id: TypeId,
         allow_fresh_literal: bool,
     ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
+        let indexed_rest = super::source_object_rest::validate(self.store, type_id)?;
         let canonical_array = self.canonical_array_member_reference(type_id)?;
         let type_id = canonical_array.unwrap_or(type_id);
         if self.global_this_hint == Some(type_id)
@@ -9448,7 +9454,10 @@ impl<'store> RelaterSession<'store> {
             return Err(RelationUnavailable::UnsupportedProperty(readonly));
         }
         let (index_infos, has_index_member) =
-            if matches!(property_origin, ObjectPropertyOrigin::GenericReference(_)) {
+            if indexed_rest {
+                property_origin = ObjectPropertyOrigin::SyntheticStructural(type_id);
+                (structured.index_infos.clone().unwrap_or_default(), false)
+            } else if matches!(property_origin, ObjectPropertyOrigin::GenericReference(_)) {
                 validate_generic_interface_members(
                     self.store,
                     type_id,
@@ -11969,6 +11978,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         instantiation_session: Option<&'query mut InstantiationSession>,
         global_this: Option<GlobalThisRelationContext<'query>>,
     ) -> Result<bool, RelationUnavailable> {
+        super::source_object_rest::validate(self, source)?;
+        if target != source {
+            super::source_object_rest::validate(self, target)?;
+        }
         let global_this_dependent = validate_global_this_relation_inputs(
             self,
             source,
@@ -13512,7 +13525,7 @@ fn validate_general_mapped_relation_endpoint(
     Ok(true)
 }
 
-fn prepare_general_mapped_relation_endpoint(
+pub(super) fn prepare_general_mapped_relation_endpoint(
     store: &mut SemanticStore<TypeRecord, TypeMapper>,
     type_id: TypeId,
     session: &mut InstantiationSession,
