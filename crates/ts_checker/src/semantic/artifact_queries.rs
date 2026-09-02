@@ -4211,7 +4211,9 @@ impl CanonicalCheckerContext<'_> {
         let (type_, reference_symbol) = if let Some(imported) =
             source.and_then(super::classes::SourceClassProvenance::imported_base)
         {
-            let host = self.declared_type_host()?;
+            let host = self
+                .declared_type_host()?
+                .with_module_resolutions(self.module_resolutions());
             let value = imported
                 .completed_value(self.store(), &host, self.global_types(), self.options())
                 .map_err(|error| {
