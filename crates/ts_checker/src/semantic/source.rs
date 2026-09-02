@@ -77456,7 +77456,9 @@ fn check_source_plan(
                     ))?,
             }
         } else if function.callable.parameters.iter().any(|parameter| {
-            parameter.explicit_type_node().is_none() && !parameter.is_implicit_any()
+            parameter.explicit_type_node().is_none()
+                && !parameter.is_implicit_any()
+                && !parameter.has_string_default_type()
         }) {
             let (type_, signature) =
                 publish_jsdoc_parameterized_source_callable(store, host, &function.callable)
