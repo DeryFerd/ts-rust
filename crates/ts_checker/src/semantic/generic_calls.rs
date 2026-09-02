@@ -9054,6 +9054,7 @@ fn identity_generic_call_vector_shape(
         }],
         parameter_templates: vec![shape.type_parameter],
         rest_element_template: None,
+        rest_type_parameter: None,
         minimum_argument_count: 1,
         return_type: shape.type_parameter,
         return_requires_exact_cache: false,
