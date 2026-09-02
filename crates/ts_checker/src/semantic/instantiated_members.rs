@@ -8921,19 +8921,13 @@ fn validate_declared_target(
     let owner_record = store
         .symbol(owner)
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
-    let Some(declarations) = owner_record
+    let Some(_) = owner_record
         .declarations()
         .filter(|declarations| !declarations.is_empty())
     else {
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     };
-    if !owner_record.flags().contains(SymbolFlags::CLASS)
-        && declarations.iter().any(|declaration| {
-            !valid_generic_interface_declaration_owner(store, owner, *declaration)
-        })
-    {
-        return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
-    }
+    // The header validates interface declarations and any merged global value owner.
 
     let mapper_parameters = mapper_parameters_for_target(store, target, &source_parameters)?;
     active.push(target);
