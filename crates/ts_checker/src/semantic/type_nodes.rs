@@ -19066,7 +19066,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
                 rhs = child;
             }
-            if rhs != request.source_node() {
+            let key = match self.store.source_node_kind(rhs) {
+                Some(SyntaxKind::ConditionalType) => ConditionalQueryKey::Node(rhs),
+                Some(SyntaxKind::TypeReference) => ConditionalQueryKey::AliasReference(rhs),
+                _ => return Err(invalid()),
+            };
+            let source_request = super::conditional_types::conditional_source_query_request(
+                self.store,
+                key,
+                self.array_targets,
+            )
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+            if !request.is_alias_declaration_of(&source_request) {
                 return Err(invalid());
             }
             return Ok(());

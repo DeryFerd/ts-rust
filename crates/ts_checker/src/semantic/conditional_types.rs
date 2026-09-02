@@ -724,6 +724,26 @@ impl ConditionalSourceQueryRequest {
         self.production.definition.node
     }
 
+    /// Alias declarations keep the conditional root of their RHS query.
+    pub(super) fn is_alias_declaration_of(&self, source: &Self) -> bool {
+        if !matches!(self.production.key, ConditionalQueryKey::AliasDeclaration(_))
+            || self.production.source_declaration.is_none()
+            || !matches!(
+                source.production.key,
+                ConditionalQueryKey::Node(_) | ConditionalQueryKey::AliasReference(_)
+            )
+        {
+            return false;
+        }
+        let mut expected = source.production.clone();
+        expected.key = self.production.key;
+        expected.type_arguments = self.production.type_arguments.clone();
+        expected.alias = None;
+        expected.source_declaration = self.production.source_declaration;
+        expected.for_constraint = false;
+        expected == self.production
+    }
+
     pub(super) fn source_root(&self) -> ConditionalSourceRoot {
         ConditionalSourceRoot {
             root: self.production.definition.root,
