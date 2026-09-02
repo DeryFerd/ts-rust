@@ -30899,6 +30899,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 import.target() == symbol
             } else if let Some(target) = self.type_reference_alias_targets.get(&node) {
                 target.reference == node && target.target == symbol
+            } else if let Some(target) = self.cached_source_annotation_type_import(node)? {
+                target.reference == node && target.target == symbol
             } else if let Some(body) =
                 source_imports::plan_source_alias_body_type_import(self.store, self.host, node)
                     .map_err(|error| property_type_import_error(node, error))?
