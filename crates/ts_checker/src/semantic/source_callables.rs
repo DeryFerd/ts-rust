@@ -6932,9 +6932,23 @@ pub(super) fn authenticated_function_object_parameter_bindings(
     let (arena, bound) = host.source(declaration)?;
     let bindings = if host.node(declaration)?.kind == SyntaxKind::ArrowFunction {
         plan_typed_arrow_object_parameter_bindings(arena, bound, store, declaration, parameter)
+            .inspect_err(|error| {
+                observe_object_parameter_plan_failure(
+                    "binding",
+                    parameter,
+                    format_args!("{error:?}"),
+                );
+            })
             .ok()?
     } else {
         plan_function_object_parameter_bindings(arena, bound, store, declaration, parameter)
+            .inspect_err(|error| {
+                observe_object_parameter_plan_failure(
+                    "binding",
+                    parameter,
+                    format_args!("{error:?}"),
+                );
+            })
             .ok()?
     };
     let NodeData::ParameterDeclaration(syntax) = &host.node(parameter)?.data else {
@@ -6954,6 +6968,24 @@ pub(super) fn authenticated_function_object_parameter_bindings(
         return None;
     }
     Some(bindings)
+}
+
+fn observe_object_parameter_plan_failure(
+    stage: &str,
+    node: NodeRef,
+    error: std::fmt::Arguments<'_>,
+) {
+    use std::io::Write as _;
+
+    let mut buffer = [0u8; 512];
+    let mut output = &mut buffer[..511];
+    let _ = write!(
+        &mut output,
+        "object_parameter_plan_failure stage={stage} node={node:?} error={error}"
+    );
+    let used = 511 - output.len();
+    buffer[used] = b'\n';
+    let _ = std::io::stderr().write_all(&buffer[..=used]);
 }
 
 fn source_object_parameter_annotation_plan(
@@ -6986,17 +7018,48 @@ fn source_object_parameter_annotation_plan(
         {
             return None;
         }
-        let mut symbol = source_alias_reference_symbol(store, host, annotation).ok()??;
+        let mut symbol = source_alias_reference_symbol(store, host, annotation)
+            .inspect_err(|error| {
+                observe_object_parameter_plan_failure(
+                    "name",
+                    annotation,
+                    format_args!("{error:?}"),
+                );
+            })
+            .ok()?
+            .or_else(|| {
+                observe_object_parameter_plan_failure(
+                    "name",
+                    annotation,
+                    format_args!("not found"),
+                );
+                None
+            })?;
         if store.symbol(symbol)?.flags().intersects(SymbolFlags::ALIAS) {
             symbol = super::type_nodes::plan_ordinary_import_alias_target(
                 store, host, annotation, symbol,
             )
+            .inspect_err(|error| {
+                observe_object_parameter_plan_failure(
+                    "import",
+                    annotation,
+                    format_args!("{error:?}"),
+                );
+            })
             .ok()?;
         }
         let owner = store.symbol(symbol)?;
         if owner.flags().contains(SymbolFlags::INTERFACE) {
             let plan = if reference.type_arguments.is_some() {
-                super::object_members::plan_generic_interface(store, host, symbol).ok()?
+                super::object_members::plan_generic_interface(store, host, symbol)
+                    .inspect_err(|error| {
+                        observe_object_parameter_plan_failure(
+                            "interface",
+                            annotation,
+                            format_args!("{error:?}"),
+                        );
+                    })
+                    .ok()?
             } else {
                 super::object_members::plan_interface(store, host, symbol).ok()?
             };
