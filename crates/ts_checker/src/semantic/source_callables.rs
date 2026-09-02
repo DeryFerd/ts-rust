@@ -23185,7 +23185,7 @@ mod tests {
         let predicate = plan.type_predicate.unwrap();
         assert_eq!(predicate.owner, declaration);
         assert_eq!(predicate.parameter_index, 1);
-        assert_eq!(predicate.parameter_symbol, plan.parameters[1].symbol);
+        assert_eq!(predicate.parameter_symbol, Some(plan.parameters[1].symbol));
         assert_eq!(predicate.kind, TypePredicateKind::Identifier);
         assert_eq!(plan.return_type.type_node(), Some(predicate.node));
         assert_eq!(
@@ -23211,7 +23211,7 @@ mod tests {
         );
         let record = fixture.store.signature(signature).unwrap();
         assert_eq!(record.declaration(), Some(declaration));
-        assert_eq!(record.parameters()[1], predicate.parameter_symbol);
+        assert_eq!(Some(record.parameters()[1]), predicate.parameter_symbol);
         assert_eq!(record.resolved_return_type(), Some(boolean));
         assert!(valid_planned_callable_type_predicate(
             &fixture.store,
@@ -23222,7 +23222,7 @@ mod tests {
         assert_eq!(
             fixture.store.symbol_node_links(predicate.parameter_name),
             Some(&SymbolNodeLinks {
-                resolved_symbol: Some(predicate.parameter_symbol),
+                resolved_symbol: predicate.parameter_symbol,
             }),
         );
         let warm = (

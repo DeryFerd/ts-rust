@@ -5730,10 +5730,13 @@ mod tests {
         assert_eq!(narrowing.node, written);
         assert_eq!(plan.callable.return_type.annotation_identity(), Some((written, false)));
         assert_eq!(narrowing.parameter_index, 0);
-        assert_eq!(narrowing.parameter_symbol, plan.callable.parameters[0].symbol);
+        assert_eq!(
+            narrowing.parameter_symbol,
+            Some(plan.callable.parameters[0].symbol)
+        );
         assert_eq!(
             predicate.bound.symbol(plan.callable.parameters[0].declaration),
-            Some(narrowing.parameter_symbol),
+            narrowing.parameter_symbol,
         );
         assert_eq!(
             narrowing.kind,

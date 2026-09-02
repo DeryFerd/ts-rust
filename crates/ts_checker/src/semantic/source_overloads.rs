@@ -2677,7 +2677,10 @@ mod tests {
                     let predicate = declaration.type_predicate.unwrap();
                     assert_eq!(predicate.owner, declaration.declaration);
                     assert_eq!(predicate.parameter_index, 0);
-                    assert_eq!(predicate.parameter_symbol, declaration.parameters[0].symbol);
+                    assert_eq!(
+                        predicate.parameter_symbol,
+                        Some(declaration.parameters[0].symbol)
+                    );
                     predicate.kind
                 })
                 .collect::<Vec<_>>(),
