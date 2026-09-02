@@ -77208,7 +77208,10 @@ fn check_source_plan(
         if resolved.immediate_target_symbol != export.local_symbol
             || !store.symbol(resolved.target_symbol).is_some_and(|target| {
                 if export.binding.syntactic_type_only {
-                    target.flags() == SymbolFlags::TYPE_ALIAS
+                    matches!(
+                        target.flags(),
+                        SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE
+                    )
                 } else {
                     matches!(
                         target.flags(),
