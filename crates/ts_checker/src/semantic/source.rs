@@ -2704,13 +2704,21 @@ struct PlannedAmbientVariable {
     initializer: Option<PlannedExpression>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PlannedAmbientNamespaceRead {
     node: NodeRef,
     namespace: SemanticSymbolId,
-    member: SemanticSymbolId,
-    member_declaration: NodeRef,
+    target: PlannedAmbientNamespaceReadTarget,
     same_file: bool,
+}
+
+#[derive(Clone, Debug)]
+enum PlannedAmbientNamespaceReadTarget {
+    Member {
+        symbol: SemanticSymbolId,
+        declaration: NodeRef,
+    },
+    Value(Box<SourceNamespacePlan>),
 }
 
 #[derive(Clone, Debug)]
@@ -26849,6 +26857,57 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Ok(None);
         }
 
+        if self.is_direct_top_level_variable_initializer(node)? {
+            let exports = owner
+                .exports()
+                .and_then(|exports| store.symbol_table(exports))
+                .ok_or(SourceCheckError::Property(node))?;
+            for (_, member) in exports.iter() {
+                let member = store
+                    .symbol(member)
+                    .ok_or(SourceCheckError::Property(node))?;
+                if member.flags().intersects(SymbolFlags::ALIAS) {
+                    // Alias exports need their canonical value projection before enumeration.
+                    return Ok(None);
+                }
+            }
+            let plan = plan_source_namespace(
+                declaration_arena,
+                declaration_bound,
+                store,
+                declaration,
+            )?;
+            if plan.symbol != namespace || !plan.ambient {
+                return Ok(None);
+            }
+            if store.symbol_node_links(node).is_some_and(|links| {
+                links
+                    .resolved_symbol
+                    .is_some_and(|cached| cached != namespace)
+            }) {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolNodeCache {
+                        node,
+                        cached: store
+                            .symbol_node_links(node)
+                            .and_then(|links| links.resolved_symbol),
+                        expected: namespace,
+                    },
+                ));
+            }
+            self.ambient_namespace_reads.push(PlannedAmbientNamespaceRead {
+                node,
+                namespace,
+                target: PlannedAmbientNamespaceReadTarget::Value(Box::new(plan)),
+                same_file,
+            });
+            return Ok(Some(PlannedIdentifierRead {
+                resolved_symbol: namespace,
+                value_symbol: namespace,
+                kind: PlannedIdentifierReadKind::DeclaredValue,
+            }));
+        }
+
         let Some(property) = self.node(node)?.parent.map(|parent| self.reference(parent)) else {
             return Ok(None);
         };
@@ -26968,8 +27027,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .push(PlannedAmbientNamespaceRead {
                 node,
                 namespace,
-                member,
-                member_declaration: *member_declaration,
+                target: PlannedAmbientNamespaceReadTarget::Member {
+                    symbol: member,
+                    declaration: *member_declaration,
+                },
                 same_file,
             });
         Ok(Some(PlannedIdentifierRead {
@@ -62205,7 +62266,7 @@ fn materialize_referenced_ambient_namespace(
     options: CanonicalCheckerOptions,
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
-    read: PlannedAmbientNamespaceRead,
+    read: &PlannedAmbientNamespaceRead,
     current: Option<TypeId>,
 ) -> Result<TypeId, SourceCheckError> {
     let (exports, properties) = {
@@ -62227,7 +62288,9 @@ fn materialize_referenced_ambient_namespace(
                     .map(|_| symbol)
             })
             .collect::<Vec<_>>();
-        if !properties.contains(&read.member) {
+        if let PlannedAmbientNamespaceReadTarget::Member { symbol, .. } = &read.target
+            && !properties.contains(symbol)
+        {
             return Err(SourceCheckError::Property(read.node));
         }
         (exports, properties)
@@ -62259,49 +62322,84 @@ fn materialize_referenced_ambient_namespace(
         ));
     }
 
-    if read.same_file {
-        let Some(links) = store.value_symbol_links(read.member) else {
+    if let PlannedAmbientNamespaceReadTarget::Value(plan) = &read.target {
+        if plan.symbol != read.namespace || !plan.ambient {
             return Err(SourceCheckError::Property(read.node));
-        };
-        let Some(type_) = links.resolved_type else {
-            return Err(SourceCheckError::Property(read.node));
-        };
-        if store.type_payload(type_).is_none()
-            || links
-                != &(ValueSymbolLinks {
-                    resolved_type: Some(type_),
-                    ..ValueSymbolLinks::default()
-                })
-        {
-            return Err(SourceCheckError::Variable(
-                VariableInvariant::InvalidValueLinks(read.member),
-            ));
         }
-    } else {
-        session.reset_query();
-        let callable = CanonicalTypeQuery::new_with_global_types_and_session(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            diagnostics,
-        )?
-        .get_type_of_source_callable(read.member_declaration, read.member)?;
-        let signature = store
-            .source_callable_provenance(callable)
-            .map(|provenance| provenance.signature)
+        let (arena, bound) = host
+            .source(plan.declaration)
             .ok_or(SourceCheckError::Property(read.node))?;
-        session.reset_query();
-        CanonicalTypeQuery::new_with_global_types_and_session(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            diagnostics,
-        )?
-        .get_return_type_of_signature(signature)?;
+        if plan_source_namespace(arena, bound, store, plan.declaration)? != **plan {
+            return Err(SourceCheckError::Property(read.node));
+        }
+        if let Some(type_) = current.or(cached)
+            && super::source_namespaces::validate_module_value_identity(store, host, type_)?
+                != read.namespace
+        {
+            return Err(SourceCheckError::Property(read.node));
+        }
+        if !read.same_file {
+            execute_source_namespace(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                plan,
+            )?;
+        }
+    }
+
+    if let PlannedAmbientNamespaceReadTarget::Member {
+        symbol: member,
+        declaration: member_declaration,
+    } = read.target
+    {
+        if read.same_file {
+            let Some(links) = store.value_symbol_links(member) else {
+                return Err(SourceCheckError::Property(read.node));
+            };
+            let Some(type_) = links.resolved_type else {
+                return Err(SourceCheckError::Property(read.node));
+            };
+            if store.type_payload(type_).is_none()
+                || links
+                    != &(ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..ValueSymbolLinks::default()
+                    })
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidValueLinks(member),
+                ));
+            }
+        } else {
+            session.reset_query();
+            let callable = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .get_type_of_source_callable(member_declaration, member)?;
+            let signature = store
+                .source_callable_provenance(callable)
+                .map(|provenance| provenance.signature)
+                .ok_or(SourceCheckError::Property(read.node))?;
+            session.reset_query();
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .get_return_type_of_signature(signature)?;
+        }
     }
 
     let shared_identity = store.symbol(read.namespace).is_some_and(|record| {
@@ -76528,11 +76626,18 @@ fn check_source_plan(
         if read.same_file {
             continue;
         }
+        let PlannedAmbientNamespaceReadTarget::Member {
+            symbol: member,
+            declaration: member_declaration,
+        } = read.target
+        else {
+            continue;
+        };
         let callable = plan_source_callable(
             store,
             host,
-            read.member_declaration,
-            read.member,
+            member_declaration,
+            member,
             Some(CanonicalArrayTargets::from_global_types(global_types)),
         )
         .map_err(SourcePlanner::callable_plan_error)?;
@@ -76554,7 +76659,7 @@ fn check_source_plan(
             session,
             &mut type_import_preflight_diagnostics,
         )?
-        .preflight_type_of_source_callable(read.member_declaration, read.member)?;
+        .preflight_type_of_source_callable(member_declaration, member)?;
     }
     debug_assert!(type_import_preflight_diagnostics.is_empty());
 
@@ -76808,7 +76913,7 @@ fn check_source_plan(
             options,
             session,
             diagnostics,
-            *read,
+            read,
             previous,
         )?;
         preflight_source_expression_cache(store, read.node, namespace_type)?;
@@ -78077,7 +78182,7 @@ fn check_source_plan(
                         options,
                         session,
                         diagnostics,
-                        *read,
+                        read,
                         previous,
                     )?;
                     preflight_source_expression_cache(store, read.node, namespace_type)?;
