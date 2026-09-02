@@ -34,7 +34,7 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerOptions, CanonicalCheckerRelatedInformation,
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, EffectsSignatureState,
-    RelationUnavailable, SignatureId, SymbolNodeLinks, TypeId, TypeNodeLinks,
+    RelationUnavailable, SignatureId, SymbolNodeLinks, TypeId, TypeNodeLinks, TypePredicateId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
@@ -47,9 +47,13 @@ use super::{
         LogicalBinaryError, TruthinessAssumption, base_type_of_literal_type, narrow_by_truthiness,
         narrow_by_truthiness_with_session,
     },
+    relation::RelationKind,
     signatures::TypePredicateKind,
     source::CheckedClassPropertyAssignment,
-    source_calls::{CheckedSourceCall, SourceCallPlan, plan_direct_source_call_syntax},
+    source_calls::{
+        CheckedSourceCall, SourceCallPlan, plan_direct_source_call_syntax,
+        resolve_source_call_effects_signature,
+    },
     source_properties::{
         ClassAccessContext, ClassPropertyTruthinessSource, OwnClassPropertyWritePlan,
         SourceClassPropertyWritePlan, SourcePropertyError, class_destructuring_write_assignment,
@@ -724,6 +728,15 @@ pub(super) struct SourceClassPropertyEqualityCondition {
     pub(super) comparison: SourceTypeofComparison,
 }
 
+/// A predicate call and the exact current-class field passed to it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassPropertyPredicateCondition {
+    pub(super) expression: NodeRef,
+    pub(super) call: NodeRef,
+    pub(super) access: NodeRef,
+    pub(super) negated: bool,
+}
+
 /// One JavaScript `typeof` result admitted by the bounded source-flow slice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceTypeofTag {
@@ -782,6 +795,7 @@ pub(super) enum SourceFlowCondition {
     Truthiness(SourceTruthinessCondition),
     ClassPropertyTruthiness(SourceClassPropertyTruthinessCondition),
     ClassPropertyEquality(SourceClassPropertyEqualityCondition),
+    ClassPropertyPredicate(SourceClassPropertyPredicateCondition),
     Typeof(SourceTypeofCondition),
     Equality(SourceEqualityCondition),
     In(SourceInCondition),
@@ -796,6 +810,7 @@ impl SourceFlowCondition {
             Self::Truthiness(condition) => condition.expression,
             Self::ClassPropertyTruthiness(condition) => condition.expression,
             Self::ClassPropertyEquality(condition) => condition.expression,
+            Self::ClassPropertyPredicate(condition) => condition.expression,
             Self::Typeof(condition) => condition.expression,
             Self::Equality(condition) => condition.expression,
             Self::In(condition) | Self::InstanceOf(condition) => condition.expression,
@@ -806,7 +821,8 @@ impl SourceFlowCondition {
         Some(match self {
             Self::Unchanged(_)
             | Self::ClassPropertyTruthiness(_)
-            | Self::ClassPropertyEquality(_) => return None,
+            | Self::ClassPropertyEquality(_)
+            | Self::ClassPropertyPredicate(_) => return None,
             Self::Nullish(condition) => return condition.symbol,
             Self::Truthiness(condition) => condition.symbol,
             Self::Typeof(condition) => condition.symbol,
@@ -819,6 +835,7 @@ impl SourceFlowCondition {
         match self {
             Self::ClassPropertyTruthiness(condition) => Some(condition.access),
             Self::ClassPropertyEquality(condition) => Some(condition.access),
+            Self::ClassPropertyPredicate(condition) => Some(condition.access),
             _ => None,
         }
     }
@@ -2052,6 +2069,28 @@ impl ClassPropertyFlowTypes<'_> {
             SourceEqualityNarrowingError::Union(error) => SourceFlowError::Join { flow, error },
             error => SourceFlowInvariant::EqualityNarrowing(error).into(),
         })
+    }
+
+    fn narrow_predicate(
+        &mut self,
+        flow: FlowRef,
+        flags: FlowFlags,
+        condition: NodeRef,
+        current: TypeId,
+        predicate: TypeId,
+        assume_true: bool,
+    ) -> Result<TypeId, SourceFlowError> {
+        let Self::Read {
+            store,
+            globals: Some(globals),
+            session: Some(session),
+        } = self
+        else {
+            return Err(SourceFlowUnsupported::FlowKind { flow, flags }.into());
+        };
+        narrow_class_property_predicate_type(
+            store, globals, session, flow, condition, current, predicate, assume_true,
+        )
     }
 
     fn join(
@@ -4537,6 +4576,7 @@ pub(super) struct ClassInitializationFrame<'plan, 'graph> {
     completed_calls: HashSet<NodeRef>,
     property_assignments: HashMap<NodeRef, CheckedClassPropertyAssignment>,
     property_conditions: HashMap<NodeRef, CompletedClassPropertyCondition>,
+    predicate_conditions: HashMap<NodeRef, CompletedClassPropertyPredicate>,
     ordinary_calls: HashMap<NodeRef, CompletedClassOrdinaryCall>,
 }
 
@@ -4549,6 +4589,24 @@ struct CompletedClassPropertyCondition {
     flow: FlowRef,
     edges: [FlowRef; 2],
     type_: TypeId,
+}
+
+struct CompletedClassPropertyPredicate {
+    condition: SourceClassPropertyPredicateCondition,
+    source: ClassPropertyTruthinessSource,
+    member: ClassMemberSource,
+    access: ClassBodyAccessToken,
+    flow: FlowRef,
+    edges: [FlowRef; 2],
+    argument_type: TypeId,
+    callee: NodeRef,
+    callee_type: TypeId,
+    callee_symbol: SymbolNodeLinks,
+    signature: SignatureId,
+    predicate: TypePredicateId,
+    predicate_type: TypeId,
+    return_type: TypeId,
+    arrays: CanonicalArrayTargets,
 }
 
 struct CompletedClassOrdinaryCall {
@@ -4605,6 +4663,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
             completed_calls: HashSet::new(),
             property_assignments: HashMap::new(),
             property_conditions: HashMap::new(),
+            predicate_conditions: HashMap::new(),
             ordinary_calls: HashMap::new(),
         })
     }
@@ -4626,6 +4685,13 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
             self.flow.plan.conditions.get(&expression),
             Some(SourceFlowCondition::ClassPropertyEquality(_))
         )
+    }
+
+    pub(super) fn is_predicate_condition_call(&self, call: NodeRef) -> bool {
+        self.flow.plan.conditions.values().any(|condition| {
+            matches!(condition, SourceFlowCondition::ClassPropertyPredicate(condition)
+                if condition.call == call)
+        })
     }
 
     /// Records the ordinary read after the source checker accepts its condition.
@@ -4785,6 +4851,240 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
             {
                 return Err(invalid().into());
             }
+        }
+        Ok(())
+    }
+
+    /// Retains the checked predicate and the field read for both condition edges.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn complete_predicate_condition(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        globals: &CanonicalGlobalTypes,
+        condition: SourceClassPropertyPredicateCondition,
+        plan: &SourceCallPlan,
+        raw: TypeId,
+        result: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        let invalid = || SourceFlowInvariant::InvalidCallEffect(condition.call);
+        if raw != result
+            || plan.node != condition.call
+            || plan.arguments.len() != 1
+            || plan.arguments[0].node != condition.access
+            || self
+                .predicate_conditions
+                .contains_key(&condition.expression)
+        {
+            return Err(invalid().into());
+        }
+        let (source, edges) = validate_class_property_predicate_condition(
+            store,
+            host,
+            self.flow.bound,
+            self.body,
+            condition,
+        )?;
+        let member = class_member_source(store, host, source.member).map_err(|_| invalid())?;
+        let signature = store
+            .signature_links(condition.call)
+            .and_then(|links| links.resolved_signature.signature())
+            .ok_or_else(invalid)?;
+        let predicate = store
+            .signature(signature)
+            .and_then(super::signatures::Signature::resolved_type_predicate)
+            .ok_or(SourceFlowUnsupported::Call(condition.call))?;
+        let predicate_type = store
+            .type_predicate(predicate)
+            .and_then(super::signatures::TypePredicate::type_id)
+            .ok_or(SourceFlowUnsupported::Call(condition.call))?;
+        let callee_type = store
+            .type_node_links(plan.callee.node)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(invalid)?;
+        let effects = resolve_source_call_effects_signature(store, plan, Some(callee_type))
+            .map_err(|error| match error {
+                super::source::SourceCheckError::Unsupported(_) => {
+                    SourceFlowError::Unsupported(SourceFlowUnsupported::Call(condition.call))
+                }
+                _ => SourceFlowError::Invariant(invalid()),
+            })?;
+        if effects != EffectsSignatureState::Resolved(signature) {
+            return Err(invalid().into());
+        }
+        let completed = CompletedClassPropertyPredicate {
+            condition,
+            source,
+            member,
+            access: self.access.clone(),
+            flow: *self
+                .flow
+                .plan
+                .points
+                .get(&condition.access)
+                .ok_or_else(invalid)?,
+            edges,
+            argument_type: store
+                .type_node_links(condition.access)
+                .and_then(|links| links.resolved_type)
+                .ok_or_else(invalid)?,
+            callee: plan.callee.node,
+            callee_type,
+            callee_symbol: store
+                .symbol_node_links(plan.callee.node)
+                .cloned()
+                .ok_or_else(invalid)?,
+            signature,
+            predicate,
+            predicate_type,
+            return_type: result,
+            arrays: CanonicalArrayTargets::from_global_types(globals),
+        };
+        self.validate_predicate_condition(store, host, &completed)?;
+        self.predicate_conditions
+            .insert(condition.expression, completed);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)] // The call and field retain one shared source proof.
+    fn validate_predicate_condition(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        completed: &CompletedClassPropertyPredicate,
+    ) -> Result<(), SourceFlowError> {
+        let condition = completed.condition;
+        let invalid = || SourceFlowInvariant::InvalidCallEffect(condition.call);
+        let unsupported =
+            || SourceFlowError::Unsupported(SourceFlowUnsupported::Call(condition.call));
+        let identities = class_body_identities(store, host, &self.access).map_err(|_| invalid())?;
+        let receiver_symbol = store
+            .type_payload(identities.this_type)
+            .and_then(TypeRecord::symbol)
+            .ok_or_else(invalid)?;
+        let (source, edges) = validate_class_property_predicate_condition(
+            store,
+            host,
+            self.flow.bound,
+            self.body,
+            condition,
+        )?;
+        let (arena, _) = host.source(condition.call).ok_or_else(invalid)?;
+        let syntax =
+            plan_direct_source_call_syntax(arena, store, condition.call).map_err(|_| invalid())?;
+        let links = store.signature_links(condition.call).ok_or_else(invalid)?;
+        if completed.access != self.access
+            || self.flow.plan.conditions.get(&condition.expression)
+                != Some(&SourceFlowCondition::ClassPropertyPredicate(condition))
+            || source != completed.source
+            || edges != completed.edges
+            || class_member_source(store, host, source.member).map_err(|_| invalid())?
+                != completed.member
+            || completed.member.declaring_class != identities.class_symbol
+            || completed.member.declaration != source.declaration
+            || completed.member.side != ClassPropertySide::Instance
+            || !matches!(completed.member.origin, ClassMemberOrigin::Field { .. })
+            || self.flow.plan.points.get(&condition.access) != Some(&completed.flow)
+            || self.flow.bound.flow_at(condition.access) != Some(completed.flow)
+            || syntax.callee() != completed.callee
+            || syntax.arguments() != [condition.access]
+            || links.resolved_signature.signature() != Some(completed.signature)
+            || links.effects_signature != EffectsSignatureState::Resolved(completed.signature)
+            || store.type_node_links(condition.call)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(completed.return_type),
+                    ..TypeNodeLinks::default()
+                })
+            || store.type_node_links(completed.callee)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(completed.callee_type),
+                    ..TypeNodeLinks::default()
+                })
+            || store.symbol_node_links(completed.callee) != Some(&completed.callee_symbol)
+            || store.type_node_links(condition.access)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(completed.argument_type),
+                    ..TypeNodeLinks::default()
+                })
+            || store.symbol_node_links(condition.access)
+                != Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(completed.member.symbol),
+                })
+            || store.type_node_links(source.context.receiver())
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(identities.this_type),
+                    ..TypeNodeLinks::default()
+                })
+            || store.symbol_node_links(source.context.receiver())
+                != Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(receiver_symbol),
+                })
+        {
+            return Err(invalid().into());
+        }
+        let projection = match validate_stored_callable_set_with_array_targets(
+            store,
+            completed.callee_type,
+            Some(completed.arrays),
+        ) {
+            StoredCallableSetValidation::Valid { projection, .. } => projection,
+            StoredCallableSetValidation::Malformed { .. } => return Err(invalid().into()),
+            _ => return Err(unsupported()),
+        };
+        let [callable] = projection.call_signatures.as_ref() else {
+            return Err(unsupported());
+        };
+        let signature = store.signature(completed.signature).ok_or_else(invalid)?;
+        let predicate = store
+            .type_predicate(completed.predicate)
+            .ok_or_else(invalid)?;
+        let declaration = signature.declaration().ok_or_else(unsupported)?;
+        let declaration_record = class_flow_source_node(store, host, declaration)?;
+        let NodeData::FunctionDeclaration(function) = &declaration_record.data else {
+            return Err(unsupported());
+        };
+        let annotation = function
+            .type_
+            .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            .ok_or_else(unsupported)?;
+        let annotation_record = class_flow_source_node(store, host, annotation)?;
+        if !projection.construct_signatures.is_empty()
+            || !signature.type_parameters().is_empty()
+            || signature.parameters().len() != 1
+            || signature.this_parameter().is_some()
+            || signature.has_rest_parameter()
+            || signature.target().is_some()
+            || signature.mapper().is_some()
+            || signature.composite().is_some()
+            || predicate.kind() != TypePredicateKind::Identifier
+            || predicate.parameter_index() != 0
+            || annotation_record.kind != SyntaxKind::TypePredicate
+        {
+            return Err(unsupported());
+        }
+        if projection.owner != completed.callee_type
+            || callable.signature != completed.signature
+            || callable.return_type != Some(completed.return_type)
+            || signature.resolved_return_type() != Some(completed.return_type)
+            || signature.resolved_type_predicate() != Some(completed.predicate)
+            || predicate.type_id() != Some(completed.predicate_type)
+            || annotation_record.parent != Some(declaration.node)
+            || store
+                .signature_links(declaration)
+                .and_then(|links| links.resolved_signature.signature())
+                != Some(completed.signature)
+            || store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.boolean_type)
+                != Some(completed.return_type)
+        {
+            return Err(invalid().into());
+        }
+        for type_ in [completed.argument_type, completed.predicate_type] {
+            store
+                .validate_union_constituent_with_array_targets(completed.arrays, type_)
+                .map_err(|_| invalid())?;
+            class_predicate_scalar_leaves(store, condition.call, type_)?;
         }
         Ok(())
     }
@@ -5559,6 +5859,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                     SourceFlowCondition::Truthiness(_)
                         | SourceFlowCondition::ClassPropertyTruthiness(_)
                         | SourceFlowCondition::ClassPropertyEquality(_)
+                        | SourceFlowCondition::ClassPropertyPredicate(_)
                 ) {
                     return Err(SourceFlowUnsupported::FlowKind {
                         flow,
@@ -5574,7 +5875,9 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                     visiting,
                     depth + 1,
                 )?;
-                if let Some(access) = condition.class_property_access() {
+                if !matches!(condition, SourceFlowCondition::ClassPropertyPredicate(_))
+                    && let Some(access) = condition.class_property_access()
+                {
                     let completed = self
                         .property_conditions
                         .get(&expression)
@@ -5635,6 +5938,40 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                             }
                             _ => unreachable!("the condition has a class property access"),
                         });
+                    }
+                }
+                if let SourceFlowCondition::ClassPropertyPredicate(condition) = condition {
+                    let completed = self
+                        .predicate_conditions
+                        .get(&expression)
+                        .ok_or(SourceFlowInvariant::UnreachedCondition(expression))?;
+                    self.validate_predicate_condition(types.store(), host, completed)?;
+                    let edge = usize::from(kind == SourceFlowKind::FalseCondition);
+                    if completed.edges[edge] != flow {
+                        return Err(SourceFlowInvariant::InvalidCallEffect(condition.call).into());
+                    }
+                    let reference = ClassPropertyFlowReference {
+                        receiver: ClassPropertyFlowReceiver::This(
+                            completed.source.context.class_declaration(),
+                        ),
+                        name: completed.source.name().to_owned(),
+                    };
+                    if query.reference == &reference
+                        && query.member == &completed.member
+                        && let Some(current) = state.type_
+                    {
+                        if current != completed.argument_type {
+                            return Err(SourceFlowInvariant::InvalidClassProperty(condition.access)
+                                .into());
+                        }
+                        state.type_ = Some(types.narrow_predicate(
+                            flow,
+                            node.flags,
+                            condition.call,
+                            current,
+                            completed.predicate_type,
+                            (kind == SourceFlowKind::TrueCondition) != condition.negated,
+                        )?);
                     }
                 }
                 Ok(state)
@@ -6603,7 +6940,8 @@ impl SourceFlowFrame<'_, '_> {
                 let narrowed = match condition {
                     SourceFlowCondition::Unchanged(_)
                     | SourceFlowCondition::ClassPropertyTruthiness(_)
-                    | SourceFlowCondition::ClassPropertyEquality(_) => unreachable!(),
+                    | SourceFlowCondition::ClassPropertyEquality(_)
+                    | SourceFlowCondition::ClassPropertyPredicate(_) => unreachable!(),
                     SourceFlowCondition::Nullish(_) => {
                         let null = store
                             .intrinsic_bootstrap()
@@ -6914,6 +7252,111 @@ impl SourceFlowFrame<'_, '_> {
             .find(|candidate| union_constituents(store, *candidate) == Some(anonymous_types))
             .unwrap_or(anonymous)
     }
+}
+
+fn class_predicate_scalar_leaves(
+    store: &CanonicalTypeMapperStore,
+    call: NodeRef,
+    type_: TypeId,
+) -> Result<Vec<TypeId>, SourceFlowError> {
+    let mut leaves = Vec::new();
+    collect_source_equality_leaves(store, type_, &mut leaves, &mut HashSet::new())
+        .map_err(SourceFlowInvariant::EqualityNarrowing)?;
+    for &leaf in &leaves {
+        let flags = store
+            .type_payload(leaf)
+            .ok_or(SourceFlowInvariant::InvalidCallEffect(call))?
+            .flags();
+        if !flags.intersects(
+            TypeFlags::STRING
+                | TypeFlags::STRING_LITERAL
+                | TypeFlags::NUMBER
+                | TypeFlags::NUMBER_LITERAL
+                | TypeFlags::BOOLEAN
+                | TypeFlags::BOOLEAN_LITERAL
+                | TypeFlags::BIG_INT
+                | TypeFlags::BIG_INT_LITERAL
+                | TypeFlags::ES_SYMBOL
+                | TypeFlags::UNIQUE_ES_SYMBOL
+                | TypeFlags::NULLABLE
+                | TypeFlags::NEVER,
+        ) || flags.intersects(TypeFlags::ENUM | TypeFlags::ENUM_LITERAL) {
+            return Err(SourceFlowUnsupported::Call(call).into());
+        }
+    }
+    Ok(leaves)
+}
+
+/// Uses the predicate's canonical target, including the complement on a false edge.
+#[allow(clippy::too_many_arguments)]
+fn narrow_class_property_predicate_type(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    flow: FlowRef,
+    call: NodeRef,
+    current: TypeId,
+    predicate: TypeId,
+    assume_true: bool,
+) -> Result<TypeId, SourceFlowError> {
+    let current_leaves = class_predicate_scalar_leaves(store, call, current)?;
+    let predicate_leaves = class_predicate_scalar_leaves(store, call, predicate)?;
+    let mut positive = Vec::new();
+    for candidate in predicate_leaves {
+        for &leaf in &current_leaves {
+            for (source, target) in [(leaf, candidate), (candidate, leaf)] {
+                if store
+                    .is_type_related_to_with_session(
+                        source,
+                        target,
+                        RelationKind::Subtype,
+                        Some(globals),
+                        None,
+                        session,
+                    )
+                    .map_err(SourceFlowError::Relation)?
+                {
+                    positive.push(source);
+                    break;
+                }
+            }
+        }
+    }
+    let positive = store
+        .expression_union_type_with_global_types_and_session(
+            globals,
+            &positive,
+            UnionReduction::Subtype,
+            session,
+        )
+        .map_err(|error| SourceFlowError::Join { flow, error })?;
+    if assume_true {
+        return Ok(positive);
+    }
+    let mut negative = Vec::new();
+    for leaf in current_leaves {
+        if !store
+            .is_type_related_to_with_session(
+                leaf,
+                positive,
+                RelationKind::Subtype,
+                Some(globals),
+                None,
+                session,
+            )
+            .map_err(SourceFlowError::Relation)?
+        {
+            negative.push(leaf);
+        }
+    }
+    store
+        .expression_union_type_with_global_types_and_session(
+            globals,
+            &negative,
+            UnionReduction::Subtype,
+            session,
+        )
+        .map_err(|error| SourceFlowError::Join { flow, error })
 }
 
 fn narrow_source_assertion_type(
@@ -10699,6 +11142,9 @@ fn validate_class_property_flow_condition(
         SourceFlowCondition::ClassPropertyEquality(condition) => {
             validate_class_property_equality_condition(store, host, bound, body, condition)
         }
+        SourceFlowCondition::ClassPropertyPredicate(condition) => {
+            validate_class_property_predicate_condition(store, host, bound, body, condition)
+        }
         _ => Err(SourceFlowInvariant::InvalidClassProperty(condition.expression()).into()),
     }
 }
@@ -10919,6 +11365,119 @@ fn class_property_condition_edges(
         edge_flows[0].ok_or_else(invalid)?,
         edge_flows[1].ok_or_else(invalid)?,
     ])
+}
+
+#[allow(clippy::too_many_lines)] // The call and both binder edges share one source proof.
+fn validate_class_property_predicate_condition(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &BoundFile,
+    body: &ClassBodyPlan,
+    condition: SourceClassPropertyPredicateCondition,
+) -> Result<(ClassPropertyTruthinessSource, [FlowRef; 2]), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCallEffect(condition.call);
+    let (arena, binding) = host.source(condition.expression).ok_or_else(invalid)?;
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || binding.source_file() != bound.source_file()
+        || !condition.call.is_for(arena.id(), bound.file_id())
+        || !condition.access.is_for(arena.id(), bound.file_id())
+        || bound.container(condition.call) != Some(body.declaration)
+    {
+        return Err(invalid().into());
+    }
+    let root = class_flow_source_node(store, host, condition.expression)?;
+    let statement = NodeRef::new(
+        condition.expression.arena,
+        condition.expression.file,
+        root.parent.ok_or_else(invalid)?,
+    );
+    let statement_record = class_flow_source_node(store, host, statement)?;
+    if statement_record.flags.0 != 0
+        || !matches!(&statement_record.data, NodeData::IfStatement(branch)
+            if branch.expression == condition.expression.node && branch.facts == 0 && branch.flow_node.is_none())
+        || !source_node_is_descendant_of(arena, statement, body.body.node)
+    {
+        return Err(invalid().into());
+    }
+    let mut current = condition.expression;
+    let mut negated = false;
+    let mut visited = HashSet::new();
+    while current != condition.call {
+        if !visited.insert(current) {
+            return Err(invalid().into());
+        }
+        let record = class_flow_source_node(store, host, current)?;
+        if record.flags.0 != 0 {
+            return Err(invalid().into());
+        }
+        let child = match &record.data {
+            NodeData::ParenthesizedExpression(parenthesized)
+                if record.kind == SyntaxKind::ParenthesizedExpression =>
+            {
+                parenthesized.expression
+            }
+            NodeData::PrefixUnaryExpression(prefix)
+                if record.kind == SyntaxKind::PrefixUnaryExpression
+                    && prefix.operator == SyntaxKind::ExclamationToken =>
+            {
+                negated = !negated;
+                prefix.operand
+            }
+            _ => return Err(invalid().into()),
+        };
+        let child = NodeRef::new(current.arena, current.file, child);
+        if class_flow_source_node(store, host, child)?.parent != Some(current.node) {
+            return Err(invalid().into());
+        }
+        current = child;
+    }
+    if negated != condition.negated {
+        return Err(invalid().into());
+    }
+    let call_record = class_flow_source_node(store, host, condition.call)?;
+    let NodeData::CallExpression(call) = &call_record.data else {
+        return Err(invalid().into());
+    };
+    let syntax =
+        plan_direct_source_call_syntax(arena, store, condition.call).map_err(|_| invalid())?;
+    if call.type_arguments.is_some()
+        || syntax.arguments() != [condition.access]
+        || class_flow_source_node(store, host, syntax.callee())?.kind != SyntaxKind::Identifier
+    {
+        return Err(SourceFlowUnsupported::Call(condition.call).into());
+    }
+    let source = plan_class_property_truthiness(store, host, body, condition.access)
+        .map_err(|_| invalid())?;
+    let entry = bound.flow_at(condition.access).ok_or_else(invalid)?;
+    let mut edge_flows = [None, None];
+    for (index, row) in bound.flow_graph().nodes().iter().enumerate() {
+        if row.payload != Some(FlowNodePayload::Ast(condition.expression)) {
+            continue;
+        }
+        let flow = FlowRef::new(
+            arena.id(),
+            bound.file_id(),
+            FlowNodeId(u32::try_from(index).map_err(|_| invalid())?),
+        );
+        let edge = match source_flow_kind(flow, row.flags)? {
+            SourceFlowKind::TrueCondition => 0,
+            SourceFlowKind::FalseCondition => 1,
+            _ => return Err(invalid().into()),
+        };
+        if edge_flows[edge].replace(flow).is_some() || linear_antecedent(flow, row)? != entry {
+            return Err(invalid().into());
+        }
+    }
+    let [Some(true_edge), Some(false_edge)] = edge_flows else {
+        return Err(SourceFlowInvariant::MissingConditionEdge {
+            condition: condition.expression,
+            true_edge: edge_flows[0].is_some(),
+            false_edge: edge_flows[1].is_some(),
+        }
+        .into());
+    };
+    Ok((source, [true_edge, false_edge]))
 }
 
 fn validate_class_body_call(

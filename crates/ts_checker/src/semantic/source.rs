@@ -12275,6 +12275,34 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         .map_err(|error| class_body_flow_error(root, error))?;
                         SourceFlowCondition::ClassPropertyEquality(condition)
                     }
+                    PlannedExpressionKind::Call(call) => {
+                        let [argument] = call.arguments.as_slice() else {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Class(root),
+                            ));
+                        };
+                        let PlannedExpressionKind::Property(property) = &argument.kind else {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Class(root),
+                            ));
+                        };
+                        let (store, host) = self.semantic.ok_or(SourceCheckError::Class(root))?;
+                        super::source_properties::plan_class_property_truthiness(
+                            store,
+                            host,
+                            body,
+                            property.node,
+                        )
+                        .map_err(|error| Self::property_plan_error(property.node, error))?;
+                        SourceFlowCondition::ClassPropertyPredicate(
+                            super::source_flow::SourceClassPropertyPredicateCondition {
+                                expression: root,
+                                call: call.node,
+                                access: property.node,
+                                negated,
+                            },
+                        )
+                    }
                     _ => {
                         return Err(SourceCheckError::Unsupported(
                             UnsupportedSourceSyntax::Class(root),
@@ -41408,6 +41436,7 @@ fn check_expression_type_with_capture_context(
             };
             if let Some(context) = class_flow.as_deref_mut()
                 && context.flow.has_property_conditions()
+                && !context.flow.is_predicate_condition_call(call.node)
             {
                 context
                     .flow
@@ -43166,7 +43195,8 @@ fn check_class_statements(
                         snapshot.type_of(condition.symbol) == Some(checked.raw)
                     }
                     SourceFlowCondition::ClassPropertyTruthiness(_)
-                    | SourceFlowCondition::ClassPropertyEquality(_) => true,
+                    | SourceFlowCondition::ClassPropertyEquality(_)
+                    | SourceFlowCondition::ClassPropertyPredicate(_) => true,
                     _ => false,
                 };
                 if !snapshot_matches {
@@ -43218,6 +43248,24 @@ fn check_class_statements(
                             store,
                             host,
                             condition,
+                            checked.raw,
+                            checked.result,
+                        )
+                        .map_err(|error| class_body_flow_error(condition.expression, error))?;
+                }
+                if let SourceFlowCondition::ClassPropertyPredicate(condition) = branch.flow {
+                    let PlannedExpressionKind::Call(call) = &branch.condition.unparenthesized().kind
+                    else {
+                        return Err(SourceCheckError::Class(condition.call));
+                    };
+                    context
+                        .flow
+                        .complete_predicate_condition(
+                            store,
+                            host,
+                            global_types,
+                            condition,
+                            call,
                             checked.raw,
                             checked.result,
                         )
@@ -52872,7 +52920,22 @@ pub(super) fn source_call_effects_target_type(
             _ => return Ok(None),
         }
     };
-    if !source_effects_symbol_is_explicit(store, host, read.value_symbol, call.node)? {
+    let effects_symbol = if read.kind == PlannedIdentifierReadKind::Import {
+        // The ordinary import read keeps the alias as its value symbol.
+        let Some(target) = store
+            .alias_symbol_links(read.value_symbol)
+            .and_then(|links| links.alias_target.symbol())
+        else {
+            return Ok(None);
+        };
+        if !store.source_symbol_declarations_match(read.value_symbol) {
+            return Err(SourceCheckError::Import(call.callee.node));
+        }
+        target
+    } else {
+        read.value_symbol
+    };
+    if !source_effects_symbol_is_explicit(store, host, effects_symbol, call.node)? {
         return Ok(None);
     }
     let mut type_ = if let Some(type_) =
@@ -52884,7 +52947,7 @@ pub(super) fn source_call_effects_target_type(
         type_
     } else {
         let declaration = store
-            .symbol(read.value_symbol)
+            .symbol(effects_symbol)
             .and_then(ts_binder::semantic::Symbol::value_declaration)
             .ok_or(SourceCheckError::Call(call.node))?;
         match &host
