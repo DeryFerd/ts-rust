@@ -266,7 +266,14 @@ impl From<NakedTypeCandidateError> for GenericCallVectorError {
 
 impl From<InstantiationError> for GenericCallVectorError {
     fn from(error: InstantiationError) -> Self {
-        Self::Instantiation(error)
+        match error {
+            // The source call retries this exact signature through its normal
+            // return query, then validates the function and mapper again.
+            InstantiationError::UnresolvedSignatureReturn(signature) => {
+                Self::Relation(RelationUnavailable::UnresolvedSignatureReturn(signature))
+            }
+            error => Self::Instantiation(error),
+        }
     }
 }
 

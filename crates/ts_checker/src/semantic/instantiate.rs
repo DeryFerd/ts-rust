@@ -120,6 +120,7 @@ pub(super) enum InstantiationError {
     InvalidRecoveryType(TypeId),
     InvalidMapper(TypeMapperId),
     InvalidAlias(TypeAliasId),
+    UnresolvedSignatureReturn(SignatureId),
     DepthLimit { depth: usize, limit: usize },
     CountLimit { count: usize, limit: usize },
     UnsupportedType(TypeId),
@@ -155,6 +156,10 @@ impl std::fmt::Display for InstantiationError {
             Self::InvalidAlias(alias) => {
                 write!(formatter, "cannot instantiate with invalid alias {alias:?}")
             }
+            Self::UnresolvedSignatureReturn(signature) => write!(
+                formatter,
+                "signature {signature:?} needs its source return type before instantiation"
+            ),
             Self::DepthLimit { depth, limit } => write!(
                 formatter,
                 "type instantiation depth {depth} reached configured limit {limit}"
@@ -2183,13 +2188,14 @@ pub(super) fn function_instantiation_shape(
         this_type,
         parameters: parameters.to_vec(),
         return_type: signature_record.resolved_return_type().ok_or_else(|| {
+            let error = InstantiationError::UnresolvedSignatureReturn(*signature);
             observe_instantiation_failure(
                 store,
                 source,
                 "function_return_pending",
-                &InstantiationError::UnsupportedType(source),
+                &error,
             );
-            InstantiationError::UnsupportedType(source)
+            error
         })?,
     })
 }
