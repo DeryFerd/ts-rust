@@ -94,7 +94,7 @@ use super::{
     instantiated_members::{
         instantiated_function_member_signature_return,
         instantiated_interface_method_signature_return,
-        interface_method_signature_return_for_query,
+        interface_method_signature_return_for_query_with_source,
     },
     interface_heritage::{
         DirectInterfaceBaseKind, DirectInterfaceBasePlan, DirectInterfaceHeritagePlan,
@@ -41196,9 +41196,20 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .and_then(|callable| callable.return_type)
                 .ok_or_else(invalid_method);
         }
-        if let Some(method) =
-            interface_method_signature_return_for_query(self.store, signature, array_targets)
-                .map_err(|_| invalid_method())?
+        let method_source_context = if self.global_types.is_some() {
+            Some(self.source_query_context()?)
+        } else {
+            None
+        };
+        if let Some(method) = interface_method_signature_return_for_query_with_source(
+            self.store,
+            signature,
+            array_targets,
+            method_source_context
+                .as_ref()
+                .map(|source| (&source.globals, source as &dyn ConditionalBranchSource)),
+        )
+        .map_err(|_| invalid_method())?
         {
             self.reject_type_reference_alias_capabilities()?;
             let source_return = if preflight_node(self.store, self.host, method.declaration)?.kind
@@ -41329,6 +41340,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             (&source.globals, source as &dyn ConditionalBranchSource)
                         }),
                     )
+                    .inspect_err(|error| {
+                        if !self.store.relation_read_observation_is_active() {
+                            super::source::observe_call_failure_detail(
+                                "signature_return_preflight",
+                                format_args!(
+                                    "signature={signature:?} target={target:?} error={error:?}"
+                                ),
+                            );
+                        }
+                    })
                     .map_err(|_| {
                         type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
                             signature,
@@ -41345,7 +41366,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     ));
                 }
                 let result = (|| {
-                    self.get_return_type_of_signature(target)?;
+                    self.get_return_type_of_signature(target)
+                        .inspect_err(|error| {
+                            if !self.store.relation_read_observation_is_active() {
+                                super::source::observe_call_failure_detail(
+                                    "signature_return_target",
+                                    format_args!(
+                                        "signature={signature:?} target={target:?} error={error:?}"
+                                    ),
+                                );
+                            }
+                        })?;
                     if let Some(expected) = member_return {
                         let actual = instantiated_function_member_signature_return(
                             self.store,
@@ -41380,7 +41411,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             signature,
                             session,
                             &mut source,
-                        );
+                        )
+                        .inspect_err(|error| {
+                            if !self.store.relation_read_observation_is_active() {
+                                let cached_return = self.store.signature(signature)
+                                    .and_then(Signature::resolved_return_type);
+                                super::source::observe_call_failure_detail(
+                                    "signature_return_demand",
+                                    format_args!("signature={signature:?} target={target:?} cached_return={cached_return:?} error={error:?}"),
+                                );
+                            }
+                        });
                         self.global_this_members = source.context.members;
                         self.completed_source_conditionals = source.context.completed;
                         self.new_source_conditionals.extend(source.context.produced);

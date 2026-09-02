@@ -5010,6 +5010,16 @@ pub(super) fn interface_method_signature_return_for_query(
     signature: SignatureId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    interface_method_signature_return_for_query_with_source(store, signature, array_targets, None)
+}
+
+pub(super) fn interface_method_signature_return_for_query_with_source(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    let mut preflight = None;
     if store
         .published_interface_method_type_for_signature(signature)
         .is_none()
@@ -5026,16 +5036,36 @@ pub(super) fn interface_method_signature_return_for_query(
                 array_targets,
             )
             .is_some())
-        && super::generic_calls::preflight_generic_call_signature_return_target(
-            store,
-            array_targets,
-            signature,
-        )
-        .is_ok_and(|source| source == target)
     {
-        return Ok(None);
+        let result =
+            super::generic_calls::preflight_generic_call_signature_return_target_with_source(
+                store,
+                array_targets,
+                signature,
+                source,
+            );
+        let call_shell = result.as_ref().is_ok_and(|source| *source == target);
+        preflight = Some((target, result));
+        if call_shell {
+            return Ok(None);
+        }
     }
     instantiated_interface_method_signature_return(store, signature, array_targets)
+        .inspect_err(|error| {
+            if store.relation_read_observation_is_active() {
+                return;
+            }
+            let metadata = store.signature(signature).map(|record| {
+                (record.target(), record.mapper(), record.declaration())
+            });
+            super::source::observe_call_failure_detail(
+                "method_return_dispatch",
+                format_args!(
+                    "signature={signature:?} source_aware={} preflight={preflight:?} fallback_error={error:?} metadata={metadata:?} observation_active=false",
+                    source.is_some(),
+                ),
+            );
+        })
 }
 
 /// Reads a selected-method copy or an exact value already owned by a member proxy.
