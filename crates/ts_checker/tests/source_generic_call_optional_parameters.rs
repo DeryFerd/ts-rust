@@ -579,13 +579,26 @@ fn assert_copied_candidate(
     );
     assert_eq!(call.candidate.target, Some(original.id));
     let mapper = call.candidate.mapper.unwrap();
-    assert_eq!(store.map_type(mapper, outer), Some(argument));
-    for (fresh, source) in call.candidate.formals.iter().zip(&original.formals) {
+    // Check the composite mapper through the canonical query results.
+    assert_eq!(original.formals[0].constraint, Some(outer));
+    assert_eq!(call.candidate.formals[0].constraint, Some(argument));
+    for (index, (fresh, source)) in call
+        .candidate
+        .formals
+        .iter()
+        .zip(&original.formals)
+        .enumerate()
+    {
         assert_ne!(fresh.type_, source.type_);
         assert_eq!(fresh.symbol, source.symbol);
         assert_eq!(fresh.target, Some(source.type_));
         assert_eq!(fresh.mapper, Some(mapper));
-        assert_eq!(store.map_type(mapper, source.type_), Some(fresh.type_));
+        let parameter_type = call.candidate.parameters[index].1.resolved_type.unwrap();
+        if index == 0 {
+            assert_eq!(parameter_type, fresh.type_);
+        } else {
+            assert_optional(context, fresh.type_, parameter_type);
+        }
     }
 }
 
