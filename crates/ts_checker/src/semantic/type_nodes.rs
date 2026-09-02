@@ -23678,14 +23678,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 } else {
                     PlannedTypeReferenceArity::NotGeneric
                 }
-            } else if exact_import.is_some()
-                && flags != SymbolFlags::CLASS
-                && type_arguments.len() != local_count
-            {
-                PlannedTypeReferenceArity::InvalidGeneric {
-                    minimum: local_count,
-                    maximum: local_count,
-                }
             } else {
                 let target = match defaulted_union_target {
                     Some(target) => target,
