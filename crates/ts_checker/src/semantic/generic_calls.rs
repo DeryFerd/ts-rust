@@ -63,6 +63,7 @@ use super::{
     },
     instantiated_members::{
         generic_interface_call_signature_return, instantiated_interface_method_signature_return,
+        source_return_function_type_owner,
     },
     keyof_types::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
@@ -3261,7 +3262,7 @@ fn validate_generic_call_signature_shape_worker(
         }
         false
     } else if let Some(return_type) = return_type {
-        let contains_keyof = validate_generic_mapper_type_worker(
+        let needs_exact_cache = validate_generic_mapper_type_worker(
             store,
             return_type,
             &type_parameter_ids,
@@ -3269,7 +3270,7 @@ fn validate_generic_call_signature_shape_worker(
             callable.signature,
             &mut Vec::new(),
         )?;
-        contains_keyof
+        needs_exact_cache
             || matches!(
                 store
                     .type_payload(return_type)
@@ -4290,7 +4291,7 @@ fn validate_generic_mapper_type(
     .map(|_| ())
 }
 
-/// Reports symbolic keyof only along the mapper arguments this validator accepts.
+/// Reports mapper results that need their exact cache when the call is replayed.
 fn validate_generic_mapper_type_worker(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -4335,6 +4336,58 @@ fn validate_generic_mapper_type_worker(
     match record.data() {
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(false),
         TypeData::TypeParameter(_) if type_parameters.contains(&type_) => Ok(false),
+        TypeData::Object(_)
+            if source_return_function_type_owner(store, type_) == Some(signature) =>
+        {
+            if active_types.len() >= InstantiationLimits::default().max_depth
+                || active_types.contains(&type_)
+            {
+                return Err(RelationUnavailable::InvalidStructuredMembers(type_).into());
+            }
+            let StoredSingleCallableValidation::Valid { callable, .. } =
+                validate_stored_single_callable(store, type_)
+            else {
+                return Err(
+                    GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into(),
+                );
+            };
+            let callback = store.signature(callable.signature).ok_or(
+                GenericCallVectorInvariant::InvalidSignature(callable.signature),
+            )?;
+            if !callback.type_parameters().is_empty()
+                || callback.this_parameter().is_some()
+                || callback.has_rest_parameter()
+                || callback.resolved_type_predicate().is_some()
+            {
+                return Err(
+                    GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into(),
+                );
+            }
+            if callable.return_type.is_none() {
+                return Err(
+                    GenericCallVectorUnsupported::UnresolvedReturnType(callable.signature).into(),
+                );
+            }
+            active_types.push(type_);
+            let result = callable
+                .parameters
+                .iter()
+                .copied()
+                .chain(callable.return_type)
+                .try_for_each(|edge| {
+                    validate_generic_mapper_type_worker(
+                        store,
+                        edge,
+                        type_parameters,
+                        array_targets,
+                        signature,
+                        active_types,
+                    )
+                    .map(|_| ())
+                });
+            active_types.pop();
+            result.map(|()| true)
+        }
         TypeData::Index(_) => {
             let target = validate_generic_keyof_index_type(store, type_)
                 .map_err(|error| generic_mapper_index_error(signature, type_, error))?;
@@ -7011,6 +7064,18 @@ fn generic_call_type_instantiation_matches(
             template == actual
         }
         TypeData::Index(_) | TypeData::Mapped(_) => {
+            !active_templates.contains(&template)
+                && cached_instantiation_with_vector(
+                    store,
+                    template,
+                    sources,
+                    targets,
+                    array_targets,
+                    None,
+                )
+                .is_ok_and(|cached| cached == Some(actual))
+        }
+        TypeData::Object(_) if source_return_function_type_owner(store, template).is_some() => {
             !active_templates.contains(&template)
                 && cached_instantiation_with_vector(
                     store,

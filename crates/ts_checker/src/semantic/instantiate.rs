@@ -8,8 +8,9 @@
 //! authenticated selection-shaped mapped aliases, deferred intersections,
 //! template literals, intrinsic string mappings, ordinary property-object
 //! aliases, inline intersection objects,
-//! authenticated deferred conditionals, closed declaration-owned values, and
-//! unions with canonical alias arguments and union origins. Other object and
+//! authenticated deferred conditionals, closed declaration-owned values,
+//! function return annotations under a checked source-call mapper, and unions
+//! with canonical alias arguments and union origins. Other object and
 //! signature instantiation needs its owning caches and is rejected.
 
 use std::collections::{HashMap, HashSet};
@@ -34,9 +35,10 @@ use super::{
         cached_deferred_indexed_access_type, get_instantiated_indexed_access_type,
     },
     instantiated_members::{
-        GenericInterfaceMemberError, cached_generic_function_alias_instance,
-        closed_declared_function_type, instantiate_generic_function_alias,
-        instantiated_function_member_type_matches,
+        GenericInterfaceMemberError, cached_function_member_type,
+        cached_generic_function_alias_instance, closed_declared_function_type,
+        instantiate_function_member_type, instantiate_generic_function_alias,
+        instantiated_function_member_type_matches, source_return_function_type_owner,
     },
     intersection_types::{
         DeferredIntersectionTypeProjection, IntersectionTypeCacheKey, IntersectionTypeError,
@@ -70,7 +72,7 @@ use super::{
         validate_direct_generic_reference,
     },
     signatures::ElementFlags,
-    store::SourceNodeParent,
+    store::{CachedSignatureLookup, SourceNodeParent},
     template_types::TemplateTypeError,
     tuple_types::{CanonicalTupleTypeRequest, TupleShape, TupleTypeError},
     type_nodes::type_alias_instantiation_cache_key,
@@ -1845,6 +1847,7 @@ fn instantiate_type_with_alias_input_and_operand(
                     store.type_payload(type_).map(TypeRecord::data),
                     Some(TypeData::Conditional(_))
                 )
+                && source_return_function_type_owner(store, type_).is_none()
             {
                 return Ok(());
             }
@@ -3705,6 +3708,16 @@ fn cached_instantiated_type_with_operand_worker(
             if mapping_invariant_object_type(store, template, array_targets)? {
                 return Ok(Some(template));
             }
+            if source_return_function_type_owner(store, template).is_some() {
+                if alias_override.is_some() {
+                    return Err(InstantiationError::UnsupportedType(template));
+                }
+                let Some(mapper) = source_return_function_mapper(store, template, mapping)? else {
+                    return Ok(None);
+                };
+                return cached_function_member_type(store, template, mapper, array_targets)
+                    .map_err(|error| function_member_instantiation_error(template, error));
+            }
             let Some(projection) = source_property_object_projection(store, template)
                 .map_err(|_| InstantiationError::InvalidType(template))?
             else {
@@ -4663,9 +4676,66 @@ fn recovered_property_alias_argument(
     Ok(result == error_type && (recovered || inherited && source == result))
 }
 
+/// Uses the mapper already owned by the checked call, including vector cache reads.
+fn source_return_function_mapper(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    mapping: InstantiationMapping<'_>,
+) -> Result<Option<TypeMapperId>, InstantiationError> {
+    let invalid = || InstantiationError::InvalidType(source);
+    let owner = source_return_function_type_owner(store, source).ok_or_else(invalid)?;
+    let original = store.signature(owner).ok_or_else(invalid)?;
+    let sources = original.type_parameters();
+    let targets = match mapping {
+        InstantiationMapping::Stored(mapper) => sources
+            .iter()
+            .map(|source| store.map_type(mapper, *source).ok_or_else(invalid))
+            .collect::<Result<Vec<_>, _>>()?,
+        InstantiationMapping::Vector {
+            sources: input,
+            targets,
+        } if input == sources => targets.to_vec(),
+        InstantiationMapping::Vector { .. } => {
+            return Err(InstantiationError::UnsupportedType(source));
+        }
+    };
+    let signature = match store.cached_signature(owner, type_list_key(&targets), &targets) {
+        CachedSignatureLookup::Missing => return Ok(None),
+        CachedSignatureLookup::Hit(signature) => signature,
+        CachedSignatureLookup::Invalid | CachedSignatureLookup::HashCollision(_) => {
+            return Err(invalid());
+        }
+    };
+    let signature = store.signature(signature).ok_or_else(invalid)?;
+    let mapper = signature.mapper().ok_or_else(invalid)?;
+    if signature.target() != Some(owner)
+        || store.type_mapper_has_exact_endpoints(mapper, sources, &targets) != Some(true)
+        || matches!(mapping, InstantiationMapping::Stored(input) if input != mapper)
+    {
+        return Err(invalid());
+    }
+    Ok(Some(mapper))
+}
+
+fn function_member_instantiation_error(
+    source: TypeId,
+    error: GenericInterfaceMemberError,
+) -> InstantiationError {
+    match error {
+        GenericInterfaceMemberError::Capacity(_) => {
+            InstantiationError::Union(LiteralTypeCacheError::Capacity)
+        }
+        GenericInterfaceMemberError::UnsupportedPropertyType(_) => {
+            InstantiationError::UnsupportedType(source)
+        }
+        _ => InstantiationError::InvalidType(source),
+    }
+}
+
 enum InstantiationWork {
     FunctionAlias(GenericFunctionAliasProjection),
     TypeParameter,
+    FunctionType,
     Identity,
     TemplateLiteral {
         texts: Vec<String>,
@@ -4814,6 +4884,11 @@ fn instantiate_type_worker(
                     InstantiationWork::FunctionAlias(projection)
                 } else if mapping_invariant_object_type(store, type_, array_targets)? {
                     InstantiationWork::Identity
+                } else if source_return_function_type_owner(store, type_).is_some() {
+                    if alias.is_some() {
+                        return Err(InstantiationError::UnsupportedType(type_));
+                    }
+                    InstantiationWork::FunctionType
                 } else {
                     match source_property_object_projection(store, type_)
                         .map_err(|_| InstantiationError::InvalidType(type_))?
@@ -4916,6 +4991,12 @@ fn instantiate_type_worker(
         }
         InstantiationWork::TypeParameter => {
             apply_mapping_with_source(store, type_, mapping, array_targets, session, source)
+        }
+        InstantiationWork::FunctionType => {
+            let mapper = source_return_function_mapper(store, type_, mapping)?
+                .ok_or(InstantiationError::UnsupportedType(type_))?;
+            instantiate_function_member_type(store, type_, mapper, array_targets, session)
+                .map_err(|error| function_member_instantiation_error(type_, error))
         }
         InstantiationWork::Identity => Ok(type_),
         InstantiationWork::TemplateLiteral { texts, types } => instantiate_template_literal(

@@ -11,6 +11,7 @@
 //!
 //! Source property objects keep their type-literal target and exact parameter
 //! mapper. Their source annotations and instantiated property types stay lazy.
+//! Returned function annotations use their checked source call's mapper.
 
 use std::collections::{HashMap, HashSet};
 
@@ -73,7 +74,8 @@ use super::{
     signatures::{
         ElementFlags, IndexInfo, SignatureFlags, SignatureInstantiationError, TupleElementInfo,
     },
-    store::SourceNodeParent,
+    source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
+    store::{CachedSignatureLookup, SourceNodeParent},
     structured_members::{
         valid_index_symbol, valid_interface_method_value, valid_late_bound_unique_symbol_member,
     },
@@ -5509,6 +5511,10 @@ fn instantiate_generic_member_type_inner(
             });
     }
     if store.type_has_function_type_provenance(template) {
+        if source_return_function_type_owner(store, template).is_some() {
+            return instantiate_type_with_session(store, template, mapper, array_targets, session)
+                .map_err(|error| property_instantiation_error(template, &error));
+        }
         if closed_declared_function_type(store, template, array_targets).map_err(|error| {
             match error {
                 RelationUnavailable::UnsupportedStructuredType(_)
@@ -6145,6 +6151,7 @@ fn function_member_parameters(
         && function_member_declaring_property_alias(store, source).is_none()
         && !generic_function_alias_projection(store, source)
             .is_ok_and(|projection| projection.is_some_and(|alias| alias.target == source))
+        && source_return_function_type_owner(store, source).is_none()
     {
         return None;
     }
@@ -6162,6 +6169,179 @@ fn function_member_parameters(
         return None;
     }
     Some((record.symbol()?, *signature, parameter_types.to_vec()))
+}
+
+/// Finds the source signature whose return annotation contains this function type.
+#[allow(clippy::too_many_lines)] // Keep annotation ancestry and the source signature in one check.
+pub(super) fn source_return_function_type_owner(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+) -> Option<SignatureId> {
+    if !matches!(
+        validate_stored_function_type(store, source),
+        StoredFunctionTypeValidation::Valid(_)
+    ) {
+        return None;
+    }
+    let source_record = store.type_payload(source)?;
+    let [signature] = source_record.data().structured()?.signatures.as_deref()? else {
+        return None;
+    };
+    let signature = store.signature(*signature)?;
+    if !signature.type_parameters().is_empty()
+        || signature.this_parameter().is_some()
+        || signature.has_rest_parameter()
+        || signature.resolved_type_predicate().is_some()
+    {
+        return None;
+    }
+    let symbol = source_record.symbol()?;
+    let [declaration] = store.symbol(symbol)?.declarations()? else {
+        return None;
+    };
+    let mut root = *declaration;
+    let mut identity = root;
+    let mut type_ = source;
+    let mut active = HashSet::new();
+    loop {
+        if active.len() >= InstantiationLimits::default().max_depth || !active.insert(root) {
+            return None;
+        }
+        let SourceNodeParent::Parent(parent) = store.source_node_parent(root)? else {
+            return None;
+        };
+        if store.source_node_kind(parent) == Some(SyntaxKind::ParenthesizedType) {
+            if store.source_direct_children(parent)?.as_slice() != [root]
+                || !store.source_direct_type_annotation_is_exact(parent, type_)
+            {
+                return None;
+            }
+            root = parent;
+            continue;
+        }
+        let (owner, parameter) = if store.source_node_kind(parent) == Some(SyntaxKind::Parameter) {
+            if store.source_direct_type_annotation(parent) != Some(root)
+                || !store.source_direct_type_annotation_is_exact(root, type_)
+            {
+                return None;
+            }
+            let SourceNodeParent::Parent(owner) = store.source_node_parent(parent)? else {
+                return None;
+            };
+            (owner, Some(parent))
+        } else {
+            (parent, None)
+        };
+        let signature = store
+            .signature_links(owner)?
+            .resolved_signature
+            .signature()?;
+        let record = store.signature(signature)?;
+        if store.source_node_kind(owner) == Some(SyntaxKind::FunctionType) {
+            let containing = store.type_node_links(owner)?.resolved_type?;
+            if !matches!(
+                validate_stored_function_type(store, containing),
+                StoredFunctionTypeValidation::Valid(_)
+            ) || record.declaration() != Some(owner)
+                || !record.type_parameters().is_empty()
+                || record.this_parameter().is_some()
+                || record.has_rest_parameter()
+                || record.resolved_type_predicate().is_some()
+            {
+                return None;
+            }
+            if let Some(parameter) = parameter {
+                let symbol = store.source_declaration_symbol(parameter)?;
+                let index = record
+                    .parameters()
+                    .iter()
+                    .position(|entry| *entry == symbol)?;
+                let parameter_type = *store
+                    .callable_signature_parameter_types(signature)?
+                    .get(index)?;
+                if parameter_type != type_
+                    && (store
+                        .source_child_with_kind(parameter, SyntaxKind::QuestionToken)
+                        .is_none()
+                        || store
+                            .validate_optional_parameter_type_metadata(type_, parameter_type)
+                            .is_err())
+                {
+                    return None;
+                }
+            } else if store.function_signature_return_annotation(signature) != Some((identity, false))
+                || record.resolved_return_type() != Some(type_)
+            {
+                return None;
+            }
+            root = owner;
+            identity = owner;
+            type_ = containing;
+            continue;
+        }
+        if parameter.is_some()
+            || !matches!(
+                store.source_node_kind(owner),
+                Some(
+                    SyntaxKind::FunctionDeclaration
+                        | SyntaxKind::FunctionExpression
+                        | SyntaxKind::ArrowFunction
+                )
+            )
+            || record.type_parameters().is_empty()
+            || store.function_signature_return_annotation(signature) != Some((identity, false))
+            || record.resolved_return_type() != Some(type_)
+        {
+            return None;
+        }
+        let callable = store.source_callable_type_for_declaration(owner)?;
+        return (store.source_callable_type_for_signature(signature) == Some(callable)
+            && matches!(
+                validate_stored_source_callable(store, callable),
+                StoredSourceCallableValidation::Valid(_)
+            ))
+        .then_some(signature);
+    }
+}
+
+/// A returned function uses the exact mapper of a checked source call.
+fn source_return_function_type_mapper_owner(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    mapper: TypeMapperId,
+) -> Option<Option<CanonicalArrayTargets>> {
+    let owner = source_return_function_type_owner(store, source)?;
+    let original = store.signature(owner)?;
+    let sources = original.type_parameters();
+    let targets = sources
+        .iter()
+        .map(|source| store.map_type(mapper, *source))
+        .collect::<Option<Vec<_>>>()?;
+    if store.type_mapper_has_exact_endpoints(mapper, sources, &targets) != Some(true) {
+        return None;
+    }
+    let CachedSignatureLookup::Hit(signature) =
+        store.cached_signature(owner, type_list_key(&targets), &targets)
+    else {
+        return None;
+    };
+    let signature = store.signature(signature)?;
+    if signature.target() != Some(owner)
+        || signature.mapper() != Some(mapper)
+        || signature.declaration() != original.declaration()
+        || signature.flags() != original.flags() & SignatureFlags::PROPAGATING_FLAGS
+        || !signature.type_parameters().is_empty()
+        || signature.this_parameter().is_some()
+        || signature.resolved_type_predicate().is_some()
+        || signature.parameters().len() != original.parameters().len()
+        || signature.min_argument_count() != original.min_argument_count()
+        || signature.composite().is_some()
+        || signature.isolated_signature_type().is_some()
+    {
+        return None;
+    }
+    let callable = store.source_callable_type_for_signature(owner)?;
+    Some(store.source_callable_provenance(callable)?.array_targets)
 }
 
 /// The installed function-type mapping covers direct global Array method parameters.
@@ -6477,7 +6657,7 @@ pub(super) fn instantiate_generic_function_alias(
 
 /// Copies a function-valued member or direct alias through its authenticated mapper.
 #[allow(clippy::too_many_lines)] // Keep cache checks, caller mapping, and publication together.
-fn instantiate_function_member_type(
+pub(super) fn instantiate_function_member_type(
     store: &mut CanonicalTypeMapperStore,
     source: TypeId,
     mapper: TypeMapperId,
@@ -6509,30 +6689,11 @@ fn instantiate_function_member_type(
     if property_alias && instantiated_function_property_owner(store, source, mapper).is_none() {
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
     }
-    let mut cached = None;
-    for (type_, record) in store.types() {
-        let TypeData::Object(object) = record.data() else {
-            continue;
-        };
-        if object.target == Some(source)
-            && object.mapper == Some(mapper)
-            && (cached.replace(type_).is_some()
-                || property_alias
-                    && store
-                        .instantiated_property_alias_callable(type_)
-                        .is_none_or(|origin| origin.source != source || origin.mapper != mapper)
-                || !instantiated_function_member_type_matches(
-                    store,
-                    source,
-                    type_,
-                    mapper,
-                    array_targets,
-                ))
-        {
-            return Err(GenericInterfaceMemberError::InvalidCachedMembers(type_));
-        }
+    let source_return = source_return_function_type_owner(store, source).is_some();
+    if source_return && source_return_function_type_mapper_owner(store, source, mapper).is_none() {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
     }
-    if let Some(cached) = cached {
+    if let Some(cached) = cached_function_member_type(store, source, mapper, array_targets)? {
         return Ok(cached);
     }
     let origin =
@@ -6589,7 +6750,9 @@ fn instantiate_function_member_type(
         symbol,
         source,
     )?;
-    if function_alias.is_some() && session.limit_event_occurred_since(limit_mark) {
+    if (function_alias.is_some() || source_return)
+        && session.limit_event_occurred_since(limit_mark)
+    {
         return session
             .recovery_error_type()
             .ok_or(GenericInterfaceMemberError::Capacity(source));
@@ -6685,6 +6848,42 @@ fn instantiate_function_member_type(
     Ok(callable)
 }
 
+/// Reads the same exact function copy that the mapper would reuse.
+pub(super) fn cached_function_member_type(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, GenericInterfaceMemberError> {
+    function_member_signature(store, source)
+        .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(source))?;
+    let property_alias = function_member_declaring_property_alias(store, source).is_some();
+    let mut cached = None;
+    for (type_, record) in store.types() {
+        let TypeData::Object(object) = record.data() else {
+            continue;
+        };
+        if object.target == Some(source)
+            && object.mapper == Some(mapper)
+            && (cached.replace(type_).is_some()
+                || property_alias
+                    && store
+                        .instantiated_property_alias_callable(type_)
+                        .is_none_or(|origin| origin.source != source || origin.mapper != mapper)
+                || !instantiated_function_member_type_matches(
+                    store,
+                    source,
+                    type_,
+                    mapper,
+                    array_targets,
+                ))
+        {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(type_));
+        }
+    }
+    Ok(cached)
+}
+
 /// Validates copies under both their retained and current caller capabilities.
 pub(super) fn instantiated_function_member_type_matches(
     store: &CanonicalTypeMapperStore,
@@ -6774,6 +6973,9 @@ fn instantiated_function_member_projection(
     recovery: Option<InstantiatedFunctionRecovery<'_>>,
 ) -> Option<ValidatedSingleCallable> {
     let (symbol, template) = function_member_signature(store, source)?;
+    if source_return_function_type_owner(store, source).is_some() {
+        source_return_function_type_mapper_owner(store, source, mapper)?;
+    }
     if function_member_declaring_property_alias(store, source).is_some() {
         instantiated_function_property_owner(store, source, mapper)?;
         let origin = store.instantiated_property_alias_callable(actual)?;
@@ -7165,6 +7367,10 @@ pub(super) fn validate_instantiated_function_member_callable(
                     return None;
                 }
                 (origin.array_targets, None, None)
+            } else if let Some(targets) =
+                source_return_function_type_mapper_owner(store, source, mapper)
+            {
+                (targets, None, None)
             } else {
                 (
                     Some(instantiated_function_member_owner(store, source, mapper)?),

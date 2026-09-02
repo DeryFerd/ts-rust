@@ -76573,7 +76573,17 @@ fn check_source_plan(
                         == Some(anchor)
                 }
                 None => {
-                    source_direct_call_argument_arrow_is_exact(store, host, arrow.declaration)
+                    arrow
+                        .contextual_function_expression_target()
+                        .is_some_and(|target| {
+                            super::source_callables::stored_returned_arrow_context_is_exact(
+                                store,
+                                arrow.declaration,
+                                arrow.owner_symbol,
+                                target,
+                            )
+                        })
+                        || source_direct_call_argument_arrow_is_exact(store, host, arrow.declaration)
                         .map_err(SourcePlanner::callable_plan_error)?
                         || source_promise_constructor_argument_arrow_is_exact(
                             store,
