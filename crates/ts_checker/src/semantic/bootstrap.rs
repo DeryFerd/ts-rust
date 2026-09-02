@@ -4934,9 +4934,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .is_none_or(|base| base == expected_base)
     }
 
-    /// Authenticates a fresh method parameter against its source and receiver mapper.
+    /// Authenticates a fresh signature parameter against its source and receiver mapper.
     #[allow(clippy::too_many_lines)] // Source, receiver, and fresh mapper form one identity proof.
-    fn instantiated_interface_method_type_parameter_owner(
+    fn instantiated_interface_signature_type_parameter_owner(
         &self,
         type_: TypeId,
         record: &TypeRecord,
@@ -4950,18 +4950,39 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let [declaration] = symbol_record.declarations()? else {
             return None;
         };
-        let SourceNodeParent::Parent(method_declaration) = self.source_node_parent(*declaration)?
+        let SourceNodeParent::Parent(signature_declaration) = self.source_node_parent(*declaration)?
         else {
             return None;
         };
         let signature_id = self
-            .signature_links(method_declaration)?
+            .signature_links(signature_declaration)?
             .resolved_signature
             .signature()?;
         let signature = self.signature(signature_id)?;
-        let callable = self.interface_method_linked_type(signature_id)?;
-        let method = self.type_payload(callable)?.symbol()?;
-        let (_, owner_type) = self.authenticated_interface_method_owner(method)?;
+        let owner_type = match self.source_node_kind(signature_declaration)? {
+            SyntaxKind::MethodSignature => {
+                if !super::callable_sets::valid_declared_method_type_parameters(
+                    self,
+                    signature,
+                    signature_declaration,
+                ) {
+                    return None;
+                }
+                let callable = self.interface_method_linked_type(signature_id)?;
+                let method = self.type_payload(callable)?.symbol()?;
+                self.authenticated_interface_method_owner(method)?.1
+            }
+            SyntaxKind::CallSignature => {
+                let owner = self.source_interface_call_owner(signature_declaration)?;
+                object_members::declared_interface_call_type_parameter_view(
+                    self,
+                    signature,
+                    signature_declaration,
+                )?;
+                cached_interface_type(self, owner).ok()??
+            }
+            _ => return None,
+        };
         let TypeData::Interface(interface) = self.type_payload(owner_type)?.data() else {
             return None;
         };
@@ -4997,14 +5018,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             || source_record.symbol() != Some(symbol)
             || symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
             || self.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
-            || self.source_node_kind(method_declaration) != Some(SyntaxKind::MethodSignature)
-            || signature.declaration() != Some(method_declaration)
+            || signature.declaration() != Some(signature_declaration)
             || !signature.type_parameters().contains(&source)
-            || !super::callable_sets::valid_declared_method_type_parameters(
-                self,
-                signature,
-                method_declaration,
-            )
             || interface_parameters.is_empty()
             || receiver_reference.target != owner_type
             || receiver_reference.type_arguments.len() != interface_parameters.len()
@@ -5342,7 +5357,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
                 let Some(symbol) =
                     cached_ordinary_type_parameter_owner(self, type_).or_else(|| {
-                        self.instantiated_interface_method_type_parameter_owner(
+                        self.instantiated_interface_signature_type_parameter_owner(
                             type_, record, parameter,
                         )
                     })
