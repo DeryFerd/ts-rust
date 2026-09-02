@@ -6426,6 +6426,113 @@ fn generic_callback_parameter_tuple(
         .map_err(|error| generic_call_rest_tuple_error(callable.signature, error))
 }
 
+#[track_caller]
+#[allow(clippy::too_many_arguments)]
+fn observe_generic_inference_candidate_failure(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    target: TypeId,
+    type_parameters: &[TypeId],
+    signature: SignatureId,
+    contravariant: bool,
+    stage: &str,
+    error: &NakedTypeInferenceError,
+) {
+    let NakedTypeInferenceError::UnsupportedCandidate(candidate) = *error else {
+        return;
+    };
+    if store.relation_read_observation_is_active() {
+        return;
+    }
+    let record = store.type_payload(candidate);
+    let parameter = record.and_then(|record| match record.data() {
+        TypeData::TypeParameter(parameter) => Some((
+            parameter.target.map(TypeId::get),
+            parameter.mapper.map(TypeMapperId::get),
+            parameter.constraint.map(TypeId::get),
+            parameter.resolved_default_type.map(TypeId::get),
+            parameter.is_this_type,
+        )),
+        _ => None,
+    });
+    let tuple = store.canonical_tuple_shape(source).ok().flatten();
+    let tuple_element = tuple.as_ref().and_then(|tuple| {
+        tuple
+            .element_types()
+            .iter()
+            .position(|element| *element == candidate)
+            .map(|index| {
+                (
+                    index,
+                    tuple
+                        .element_infos()
+                        .get(index)
+                        .and_then(|info| info.labeled_declaration()),
+                )
+            })
+    });
+    super::source::observe_call_failure_detail(
+        "inference_candidate",
+        format_args!(
+            "stage={stage} line={} signature={} source={} target={} formal_index={:?} contravariant={contravariant} candidate={} kind={:?} parameter={parameter:?} source_tuple={:?} tuple_element={tuple_element:?}",
+            std::panic::Location::caller().line(),
+            signature.get(),
+            source.get(),
+            target.get(),
+            type_parameters
+                .iter()
+                .position(|parameter| *parameter == target),
+            candidate.get(),
+            record.map(|record| (
+                record.data().kind(),
+                record.flags().bits(),
+                record.object_flags().bits(),
+                record.symbol().map(SemanticSymbolId::get),
+            )),
+            tuple.as_ref().map(|tuple| (
+                tuple.target().get(),
+                tuple.element_types().len(),
+                tuple.combined_flags().bits(),
+            )),
+        ),
+    );
+    let declaration = |type_| {
+        store
+            .type_payload(type_)
+            .and_then(|record| record.symbol())
+            .and_then(|symbol| store.symbol(symbol))
+            .and_then(|symbol| symbol.declarations())
+            .and_then(|declarations| match declarations {
+                [declaration] => Some(*declaration),
+                _ => None,
+            })
+    };
+    let node_metadata = |node| {
+        (
+            node,
+            store.source_node_kind(node),
+            store.source_node_start(node),
+        )
+    };
+    let candidate_declaration = declaration(candidate);
+    let parent = candidate_declaration.and_then(|node| match store.source_node_parent(node) {
+        Some(SourceNodeParent::Parent(parent)) => Some(parent),
+        _ => None,
+    });
+    super::source::observe_call_failure_detail(
+        "inference_candidate_owner",
+        format_args!(
+            "signature={} candidate={} declaration={:?} parent={:?} target={} target_declaration={:?}",
+            signature.get(),
+            candidate.get(),
+            candidate_declaration.map(node_metadata),
+            parent.map(node_metadata),
+            target.get(),
+            declaration(target).map(node_metadata),
+        ),
+    );
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn collect_generic_call_inferences_pair(
     store: &mut CanonicalTypeMapperStore,
@@ -6460,7 +6567,19 @@ fn collect_generic_call_inferences_pair(
     }
     let result = (|| {
         if is_non_inferrable_inference_source(store, source, array_targets)
-            .map_err(|error| GenericCallVectorError::Inference(error.into()))?
+            .map_err(|error| {
+                observe_generic_inference_candidate_failure(
+                    store,
+                    source,
+                    target,
+                    type_parameters,
+                    signature,
+                    contravariant,
+                    "non_inferrable_source",
+                    &error,
+                );
+                GenericCallVectorError::Inference(error.into())
+            })?
         {
             return Ok(());
         }
@@ -6477,7 +6596,19 @@ fn collect_generic_call_inferences_pair(
                 }
                 (None, None) => validate_inference_leaf(store, source),
             }
-            .map_err(|error| GenericCallVectorError::Inference(error.into()))?;
+            .map_err(|error| {
+                observe_generic_inference_candidate_failure(
+                    store,
+                    source,
+                    target,
+                    type_parameters,
+                    signature,
+                    contravariant,
+                    "naked_target",
+                    &error,
+                );
+                GenericCallVectorError::Inference(error.into())
+            })?;
             let bucket = if contravariant {
                 &mut contravariant_buckets[index]
             } else {
@@ -6682,7 +6813,19 @@ fn collect_generic_call_inferences_pair(
                         }
                         (None, None) => validate_inference_leaf(store, source),
                     }
-                    .map_err(|error| GenericCallVectorError::Inference(error.into()))?;
+                    .map_err(|error| {
+                        observe_generic_inference_candidate_failure(
+                            store,
+                            source,
+                            target,
+                            type_parameters,
+                            signature,
+                            contravariant,
+                            "union_template",
+                            &error,
+                        );
+                        GenericCallVectorError::Inference(error.into())
+                    })?;
                     union.union.types.clone()
                 }
                 Some(_) => vec![source],
