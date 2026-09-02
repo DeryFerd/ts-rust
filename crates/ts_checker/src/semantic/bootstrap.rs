@@ -4440,7 +4440,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .and_then(|links| links.late_symbol)
             .unwrap_or(source);
         let record = self.symbol(member)?;
+        let late_property_name_type = if member != source
+            && record.flags().contains(SymbolFlags::PROPERTY)
+        {
+            Some(object_members::declared_late_property_name_type(
+                self, source, member,
+            )?)
+        } else {
+            None
+        };
         if member != source
+            && late_property_name_type.is_none()
             && (!record.flags().contains(SymbolFlags::METHOD)
                 || record.check_flags() != CheckFlags::LATE
                 || self.get_parent_of_symbol(member) != self.get_parent_of_symbol(source)
@@ -4481,10 +4491,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 // Keep the dependencies from the provider that proved this publication.
                 return Some(edges);
             }
-            if record.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::PROPERTY
+            let property_flags = SymbolFlags::PROPERTY
+                | if late_property_name_type.is_some() {
+                    SymbolFlags::TRANSIENT
+                } else {
+                    SymbolFlags::NONE
+                };
+            if record.flags().without(SymbolFlags::OPTIONAL) != property_flags
                 || self.value_symbol_links(member)
                     != Some(&ValueSymbolLinks {
                         resolved_type: Some(value),
+                        name_type: late_property_name_type,
                         ..ValueSymbolLinks::default()
                     })
             {
@@ -4503,7 +4520,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     return None;
                 }
             }
-            return Some(vec![value]);
+            let mut edges = vec![value];
+            edges.extend(late_property_name_type);
+            return Some(edges);
         }
         if member != source {
             return None;

@@ -3816,6 +3816,34 @@ fn late_interface_property_name_type(
     Some(name_type)
 }
 
+/// Reads a published computed property's key through its actual source declaration.
+pub(super) fn declared_late_property_name_type(
+    store: &CanonicalTypeMapperStore,
+    source: SemanticSymbolId,
+    member: SemanticSymbolId,
+) -> Option<TypeId> {
+    let [declaration] = store.symbol(source)?.declarations()? else {
+        return None;
+    };
+    if store.source_declaration_symbol(*declaration) != Some(source) {
+        return None;
+    }
+    let property = PlannedProperty {
+        declaration: *declaration,
+        symbol: member,
+        name_node: store.source_child_with_kind(*declaration, SyntaxKind::ComputedPropertyName)?,
+        type_node: store.source_direct_type_annotation(*declaration)?,
+        optional: store
+            .source_child_with_kind(*declaration, SyntaxKind::QuestionToken)
+            .is_some(),
+        readonly: store
+            .source_child_with_kind(*declaration, SyntaxKind::ReadonlyKeyword)
+            .is_some(),
+        name: store.symbol(member)?.name().to_owned(),
+    };
+    late_interface_property_name_type(store, &property)
+}
+
 pub(super) fn valid_declared_property_check_flags(
     store: &CanonicalTypeMapperStore,
     property: &PlannedProperty,
