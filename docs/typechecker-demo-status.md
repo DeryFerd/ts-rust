@@ -1,6 +1,6 @@
 # Typechecker demo status
 
-Updated 2026-09-01. No complete real-world project has passed in Rust yet.
+Updated 2026-09-02. No complete real-world project has passed in Rust yet.
 
 ## Current result
 
@@ -14,19 +14,19 @@ passing test regressed. The twelve new tests have four passes and eight
 failures. Both tuple-binding tests pass. Two of six counted-loop tests pass.
 All four computed-interface tests fail. The
 [independent result review](../target/wave202-pathe-demo-tests-10-result-review.md)
-is closed. The separate resource check is in progress.
+is closed. The separate resource check is also closed.
 
 Pathe is not demo-ready. Its latest project run attempted all nine original
 roots and completed none. Every root and the ordinary project attempt stopped
 with an unsupported operation. No internal checker error occurred in this run.
 The evidence reader passed and the independent result review is closed.
-The separate resource check remains open.
+The separate resource check is also closed.
 
 | Measurement | Result |
 | --- | --- |
 | [Combined tests 10](../target/wave202-pathe-demo-tests-10-result.md), `c9258a43` | All 496 ran. 419 pass, 77 fail. Eleven earlier failures fixed, no earlier pass lost. Main result review is closed. |
-| [Ordinary compiler build 10](../target/wave202-pathe-demo-bin-10-main-result.md), `c9258a43` | Build passed in 74.660 seconds. Main result review is closed. Separate resource closure is pending. A build is not a project pass. |
-| [Pathe census 9](../target/wave202-pathe-demo-census-9-result.md), `27b71eed` | Zero of nine roots complete. All nine and the ordinary attempt are unsupported. The oracle stage took 23.104 seconds. Evidence validation passed. Main result review is closed. Separate resource closure is pending. |
+| [Ordinary compiler build 10](../target/wave202-pathe-demo-bin-10-main-result.md), `c9258a43` | Build passed in 74.660 seconds. Main and separate resource reviews are closed. A build is not a project pass. |
+| [Pathe census 9](../target/wave202-pathe-demo-census-9-result.md), `27b71eed` | Zero of nine roots complete. All nine and the ordinary attempt are unsupported. The oracle stage took 23.104 seconds. Main and separate resource reviews are closed. |
 | [Previous combined tests 9](../target/wave202-pathe-demo-tests-9-result.md), `27b71eed` | 404 of 484 passed. Main and separate resource reviews are closed. This is the comparison set for Tests10. |
 
 The project run used the older compiler. It does not measure the eleven fixes
@@ -50,30 +50,39 @@ Keep the projects unchanged. Do not remove tests, replace dependencies, change
 compiler options or supply permissive stub types to produce a demo.
 
 The [offline candidate check](../target/wave202-offline-demo-readiness.md)
-found that cached tiny-invariant and Mitt also lack dependencies. Their
-original configs use options removed by the pinned Go compiler. Neither is
-a measured shortcut to a second demo.
+found missing dependencies in the cached tiny-invariant and Mitt checkouts.
+There is also a separate installed tiny-invariant project. Its
+[earlier Rust measurement](../target/wave202-tiny-invariant-rust-measurement-1-result.md)
+completed zero of five roots. Rust loaded 30 files versus 168 in its
+TypeScript 5.3.3 reference and reported a removed config option. No Go
+executable ran. This is a useful compatibility case, not a verified faster
+route to a complete demo. Neither Pathe nor UFO is a proved near-pass yet.
 
 ## Next work
 
 1. Check unchanged Pathe with `c9258a43`. Build and test results are available.
-   Finish their resource checks and the earlier census closure, then run the
-   [next project measurement](../target/wave202-pathe-demo-census-10-plan.md).
+   Their resource checks and the earlier census closure are complete. Prepare
+   and run the [next project measurement](../target/wave202-pathe-demo-census-10-plan.md).
    Keep all failures visible. A diagnostic run does not require pretending
    the 77 test failures passed.
 2. Run the closed `2f8ae108` repair batch with all 496 current tests and four
    new tests. This 500-test selection adds Array property preparation,
    Array-to-Iterable relations, loop expression preparation, generic method
-   parameters and parameterized function expressions. It has no test result yet.
+   parameters and parameterized function expressions. Its source capture and
+   independent capture review are closed. It has no test result yet.
 3. Combine the next eight reviewed changes without delaying those runs.
    They cover typed arrows, loop-local reads, property error recovery,
    function-expression locals, type-only namespace queries and callable
    intersection properties. Two changes add failure observations for import
-   aliases and constructor providers. The proposed selection retains all
-   500 tests and adds ten. This 510-test batch is a plan, not a measured result.
-4. Finish the separate nullable-argument diagnostic, nested logical-assignment
-   flow and public AST-helper corrections. Keep their tests and results
-   separate until the next combined batch. No pass is claimed from review alone.
+   aliases and constructor providers. The changes are now in one candidate
+   worktree under source review. Its planned selection retains all 500 tests
+   and adds ten. This 510-test batch has no measured result.
+4. The nullable-argument diagnostic, nested logical-assignment flow and public
+   AST-helper corrections now have reviewed source commits. Their next
+   integration plan retains all 510 tests and adds six. Four more repair
+   pairs work on computed-property writes, nullish diagnostic text, optional
+   top-level reads and the computed-member test setup. None has a new test
+   result yet. No pass is claimed from review alone.
 5. After dependency approval, measure unchanged UFO with the pinned Go and
    Rust compilers. Use its actual first failures to confirm or reject it as
    the second demo target.
