@@ -48,10 +48,9 @@ use super::{
     },
     conditional_types::ConditionalTypeError,
     constructor_values::{
-        GlobalConstructorValueKind, GlobalConstructorValuePlan, plan_global_constructor_value,
-        plan_global_generic_constructor_value, plan_global_named_constructor,
+        GlobalConstructorValuePlan, plan_global_constructor_value, plan_global_named_constructor,
         plan_source_generic_constructor_value, prepare_global_constructor_candidates,
-        resolve_global_constructor_candidates,
+        resolve_global_constructor_candidates, validate_global_plan,
     },
     declared::{execute_type_parameter, preflight_class_or_interface_reference},
     functions::plan_function_type,
@@ -7285,25 +7284,7 @@ fn resolve_library_new_candidates(
     {
         return Err(invalid());
     }
-    let current = match library.kind() {
-        GlobalConstructorValueKind::TypeLiteral => {
-            plan_global_constructor_value(store, host, globals, options, plan.resolved_symbol)
-        }
-        GlobalConstructorValueKind::NamedNongeneric => {
-            plan_global_named_constructor(store, host, globals, options, plan.resolved_symbol)
-        }
-        GlobalConstructorValueKind::NamedGeneric => {
-            plan_global_generic_constructor_value(store, host, globals, options, plan.resolved_symbol)
-        }
-        GlobalConstructorValueKind::SourceNamedGeneric => plan_source_generic_constructor_value(
-            store,
-            host,
-            globals,
-            options,
-            plan.resolved_symbol,
-        ),
-    }
-    .map_err(|error| {
+    validate_global_plan(store, host, globals, options, library).map_err(|error| {
         trace_constructor_failure(
             "provider_revalidate",
             plan.node,
@@ -7312,9 +7293,6 @@ fn resolve_library_new_candidates(
         );
         global_error::provider_error(plan.constructor, plan.resolved_symbol, error)
     })?;
-    if current.as_ref() != Some(library.as_ref()) {
-        return Err(invalid());
-    }
     let Some(ready) = resolve_global_constructor_candidates(store, host, globals, options, library)
         .map_err(|error| {
             trace_constructor_failure(

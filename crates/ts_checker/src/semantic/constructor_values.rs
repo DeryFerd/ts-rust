@@ -466,14 +466,15 @@ fn project_global_constructor_plan<'plan>(
     Ok(Cow::Owned(projected))
 }
 
-fn validate_global_plan(
+/// Compares retained source plans after checked computed-member publication.
+pub(super) fn validate_global_plan(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     globals: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
     plan: &GlobalConstructorValuePlan,
 ) -> Result<(), DeclaredConstructorValueError> {
-    let current = match plan.kind {
+    let current = match plan.kind() {
         GlobalConstructorValueKind::TypeLiteral => {
             plan_global_constructor_value(store, host, globals, options, plan.value_symbol())?
         }
