@@ -34707,7 +34707,7 @@ fn source_conditional_import_branch(
 
 /// This copy has no store or caller borrow. Callbacks use the supplied caller.
 #[derive(Clone)]
-struct SourceTypeQueryContext<'host, 'arena> {
+pub(super) struct SourceTypeQueryContext<'host, 'arena> {
     host: &'host DeclaredTypeHost<'arena>,
     globals: CanonicalGlobalTypes,
     options: CanonicalTypeQueryOptions,
@@ -34735,7 +34735,7 @@ struct SourceTypeQueryAdapter<'host, 'arena, 'diagnostics> {
 }
 
 impl<'host, 'arena> SourceTypeQueryContext<'host, 'arena> {
-    fn query<R>(
+    pub(super) fn query<R>(
         &mut self,
         store: &mut CanonicalTypeMapperStore,
         session: &mut InstantiationSession,
@@ -36175,6 +36175,27 @@ impl ConditionalBranchSource for SourceTypeQueryAdapter<'_, '_, '_> {
 
     fn source_query_options(&self) -> Option<CanonicalTypeQueryOptions> {
         Some(self.context.options)
+    }
+
+    fn resolve_source_property_object_member(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        receiver: TypeId,
+        member: SemanticSymbolId,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, super::conditional_types::ConditionalTypeError> {
+        let globals = self.context.globals.clone();
+        super::instantiated_members::demand_property_object_alias_property_with_source(
+            store,
+            self.context.host,
+            &globals,
+            self.context.options,
+            session,
+            self.diagnostics,
+            receiver,
+            member,
+            &mut self.context,
+        )
     }
 
     fn source_signature_return_query(&self) -> Option<&dyn SourceSignatureReturnQuery> {

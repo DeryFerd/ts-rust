@@ -196,6 +196,16 @@ pub(super) trait ConditionalBranchSource {
         None
     }
 
+    fn resolve_source_property_object_member(
+        &mut self,
+        _store: &mut CanonicalTypeMapperStore,
+        _receiver: TypeId,
+        _member: SemanticSymbolId,
+        _session: &mut InstantiationSession,
+    ) -> Result<TypeId, ConditionalTypeError> {
+        Err(ConditionalTypeError::Declared(missing_source_query()))
+    }
+
     fn prepare_global_this_members(
         &mut self,
         _store: &mut CanonicalTypeMapperStore,
@@ -1161,6 +1171,21 @@ impl ConditionalBranchSource for RecordingConditionalSource<'_> {
         self.source.source_query_options()
     }
 
+    fn resolve_source_property_object_member(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        receiver: TypeId,
+        member: SemanticSymbolId,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, ConditionalTypeError> {
+        self.validate_options()?;
+        let result = self
+            .source
+            .resolve_source_property_object_member(store, receiver, member, session)?;
+        self.validate_reads(store, session)?;
+        Ok(result)
+    }
+
     fn prepare_global_this_members(
         &mut self,
         store: &mut CanonicalTypeMapperStore,
@@ -1374,6 +1399,12 @@ impl std::error::Error for ConditionalTypeError {
 impl From<InstantiationError> for ConditionalTypeError {
     fn from(error: InstantiationError) -> Self {
         Self::Instantiation(error)
+    }
+}
+
+impl From<DeclaredTypeError> for ConditionalTypeError {
+    fn from(error: DeclaredTypeError) -> Self {
+        Self::Declared(error)
     }
 }
 
@@ -8473,6 +8504,20 @@ fn infer_from_structured_types(
     query: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<bool, ConditionalTypeError> {
     let mark = session.limit_event_mark();
+    if is_source_query(query) {
+        for endpoint in [source, target] {
+            if super::object_aliases::source_property_object_projection(store, endpoint)?.is_some()
+            {
+                super::instantiated_members::resolve_property_object_alias_members_with_array_targets(
+                    store,
+                    endpoint,
+                    context
+                        .global_types
+                        .map(CanonicalArrayTargets::from_global_types),
+                )?;
+            }
+        }
+    }
     let source_shape = structured_inference_shape(
         store,
         source,
@@ -8701,6 +8746,15 @@ fn inference_property_type(
     session: &mut InstantiationSession,
     query: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<Option<TypeId>, ConditionalTypeError> {
+    if is_source_query(query)
+        && super::object_aliases::source_property_object_projection(store, receiver)?.is_some()
+    {
+        return query
+            .as_deref_mut()
+            .ok_or_else(|| ConditionalTypeError::Declared(missing_source_query()))?
+            .resolve_source_property_object_member(store, receiver, member, session)
+            .map(Some);
+    }
     if !is_source_query(query) || !is_global_this_type_candidate(store, globals, receiver) {
         return Ok(store
             .value_symbol_links(member)

@@ -23,8 +23,8 @@ use ts_binder::{
 
 use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
-    CanonicalTypeMapperStore, DeclaredTypeHost, IndexInfoId, RelationUnavailable, SignatureId,
-    SourceCheckError, TypeId, TypeMapperId,
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, IndexInfoId, RelationUnavailable,
+    SignatureId, SourceCheckError, TypeId, TypeMapperId,
     array_types::{CanonicalArrayReference, CanonicalArrayTargets},
     callable_sets::{
         CallableSetProjection, StoredCallableSetValidation, instantiated_method_type_matches,
@@ -40,7 +40,7 @@ use super::{
         validate_class_heritage_members,
     },
     conditional_types::{
-        ConditionalBranchSource, ConditionalRemapProjection,
+        ConditionalBranchSource, ConditionalRemapProjection, ConditionalTypeError,
         conditional_signature_projection_with_array_targets, is_signature_conditional_source,
     },
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
@@ -80,7 +80,7 @@ use super::{
         valid_index_symbol, valid_interface_method_value, valid_late_bound_unique_symbol_member,
     },
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
-    type_nodes::CanonicalTypeQuery,
+    type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions, SourceTypeQueryContext},
     type_records::{
         ConstrainedTypeData, LiteralValue, ObjectTypeData, StructuredTypeData, TypeCacheState,
         TypeData, TypeDataKind, TypeParameterData,
@@ -2655,9 +2655,40 @@ pub(super) fn resolve_property_object_alias_members_with_array_targets(
     })
 }
 
+struct PropertyObjectAliasQuery<'query, 'host, 'arena> {
+    host: &'host DeclaredTypeHost<'arena>,
+    globals: &'query CanonicalGlobalTypes,
+    options: CanonicalTypeQueryOptions,
+    diagnostics: &'query mut CanonicalCheckerDiagnostics,
+    context: Option<&'query mut SourceTypeQueryContext<'host, 'arena>>,
+}
+
+impl<'host, 'arena> PropertyObjectAliasQuery<'_, 'host, 'arena> {
+    fn run<R>(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        session: &mut InstantiationSession,
+        operation: impl FnOnce(
+            &mut CanonicalTypeQuery<'_, 'host, 'arena, '_>,
+        ) -> Result<R, DeclaredTypeError>,
+    ) -> Result<R, DeclaredTypeError> {
+        if let Some(context) = self.context.as_deref_mut() {
+            return context.query(store, session, self.diagnostics, operation);
+        }
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            self.host,
+            self.globals,
+            self.options,
+            session,
+            self.diagnostics,
+        )?;
+        operation(&mut query)
+    }
+}
+
 /// Resolves one original annotation, then maps only that property's value.
 #[allow(clippy::too_many_arguments)] // The source owner supplies the query session and diagnostics.
-#[allow(clippy::too_many_lines)] // Keep cold resolution, caller-session mapping, and publication together.
 pub(super) fn demand_property_object_alias_property(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2668,7 +2699,61 @@ pub(super) fn demand_property_object_alias_property(
     receiver: TypeId,
     property: SemanticSymbolId,
 ) -> Result<TypeId, SourceCheckError> {
-    let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
+    demand_property_object_alias_property_worker(
+        store,
+        session,
+        receiver,
+        property,
+        &mut PropertyObjectAliasQuery {
+            host,
+            globals: global_types,
+            options: options.into(),
+            diagnostics,
+            context: None,
+        },
+    )
+}
+
+/// Retains the conditional caller's aliases, recovery state, and query guards.
+#[allow(clippy::too_many_arguments)] // The existing caller owns all query inputs.
+pub(super) fn demand_property_object_alias_property_with_source<'host, 'arena>(
+    store: &mut CanonicalTypeMapperStore,
+    host: &'host DeclaredTypeHost<'arena>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalTypeQueryOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    receiver: TypeId,
+    property: SemanticSymbolId,
+    context: &mut SourceTypeQueryContext<'host, 'arena>,
+) -> Result<TypeId, ConditionalTypeError> {
+    demand_property_object_alias_property_worker(
+        store,
+        session,
+        receiver,
+        property,
+        &mut PropertyObjectAliasQuery {
+            host,
+            globals,
+            options,
+            diagnostics,
+            context: Some(context),
+        },
+    )
+}
+
+#[allow(clippy::too_many_lines)] // Keep the existing proxy checks and publication order.
+fn demand_property_object_alias_property_worker<Error>(
+    store: &mut CanonicalTypeMapperStore,
+    session: &mut InstantiationSession,
+    receiver: TypeId,
+    property: SemanticSymbolId,
+    query: &mut PropertyObjectAliasQuery<'_, '_, '_>,
+) -> Result<TypeId, Error>
+where
+    Error: From<DeclaredTypeError> + From<RelationUnavailable>,
+{
+    let array_targets = Some(CanonicalArrayTargets::from_global_types(query.globals));
     let members =
         validate_property_object_alias_members_with_array_targets(store, receiver, array_targets)?
             .ok_or(RelationUnavailable::UnresolvedStructuredMembers(receiver))?;
@@ -2688,15 +2773,9 @@ pub(super) fn demand_property_object_alias_property(
         .value_symbol_links(property)
         .and_then(|links| links.resolved_type)
     {
-        CanonicalTypeQuery::new_with_global_types_and_session(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            diagnostics,
-        )?
-        .preflight_type_of_declared_value(source.symbol)?;
+        query.run(store, session, |query| {
+            query.preflight_type_of_declared_value(source.symbol)
+        })?;
         return Ok(type_);
     }
     if session.recovery_error_type().is_some_and(|error_type| {
@@ -2709,27 +2788,15 @@ pub(super) fn demand_property_object_alias_property(
     }
     let template = match selected_source_property_object_property(store, &projection, index)? {
         SelectedDeclaredProperty::Resolved(property) => {
-            CanonicalTypeQuery::new_with_global_types_and_session(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                diagnostics,
-            )?
-            .preflight_type_of_declared_value(source.symbol)?;
+            query.run(store, session, |query| {
+                query.preflight_type_of_declared_value(source.symbol)
+            })?;
             property.type_
         }
         SelectedDeclaredProperty::Unresolved(symbol) if symbol == source.symbol => {
-            CanonicalTypeQuery::new_with_global_types_and_session(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                diagnostics,
-            )?
-            .get_type_of_declared_value(source.symbol)?
+            query.run(store, session, |query| {
+                query.get_type_of_declared_value(source.symbol)
+            })?
         }
         _ => return Err(invalid().into()),
     };
@@ -2759,15 +2826,9 @@ pub(super) fn demand_property_object_alias_property(
                 .ok_or_else(invalid)?
                 .1
         };
-        CanonicalTypeQuery::new_with_global_types_and_session(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            diagnostics,
-        )?
-        .get_return_type_of_signature(signature)?;
+        query.run(store, session, |query| {
+            query.get_return_type_of_signature(signature)
+        })?;
     }
     let mapper = projection.mapper().ok_or_else(invalid)?;
     let limit_mark = session.limit_event_mark();
