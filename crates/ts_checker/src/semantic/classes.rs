@@ -11555,20 +11555,23 @@ fn plan_constructor_parameter_with_body_mode(
         None
     };
     if let Some(initializer) = initializer.filter(|_| !annotated && !source_annotation) {
-        if property_readonly.is_none() || decorator.is_some() {
+        if !source_body && property_readonly.is_none() || decorator.is_some() {
             return Err(reject());
         }
         let initializer_record = preflight_node(store, host, initializer)?;
+        // The source body checks ordinary defaults against the declared parameter type.
+        let ordinary_source_default = source_body && property_readonly.is_none();
         let (expected_kind, text) = match &initializer_record.data {
             NodeData::NumericLiteral(literal)
-                if type_record.kind == SyntaxKind::NumberKeyword
+                if (ordinary_source_default || type_record.kind == SyntaxKind::NumberKeyword)
                     && literal.token_flags.0 == 0
                     && !ts_jsnum::from_string(&literal.text).is_nan() =>
             {
                 (SyntaxKind::NumericLiteral, literal.text.as_str())
             }
             NodeData::StringLiteral(literal)
-                if type_record.kind == SyntaxKind::StringKeyword && literal.token_flags.0 == 0 =>
+                if (ordinary_source_default || type_record.kind == SyntaxKind::StringKeyword)
+                    && literal.token_flags.0 == 0 =>
             {
                 (SyntaxKind::StringLiteral, literal.text.as_str())
             }
