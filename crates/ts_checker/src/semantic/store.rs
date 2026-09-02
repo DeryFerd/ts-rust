@@ -981,6 +981,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
         HashMap<SemanticSymbolId, HashMap<CacheHashKey, UnionAliasInstantiationProof>>,
     claimed_strict_builtin_iterator_return: Option<bool>,
     claimed_strict_function_types: Option<bool>,
+    claimed_relation_function_types: Option<(TypeId, TypeId)>,
     pub(super) union_cache_needs_validation: bool,
     #[cfg(test)]
     pub(super) union_cache_validation_scans: usize,
@@ -1193,6 +1194,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             union_alias_instantiations: HashMap::new(),
             claimed_strict_builtin_iterator_return: None,
             claimed_strict_function_types: None,
+            claimed_relation_function_types: None,
             union_cache_needs_validation: false,
             #[cfg(test)]
             union_cache_validation_scans: 0,
@@ -1245,6 +1247,30 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// entries that their API did not explicitly admit.
     pub(super) const fn claimed_strict_function_types(&self) -> Option<bool> {
         self.claimed_strict_function_types
+    }
+
+    /// Retains the function globals used by structural property lookup.
+    /// Relation keys do not contain these checker-context identities.
+    pub(super) fn claim_relation_function_types(
+        &mut self,
+        requested: (TypeId, TypeId),
+    ) -> Result<(), (TypeId, TypeId)> {
+        match self.claimed_relation_function_types {
+            Some(established) if established != requested => Err(established),
+            Some(_) => Ok(()),
+            None => {
+                self.claimed_relation_function_types = Some(requested);
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn relation_function_types_match(
+        &self,
+        requested: Option<(TypeId, TypeId)>,
+    ) -> bool {
+        self.claimed_relation_function_types
+            .is_none_or(|established| requested == Some(established))
     }
 
     /// Registers a safe AST snapshot for semantic references.

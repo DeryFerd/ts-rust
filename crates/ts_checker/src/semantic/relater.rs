@@ -1491,6 +1491,8 @@ struct RelationBootstrapFacts {
 #[derive(Clone, Copy)]
 struct RelationGlobalTypes {
     array_targets: CanonicalArrayTargets,
+    function_type: TypeId,
+    callable_function_type: TypeId,
     string_wrapper: TypeId,
     number_wrapper: TypeId,
     boolean_wrapper: TypeId,
@@ -1500,10 +1502,16 @@ impl RelationGlobalTypes {
     const fn from_global_types(global_types: &CanonicalGlobalTypes) -> Self {
         Self {
             array_targets: CanonicalArrayTargets::from_global_types(global_types),
+            function_type: global_types.function_type,
+            callable_function_type: global_types.callable_function_type,
             string_wrapper: global_types.string_type,
             number_wrapper: global_types.number_type,
             boolean_wrapper: global_types.boolean_type,
         }
+    }
+
+    const fn function_types(self) -> (TypeId, TypeId) {
+        (self.function_type, self.callable_function_type)
     }
 
     fn contains_array_target(self, target: TypeId) -> bool {
@@ -2147,9 +2155,12 @@ impl<'store> RelaterSession<'store> {
     fn cache_get(&self, key: CacheHashKey) -> RelationComparisonResult {
         if self.strict_function_types.is_none()
             && self.store.claimed_strict_function_types().is_some()
+            || !self.store.relation_function_types_match(
+                self.global_types.map(RelationGlobalTypes::function_types),
+            )
         {
-            // A legacy session cannot prove whether a retained entry depended
-            // on function variance. It may reuse only writes from this query.
+            // Physical entries need the same variance and function globals.
+            // Local entries already have this query's inputs.
             self.pending
                 .latest
                 .get(&key)
@@ -7671,7 +7682,90 @@ impl<'store> RelaterSession<'store> {
                 }
             }
         }
+        if let Some(property) =
+            self.global_function_property(source, source_members, name.as_ref())?
+        {
+            return Ok(Some(property));
+        }
         self.global_object_property(name.as_ref())
+    }
+
+    /// Adds the selected global interface after the callable's own properties.
+    fn global_function_property(
+        &mut self,
+        source: TypeId,
+        source_members: &ResolvedObjectMembers,
+        name: EscapedNameRef<'_>,
+    ) -> Result<Option<SemanticSymbolId>, RelationUnavailable> {
+        if source != self.bootstrap.any_function_type && source_members.call_signatures.is_empty()
+        {
+            return Ok(None);
+        }
+        let globals = self
+            .global_types
+            .ok_or(RelationUnavailable::StructuredSignatures(source))?;
+        let function_type = if source == self.bootstrap.any_function_type {
+            globals.function_type
+        } else {
+            globals.callable_function_type
+        };
+        let bootstrap = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?;
+        let empty_object = bootstrap.empty_object_type;
+        let global_symbols = bootstrap.globals;
+        if function_type != empty_object {
+            let owner = self
+                .store
+                .type_payload(function_type)
+                .filter(|record| matches!(record.data(), TypeData::Interface(_)))
+                .and_then(TypeRecord::symbol)
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(function_type))?;
+            let name = if function_type == globals.function_type {
+                "Function"
+            } else {
+                "CallableFunction"
+            };
+            self.observe_symbol_table(global_symbols);
+            let global_symbol = self
+                .store
+                .symbol_table(global_symbols)
+                .ok_or(RelationUnavailable::MissingBootstrap)?
+                .get_source(name)
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(function_type))?;
+            if self.observe_merged_symbol_lookup(global_symbol) != Some(owner)
+                || !authenticated_nongeneric_global_interface_owner(self.store, owner)
+                || self
+                    .store
+                    .declared_type_links(owner)
+                    .and_then(|links| links.declared_type)
+                    != Some(function_type)
+            {
+                return Err(RelationUnavailable::InvalidStructuredMembers(function_type));
+            }
+        }
+        let resolved = self.resolved_object_members(function_type, false)?;
+        self.store
+            .claim_relation_function_types(globals.function_types())
+            .map_err(|_| RelationUnavailable::StructuredSignatures(source))?;
+        let Some(members) = resolved.members else {
+            return Ok(None);
+        };
+        self.observe_symbol_table(members);
+        let Some(property) = self
+            .store
+            .symbol_table(members)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(function_type))?
+            .get(name)
+        else {
+            return Ok(None);
+        };
+        if !resolved.properties.contains(&property) {
+            return Err(RelationUnavailable::InvalidStructuredMembers(function_type));
+        }
+        self.property_symbol(property, resolved.property_origin)?;
+        Ok(Some(property))
     }
 
     fn global_object_property(
@@ -12571,6 +12665,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             && !supported_broad_string_record_relation
             && !global_this_dependent
             && (strict_function_types.is_some() || self.claimed_strict_function_types().is_none())
+            && self.relation_function_types_match(
+                global_types.map(RelationGlobalTypes::function_types),
+            )
         {
             let key = self
                 .relation_key_if_available(
