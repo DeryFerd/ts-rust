@@ -2401,7 +2401,24 @@ impl TypeQueryPlan {
             .and_then(|links| links.resolved_type);
         let mut needs_node_cache = true;
         let expected = if let Some(reference) = self.references.get(&node) {
-            let cold_property_import = if let Some(import) = &reference.implementation_import {
+            let cold_property_import = if let Some(import) = &reference.interface_heritage_import {
+                if reference.implementation_import.is_some()
+                    || reference.property_import.is_some()
+                    || reference.alias_body_import.is_some()
+                    || reference.class_annotation_import.is_some()
+                {
+                    return Err(invalid());
+                }
+                !import
+                    .validate_alias_reference(
+                        store,
+                        node,
+                        reference.import_alias,
+                        reference.symbol,
+                        &reference.type_arguments,
+                    )
+                    .map_err(|error| property_type_import_error(node, error))?
+            } else if let Some(import) = &reference.implementation_import {
                 let alias = import
                     .steps
                     .first()
@@ -3551,6 +3568,17 @@ impl TypeQueryPlan {
         if let Some(import) = self
             .references
             .get(&node)
+            .and_then(|reference| reference.interface_heritage_import.as_ref())
+            && source_imports::plan_source_interface_alias_heritage_import(store, host, node)
+                .map_err(|error| property_type_import_error(node, error))?
+                .as_ref()
+                != Some(import)
+        {
+            return Err(invalid());
+        }
+        if let Some(import) = self
+            .references
+            .get(&node)
             .and_then(|reference| reference.implementation_import.as_ref())
             && plan_source_class_implementation_import(store, host, node)?.as_ref() != Some(import)
         {
@@ -3568,7 +3596,8 @@ impl TypeQueryPlan {
             return Err(invalid());
         }
         if self.references.get(&node).is_some_and(|reference| {
-            reference.implementation_import.is_some()
+            reference.interface_heritage_import.is_some()
+                || reference.implementation_import.is_some()
                 || self
                     .aliases
                     .get(&reference.symbol)
@@ -5712,6 +5741,7 @@ fn cached_ordinary_intersection_alias_request_matches(
 struct PlannedTypeReference {
     symbol: SemanticSymbolId,
     import_alias: Option<SemanticSymbolId>,
+    interface_heritage_import: Option<source_imports::SourceInterfaceHeritageImport>,
     implementation_import: Option<OrdinaryImportAliasChain>,
     property_import: Option<SourcePropertyTypeImportPlan>,
     alias_body_import: Option<SourceAliasBodyTypeImportPlan>,
@@ -6982,6 +7012,18 @@ impl SourceCallableTypeQueryEvidence {
                         .class_annotation_import
                         .as_ref()
                         .is_some_and(|class| class.validate_current(store) != Ok(true))
+                    || reference
+                        .interface_heritage_import
+                        .as_ref()
+                        .is_some_and(|import| {
+                            import.validate_alias_reference(
+                                store,
+                                import.reference(),
+                                reference.import_alias,
+                                reference.symbol,
+                                &reference.type_arguments,
+                            ) != Ok(true)
+                        })
             })
         {
             return false;
@@ -23581,6 +23623,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         } else {
             None
         };
+        let interface_heritage_import = if interface_alias_heritage.is_some() {
+            source_imports::plan_source_interface_alias_heritage_import(
+                self.store, self.host, node,
+            )
+            .map_err(|error| property_type_import_error(node, error))?
+        } else {
+            None
+        };
         if record_heritage
             && !array_heritage
             && !source_class_heritage
@@ -23683,7 +23733,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 TypeNodeUnavailable::ImportAliasCapabilityUnsupported(node),
             ));
         }
-        let cached_source_symbol = if !qualified
+        let cached_source_symbol = if let Some(import) = &interface_heritage_import {
+            Some(import.target_symbol())
+        } else if !qualified
             && exact_import.is_none()
             && property_import.is_none()
             && alias_body_import.is_none()
@@ -23801,7 +23853,28 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let possible_global_array_name = !qualified
             && self.array_targets.is_some()
             && matches!(name_text, "Array" | "ReadonlyArray");
-        let symbol = if let Some(import) = &implementation_import {
+        let symbol = if let Some(import) = &interface_heritage_import {
+            if exact_import.is_some()
+                || property_import.is_some()
+                || alias_body_import.is_some()
+                || class_annotation_import.is_some()
+                || implementation_import.is_some()
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+            import
+                .validate_alias_reference(
+                    self.store,
+                    node,
+                    Some(import.alias_symbol()),
+                    import.target_symbol(),
+                    &type_arguments,
+                )
+                .map_err(|error| property_type_import_error(node, error))?;
+            import.target_symbol()
+        } else if let Some(import) = &implementation_import {
             if exact_import.is_some()
                 || property_import.is_some()
                 || alias_body_import.is_some()
@@ -24147,6 +24220,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             if alias_body_import.is_some()
                 || class_annotation_import.is_some()
                 || implementation_import.is_some()
+                || interface_heritage_import.is_some()
             {
                 self.replay_cached_annotations = true;
                 self.checking_imported_arguments = true;
@@ -24631,7 +24705,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         .as_ref()
                         .and_then(|chain| chain.steps.first())
                         .map(|step| step.source.alias())
+                })
+                .or_else(|| {
+                    interface_heritage_import
+                        .as_ref()
+                        .map(|import| import.alias_symbol())
                 }),
+            interface_heritage_import,
             implementation_import,
             class_annotation_import,
             property_import,
@@ -33574,6 +33654,21 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         &self,
         node: NodeRef,
     ) -> Result<SemanticSymbolId, DeclaredTypeError> {
+        if let Some(import) = source_imports::plan_source_interface_alias_heritage_import(
+            self.store, self.host, node,
+        )
+        .map_err(|error| property_type_import_error(node, error))?
+        {
+            if self.plan.references.get(&node).is_some_and(|reference| {
+                reference.interface_heritage_import.as_ref() != Some(&import)
+                    || reference.symbol != import.target_symbol()
+            }) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+            return Ok(import.target_symbol());
+        }
         if self.source_class_heritage == Some(node)
             && let Some(import) =
                 plan_source_class_implementation_import(self.store, self.host, node)?
@@ -44551,6 +44646,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .any(|reference| {
                 reference.class_annotation_import.is_some()
                     || reference.implementation_import.is_some()
+                    || reference.interface_heritage_import.is_some()
             })
         {
             for node in &plan.nodes {
@@ -44583,6 +44679,31 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
         // Validate every declaration-owned route before publishing cold import links.
         for (&node, reference) in &plan.references {
+            if let Some(import) = &reference.interface_heritage_import {
+                let current = source_imports::plan_source_interface_alias_heritage_import(
+                    self.store, self.host, node,
+                )
+                .map_err(|error| property_type_import_error(node, error))?;
+                if current.as_ref() != Some(import)
+                    || reference.implementation_import.is_some()
+                    || reference.property_import.is_some()
+                    || reference.alias_body_import.is_some()
+                    || reference.class_annotation_import.is_some()
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(node),
+                    ));
+                }
+                import
+                    .validate_alias_reference(
+                        self.store,
+                        node,
+                        reference.import_alias,
+                        reference.symbol,
+                        &reference.type_arguments,
+                    )
+                    .map_err(|error| property_type_import_error(node, error))?;
+            }
             if let Some(import) = &reference.implementation_import {
                 if plan_source_class_implementation_import(self.store, self.host, node)?.as_ref()
                     != Some(import)
@@ -44650,6 +44771,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
         }
         for (&node, reference) in &plan.references {
+            if let Some(import) = &reference.interface_heritage_import {
+                source_imports::prepare_source_interface_alias_heritage_import(
+                    self.store, self.host, import,
+                )
+                .map_err(|error| property_type_import_error(node, error))?;
+            }
             if let Some(import) = &reference.implementation_import {
                 let alias = reference.import_alias.ok_or_else(|| {
                     type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
@@ -45476,6 +45603,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let reference = PlannedTypeReference {
                 symbol: base.symbol,
                 import_alias: None,
+                interface_heritage_import: None,
                 implementation_import: None,
                 property_import: None,
                 alias_body_import: None,

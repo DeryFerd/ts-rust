@@ -5905,9 +5905,14 @@ pub(super) struct SourceInterfaceHeritageImport {
     expected: ResolvedSourceTypeImportBinding,
     alias_chain: Option<OrdinaryImportAliasChain>,
     module: Option<SourceFileNamespacePlan>,
+    alias_request: Option<super::interface_heritage::SourceInterfaceAliasBaseRequest>,
 }
 
 impl SourceInterfaceHeritageImport {
+    pub(super) fn reference(&self) -> NodeRef {
+        self.reference
+    }
+
     pub(super) fn alias_symbol(&self) -> SemanticSymbolId {
         self.expected.binding.alias_symbol
     }
@@ -5942,7 +5947,18 @@ impl SourceInterfaceHeritageImport {
             &self.expected,
             self.alias_chain.as_ref(),
         )?;
-        if store
+        if let Some(request) = &self.alias_request {
+            if request.symbol() != self.target_symbol()
+                || request.reference() != Some(reference)
+                || super::interface_heritage::source_interface_alias_reference_request(
+                    store,
+                    self.target_symbol(),
+                    reference,
+                )? != *request
+            {
+                return Err(invariant(SourceImportInvariant::InvalidNode(reference)));
+            }
+        } else if store
             .symbol_node_links(reference)
             .is_some_and(|links| links.resolved_symbol.is_some())
             || store
@@ -5954,6 +5970,32 @@ impl SourceInterfaceHeritageImport {
             )));
         }
         Ok(())
+    }
+
+    /// The normal type query checks the alias result with its caller's array targets.
+    pub(super) fn validate_alias_reference(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        reference: NodeRef,
+        alias: Option<SemanticSymbolId>,
+        target: SemanticSymbolId,
+        arguments: &[NodeRef],
+    ) -> Result<bool, SourceImportError> {
+        if alias != Some(self.alias_symbol())
+            || target != self.target_symbol()
+            || self.alias_request.as_ref().is_none_or(|request| {
+                request.reference() != Some(reference) || request.arguments() != arguments
+            })
+        {
+            return Err(invariant(SourceImportInvariant::InvalidNode(reference)));
+        }
+        self.validate_current(store, reference)?;
+        validate_named_type_import_caches(
+            store,
+            reference,
+            &self.expected,
+            self.alias_chain.as_ref(),
+        )
     }
 }
 
@@ -6181,7 +6223,22 @@ pub(super) fn plan_source_interface_heritage_import(
         .is_some_and(|request| {
             store.source_node_kind(request.root()) == Some(SyntaxKind::TypeLiteral)
         });
+    let alias_request = if augmentation
+        && !plain_alias
+        && store
+            .symbol(expected.target_symbol)
+            .is_some_and(|record| record.flags() == SymbolFlags::TYPE_ALIAS)
+    {
+        Some(super::interface_heritage::source_interface_alias_reference_request(
+            store,
+            expected.target_symbol,
+            reference,
+        )?)
+    } else {
+        None
+    };
     if !plain_alias
+        && alias_request.is_none()
         && store
             .symbol(expected.target_symbol)
             .map(|symbol| symbol.flags())
@@ -6196,6 +6253,7 @@ pub(super) fn plan_source_interface_heritage_import(
         module_specifier: import.module_specifier,
         expected,
         alias_chain,
+        alias_request,
         module: if augmentation {
             let Some(CanonicalModuleResolutionLookup::Resolved(resolved)) = host
                 .module_resolutions()
@@ -6213,6 +6271,87 @@ pub(super) fn plan_source_interface_heritage_import(
     };
     plan.validate_current(store, reference)?;
     Ok(Some(plan))
+}
+
+/// Finds a named alias import through its real interface heritage owner.
+pub(super) fn plan_source_interface_alias_heritage_import(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    reference: NodeRef,
+) -> Result<Option<SourceInterfaceHeritageImport>, SourceImportError> {
+    if store.source_node_kind(reference) != Some(SyntaxKind::ExpressionWithTypeArguments) {
+        return Ok(None);
+    }
+    let invalid = || invariant(SourceImportInvariant::InvalidNode(reference));
+    let Some(SourceNodeParent::Parent(clause)) = store.source_node_parent(reference) else {
+        return Err(invalid());
+    };
+    let Some(SourceNodeParent::Parent(declaration)) = store.source_node_parent(clause) else {
+        return Err(invalid());
+    };
+    if store.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration) {
+        return Ok(None);
+    }
+    let expression = store
+        .source_direct_children(reference)
+        .and_then(|children| children.first().copied())
+        .ok_or_else(invalid)?;
+    if store.source_node_kind(expression) != Some(SyntaxKind::Identifier) {
+        return Ok(None);
+    }
+    let owner = host
+        .bound_file(declaration)
+        .and_then(|bound| bound.symbol(declaration))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    Ok(
+        plan_source_interface_heritage_import(store, host, declaration, owner, reference)?
+            .filter(|plan| plan.alias_request.is_some()),
+    )
+}
+
+/// Publishes only the alias links proved by the complete type-query plan.
+pub(super) fn prepare_source_interface_alias_heritage_import(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceInterfaceHeritageImport,
+) -> Result<(), SourceImportError> {
+    let reference = plan.reference();
+    let invalid = || invariant(SourceImportInvariant::InvalidNode(reference));
+    if plan_source_interface_alias_heritage_import(store, host, reference)?.as_ref() != Some(plan) {
+        return Err(invalid());
+    }
+    if !validate_named_type_import_caches(
+        store,
+        reference,
+        &plan.expected,
+        plan.alias_chain.as_ref(),
+    )? {
+        let manifest = host.module_resolutions().ok_or_else(invalid)?;
+        let mut aliases = host.alias_target_host(store, manifest).map_err(|error| {
+            source_property_import_module_error(plan.alias_symbol(), error.into())
+        })?;
+        let actual =
+            resolve_source_type_import_binding(store, &mut aliases, host, &plan.expected.binding)?;
+        if actual != plan.expected {
+            return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
+                plan.alias_symbol(),
+            )));
+        }
+    }
+    let request = plan.alias_request.as_ref().ok_or_else(invalid)?;
+    if !plan.validate_alias_reference(
+        store,
+        reference,
+        Some(plan.alias_symbol()),
+        plan.target_symbol(),
+        request.arguments(),
+    )? {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
+            plan.alias_symbol(),
+        )));
+    }
+    Ok(())
 }
 
 /// Reads a named type import's real target without publishing alias or type links.
