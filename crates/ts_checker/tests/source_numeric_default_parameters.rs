@@ -207,7 +207,7 @@ fn check_case(invalid: bool) {
                         2345,
                         argument,
                         argument + 5,
-                        vec!["\"bad\"".to_owned(), "number | undefined".to_owned()]
+                        vec!["string".to_owned(), "number".to_owned()]
                     ),
                 ]
             );
