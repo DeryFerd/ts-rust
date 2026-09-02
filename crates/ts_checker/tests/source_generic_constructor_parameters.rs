@@ -212,12 +212,10 @@ fn assert_optional_type(
     actual: TypeId,
     expected: &[TypeId],
 ) {
-    let elements = context
-        .store()
-        .type_payload(actual)
-        .unwrap()
-        .union_elements()
-        .expect("the optional parameter retains its canonical union");
+    let TypeData::Union(union) = context.store().type_payload(actual).unwrap().data() else {
+        panic!("the optional parameter retains its canonical union")
+    };
+    let elements = &union.union.types;
     assert_eq!(elements.len(), expected.len());
     for type_ in expected {
         assert!(elements.contains(type_), "missing canonical union member");
@@ -537,12 +535,10 @@ fn assert_native_set_signatures(context: &mut CanonicalCheckerContext<'_>) -> Ve
         let (signature, formal, parameter) = assert_formal(context, declaration, 0, None, default);
         signatures.push(signature);
         let type_ = parameter_type(context, parameter);
-        let elements = context
-            .store()
-            .type_payload(type_)
-            .unwrap()
-            .union_elements()
-            .unwrap();
+        let TypeData::Union(union) = context.store().type_payload(type_).unwrap().data() else {
+            panic!("the native parameter retains its canonical union")
+        };
+        let elements = &union.union.types;
         assert_eq!(elements.len(), 3);
         assert!(elements.contains(&undefined));
         assert!(elements.contains(&null));
