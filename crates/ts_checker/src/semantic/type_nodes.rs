@@ -8086,6 +8086,29 @@ pub(super) fn property_object_error(error: PropertyObjectError) -> DeclaredTypeE
     }
 }
 
+#[track_caller]
+fn observe_declared_cache_failure(
+    store: &CanonicalTypeMapperStore,
+    stage: &'static str,
+    node: Option<NodeRef>,
+    error: &DeclaredTypeError,
+) {
+    if let DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+        symbol,
+        declared_type,
+    }) = error
+    {
+        object_members::observe_declared_type_failure(
+            store,
+            stage,
+            *symbol,
+            Some(*declared_type),
+            node,
+            error,
+        );
+    }
+}
+
 fn indexed_access_error(error: ConcreteIndexedAccessError, root: NodeRef) -> DeclaredTypeError {
     match error {
         ConcreteIndexedAccessError::DeclaredType(error) => error,
@@ -24046,8 +24069,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
             }
         } else if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
-            let local_count =
-                preflight_class_or_interface_reference(self.store, self.host, symbol, flags)?;
+            let local_count = preflight_class_or_interface_reference(
+                self.store, self.host, symbol, flags,
+            )
+            .inspect_err(|error| {
+                observe_declared_cache_failure(
+                    self.store,
+                    "type_reference.declared_arity",
+                    Some(node),
+                    error,
+                );
+            })?;
             if local_count != 0 {
                 self.native_parameter_interface_values = false;
             }
@@ -31347,7 +31379,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 DeclaredTypeUnavailable::SymbolNotOwned(target_symbol),
             ))?;
         let local_type_parameter_count =
-            preflight_class_or_interface_reference(self.store, self.host, target_symbol, flags)?;
+            preflight_class_or_interface_reference(self.store, self.host, target_symbol, flags)
+                .inspect_err(|error| {
+                    observe_declared_cache_failure(
+                        self.store,
+                        "cached_reference.declared_arity",
+                        Some(reference),
+                        error,
+                    );
+                })?;
         let argument_nodes = self.type_reference_argument_nodes(reference)?;
         let is_error = self
             .store
@@ -44680,8 +44720,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 })?;
             return Ok(members.shells().instance_type());
         }
-        if let Some(declared_type) =
-            get_declared_class_interface_or_type_parameter(self.store, self.host, symbol, flags)?
+        if let Some(declared_type) = get_declared_class_interface_or_type_parameter(
+            self.store, self.host, symbol, flags,
+        )
+        .inspect_err(|error| {
+            observe_declared_cache_failure(self.store, "declared_type.identity", None, error);
+        })?
         {
             if flags.contains(SymbolFlags::INTERFACE) && !flags.contains(SymbolFlags::CLASS) {
                 if let Some(header) = plan.interface_headers.get(&symbol) {
@@ -45568,7 +45612,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         &base_types,
                     )
                 }
-                .map_err(property_object_error);
+                .map_err(|error| {
+                    object_members::observe_declared_type_failure(
+                        self.store,
+                        "interface.heritage_members",
+                        symbol,
+                        Some(declared_type),
+                        Some(interface.node),
+                        &error,
+                    );
+                    property_object_error(error)
+                });
             }
             let state = state.expect("a no-heritage interface has object-member state");
             let resolved = if state.is_resolved() {

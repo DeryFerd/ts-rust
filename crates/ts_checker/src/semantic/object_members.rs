@@ -7048,6 +7048,91 @@ fn invalid_cache(plan: &PropertyObjectPlan, type_: TypeId) -> PropertyObjectErro
     }
 }
 
+/// Records the failed operation without querying or changing its cached types.
+#[track_caller]
+pub(super) fn observe_declared_type_failure(
+    store: &CanonicalTypeMapperStore,
+    stage: &'static str,
+    symbol: SemanticSymbolId,
+    type_: Option<TypeId>,
+    checked_node: Option<NodeRef>,
+    error: &dyn std::fmt::Debug,
+) {
+    if store.relation_read_observation_is_active() {
+        return;
+    }
+    let caller = std::panic::Location::caller();
+    let owner = store.symbol(symbol);
+    let record = type_.and_then(|type_| store.type_payload(type_));
+    super::source::observe_call_failure_detail(
+        stage,
+        format_args!(
+            "guard={}:{} raw_error={error:?} checked_node={checked_node:?} node_metadata={:?}",
+            caller.file(),
+            caller.line(),
+            checked_node.map(|node| (
+                store.source_node_kind(node),
+                store.source_node_start(node),
+                store.source_node_parent(node),
+            )),
+        ),
+    );
+    let interface = record.and_then(|record| match record.data() {
+        TypeData::Interface(interface) => Some((
+            interface.base_types_resolved,
+            interface.declared_members_resolved,
+            interface.declared_members,
+            interface.reference.object.structured.members,
+            interface.reference.object.target,
+            interface.this_type,
+        )),
+        _ => None,
+    });
+    super::source::observe_call_failure_detail(
+        stage,
+        format_args!(
+            "guard={}:{} owner={symbol:?} name={:?} type={type_:?} owner_flags={:?} owner_checks={:?} declaration_count={:?} value_declaration={:?} declared_cache={:?} type_metadata={:?} interface_cache={interface:?}",
+            caller.file(),
+            caller.line(),
+            owner.and_then(|owner| owner.name().as_utf8()),
+            owner.map(|owner| owner.flags().bits()),
+            owner.map(|owner| owner.check_flags().bits()),
+            owner
+                .and_then(|owner| owner.declarations())
+                .map(|declarations| declarations.len()),
+            owner.and_then(|owner| owner.value_declaration()),
+            store
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type),
+            record.map(|record| (
+                record.data().kind(),
+                record.flags().bits(),
+                record.object_flags().bits(),
+                record.symbol(),
+            )),
+        ),
+    );
+}
+
+#[track_caller]
+fn observed_invalid_cache(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    type_: TypeId,
+    cause: &dyn std::fmt::Debug,
+) -> PropertyObjectError {
+    let error = invalid_cache(plan, type_);
+    observe_declared_type_failure(
+        store,
+        "declared_member_cache",
+        plan.symbol,
+        Some(type_),
+        Some(plan.node),
+        &(&error, cause),
+    );
+    error
+}
+
 pub(super) fn plan_object_literal(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -18725,7 +18810,8 @@ pub(super) fn interface_state(
     type_: TypeId,
 ) -> Result<PropertyObjectState, PropertyObjectError> {
     debug_assert_eq!(plan.kind, PropertyObjectKind::Interface);
-    validate_interface_record(store, plan, type_).ok_or_else(|| invalid_cache(plan, type_))
+    validate_interface_record(store, plan, type_)
+        .ok_or_else(|| observed_invalid_cache(store, plan, type_, &"interface_record"))
 }
 
 /// Read-only proof for the declared-own half of a direct heritage result.
@@ -18755,13 +18841,13 @@ pub(super) fn prepare_direct_interface_declared_properties(
             .iter()
             .any(|type_| store.type_payload(*type_).is_none())
     {
-        return Err(invalid_cache(plan, type_));
+        return Err(observed_invalid_cache(store, plan, type_, &"plan_shape"));
     }
     let Some(record) = store.type_payload(type_) else {
-        return Err(invalid_cache(plan, type_));
+        return Err(observed_invalid_cache(store, plan, type_, &"missing_type"));
     };
     let TypeData::Interface(interface) = record.data() else {
-        return Err(invalid_cache(plan, type_));
+        return Err(observed_invalid_cache(store, plan, type_, &"type_kind"));
     };
     let reference_identity = validate_nongeneric_interface_argument_origin(store, type_).is_ok();
     let identity_flags = ObjectFlags::INTERFACE
@@ -18786,7 +18872,7 @@ pub(super) fn prepare_direct_interface_declared_properties(
             .is_none_or(|links| links.declared_type != Some(type_))
         || !valid_thisless_interface_identity(interface) && !reference_identity
     {
-        return Err(invalid_cache(plan, type_));
+        return Err(observed_invalid_cache(store, plan, type_, &"identity"));
     }
     let unresolved_members = if reference_identity {
         interface.reference.object.structured == StructuredTypeData::default()
@@ -18827,7 +18913,18 @@ pub(super) fn prepare_direct_interface_declared_properties(
     {
         return Ok(DirectInterfaceDeclaredState::Resolved);
     }
-    Err(invalid_cache(plan, type_))
+    Err(observed_invalid_cache(
+        store,
+        plan,
+        type_,
+        &(
+            "member_state",
+            reference_identity,
+            object_flags.bits(),
+            unresolved_members,
+            exact_property_types,
+        ),
+    ))
 }
 
 /// Publishes a previously validated declared-own property result.
@@ -24254,11 +24351,13 @@ fn publish_interface_method_values_worker(
     }
     .ok_or_else(|| invalid_plan(plan))?;
     if resolved.len() != plan.methods.len() {
-        return Err(invalid_cache(plan, owner_type));
+        return Err(observed_invalid_cache(
+            store, plan, owner_type, &"method_count",
+        ));
     }
     let owner_record = store
         .type_payload(owner_type)
-        .ok_or_else(|| invalid_cache(plan, owner_type))?;
+        .ok_or_else(|| observed_invalid_cache(store, plan, owner_type, &"owner_payload"))?;
     let valid_owner = owner_record.symbol() == Some(plan.symbol)
         && match plan.kind {
             PropertyObjectKind::Interface => {
@@ -24272,13 +24371,13 @@ fn publish_interface_method_values_worker(
             PropertyObjectKind::ObjectLiteral => false,
         };
     if !valid_owner {
-        return Err(invalid_cache(plan, owner_type));
+        return Err(observed_invalid_cache(store, plan, owner_type, &"owner_kind"));
     }
 
     let placeholder = store
         .intrinsic_bootstrap()
         .map(|bootstrap| bootstrap.error_type)
-        .ok_or_else(|| invalid_cache(plan, owner_type))?;
+        .ok_or_else(|| observed_invalid_cache(store, plan, owner_type, &"bootstrap"))?;
     let mut published = Vec::new();
     let mut prepared = Vec::new();
     let mut method_groups = HashMap::new();
@@ -24324,10 +24423,22 @@ fn publish_interface_method_values_worker(
                     ) != Some(*parameter_type)
                 })
         {
-            return Err(invalid_cache(plan, owner_type));
+            return Err(observed_invalid_cache(
+                store,
+                plan,
+                owner_type,
+                &("method_annotations", method.declaration, method.symbol),
+            ));
         }
         let type_parameters = resolved_interface_method_type_parameters(store, method)
-            .ok_or_else(|| invalid_cache(plan, owner_type))?;
+            .ok_or_else(|| {
+                observed_invalid_cache(
+                    store,
+                    plan,
+                    owner_type,
+                    &("method_type_parameters", method.declaration),
+                )
+            })?;
         let this_parameter = method
             .this_parameter
             .map(|parameter| {
@@ -24337,7 +24448,14 @@ fn publish_interface_method_values_worker(
                     parameter.null_literal_identity,
                 )
                 .filter(|type_| method_parameter_value_type_matches(store, &parameter, *type_))
-                .ok_or_else(|| invalid_cache(plan, owner_type))?;
+                .ok_or_else(|| {
+                    observed_invalid_cache(
+                        store,
+                        plan,
+                        owner_type,
+                        &("this_parameter", parameter.identity_node, parameter.symbol),
+                    )
+                })?;
                 Ok::<_, PropertyObjectError>((parameter.symbol, type_))
             })
             .transpose()?;
@@ -24404,10 +24522,20 @@ fn publish_interface_method_values_worker(
     let mut missing_signature_links = 0usize;
     for group in &mut prepared {
         let Some(method_symbol) = store.symbol(group.symbol) else {
-            return Err(invalid_cache(plan, owner_type));
+            return Err(observed_invalid_cache(
+                store,
+                plan,
+                owner_type,
+                &("method_symbol", group.symbol),
+            ));
         };
         let Some(declarations) = method_symbol.declarations() else {
-            return Err(invalid_cache(plan, owner_type));
+            return Err(observed_invalid_cache(
+                store,
+                plan,
+                owner_type,
+                &("method_declarations", group.symbol),
+            ));
         };
         if declarations.len() != group.indexes.len()
             || declarations
@@ -24418,7 +24546,12 @@ fn publish_interface_method_values_worker(
                 property.symbol != group.symbol || property.declaration != declarations[0]
             })
         {
-            return Err(invalid_cache(plan, owner_type));
+            return Err(observed_invalid_cache(
+                store,
+                plan,
+                owner_type,
+                &("method_group", group.symbol),
+            ));
         }
 
         let value = store.value_symbol_links(group.symbol);
@@ -24427,24 +24560,45 @@ fn publish_interface_method_values_worker(
             group.symbol,
             value.and_then(|links| links.resolved_type),
         )
-        .ok_or_else(|| invalid_cache(plan, owner_type))?;
+        .ok_or_else(|| {
+            observed_invalid_cache(store, plan, owner_type, &("method_links", group.symbol))
+        })?;
         if value.is_some_and(|links| links != &expected) {
-            return Err(invalid_cache(plan, owner_type));
+            return Err(observed_invalid_cache(
+                store,
+                plan,
+                owner_type,
+                &("method_links_cache", group.symbol),
+            ));
         }
         group.name_type = expected.name_type;
         if value.is_some_and(|links| links.resolved_type.is_some()) {
             let Some(callable_type) = resolved_interface_method_value(store, plan, group.symbol)
             else {
-                return Err(invalid_cache(plan, owner_type));
+                return Err(observed_invalid_cache(
+                    store,
+                    plan,
+                    owner_type,
+                    &("warm_method_value", group.symbol),
+                ));
             };
             let callable = declared_method_value_types(store, group.symbol)
                 .map(|(callable, _)| callable)
-                .ok_or_else(|| invalid_cache(plan, owner_type))?;
+                .ok_or_else(|| {
+                    observed_invalid_cache(store, plan, owner_type, &("warm_callable", group.symbol))
+                })?;
             let signatures = store
                 .type_payload(callable)
                 .and_then(|record| record.data().structured())
                 .and_then(|structured| structured.signatures.as_deref())
-                .ok_or_else(|| invalid_cache(plan, owner_type))?;
+                .ok_or_else(|| {
+                    observed_invalid_cache(
+                        store,
+                        plan,
+                        owner_type,
+                        &("warm_signatures", group.symbol, callable),
+                    )
+                })?;
             for (index, signature) in group.indexes.iter().zip(signatures) {
                 let method = &plan.methods[*index];
                 let resolved_signature = &resolved[*index];
@@ -24465,7 +24619,12 @@ fn publish_interface_method_values_worker(
                                 })
                         })
                 {
-                    return Err(invalid_cache(plan, owner_type));
+                    return Err(observed_invalid_cache(
+                        store,
+                        plan,
+                        owner_type,
+                        &("warm_signature_annotations", method.declaration, signature),
+                    ));
                 }
                 published[*index] = callable_type;
             }
@@ -24497,7 +24656,12 @@ fn publish_interface_method_values_worker(
                         .is_some_and(|links| links != &ValueSymbolLinks::default())
                 })
             {
-                return Err(invalid_cache(plan, owner_type));
+                return Err(observed_invalid_cache(
+                    store,
+                    plan,
+                    owner_type,
+                    &("cold_method_links", method.declaration, method.symbol),
+                ));
             }
             missing_signature_links = missing_signature_links
                 .checked_add(usize::from(
@@ -24524,7 +24688,7 @@ fn publish_interface_method_values_worker(
                 bootstrap.undefined_or_missing_type,
             )
         })
-        .ok_or_else(|| invalid_cache(plan, owner_type))?;
+        .ok_or_else(|| observed_invalid_cache(store, plan, owner_type, &"optional_bootstrap"))?;
     if strict {
         let needed = prepared
             .iter()
@@ -24546,14 +24710,23 @@ fn publish_interface_method_values_worker(
         if needed != 0 {
             let (preparation, globals) = query_preparation
                 .as_ref()
-                .ok_or_else(|| invalid_cache(plan, owner_type))?;
+                .ok_or_else(|| {
+                    observed_invalid_cache(store, plan, owner_type, &"missing_union_preparation")
+                })?;
             preparation
                 .preflight_union_operations(
                     store,
                     globals.map(CanonicalArrayTargets::from_global_types),
                     needed,
                 )
-                .map_err(|_| invalid_cache(plan, owner_type))?;
+                .map_err(|error| {
+                    observed_invalid_cache(
+                        store,
+                        plan,
+                        owner_type,
+                        &("union_operations", error, needed, preparation),
+                    )
+                })?;
         }
         for group in prepared.iter().filter(|group| group.warm.is_none()) {
             for (index, bases) in group.indexes.iter().zip(&group.parameter_types) {
@@ -24561,10 +24734,30 @@ fn publish_interface_method_values_worker(
                     if parameter.optional {
                         let (preparation, globals) = query_preparation
                             .as_ref()
-                            .ok_or_else(|| invalid_cache(plan, owner_type))?;
+                            .ok_or_else(|| {
+                                observed_invalid_cache(
+                                    store,
+                                    plan,
+                                    owner_type,
+                                    &("parameter_preparation", parameter.identity_node),
+                                )
+                            })?;
                         store
                             .preflight_prepared_union_constituent(*base, preparation, *globals)
-                            .map_err(|_| invalid_cache(plan, owner_type))?;
+                            .map_err(|error| {
+                                observed_invalid_cache(
+                                    store,
+                                    plan,
+                                    owner_type,
+                                    &(
+                                        "union_constituent",
+                                        error,
+                                        parameter.identity_node,
+                                        base,
+                                        preparation,
+                                    ),
+                                )
+                            })?;
                     }
                 }
             }
@@ -24591,7 +24784,14 @@ fn publish_interface_method_values_worker(
                     if parameter.optional {
                         let (preparation, globals) = query_preparation
                             .as_mut()
-                            .ok_or_else(|| invalid_cache(plan, owner_type))?;
+                            .ok_or_else(|| {
+                                observed_invalid_cache(
+                                    store,
+                                    plan,
+                                    owner_type,
+                                    &("parameter_union_preparation", parameter.identity_node),
+                                )
+                            })?;
                         *type_ = match *globals {
                             Some(globals) => store.literal_union_type_prepared_with_global_types(
                                 globals,
@@ -24605,7 +24805,14 @@ fn publish_interface_method_values_worker(
                                 preparation,
                             ),
                         }
-                        .map_err(|_| invalid_cache(plan, owner_type))?;
+                        .map_err(|error| {
+                            observed_invalid_cache(
+                                store,
+                                plan,
+                                owner_type,
+                                &("parameter_union", error, parameter.identity_node, preparation),
+                            )
+                        })?;
                     }
                 }
             }
@@ -24684,7 +24891,9 @@ fn publish_interface_method_values_worker(
         let value = if strict && plan.methods[group.indexes[0]].optional {
             let (preparation, globals) = query_preparation
                 .as_mut()
-                .ok_or_else(|| invalid_cache(plan, owner_type))?;
+                .ok_or_else(|| {
+                    observed_invalid_cache(store, plan, owner_type, &"optional_method_preparation")
+                })?;
             let proof = PendingFunctionTypeProof::declared_method(
                 store,
                 callable_type,
@@ -24704,7 +24913,14 @@ fn publish_interface_method_values_worker(
             );
             preparation
                 .authorize_pending_function(store, &proof)
-                .map_err(|_| invalid_cache(plan, owner_type))?;
+                .map_err(|error| {
+                    observed_invalid_cache(
+                        store,
+                        plan,
+                        owner_type,
+                        &("authorize_method", error, group.symbol),
+                    )
+                })?;
             let value = match *globals {
                 Some(globals) => store.literal_union_type_prepared_with_global_types(
                     globals,
@@ -24720,8 +24936,22 @@ fn publish_interface_method_values_worker(
             };
             preparation
                 .finish_pending_function(&proof)
-                .map_err(|_| invalid_cache(plan, owner_type))?;
-            let value = value.map_err(|_| invalid_cache(plan, owner_type))?;
+                .map_err(|error| {
+                    observed_invalid_cache(
+                        store,
+                        plan,
+                        owner_type,
+                        &("finish_method", error, group.symbol),
+                    )
+                })?;
+            let value = value.map_err(|error| {
+                observed_invalid_cache(
+                    store,
+                    plan,
+                    owner_type,
+                    &("optional_method_union", error, group.symbol, preparation),
+                )
+            })?;
             assert!(store.set_value_symbol_links(
                 group.symbol,
                 ValueSymbolLinks {
