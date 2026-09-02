@@ -2,7 +2,67 @@
 
 Updated 2026-09-02. Neither Query nor Hono has passed a full Rust type check.
 
-## Latest Query and Hono checkpoint
+## Latest measured result
+
+The project totals have not improved in the latest run. The focused tests have.
+Neither project is ready for a full typechecking demo.
+
+| Check | Latest result | Change |
+| --- | --- | --- |
+| Query core, census 21 | 1 of 23 isolated roots complete | No gain or loss |
+| Hono, census 22 | 33 of 188 isolated roots complete | No gain or loss |
+| Focused tests, run 36 | 134 pass, 31 fail | Three unchanged tests recovered since run 34 |
+| Checker library, run 1 | Build failed with 37 compiler errors | No library tests ran |
+
+These runs use `bbfd62521499c8cf7375c1be95076fe1a6576483`. All processes
+and their exact services are closed. Project source, roots, dependencies,
+options and libraries stayed fixed. Isolated roots are not full-project passes.
+
+[Query 21](../target/wave202-query-combined-census-21-result.md) gets past
+the merged `clearTimeout` call. Its ordinary check now rejects the later
+class declaration in `timeoutManager.ts`. One DOM method check also moves
+to a later failure. Neither change completes another root.
+
+[Hono 22](../target/wave202-hono-combined-census-22-result.md) still stops
+at the `ContentfulStatusCode` reference in `http-exception.ts`. It has
+148 unsupported roots, six internal errors and one original policy skip.
+Only two first stops changed. No complete root was lost.
+
+[Tests 36](../target/wave202-query-hono-combined-tests-36-result.md)
+compiled all 57 targets and ran all 165 tests. The three new unchanged passes
+cover class write errors, `Awaited` callback unions and imported Router errors.
+No old pass was lost. The three generic-default cases with the earlier
+expected-order correction still fail and remain a separate comparison group.
+
+The [checker-library build](../target/wave202-query-hono-checker-lib-1-result.md)
+found outdated Rust test setup. Calls and initializers no longer match the
+checker APIs. The repair must keep the original TypeScript and assertions.
+This failure does not establish a library test pass rate.
+
+### Next run
+
+The next candidate contains reviewed repairs for Hono's conditional alias
+reference and JWT generic imports, class-body generic member lookup, mapped
+`bind` functions, Node timer inheritance, type-only interface exports and
+intersections inside generic unions. Two new JWT tests are tracked separately.
+These changes are not measured gains yet.
+
+Separate test-only corrections address a native literal error message and
+stale test API assumptions. Their results will not count as unchanged-test
+gains. The next run compares the old cases by exact input and records the new
+cases separately.
+
+Each source repair has one writer, one reviewer and an isolated worktree.
+Root combines ready changes and runs the tests. Later fixes do not hold up
+the next batch. The next useful result is another completed project root,
+then an ordinary project check with native diagnostic parity.
+
+No repair batch is accepted on primary. The unchanged corpus, broader tests
+and removal of temporary error traces still apply.
+
+## Earlier checkpoint, tests 34 and project censuses 20 and 21
+
+The following section is retained history. Its pending work is superseded above.
 
 Project progress remains slow. Hono gained one completed root in the latest
 run. Query is unchanged. Neither is ready for a full-project demo.
