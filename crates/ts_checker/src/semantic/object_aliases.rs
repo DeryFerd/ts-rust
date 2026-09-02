@@ -474,8 +474,10 @@ impl SourceAliasOperandGraph {
                 };
                 row.children.as_slice() == [function.return_type]
                     && type_ == row.type_
-                    && store.source_declaration_symbol(node) == Some(function.symbol)
+                    && store.source_declaration_belongs_to_symbol(node, function.symbol)
                     && store.source_symbol_declarations_match(function.symbol)
+                    && store.source_declaration_belongs_to_symbol(node, function.call_symbol)
+                    && store.source_symbol_declarations_match(function.call_symbol)
                     && source_alias_direct_owner(store, node)? == function.alias_symbol
                     && !store.signature_has_circular_return_type(signature)
                     && store.signature(signature).is_some_and(|signature| {
