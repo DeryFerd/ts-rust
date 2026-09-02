@@ -317,7 +317,7 @@ fn check_function(
     let mode_type = value_type(checker, symbol(checker, mode.declaration));
     assert_eq!(
         checker.type_to_string(mode_type).unwrap(),
-        "\"append\" | \"reset\" | \"replace\"",
+        "\"append\" | \"replace\" | \"reset\"",
     );
     let reducer_type = value_type(checker, symbol(checker, reducer.declaration));
     for (leaf, expected) in [
@@ -510,7 +510,7 @@ fn bad_binding_default_keeps_the_property_type_and_native_error() {
     assert_eq!(diagnostic.range_override, None);
     assert_eq!(
         diagnostic.diagnostic.render().unwrap(),
-        "Type 'number' is not assignable to type '\"append\" | \"reset\" | \"replace\"'.",
+        "Type 'number' is not assignable to type '\"append\" | \"replace\" | \"reset\"'.",
     );
     assert!(diagnostic.related_information.is_empty());
     replay(&mut checker, &parsed, &queries);
