@@ -39154,6 +39154,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             lazy_interface_values,
             replay_cached_annotations,
         );
+        if let Err(error) = &result {
+            observe_declared_cache_failure(self.store, "type_node.annotation", Some(node), error);
+        }
         self.finish_source_query();
         result
     }
