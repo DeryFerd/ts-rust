@@ -3952,6 +3952,16 @@ fn instantiated_member_type_matches_worker(
         TypeData::Union(_) => {
             instantiated_member_union_matches(store, template, actual, mapper, array_targets)
         }
+        TypeData::Interface(data)
+            if data
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .is_none_or(Vec::is_empty) =>
+        {
+            // The producer and cached reader preserve non-generic interface identity.
+            Ok(template == actual)
+        }
         TypeData::TypeReference(_) | TypeData::Interface(_) | TypeData::Tuple(_) => {
             if normalizable_tuple_shape(store, template)?.is_some() {
                 cached_instantiated_member_type(
