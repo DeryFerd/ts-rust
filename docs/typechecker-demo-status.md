@@ -7,62 +7,98 @@ Updated 2026-09-02. No complete real-world project has passed in Rust yet.
 Query core and Hono are the primary targets again. New Pathe-only work,
 runner redesign and the UFO dependency task are paused.
 
-The last complete pair of project censuses used `ece9344d`. These results
-measure a repair branch, not an accepted merge into the primary branch.
+The latest complete Query census used `df057324`. Hono used `a6f71911`.
+These measure the repair branch, not an accepted primary-branch merge.
 
-| Project | August 31 | September 2 |
-| --- | --- | --- |
-| Query core | 1 of 23 isolated source checks complete, no internal errors | 1 of 23 complete, 1 internal error |
-| Hono | 29 of 188 complete, 3 internal errors | 30 of 188 complete, 5 internal errors |
+| Project | Completed isolated roots | Unsupported | Internal errors | Original policy skip |
+| --- | ---: | ---: | ---: | ---: |
+| Query core | 1 of 23 | 21 | 1 | 0 |
+| Hono | 30 of 188 | 151 | 6 | 1 |
 
-Both ordinary project checks still fail. These counts are not passing-file
-or diagnostic-parity counts. Every original root was attempted. The root
-lists, loaded graphs and empty load diagnostics match the previous census.
-Hono newly completes `utils/headers.ts`. Query has no new completion.
+Neither ordinary project check completes. These are not passing-file or
+diagnostic-parity counts. Both runs attempted every original root and ended
+normally. Their root lists, loaded graphs and empty load diagnostics match
+the earlier runs.
 
-The full [current results](../target/wave202-query-hono-current-results.md)
-link the raw reports and logs. Query's census took 38 seconds. Hono's took
-333 seconds. The runs reused the existing compiler.
+There is no new completed root since the earlier September 2 checkpoint.
+No earlier completion was lost. Hono has one more internal error: its repaired
+constructor now reaches a missing optional-chain flow condition. The same
+condition error occurs in Query's `CancelledError` constructor.
 
-The first Hono repair is now tested. All 15 constructor tests pass, including
-two new optional-alias controls. The unchanged project clears that annotation
-failure and next stops at the constructor's `super(...)` call. This does not
-change the complete-census counts above or establish a full project pass.
+Query took 37.900 seconds after compilation. Hono took 342.526 seconds.
+The [current results](../target/wave202-query-hono-current-results.md) link
+the complete raw reports and logs.
 
-The combined repair test run at `6769d988` compiled and ran all 28 selected
-tests. It passed 17 and failed 11. The 15 constructor controls still pass.
+The newer ordinary Hono run at `d6a5182d` still fails. It reports
+`InvalidCachedTypeAlias` in `http-exception.ts` before final diagnostics or
+replay. This run does not replace the complete census above. The same error
+category appears in the new imported-class tests. Their common cause is not
+yet proved.
+
+### Focused test progress
+
+The latest [combined run](../target/wave202-query-hono-combined-tests-5.cargo.log)
+at `d6a5182d` ran all 44 selected tests. It passed 33 and failed 11.
+The preceding run passed 27 of 39. Four existing failures now pass, and the
+five added tests contribute two passes and three failures. No earlier pass
+was lost. Two of those four changed results are test-contract corrections,
+not new checker support.
+
+Before this batch, six genuine checker failures had been fixed on an unchanged
+30-test set, increasing passes from 18 to 24. The latest batch adds passing
+checks for two generic-call cases and two optional-constructor flow cases.
 
 | Test group | Passed | Failed |
 | --- | ---: | ---: |
-| Constructor and optional-argument controls | 15 | 0 |
-| Constructor field initializers | 1 | 2 |
+| Existing constructor and optional-argument controls | 15 | 0 |
+| Optional arguments to super | 2 | 0 |
+| Own class method assignments | 2 | 0 |
+| Constructor field initializers | 2 | 1 |
 | Contextual object-property parameters | 1 | 3 |
-| Captured array writes | 0 | 3 |
-| Generic signature commas and defaults | 0 | 3 |
+| Captured array writes | 3 | 0 |
+| Generic constructor parameters | 0 | 3 |
+| Generic optional call parameters | 2 | 1 |
+| Generic signature commas and defaults | 4 | 0 |
+| Optional constructor flow | 2 | 0 |
+| Imported generic class types | 0 | 3 |
 
-The [complete test log](../target/wave202-query-hono-combined-tests-1.log)
-includes every failure. These new repairs are not accepted yet. The new tests
-remain unchanged while workers fix the next rejected operations.
+The comma repair also passed all 366 parser tests in its separate
+[parser check](../target/wave202-hono-generic-trailing-comma-tests-2-result.md).
+These counts are not the full Rust or upstream TypeScript suite.
 
-The current repairs follow measured project failures:
+The earlier third batch did not run tests. Two calls to a nonexistent test
+API prevented compilation. Its test-only correction preserves every input
+and expected result. Two captured-array failures also exposed a test
+contract error: signatures can keep lazy return types until queried. The
+pinned Go source confirms this. A reviewed test-only correction calls the
+canonical return-type query before checking the same result. Both corrected
+tests now pass. This is not a new checker feature or a project gain.
 
-1. Query's ordinary check stops at a parameter in `timeoutManager.ts`.
-   Its parameter repair still fails three focused arrow-body tests.
-2. The shared `Subscribable` class blocks eight Query source checks.
-   Its measured failure is the `new Set<TListener>()` field initializer.
-   Field admission works for a user constructor. Generic `Set` preparation
-   and invalid constructor-argument diagnostics still fail focused tests.
-3. Query's new internal error is `InvalidArrayMutation` at
-   `queue.push(callback)` in `notifyManager.ts`. Its capture repair still
-   fails the outer-function checks in all three focused tests.
-4. Hono now stops at `super(options?.message, { cause: options?.cause })`.
-   The call-argument syntax check rejects the optional property read.
-5. Hono's generic call signatures need optional-parameter support. Separate
-   tests found lost parser comma metadata and missing method type-parameter
-   default diagnostics. Keep these separate from measured project progress.
-6. Query also rejects the inferred imported `isServer` variable. The current
-   annotation-only query cannot infer it. Reuse the source dependency and
-   variable-checking paths, with their cache and cycle checks.
+### Current implementation priorities
+
+1. Fix Hono's current type-alias cache error. The optional-chain flow repair
+   passes both focused tests, but the project still fails in `HTTPException`.
+   Determine whether the imported-class tests expose the same cache defect.
+2. Finish Query's shared `Subscribable` class. Eight roots now pass the old
+   field and method-assignment stops, then reject
+   `this.subscribe.bind(this)`. Workers are porting real callable-library
+   lookup and generic receiver inference. Query uses strict bind checking.
+3. Fix Query's ordinary function call. Its next stop rejects a merged callable
+   symbol. Preserve its real function declarations and namespace members.
+4. Finish Hono's imported generic class types, generic call signatures and
+   mutable object destructuring. All three class-import tests still fail.
+   Two of three generic-call tests pass. The indexed object-rest repair is
+   committed and reviewed, but has not run.
+5. Fix the remaining focused constructor and contextual-parameter failures.
+   Keep cold queries, lazy returns, real diagnostics and warm replay correct.
+
+Each feature has a source owner and a test or review owner in a separate
+worktree. Root owns the combined build and project measurements. The current
+batch is not accepted on the primary branch. Remaining repairs need runtime
+verification and the unchanged corpus checks. All current test and project
+measurements above have finished. Separate focused runs are now released for
+the committed method-bind and mutable object-rest repairs. They do not yet
+have runtime results.
 
 Each repair must preserve the original projects, options and dependencies.
 Run focused type and diagnostic tests, then rerun the affected project.
