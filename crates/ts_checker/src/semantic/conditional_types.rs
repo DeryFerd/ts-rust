@@ -4221,6 +4221,11 @@ pub(super) fn record_conditional_alias_reference_with_source(
         || !type_arguments.is_empty()
         || !completed.production.type_arguments.is_empty()
         || completed.production.for_constraint
+        || !matches!(
+            completed.production.key,
+            ConditionalQueryKey::AliasDeclaration(_)
+        )
+        || completed.production.source_declaration.is_none()
     {
         return Err(ConditionalTypeError::InvalidTypeNodeCache(
             reference.reference(),
@@ -4231,7 +4236,6 @@ pub(super) fn record_conditional_alias_reference_with_source(
     proof.production.alias = reference
         .identity()
         .map(|alias| (alias.symbol, alias.type_arguments.to_vec()));
-    proof.production.source_declaration = None;
     proof.nested.push(completed.clone());
     publish_source_query_production(store, &proof, globals, source)?;
     Ok(proof)
@@ -4525,6 +4529,15 @@ fn validate_query_production_worker(
             }
             return validate_query_operands_worker(store, proof, array_targets, validation);
         }
+        ConditionalQueryKey::AliasReference(reference) if proof.source_declaration.is_some() => {
+            return validate_forwarded_alias_reference(
+                store,
+                reference,
+                proof,
+                array_targets,
+                validation,
+            );
+        }
         ConditionalQueryKey::Node(_) | ConditionalQueryKey::AliasReference(_)
             if proof.definition.outer_type_parameters.is_none() =>
         {
@@ -4561,6 +4574,48 @@ fn validate_query_production_worker(
             proof.definition.root,
         ));
     }
+    validate_query_operands_worker(store, proof, array_targets, validation)
+}
+
+// A nongeneric alias reference reads its declaration result, not a new root instantiation.
+fn validate_forwarded_alias_reference(
+    store: &CanonicalTypeMapperStore,
+    reference: NodeRef,
+    proof: &ConditionalQueryProduction,
+    array_targets: Option<CanonicalArrayTargets>,
+    validation: ConditionalValidation<'_>,
+) -> Result<(), ConditionalTypeError> {
+    let invalid = || ConditionalTypeError::InvalidTypeNodeCache(reference);
+    let declaration = proof.source_declaration.ok_or_else(invalid)?;
+    let symbol = store
+        .symbol_node_links(reference)
+        .and_then(|links| links.resolved_symbol)
+        .ok_or_else(invalid)?;
+    let links = store.type_alias_links(symbol).ok_or_else(invalid)?;
+    if store.source_node_kind(reference) != Some(SyntaxKind::TypeReference)
+        || !store.source_declaration_belongs_to_symbol(declaration, symbol)
+        || !proof.type_arguments.is_empty()
+        || proof.for_constraint
+        || store
+            .type_node_links(reference)
+            .and_then(|links| links.resolved_type)
+            != Some(proof.result)
+        || links.declared_type != Some(proof.result)
+        || links.type_parameters.is_some()
+        || links.instantiations.is_some()
+    {
+        return Err(invalid());
+    }
+    let source = store
+        .conditional_query_production(ConditionalQueryKey::AliasDeclaration(symbol))
+        .ok_or_else(invalid)?;
+    let mut expected = source.clone();
+    expected.key = proof.key;
+    expected.alias = proof.alias.clone();
+    if source.alias.is_some() || expected != *proof {
+        return Err(invalid());
+    }
+    validate_query_production_worker(store, source, array_targets, validation)?;
     validate_query_operands_worker(store, proof, array_targets, validation)
 }
 
