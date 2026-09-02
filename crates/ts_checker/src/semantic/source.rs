@@ -1393,6 +1393,87 @@ fn observe_loop_failure(
     }
 }
 
+// This records an error at one propagation boundary, not a final project failure.
+fn observe_import_value_failure(
+    stage: &'static str,
+    resolved: &super::source_imports::ResolvedSourceImportBinding,
+    read: &PlannedSourceImportRead,
+    error: &SourceImportError,
+    mapped: &SourceCheckError,
+) {
+    use std::io::Write as _;
+
+    let family = match error {
+        SourceImportError::Unsupported(_) => "Unsupported",
+        SourceImportError::Invariant(_) => "Invariant",
+        SourceImportError::Alias(_) => "Alias",
+        SourceImportError::ModuleExport { .. } => "ModuleExport",
+        SourceImportError::DeclaredType(_) => "DeclaredType",
+        SourceImportError::Variable(_) => "Variable",
+        SourceImportError::Callable(_) => "Callable",
+        SourceImportError::CircularAlias { .. } => "CircularAlias",
+    };
+    let mapped = loop_source_failure_info(mapped);
+    let mut record = [0_u8; 1024];
+    let Some(mut output) = record.get_mut(..1000) else {
+        return;
+    };
+    let mut truncated = write!(
+        output,
+        "import_value_failure stage={stage} original_family={family} mapped_family={} mapped_variant={} read={:?} binding={:?} alias={:?} immediate_target={:?} final_target={:?} error_node={:?}",
+        mapped.family,
+        mapped.variant,
+        read.node,
+        resolved.binding.declaration,
+        resolved.binding.alias_symbol,
+        resolved.immediate_target_symbol,
+        resolved.target_symbol,
+        error.node(),
+    )
+    .is_err();
+    // These payloads contain only enum tags, identities and numeric flags.
+    // Deeper payloads stay omitted until their text safety is established.
+    truncated |= match error {
+        SourceImportError::Unsupported(reason) => {
+            write!(output, " detail={reason:?}").is_err()
+        }
+        SourceImportError::Invariant(reason) => {
+            write!(output, " detail={reason:?}").is_err()
+        }
+        SourceImportError::Alias(
+            super::alias::CanonicalAliasResolutionError::TargetUnavailable { alias, reason },
+        ) => write!(
+            output,
+            " detail=TargetUnavailable error_alias={alias:?} reason={reason:?}",
+        )
+        .is_err(),
+        SourceImportError::Alias(_)
+        | SourceImportError::ModuleExport { .. }
+        | SourceImportError::DeclaredType(_)
+        | SourceImportError::Variable(_)
+        | SourceImportError::Callable(_)
+        | SourceImportError::CircularAlias { .. } => {
+            write!(output, " detail=omitted").is_err()
+        }
+    };
+    let used = 1000_usize.saturating_sub(output.len());
+    let suffix = if truncated {
+        b" record_truncated=1\n"
+    } else {
+        b" record_truncated=0\n"
+    };
+    let Some(end) = used.checked_add(suffix.len()) else {
+        return;
+    };
+    let Some(tail) = record.get_mut(used..end) else {
+        return;
+    };
+    tail.copy_from_slice(suffix);
+    if let Some(bytes) = record.get(..end) {
+        let _ = std::io::stderr().write_all(bytes);
+    }
+}
+
 impl std::fmt::Display for SourceCheckError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -11533,8 +11614,61 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             } => SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
                 SourceFunctionUnsupported::FunctionBody(callable.body),
             )),
-            SourceFlowError::Invariant(_) => {
-                SourceCheckError::Function(SourceFunctionInvariant::Callable(callable.declaration))
+            SourceFlowError::Invariant(invariant) => {
+                let original = match &invariant {
+                    super::source_flow::SourceFlowInvariant::ForeignNode(_) => "ForeignNode",
+                    super::source_flow::SourceFlowInvariant::ForeignFlow(_) => "ForeignFlow",
+                    super::source_flow::SourceFlowInvariant::MissingContainer(_) => "MissingContainer",
+                    super::source_flow::SourceFlowInvariant::MissingStart(_) => "MissingStart",
+                    super::source_flow::SourceFlowInvariant::InvalidStart(_) => "InvalidStart",
+                    super::source_flow::SourceFlowInvariant::InvalidUnreachable(_) => "InvalidUnreachable",
+                    super::source_flow::SourceFlowInvariant::MissingFlowPoint(_) => "MissingFlowPoint",
+                    super::source_flow::SourceFlowInvariant::MissingFlowNode(_) => "MissingFlowNode",
+                    super::source_flow::SourceFlowInvariant::InvalidPayload(_) => "InvalidPayload",
+                    super::source_flow::SourceFlowInvariant::InvalidAntecedents(_) => "InvalidAntecedents",
+                    super::source_flow::SourceFlowInvariant::DuplicatePoint(_) => "DuplicatePoint",
+                    super::source_flow::SourceFlowInvariant::DuplicateCondition(_) => "DuplicateCondition",
+                    super::source_flow::SourceFlowInvariant::DuplicateAssignment(_) => "DuplicateAssignment",
+                    super::source_flow::SourceFlowInvariant::DuplicateCall(_) => "DuplicateCall",
+                    super::source_flow::SourceFlowInvariant::UnknownCondition(_) => "UnknownCondition",
+                    super::source_flow::SourceFlowInvariant::UnknownAssignment(_) => "UnknownAssignment",
+                    super::source_flow::SourceFlowInvariant::UnreachedCall(_) => "UnreachedCall",
+                    super::source_flow::SourceFlowInvariant::UnreachedCondition(_) => "UnreachedCondition",
+                    super::source_flow::SourceFlowInvariant::UnreachedAssignment(_) => "UnreachedAssignment",
+                    super::source_flow::SourceFlowInvariant::PendingAssignment(_) => "PendingAssignment",
+                    super::source_flow::SourceFlowInvariant::InvalidParameterAssignment(_) => "InvalidParameterAssignment",
+                    super::source_flow::SourceFlowInvariant::InvalidCapturedLocal(_) => "InvalidCapturedLocal",
+                    super::source_flow::SourceFlowInvariant::InvalidArrayMutation(_) => "InvalidArrayMutation",
+                    super::source_flow::SourceFlowInvariant::InvalidCall(_) => "InvalidCall",
+                    super::source_flow::SourceFlowInvariant::InvalidSourceRegion(_) => "InvalidSourceRegion",
+                    super::source_flow::SourceFlowInvariant::InvalidUpdate(_) => "InvalidUpdate",
+                    super::source_flow::SourceFlowInvariant::InvalidCallEffect(_) => "InvalidCallEffect",
+                    super::source_flow::SourceFlowInvariant::InvalidLogicalStatement(_) => "InvalidLogicalStatement",
+                    super::source_flow::SourceFlowInvariant::InvalidDeclarationUse(_) => "InvalidDeclarationUse",
+                    super::source_flow::SourceFlowInvariant::InvalidClassBody(_) => "InvalidClassBody",
+                    super::source_flow::SourceFlowInvariant::InvalidClassProperty(_) => "InvalidClassProperty",
+                    super::source_flow::SourceFlowInvariant::AssignmentAlreadyCompleted(_) => "AssignmentAlreadyCompleted",
+                    super::source_flow::SourceFlowInvariant::MissingCurrentType(_) => "MissingCurrentType",
+                    super::source_flow::SourceFlowInvariant::TypeofNarrowing(_) => "TypeofNarrowing",
+                    super::source_flow::SourceFlowInvariant::EqualityNarrowing(_) => "EqualityNarrowing",
+                    super::source_flow::SourceFlowInvariant::Cycle(_) => "Cycle",
+                    super::source_flow::SourceFlowInvariant::DepthLimit(_) => "DepthLimit",
+                    super::source_flow::SourceFlowInvariant::ContainerMismatch { .. } => "ContainerMismatch",
+                    super::source_flow::SourceFlowInvariant::StartMismatch { .. } => "StartMismatch",
+                    super::source_flow::SourceFlowInvariant::InvalidFlowFlags { .. } => "InvalidFlowFlags",
+                    super::source_flow::SourceFlowInvariant::MissingConditionEdge { .. } => "MissingConditionEdge",
+                    super::source_flow::SourceFlowInvariant::AssignmentSymbolMismatch { .. } => "AssignmentSymbolMismatch",
+                };
+                let mapped = SourceCheckError::Function(SourceFunctionInvariant::Callable(
+                    callable.declaration,
+                ));
+                observe_parameter_default_failure(
+                    "flow_invariant",
+                    original,
+                    &mapped,
+                    format_args!("callable={:?} body={:?}", callable.declaration, callable.body),
+                );
+                mapped
             }
             SourceFlowError::Narrowing {
                 condition,
@@ -12777,10 +12911,29 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     node.expect("source callable unsupported errors retain their syntax node"),
                 )),
             ),
-            SourceCallableError::Invariant(_) => {
-                SourceCheckError::Function(SourceFunctionInvariant::Callable(
+            SourceCallableError::Invariant(invariant) => {
+                let original = match &invariant {
+                    super::source_callables::SourceCallableInvariant::InvalidSyntax(_) => "InvalidSyntax",
+                    super::source_callables::SourceCallableInvariant::InvalidOwnerSymbol(_) => "InvalidOwnerSymbol",
+                    super::source_callables::SourceCallableInvariant::InvalidExportRoute(_) => "InvalidExportRoute",
+                    super::source_callables::SourceCallableInvariant::InvalidParameter(_) => "InvalidParameter",
+                    super::source_callables::SourceCallableInvariant::InvalidParameterSymbol(_) => "InvalidParameterSymbol",
+                    super::source_callables::SourceCallableInvariant::InvalidTypeCache(_) => "InvalidTypeCache",
+                    super::source_callables::SourceCallableInvariant::InvalidSignatureCache(_) => "InvalidSignatureCache",
+                    super::source_callables::SourceCallableInvariant::InvalidParameterCache(_) => "InvalidParameterCache",
+                    super::source_callables::SourceCallableInvariant::Capacity(_) => "Capacity",
+                    super::source_callables::SourceCallableInvariant::Publication(_) => "Publication",
+                };
+                let mapped = SourceCheckError::Function(SourceFunctionInvariant::Callable(
                     node.expect("source callable invariant errors retain their syntax node"),
-                ))
+                ));
+                observe_parameter_default_failure(
+                    "callable_invariant",
+                    original,
+                    &mapped,
+                    format_args!("node={node:?}"),
+                );
+                mapped
             }
             SourceCallableError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
             SourceCallableError::LiteralCache(error) => error.into(),
@@ -13014,9 +13167,19 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 )
             );
         if !body_mode_matches {
-            return Err(SourceCheckError::Function(
+            let mapped = SourceCheckError::Function(
                 SourceFunctionInvariant::Callable(declaration),
-            ));
+            );
+            observe_parameter_default_failure(
+                "preplan_body_mode",
+                "direct_guard",
+                &mapped,
+                format_args!(
+                    "callable={:?} body={:?} is_async={} declaration_file={}",
+                    declaration, callable.body, callable.is_async, is_declaration_file,
+                ),
+            );
+            return Err(mapped);
         }
         if callable.is_async
             != matches!(
@@ -13024,9 +13187,19 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 PlannedFunctionModifierMode::Async | PlannedFunctionModifierMode::ExportAsync(_)
             )
         {
-            return Err(SourceCheckError::Function(
+            let mapped = SourceCheckError::Function(
                 SourceFunctionInvariant::Callable(declaration),
-            ));
+            );
+            observe_parameter_default_failure(
+                "preplan_async",
+                "direct_guard",
+                &mapped,
+                format_args!(
+                    "callable={:?} body={:?} is_async={} declaration_file={}",
+                    declaration, callable.body, callable.is_async, is_declaration_file,
+                ),
+            );
+            return Err(mapped);
         }
         if !self.hoisted_functions.insert(function.owner_symbol) {
             return Err(SourceCheckError::Function(
@@ -49083,6 +49256,39 @@ fn check_callable_parameter_initializers(
     )
 }
 
+// Record a local error return. A caller can still catch that error.
+fn observe_parameter_default_failure(
+    stage: &'static str,
+    original: &'static str,
+    mapped: &SourceCheckError,
+    values: std::fmt::Arguments<'_>,
+) {
+    use std::io::Write as _;
+
+    let (mapped_family, node) = match mapped {
+        SourceCheckError::Function(SourceFunctionInvariant::Callable(node)) => {
+            ("Function.Callable", Some(*node))
+        }
+        SourceCheckError::Arrow(node) => ("Arrow", Some(*node)),
+        _ => ("Other", None),
+    };
+    let mut buffer = [0u8; 1024];
+    let mut output = &mut buffer[..1000];
+    let truncated = write!(
+        &mut output,
+        "parameter_default_failure stage={stage} original={original} mapped={mapped_family} mapped_node={node:?} detail=omitted metadata=unavailable {values}"
+    )
+    .is_err();
+    let used = 1000 - output.len();
+    let suffix = if truncated {
+        b" record_truncated=1\n"
+    } else {
+        b" record_truncated=0\n"
+    };
+    buffer[used..used + suffix.len()].copy_from_slice(suffix);
+    let _ = std::io::stderr().write_all(&buffer[..used + suffix.len()]);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_callable_parameter_initializers_with_capture_context(
     store: &mut CanonicalTypeMapperStore,
@@ -49112,35 +49318,98 @@ fn check_callable_parameter_initializers_with_capture_context(
             ))?;
         if let Some(initializer) = parameter.initializer {
             let planned = initializers.get(initializer_index).ok_or_else(|| {
-                callable_parameter_execution_error(callable, parameter.declaration)
+                {
+                    let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                    observe_parameter_default_failure(
+                        "initializer_plan_missing",
+                        "direct_guard",
+                        &mapped,
+                        format_args!(
+                            "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                            callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                        ),
+                    );
+                    mapped
+                }
             })?;
             if planned.parameter != *parameter || planned.expression.node != initializer {
-                return Err(callable_parameter_execution_error(
-                    callable,
-                    parameter.declaration,
-                ));
+                return Err({
+                    let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                    observe_parameter_default_failure(
+                        "initializer_plan_mismatch",
+                        "direct_guard",
+                        &mapped,
+                        format_args!(
+                            "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?} planned_parameter={:?} planned_symbol={:?} planned_node={:?}",
+                            callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type, planned.parameter.declaration, planned.parameter.symbol, planned.expression.node,
+                        ),
+                    );
+                    mapped
+                });
             }
             if parameter.has_inferred_initializer_type() {
                 let PlannedExpressionKind::Identifier(read) = &planned.expression.kind else {
-                    return Err(callable_parameter_execution_error(
-                        callable,
-                        parameter.declaration,
-                    ));
+                    return Err({
+                        let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                        observe_parameter_default_failure(
+                            "inferred_identifier_kind",
+                            "direct_guard",
+                            &mapped,
+                            format_args!(
+                                "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                                callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                            ),
+                        );
+                        mapped
+                    });
                 };
                 let declaration = store
                     .symbol(read.value_symbol)
                     .and_then(ts_binder::semantic::Symbol::value_declaration)
                     .ok_or_else(|| {
-                        callable_parameter_execution_error(callable, parameter.declaration)
+                        {
+                            let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                            observe_parameter_default_failure(
+                                "inferred_value_declaration_missing",
+                                "direct_guard",
+                                &mapped,
+                                format_args!(
+                                    "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                                    callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                                ),
+                            );
+                            mapped
+                        }
                     })?;
                 let record = host.node(declaration).ok_or_else(|| {
-                    callable_parameter_execution_error(callable, parameter.declaration)
+                    {
+                        let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                        observe_parameter_default_failure(
+                            "inferred_node_missing",
+                            "direct_guard",
+                            &mapped,
+                            format_args!(
+                                "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                                callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                            ),
+                        );
+                        mapped
+                    }
                 })?;
                 let NodeData::VariableDeclaration(variable) = &record.data else {
-                    return Err(callable_parameter_execution_error(
-                        callable,
-                        parameter.declaration,
-                    ));
+                    return Err({
+                        let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                        observe_parameter_default_failure(
+                            "inferred_variable_kind",
+                            "direct_guard",
+                            &mapped,
+                            format_args!(
+                                "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                                callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                            ),
+                        );
+                        mapped
+                    });
                 };
                 if read.kind != PlannedIdentifierReadKind::Variable
                     || !host.symbol_matches(store, declaration, read.value_symbol)
@@ -49152,10 +49421,19 @@ fn check_callable_parameter_initializers_with_capture_context(
                         .get(&read.value_symbol)
                         .is_some_and(|existing| *existing != body_type)
                 {
-                    return Err(callable_parameter_execution_error(
-                        callable,
-                        parameter.declaration,
-                    ));
+                    return Err({
+                        let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                        observe_parameter_default_failure(
+                            "inferred_identity_guard",
+                            "direct_guard",
+                            &mapped,
+                            format_args!(
+                                "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                                callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                            ),
+                        );
+                        mapped
+                    });
                 }
                 if let Some(cached) = store
                     .value_symbol_links(read.value_symbol)
@@ -49174,14 +49452,53 @@ fn check_callable_parameter_initializers_with_capture_context(
                 flow_types.entry(read.value_symbol).or_insert(body_type);
             }
             let assignment = if parameter.has_string_default_type() {
-                parameter.string_default_value(store, host).map_err(|_| {
-                    callable_parameter_execution_error(callable, parameter.declaration)
+                parameter.string_default_value(store, host).map_err(|error| {
+                    {
+                        let original = match &error {
+                            SourceCallableError::Invariant(invariant) => match invariant {
+                                super::source_callables::SourceCallableInvariant::InvalidSyntax(_) => "InvalidSyntax",
+                                super::source_callables::SourceCallableInvariant::InvalidOwnerSymbol(_) => "InvalidOwnerSymbol",
+                                super::source_callables::SourceCallableInvariant::InvalidExportRoute(_) => "InvalidExportRoute",
+                                super::source_callables::SourceCallableInvariant::InvalidParameter(_) => "InvalidParameter",
+                                super::source_callables::SourceCallableInvariant::InvalidParameterSymbol(_) => "InvalidParameterSymbol",
+                                super::source_callables::SourceCallableInvariant::InvalidTypeCache(_) => "InvalidTypeCache",
+                                super::source_callables::SourceCallableInvariant::InvalidSignatureCache(_) => "InvalidSignatureCache",
+                                super::source_callables::SourceCallableInvariant::InvalidParameterCache(_) => "InvalidParameterCache",
+                                super::source_callables::SourceCallableInvariant::Capacity(_) => "Capacity",
+                                super::source_callables::SourceCallableInvariant::Publication(_) => "Publication",
+                            },
+                            SourceCallableError::Unsupported(_) => "Unsupported",
+                            SourceCallableError::DeclaredType(_) => "DeclaredType",
+                            SourceCallableError::LiteralCache(_) => "LiteralCache",
+                        };
+                        let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                        observe_parameter_default_failure(
+                            "string_default_error",
+                            original,
+                            &mapped,
+                            format_args!(
+                                "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                                callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                            ),
+                        );
+                        mapped
+                    }
                 })?;
-                if parameter.base_type(store) != Some(body_type) {
-                    return Err(callable_parameter_execution_error(
-                        callable,
-                        parameter.declaration,
-                    ));
+                let base_type = parameter.base_type(store);
+                if base_type != Some(body_type) {
+                    return Err({
+                        let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                        observe_parameter_default_failure(
+                            "string_default_body_type",
+                            "direct_guard",
+                            &mapped,
+                            format_args!(
+                                "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?} base_type={:?}",
+                                callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type, base_type,
+                            ),
+                        );
+                        mapped
+                    });
                 }
                 check_assignment_to_type_with_capture_context(
                     store,
@@ -49223,10 +49540,19 @@ fn check_callable_parameter_initializers_with_capture_context(
                 )?
             };
             if assignment.declared_type != body_type {
-                return Err(callable_parameter_execution_error(
-                    callable,
-                    parameter.declaration,
-                ));
+                return Err({
+                    let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                    observe_parameter_default_failure(
+                        "assignment_declared_type",
+                        "direct_guard",
+                        &mapped,
+                        format_args!(
+                            "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?} assigned_type={:?}",
+                            callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type, assignment.declared_type,
+                        ),
+                    );
+                    mapped
+                });
             }
             initializer_index += 1;
         }
@@ -49243,13 +49569,34 @@ fn check_callable_parameter_initializers_with_capture_context(
         }
         let NodeData::ParameterDeclaration(parameter_syntax) = &host
             .node(parameter.declaration)
-            .ok_or_else(|| callable_parameter_execution_error(callable, parameter.declaration))?
+            .ok_or_else(|| {
+                let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                observe_parameter_default_failure(
+                    "parameter_node_missing",
+                    "direct_guard",
+                    &mapped,
+                    format_args!(
+                        "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                        callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                    ),
+                );
+                mapped
+            })?
             .data
         else {
-            return Err(callable_parameter_execution_error(
-                callable,
-                parameter.declaration,
-            ));
+            return Err({
+                let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                observe_parameter_default_failure(
+                    "parameter_kind",
+                    "direct_guard",
+                    &mapped,
+                    format_args!(
+                        "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                        callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                    ),
+                );
+                mapped
+            });
         };
         let pattern = NodeRef::new(
             parameter.declaration.arena,
@@ -49269,14 +49616,35 @@ fn check_callable_parameter_initializers_with_capture_context(
                     parameter.declaration,
                 )
                 .ok_or_else(|| {
-                    callable_parameter_execution_error(callable, parameter.declaration)
+                    {
+                        let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                        observe_parameter_default_failure(
+                            "arrow_object_bindings_missing",
+                            "direct_guard",
+                            &mapped,
+                            format_args!(
+                                "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                                callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                            ),
+                        );
+                        mapped
+                    }
                 })?;
                 // Named keys have no expressions to plan. Reuse the function binding check.
                 if bindings.iter().any(|binding| binding.computed_key.is_some()) {
-                    return Err(callable_parameter_execution_error(
-                        callable,
-                        parameter.declaration,
-                    ));
+                    return Err({
+                        let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                        observe_parameter_default_failure(
+                            "arrow_computed_key",
+                            "direct_guard",
+                            &mapped,
+                            format_args!(
+                                "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                                callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                            ),
+                        );
+                        mapped
+                    });
                 }
                 arrow_bindings = PlannedObjectParameterBindings {
                     parameter: *parameter,
@@ -49292,16 +49660,37 @@ fn check_callable_parameter_initializers_with_capture_context(
                 &arrow_bindings
             } else {
                 let planned = object_bindings.get(object_binding_index).ok_or_else(|| {
-                    callable_parameter_execution_error(callable, parameter.declaration)
+                    {
+                        let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                        observe_parameter_default_failure(
+                            "object_plan_missing",
+                            "direct_guard",
+                            &mapped,
+                            format_args!(
+                                "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                                callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                            ),
+                        );
+                        mapped
+                    }
                 })?;
                 object_binding_index += 1;
                 planned
             };
             if planned.parameter != *parameter {
-                return Err(callable_parameter_execution_error(
-                    callable,
-                    parameter.declaration,
-                ));
+                return Err({
+                    let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                    observe_parameter_default_failure(
+                        "object_plan_mismatch",
+                        "direct_guard",
+                        &mapped,
+                        format_args!(
+                            "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                            callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                        ),
+                    );
+                    mapped
+                });
             }
             check_callable_object_parameter_bindings(
                 store,
@@ -49333,13 +49722,34 @@ fn check_callable_parameter_initializers_with_capture_context(
         };
         let NodeData::ParameterDeclaration(parameter_syntax) = &host
             .node(parameter.declaration)
-            .ok_or_else(|| callable_parameter_execution_error(callable, parameter.declaration))?
+            .ok_or_else(|| {
+                let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                observe_parameter_default_failure(
+                    "array_parameter_node_missing",
+                    "direct_guard",
+                    &mapped,
+                    format_args!(
+                        "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                        callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                    ),
+                );
+                mapped
+            })?
             .data
         else {
-            return Err(callable_parameter_execution_error(
-                callable,
-                parameter.declaration,
-            ));
+            return Err({
+                let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                observe_parameter_default_failure(
+                    "array_parameter_kind",
+                    "direct_guard",
+                    &mapped,
+                    format_args!(
+                        "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                        callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                    ),
+                );
+                mapped
+            });
         };
         let pattern = NodeRef::new(
             parameter.declaration.arena,
@@ -49380,10 +49790,19 @@ fn check_callable_parameter_initializers_with_capture_context(
                 .value_symbol_links(symbol)
                 .is_some_and(|links| links != &ValueSymbolLinks::default() && links != &expected)
             {
-                return Err(callable_parameter_execution_error(
-                    callable,
-                    parameter.declaration,
-                ));
+                return Err({
+                    let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                    observe_parameter_default_failure(
+                        "array_binding_cache_guard",
+                        "direct_guard",
+                        &mapped,
+                        format_args!(
+                            "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                            callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                        ),
+                    );
+                    mapped
+                });
             }
             if flow_types.insert(symbol, checked.type_).is_some() {
                 return Err(SourceCheckError::Variable(
@@ -49397,25 +49816,52 @@ fn check_callable_parameter_initializers_with_capture_context(
             .filter(|(symbol, _)| store.value_symbol_links(*symbol).is_none())
             .count();
         if !store.try_reserve_value_symbol_links(missing) {
-            return Err(callable_parameter_execution_error(
-                callable,
-                parameter.declaration,
-            ));
+            return Err({
+                let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                observe_parameter_default_failure(
+                    "array_binding_reserve",
+                    "direct_guard",
+                    &mapped,
+                    format_args!(
+                        "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                        callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                    ),
+                );
+                mapped
+            });
         }
         for (symbol, links) in binding_types {
             if !store.set_value_symbol_links(symbol, links) {
-                return Err(callable_parameter_execution_error(
-                    callable,
-                    parameter.declaration,
-                ));
+                return Err({
+                    let mapped = callable_parameter_execution_error(callable, parameter.declaration);
+                    observe_parameter_default_failure(
+                        "array_binding_publish",
+                        "direct_guard",
+                        &mapped,
+                        format_args!(
+                            "callable={:?} body={:?} parameter={:?} symbol={:?} initializer={:?} body_type={:?}",
+                            callable.declaration, callable.body, parameter.declaration, parameter.symbol, parameter.initializer, body_type,
+                        ),
+                    );
+                    mapped
+                });
             }
         }
     }
     if initializer_index != initializers.len() || object_binding_index != object_bindings.len() {
-        return Err(callable_parameter_execution_error(
-            callable,
-            callable.declaration,
-        ));
+        return Err({
+            let mapped = callable_parameter_execution_error(callable, callable.declaration);
+            observe_parameter_default_failure(
+                "initializer_counts",
+                "direct_guard",
+                &mapped,
+                format_args!(
+                    "callable={:?} body={:?} initializer_index={} object_index={}",
+                    callable.declaration, callable.body, initializer_index, object_binding_index,
+                ),
+            );
+            mapped
+        });
     }
     Ok(flow_types)
 }
@@ -75366,8 +75812,13 @@ pub(super) fn check_source_file(
                 UnsupportedSourceSyntax::Import(read.node),
             ));
         }
-        resolve_source_import_namespace_exports(store, alias_host, host, resolved)
-            .map_err(|error| SourcePlanner::import_plan_error(read.node, &error))?;
+        resolve_source_import_namespace_exports(store, alias_host, host, resolved).map_err(
+            |error| {
+                let mapped = SourcePlanner::import_plan_error(read.node, &error);
+                observe_import_value_failure("namespace-exports", resolved, read, &error, &mapped);
+                mapped
+            },
+        )?;
         materialize_imported_default_interface_return(
             store,
             host,
@@ -75398,7 +75849,11 @@ pub(super) fn check_source_file(
             read,
             &provider_capabilities,
         )
-        .map_err(|error| SourcePlanner::import_plan_error(read.node, &error))?;
+        .map_err(|error| {
+            let mapped = SourcePlanner::import_plan_error(read.node, &error);
+            observe_import_value_failure("import-value", resolved, read, &error, &mapped);
+            mapped
+        })?;
         if current_flow_types
             .insert(read.value_symbol, prepared.type_)
             .is_some()
@@ -77438,16 +77893,36 @@ pub(super) fn check_source_file(
                         || function.callable.return_type.is_inferred()
                         || !function.parameter_initializers.is_empty()
                     {
-                        return Err(SourceCheckError::Function(
+                        let mapped = SourceCheckError::Function(
                             SourceFunctionInvariant::Callable(function.callable.declaration),
-                        ));
+                        );
+                        observe_parameter_default_failure(
+                            "ambient_state",
+                            "direct_guard",
+                            &mapped,
+                            format_args!(
+                                "callable={:?} body={:?} statement_index={}",
+                                function.callable.declaration, function.callable.body, index,
+                            ),
+                        );
+                        return Err(mapped);
                     }
                     continue;
                 }
                 if function.callable.body_mode != SourceCallableBodyMode::Present {
-                    return Err(SourceCheckError::Function(
+                    let mapped = SourceCheckError::Function(
                         SourceFunctionInvariant::Callable(function.callable.declaration),
-                    ));
+                    );
+                    observe_parameter_default_failure(
+                        "present_body_mode",
+                        "direct_guard",
+                        &mapped,
+                        format_args!(
+                            "callable={:?} body={:?} statement_index={}",
+                            function.callable.declaration, function.callable.body, index,
+                        ),
+                    );
+                    return Err(mapped);
                 }
                 if function.callable.return_type.is_inferred() {
                     let mut function_diagnostics = inferred_function_diagnostics
@@ -77455,7 +77930,19 @@ pub(super) fn check_source_file(
                         .and_then(Option::take)
                         .ok_or(SourceCheckError::Function(
                             SourceFunctionInvariant::Callable(function.callable.declaration),
-                        ))?;
+                        ))
+                        .map_err(|mapped| {
+                            observe_parameter_default_failure(
+                                "inferred_diagnostics_missing",
+                                "direct_guard",
+                                &mapped,
+                                format_args!(
+                                    "callable={:?} body={:?} statement_index={}",
+                                    function.callable.declaration, function.callable.body, index,
+                                ),
+                            );
+                            mapped
+                        })?;
                     if deferred_computed_parameter_functions.contains(&index) {
                         let expression = match &function.body {
                             PlannedFunctionBody::Empty => None,
@@ -77508,9 +77995,19 @@ pub(super) fn check_source_file(
                         )?;
                     } else if deferred_inferred_functions.contains(&index) {
                         let PlannedFunctionBody::Linear(statements) = &function.body else {
-                            return Err(SourceCheckError::Function(
+                            let mapped = SourceCheckError::Function(
                                 SourceFunctionInvariant::Callable(function.callable.declaration),
-                            ));
+                            );
+                            observe_parameter_default_failure(
+                                "inferred_linear_body",
+                                "direct_guard",
+                                &mapped,
+                                format_args!(
+                                    "callable={:?} body={:?} statement_index={}",
+                                    function.callable.declaration, function.callable.body, index,
+                                ),
+                            );
+                            return Err(mapped);
                         };
                         let captured_flow_types = function_declaration_flow_types(
                             &current_flow_types,
@@ -77555,9 +78052,19 @@ pub(super) fn check_source_file(
                     continue;
                 }
                 let Some(return_type) = function.callable.return_type.type_node() else {
-                    return Err(SourceCheckError::Function(
+                    let mapped = SourceCheckError::Function(
                         SourceFunctionInvariant::Callable(function.callable.declaration),
-                    ));
+                    );
+                    observe_parameter_default_failure(
+                        "return_type_node_missing",
+                        "direct_guard",
+                        &mapped,
+                        format_args!(
+                            "callable={:?} body={:?} statement_index={}",
+                            function.callable.declaration, function.callable.body, index,
+                        ),
+                    );
+                    return Err(mapped);
                 };
                 let captured_flow_types =
                     function_declaration_flow_types(&current_flow_types, &top_level_declared_types);
@@ -77582,9 +78089,19 @@ pub(super) fn check_source_file(
                     | PlannedFunctionBody::ObjectShorthandAssignment(_)
                     | PlannedFunctionBody::TypeofSwitch(_)
                     | PlannedFunctionBody::ConditionalEnum(_) => {
-                        return Err(SourceCheckError::Function(
+                        let mapped = SourceCheckError::Function(
                             SourceFunctionInvariant::Callable(function.callable.declaration),
-                        ));
+                        );
+                        observe_parameter_default_failure(
+                            "explicit_body_form",
+                            "direct_guard",
+                            &mapped,
+                            format_args!(
+                                "callable={:?} body={:?} statement_index={}",
+                                function.callable.declaration, function.callable.body, index,
+                            ),
+                        );
+                        return Err(mapped);
                     }
                     PlannedFunctionBody::Empty => {}
                     PlannedFunctionBody::Return {

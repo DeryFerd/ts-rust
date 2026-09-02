@@ -1493,7 +1493,7 @@ fn validate_source_function_expression_owner(
         || body_record.range.start < record.range.start
         || body_record.range.end > record.range.end
         || !bound.contains(body)
-        || store.source_node_parent(body) != Some(container)
+        || store.source_node_parent(body) != Some(super::store::SourceNodeParent::Parent(container))
         || block.flow_node.is_some()
         || block.next_container.is_some()
         || block.facts != 0
@@ -2186,6 +2186,39 @@ struct SourceFlowCoverage {
     assignments: HashSet<NodeRef>,
     calls: HashSet<NodeRef>,
     condition_edges: HashMap<NodeRef, u8>,
+}
+
+#[derive(Default)]
+struct SourceFlowActivePath {
+    members: HashSet<FlowRef>,
+    nodes: Vec<FlowRef>,
+}
+
+impl SourceFlowActivePath {
+    fn validate_cycle(
+        &self,
+        nodes: &ts_ast::FlowNodeArena,
+        flow: FlowRef,
+    ) -> Result<(), SourceFlowError> {
+        let Some(start) = self.nodes.iter().position(|active| *active == flow) else {
+            return Err(SourceFlowInvariant::Cycle(flow).into());
+        };
+        // A backedge can return to a call or update inside a valid loop.
+        // Only a loop label in this closed segment can justify the repeat.
+        for active in &self.nodes[start..] {
+            if !active.is_for(nodes.node_arena(), nodes.file()) {
+                return Err(SourceFlowInvariant::ForeignFlow(*active).into());
+            }
+            let node = nodes
+                .get(*active)
+                .ok_or(SourceFlowInvariant::MissingFlowNode(*active))?;
+            if source_flow_kind(*active, node.flags)? == SourceFlowKind::LoopLabel {
+                label_antecedents(*active, node)?;
+                return Ok(());
+            }
+        }
+        Err(SourceFlowInvariant::Cycle(flow).into())
+    }
 }
 
 #[derive(Default)]
@@ -4146,7 +4179,7 @@ impl SourceFlowPlan {
 
     fn validate_flow_paths(&self, bound: &BoundFile) -> Result<(), SourceFlowError> {
         let mut validated = HashSet::new();
-        let mut visiting = HashSet::new();
+        let mut visiting = SourceFlowActivePath::default();
         let mut coverage = SourceFlowCoverage::default();
         for point in &self.point_order {
             let flow = *self
@@ -4213,7 +4246,7 @@ impl SourceFlowPlan {
         flow: FlowRef,
         depth: usize,
         validated: &mut HashSet<FlowRef>,
-        visiting: &mut HashSet<FlowRef>,
+        visiting: &mut SourceFlowActivePath,
         coverage: &mut SourceFlowCoverage,
     ) -> Result<(), SourceFlowError> {
         let graph = bound.flow_graph();
@@ -4227,16 +4260,15 @@ impl SourceFlowPlan {
         if depth > FLOW_DEPTH_LIMIT {
             return Err(SourceFlowInvariant::DepthLimit(flow).into());
         }
-        if !visiting.insert(flow) {
-            let node = flow_node(graph, flow)?;
-            return if source_flow_kind(flow, node.flags)? == SourceFlowKind::LoopLabel {
-                Ok(())
-            } else {
-                Err(SourceFlowInvariant::Cycle(flow).into())
-            };
+        if !visiting.members.insert(flow) {
+            let _ = flow_node(graph, flow)?;
+            return visiting.validate_cycle(graph.nodes(), flow);
         }
+        visiting.nodes.push(flow);
         let result = self.validate_flow_uncached(bound, flow, depth, validated, visiting, coverage);
-        let removed = visiting.remove(&flow);
+        let last = visiting.nodes.pop();
+        debug_assert_eq!(last, Some(flow));
+        let removed = visiting.members.remove(&flow);
         debug_assert!(removed);
         if result.is_ok() {
             validated.insert(flow);
@@ -4250,7 +4282,7 @@ impl SourceFlowPlan {
         flow: FlowRef,
         depth: usize,
         validated: &mut HashSet<FlowRef>,
-        visiting: &mut HashSet<FlowRef>,
+        visiting: &mut SourceFlowActivePath,
         coverage: &mut SourceFlowCoverage,
     ) -> Result<(), SourceFlowError> {
         let graph = bound.flow_graph();
@@ -10926,6 +10958,10 @@ fn ast_payload(flow: FlowRef, node: &FlowNode) -> Result<NodeRef, SourceFlowErro
         _ => Err(SourceFlowInvariant::InvalidPayload(flow).into()),
     }
 }
+
+#[cfg(test)]
+#[path = "source_flow_counted_loop_tests.rs"]
+mod counted_loop_cycle_tests;
 
 #[cfg(test)]
 mod tests {

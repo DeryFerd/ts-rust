@@ -723,12 +723,36 @@ fn compile_parameters(
         .find(|&&type_| type_ != string)
         .unwrap();
     assert_array(checker, array, string);
-    let partial = only(parsed, SyntaxKind::PropertySignature);
-    let NodeData::PropertySignatureDeclaration(data) =
-        &parsed.arena.get(partial.node).unwrap().data
+    let options = arrow.parameters[1];
+    let NodeData::ParameterDeclaration(parameter) =
+        &parsed.arena.get(options.node).unwrap().data
     else {
         unreachable!();
     };
+    let options_type = child(
+        parsed,
+        options,
+        parameter.type_.expect("the options parameter must retain its written type"),
+    );
+    let NodeData::TypeLiteralNode(literal) =
+        &parsed.arena.get(options_type.node).unwrap().data
+    else {
+        panic!("the options parameter must retain its type literal");
+    };
+    let [partial] = literal.members.nodes.as_slice() else {
+        panic!("the options type must retain its one partial property");
+    };
+    let partial = child(parsed, options_type, *partial);
+    let record = parsed.arena.get(partial.node).unwrap();
+    assert_eq!(record.kind, SyntaxKind::PropertyDeclaration);
+    let NodeData::PropertyDeclaration(data) = &record.data else {
+        unreachable!();
+    };
+    let name = child(parsed, partial, data.name);
+    let NodeData::Identifier(name) = &parsed.arena.get(name.node).unwrap().data else {
+        panic!("the partial property must retain its identifier");
+    };
+    assert_eq!(name.text, "partial");
     assert_eq!(
         parsed
             .arena
@@ -737,7 +761,11 @@ fn compile_parameters(
             .kind,
         SyntaxKind::QuestionToken
     );
-    let annotation = child(parsed, partial, data.type_);
+    let annotation = child(
+        parsed,
+        partial,
+        data.type_.expect("the partial property must retain its boolean annotation"),
+    );
     let boolean = checker.store().intrinsic_bootstrap().unwrap().boolean_type;
     assert_eq!(checker.get_type_from_type_node(annotation), Ok(boolean));
     assert!(matches!(
