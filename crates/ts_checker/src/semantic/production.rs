@@ -1914,7 +1914,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     pub fn check_source_file(&mut self, file: FileId) -> Result<(), SourceCheckError> {
         let result = self.check_source_file_with_classic_jsx_factories(file, None);
         if let Err(SourceCheckError::RelationUnavailable(
-            super::relation::RelationUnavailable::UnresolvedStructuredMembers(type_),
+            super::RelationUnavailable::UnresolvedStructuredMembers(type_),
         )) = &result
         {
             let state = self.store.type_payload(*type_).map(|record| {
