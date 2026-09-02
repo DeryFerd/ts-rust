@@ -19,10 +19,10 @@ use super::{
     AliasTargetState, CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics,
     CanonicalCheckerOptions, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeUnavailable,
-    ProductionAliasTargetHost, ResolvedSignatureState, SignatureLinks, SourceAssertionError,
-    SourceCheckError, SourceCheckProvenanceError, SourceFunctionInvariant, SourceLiteralCacheError,
-    SourceObjectLiteralError, SourceSyntaxRole, SymbolNodeLinks, TypeData, TypeId, TypeMapper,
-    TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks, VariableInvariant,
+    ProductionAliasTargetHost, RelationUnavailable, ResolvedSignatureState, SignatureLinks,
+    SourceAssertionError, SourceCheckError, SourceCheckProvenanceError, SourceFunctionInvariant,
+    SourceLiteralCacheError, SourceObjectLiteralError, SourceSyntaxRole, SymbolNodeLinks, TypeData,
+    TypeId, TypeMapper, TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks, VariableInvariant,
     alias::{
         CanonicalAliasResolutionError, CanonicalAliasResolutionEvent, CanonicalAliasResolver,
         CanonicalAliasTargetHost, CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
@@ -59,6 +59,7 @@ const CANNOT_REDECLARE_BLOCK_SCOPED_VARIABLE: u32 = 2_451;
 const ALSO_DECLARED_HERE: u32 = 6_203;
 const NODE_FLAG_LET: u32 = 1 << 0;
 const NODE_FLAG_CONST: u32 = 1 << 1;
+const NODE_FLAG_USING: u32 = 1 << 2;
 
 /// One checked statement inside a namespace or ambient module.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -309,6 +310,7 @@ struct ModuleValueExport {
     declarations: Box<[NodeRef]>,
     flags: SymbolFlags,
     value_declaration: Option<NodeRef>,
+    readonly: bool,
 }
 
 struct ModuleExportDeclaration {
@@ -336,6 +338,34 @@ impl ModuleValueIdentity {
 
     pub(super) const fn mark_published(&mut self) {
         self.published = true;
+    }
+}
+
+/// The original export table and its source-checked value members.
+pub(super) struct ModuleValueMembers<'a> {
+    type_: TypeId,
+    members: Option<SymbolTableId>,
+    properties: &'a [SemanticSymbolId],
+    exports: &'a [ModuleValueExport],
+}
+
+impl<'a> ModuleValueMembers<'a> {
+    pub(super) const fn type_(&self) -> TypeId {
+        self.type_
+    }
+
+    pub(super) const fn members(&self) -> Option<SymbolTableId> {
+        self.members
+    }
+
+    pub(super) const fn properties(&self) -> &'a [SemanticSymbolId] {
+        self.properties
+    }
+
+    pub(super) fn is_readonly(&self, symbol: SemanticSymbolId) -> bool {
+        self.exports
+            .iter()
+            .any(|export| export.symbol == symbol && export.readonly)
     }
 }
 
@@ -544,6 +574,52 @@ pub(super) fn native_ambient_losing_export_parent_is_exact(
         }))
 }
 
+fn module_value_export_readonly(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<bool, SourceCheckError> {
+    let invalid = || SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(symbol));
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
+    if !record.flags().intersects(SymbolFlags::VARIABLE) {
+        return Ok(false);
+    }
+    let mut declaration = record.value_declaration().ok_or_else(invalid)?;
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let mut seen = HashSet::new();
+    let root = loop {
+        if !seen.insert(declaration) {
+            return Err(invalid());
+        }
+        let node = owned_node(arena, bound, store, declaration)?;
+        if !matches!(
+            node.kind,
+            SyntaxKind::BindingElement
+                | SyntaxKind::ObjectBindingPattern
+                | SyntaxKind::ArrayBindingPattern
+        ) {
+            break node;
+        }
+        declaration = child(declaration, node.parent.ok_or_else(invalid)?);
+    };
+    if root.kind != SyntaxKind::VariableDeclaration {
+        return Ok(root.flags.0 & (NODE_FLAG_CONST | NODE_FLAG_USING) != 0);
+    }
+    let list = child(declaration, root.parent.ok_or_else(invalid)?);
+    let list_record = owned_node(arena, bound, store, list)?;
+    if list_record.kind != SyntaxKind::VariableDeclarationList {
+        return Err(invalid());
+    }
+    let mut flags = root.flags.0 | list_record.flags.0;
+    if let Some(parent) = list_record.parent {
+        let parent = owned_node(arena, bound, store, child(list, parent))?;
+        if parent.kind == SyntaxKind::VariableStatement {
+            flags |= parent.flags.0;
+        }
+    }
+    Ok(flags & (NODE_FLAG_CONST | NODE_FLAG_USING) != 0)
+}
+
 fn module_value_exports(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -627,6 +703,7 @@ fn module_value_exports(
             declarations: actual.into(),
             flags: record.flags(),
             value_declaration: record.value_declaration(),
+            readonly: module_value_export_readonly(store, host, symbol)?,
         });
     }
     Ok(members.into_boxed_slice())
@@ -1090,6 +1167,124 @@ fn module_value_type_matches(
         .map(|export| export.symbol)
         .collect::<Vec<_>>();
     object.structured.properties.as_deref().unwrap_or_default() == properties
+}
+
+/// Reuses the source-validated module plan for a store-only property read.
+#[allow(clippy::too_many_lines)] // Keep the saved owner, exports and caches in one check.
+pub(super) fn validated_module_value_members(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<ModuleValueMembers<'_>>, RelationUnavailable> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(RelationUnavailable::Type(type_))?;
+    let Some(symbol) = record.symbol() else {
+        return Ok(None);
+    };
+    let owner = store
+        .symbol(symbol)
+        .ok_or(RelationUnavailable::Symbol(symbol))?;
+    let Some(identity) = store.module_value_identity(symbol) else {
+        return Ok(None);
+    };
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+    let plan = &identity.plan;
+    if identity.type_ != type_
+        || plan.symbol != symbol
+        || !has_pure_module_flags(owner.flags())
+        || owner.flags() != plan.flags
+        || !owner.flags().contains(SymbolFlags::VALUE_MODULE)
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.declarations() != Some(plan.declarations.as_ref())
+        || owner.value_declaration() != plan.value_declaration
+        || owner.members().is_some()
+        || owner.exports() != plan.exports
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || owner
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != plan.parent
+        || store.get_parent_of_symbol(symbol) != plan.parent
+        || !module_value_type_matches(store, plan, type_)
+    {
+        return Err(invalid());
+    }
+    let expected = ValueSymbolLinks {
+        resolved_type: Some(type_),
+        ..ValueSymbolLinks::default()
+    };
+    let links_match = if identity.published {
+        store.value_symbol_links(symbol) == Some(&expected)
+    } else {
+        store
+            .value_symbol_links(symbol)
+            .is_none_or(|links| links == &ValueSymbolLinks::default())
+    };
+    if !links_match {
+        return Err(invalid());
+    }
+    for &declaration in &plan.declarations {
+        if store.source_node_kind(declaration) != Some(SyntaxKind::ModuleDeclaration)
+            || !store.source_declaration_belongs_to_symbol(declaration, symbol)
+        {
+            return Err(invalid());
+        }
+        let name = store
+            .source_child_with_kind(declaration, SyntaxKind::Identifier)
+            .or_else(|| store.source_child_with_kind(declaration, SyntaxKind::StringLiteral))
+            .ok_or_else(invalid)?;
+        for node in [declaration, name] {
+            if store.type_node_links(node).is_some_and(|links| {
+                links.outer_type_parameters.is_some()
+                    || links.resolved_type.is_some_and(|cached| cached != type_)
+            }) {
+                return Err(invalid());
+            }
+        }
+    }
+    let table = plan
+        .exports
+        .map(|exports| store.symbol_table(exports).ok_or_else(invalid))
+        .transpose()?;
+    if table.map_or(0, ts_binder::semantic::SymbolTable::len) != plan.export_members.len() {
+        return Err(invalid());
+    }
+    for export in &plan.export_members {
+        let member = store.symbol(export.symbol).ok_or_else(invalid)?;
+        let canonical = store.get_merged_symbol(export.symbol).ok_or_else(invalid)?;
+        if table.and_then(|table| table.get(export.name.as_ref())) != Some(export.symbol)
+            || member.name() != export.name.as_ref()
+            || member.flags() != export.flags
+            || member.check_flags() != CheckFlags::NONE
+            || member.declarations() != Some(export.declarations.as_ref())
+            || member.value_declaration() != export.value_declaration
+            || member
+                .parent()
+                .and_then(|parent| store.get_merged_symbol(parent))
+                != Some(symbol)
+            || store.get_parent_of_symbol(export.symbol) != Some(symbol)
+            || export.declarations.iter().any(|&declaration| {
+                !store.source_declaration_belongs_to_symbol(declaration, canonical)
+            })
+        {
+            return Err(invalid());
+        }
+    }
+    if !record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED) {
+        return Err(RelationUnavailable::UnresolvedStructuredMembers(type_));
+    }
+    let properties = record
+        .data()
+        .structured()
+        .and_then(|structured| structured.properties.as_deref())
+        .unwrap_or_default();
+    Ok(Some(ModuleValueMembers {
+        type_,
+        members: plan.exports,
+        properties,
+        exports: &plan.export_members,
+    }))
 }
 
 /// Validates a module type without resolving the types of its exports.

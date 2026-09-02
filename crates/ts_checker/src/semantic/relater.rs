@@ -77,8 +77,8 @@ use super::{
     object_aliases::source_property_object_projection,
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
-        authenticated_nongeneric_global_interface_owner, valid_thisless_interface_identity,
-        validate_resolved_declared_property_object,
+        authenticated_nongeneric_global_interface_owner, property_from_module_value_members,
+        valid_thisless_interface_identity, validate_resolved_declared_property_object,
     },
     reference_types::validate_direct_generic_reference,
     relation::{
@@ -88,6 +88,7 @@ use super::{
     },
     signatures::{ElementFlags, SignatureFlags, Ternary, TupleElementInfo},
     source_callables::validate_source_callable_signature_identity,
+    source_namespaces::validated_module_value_members,
     source_overloads::source_overload_signature_type_query,
     store::{RelationObservationToken, SemanticStore, SourceNodeParent},
     structured_members::{
@@ -10405,6 +10406,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         global_types: Option<&CanonicalGlobalTypes>,
         instantiation_session: Option<&mut InstantiationSession>,
     ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+        if let Some(members) = validated_module_value_members(self, type_id)? {
+            return property_from_module_value_members(self, members, name);
+        }
         let bootstrap = self.relation_bootstrap_facts()?;
         let mut session = RelaterSession::new_with_global_types_options_and_session(
             self,

@@ -85,7 +85,10 @@ use super::{
         CallableTypePredicatePlan, implicit_any_array_type, plan_callable_type_predicate,
         valid_planned_callable_type_predicate, valid_stored_callable_type_predicate,
     },
-    source_namespaces::authenticated_merged_namespace_interface,
+    source_namespaces::{
+        ModuleValueMembers, authenticated_merged_namespace_interface,
+        validated_module_value_members,
+    },
     store::SourceNodeParent,
     type_nodes::CanonicalTypeQuery,
     type_records::{
@@ -136,6 +139,9 @@ pub(super) fn resolve_object_property_by_key_with_alias_operand(
             name,
             global_types.map(CanonicalArrayTargets::from_global_types),
         );
+    }
+    if let Some(members) = validated_module_value_members(store, receiver)? {
+        return property_from_module_value_members(store, members, name);
     }
     if source_property_object_projection(store, receiver)?.is_some() {
         let members = match validate_property_object_alias_members_with_array_targets(
@@ -327,6 +333,27 @@ pub(super) fn property_from_source_alias_members(
 ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
     graph.validate_closed_object(store, node, receiver, array_targets)?;
     property_from_validated_members(store, receiver, name)
+}
+
+pub(super) fn property_from_module_value_members(
+    store: &CanonicalTypeMapperStore,
+    members: ModuleValueMembers<'_>,
+    name: EscapedNameRef<'_>,
+) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+    let property = members
+        .members()
+        .and_then(|table| store.symbol_table(table))
+        .and_then(|table| table.get(name));
+    if property.is_none_or(|property| !members.properties().contains(&property)) {
+        // The binder keeps type-only exports in the same table as values.
+        return Ok(None);
+    }
+    property_from_validated_members(store, members.type_(), name).map(|property| {
+        property.map(|mut property| {
+            property.readonly |= members.is_readonly(property.symbol);
+            property
+        })
+    })
 }
 
 fn property_from_validated_members(
