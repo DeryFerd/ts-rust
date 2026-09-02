@@ -3,9 +3,10 @@ use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
     EscapedName, SemanticSymbolId, SymbolFlags,
 };
+use ts_checker::semantic::types::TypeFlags;
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
-    IntrinsicBootstrapOptions, SignatureId, SignatureLinks, TypeData, TypeFlags, TypeId,
+    IntrinsicBootstrapOptions, SignatureId, SignatureLinks, TypeData, TypeId,
     TypeNodeLinks,
 };
 use ts_diagnostics::Category;
