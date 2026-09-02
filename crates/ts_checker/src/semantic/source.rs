@@ -32108,10 +32108,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     ) -> SourceCheckError {
         debug_assert!(node.is_for(self.arena.id(), self.bound.file_id()));
         if kind == SyntaxKind::NamedExports && role == SourceSyntaxRole::ExportClause {
-            let _ = std::io::Write::write_fmt(
-                &mut std::io::stderr().lock(),
+            observe_call_failure_detail(
+                "named_export_preflight",
                 format_args!(
-                    "SOURCE_NAMED_EXPORT_FAILURE node={node:?} caller={}\n",
+                    "SOURCE_NAMED_EXPORT_FAILURE node={node:?} caller={}",
                     std::panic::Location::caller(),
                 ),
             );
