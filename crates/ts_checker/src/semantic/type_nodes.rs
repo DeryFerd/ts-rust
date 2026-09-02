@@ -9646,7 +9646,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(false)
     }
 
-    /// A return union can use the type parameter declared by its function type.
+    /// A return union can use its function's own or captured alias parameters.
+    #[allow(clippy::too_many_lines)] // Keep the formal owner, return path, and callable proof together.
     fn function_type_owns_return_type_parameter_reference(
         &self,
         node: NodeRef,
@@ -9663,7 +9664,37 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let Some(owner) = declaration_record.parent else {
             return Ok(false);
         };
-        let owner = NodeRef::new(declaration.arena, declaration.file, owner);
+        let mut owner = NodeRef::new(declaration.arena, declaration.file, owner);
+        let owner_record = preflight_node(self.store, self.host, owner)?;
+        let captured = if let NodeData::TypeAliasDeclaration(alias) = &owner_record.data
+            && owner_record.kind == SyntaxKind::TypeAliasDeclaration
+        {
+            owner = NodeRef::new(owner.arena, owner.file, alias.type_);
+            let mut visited = HashSet::new();
+            loop {
+                if !visited.insert(owner) {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionType(owner),
+                    ));
+                }
+                let record = preflight_node(self.store, self.host, owner)?;
+                let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
+                    break;
+                };
+                let child = NodeRef::new(owner.arena, owner.file, parenthesized.type_);
+                if record.kind != SyntaxKind::ParenthesizedType
+                    || preflight_node(self.store, self.host, child)?.parent != Some(owner.node)
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionType(owner),
+                    ));
+                }
+                owner = child;
+            }
+            true
+        } else {
+            false
+        };
         let owner_record = preflight_node(self.store, self.host, owner)?;
         let NodeData::FunctionTypeNode(function) = &owner_record.data else {
             return Ok(false);
@@ -9723,9 +9754,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         )
         .map_err(function_type_error)?;
         Ok(planned.return_type == return_type
-            && planned.type_parameters.iter().any(|parameter| {
-                parameter.declaration == *declaration && parameter.symbol == symbol
-            }))
+            && if captured {
+                planned.alias_parameters.contains(&symbol)
+            } else {
+                planned.type_parameters.iter().any(|parameter| {
+                    parameter.declaration == *declaration && parameter.symbol == symbol
+                })
+            })
     }
 
     fn plan_source_callable_inputs(
