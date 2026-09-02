@@ -110,6 +110,33 @@ pub(super) struct SourceCallableParameterPlan {
     pub(super) rest: bool,
 }
 
+/// A fresh literal bound to its actual source default by the canonical validator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableDefaultType {
+    parameter: SourceCallableParameterPlan,
+    fresh: TypeId,
+}
+
+impl SourceCallableDefaultType {
+    pub(super) const fn parameter(self) -> SourceCallableParameterPlan {
+        self.parameter
+    }
+
+    pub(super) const fn fresh(self) -> TypeId {
+        self.fresh
+    }
+
+    pub(super) fn is_exact(
+        self,
+        store: &CanonicalTypeMapperStore,
+        function: NodeRef,
+        base_type: TypeId,
+    ) -> bool {
+        self.parameter
+            .default_type_is_exact(store, function, base_type, self.fresh)
+    }
+}
+
 impl SourceCallableParameterPlan {
     pub(super) const fn annotation_identity(self) -> (NodeRef, bool) {
         (self.identity_node, self.null_literal_identity)
@@ -164,7 +191,7 @@ impl SourceCallableParameterPlan {
     }
 
     /// Rechecks a retained default origin and its canonical fresh initializer type.
-    pub(super) fn default_type_is_exact(
+    fn default_type_is_exact(
         self,
         store: &CanonicalTypeMapperStore,
         function: NodeRef,
@@ -201,6 +228,35 @@ impl SourceCallableParameterPlan {
         self,
         store: &CanonicalTypeMapperStore,
         host: &DeclaredTypeHost<'_>,
+    ) -> Result<Option<String>, SourceCallableError> {
+        self.string_default_value_with_type(store, host, None)
+    }
+
+    pub(super) fn default_type_proof(
+        self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        fresh: TypeId,
+    ) -> Result<SourceCallableDefaultType, SourceCallableError> {
+        if self
+            .string_default_value_with_type(store, host, Some(fresh))?
+            .is_none()
+        {
+            return Err(invariant(SourceCallableInvariant::InvalidParameter(
+                self.declaration,
+            )));
+        }
+        Ok(SourceCallableDefaultType {
+            parameter: self,
+            fresh,
+        })
+    }
+
+    fn string_default_value_with_type(
+        self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        fresh: Option<TypeId>,
     ) -> Result<Option<String>, SourceCallableError> {
         let Some(origin) = self.string_default else {
             return Ok(None);
@@ -274,10 +330,10 @@ impl SourceCallableParameterPlan {
                 }
             }
         }
-        if let Some(cached) = store
+        let cached = store
             .type_node_links(origin.initializer)
-            .and_then(|links| links.resolved_type)
-        {
+            .and_then(|links| links.resolved_type);
+        if cached.is_some() || fresh.is_some() {
             let expected = store
                 .intrinsic_bootstrap()
                 .and_then(|bootstrap| match number {
@@ -285,7 +341,9 @@ impl SourceCallableParameterPlan {
                     None => bootstrap.cached_string_literal_type(text),
                 })
                 .and_then(|regular| store.fresh_type_of_literal_type(regular).ok());
-            if expected != Some(cached) {
+            if cached.is_some_and(|cached| expected != Some(cached))
+                || fresh.is_some_and(|fresh| expected != Some(fresh))
+            {
                 return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
                     self.declaration,
                 )));

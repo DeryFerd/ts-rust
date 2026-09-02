@@ -74,7 +74,7 @@ use super::{
         TypePredicateArena, TypePredicateKind,
     },
     source_callables::{
-        SourceCallableAliasAnnotation, SourceCallableAliasSnapshot, SourceCallableParameterPlan,
+        SourceCallableAliasAnnotation, SourceCallableAliasSnapshot, SourceCallableDefaultType,
         SourceCallableTypeParameterSyntaxProof, SourceDirectCallResolution,
         source_generic_index_map_syntax,
         source_type_parameter_default_is_assignable, valid_source_generic_index_map,
@@ -589,7 +589,7 @@ pub(super) struct SourceOverloadParameterProvenance {
     pub(super) base_type: TypeId,
     pub(super) call_type: TypeId,
     pub(super) optional: bool,
-    pub(super) default_parameter: Option<(SourceCallableParameterPlan, TypeId)>,
+    pub(super) default_parameter: Option<SourceCallableDefaultType>,
 }
 
 /// One declaration-order signature row owned by a source overload group.
@@ -631,7 +631,7 @@ pub(super) struct PreparedSourceOverloadParameter {
     pub(super) base_type: TypeId,
     pub(super) call_type: TypeId,
     pub(super) optional: bool,
-    pub(super) default_parameter: Option<(SourceCallableParameterPlan, TypeId)>,
+    pub(super) default_parameter: Option<SourceCallableDefaultType>,
 }
 
 /// Fully resolved signature row staged before overload publication.
@@ -12461,7 +12461,8 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                 for (index, parameter) in signature.parameters.iter().enumerate() {
                     let rest = has_rest && index + 1 == signature.parameters.len();
                     let symbol = self.symbol(parameter.symbol)?;
-                    if let Some((planned, fresh)) = parameter.default_parameter {
+                    if let Some(proof) = parameter.default_parameter {
+                        let planned = proof.parameter();
                         if !parameter.optional
                             || index < usize::try_from(signature.min_argument_count).ok()?
                             || signature.query_evidence.is_some()
@@ -12475,12 +12476,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                                     parameter.annotation,
                                     parameter.annotation_null_literal_identity,
                                 )
-                            || !planned.default_type_is_exact(
-                                self,
-                                signature.declaration,
-                                parameter.base_type,
-                                fresh,
-                            )
+                            || !proof.is_exact(self, signature.declaration, parameter.base_type)
                         {
                             return None;
                         }

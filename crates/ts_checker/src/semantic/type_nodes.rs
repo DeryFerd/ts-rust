@@ -40737,7 +40737,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     pub(super) fn source_callable_string_default_types(
         &mut self,
         callable: &SourceCallablePlan,
-    ) -> Result<BTreeMap<SemanticSymbolId, (TypeId, TypeId)>, DeclaredTypeError> {
+    ) -> Result<
+        BTreeMap<SemanticSymbolId, (TypeId, source_callables::SourceCallableDefaultType)>,
+        DeclaredTypeError,
+    > {
         let mut defaults = Vec::new();
         for parameter in callable.all_parameters() {
             if let Some(value) = parameter
@@ -40791,8 +40794,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         callable.declaration,
                     ))
                 })?;
+            let proof = parameter
+                .default_type_proof(self.store, self.host, fresh)
+                .map_err(|error| source_callable_error(error, callable.family))?;
             if parameter.base_type(self.store) != Some(type_)
-                || types.insert(parameter.symbol, (type_, fresh)).is_some()
+                || types.insert(parameter.symbol, (type_, proof)).is_some()
             {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::InvalidFunctionType(callable.declaration),

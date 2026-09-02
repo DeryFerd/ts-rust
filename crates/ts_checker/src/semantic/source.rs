@@ -63167,8 +63167,8 @@ fn materialize_source_overloads(
             let default_types = default_types?;
             let mut parameter_types = Vec::with_capacity(declaration.parameters.len());
             for parameter in &declaration.parameters {
-                if let Some((base_type, fresh)) = default_types.get(&parameter.symbol) {
-                    parameter_types.push((*base_type, Some(*fresh)));
+                if let Some((base_type, proof)) = default_types.get(&parameter.symbol) {
+                    parameter_types.push((*base_type, Some(*proof)));
                     continue;
                 }
                 session.reset_query();

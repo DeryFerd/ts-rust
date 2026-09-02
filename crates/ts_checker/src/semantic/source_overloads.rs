@@ -24,8 +24,9 @@ use super::{
     relation::RelationKind,
     signatures::SignatureFlags,
     source_callables::{
-        CallableTypePredicatePlan, SourceCallableBodyMode, SourceCallableError, SourceCallablePlan,
-        SourceCallableReturnPlan, cached_annotation_identity, plan_callable_type_predicate,
+        CallableTypePredicatePlan, SourceCallableBodyMode, SourceCallableDefaultType,
+        SourceCallableError, SourceCallablePlan, SourceCallableReturnPlan,
+        cached_annotation_identity, plan_callable_type_predicate,
         plan_source_ambient_overload_declaration, plan_source_exported_overload_declaration,
         plan_source_jsdoc_overload_declaration, valid_optional_type,
     },
@@ -117,8 +118,8 @@ impl SourceNamespaceAmbientOverloadPlan {
 #[derive(Clone, Debug)]
 pub(super) struct ResolvedSourceOverloadSignature {
     pub(super) query_evidence: Option<Arc<SourceCallableTypeQueryEvidence>>,
-    /// Base types and optional fresh default literal identities, in source order.
-    pub(super) parameter_types: Vec<(TypeId, Option<TypeId>)>,
+    /// Base types and source-checked default literal proofs, in source order.
+    pub(super) parameter_types: Vec<(TypeId, Option<SourceCallableDefaultType>)>,
     pub(super) return_type: TypeId,
 }
 
@@ -1067,24 +1068,20 @@ pub(super) fn prepare_source_overload_publication(
                 }
             };
         let mut parameters = Vec::with_capacity(declaration.parameters.len());
-        for (parameter, (base_type, fresh)) in
+        for (parameter, (base_type, default_parameter)) in
             declaration.parameters.iter().zip(&resolved.parameter_types)
         {
             let (annotation, annotation_null_literal_identity) = parameter.annotation_identity();
-            let default_parameter = fresh.map(|fresh| (*parameter, fresh));
+            let default_parameter = *default_parameter;
             let type_is_exact = match default_parameter {
-                Some((parameter, fresh)) => {
-                    declaration.type_parameters.is_empty()
+                Some(proof) => {
+                    proof.parameter() == *parameter
+                        && declaration.type_parameters.is_empty()
                         && plan.implementation.is_some_and(|implementation| {
                             implementation.declaration == declaration.declaration
                                 && implementation.body == declaration.body
                         })
-                        && parameter.default_type_is_exact(
-                            store,
-                            declaration.declaration,
-                            *base_type,
-                            fresh,
-                        )
+                        && proof.is_exact(store, declaration.declaration, *base_type)
                 }
                 None => {
                     !parameter.has_string_default_type()
@@ -1531,7 +1528,7 @@ fn source_overload_state(
                 || stored.annotation != annotation
                 || stored.annotation_null_literal_identity != null_literal_identity
                 || stored.optional != (parameter.optional || parameter.has_string_default_type())
-                || stored.default_parameter.map(|(parameter, _)| parameter)
+                || stored.default_parameter.map(|proof| proof.parameter())
                     != parameter.has_string_default_type().then_some(*parameter)
             {
                 return Err(SourceOverloadError::Invariant(
@@ -1587,7 +1584,7 @@ fn prepared_matches_plan(
                                     == prepared.annotation_null_literal_identity
                                 && (plan.optional || plan.has_string_default_type())
                                     == prepared.optional
-                                && prepared.default_parameter.map(|(parameter, _)| parameter)
+                                && prepared.default_parameter.map(|proof| proof.parameter())
                                     == plan.has_string_default_type().then_some(*plan)
                         })
                     && match prepared.return_annotation {
@@ -1940,7 +1937,8 @@ pub(super) fn validate_stored_source_overload(
                 return StoredSourceOverloadValidation::Malformed;
             };
             let type_is_exact = match parameter.default_parameter {
-                Some((planned, fresh)) => {
+                Some(proof) => {
+                    let planned = proof.parameter();
                     parameter.optional
                         && row.type_parameters.is_empty()
                         && provenance.implementation.is_some_and(|implementation| {
@@ -1953,12 +1951,7 @@ pub(super) fn validate_stored_source_overload(
                                 parameter.annotation,
                                 parameter.annotation_null_literal_identity,
                             )
-                        && planned.default_type_is_exact(
-                            store,
-                            row.declaration,
-                            parameter.base_type,
-                            fresh,
-                        )
+                        && proof.is_exact(store, row.declaration, parameter.base_type)
                 }
                 None => cached_annotation_identity(
                     store,
@@ -2034,8 +2027,8 @@ pub(super) fn validate_stored_source_overload(
                 return StoredSourceOverloadValidation::Malformed;
             }
             optional_seen |= parameter.optional;
-            if let Some((_, fresh)) = parameter.default_parameter {
-                edges.push(fresh);
+            if let Some(proof) = parameter.default_parameter {
+                edges.push(proof.fresh());
             }
             edges.push(parameter.base_type);
             if parameter.call_type != parameter.base_type {
