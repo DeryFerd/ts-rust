@@ -14541,7 +14541,6 @@ pub(super) fn plan_declared_signature_type_parameters(
     };
     let declaration_record = preflight_node(store, host, declaration).map_err(|_| unsupported())?;
     if parameters.nodes.is_empty()
-        || parameters.has_trailing_comma
         || parameters.range.start < declaration_record.range.start
         || parameters.range.end > value_parameters.range.start
         || parameters.range.start >= parameters.range.end
