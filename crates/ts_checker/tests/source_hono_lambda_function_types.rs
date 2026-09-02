@@ -4,8 +4,8 @@ use ts_binder::{
     EscapedName, SemanticSymbolId,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeError,
-    IntrinsicBootstrapOptions, SignatureId, TypeData, TypeId, TypeNodeUnavailable,
+    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SignatureId,
+    TypeData, TypeId,
 };
 use ts_diagnostics::Category;
 use ts_parser::{ParseResult, parse_source_file};
@@ -521,24 +521,86 @@ fn captured_alias_defaults_preserve_required_parameters_and_non_generic_controls
 }
 
 #[test]
-fn captured_function_alias_keeps_this_parameter_unsupported_without_publication() {
+fn captured_function_alias_keeps_separate_receiver_and_value_parameter() {
     let parsed = parse_source_file("type Receiver<T> = (this: T, value: T) => T;");
     let library = parse_source_file(ES5);
     let receiver = alias(&parsed, "Receiver");
     let mut checker = context(&parsed, &library);
+    let [formal] = receiver.formals.as_slice() else {
+        panic!("expected the alias's one type parameter");
+    };
+    let [this_parameter, value_parameter] = receiver.parameters.as_slice() else {
+        panic!("expected the written receiver and value parameters");
+    };
+    let formal_symbol = symbol(&checker, *formal);
+    let this_symbol = symbol(&checker, *this_parameter);
+    let value_symbol = symbol(&checker, *value_parameter);
+    assert_ne!(this_symbol, value_symbol);
+
+    let callable = checker.get_type_from_type_node(receiver.body).unwrap();
+    let selected = signature(&checker, callable);
+    let formal_type = checker.get_declared_type_of_symbol(formal_symbol).unwrap();
+    let store = checker.store();
+    assert_eq!(
+        store.symbol(formal_symbol).unwrap().declarations(),
+        Some(receiver.formals.as_slice())
+    );
+    let formal_record = store.type_payload(formal_type).unwrap();
+    assert_eq!(formal_record.symbol(), Some(formal_symbol));
+    let TypeData::TypeParameter(formal_data) = formal_record.data() else {
+        panic!("expected the alias's real type parameter");
+    };
+    assert!(formal_data.target.is_none());
+    assert!(formal_data.mapper.is_none());
+    assert!(!formal_data.is_this_type);
+
+    let record = store.type_payload(callable).unwrap();
+    assert_eq!(record.symbol(), Some(symbol(&checker, receiver.body)));
+    let TypeData::Object(object) = record.data() else {
+        panic!("expected the original function type");
+    };
+    assert!(object.target.is_none());
+    assert!(object.mapper.is_none());
+    let record = store.signature(selected).unwrap();
+    assert_eq!(record.declaration(), Some(receiver.body));
+    assert_eq!(record.this_parameter(), Some(this_symbol));
+    assert_eq!(record.parameters(), &[value_symbol]);
+    assert!(record.type_parameters().is_empty());
+    assert_eq!(record.min_argument_count(), 1);
+    assert!(record.target().is_none());
+    assert!(record.mapper().is_none());
+    for (parameter, declaration) in [
+        (this_symbol, *this_parameter),
+        (value_symbol, *value_parameter),
+    ] {
+        assert_eq!(
+            store.symbol(parameter).unwrap().declarations(),
+            Some(&[declaration][..])
+        );
+        let links = store.value_symbol_links(parameter).unwrap();
+        assert_eq!(links.resolved_type, Some(formal_type));
+        assert!(links.target.is_none());
+        assert!(links.mapper.is_none());
+    }
+    assert_eq!(parameter_types(&checker, selected), [formal_type]);
+    assert_eq!(
+        checker.get_return_type_of_signature(selected),
+        Ok(formal_type)
+    );
+    assert!(checker.diagnostics().is_empty());
+
     let before = snapshot(&checker, &parsed);
     for _ in 0..2 {
+        assert_eq!(checker.get_type_from_type_node(receiver.body), Ok(callable));
         assert_eq!(
-            checker.get_type_from_type_node(receiver.body),
-            Err(DeclaredTypeError::TypeNodeUnavailable(
-                TypeNodeUnavailable::UnsupportedSyntax {
-                    node: receiver.parameters[0],
-                    kind: SyntaxKind::FunctionType,
-                }
-            ))
+            checker.get_declared_type_of_symbol(formal_symbol),
+            Ok(formal_type)
         );
-        assert!(checker.store().type_node_links(receiver.body).is_none());
-        assert!(checker.store().signature_links(receiver.body).is_none());
+        assert_eq!(signature(&checker, callable), selected);
+        assert_eq!(
+            checker.get_return_type_of_signature(selected),
+            Ok(formal_type)
+        );
         assert_eq!(snapshot(&checker, &parsed), before);
         assert!(checker.diagnostics().is_empty());
     }
