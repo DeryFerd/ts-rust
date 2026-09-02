@@ -31317,7 +31317,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     );
                 }
                 SyntaxKind::TypeLiteral => {
-                    let object = self.plan.type_literals.get(&node).ok_or_else(unsupported)?;
+                    let mut object = self
+                        .plan
+                        .type_literals
+                        .get(&node)
+                        .cloned()
+                        .ok_or_else(unsupported)?;
+                    object_members::project_full_interface_computed_property_names(
+                        self.store,
+                        self.host,
+                        &mut object,
+                    )
+                    .map_err(property_object_error)?;
                     if !object.methods.is_empty()
                         || !object.accessors.is_empty()
                         || !object.spreads.is_empty()
@@ -31332,7 +31343,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     for (key, value) in object.index_type_nodes() {
                         children.extend([key, value]);
                     }
-                    if object_members::type_literal_state(self.store, object)
+                    if object_members::type_literal_state(self.store, &object)
                         .map_err(property_object_error)?
                         .is_some_and(|state| {
                             state.is_resolved()
@@ -31354,13 +31365,24 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             .collect::<Result<Vec<_>, DeclaredTypeError>>()?;
                         object_members::validate_resolved_declared_member_types(
                             self.store,
-                            object,
+                            &object,
                             &properties,
                             &indexes,
                             &[],
                         )
                         .map_err(property_object_error)?;
                     }
+                }
+                SyntaxKind::FunctionType => {
+                    let function = self.plan.functions.get(&node).ok_or_else(unsupported)?;
+                    if !function.alias_parameters.is_empty()
+                        || !function.type_parameters.is_empty()
+                        || !function.parameters.is_empty()
+                        || function.type_predicate.is_some()
+                    {
+                        return Err(unsupported());
+                    }
+                    children.push(function.return_type);
                 }
                 SyntaxKind::TypeReference => {
                     let reference = self.plan.references.get(&node).ok_or_else(unsupported)?;

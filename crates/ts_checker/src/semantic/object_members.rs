@@ -18109,11 +18109,17 @@ impl SourceAliasClosedObject {
             return Err(invalid());
         }
         for property in &plan.properties {
+            let source_matches =
+                if full_interface_computed_property_expression(store, property).is_some() {
+                    late_interface_property_name_type(store, property).is_some()
+                } else {
+                    store.source_declaration_symbol(property.declaration) == Some(property.symbol)
+                        && store.source_symbol_declarations_match(property.symbol)
+                };
             if !matches!(
                 store.source_node_kind(property.declaration),
                 Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
-            ) || store.source_declaration_symbol(property.declaration) != Some(property.symbol)
-                || !store.source_symbol_declarations_match(property.symbol)
+            ) || !source_matches
                 || store.source_direct_type_annotation(property.declaration)
                     != Some(property.type_node)
                 || store.source_node_parent(property.name_node)
@@ -18201,8 +18207,13 @@ pub(super) fn source_alias_closed_object(
     property_types: Vec<TypeId>,
     index_types: Vec<(TypeId, TypeId)>,
 ) -> Result<SourceAliasClosedObject, PropertyObjectError> {
+    let mut planned = plan.clone();
+    project_full_interface_computed_property_names(store, host, &mut planned)?;
+    let plan = &planned;
     let invalid = || invalid_cache(plan, type_);
-    if plan_type_literal(store, host, plan.node, plan.alias_symbol)? != *plan {
+    let mut current = plan_type_literal(store, host, plan.node, plan.alias_symbol)?;
+    project_full_interface_computed_property_names(store, host, &mut current)?;
+    if current != *plan {
         return Err(invalid());
     }
     let index_parameters = plan

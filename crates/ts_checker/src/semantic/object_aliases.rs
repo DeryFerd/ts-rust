@@ -14,6 +14,7 @@ use super::{
     CanonicalTypeMapperStore, DeclaredTypeHost, TypeId, TypeMapperId,
     array_types::CanonicalArrayTargets,
     declared::{cached_ordinary_type_parameter_owner, preflight_node},
+    functions::{self, FunctionTypePlan, FunctionTypeState},
     indexed_access_types::SourceAliasIndexedBoundPlan,
     instantiate::PropertyObjectAliasRecovery,
     links::{SourceFileRef, SymbolNodeLinks, TypeAliasLinks, TypeNodeLinks, ValueSymbolLinks},
@@ -223,6 +224,7 @@ enum SourceAliasOperandProof {
         children: Vec<NodeRef>,
         alias: Option<SemanticSymbolId>,
     },
+    Function(Box<FunctionTypePlan>),
     Union {
         children: Vec<NodeRef>,
         alias: Option<SemanticSymbolId>,
@@ -460,6 +462,31 @@ impl SourceAliasOperandGraph {
                     && children
                         .iter()
                         .all(|child| self.nodes.get(child).is_some_and(|row| row.closed))
+            }
+            SourceAliasOperandProof::Function(function) => {
+                children.push(function.return_type);
+                let expected_return = self.child_type(function.return_type)?;
+                let FunctionTypeState::Resolved { type_, signature } =
+                    functions::function_type_state(store, function, false)
+                        .map_err(|_| invalid())?
+                else {
+                    return Err(invalid());
+                };
+                row.children.as_slice() == [function.return_type]
+                    && type_ == row.type_
+                    && store.source_declaration_symbol(node) == Some(function.symbol)
+                    && store.source_symbol_declarations_match(function.symbol)
+                    && source_alias_direct_owner(store, node)? == function.alias_symbol
+                    && !store.signature_has_circular_return_type(signature)
+                    && store.signature(signature).is_some_and(|signature| {
+                        signature
+                            .resolved_return_type()
+                            .is_none_or(|actual| actual == expected_return)
+                    })
+                    && self
+                        .nodes
+                        .get(&function.return_type)
+                        .is_some_and(|row| row.closed)
             }
             SourceAliasOperandProof::Union {
                 children: union_children,
@@ -1036,6 +1063,26 @@ impl SourceAliasOperandGraphBuilder<'_, '_> {
                     children: object_children,
                     alias,
                 }
+            }
+            NodeData::FunctionTypeNode(_) => {
+                let function = functions::plan_function_type(
+                    self.store,
+                    self.host,
+                    node,
+                    source_alias_direct_owner(self.store, node)?,
+                    false,
+                    self.array_targets,
+                )
+                .map_err(|_| invalid())?;
+                if !function.alias_parameters.is_empty()
+                    || !function.type_parameters.is_empty()
+                    || !function.parameters.is_empty()
+                    || function.type_predicate.is_some()
+                {
+                    return Err(RelationUnavailable::UnsupportedStructuredType(type_));
+                }
+                self.read_child(function.return_type, true)?;
+                SourceAliasOperandProof::Function(Box::new(function))
             }
             NodeData::UnionTypeNode(union) => {
                 let mut union_children = Vec::new();
