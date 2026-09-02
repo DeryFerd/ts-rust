@@ -95,7 +95,7 @@ use super::{
         publish_inferred_source_callable_return, source_callable_state,
         validate_stored_source_callable,
     },
-    store::SourceNodeParent,
+    store::{SemanticStore, SourceNodeParent},
     type_nodes::{
         CanonicalJsDocImportTypeTarget, CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget,
         OrdinaryImportAliasChain, ordinary_import_alias_chain,
@@ -5806,7 +5806,31 @@ fn plan_named_type_import_at_reference(
     let alias = match resolved {
         Ok(Some(symbol))
         | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(symbol)) => symbol,
-        Ok(None) => return Ok(None),
+        Ok(None) => {
+            // A failed alias still has a real lexical import binding.
+            let Some(alias) =
+                CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut name_host)
+                    .map_err(DeclaredTypeError::from)?
+                    .resolve(
+                        Some(CanonicalResolutionLocation::Bound(name)),
+                        &identifier.text,
+                        SymbolFlags::TYPE | SymbolFlags::ALIAS,
+                        None,
+                        true,
+                        false,
+                    )
+                    .map_err(DeclaredTypeError::from)?
+            else {
+                return Ok(None);
+            };
+            if store
+                .alias_symbol_links(alias)
+                .is_none_or(|links| links.alias_target != AliasTargetState::Unknown)
+            {
+                return Ok(None);
+            }
+            alias
+        }
         Err(error) => return Err(DeclaredTypeError::from(error).into()),
     };
     plan_named_type_import_binding(store, host, annotation, &identifier.text, alias)
@@ -14210,8 +14234,8 @@ fn retained_namespace_plan_is_exact(
 }
 
 /// Checks immutable source ownership after a module's canonical symbol merge.
-pub(super) fn source_file_namespace_symbol_is_exact(
-    store: &CanonicalTypeMapperStore,
+pub(super) fn source_file_namespace_symbol_is_exact<TypePayload, MapperPayload>(
+    store: &SemanticStore<TypePayload, MapperPayload>,
     symbol: SemanticSymbolId,
     declaration: NodeRef,
 ) -> bool {

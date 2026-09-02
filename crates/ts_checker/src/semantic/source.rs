@@ -42037,6 +42037,18 @@ fn check_expression_type_with_capture_context(
                 .prepare_generic_interface_declared_members(contextual_type);
                 merge_retry_diagnostics(diagnostics, member_diagnostics);
                 prepared?;
+                if store
+                    .type_payload(contextual_type)
+                    .is_some_and(|record| matches!(record.data(), TypeData::TypeReference(_)))
+                {
+                    store.resolved_declared_property_object_with_global_types_and_session(
+                        host,
+                        contextual_type,
+                        global_types,
+                        Some(options.strict_function_types),
+                        session,
+                    )?;
+                }
                 // Contextual preflight reads members without a source query session.
                 if super::object_aliases::source_property_object_projection(store, contextual_type)?
                     .is_some()

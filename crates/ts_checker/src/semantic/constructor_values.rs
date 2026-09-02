@@ -7,6 +7,8 @@
 //! The global `TypeLiteral` path uses the full canonical annotation query.
 //! Named global constructors keep the full named interface publication.
 
+use std::borrow::Cow;
+
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
 
@@ -280,7 +282,7 @@ pub(super) fn plan_global_constructor_value(
         kind: GlobalConstructorValueKind::TypeLiteral,
     };
     validate_global_annotation_caches(store, host, &plan)?;
-    let ready = read_global_constructor_literal(store, &plan)?;
+    let ready = read_global_constructor_with_current_owner(store, host, &plan)?;
     if value.cached_type.is_some_and(|cached| {
         ready
             .as_ref()
@@ -435,7 +437,7 @@ fn plan_named_constructor_worker(
         },
     };
     validate_global_annotation_caches(store, host, &plan)?;
-    let ready = read_global_named_constructor(store, &plan)?;
+    let ready = read_global_constructor_with_current_owner(store, host, &plan)?;
     if value.cached_type.is_some_and(|cached| {
         ready
             .as_ref()
@@ -444,6 +446,24 @@ fn plan_named_constructor_worker(
         return Err(invalid());
     }
     Ok(Some(plan))
+}
+
+/// Retained named plans follow checked late property names and their member table.
+fn project_global_constructor_plan<'plan>(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &'plan GlobalConstructorValuePlan,
+) -> Result<Cow<'plan, GlobalConstructorValuePlan>, DeclaredConstructorValueError> {
+    if plan.kind == GlobalConstructorValueKind::TypeLiteral {
+        return Ok(Cow::Borrowed(plan));
+    }
+    let mut projected = plan.clone();
+    object_members::project_full_interface_computed_property_names(
+        store,
+        host,
+        &mut projected.owner,
+    )?;
+    Ok(Cow::Owned(projected))
 }
 
 fn validate_global_plan(
@@ -471,7 +491,8 @@ fn validate_global_plan(
             plan.value_symbol(),
         )?,
     };
-    if current.as_ref() != Some(plan) {
+    let expected = project_global_constructor_plan(store, host, plan)?;
+    if current.as_ref() != Some(expected.as_ref()) {
         return Err(DeclaredConstructorValueError::InvalidValue(
             plan.value_symbol,
         ));
@@ -525,6 +546,15 @@ fn validate_global_annotation_caches(
 }
 
 /// The full member and signature readers also check every later overload.
+fn read_global_constructor_with_current_owner(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &GlobalConstructorValuePlan,
+) -> Result<Option<GlobalConstructorCandidates>, DeclaredConstructorValueError> {
+    let plan = project_global_constructor_plan(store, host, plan)?;
+    read_global_constructor_literal(store, plan.as_ref())
+}
+
 #[allow(clippy::too_many_lines)] // Source signatures, member state and Array authority form one read.
 fn read_global_constructor_literal(
     store: &CanonicalTypeMapperStore,
@@ -715,7 +745,7 @@ pub(super) fn resolve_global_constructor_candidates(
     plan: &GlobalConstructorValuePlan,
 ) -> Result<Option<GlobalConstructorCandidates>, DeclaredConstructorValueError> {
     validate_global_plan(store, host, globals, options, plan)?;
-    let ready = read_global_constructor_literal(store, plan)?;
+    let ready = read_global_constructor_with_current_owner(store, host, plan)?;
     let Some(ready) = ready else {
         return Ok(None);
     };
@@ -794,7 +824,7 @@ pub(super) fn prepare_global_constructor_candidates(
             return Ok(ready);
         }
         observation = ("read_initial", "value_annotation", annotation);
-        if read_global_constructor_literal(store, plan)?.is_none() {
+        if read_global_constructor_with_current_owner(store, host, plan)?.is_none() {
             observation = ("query_create", "value_annotation", annotation);
             let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
                 store,
@@ -815,7 +845,8 @@ pub(super) fn prepare_global_constructor_candidates(
         validate_global_plan(store, host, globals, options, plan)?;
         let invalid = || DeclaredConstructorValueError::InvalidValue(plan.value_symbol);
         observation = ("read_final", "value_annotation", annotation);
-        let ready = read_global_constructor_literal(store, plan)?.ok_or_else(invalid)?;
+        let ready = read_global_constructor_with_current_owner(store, host, plan)?
+            .ok_or_else(invalid)?;
         let value = if plan.kind != GlobalConstructorValueKind::TypeLiteral {
             observation = ("value_plan_named", "value_annotation", annotation);
             if plan.kind == GlobalConstructorValueKind::SourceNamedGeneric {

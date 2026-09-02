@@ -62,7 +62,8 @@ use super::{
     },
     generic_calls::{
         demand_generic_call_signature_return_with_session,
-        preflight_generic_call_signature_return_target,
+        demand_generic_call_signature_return_with_source,
+        preflight_generic_call_signature_return_target_with_source,
     },
     global_types::{
         GlobalThisMember, GlobalThisMembers, create_type_from_generic_global_type,
@@ -41107,11 +41108,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .map_err(|_| {
                     type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
                 })?;
+                let source_context = if member_return.is_none() && self.global_types.is_some() {
+                    Some(self.source_query_context()?)
+                } else {
+                    None
+                };
                 if member_return.is_none()
-                    && preflight_generic_call_signature_return_target(
+                    && preflight_generic_call_signature_return_target_with_source(
                         self.store,
                         array_targets,
                         signature,
+                        source_context.as_ref().map(|source| {
+                            (&source.globals, source as &dyn ConditionalBranchSource)
+                        }),
                     )
                     .map_err(|_| {
                         type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
@@ -41144,6 +41153,39 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             ))
                         })?;
                         return Ok(actual);
+                    }
+                    if self.global_types.is_some() {
+                        let context = self.source_query_context()?;
+                        let globals = context.globals.clone();
+                        let mut source = SourceTypeQueryAdapter {
+                            context,
+                            diagnostics: self.diagnostics,
+                        };
+                        let mut fallback =
+                            InstantiationSession::new(InstantiationLimits::default());
+                        let session = self
+                            .instantiation_session
+                            .as_deref_mut()
+                            .unwrap_or(&mut fallback);
+                        let result = demand_generic_call_signature_return_with_source(
+                            self.store,
+                            &globals,
+                            signature,
+                            session,
+                            &mut source,
+                        );
+                        self.global_this_members = source.context.members;
+                        self.completed_source_conditionals = source.context.completed;
+                        self.new_source_conditionals.extend(source.context.produced);
+                        self.completed_global_values = source.context.values;
+                        self.source_branch_recoveries = source.context.recoveries;
+                        self.source_conditional_recoveries = source.context.semantic_results;
+                        self.completed_source_returns = source.context.returns;
+                        return result.map_err(|_| {
+                            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                                signature,
+                            ))
+                        });
                     }
                     if let Some(session) = self.instantiation_session.as_deref_mut() {
                         demand_generic_call_signature_return_with_session(

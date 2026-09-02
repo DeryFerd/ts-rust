@@ -2154,6 +2154,20 @@ pub(super) fn preflight_generic_call_signature_return_target(
     array_targets: Option<CanonicalArrayTargets>,
     signature: SignatureId,
 ) -> Result<SignatureId, GenericCallVectorError> {
+    preflight_generic_call_signature_return_target_with_source(
+        store,
+        array_targets,
+        signature,
+        None,
+    )
+}
+
+pub(super) fn preflight_generic_call_signature_return_target_with_source(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    signature: SignatureId,
+    source: GenericCallSourceValidation<'_>,
+) -> Result<SignatureId, GenericCallVectorError> {
     let instantiated = store.signature(signature).ok_or(
         GenericCallVectorInvariant::InvalidCachedInstantiation {
             target: signature,
@@ -2193,8 +2207,14 @@ pub(super) fn preflight_generic_call_signature_return_target(
         })
         .collect::<Result<Vec<_>, _>>()?;
     if store.type_mapper_has_exact_endpoints(mapper, &sources, &type_arguments) != Some(true)
-        || validate_generic_call_vector_shell(store, &shape, &sources, &type_arguments, signature)?
-            != mapper
+        || validate_generic_call_vector_shell_with_source(
+            store,
+            &shape,
+            &sources,
+            &type_arguments,
+            signature,
+            source,
+        )? != mapper
         || !fixed_contextual_return_cache_is_exact(store, target, &type_arguments, signature)
     {
         return Err(
@@ -2266,6 +2286,32 @@ pub(super) fn demand_generic_call_signature_return_with_session(
     signature: SignatureId,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, GenericCallVectorError> {
+    demand_generic_call_signature_return_worker(store, array_targets, signature, session, None)
+}
+
+pub(super) fn demand_generic_call_signature_return_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    signature: SignatureId,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<TypeId, GenericCallVectorError> {
+    demand_generic_call_signature_return_worker(
+        store,
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+        signature,
+        session,
+        Some((globals, source)),
+    )
+}
+
+fn demand_generic_call_signature_return_worker(
+    store: &mut CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    signature: SignatureId,
+    session: &mut InstantiationSession,
+    source: Option<(&CanonicalGlobalTypes, &mut dyn ConditionalBranchSource)>,
+) -> Result<TypeId, GenericCallVectorError> {
     let instantiated = store.signature(signature).ok_or(
         GenericCallVectorInvariant::InvalidCachedInstantiation {
             target: signature,
@@ -2309,7 +2355,26 @@ pub(super) fn demand_generic_call_signature_return_with_session(
             GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature }.into(),
         );
     }
-    demand_generic_call_vector_return(store, &shape, &sources, &type_arguments, signature, session)
+    match source {
+        Some((globals, source)) => demand_generic_call_vector_return_from_source(
+            store,
+            &shape,
+            &sources,
+            &type_arguments,
+            signature,
+            globals,
+            session,
+            source,
+        ),
+        None => demand_generic_call_vector_return(
+            store,
+            &shape,
+            &sources,
+            &type_arguments,
+            signature,
+            session,
+        ),
+    }
 }
 
 /// Revalidates the original owner of a checked signature, including a contextual call.
@@ -10271,11 +10336,33 @@ pub(super) fn demand_generic_call_vector_return_with_source(
         Some((globals, source)),
     )?;
     let signature = projection.instantiation.signature;
-    let mapper = validate_generic_call_vector_shell_with_source(
+    demand_generic_call_vector_return_from_source(
         store,
         &shape,
         &sources,
         &projection.instantiation.type_arguments,
+        signature,
+        globals,
+        session,
+        source,
+    )
+}
+
+fn demand_generic_call_vector_return_from_source(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    sources: &[TypeId],
+    type_arguments: &[TypeId],
+    signature: SignatureId,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<TypeId, GenericCallVectorError> {
+    let mapper = validate_generic_call_vector_shell_with_source(
+        store,
+        shape,
+        sources,
+        type_arguments,
         signature,
         Some((globals, source)),
     )?;
@@ -10298,8 +10385,8 @@ pub(super) fn demand_generic_call_vector_return_with_source(
         shape.array_targets,
         shape.return_type,
         resolved,
-        &sources,
-        &projection.instantiation.type_arguments,
+        sources,
+        type_arguments,
         Some((globals, source)),
     ) {
         return Err(

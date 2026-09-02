@@ -4906,9 +4906,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || self.source_node_kind(declaration) == Some(SyntaxKind::FunctionExpression)
                 && symbol.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
         {
-            return symbol.parent().is_none()
-                && self.source_node_kind(anchor_declaration)
-                    == Some(SyntaxKind::VariableDeclaration)
+            return self.source_contextual_variable_parent_is_exact(
+                declaration,
+                anchor,
+                anchor_declaration,
+            ) && self.source_node_kind(anchor_declaration)
+                == Some(SyntaxKind::VariableDeclaration)
                 && (owner.exports().is_none()
                     || self.source_contextual_variable_expando_exports_are_exact(
                         declaration,
@@ -4952,6 +4955,78 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .members()
                 .and_then(|members| self.symbol_table(members))
                 .and_then(|members| members.get(symbol.name()))
+                == Some(anchor)
+    }
+
+    fn source_contextual_variable_parent_is_exact(
+        &self,
+        declaration: NodeRef,
+        anchor: SemanticSymbolId,
+        variable: NodeRef,
+    ) -> bool {
+        let Some(symbol) = self.symbol(anchor) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(list)) = self.source_node_parent(variable) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(statement)) = self.source_node_parent(list) else {
+            return false;
+        };
+        if self
+            .source_child_with_kind(statement, SyntaxKind::ExportKeyword)
+            .is_none()
+        {
+            return symbol.parent().is_none();
+        }
+        let Some(parent) = symbol.parent() else {
+            return false;
+        };
+        let Some(module) = self.get_merged_symbol(parent) else {
+            return false;
+        };
+        let Some(module_record) = self.symbol(module) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(source)) = self.source_node_parent(statement) else {
+            return false;
+        };
+        let Some(facts) = self.source_file_facts.get(&declaration.file) else {
+            return false;
+        };
+        let parent_is_exact = parent == module
+            || self.symbol(parent).is_some_and(|original| {
+                original.flags() == SymbolFlags::VALUE_MODULE
+                    && original.declarations() == Some(&[source])
+                    && original.value_declaration() == Some(source)
+                    && original.parent().is_none()
+                    && original.members().is_none()
+                    && original.export_symbol().is_none()
+                    && self.source_raw_symbol_declarations_match(parent)
+            });
+        facts.is_external_module()
+            && !facts.is_javascript_file()
+            && !facts.is_common_js_module()
+            && parent_is_exact
+            && self.source_node_parent(declaration) == Some(SourceNodeParent::Parent(variable))
+            && self.source_node_kind(list) == Some(SyntaxKind::VariableDeclarationList)
+            && self.source_node_kind(statement) == Some(SyntaxKind::VariableStatement)
+            && self
+                .source_files
+                .get(&declaration.file)
+                .map(|file| file.node_ref())
+                == Some(source)
+            && self.source_declaration_belongs_to_symbol(variable, anchor)
+            && self.source_symbol_declarations_match(anchor)
+            && self.source_declaration_symbol(source) == Some(module)
+            && super::source_imports::source_file_namespace_symbol_is_exact(self, module, source)
+            && module_record.name() == facts.source_file_symbol_name()
+            && (module_record.flags().contains(SymbolFlags::TRANSIENT)
+                || self.source_symbol_export_table_matches(module))
+            && module_record
+                .exports()
+                .and_then(|exports| self.symbol_table(exports))
+                .and_then(|exports| exports.get(symbol.name()))
                 == Some(anchor)
     }
 
