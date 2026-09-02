@@ -1862,12 +1862,7 @@ fn supported_mapped_alias_projection_inner(
     let identity = store
         .mapped_alias_display_identity(type_, alias)
         .map_err(|error| selection_alias_cache_error(type_, error))?;
-    // A forwarding alias needs its own concrete alias-cache proof. The
-    // installed declaration-only wrapper proof must not authorize that result.
-    if identity.symbol != alias {
-        return Ok(None);
-    }
-    if identity.arguments != arguments {
+    if identity.symbol == alias && identity.arguments != arguments {
         return Err(invalid());
     }
     Ok(Some(SupportedMappedAliasProjection {
@@ -2098,12 +2093,31 @@ fn validate_supported_mapped_alias_instance_request(
     {
         return Err(MappedTypeError::InvalidMappedType(projection.type_));
     }
-    if identity.0 != projection.alias {
-        return Err(MappedTypeError::UnsupportedSource(projection.type_));
-    }
-    if identity.1 != arguments {
+    if identity.0 == projection.alias && identity.1 != arguments {
         return Err(MappedTypeError::InvalidMappedType(projection.type_));
     }
+    let identity_key = if identity.0 == projection.alias {
+        None
+    } else {
+        if identity.0 != projection.identity_symbol
+            || forwarded_mapped_alias_arguments(
+                store,
+                projection.declared_type,
+                identity.0,
+                identity.1,
+                array_targets,
+            )? != arguments
+        {
+            return Err(MappedTypeError::InvalidMappedType(projection.type_));
+        }
+        Some((
+            store
+                .symbol_store()
+                .assigned_global_symbol_id(identity.0)
+                .ok_or(MappedTypeError::InvalidSymbol(identity.0))?,
+            identity.1,
+        ))
+    };
     validate_supported_mapped_alias_source(store, arguments[0], array_targets)?;
     projection
         .kind
@@ -2115,7 +2129,7 @@ fn validate_supported_mapped_alias_instance_request(
             arguments,
         )
         .map_err(|error| selection_alias_cache_error(projection.type_, error))?;
-    Ok(type_alias_instantiation_cache_key(arguments, None))
+    Ok(type_alias_instantiation_cache_key(arguments, identity_key))
 }
 
 /// Reads the same canonical alias cache used by type-node queries.
@@ -2133,10 +2147,13 @@ pub(super) fn cached_supported_mapped_alias_instance(
         identity,
         array_targets,
     )?;
-    if arguments == projection.arguments && identity.1 == projection.identity_arguments {
+    if arguments == projection.arguments
+        && identity.0 == projection.identity_symbol
+        && identity.1 == projection.identity_arguments
+    {
         return Ok(Some(projection.type_));
     }
-    if arguments == projection.type_parameters {
+    if identity.0 == projection.alias && arguments == projection.type_parameters {
         return Ok(Some(projection.declared_type));
     }
     let cached = store
@@ -2221,7 +2238,16 @@ fn instantiate_supported_mapped_alias_instance_worker(
     )? {
         return Ok(cached);
     }
-    let key = type_alias_instantiation_cache_key(arguments, None);
+    let key = validate_supported_mapped_alias_instance_request(
+        store,
+        projection,
+        arguments,
+        identity,
+        array_targets,
+    )?;
+    if identity.0 != projection.alias && arguments == projection.type_parameters {
+        return Err(MappedTypeError::UnsupportedSource(projection.type_));
+    }
     let mut links = store
         .type_alias_links(projection.alias)
         .cloned()
@@ -2284,6 +2310,533 @@ fn instantiate_supported_mapped_alias_instance_worker(
         return Err(MappedTypeError::InvalidMappedType(result));
     }
     Ok(result)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GenericMappedTypeProjection {
+    pub(super) type_: TypeId,
+    pub(super) target: TypeId,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    parameter: TypeId,
+    alias: Option<SemanticSymbolId>,
+    pub(super) parameters: Vec<TypeId>,
+    pub(super) arguments: Vec<TypeId>,
+}
+
+fn source_mapped_parameter_constraint(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<TypeId>, MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidTypeParameter(type_);
+    let TypeData::TypeParameter(parameter) = store.type_payload(type_).ok_or_else(invalid)?.data()
+    else {
+        return Err(invalid());
+    };
+    let owner = cached_ordinary_type_parameter_owner(store, type_).ok_or_else(invalid)?;
+    let Some([declaration]) = store.symbol(owner).and_then(|owner| owner.declarations()) else {
+        return Err(invalid());
+    };
+    let annotations = store
+        .source_type_parameter_annotations(*declaration)
+        .ok_or_else(invalid)?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(MappedTypeError::BootstrapUninitialized)?;
+    match (annotations.constraint, parameter.constraint) {
+        (None, cached) if cached.is_none_or(|cached| cached == bootstrap.no_constraint_type) => {
+            Ok(None)
+        }
+        (Some(node), Some(type_)) if store.source_direct_type_annotation_is_exact(node, type_) => {
+            Ok(Some(type_))
+        }
+        _ => Err(invalid()),
+    }
+}
+
+pub(super) fn mapped_modifiers_type_from_constraint(
+    store: &CanonicalTypeMapperStore,
+    constraint: TypeId,
+) -> Result<Option<TypeId>, MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidMappedType(constraint);
+    let mut extended = constraint;
+    if matches!(
+        store.type_payload(constraint).ok_or_else(invalid)?.data(),
+        TypeData::TypeParameter(_)
+    ) {
+        match source_mapped_parameter_constraint(store, constraint)? {
+            Some(type_) => extended = type_,
+            None => return Ok(None),
+        }
+    }
+    let record = store.type_payload(extended).ok_or_else(invalid)?;
+    if !matches!(record.data(), TypeData::Index(_)) {
+        return Ok(None);
+    }
+    validate_generic_keyof_index_type(store, extended)
+        .map(Some)
+        .map_err(|_| invalid())
+}
+
+/// Finds the outer formals used by a written mapped type. An inline mapped
+/// type does not capture a formal merely because another formal constrains it.
+#[allow(clippy::too_many_lines)] // Source operands, cloned formals, and both cache entries form one proof.
+pub(super) fn generic_mapped_type_projection(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<GenericMappedTypeProjection>, MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidMappedType(type_);
+    let Some(TypeData::Mapped(mapped)) = store.type_payload(type_).map(TypeRecord::data) else {
+        return Ok(None);
+    };
+    let target = mapped.object.target.unwrap_or(type_);
+    let original_record = store.type_payload(target).ok_or_else(invalid)?;
+    let TypeData::Mapped(original) = original_record.data() else {
+        return Err(invalid());
+    };
+    // Existing utility instances retain their alias cache, not this object cache.
+    if target != type_ && original.object.instantiations == TypeCacheState::Unallocated {
+        return Ok(None);
+    }
+    let declaration = original.declaration.ok_or_else(invalid)?;
+    let mut parent = declaration;
+    let mut seen = HashSet::new();
+    let alias_declaration = loop {
+        if seen.len() >= 16 || !seen.insert(parent) {
+            return Err(invalid());
+        }
+        let Some(SourceNodeParent::Parent(next)) = store.source_node_parent(parent) else {
+            return Ok(None);
+        };
+        match store.source_node_kind(next) {
+            Some(SyntaxKind::TypeAliasDeclaration) => break next,
+            Some(SyntaxKind::IntersectionType | SyntaxKind::ParenthesizedType) => parent = next,
+            _ => return Ok(None),
+        }
+    };
+    let alias_symbol = store
+        .source_declaration_symbol(alias_declaration)
+        .ok_or_else(invalid)?;
+    let header =
+        property_object_alias_identity_source_header(store, alias_symbol).map_err(|_| invalid())?;
+    if header.alias_declaration != alias_declaration || header.parameters.is_empty() {
+        return Ok(None);
+    }
+    let direct_alias = store.source_direct_type_annotation(alias_declaration) == Some(declaration);
+    let mut referenced = HashSet::new();
+    let mut nodes = vec![declaration];
+    let mut visited = HashSet::new();
+    while let Some(node) = nodes.pop() {
+        if !visited.insert(node) {
+            return Err(invalid());
+        }
+        if store.source_node_kind(node) == Some(SyntaxKind::TypeReference)
+            && let Some(symbol) = store
+                .symbol_node_links(node)
+                .and_then(|links| links.resolved_symbol)
+        {
+            referenced.insert(symbol);
+        }
+        for child in store.source_direct_children(node).ok_or_else(invalid)? {
+            if store.source_node_parent(child) != Some(SourceNodeParent::Parent(node)) {
+                return Err(invalid());
+            }
+            nodes.push(child);
+        }
+    }
+    let parameters = header
+        .parameters
+        .iter()
+        .filter(|(_, symbol)| direct_alias || referenced.contains(symbol))
+        .map(|(_, symbol)| {
+            store
+                .declared_type_links(*symbol)
+                .and_then(|links| links.declared_type)
+                .filter(|type_| {
+                    cached_ordinary_type_parameter_owner(store, *type_) == Some(*symbol)
+                })
+                .ok_or_else(invalid)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let symbol = original_record.symbol().ok_or_else(invalid)?;
+    let parameter = original.type_parameter.ok_or_else(invalid)?;
+    let operands = store
+        .source_mapped_type_operands(declaration)
+        .ok_or_else(invalid)?;
+    let request = MappedTypeRequest::new(
+        declaration,
+        symbol,
+        parameter,
+        original.constraint_type.ok_or_else(invalid)?,
+        original.template_type.ok_or_else(invalid)?,
+        original.modifiers_type.ok_or_else(invalid)?,
+    );
+    let request = original
+        .name_type
+        .map_or(request, |name| request.with_name_type(name));
+    validate_mapped_request(store, request)?;
+    validate_request_record(store, request, target)?;
+    let parameter_owner =
+        cached_ordinary_type_parameter_owner(store, parameter).ok_or_else(invalid)?;
+    let links = store.type_node_links(declaration).ok_or_else(invalid)?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(MappedTypeError::BootstrapUninitialized)?;
+    let source_flags = ObjectFlags::MAPPED
+        | ObjectFlags::MEMBERS_RESOLVED
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+        | ObjectFlags::PROPAGATING_FLAGS;
+    if original_record.flags() != TypeFlags::OBJECT
+        || !original_record.object_flags().contains(ObjectFlags::MAPPED)
+        || !(original_record.object_flags() & !source_flags).is_empty()
+        || original.object.target.is_some()
+        || original.object.mapper.is_some()
+        || original_record.alias().is_some()
+        || original.contains_error
+        || links.resolved_type != Some(target)
+        || links
+            .outer_type_parameters
+            .as_ref()
+            .is_some_and(|saved| *saved != parameters)
+        || !store.source_declaration_belongs_to_symbol(declaration, symbol)
+        || !store.source_symbol_declarations_match(symbol)
+        || store
+            .symbol(parameter_owner)
+            .and_then(|owner| owner.declarations())
+            != Some(&[operands.type_parameter][..])
+        || !matches!(store.type_payload(parameter).map(TypeRecord::data),
+            Some(TypeData::TypeParameter(parameter)) if parameter.constraint == Some(request.constraint_type))
+        || !store
+            .source_direct_type_annotation_is_exact(operands.constraint, request.constraint_type)
+        || !operands
+            .template
+            .map_or(request.template_type == bootstrap.any_type, |node| {
+                store.source_direct_type_annotation_is_exact(node, request.template_type)
+            })
+        || match (operands.name_type, original.name_type) {
+            (None, None) => false,
+            (Some(node), Some(type_)) => !store.source_direct_type_annotation_is_exact(node, type_),
+            _ => true,
+        }
+    {
+        return Err(invalid());
+    }
+    if store.source_type_operator(operands.constraint) == Some(SyntaxKind::KeyOfKeyword) {
+        let source = store
+            .source_direct_type_annotation(operands.constraint)
+            .ok_or_else(invalid)?;
+        if !store.source_direct_type_annotation_is_exact(source, request.modifiers_type) {
+            return Err(invalid());
+        }
+    } else if request.modifiers_type
+        != mapped_modifiers_type_from_constraint(store, request.constraint_type)?
+            .unwrap_or(bootstrap.unknown_type)
+    {
+        return Err(invalid());
+    }
+    let arguments = if target == type_ {
+        parameters.clone()
+    } else {
+        let mapper = mapped.object.mapper.ok_or_else(invalid)?;
+        let Some(TypeMapperApplication::Composite { second, .. }) =
+            store.mapper_application(mapper, parameter)
+        else {
+            return Err(invalid());
+        };
+        let arguments = parameters
+            .iter()
+            .map(|type_| store.map_type(second, *type_).ok_or_else(invalid))
+            .collect::<Result<Vec<_>, _>>()?;
+        if store.type_mapper_has_exact_endpoints(second, &parameters, &arguments) != Some(true)
+            || mapped_type_parameter_owner(store, type_, mapped.type_parameter.ok_or_else(invalid)?)
+                != cached_ordinary_type_parameter_owner(store, parameter)
+            || mapped.object.instantiations != TypeCacheState::Unallocated
+            || mapped.contains_error
+            || !store.type_payload(type_).is_some_and(|record| {
+                record.flags() == TypeFlags::OBJECT
+                    && record
+                        .object_flags()
+                        .contains(ObjectFlags::INSTANTIATED_MAPPED)
+                    && (record.object_flags() & !(source_flags | ObjectFlags::INSTANTIATED_MAPPED))
+                        .is_empty()
+                    && record.symbol() == Some(symbol)
+            })
+        {
+            return Err(invalid());
+        }
+        let mut sources = parameters.clone();
+        let mut targets = arguments.clone();
+        sources.push(parameter);
+        targets.push(mapped.type_parameter.ok_or_else(invalid)?);
+        match (original.name_type, mapped.name_type) {
+            (None, None) => {}
+            (Some(source), Some(actual))
+                if cached_instantiation_with_vector(
+                    store,
+                    source,
+                    &sources,
+                    &targets,
+                    array_targets,
+                    None,
+                )
+                .map_err(|_| invalid())?
+                    == Some(actual) => {}
+            _ => return Err(invalid()),
+        }
+        arguments
+    };
+    let identity = store.type_payload(type_).and_then(TypeRecord::alias);
+    if target != type_ && direct_alias {
+        let identity = identity
+            .and_then(|identity| store.type_alias(identity))
+            .ok_or_else(invalid)?;
+        if identity.symbol() != Some(alias_symbol)
+            || identity.type_arguments().unwrap_or_default() != arguments
+        {
+            return Err(invalid());
+        }
+    } else if identity.is_some() {
+        return Err(invalid());
+    }
+    if !store.type_payload(type_).is_some_and(|record| {
+        record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+    }) && !unresolved_mapped_structure_is_valid(store, type_, &mapped.object.structured)
+    {
+        return Err(invalid());
+    }
+    match &original.object.instantiations {
+        TypeCacheState::Unallocated if target == type_ && links.outer_type_parameters.is_none() => {
+        }
+        TypeCacheState::Allocated(cache)
+            if links.outer_type_parameters.as_deref() == Some(parameters.as_slice())
+                && cache.get(&type_alias_instantiation_cache_key(&parameters, None))
+                    == Some(&target)
+                && cache.get(&type_alias_instantiation_cache_key(&arguments, None))
+                    == Some(&type_) => {}
+        _ => return Err(invalid()),
+    }
+    Ok(Some(GenericMappedTypeProjection {
+        type_,
+        target,
+        declaration,
+        symbol,
+        parameter,
+        alias: direct_alias.then_some(alias_symbol),
+        parameters,
+        arguments,
+    }))
+}
+
+pub(super) fn cached_generic_mapped_type_instance(
+    store: &CanonicalTypeMapperStore,
+    projection: &GenericMappedTypeProjection,
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidMappedType(projection.type_);
+    if generic_mapped_type_projection(store, projection.type_, array_targets)?.as_ref()
+        != Some(projection)
+        || arguments.len() != projection.parameters.len()
+        || arguments
+            .iter()
+            .any(|type_| store.type_payload(*type_).is_none())
+    {
+        return Err(invalid());
+    }
+    if arguments == projection.arguments {
+        return Ok(Some(projection.type_));
+    }
+    if arguments == projection.parameters {
+        return Ok(Some(projection.target));
+    }
+    let key = type_alias_instantiation_cache_key(arguments, None);
+    let Some(cached) = store.relation_object_instantiation(projection.target, key) else {
+        return Ok(None);
+    };
+    let actual =
+        generic_mapped_type_projection(store, cached, array_targets)?.ok_or_else(invalid)?;
+    if actual.target != projection.target
+        || actual.parameters != projection.parameters
+        || actual.arguments != arguments
+    {
+        return Err(invalid());
+    }
+    Ok(Some(cached))
+}
+
+/// Substitutes mapped operands through the normal type instantiator. The
+/// mapped parameter stays local and receives its own declaration-linked clone.
+#[allow(clippy::too_many_lines)] // Publish the operands, local mapper, and identity in one caller frame.
+pub(super) fn instantiate_generic_mapped_type_instance(
+    store: &mut CanonicalTypeMapperStore,
+    projection: &GenericMappedTypeProjection,
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, MappedTypeError> {
+    if let Some(cached) =
+        cached_generic_mapped_type_instance(store, projection, arguments, array_targets)?
+    {
+        return Ok(cached);
+    }
+    let invalid = || MappedTypeError::InvalidMappedType(projection.target);
+    let TypeData::Mapped(original) = store
+        .type_payload(projection.target)
+        .ok_or_else(invalid)?
+        .data()
+    else {
+        return Err(invalid());
+    };
+    let original = original.clone();
+    let mark = session.limit_event_mark();
+    let constraint = instantiate_type_with_vector_and_session(
+        store,
+        original.constraint_type.ok_or_else(invalid)?,
+        &projection.parameters,
+        arguments,
+        array_targets,
+        session,
+    )
+    .map_err(|error| mapped_instantiation_error(projection.target, &error))?;
+    if session.limit_event_occurred_since(mark) {
+        return session.recovery_error_type().ok_or_else(invalid);
+    }
+    if !store.try_reserve_types(2)
+        || !store.try_reserve_mappers(3)
+        || !store.try_reserve_type_node_links(1)
+        || !store.try_reserve_type_aliases(usize::from(projection.alias.is_some()))
+    {
+        return Err(MappedTypeError::Capacity);
+    }
+    let owner =
+        cached_ordinary_type_parameter_owner(store, projection.parameter).ok_or_else(invalid)?;
+    let parameter = store
+        .alloc_type_parameter(Some(owner))
+        .ok_or(MappedTypeError::Capacity)?;
+    let outer = store
+        .new_type_mapper(projection.parameters.clone(), arguments.to_vec())
+        .ok_or_else(invalid)?;
+    let local = store
+        .new_simple_type_mapper(projection.parameter, parameter)
+        .ok_or_else(invalid)?;
+    let mapper = store
+        .combine_type_mappers(Some(local), outer)
+        .ok_or_else(invalid)?;
+    if !store.set_type_parameter_resolution(
+        parameter,
+        Some(constraint),
+        Some(projection.parameter),
+        Some(mapper),
+        None,
+    ) {
+        return Err(invalid());
+    }
+    let mut sources = projection.parameters.clone();
+    let mut targets = arguments.to_vec();
+    sources.push(projection.parameter);
+    targets.push(parameter);
+    let template = instantiate_type_with_vector_and_session(
+        store,
+        original.template_type.ok_or_else(invalid)?,
+        &sources,
+        &targets,
+        array_targets,
+        session,
+    )
+    .map_err(|error| mapped_instantiation_error(projection.target, &error))?;
+    let modifiers = instantiate_type_with_vector_and_session(
+        store,
+        original.modifiers_type.ok_or_else(invalid)?,
+        &projection.parameters,
+        arguments,
+        array_targets,
+        session,
+    )
+    .map_err(|error| mapped_instantiation_error(projection.target, &error))?;
+    let name = original
+        .name_type
+        .map(|name| {
+            instantiate_type_with_vector_and_session(
+                store,
+                name,
+                &sources,
+                &targets,
+                array_targets,
+                session,
+            )
+        })
+        .transpose()
+        .map_err(|error| mapped_instantiation_error(projection.target, &error))?;
+    if session.limit_event_occurred_since(mark) {
+        return session.recovery_error_type().ok_or_else(invalid);
+    }
+    let instantiated = store
+        .alloc_mapped_type(
+            ObjectFlags::INSTANTIATED_MAPPED,
+            Some(projection.symbol),
+            Some(projection.declaration),
+        )
+        .ok_or(MappedTypeError::Capacity)?;
+    if !store.set_object_target_and_mapper(instantiated, Some(projection.target), Some(mapper))
+        || !store.set_mapped_type_resolution(
+            instantiated,
+            Some(projection.declaration),
+            Some(parameter),
+            Some(constraint),
+            name,
+            Some(template),
+            Some(modifiers),
+            None,
+            false,
+        )
+    {
+        return Err(invalid());
+    }
+    if let Some(symbol) = projection.alias {
+        let identity = store
+            .alloc_type_alias(Some(symbol))
+            .ok_or(MappedTypeError::Capacity)?;
+        if !store.set_type_alias_arguments(identity, Some(arguments.to_vec()))
+            || !store.set_type_alias(instantiated, Some(identity))
+        {
+            return Err(invalid());
+        }
+    }
+    let key = type_alias_instantiation_cache_key(arguments, None);
+    if original.object.instantiations == TypeCacheState::Unallocated {
+        let mut entries = HashMap::new();
+        entries
+            .try_reserve(2)
+            .map_err(|_| MappedTypeError::Capacity)?;
+        entries.insert(
+            type_alias_instantiation_cache_key(&projection.parameters, None),
+            projection.target,
+        );
+        entries.insert(key, instantiated);
+        if !store.set_object_instantiations(projection.target, TypeCacheState::Allocated(entries)) {
+            return Err(invalid());
+        }
+    } else if !store.try_reserve_object_instantiations(projection.target, 1)
+        || store.insert_object_instantiation(projection.target, key, instantiated)
+            != Some(instantiated)
+    {
+        return Err(invalid());
+    }
+    let mut links = store
+        .type_node_links(projection.declaration)
+        .cloned()
+        .ok_or_else(invalid)?;
+    links.outer_type_parameters = Some(projection.parameters.clone());
+    if !store.set_type_node_links(projection.declaration, links)
+        || generic_mapped_type_projection(store, instantiated, array_targets)?.is_none()
+    {
+        return Err(invalid());
+    }
+    Ok(instantiated)
 }
 
 /// An invalid mapped record, unsupported input, or poisoned lazy cache.
@@ -6776,10 +7329,101 @@ fn validate_source_mapped_relation_identity(
         if !store.source_direct_type_annotation_is_exact(source, modifiers_type) {
             return Err(invalid());
         }
-    } else if !utility_modifiers && modifiers_type != bootstrap.unknown_type {
+    } else if !utility_modifiers
+        && modifiers_type
+            != mapped_modifiers_type_from_constraint(store, constraint)?
+                .unwrap_or(bootstrap.unknown_type)
+    {
         return Err(invalid());
     }
     Ok(())
+}
+
+/// Replays the physical arguments of a mapped forwarding alias from its
+/// declared result. Its own formals and the mapped declaration keep separate identities.
+fn forwarded_mapped_alias_arguments(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    alias: SemanticSymbolId,
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Vec<TypeId>, MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidMappedType(target);
+    let header =
+        property_object_alias_identity_source_header(store, alias).map_err(|_| invalid())?;
+    let links = store.type_alias_links(alias).ok_or_else(invalid)?;
+    let parameters = links.type_parameters.as_deref().ok_or_else(invalid)?;
+    let declared = links
+        .declared_type
+        .filter(|type_| *type_ != target)
+        .ok_or_else(invalid)?;
+    let body = store
+        .source_direct_type_annotation(header.alias_declaration)
+        .ok_or_else(invalid)?;
+    if parameters.len() != header.parameters.len()
+        || parameters.len() != arguments.len()
+        || parameters
+            .iter()
+            .zip(&header.parameters)
+            .any(|(type_, (_, symbol))| {
+                cached_ordinary_type_parameter_owner(store, *type_) != Some(*symbol)
+            })
+        || !store.source_direct_type_annotation_is_exact(body, declared)
+    {
+        return Err(invalid());
+    }
+    let declared_record = store.type_payload(declared).ok_or_else(invalid)?;
+    let TypeData::Mapped(wrapper) = declared_record.data() else {
+        return Err(invalid());
+    };
+    let identity = declared_record
+        .alias()
+        .and_then(|alias| store.type_alias(alias))
+        .ok_or_else(invalid)?;
+    if wrapper.object.target != Some(target)
+        || identity.symbol() != Some(alias)
+        || identity.type_arguments().unwrap_or_default() != parameters
+    {
+        return Err(invalid());
+    }
+    // This is the declaration-only wrapper case below. It does not recurse
+    // through a concrete wrapper's instantiation cache.
+    validate_mapped_relation_identity(store, declared)?;
+    let TypeData::Mapped(original) = store.type_payload(target).ok_or_else(invalid)?.data() else {
+        return Err(invalid());
+    };
+    let declaration = original.declaration.ok_or_else(invalid)?;
+    let Some(SourceNodeParent::Parent(owner)) = store.source_node_parent(declaration) else {
+        return Err(invalid());
+    };
+    let owner = store.source_declaration_symbol(owner).ok_or_else(invalid)?;
+    let source = store.type_alias_links(owner).ok_or_else(invalid)?;
+    if source.declared_type != Some(target) {
+        return Err(invalid());
+    }
+    let formals = source.type_parameters.as_deref().ok_or_else(invalid)?;
+    let mapper = wrapper.object.mapper.ok_or_else(invalid)?;
+    let Some(TypeMapperApplication::Composite { second, .. }) =
+        store.mapper_application(mapper, original.type_parameter.ok_or_else(invalid)?)
+    else {
+        return Err(invalid());
+    };
+    formals
+        .iter()
+        .map(|formal| {
+            let symbolic = store.map_type(second, *formal).ok_or_else(invalid)?;
+            cached_instantiation_with_vector(
+                store,
+                symbolic,
+                parameters,
+                arguments,
+                array_targets,
+                None,
+            )
+            .map_err(|_| invalid())?
+            .ok_or(MappedTypeError::UnsupportedSource(symbolic))
+        })
+        .collect()
 }
 
 fn validate_mapped_relation_identity(
@@ -6791,6 +7435,14 @@ fn validate_mapped_relation_identity(
     let TypeData::Mapped(mapped) = record.data() else {
         return Err(invalid());
     };
+    let target = mapped.object.target.unwrap_or(type_);
+    if matches!(store.type_payload(target).map(TypeRecord::data),
+        Some(TypeData::Mapped(original)) if matches!(original.object.instantiations, TypeCacheState::Allocated(_)))
+    {
+        return generic_mapped_type_projection(store, type_, None)?
+            .map(|_| ())
+            .ok_or_else(invalid);
+    }
     let Some(target) = mapped.object.target else {
         return validate_source_mapped_relation_identity(store, type_, false);
     };
@@ -6871,9 +7523,17 @@ fn validate_mapped_relation_identity(
             .ok_or_else(invalid)?;
         if owner_record.flags() != SymbolFlags::TYPE_ALIAS
             || !store.source_symbol_declarations_match(owner)
-            || owner_links.declared_type != Some(type_)
-            || owner_links.type_parameters.as_deref().unwrap_or_default() != owner_arguments
-            || !store.source_direct_type_annotation_is_exact(body, type_)
+        {
+            return Err(invalid());
+        }
+        if owner_links.declared_type == Some(type_) {
+            if owner_links.type_parameters.as_deref().unwrap_or_default() != owner_arguments
+                || !store.source_direct_type_annotation_is_exact(body, type_)
+            {
+                return Err(invalid());
+            }
+        } else if forwarded_mapped_alias_arguments(store, target, owner, owner_arguments, None)?
+            != arguments
         {
             return Err(invalid());
         }
@@ -7037,6 +7697,32 @@ fn mapped_instantiated_operand_matches(
     }
 }
 
+/// An uncaptured source formal stays unchanged in the mapped record. A
+/// formal with no written constraint has no apparent modifier members.
+fn unconstrained_modifier_has_no_members(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<bool, MappedTypeError> {
+    let Some(TypeData::TypeParameter(parameter)) = store.type_payload(type_).map(TypeRecord::data)
+    else {
+        return Ok(false);
+    };
+    if source_mapped_parameter_constraint(store, type_)?.is_some() {
+        return Err(MappedTypeError::UnsupportedSource(type_));
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(MappedTypeError::BootstrapUninitialized)?;
+    if parameter
+        .constrained
+        .resolved_base_constraint
+        .is_some_and(|cached| cached != bootstrap.no_constraint_type)
+    {
+        return Err(MappedTypeError::InvalidSource(type_));
+    }
+    Ok(true)
+}
+
 fn source_properties(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -7044,6 +7730,9 @@ fn source_properties(
     let record = store
         .type_payload(type_)
         .ok_or(MappedTypeError::InvalidSource(type_))?;
+    if unconstrained_modifier_has_no_members(store, type_)? {
+        return Ok(Vec::new());
+    }
     if record
         .flags()
         .intersects(TypeFlags::ANY | TypeFlags::UNKNOWN)
@@ -7138,6 +7827,9 @@ fn source_indexes(
     let record = store
         .type_payload(type_)
         .ok_or(MappedTypeError::InvalidSource(type_))?;
+    if unconstrained_modifier_has_no_members(store, type_)? {
+        return Ok(Vec::new());
+    }
     if record
         .flags()
         .intersects(TypeFlags::ANY | TypeFlags::UNKNOWN)

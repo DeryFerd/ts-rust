@@ -208,6 +208,7 @@ impl CanonicalTypeMapperStore {
                 .materialize_deferred_intersection_type_with_array_targets(cached, array_targets);
         }
 
+        self.prepare_intersection_property_types(&key.types, array_targets)?;
         let expected = expected_properties(self, &key.types, array_targets)?;
         let call_signatures = expected_call_signatures(self, &key.types)?;
         let synthetic_count = expected
@@ -360,6 +361,9 @@ impl CanonicalTypeMapperStore {
         if let Some(reduced) = self.reduce_numeric_literal_intersection(input)? {
             return Ok(reduced);
         }
+        if let Some(reduced) = self.reduce_empty_object_intersection(input)? {
+            return Ok(reduced);
+        }
 
         let mut types = Vec::with_capacity(input.len());
         for type_ in input {
@@ -370,6 +374,9 @@ impl CanonicalTypeMapperStore {
             )?;
         }
         if let Some(reduced) = self.reduce_numeric_literal_intersection(&types)? {
+            return Ok(reduced);
+        }
+        if let Some(reduced) = self.reduce_empty_object_intersection(&types)? {
             return Ok(reduced);
         }
         if types.is_empty() {
@@ -515,6 +522,10 @@ impl CanonicalTypeMapperStore {
             .reduce_numeric_literal_intersection(&validated)
             .map_err(|_| invalid())?
             .is_some()
+            || self
+                .reduce_empty_object_intersection(&validated)
+                .map_err(|_| invalid())?
+                .is_some()
         {
             return Err(invalid());
         }
@@ -671,6 +682,16 @@ impl CanonicalTypeMapperStore {
         let record = self
             .type_payload(type_)
             .ok_or(IntersectionTypeError::MalformedConstituent(type_))?;
+        if record.flags() == TypeFlags::OBJECT
+            && record.object_flags().contains(ObjectFlags::ANONYMOUS)
+            && self.empty_type_literal_intersection_constituent(type_)?
+        {
+            for &existing in output.iter() {
+                if self.empty_type_literal_intersection_constituent(existing)? {
+                    return Ok(());
+                }
+            }
+        }
         match record.data() {
             TypeData::Literal(literal) if record.flags() == TypeFlags::NUMBER_LITERAL => {
                 self.validate_union_constituent(type_)
@@ -818,6 +839,7 @@ impl CanonicalTypeMapperStore {
                 return Err(IntersectionTypeError::InvalidCachedIntersection(type_));
             }
         }
+        self.prepare_intersection_property_types(&projection.types, array_targets)?;
         let expected = expected_properties(self, &projection.types, array_targets)?;
         let call_signatures = expected_call_signatures(self, &projection.types)?;
         let synthetic_count = expected
@@ -1070,24 +1092,120 @@ impl CanonicalTypeMapperStore {
             if constituent == primitive {
                 continue;
             }
-            match validate_resolved_declared_property_object(self, constituent) {
-                DeclaredPropertyObjectValidation::Valid(
-                    DeclaredPropertyObjectProof::TypeLiteral,
-                ) if self
-                    .type_payload(constituent)
+            if !self.empty_type_literal_intersection_constituent(constituent)? {
+                return Err(IntersectionTypeError::UnsupportedConstituent(constituent));
+            }
+        }
+        Ok(Some(primitive))
+    }
+
+    fn empty_type_literal_intersection_constituent(
+        &self,
+        type_: TypeId,
+    ) -> Result<bool, IntersectionTypeError> {
+        match validate_resolved_declared_property_object(self, type_) {
+            DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::TypeLiteral) => {
+                Ok(self
+                    .type_payload(type_)
                     .and_then(|record| record.data().structured())
                     .is_some_and(|members| {
                         members.properties.as_deref().is_none_or(<[_]>::is_empty)
                             && members.signatures.as_deref().is_none_or(<[_]>::is_empty)
                             && members.index_infos.as_deref().is_none_or(<[_]>::is_empty)
-                    }) => {}
-                DeclaredPropertyObjectValidation::Malformed => {
-                    return Err(IntersectionTypeError::MalformedConstituent(constituent));
+                    }))
+            }
+            DeclaredPropertyObjectValidation::Malformed => {
+                Err(IntersectionTypeError::MalformedConstituent(type_))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// The mapper and property reader use the same native `{}` reduction.
+    pub(super) fn reduce_empty_object_intersection(
+        &self,
+        input: &[TypeId],
+    ) -> Result<Option<TypeId>, IntersectionTypeError> {
+        let [left, right] = input else {
+            return Ok(None);
+        };
+        let (value, empty) = if self.empty_type_literal_intersection_constituent(*right)? {
+            (*left, *right)
+        } else if self.empty_type_literal_intersection_constituent(*left)? {
+            (*right, *left)
+        } else {
+            return Ok(None);
+        };
+        let bootstrap = self
+            .intrinsic_bootstrap()
+            .ok_or(IntersectionTypeError::BootstrapUninitialized)?;
+        if value == bootstrap.unknown_type {
+            return Ok(Some(empty));
+        }
+        let flags = self
+            .type_payload(value)
+            .ok_or(IntersectionTypeError::MalformedConstituent(value))?
+            .flags();
+        if flags.intersects(TypeFlags::NULL | TypeFlags::UNDEFINED) {
+            return Ok(Some(bootstrap.never_type));
+        }
+        if matches!(flags, TypeFlags::ANY | TypeFlags::NEVER) {
+            self.validate_union_constituent(value)
+                .map_err(|_| IntersectionTypeError::MalformedConstituent(value))?;
+            return Ok(Some(value));
+        }
+        if property_parameter_reduces_with_empty_object(self, value)?
+            || property_type_is_definitely_nonnullable(self, value)?
+        {
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    /// Intern retained generic property pairs before immutable member validation.
+    fn prepare_intersection_property_types(
+        &mut self,
+        types: &[TypeId],
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<(), IntersectionTypeError> {
+        for group in intersection_property_groups(self, types, array_targets)? {
+            let [left, right] = group.sources.as_slice() else {
+                continue;
+            };
+            let (value, empty, empty_first) =
+                if self.empty_type_literal_intersection_constituent(right.type_)? {
+                    (left.type_, right.type_, false)
+                } else if self.empty_type_literal_intersection_constituent(left.type_)? {
+                    (right.type_, left.type_, true)
+                } else {
+                    continue;
+                };
+            let record = self
+                .type_payload(value)
+                .ok_or(IntersectionTypeError::MalformedConstituent(value))?;
+            let values = match record.data() {
+                TypeData::Union(union) => union.union.types.clone(),
+                _ => vec![value],
+            };
+            for value in values {
+                if self
+                    .type_payload(value)
+                    .is_some_and(|record| record.flags() == TypeFlags::TYPE_PARAMETER)
+                {
+                    let pair = if empty_first {
+                        [empty, value]
+                    } else {
+                        [value, empty]
+                    };
+                    self.canonical_deferred_intersection_type_with_array_targets(
+                        &pair,
+                        None,
+                        array_targets,
+                    )?;
                 }
-                _ => return Err(IntersectionTypeError::UnsupportedConstituent(constituent)),
             }
         }
-        Ok(Some(primitive))
+        Ok(())
     }
 
     /// Replays the source reduction before looking up a retained intersection key.
@@ -1652,11 +1770,11 @@ fn expected_call_signatures(
         .collect())
 }
 
-fn expected_properties(
+fn intersection_property_groups(
     store: &CanonicalTypeMapperStore,
     types: &[TypeId],
     array_targets: Option<CanonicalArrayTargets>,
-) -> Result<Vec<ExpectedProperty>, IntersectionTypeError> {
+) -> Result<Vec<PropertyGroup>, IntersectionTypeError> {
     let boolean_type = store
         .intrinsic_bootstrap()
         .ok_or(IntersectionTypeError::BootstrapUninitialized)?
@@ -1750,7 +1868,15 @@ fn expected_properties(
         }
     }
 
-    groups
+    Ok(groups)
+}
+
+fn expected_properties(
+    store: &CanonicalTypeMapperStore,
+    types: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Vec<ExpectedProperty>, IntersectionTypeError> {
+    intersection_property_groups(store, types, array_targets)?
         .into_iter()
         .map(|group| {
             if let [source] = group.sources.as_slice() {
@@ -1875,6 +2001,30 @@ fn validate_property_type_worker(
             validate_property_type_with_array_targets(
                 store,
                 *constituent,
+                array_targets,
+                validating,
+                validated,
+            )?;
+        }
+        return Ok(());
+    }
+    if let TypeData::Intersection(_) = record.data() {
+        let constituents = if record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+        {
+            store
+                .validate_intersection_type_with_array_targets(type_, array_targets)?
+                .types
+        } else {
+            store
+                .validate_deferred_intersection_type_with_array_targets(type_, array_targets)?
+                .types
+        };
+        for constituent in constituents {
+            validate_property_type_with_array_targets(
+                store,
+                constituent,
                 array_targets,
                 validating,
                 validated,
@@ -2055,6 +2205,106 @@ fn literal_values_equal(store: &CanonicalTypeMapperStore, left: TypeId, right: T
     }
 }
 
+/// Go reduces formal constraints only for primitive types, `object`, or `{}`.
+fn property_parameter_reduces_with_empty_object(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<bool, IntersectionTypeError> {
+    let invalid = || IntersectionTypeError::MalformedConstituent(type_);
+    let TypeData::TypeParameter(parameter) = store.type_payload(type_).ok_or_else(invalid)?.data()
+    else {
+        return Ok(false);
+    };
+    let owner = cached_ordinary_type_parameter_owner(store, type_).ok_or_else(invalid)?;
+    let Some([declaration]) = store.symbol(owner).and_then(|owner| owner.declarations()) else {
+        return Err(invalid());
+    };
+    let annotations = store
+        .source_type_parameter_annotations(*declaration)
+        .ok_or_else(invalid)?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(IntersectionTypeError::BootstrapUninitialized)?;
+    let (node, constraint) = match (annotations.constraint, parameter.constraint) {
+        (None, cached) if cached.is_none_or(|cached| cached == bootstrap.no_constraint_type) => {
+            if parameter
+                .constrained
+                .resolved_base_constraint
+                .is_some_and(|cached| cached != bootstrap.no_constraint_type)
+            {
+                return Err(invalid());
+            }
+            return Ok(false);
+        }
+        (Some(node), Some(constraint)) => (node, constraint),
+        _ => return Err(invalid()),
+    };
+    if !store.source_direct_type_annotation_is_exact(node, constraint) {
+        return Err(invalid());
+    }
+    if parameter
+        .constrained
+        .resolved_base_constraint
+        .is_some_and(|cached| cached != constraint)
+    {
+        return Err(invalid());
+    }
+    let record = store.type_payload(constraint).ok_or_else(invalid)?;
+    let empty = store.empty_type_literal_intersection_constituent(constraint)?;
+    if !record
+        .flags()
+        .intersects(TypeFlags::PRIMITIVE | TypeFlags::NON_PRIMITIVE)
+        && !empty
+    {
+        return if record.flags() == TypeFlags::OBJECT {
+            property_type_is_definitely_nonnullable(store, constraint).map(|_| false)
+        } else {
+            Err(IntersectionTypeError::UnsupportedPropertyType(type_))
+        };
+    }
+    if !record
+        .flags()
+        .intersects(TypeFlags::DEFINITELY_NON_NULLABLE)
+    {
+        return Err(IntersectionTypeError::UnsupportedPropertyType(type_));
+    }
+    property_type_is_definitely_nonnullable(store, constraint)
+}
+
+fn property_type_is_definitely_nonnullable(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<bool, IntersectionTypeError> {
+    let invalid = || IntersectionTypeError::MalformedConstituent(type_);
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    if !record
+        .flags()
+        .intersects(TypeFlags::DEFINITELY_NON_NULLABLE)
+    {
+        return Ok(false);
+    }
+    match record.data() {
+        TypeData::TypeReference(_) => {
+            validate_direct_generic_reference(store, type_).map_err(|_| invalid())?;
+        }
+        TypeData::Mapped(_) => store
+            .validate_deferred_mapped_type(type_)
+            .map_err(|_| invalid())?,
+        TypeData::Object(_) | TypeData::Interface(_) => {
+            if !matches!(
+                validate_resolved_declared_property_object(store, type_),
+                DeclaredPropertyObjectValidation::Valid(_)
+            ) {
+                return Err(IntersectionTypeError::UnsupportedPropertyType(type_));
+            }
+        }
+        _ => store
+            .validate_union_constituent(type_)
+            .map_err(|_| invalid())?,
+    }
+    Ok(true)
+}
+
 /// Reuses the canonical primitive intersection rules for properties and failed calls.
 pub(super) fn intersect_property_types(
     store: &CanonicalTypeMapperStore,
@@ -2076,6 +2326,117 @@ pub(super) fn intersect_property_types(
             )
     }) {
         return intersect_union_property_types(store, types);
+    }
+    if let Some(type_) = types
+        .iter()
+        .copied()
+        .find(|type_| *type_ != bootstrap.unknown_type)
+        && types
+            .iter()
+            .all(|other| *other == type_ || *other == bootstrap.unknown_type)
+        && (cached_ordinary_type_parameter_owner(store, type_).is_some()
+            || property_type_is_definitely_nonnullable(store, type_)?)
+    {
+        return Ok(type_);
+    }
+    let mut empty_object = None;
+    let mut primitive_types = Vec::with_capacity(types.len());
+    for &type_ in types {
+        let record = store
+            .type_payload(type_)
+            .ok_or(IntersectionTypeError::UnsupportedPropertyType(type_))?;
+        if record.flags() == TypeFlags::OBJECT
+            && store.empty_type_literal_intersection_constituent(type_)?
+        {
+            empty_object.get_or_insert(type_);
+        } else {
+            primitive_types.push(type_);
+        }
+    }
+    if let Some(empty_object) = empty_object {
+        let primitive = intersect_property_types(store, &primitive_types)?;
+        // With strict null checks, a nullable constituent takes precedence
+        // over `any` when the intersection also contains `{}`.
+        if (bootstrap.options.strict_null_checks || primitive != bootstrap.any_type)
+            && primitive_types.iter().any(|type_| {
+                store.type_payload(*type_).is_some_and(|record| {
+                    record
+                        .flags()
+                        .intersects(TypeFlags::NULL | TypeFlags::UNDEFINED)
+                })
+            })
+        {
+            return Ok(bootstrap.never_type);
+        }
+        if primitive == bootstrap.unknown_type {
+            return Ok(empty_object);
+        }
+        if primitive == bootstrap.boolean_type {
+            return Ok(primitive);
+        }
+        if property_parameter_reduces_with_empty_object(store, primitive)?
+            || property_type_is_definitely_nonnullable(store, primitive)?
+        {
+            return Ok(primitive);
+        }
+        if cached_ordinary_type_parameter_owner(store, primitive).is_some() {
+            let pair = if types.first() == Some(&empty_object) {
+                vec![empty_object, primitive]
+            } else {
+                vec![primitive, empty_object]
+            };
+            let key = IntersectionTypeCacheKey {
+                types: pair,
+                alias_symbol: None,
+                alias_arguments: Vec::new(),
+            };
+            let cached = store
+                .intersection_types
+                .get(&key)
+                .copied()
+                .ok_or(IntersectionTypeError::UnsupportedPropertyType(primitive))?;
+            let record = store
+                .type_payload(cached)
+                .ok_or(IntersectionTypeError::InvalidCachedIntersection(cached))?;
+            if record.alias().is_some() {
+                return Err(IntersectionTypeError::InvalidCachedIntersection(cached));
+            }
+            let constituents = if record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+            {
+                store.validate_intersection_type(cached)?.types
+            } else {
+                store.validate_deferred_intersection_type(cached)?.types
+            };
+            if constituents != key.types {
+                return Err(IntersectionTypeError::InvalidCachedIntersection(cached));
+            }
+            return Ok(cached);
+        }
+        let flags = store
+            .type_payload(primitive)
+            .ok_or(IntersectionTypeError::UnsupportedPropertyType(primitive))?
+            .flags();
+        return if matches!(
+            flags,
+            TypeFlags::ANY
+                | TypeFlags::NEVER
+                | TypeFlags::STRING
+                | TypeFlags::NUMBER
+                | TypeFlags::BIG_INT
+                | TypeFlags::BOOLEAN
+                | TypeFlags::ES_SYMBOL
+                | TypeFlags::STRING_LITERAL
+                | TypeFlags::NUMBER_LITERAL
+                | TypeFlags::BIG_INT_LITERAL
+                | TypeFlags::BOOLEAN_LITERAL
+                | TypeFlags::UNIQUE_ES_SYMBOL
+        ) {
+            Ok(primitive)
+        } else {
+            Err(IntersectionTypeError::UnsupportedPropertyType(primitive))
+        };
     }
     for type_ in types {
         if *type_ == bootstrap.boolean_type {

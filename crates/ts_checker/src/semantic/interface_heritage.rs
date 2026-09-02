@@ -10,7 +10,8 @@
 //! arguments and authenticated deferred generic constraints.
 //! Authenticated React node arrays retain their default-library `Array<T>`
 //! heritage without expanding recursive members.
-//! It also authenticates the exact `Record<string, any>` mapped-alias base.
+//! Alias bases use the normal type-reference query before member resolution.
+//! The exact `Record<string, any>` path retains its existing authentication.
 //! Every base is resolved before publication so member construction retains
 //! its declaration identity and, for mapped bases, its source type arguments.
 
@@ -43,7 +44,7 @@ use super::{
     },
     store::{PlainInterfaceHeritageFacts, SourceNodeParent},
     type_nodes::TypeNodeUnavailable,
-    types::ObjectFlags,
+    types::{ObjectFlags, TypeFlags},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +54,7 @@ pub(super) enum DirectInterfaceBaseKind {
     DefaultLibraryArray,
     RecordMappedAlias,
     NongenericTypeLiteralAlias,
+    InstantiatedTypeAlias,
 }
 
 /// Source bindings only. A header does not complete a base or its members.
@@ -122,6 +124,8 @@ pub(super) struct SourceInterfaceAliasBaseRequest {
     rhs: NodeRef,
     root: NodeRef,
     wrappers: Vec<NodeRef>,
+    reference: Option<NodeRef>,
+    arguments: Vec<NodeRef>,
 }
 
 impl SourceInterfaceAliasBaseRequest {
@@ -143,6 +147,14 @@ impl SourceInterfaceAliasBaseRequest {
 
     pub(super) fn wrappers(&self) -> &[NodeRef] {
         &self.wrappers
+    }
+
+    pub(super) const fn reference(&self) -> Option<NodeRef> {
+        self.reference
+    }
+
+    pub(super) fn arguments(&self) -> &[NodeRef] {
+        &self.arguments
     }
 }
 
@@ -331,7 +343,46 @@ pub(super) fn source_interface_alias_base_request(
         rhs,
         root,
         wrappers,
+        reference: None,
+        arguments: Vec::new(),
     }))
+}
+
+/// Retains the written arguments separately from the alias's source formals.
+pub(super) fn source_interface_alias_reference_request(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    reference: NodeRef,
+) -> Result<SourceInterfaceAliasBaseRequest, DeclaredTypeError> {
+    let invalid = || source_heritage_error(reference);
+    let source =
+        property_object_alias_identity_source_header(store, symbol).map_err(|_| invalid())?;
+    let rhs = store
+        .source_direct_type_annotation(source.alias_declaration)
+        .ok_or_else(invalid)?;
+    let children = store
+        .source_direct_children(reference)
+        .ok_or_else(invalid)?;
+    let [expression, arguments @ ..] = children.as_slice() else {
+        return Err(invalid());
+    };
+    if store.source_node_kind(reference) != Some(SyntaxKind::ExpressionWithTypeArguments)
+        || store.source_node_kind(*expression) != Some(SyntaxKind::Identifier)
+        || children.iter().any(|child| {
+            store.source_node_parent(*child) != Some(SourceNodeParent::Parent(reference))
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(SourceInterfaceAliasBaseRequest {
+        symbol,
+        declaration: source.alias_declaration,
+        rhs,
+        root: reference,
+        wrappers: Vec::new(),
+        reference: Some(reference),
+        arguments: arguments.to_vec(),
+    })
 }
 
 fn source_heritage_table_read(
@@ -1128,17 +1179,26 @@ pub(super) fn plan_source_interface_heritage_header(
                 base.kind,
                 DirectInterfaceBaseKind::Interface
                     | DirectInterfaceBaseKind::NongenericTypeLiteralAlias
-            ) || !base.type_arguments.is_empty()
+                    | DirectInterfaceBaseKind::InstantiatedTypeAlias
+            ) || base.kind != DirectInterfaceBaseKind::InstantiatedTypeAlias
+                && !base.type_arguments.is_empty()
                 || !base.defaults.is_empty()
                 || store.source_node_kind(base.expression) != Some(SyntaxKind::Identifier)
             {
                 return not_source_alias_heritage();
             }
-            let (symbol, resolution) = resolutions
+            let resolution = resolutions
                 .iter_mut()
                 .find(|(expression, _)| *expression == base.expression)
-                .and_then(|(_, resolution)| resolution.take())
-                .ok_or_else(|| source_heritage_error(base.expression))?;
+                .and_then(|(_, resolution)| resolution.take());
+            let (symbol, resolution) = match resolution {
+                Some(resolution) => resolution,
+                None if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias => {
+                    try_resolve_source_heritage_base(store, host, base.expression)?
+                        .ok_or_else(|| source_heritage_error(base.expression))?
+                }
+                None => return Err(source_heritage_error(base.expression)),
+            };
             let import = super::source_imports::plan_source_interface_heritage_import(
                 store,
                 host,
@@ -1157,7 +1217,11 @@ pub(super) fn plan_source_interface_heritage_header(
             {
                 return Err(source_heritage_error(base.expression));
             }
-            let alias = if base.kind == DirectInterfaceBaseKind::NongenericTypeLiteralAlias {
+            let alias = if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+                Some(source_interface_alias_reference_request(
+                    store, base.symbol, base.node,
+                )?)
+            } else if base.kind == DirectInterfaceBaseKind::NongenericTypeLiteralAlias {
                 Some(
                     source_interface_alias_base_request(store, base.symbol)?
                         .ok_or_else(|| source_heritage_error(base.expression))?,
@@ -1392,6 +1456,10 @@ fn source_alias_base_metadata(
     ),
     DeclaredTypeError,
 > {
+    if request.reference.is_some() {
+        let cached = cached_interface_alias_reference(store, request, array_targets)?;
+        return Ok((cached, cached.into_iter().collect(), None));
+    }
     let invalid = || source_heritage_error(request.rhs);
     let cached = source_alias_cached_identity(store, request)?;
     let mut edges = Vec::new();
@@ -1463,6 +1531,22 @@ pub(super) fn source_interface_alias_base_state(
     let invalid = || source_heritage_error(request.rhs);
     let (cached, mut edges, conditional) =
         source_alias_base_metadata(store, request, array_targets)?;
+    if request.reference.is_some() {
+        let Some(type_) = cached else {
+            return Ok(SourceInterfaceAliasBaseState::Pending { edges, conditional });
+        };
+        if !interface_base_has_statically_known_members(store, type_)? {
+            return Err(TypeNodeUnavailable::UnsupportedSyntax {
+                node: request.root,
+                kind: SyntaxKind::ExpressionWithTypeArguments,
+            }
+            .into());
+        }
+        if interface_alias_base_members(store, type_, array_targets)?.is_none() {
+            return Ok(SourceInterfaceAliasBaseState::Pending { edges, conditional });
+        }
+        return Ok(SourceInterfaceAliasBaseState::Ready { type_, edges });
+    }
     if store.source_node_kind(request.root) == Some(SyntaxKind::ConditionalType) {
         if let Some(metadata) = conditional.as_ref() {
             if metadata.requires_source_result_proof() {
@@ -1546,6 +1630,448 @@ pub(super) fn source_interface_alias_base_state(
     Ok(SourceInterfaceAliasBaseState::Ready { type_, edges })
 }
 
+/// Replays the canonical alias cache with the source formals in declaration order.
+pub(super) fn cached_interface_alias_reference(
+    store: &CanonicalTypeMapperStore,
+    request: &SourceInterfaceAliasBaseRequest,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, DeclaredTypeError> {
+    let invalid = || source_heritage_error(request.root);
+    let reference = request.reference.ok_or_else(invalid)?;
+    if source_interface_alias_reference_request(store, request.symbol, reference)? != *request {
+        return Err(invalid());
+    }
+    let Some(type_) = store
+        .type_node_links(reference)
+        .and_then(|links| links.resolved_type)
+    else {
+        return Ok(None);
+    };
+    if store
+        .symbol_node_links(reference)
+        .and_then(|links| links.resolved_symbol)
+        != Some(request.symbol)
+    {
+        return Err(invalid());
+    }
+    let source = property_object_alias_identity_source_header(store, request.symbol)
+        .map_err(|_| invalid())?;
+    let links = store.type_alias_links(request.symbol).ok_or_else(invalid)?;
+    let declared = links.declared_type.ok_or_else(invalid)?;
+    if super::object_members::cached_planned_type_identity(store, request.rhs) != Some(declared) {
+        return Err(invalid());
+    }
+    let parameters = links.type_parameters.as_deref().unwrap_or_default();
+    if parameters.len() != source.parameters.len()
+        || parameters
+            .iter()
+            .zip(&source.parameters)
+            .any(|(&type_, &(_, symbol))| {
+                super::declared::cached_ordinary_type_parameter_owner(store, type_) != Some(symbol)
+            })
+    {
+        return Err(invalid());
+    }
+    let mut arguments = request
+        .arguments
+        .iter()
+        .map(|node| {
+            super::object_members::cached_planned_type_identity(store, *node).ok_or_else(invalid)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if store
+        .intrinsic_bootstrap()
+        .is_some_and(|types| types.error_type == type_)
+    {
+        let mut required = 0;
+        for (index, &(declaration, _)) in source.parameters.iter().enumerate() {
+            let annotations = store
+                .source_type_parameter_annotations(declaration)
+                .ok_or_else(invalid)?;
+            if annotations.default_type.is_none() {
+                required = index + 1;
+            }
+        }
+        if arguments.len() < required || arguments.len() > parameters.len() {
+            return Ok(Some(type_));
+        }
+    }
+    let provided = arguments.clone();
+    if arguments.len() > parameters.len() {
+        return Err(invalid());
+    }
+    for &(parameter, _) in source.parameters.iter().skip(arguments.len()) {
+        let default = store
+            .source_type_parameter_annotations(parameter)
+            .and_then(|annotations| annotations.default_type)
+            .and_then(|node| super::object_members::cached_planned_type_identity(store, node))
+            .ok_or_else(invalid)?;
+        let value = super::instantiate::cached_instantiation_with_vector(
+            store,
+            default,
+            &parameters[..arguments.len()],
+            &arguments,
+            array_targets,
+            None,
+        )
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+        arguments.push(value);
+    }
+    if parameters.is_empty() {
+        return if declared == type_ && links.instantiations.is_none() {
+            Ok(Some(type_))
+        } else {
+            Err(invalid())
+        };
+    }
+    let key = super::type_nodes::type_alias_instantiation_cache_key(&provided, None);
+    if links
+        .instantiations
+        .as_ref()
+        .and_then(|instances| instances.get(&key))
+        != Some(&type_)
+        || super::instantiate::cached_instantiation_with_vector(
+            store,
+            declared,
+            parameters,
+            &arguments,
+            array_targets,
+            None,
+        )
+        .map_err(|_| invalid())?
+            != Some(type_)
+    {
+        return Err(invalid());
+    }
+    Ok(Some(type_))
+}
+
+fn interface_alias_result_is_ignored(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<bool, DeclaredTypeError> {
+    if store
+        .intrinsic_bootstrap()
+        .is_some_and(|types| types.error_type == type_)
+    {
+        return Ok(true);
+    }
+    Ok(!interface_base_has_statically_known_members(store, type_)?)
+}
+
+pub(super) fn source_interface_alias_base_is_ignored(
+    store: &CanonicalTypeMapperStore,
+    request: &SourceInterfaceAliasBaseRequest,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, DeclaredTypeError> {
+    if request.reference.is_none() {
+        return Ok(false);
+    }
+    match cached_interface_alias_reference(store, request, array_targets)? {
+        Some(type_) => interface_alias_result_is_ignored(store, type_),
+        None => Ok(false),
+    }
+}
+
+/// Invalid bases remain in the source plan but do not contribute members.
+/// A missing query result cannot authorize removal from the base list.
+pub(super) fn effective_interface_heritage_bases<'a>(
+    store: &CanonicalTypeMapperStore,
+    plan: &'a DirectInterfaceHeritagePlan,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Vec<&'a DirectInterfaceBasePlan>, DeclaredTypeError> {
+    let mut bases = Vec::with_capacity(plan.bases.len());
+    for base in &plan.bases {
+        if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+            let request = source_interface_alias_reference_request(store, base.symbol, base.node)?;
+            if source_interface_alias_base_is_ignored(store, &request, array_targets)? {
+                continue;
+            }
+        }
+        bases.push(base);
+    }
+    Ok(bases)
+}
+
+pub(super) fn effective_source_interface_heritage_bases<'a>(
+    store: &CanonicalTypeMapperStore,
+    header: &'a SourceInterfaceHeritageHeader,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Vec<&'a SourceInterfaceHeritageBase>, DeclaredTypeError> {
+    let mut bases = Vec::with_capacity(header.bases.len());
+    for base in &header.bases {
+        if let Some(request) = base.alias.as_ref()
+            && source_interface_alias_base_is_ignored(store, request, array_targets)?
+        {
+            continue;
+        }
+        bases.push(base);
+    }
+    Ok(bases)
+}
+
+/// The native base rule depends on mapped keys, not on property value parameters.
+pub(super) fn interface_base_has_statically_known_members(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<bool, DeclaredTypeError> {
+    fn visit(
+        store: &CanonicalTypeMapperStore,
+        type_: TypeId,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<bool, DeclaredTypeError> {
+        let invalid = || {
+            DeclaredTypeError::from(TypeNodeUnavailable::UnsupportedIntersectionConstituentType(
+                type_,
+            ))
+        };
+        if active.len() >= MAX_INTERFACE_HERITAGE_DEPTH || !active.insert(type_) {
+            return Err(invalid());
+        }
+        let record = store.type_payload(type_).ok_or_else(invalid)?;
+        let valid = match record.data() {
+            TypeData::TypeParameter(parameter) => {
+                let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+                if let Some(constraint) = parameter.constraint.filter(|constraint| {
+                    *constraint != type_
+                        && *constraint != bootstrap.no_constraint_type
+                        && *constraint != bootstrap.circular_constraint_type
+                }) {
+                    visit(store, constraint, active)?
+                } else {
+                    false
+                }
+            }
+            TypeData::Intersection(intersection) => {
+                let mut valid = !record
+                    .object_flags()
+                    .contains(ObjectFlags::IS_NEVER_INTERSECTION);
+                for &part in &intersection.intersection.types {
+                    valid &= visit(store, part, active)?;
+                }
+                valid
+            }
+            TypeData::Mapped(mapped) => {
+                let constraint = mapped.constraint_type.ok_or_else(invalid)?;
+                let mut keys = vec![constraint];
+                let mut seen = HashSet::new();
+                let mut generic = false;
+                while let Some(key) = keys.pop() {
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    let key = store.type_payload(key).ok_or_else(invalid)?;
+                    generic |= key
+                        .flags()
+                        .intersects(TypeFlags::INSTANTIABLE_NON_PRIMITIVE | TypeFlags::INDEX);
+                    match key.data() {
+                        TypeData::Union(union) => keys.extend_from_slice(&union.union.types),
+                        TypeData::Intersection(intersection) => {
+                            keys.extend_from_slice(&intersection.intersection.types)
+                        }
+                        TypeData::TemplateLiteral(template) => {
+                            keys.extend_from_slice(&template.types)
+                        }
+                        TypeData::StringMapping(mapping) => keys.push(mapping.target),
+                        _ => {}
+                    }
+                }
+                if !generic && mapped.name_type.is_some() {
+                    super::mapped_types::plan_mapped_type_keys(store, type_)
+                        .map_err(|_| invalid())?;
+                }
+                !generic
+            }
+            _ => record
+                .flags()
+                .intersects(TypeFlags::OBJECT | TypeFlags::NON_PRIMITIVE | TypeFlags::ANY),
+        };
+        assert!(active.remove(&type_));
+        Ok(valid)
+    }
+    visit(store, type_, &mut HashSet::new())
+}
+
+pub(super) struct InterfaceAliasBaseMembers {
+    pub(super) properties: Vec<SemanticSymbolId>,
+    pub(super) indexes: Vec<super::IndexInfoId>,
+}
+
+/// Reads only members proved by their existing object, mapped, or intersection provider.
+pub(super) fn interface_alias_base_members(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<InterfaceAliasBaseMembers>, DeclaredTypeError> {
+    let invalid = || {
+        DeclaredTypeError::from(TypeNodeUnavailable::UnsupportedIntersectionConstituentType(
+            type_,
+        ))
+    };
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let properties = match record.data() {
+        TypeData::Mapped(_) => {
+            let Some(members) = store
+                .validate_mapped_type_relation_endpoint(type_)
+                .map_err(|_| invalid())?
+            else {
+                return Ok(None);
+            };
+            members.properties().to_vec()
+        }
+        TypeData::Intersection(_) => {
+            if !record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+            {
+                store
+                    .validate_deferred_intersection_type_with_array_targets(type_, array_targets)
+                    .map_err(|_| invalid())?;
+                return Ok(None);
+            }
+            let projection = store
+                .validate_intersection_type_with_array_targets(type_, array_targets)
+                .map_err(|_| invalid())?;
+            if projection.reduced_to_never {
+                return Err(invalid());
+            }
+            projection.properties
+        }
+        _ if super::object_aliases::source_property_object_projection(store, type_)
+            .map_err(|_| invalid())?
+            .is_some() =>
+        {
+            let Some(members) = super::instantiated_members::validate_property_object_alias_members_with_array_targets(
+                store, type_, array_targets,
+            ).map_err(|_| invalid())? else { return Ok(None); };
+            members.properties
+        }
+        _ if super::reference_types::validate_direct_generic_reference(store, type_).is_ok() => {
+            let Some(members) = super::instantiated_members::validate_generic_interface_members(
+                store,
+                type_,
+                array_targets,
+            )
+            .map_err(|_| invalid())?
+            else {
+                return Ok(None);
+            };
+            members.properties().to_vec()
+        }
+        _ if matches!(
+            super::object_members::validate_resolved_declared_property_object(store, type_),
+            super::object_members::DeclaredPropertyObjectValidation::Valid(_)
+        ) =>
+        {
+            record
+                .data()
+                .structured()
+                .ok_or_else(invalid)?
+                .properties
+                .clone()
+                .unwrap_or_default()
+        }
+        _ => return Err(invalid()),
+    };
+    let structured = record.data().structured().ok_or_else(invalid)?;
+    if structured.call_signature_count != 0
+        || structured
+            .signatures
+            .as_ref()
+            .is_some_and(|signatures| !signatures.is_empty())
+    {
+        return Err(invalid());
+    }
+    Ok(Some(InterfaceAliasBaseMembers {
+        properties,
+        indexes: structured.index_infos.clone().unwrap_or_default(),
+    }))
+}
+
+/// Uses the existing member providers with the caller's instantiation budget.
+pub(super) fn resolve_interface_alias_base_members(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut super::instantiate::InstantiationSession,
+) -> Result<InterfaceAliasBaseMembers, DeclaredTypeError> {
+    fn resolve(
+        store: &mut CanonicalTypeMapperStore,
+        type_: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+        session: &mut super::instantiate::InstantiationSession,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid = || {
+            DeclaredTypeError::from(TypeNodeUnavailable::UnsupportedIntersectionConstituentType(
+                type_,
+            ))
+        };
+        if active.len() >= MAX_INTERFACE_HERITAGE_DEPTH || !active.insert(type_) {
+            return Err(invalid());
+        }
+        let record = store.type_payload(type_).ok_or_else(invalid)?;
+        if let TypeData::Intersection(intersection) = record.data() {
+            let types = intersection.intersection.types.clone();
+            for part in types {
+                resolve(store, part, array_targets, session, active)?;
+            }
+            store
+                .materialize_deferred_intersection_type_with_array_targets(type_, array_targets)
+                .map_err(|_| invalid())?;
+        } else if matches!(record.data(), TypeData::Mapped(_)) {
+            let members = store
+                .resolve_mapped_type_members_with_session(
+                    type_,
+                    super::mapped_types::MappedTypeModifiers::NONE,
+                    session,
+                )
+                .map_err(|_| invalid())?;
+            for &property in members.properties() {
+                store
+                    .resolve_mapped_symbol_type_with_session(property, session)
+                    .map_err(|_| invalid())?;
+            }
+        } else if super::object_aliases::source_property_object_projection(store, type_)
+            .map_err(|_| invalid())?
+            .is_some()
+        {
+            super::instantiated_members::resolve_property_object_alias_members_with_array_targets(
+                store,
+                type_,
+                array_targets,
+            )
+            .map_err(|_| invalid())?;
+        } else if super::reference_types::validate_direct_generic_reference(store, type_).is_ok() {
+            let members =
+                super::instantiated_members::resolve_members_with_array_targets_and_session(
+                    store,
+                    type_,
+                    array_targets,
+                    session,
+                )
+                .map_err(|_| invalid())?;
+            for &property in members.properties() {
+                super::instantiated_members::demand_instantiated_property_type(
+                    store,
+                    type_,
+                    property,
+                    array_targets,
+                    session,
+                )
+                .map_err(|_| invalid())?;
+            }
+        }
+        interface_alias_base_members(store, type_, array_targets)?.ok_or_else(invalid)?;
+        assert!(active.remove(&type_));
+        Ok(())
+    }
+    resolve(store, type_, array_targets, session, &mut HashSet::new())?;
+    interface_alias_base_members(store, type_, array_targets)?
+        .ok_or_else(|| TypeNodeUnavailable::UnsupportedIntersectionConstituentType(type_).into())
+}
+
 /// Rechecks source and all populated cache metadata, without completing a base.
 pub(super) fn validate_source_interface_heritage_header(
     store: &CanonicalTypeMapperStore,
@@ -1605,6 +2131,14 @@ pub(super) fn validate_source_interface_heritage_header(
     let mut edges = Vec::new();
     let mut cached_bases = Vec::new();
     for ((declaration, clause, node), base) in expected_nodes.into_iter().zip(&header.bases) {
+        let expected_children = std::iter::once(base.expression)
+            .chain(
+                base.alias
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|alias| alias.arguments.iter().copied()),
+            )
+            .collect::<Vec<_>>();
         if (base.declaration, base.clause, base.node) != (declaration, clause, node)
             || base.symbol == header.owner_symbol
             || store.source_node_kind(node) != Some(SyntaxKind::ExpressionWithTypeArguments)
@@ -1612,7 +2146,7 @@ pub(super) fn validate_source_interface_heritage_header(
             || store.source_node_parent(clause) != Some(SourceNodeParent::Parent(declaration))
             || store.source_node_parent(node) != Some(SourceNodeParent::Parent(clause))
             || store.source_node_parent(base.expression) != Some(SourceNodeParent::Parent(node))
-            || store.source_direct_children(node).as_deref() != Some(&[base.expression])
+            || store.source_direct_children(node).as_deref() != Some(expected_children.as_slice())
             || !validate_source_heritage_resolution(store, base)
         {
             return Err(invalid());
@@ -1654,6 +2188,15 @@ pub(super) fn validate_source_interface_heritage_header(
             }) {
                 return Err(invalid());
             }
+        }
+        if base
+            .alias
+            .as_ref()
+            .is_some_and(|alias| alias.reference.is_some())
+            && let Some(type_) = cached
+            && interface_alias_result_is_ignored(store, type_)?
+        {
+            continue;
         }
         cached_bases.push((base.symbol, cached));
     }
@@ -1716,12 +2259,13 @@ pub(super) fn validate_source_interface_heritage_complete_bases(
         })
     };
     validate_source_interface_heritage_header(store, actual_type, header, array_targets)?;
-    if bases.len() != header.bases.len() {
+    let source_bases = effective_source_interface_heritage_bases(store, header, array_targets)?;
+    if bases.len() != source_bases.len() {
         return Err(invalid());
     }
     let mut symbols = std::collections::HashMap::new();
     let mut types = HashSet::new();
-    for (row, &(symbol, type_)) in header.bases.iter().zip(bases) {
+    for (row, &(symbol, type_)) in source_bases.into_iter().zip(bases) {
         if row.symbol != symbol || type_ == actual_type {
             return Err(invalid());
         }
@@ -1774,6 +2318,39 @@ pub(super) fn plan_direct_interface_heritage(
         &mut HashSet::from([owner]),
         0,
     )
+}
+
+/// Proves that an expression-with-arguments is a written interface alias base.
+pub(super) fn plan_interface_alias_base_reference(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Option<DirectInterfaceBasePlan>, DirectInterfaceHeritageError> {
+    let invalid = || DirectInterfaceHeritageError::Invalid;
+    let record = preflight_node(store, host, node).map_err(|_| invalid())?;
+    let clause = record
+        .parent
+        .map(|parent| NodeRef::new(node.arena, node.file, parent))
+        .ok_or_else(invalid)?;
+    let clause_record = preflight_node(store, host, clause).map_err(|_| invalid())?;
+    let declaration = clause_record
+        .parent
+        .map(|parent| NodeRef::new(node.arena, node.file, parent))
+        .ok_or_else(invalid)?;
+    let record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
+    let NodeData::InterfaceDeclaration(interface) = &record.data else {
+        return Ok(None);
+    };
+    let owner = host
+        .bound_file(declaration)
+        .and_then(|bound| bound.symbol(declaration))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let clauses = interface.heritage_clauses.as_ref().ok_or_else(invalid)?;
+    let plan = plan_direct_interface_heritage(store, host, declaration, owner, clauses)?;
+    Ok(plan.bases.into_iter().find(|base| {
+        base.node == node && base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias
+    }))
 }
 
 fn plan_direct_interface_heritage_inner(
@@ -1989,26 +2566,61 @@ fn plan_direct_interface_heritage_inner(
             }
             _ => None,
         };
+        let alias_kind = if symbol_record.flags() == SymbolFlags::TYPE_ALIAS {
+            if identifier.is_none() {
+                return Err(DirectInterfaceHeritageError::Unsupported {
+                    node: expression,
+                    kind: expression_record.kind,
+                });
+            }
+            let record_arguments = base.type_arguments.as_ref().is_some_and(|arguments| {
+                matches!(arguments.nodes.as_slice(), [key, value]
+                    if store.source_node_kind(NodeRef::new(node.arena, node.file, *key))
+                        == Some(SyntaxKind::StringKeyword)
+                        && store.source_node_kind(NodeRef::new(node.arena, node.file, *value))
+                            == Some(SyntaxKind::AnyKeyword))
+            });
+            if identifier.is_some_and(|identifier| identifier.text == "Record")
+                && record_arguments
+                && clause_data.types.nodes.len() == 1
+                && authenticate_record_mapped_alias(store, host, symbol, base_declarations)?
+            {
+                Some(DirectInterfaceBaseKind::RecordMappedAlias)
+            } else if base.type_arguments.is_none()
+                && matches!(
+                    source_interface_alias_base_request(store, symbol),
+                    Ok(Some(_))
+                )
+                && matches!(
+                    preflight_node(store, host, declaration).map(|record| &record.data),
+                    Ok(NodeData::InterfaceDeclaration(interface)) if interface.type_parameters.is_none()
+                )
+            {
+                Some(DirectInterfaceBaseKind::NongenericTypeLiteralAlias)
+            } else {
+                source_interface_alias_reference_request(store, symbol, node)
+                    .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+                Some(DirectInterfaceBaseKind::InstantiatedTypeAlias)
+            }
+        } else {
+            None
+        };
         let (type_arguments, defaults) =
             match (base.type_arguments.as_ref(), react_array_arguments.as_ref()) {
                 (Some(_), Some(arguments)) => (arguments.clone(), Vec::new()),
-                (Some(arguments), _) if symbol_record.flags() == SymbolFlags::TYPE_ALIAS => {
-                    if identifier.is_none_or(|identifier| identifier.text != "Record")
-                        || clause_data.types.nodes.len() != 1
-                        || !authenticate_record_mapped_alias(
-                            store,
-                            host,
-                            symbol,
-                            base_declarations,
-                        )?
-                    {
-                        return Err(DirectInterfaceHeritageError::Unsupported {
-                            node: expression,
-                            kind: expression_record.kind,
-                        });
-                    }
+                (Some(arguments), _)
+                    if alias_kind == Some(DirectInterfaceBaseKind::RecordMappedAlias) =>
+                {
                     (
                         plan_record_type_arguments(store, host, node, arguments)?,
+                        Vec::new(),
+                    )
+                }
+                (arguments, _)
+                    if alias_kind == Some(DirectInterfaceBaseKind::InstantiatedTypeAlias) =>
+                {
+                    (
+                        plan_alias_base_arguments(store, host, node, arguments)?,
                         Vec::new(),
                     )
                 }
@@ -2035,39 +2647,12 @@ fn plan_direct_interface_heritage_inner(
                     });
                 }
             };
-        if symbol_record.flags() == SymbolFlags::TYPE_ALIAS {
-            if type_arguments.is_empty() {
-                if base.type_arguments.is_some()
-                    || identifier.is_none()
-                    || !matches!(
-                        source_interface_alias_base_request(store, symbol),
-                        Ok(Some(_))
-                    )
-                    || !matches!(
-                        preflight_node(store, host, declaration).map(|record| &record.data),
-                        Ok(NodeData::InterfaceDeclaration(interface)) if interface.type_parameters.is_none()
-                    )
-                {
-                    return Err(DirectInterfaceHeritageError::Unsupported {
-                        node: expression,
-                        kind: expression_record.kind,
-                    });
-                }
-                bases.push(DirectInterfaceBasePlan {
-                    node,
-                    expression,
-                    symbol,
-                    kind: DirectInterfaceBaseKind::NongenericTypeLiteralAlias,
-                    type_arguments,
-                    defaults,
-                });
-                continue;
-            }
+        if let Some(kind) = alias_kind {
             bases.push(DirectInterfaceBasePlan {
                 node,
                 expression,
                 symbol,
-                kind: DirectInterfaceBaseKind::RecordMappedAlias,
+                kind,
                 type_arguments,
                 defaults,
             });
@@ -2192,6 +2777,7 @@ fn plan_direct_interface_heritage_inner(
                         base.kind,
                         DirectInterfaceBaseKind::Interface
                             | DirectInterfaceBaseKind::NongenericTypeLiteralAlias
+                            | DirectInterfaceBaseKind::InstantiatedTypeAlias
                     )
                 }) {
                     return Err(DirectInterfaceHeritageError::Unsupported {
@@ -2227,6 +2813,51 @@ fn plan_direct_interface_heritage_inner(
         });
     }
     Ok(DirectInterfaceHeritagePlan { clause, bases })
+}
+
+/// Type arguments are checked by the normal alias query, including defaults and bounds.
+fn plan_alias_base_arguments(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    arguments: Option<&NodeList>,
+) -> Result<Vec<NodeRef>, DirectInterfaceHeritageError> {
+    let invalid = || DirectInterfaceHeritageError::Invalid;
+    let Some(arguments) = arguments else {
+        return Ok(Vec::new());
+    };
+    let record = preflight_node(store, host, node).map_err(|_| invalid())?;
+    let NodeData::ExpressionWithTypeArguments(base) = &record.data else {
+        return Err(invalid());
+    };
+    let expression = NodeRef::new(node.arena, node.file, base.expression);
+    let mut previous_end = preflight_node(store, host, expression)
+        .map_err(|_| invalid())?
+        .range
+        .end;
+    if arguments.nodes.is_empty()
+        || arguments.has_trailing_comma
+        || arguments.range.start < previous_end
+        || arguments.range.end != record.range.end
+    {
+        return Err(invalid());
+    }
+    let mut result = Vec::with_capacity(arguments.nodes.len());
+    for argument in &arguments.nodes {
+        let argument = NodeRef::new(node.arena, node.file, *argument);
+        let record = preflight_node(store, host, argument).map_err(|_| invalid())?;
+        if record.parent != Some(node.node)
+            || record.range.start < previous_end
+            || record.range.start <= arguments.range.start
+            || record.range.end >= arguments.range.end
+            || result.contains(&argument)
+        {
+            return Err(invalid());
+        }
+        previous_end = record.range.end;
+        result.push(argument);
+    }
+    Ok(result)
 }
 
 #[allow(clippy::too_many_arguments)] // Both interface owners and their exact syntax remain explicit.

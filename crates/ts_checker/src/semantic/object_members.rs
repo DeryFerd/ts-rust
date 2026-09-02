@@ -1457,7 +1457,14 @@ fn source_interface_condition_owner(
         .contains(ObjectFlags::MEMBERS_RESOLVED);
     if complete && let Some(header) = planned_header.as_ref() {
         let mut pending = false;
-        for request in header.bases().iter().filter_map(|base| base.alias()) {
+        for request in super::interface_heritage::effective_source_interface_heritage_bases(
+            store,
+            header,
+            array_targets,
+        )?
+        .into_iter()
+        .filter_map(|base| base.alias())
+        {
             if let SourceInterfaceAliasBaseState::Pending { conditional, .. } =
                 super::interface_heritage::source_interface_alias_base_state(
                     store,
@@ -1545,7 +1552,11 @@ fn source_interface_condition_owner(
     );
     let mut bases = Vec::new();
     if let Some(header) = planned_header.as_ref() {
-        for base in header.bases() {
+        for base in super::interface_heritage::effective_source_interface_heritage_bases(
+            store,
+            header,
+            array_targets,
+        )? {
             if let Some(request) = base.alias() {
                 match super::interface_heritage::source_interface_alias_base_state(
                     store,
@@ -8410,6 +8421,7 @@ pub(super) fn plan_interface(
         for base in &heritage.bases[1..] {
             if base.symbol != heritage.bases[0].symbol
                 && base.kind != DirectInterfaceBaseKind::NongenericTypeLiteralAlias
+                && base.kind != DirectInterfaceBaseKind::InstantiatedTypeAlias
                 && store
                     .symbol(base.symbol)
                     .ok_or(PropertyObjectError::InvalidInterfaceSymbol(base.symbol))?
@@ -8438,7 +8450,11 @@ pub(super) fn plan_interface(
             });
         }
         for base in &heritage.bases {
-            if base.kind == DirectInterfaceBaseKind::NongenericTypeLiteralAlias {
+            if matches!(
+                base.kind,
+                DirectInterfaceBaseKind::NongenericTypeLiteralAlias
+                    | DirectInterfaceBaseKind::InstantiatedTypeAlias
+            ) {
                 // The normal alias query selects the real property object.
                 // Member construction checks its properties and all overlaps.
                 continue;
@@ -8646,6 +8662,12 @@ pub(super) fn check_source_interface_property_heritage(
     }
     let plan = plan_interface(store, host, provenance.owner_symbol).map_err(|_| invalid())?;
     let heritage = plan.heritage.as_ref().ok_or_else(invalid)?;
+    let effective_bases = super::interface_heritage::effective_interface_heritage_bases(
+        store,
+        heritage,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+    )
+    .map_err(|_| invalid())?;
     // Alias-base and method-only providers still enforce their existing rules.
     if heritage
         .bases
@@ -8666,9 +8688,8 @@ pub(super) fn check_source_interface_property_heritage(
         || !record
             .object_flags()
             .contains(ObjectFlags::MEMBERS_RESOLVED)
-        || base_types.len() != heritage.bases.len()
-        || !provenance.bases.iter().copied().eq(heritage
-            .bases
+        || base_types.len() != effective_bases.len()
+        || !provenance.bases.iter().copied().eq(effective_bases
             .iter()
             .zip(&base_types)
             .map(|(base, &type_)| (base.symbol, type_)))
@@ -11800,11 +11821,13 @@ pub(super) fn plan_generic_interface_identity(
                         PropertyObjectError::UnsupportedMember { node, kind }
                     }
                 })?;
-            if planned
-                .bases
-                .iter()
-                .any(|base| base.kind != DirectInterfaceBaseKind::Interface)
-            {
+            if planned.bases.iter().any(|base| {
+                !matches!(
+                    base.kind,
+                    DirectInterfaceBaseKind::Interface
+                        | DirectInterfaceBaseKind::InstantiatedTypeAlias
+                )
+            }) {
                 return Err(PropertyObjectError::UnsupportedMember {
                     node: planned.clause,
                     kind: SyntaxKind::HeritageClause,
@@ -11921,10 +11944,13 @@ pub(super) fn plan_generic_interface(
             })?;
             if planned.bases.is_empty()
                 || planned.bases.len() > 2
-                || planned
-                    .bases
-                    .iter()
-                    .any(|base| base.kind != DirectInterfaceBaseKind::Interface)
+                || planned.bases.iter().any(|base| {
+                    !matches!(
+                        base.kind,
+                        DirectInterfaceBaseKind::Interface
+                            | DirectInterfaceBaseKind::InstantiatedTypeAlias
+                    )
+                })
             {
                 return Err(PropertyObjectError::UnsupportedMember {
                     node: planned.clause,

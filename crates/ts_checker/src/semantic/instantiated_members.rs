@@ -8616,7 +8616,7 @@ fn cached_inherited_properties(
         })
         .collect::<Result<HashSet<_>, _>>()?;
     for base in &shape.base_types {
-        let Some(base) = mapped_inherited_type(store, shape, *base)? else {
+        let Some(base) = mapped_inherited_type(store, shape, *base, array_targets)? else {
             return Ok(None);
         };
         let (properties, indexes) = if validate_direct_generic_reference(store, base).is_ok() {
@@ -8643,7 +8643,13 @@ fn cached_inherited_properties(
                 structured.index_infos.clone().unwrap_or_default(),
             )
         } else {
-            return Err(GenericInterfaceMemberError::UnsupportedTarget(base));
+            let members =
+                super::interface_heritage::interface_alias_base_members(store, base, array_targets)
+                    .map_err(|_| GenericInterfaceMemberError::UnsupportedTarget(base))?;
+            let Some(members) = members else {
+                return Ok(None);
+            };
+            (members.properties, members.indexes)
         };
         for property in properties {
             let name = store
@@ -8672,70 +8678,17 @@ fn mapped_inherited_type(
     store: &CanonicalTypeMapperStore,
     shape: &GenericInterfaceShape,
     type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<TypeId>, GenericInterfaceMemberError> {
-    if let Some(index) = shape
-        .source_parameters
+    let sources = mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
+    let targets = shape
+        .target_arguments
         .iter()
-        .position(|parameter| *parameter == type_)
-    {
-        return shape
-            .target_arguments
-            .get(index)
-            .copied()
-            .map(Some)
-            .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target));
-    }
-    let this_type = store
-        .type_payload(shape.target)
-        .and_then(|record| match record.data() {
-            TypeData::Interface(interface) => interface.this_type,
-            _ => None,
-        })
-        .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?;
-    if type_ == this_type {
-        return Ok(Some(shape.reference));
-    }
-    let record = store
-        .type_payload(type_)
-        .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(type_))?;
-    if matches!(record.data(), TypeData::Intrinsic(_) | TypeData::Literal(_)) {
-        return Ok(Some(type_));
-    }
-    let reference = match validate_direct_generic_reference(store, type_) {
-        Ok(reference) => reference,
-        Err(_) if matches!(record.data(), TypeData::Interface(_)) => {
-            return Ok(Some(type_));
-        }
-        Err(_) => return Err(GenericInterfaceMemberError::UnsupportedPropertyType(type_)),
-    };
-    let mut arguments = Vec::with_capacity(reference.type_arguments.len());
-    for argument in &reference.type_arguments {
-        let Some(argument) = mapped_inherited_type(store, shape, *argument)? else {
-            return Ok(None);
-        };
-        arguments.push(argument);
-    }
-    if arguments == reference.type_arguments {
-        return Ok(Some(type_));
-    }
-    let TypeData::Interface(target) = store
-        .type_payload(reference.target)
-        .ok_or(GenericInterfaceMemberError::InvalidTarget(reference.target))?
-        .data()
-    else {
-        return Err(GenericInterfaceMemberError::InvalidTarget(reference.target));
-    };
-    let TypeCacheState::Allocated(cache) = &target.reference.object.instantiations else {
-        return Err(GenericInterfaceMemberError::InvalidTarget(reference.target));
-    };
-    let Some(cached) = cache.get(&type_list_key(&arguments)).copied() else {
-        return Ok(None);
-    };
-    let actual = validate_direct_generic_reference(store, cached)?;
-    if actual.target != reference.target || actual.type_arguments != arguments {
-        return Err(GenericInterfaceMemberError::InvalidCachedMembers(cached));
-    }
-    Ok(Some(cached))
+        .copied()
+        .chain(std::iter::once(shape.reference))
+        .collect::<Vec<_>>();
+    cached_instantiation_with_vector(store, type_, &sources, &targets, array_targets, None)
+        .map_err(|error| property_instantiation_error(type_, &error))
 }
 
 fn materialize_inherited_members(
@@ -8779,7 +8732,13 @@ fn materialize_inherited_members(
             validate_resolved_declared_property_object(store, resolved),
             DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
         ) {
-            return Err(GenericInterfaceMemberError::UnsupportedTarget(resolved));
+            super::interface_heritage::resolve_interface_alias_base_members(
+                store,
+                resolved,
+                array_targets,
+                session,
+            )
+            .map_err(|_| GenericInterfaceMemberError::UnsupportedTarget(resolved))?;
         }
     }
     Ok(())
@@ -9022,7 +8981,12 @@ fn validate_declared_target(
             validate_resolved_declared_property_object(store, base),
             DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
         ) {
-            return Err(GenericInterfaceMemberError::UnsupportedTarget(base));
+            if !super::interface_heritage::interface_base_has_statically_known_members(store, base)
+                .map_err(|_| GenericInterfaceMemberError::InvalidTarget(base))?
+            {
+                return Err(GenericInterfaceMemberError::UnsupportedTarget(base));
+            }
+            member_type_requires_instantiation(store, base, &mapper_parameters, array_targets)?;
         }
     }
     for property in &mut properties {

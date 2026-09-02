@@ -11916,7 +11916,36 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .is_none_or(|utility| utility.mapped != node)
             && !self.is_homomorphic_generic_mapped_alias(alias, mapped)?
         {
-            self.validate_record_mapped_alias_plan(alias, mapped)?;
+            if self
+                .validate_record_mapped_alias_plan(alias, mapped)
+                .is_err()
+            {
+                let source = super::object_aliases::property_object_alias_identity_source_header(
+                    self.store, alias,
+                )
+                .map_err(|_| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeAliasSymbol(alias))
+                })?;
+                if self
+                    .plan
+                    .aliases
+                    .get(&alias)
+                    .is_none_or(|plan| plan.type_node != node)
+                    || self
+                        .store
+                        .source_direct_type_annotation(source.alias_declaration)
+                        != Some(node)
+                    || self.store.source_node_parent(node)
+                        != Some(SourceNodeParent::Parent(source.alias_declaration))
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::GenericReferenceUnsupported {
+                            node,
+                            symbol: alias,
+                        },
+                    ));
+                }
+            }
         }
         self.plan.mapped_types.insert(node, mapped);
         self.plan_type_node_in_context(mapped.constraint(), None, false)?;
@@ -16474,7 +16503,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 && let Some(heritage) = &planned.heritage
             {
                 for base in &heritage.bases {
-                    if base.kind == DirectInterfaceBaseKind::NongenericTypeLiteralAlias {
+                    if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+                        self.plan_type_node(base.node)?;
+                    } else if base.kind == DirectInterfaceBaseKind::NongenericTypeLiteralAlias {
                         self.plan_type_alias(base.symbol, false)?;
                     } else if base.type_arguments.is_empty() {
                         self.plan_property_interface(base.symbol)?;
@@ -16566,7 +16597,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             if let Some(heritage) = &members.heritage {
                 for inherited in &heritage.bases {
-                    if inherited.type_arguments.is_empty() {
+                    if inherited.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+                        self.plan_type_node(inherited.node)?;
+                    } else if inherited.type_arguments.is_empty() {
                         self.plan_property_interface(inherited.symbol)?;
                     } else {
                         self.plan_concrete_generic_interface_base(inherited)?;
@@ -17409,6 +17442,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
         let result = (|| {
             for base in bases {
+                if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+                    self.plan_type_node(base.node)?;
+                    continue;
+                }
                 if react_namespace.is_some()
                     && let Some(NodeData::Identifier(identifier)) =
                         self.host.node(base.expression).map(|record| &record.data)
@@ -18263,6 +18300,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
     }
 
     fn planned_mapped_intersection_constituent(&self, node: NodeRef) -> Option<bool> {
+        if self.plan.mapped_types.contains_key(&node) {
+            return Some(true);
+        }
         if self.host.node(node)?.kind != SyntaxKind::TypeReference {
             return None;
         }
@@ -21114,6 +21154,21 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     if self.store.validate_deferred_mapped_type(type_).is_err() {
                         return false;
                     }
+                    if record.kind == SyntaxKind::MappedType {
+                        if super::mapped_types::generic_mapped_type_projection(
+                            self.store,
+                            type_,
+                            self.array_targets,
+                        )
+                        .is_ok_and(|projection| {
+                            projection.is_some_and(|projection| projection.target == type_)
+                        }) {
+                            has_mapped = true;
+                            constituents.push(type_);
+                            continue;
+                        }
+                        return false;
+                    }
                     let NodeData::TypeReferenceNode(reference) = &record.data else {
                         return false;
                     };
@@ -23363,9 +23418,21 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let source_class_heritage = record_heritage && self.source_class_heritage == Some(node);
         let source_class_implementation = source_class_heritage
             && source_class_implementation_owner(self.store, self.host, node)?.is_some();
+        let interface_alias_heritage = if record_heritage
+            && !array_heritage
+            && !source_class_heritage
+        {
+            super::interface_heritage::plan_interface_alias_base_reference(
+                self.store, self.host, node,
+            )
+            .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)))?
+        } else {
+            None
+        };
         if record_heritage
             && !array_heritage
             && !source_class_heritage
+            && interface_alias_heritage.is_none()
             && (qualified
                 || name_text != "Record"
                 || type_arguments.len() != 2
@@ -23526,6 +23593,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
 
         if !self.replay_cached_annotations
+            && !record_heritage
             && !cached_intersection_source
             && !cached_mapped_lookup_source
             && !self.source_type_consumes_interface_defaults(node, &mut HashSet::new())?
@@ -23855,6 +23923,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedReferenceTarget { node, symbol },
+            ));
+        }
+        if interface_alias_heritage
+            .as_ref()
+            .is_some_and(|base| base.symbol != symbol)
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
             ));
         }
         if malformed_alias_merge(flags) {
@@ -37721,27 +37797,48 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         .ok_or_else(|| {
                             type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(root))
                         })?;
-                    self.get_declared_type_of_symbol(alias)?;
-                    let context = self.source_query_context()?;
-                    if !matches!(
-                        super::interface_heritage::source_interface_alias_base_state(
-                            self.store,
-                            source,
-                            arrays,
-                            Some(&context.heritage())
-                        )?,
-                        super::interface_heritage::SourceInterfaceAliasBaseState::Ready { .. }
-                    ) {
-                        return Err(type_node_unavailable(
-                            TypeNodeUnavailable::InvalidTypeReference(root),
-                        ));
-                    }
+                    self.prepare_source_interface_alias_base(source)?;
                 }
             }
             Ok(())
         })();
         self.active_source_heritage.remove(&request);
         result
+    }
+
+    fn prepare_source_interface_alias_base(
+        &mut self,
+        request: &super::interface_heritage::SourceInterfaceAliasBaseRequest,
+    ) -> Result<(), DeclaredTypeError> {
+        if let Some(reference) = request.reference() {
+            self.get_type_from_type_node(reference)?;
+        } else {
+            self.get_declared_type_of_symbol(request.symbol())?;
+        }
+        let arrays = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types);
+        if super::interface_heritage::source_interface_alias_base_is_ignored(
+            self.store, request, arrays,
+        )? {
+            return Ok(());
+        }
+        let context = self.source_query_context()?;
+        if !matches!(
+            super::interface_heritage::source_interface_alias_base_state(
+                self.store,
+                request,
+                arrays,
+                Some(&context.heritage()),
+            )?,
+            super::interface_heritage::SourceInterfaceAliasBaseState::Ready { .. }
+        ) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(request.root()),
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn prepare_source_condition_type(
@@ -37847,19 +37944,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             if conditional.is_some() && conditional != current {
                                 return Err(invalid());
                             }
-                            self.get_declared_type_of_symbol(request.symbol())?;
-                            let current = self.source_query_context()?;
-                            if !matches!(
-                                super::interface_heritage::source_interface_alias_base_state(
-                                    self.store,
-                                    &request,
-                                    arrays,
-                                    Some(&current.heritage()),
-                                )?,
-                                super::interface_heritage::SourceInterfaceAliasBaseState::Ready { .. }
-                            ) {
-                                return Err(invalid());
-                            }
+                            self.prepare_source_interface_alias_base(&request)?;
                         }
                     }
                 }
@@ -38971,6 +39056,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 Some(alias) => self.execute_declared_type(alias, &plan, &mut prepared),
                 None => self.execute_type_node(node, &plan, &mut prepared),
             }?;
+            if self.store.source_node_kind(node) == Some(SyntaxKind::ExpressionWithTypeArguments)
+                && let Some(base) = super::interface_heritage::plan_interface_alias_base_reference(
+                    self.store, self.host, node,
+                )
+                .map_err(|_| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+                })?
+                && self
+                    .execute_interface_alias_base(&base, &plan, &mut prepared)?
+                    .is_some_and(|base_type| base_type != result)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
             if let Some(operand) = &source_operand {
                 self.source_alias_operand_graph(&operand.source, node, result, &plan)?;
             }
@@ -44626,10 +44726,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
 
         let mut bases = Vec::with_capacity(heritage.bases.len());
         for base in &heritage.bases {
-            if base.kind != DirectInterfaceBaseKind::Interface || base.symbol == symbol {
+            if !matches!(
+                base.kind,
+                DirectInterfaceBaseKind::Interface | DirectInterfaceBaseKind::InstantiatedTypeAlias
+            ) || base.symbol == symbol
+            {
                 return Err(invalid());
             }
-            let reference = self.execute_direct_interface_base_type(base, plan, prepared)?;
+            let reference = if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+                let Some(type_) = self.execute_interface_alias_base(base, plan, prepared)? else {
+                    continue;
+                };
+                type_
+            } else {
+                self.execute_direct_interface_base_type(base, plan, prepared)?
+            };
             if reference == target || bases.contains(&reference) {
                 return Err(invalid());
             }
@@ -44643,21 +44754,172 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if record.symbol() != Some(symbol) || data.resolved_base_constructor_type.is_some() {
             return Err(invalid());
         }
+        let expected_bases = (!bases.is_empty()).then_some(bases.as_slice());
         if data.base_types_resolved {
-            return if data.resolved_base_types.as_deref() == Some(bases.as_slice()) {
+            return if data.resolved_base_types.as_deref() == expected_bases {
                 Ok(target)
             } else {
                 Err(invalid())
             };
         }
         if data.resolved_base_types.is_some()
-            || !self
-                .store
-                .set_interface_base_resolution(target, true, None, Some(bases))
+            || !self.store.set_interface_base_resolution(
+                target,
+                true,
+                None,
+                (!bases.is_empty()).then_some(bases),
+            )
         {
             return Err(invalid());
         }
         Ok(target)
+    }
+
+    fn execute_interface_alias_base(
+        &mut self,
+        base: &DirectInterfaceBasePlan,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        let type_ = self.execute_type_node(base.node, plan, prepared)?;
+        if type_ == self.error_type()? {
+            return Ok(None);
+        }
+        if !super::interface_heritage::interface_base_has_statically_known_members(
+            self.store, type_,
+        )? {
+            self.diagnostics.lookup_or_issue(
+                Some(base.node),
+                Diagnostic::new(
+                    message_by_code(2312).expect("TS2312 is in the diagnostic catalog"),
+                ),
+            );
+            return Ok(None);
+        }
+        self.prepare_interface_alias_base_sources(type_, plan, prepared, &mut HashSet::new())?;
+        let arrays = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types);
+        let mut fallback = InstantiationSession::new(InstantiationLimits::default());
+        super::interface_heritage::resolve_interface_alias_base_members(
+            self.store,
+            type_,
+            arrays,
+            self.instantiation_session
+                .as_deref_mut()
+                .unwrap_or(&mut fallback),
+        )?;
+        Ok(Some(type_))
+    }
+
+    /// Prepares source annotations before the existing member resolvers run.
+    #[allow(clippy::too_many_lines)] // Keep the caller's source context through each member provider.
+    fn prepare_interface_alias_base_sources(
+        &mut self,
+        type_: TypeId,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedIntersectionConstituentType(
+                type_,
+            ))
+        };
+        if active.len() >= super::interface_heritage::MAX_INTERFACE_HERITAGE_DEPTH
+            || !active.insert(type_)
+        {
+            return Err(invalid());
+        }
+        let record = self.store.type_payload(type_).ok_or_else(invalid)?;
+        if let TypeData::Intersection(intersection) = record.data() {
+            let types = intersection.intersection.types.clone();
+            for part in types {
+                self.prepare_interface_alias_base_sources(part, plan, prepared, active)?;
+            }
+        } else if let TypeData::Mapped(mapped) = record.data() {
+            let source = mapped.modifiers_type;
+            if let Some(source) = source.filter(|source| {
+                self.store.type_payload(*source).is_some_and(|record| {
+                    record
+                        .flags()
+                        .intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION)
+                })
+            }) {
+                self.prepare_interface_alias_base_sources(source, plan, prepared, active)?;
+            }
+        } else if let Some(source) =
+            super::object_aliases::source_property_object_projection(self.store, type_)
+                .map_err(|_| invalid())?
+        {
+            for property in source.properties() {
+                self.execute_type_node(property.type_node, plan, prepared)?;
+            }
+            let arrays = self
+                .global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types);
+            let members = super::instantiated_members::resolve_property_object_alias_members_with_array_targets(
+                self.store, type_, arrays,
+            ).map_err(|_| invalid())?;
+            let globals = self.global_types.clone().ok_or_else(invalid)?;
+            let mut context = self.source_query_context()?;
+            let mut fallback = InstantiationSession::new(InstantiationLimits::default());
+            let session = self
+                .instantiation_session
+                .as_deref_mut()
+                .unwrap_or(&mut fallback);
+            for property in members.properties {
+                super::instantiated_members::demand_property_object_alias_property_with_source(
+                    self.store,
+                    self.host,
+                    &globals,
+                    self.options,
+                    session,
+                    self.diagnostics,
+                    type_,
+                    property,
+                    &mut context,
+                )
+                .map_err(|error| match error {
+                    ConditionalTypeError::Declared(error) => error,
+                    _ => invalid(),
+                })?;
+            }
+            self.global_this_members = context.members;
+            self.completed_source_conditionals = context.completed;
+            self.new_source_conditionals.extend(context.produced);
+            self.completed_global_values = context.values;
+            self.source_branch_recoveries = context.recoveries;
+            self.source_conditional_recoveries = context.semantic_results;
+            self.completed_source_returns = context.returns;
+        } else if let Ok(reference) = validate_direct_generic_reference(self.store, type_) {
+            let symbol = self
+                .store
+                .type_payload(reference.target)
+                .and_then(TypeRecord::symbol)
+                .ok_or_else(invalid)?;
+            if plan.generic_member_plans.contains_key(&symbol) {
+                self.execute_generic_interface_declared_members(
+                    symbol,
+                    reference.target,
+                    plan,
+                    prepared,
+                )?;
+            } else {
+                self.prepare_generic_interface_declared_members(type_)?;
+            }
+        } else if matches!(record.data(), TypeData::Interface(_)) {
+            let symbol = record.symbol().ok_or_else(invalid)?;
+            if plan.interfaces.contains_key(&symbol) {
+                self.execute_declared_type(symbol, plan, prepared)?;
+            } else {
+                self.get_declared_interface_for_source_check(symbol)?;
+            }
+        }
+        assert!(active.remove(&type_));
+        Ok(())
     }
 
     fn execute_direct_interface_base_type(
@@ -44807,7 +45069,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .ok_or_else(invalid)?;
         if let Some(heritage) = &members.heritage {
             for base in &heritage.bases {
-                if base.type_arguments.is_empty() {
+                if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+                    self.execute_interface_alias_base(base, plan, prepared)?;
+                } else if base.type_arguments.is_empty() {
                     self.execute_declared_type(base.symbol, plan, prepared)?;
                 } else {
                     self.execute_concrete_generic_interface_base(base, plan, prepared)?;
@@ -45021,7 +45285,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             if let Some(heritage) = &interface.heritage {
                 base_types.reserve(heritage.bases.len());
                 for base in &heritage.bases {
-                    let type_ = if base.type_arguments.is_empty() {
+                    let type_ = if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+                        let Some(type_) =
+                            self.execute_interface_alias_base(base, plan, prepared)?
+                        else {
+                            continue;
+                        };
+                        type_
+                    } else if base.type_arguments.is_empty() {
                         self.execute_declared_type(base.symbol, plan, prepared)?
                     } else {
                         self.execute_concrete_generic_interface_base(base, plan, prepared)?
@@ -45049,7 +45320,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             .and_then(|members| self.store.symbol_table(members))
                             .and_then(|members| members.get(key));
                         if let Some(inherited) = inherited {
-                            let reference = if !base.type_arguments.is_empty() {
+                            let reference = if base.kind
+                                == DirectInterfaceBaseKind::InstantiatedTypeAlias
+                            {
+                                None
+                            } else if !base.type_arguments.is_empty() {
                                 Some(type_)
                             } else if self.store.symbol(inherited).is_some_and(|property| {
                                 property.flags().contains(SymbolFlags::TRANSIENT)
@@ -47415,12 +47690,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let modifiers_source = match mapped.modifiers_source().or(utility_source) {
             Some(source) => self.execute_type_node(source, plan, prepared)?,
             None => {
-                self.store
-                    .intrinsic_bootstrap()
-                    .ok_or(DeclaredTypeError::Unavailable(
-                        DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
-                    ))?
-                    .unknown_type
+                super::mapped_types::mapped_modifiers_type_from_constraint(self.store, constraint)
+                    .map_err(|error| mapped_type_error(error, node))?
+                    .unwrap_or(
+                        self.store
+                            .intrinsic_bootstrap()
+                            .ok_or(DeclaredTypeError::Unavailable(
+                                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                            ))?
+                            .unknown_type,
+                    )
             }
         };
         let mut request = MappedTypeRequest::new(
@@ -52135,6 +52414,102 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     symbol,
                 ))
             };
+            if utility.is_none()
+                && self
+                    .store
+                    .validate_record_mapped_alias_instantiation(
+                        symbol,
+                        declared_type,
+                        &type_parameters,
+                        &type_parameters,
+                        declared_type,
+                    )
+                    .is_err()
+            {
+                let arrays = self
+                    .global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types);
+                let supported = super::mapped_types::supported_mapped_alias_projection(
+                    self.store,
+                    declared_type,
+                    arrays,
+                )
+                .map_err(|_| invalid_cache())?;
+                let exact = if let Some(projection) = supported {
+                    projection.identity_symbol == symbol
+                        && projection.identity_arguments == type_parameters
+                } else {
+                    super::mapped_types::generic_mapped_type_projection(
+                        self.store,
+                        declared_type,
+                        arrays,
+                    )
+                    .map_err(|_| invalid_cache())?
+                    .is_some_and(|projection| projection.parameters == type_parameters)
+                };
+                if alias_identity.is_some() || !exact {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                            alias: symbol,
+                            declared_type,
+                        },
+                    ));
+                }
+                let mut fallback = InstantiationSession::new(InstantiationLimits::default());
+                let session = self
+                    .instantiation_session
+                    .as_deref_mut()
+                    .unwrap_or(&mut fallback);
+                let mark = session.limit_event_mark();
+                let instantiated = super::instantiate::instantiate_type_with_vector_and_session(
+                    self.store,
+                    declared_type,
+                    &type_parameters,
+                    &type_arguments,
+                    arrays,
+                    session,
+                )
+                .map_err(|_| invalid_cache())?;
+                if session.limit_event_occurred_since(mark) {
+                    return Ok(instantiated);
+                }
+                if let Some(cached) = links
+                    .instantiations
+                    .as_ref()
+                    .and_then(|entries| entries.get(&key))
+                {
+                    return if *cached == instantiated {
+                        Ok(instantiated)
+                    } else {
+                        Err(invalid_cache())
+                    };
+                }
+                if instantiated != declared_type {
+                    let identity = self
+                        .store
+                        .type_payload(instantiated)
+                        .and_then(TypeRecord::alias)
+                        .and_then(|identity| self.store.type_alias(identity))
+                        .ok_or_else(invalid_cache)?;
+                    if identity.symbol() != Some(symbol)
+                        || identity.type_arguments().unwrap_or_default() != type_arguments
+                    {
+                        return Err(invalid_cache());
+                    }
+                }
+                let mut updated = links.clone();
+                let entries = updated.instantiations.as_mut().ok_or_else(invalid_cache)?;
+                entries
+                    .try_reserve(1)
+                    .map_err(|_| type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity))?;
+                if entries.insert(key, instantiated).is_some()
+                    || !self.store.set_type_alias_links(symbol, updated)
+                {
+                    return Err(invalid_cache());
+                }
+                return Ok(instantiated);
+            }
             if utility.is_some_and(|utility| utility.kind == MappedUtilityKind::Pick)
                 && alias_identity.is_none()
                 && provided_argument_count == type_arguments.len()
