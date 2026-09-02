@@ -2577,8 +2577,10 @@ fn plan_body(
             NodeData::CallExpression(_) => record.kind == SyntaxKind::CallExpression,
             NodeData::BinaryExpression(binary) => {
                 record.kind == SyntaxKind::BinaryExpression
-                    && store.source_node_kind(NodeRef::new(body.arena, body.file, binary.left))
-                        == Some(SyntaxKind::Identifier)
+                    && matches!(
+                        store.source_node_kind(NodeRef::new(body.arena, body.file, binary.left)),
+                        Some(SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression)
+                    )
                     && store.source_node_kind(NodeRef::new(
                         body.arena,
                         body.file,

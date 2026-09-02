@@ -2542,6 +2542,20 @@ pub(super) fn plan_direct_source_property_syntax(
     plan_direct_source_property_syntax_at(arena, store, node, SourcePropertyPosition::Read)
 }
 
+pub(super) fn plan_direct_source_property_write_syntax(
+    arena: &NodeArena,
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    assignment: NodeRef,
+) -> Result<DirectSourcePropertySyntax, SourcePropertyError> {
+    plan_direct_source_property_syntax_at(
+        arena,
+        store,
+        node,
+        SourcePropertyPosition::WriteTarget(assignment),
+    )
+}
+
 /// Proves a property access specifically as the callee of `call`.
 pub(super) fn plan_direct_source_property_call_syntax(
     arena: &NodeArena,
@@ -2868,7 +2882,7 @@ pub(super) fn check_direct_source_property_with_source(
 
 /// Checks a read/write property target without publishing an ordinary read first.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn check_nullish_property_assignment_target(
+pub(super) fn check_source_property_assignment_target(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
@@ -3005,10 +3019,15 @@ pub(super) fn check_nullish_property_assignment_target(
     } else {
         write
     };
-    publish_property_links(store, plan.node, Some(property.symbol), read)?;
+    let result = if matches!(plan.position, SourcePropertyPosition::WriteTarget(_)) {
+        write
+    } else {
+        read
+    };
+    publish_property_links(store, plan.node, Some(property.symbol), result)?;
     Ok((
         CheckedSourceProperty {
-            type_: read,
+            type_: result,
             diagnostics: Vec::new(),
         },
         write,

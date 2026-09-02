@@ -576,6 +576,37 @@ pub(super) struct SourceCallableForSyntax {
 }
 
 impl SourceCallableStatementListSyntax {
+    pub(super) fn expression_statements(&self) -> Vec<NodeRef> {
+        let mut pending = self.statements.iter().collect::<Vec<_>>();
+        let mut expressions = Vec::new();
+        while let Some(statement) = pending.pop() {
+            match statement {
+                SourceCallableStatementSyntax::Leaf(
+                    SourceLinearFunctionStatementSyntax::Expression { expression, .. },
+                ) => expressions.push(*expression),
+                SourceCallableStatementSyntax::Block { statements, .. } => {
+                    pending.extend(statements);
+                }
+                SourceCallableStatementSyntax::If(branch) => {
+                    pending.extend(&branch.then_statements);
+                    pending.extend(&branch.else_statements);
+                }
+                SourceCallableStatementSyntax::Try(tried) => {
+                    pending.extend(&tried.try_statements);
+                    pending.extend(&tried.catch_statements);
+                }
+                SourceCallableStatementSyntax::ForOf(iteration) => {
+                    pending.extend(&iteration.statements);
+                }
+                SourceCallableStatementSyntax::For(iteration) => {
+                    pending.extend(&iteration.statements);
+                }
+                _ => {}
+            }
+        }
+        expressions
+    }
+
     pub(super) fn catch_bindings(&self) -> Vec<&SourceCallableCatchBindingSyntax> {
         let mut pending = self.statements.iter().collect::<Vec<_>>();
         let mut bindings = Vec::new();
@@ -10141,18 +10172,25 @@ impl SyntaxPlanner<'_> {
         self.validate_order(operator, right)?;
 
         let target = self.node(left)?;
-        let NodeData::Identifier(identifier) = &target.data else {
-            return Err(self.unsupported(
-                left,
-                target.kind,
-                SourceFunctionStatementsRole::BodyStatement,
-            ));
+        let token = self.node(operator)?;
+        let supported = match &target.data {
+            NodeData::Identifier(identifier) => {
+                target.kind == SyntaxKind::Identifier
+                    && !identifier.text.is_empty()
+                    && identifier.flow_node.is_none()
+            }
+            NodeData::PropertyAccessExpression(property) => {
+                self.statement_scope.is_some()
+                    && self.callable.family == SourceCallableFamily::ArrowFunction
+                    && target.kind == SyntaxKind::PropertyAccessExpression
+                    && token.kind == SyntaxKind::EqualsToken
+                    && property.question_dot_token.is_none()
+                    && property.flow_node.is_none()
+                    && property.facts == 0
+            }
+            _ => false,
         };
-        if target.kind != SyntaxKind::Identifier
-            || target.flags.0 != 0
-            || identifier.text.is_empty()
-            || identifier.flow_node.is_some()
-        {
+        if target.flags.0 != 0 || !supported {
             return Err(self.unsupported(
                 left,
                 target.kind,
@@ -10160,7 +10198,6 @@ impl SyntaxPlanner<'_> {
             ));
         }
 
-        let token = self.node(operator)?;
         let compound = self.statement_scope.is_some()
             && super::primitive_operators::compound_assignment_binary_operator(token.kind).is_some();
         if token.kind != SyntaxKind::EqualsToken && !compound

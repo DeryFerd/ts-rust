@@ -25778,6 +25778,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let mut argument = declaration;
         let mut default_export = None;
         let mut local_arrow_in_sync_callable = false;
+        let mut member_assignment_arrow = false;
         loop {
             let parent = self
                 .node(argument)?
@@ -25872,6 +25873,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             UnsupportedSourceSyntax::Arrow(declaration),
                         ));
                     }
+                    break;
+                }
+                NodeData::BinaryExpression(binary)
+                    if record.kind == SyntaxKind::BinaryExpression
+                        && binary.right == argument.node
+                        && super::source_callables::source_member_assignment_arrow_target(
+                            store, host, declaration,
+                        )
+                        .map_err(Self::callable_plan_error)?
+                            == Some(self.reference(binary.left)) =>
+                {
+                    member_assignment_arrow = true;
                     break;
                 }
                 NodeData::PropertyAssignment(property)
@@ -26232,6 +26245,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && !javascript_object_property_arrow
             && !contextual_object_property_arrow
             && !contextual_direct_call_arrow
+            && !member_assignment_arrow
             && super::source_callables::source_returned_arrow_context_annotation(
                 store, host, declaration,
             )
@@ -30038,6 +30052,37 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         if operator_kind == SyntaxKind::EqualsToken && !assignment {
             if !self.source_spelling_matches(operator, "=") {
                 return Err(SourceCheckError::PrimitiveOperator(operator));
+            }
+            let (_, host) = self
+                .semantic
+                .ok_or(SourceCheckError::PrimitiveOperator(expression))?;
+            if let Some(proof) =
+                super::source_flow::source_member_assignment_proof(store, host, expression)
+                    .map_err(|error| class_body_flow_error(expression, error))?
+            {
+                let syntax = super::source_properties::plan_direct_source_property_write_syntax(
+                    self.arena, store, proof.target, expression,
+                )
+                .map_err(|error| Self::property_plan_error(proof.target, error))?;
+                let receiver = self.plan_expression(proof.receiver)?;
+                let property = finish_direct_source_property_plan(&syntax, receiver)
+                    .map_err(|error| Self::property_plan_error(proof.target, error))?;
+                self.primitive_binary_position_roots.insert(proof.right);
+                let right = self.plan_expression(proof.right)?;
+                return Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::Binary(Box::new(PrimitiveBinaryPlan {
+                        node: expression,
+                        left: PlannedExpression::new(
+                            proof.target,
+                            PlannedExpressionKind::Property(Box::new(property)),
+                        ),
+                        operator: operator_kind,
+                        right,
+                        prefix: Vec::new(),
+                        shorthand_assignment: None,
+                    })),
+                ));
             }
             return self.plan_object_shorthand_assignment_expression(expression, left, right);
         }
@@ -39963,22 +40008,82 @@ fn check_expression_type_with_capture_context(
             Ok(CheckedExpressionTypes::leaf(value.result, value.result))
         }
         PlannedExpressionKind::Binary(binary) if binary.operator == SyntaxKind::EqualsToken => {
-            let target = check_expression_type_with_capture_context(
-                store,
-                host,
-                global_types,
-                source,
-                options,
-                session,
-                diagnostics,
-                current_flow_types,
-                type_import_execution,
-                &binary.left,
-                None,
-                deferred,
-                class_flow.as_deref_mut(),
-                arrow_capture,
-            )?;
+            let target = if let PlannedExpressionKind::Property(property) = &binary.left.kind {
+                let proof =
+                    super::source_flow::source_member_assignment_proof(store, host, binary.node)
+                        .map_err(|error| class_body_flow_error(binary.node, error))?
+                        .ok_or(SourceCheckError::PrimitiveOperator(binary.node))?;
+                if proof.target != binary.left.node
+                    || proof.receiver != property.receiver.node
+                    || proof.right != binary.right.node
+                    || !binary.prefix.is_empty()
+                {
+                    return Err(SourceCheckError::PrimitiveOperator(binary.node));
+                }
+                let receiver = check_expression_type_with_capture_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    current_flow_types,
+                    type_import_execution,
+                    &property.receiver,
+                    None,
+                    deferred,
+                    class_flow.as_deref_mut(),
+                    arrow_capture,
+                )?;
+                let (checked, write_type) =
+                    super::source_properties::check_source_property_assignment_target(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        property,
+                        receiver.result,
+                        session,
+                        diagnostics,
+                    )
+                    .map_err(|error| match error {
+                        SourcePropertyQueryError::Property(error) => {
+                            SourcePlanner::property_plan_error(binary.left.node, error)
+                        }
+                        SourcePropertyQueryError::Source(error) => error,
+                    })?;
+                for diagnostic in checked.diagnostics {
+                    publish_or_defer_class_property_diagnostic(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        diagnostics,
+                        binary.left.node,
+                        diagnostic,
+                        class_flow.as_deref_mut(),
+                    )?;
+                }
+                CheckedExpressionTypes::leaf(write_type, write_type)
+            } else {
+                check_expression_type_with_capture_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    current_flow_types,
+                    type_import_execution,
+                    &binary.left,
+                    None,
+                    deferred,
+                    class_flow.as_deref_mut(),
+                    arrow_capture,
+                )?
+            };
             let destructuring = match (&binary.left.kind, &binary.right.kind) {
                 (PlannedExpressionKind::Array(targets), PlannedExpressionKind::Array(values)) => {
                     Some((
@@ -43972,7 +44077,11 @@ fn check_planned_arrow_argument(
     )
     .map_err(SourcePlanner::callable_plan_error)?
     .is_some();
-    if returned_arrow && contextual_type.is_none() {
+    let member_assignment_arrow =
+        super::source_callables::source_member_assignment_arrow_target(store, host, expression)
+            .map_err(SourcePlanner::callable_plan_error)?
+            .is_some();
+    if (returned_arrow || member_assignment_arrow) && contextual_type.is_none() {
         return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(
             expression,
         )));
@@ -43985,6 +44094,10 @@ fn check_planned_arrow_argument(
             .iter()
             .any(|parameter| parameter.is_implicit_any())
         && (returned_arrow
+            || member_assignment_arrow
+            || source_object_property_arrow_symbol(store, host, expression)
+                .map_err(SourcePlanner::callable_plan_error)?
+                .is_some()
             || source_direct_call_argument_arrow_is_exact(store, host, expression)
                 .map_err(SourcePlanner::callable_plan_error)?);
     if matches!(
@@ -44066,7 +44179,7 @@ fn check_planned_arrow_argument(
     };
     let current_flow_types = closure_flow_types.as_ref().unwrap_or(current_flow_types);
     let mut contextual_arrow;
-    let arrow = if (function_expression || returned_arrow)
+    let arrow = if (function_expression || returned_arrow || member_assignment_arrow)
         && (arrow.callable.return_type.is_inferred()
             || arrow
                 .callable
@@ -44371,7 +44484,7 @@ fn check_planned_arrow_argument(
         type_import_execution.annotation_capabilities,
     )?;
     let mut contextual_statement_list;
-    let arrow = if (function_expression || returned_arrow)
+    let arrow = if (function_expression || returned_arrow || member_assignment_arrow)
         && let PlannedArrowBody::StatementList(body) = &arrow.body
         && body.syntax.callable != arrow.callable
     {
@@ -44866,12 +44979,12 @@ fn check_contextual_object_property_arrow(
     {
         return Err(unsupported());
     }
-    let PlannedArrowBody::Return {
-        expression: body, ..
-    } = &arrow.body
-    else {
+    if !matches!(
+        arrow.body,
+        PlannedArrowBody::Return { .. } | PlannedArrowBody::StatementList(_)
+    ) {
         return Err(unsupported());
-    };
+    }
 
     let mut flow_types = current_flow_types.clone();
     let mut prepared_parameters = Vec::with_capacity(parameters.len());
@@ -44914,54 +45027,88 @@ fn check_contextual_object_property_arrow(
             type_: parameter_type,
         });
     }
-    let checked = check_expression_type_with_capture_context(
-        store,
-        host,
-        global_types,
-        source,
-        options,
-        session,
-        diagnostics,
-        &flow_types,
-        type_import_execution,
-        body,
-        None,
-        deferred,
-        None,
-        outer_capture,
-    );
-    let checked = match checked {
-        Ok(checked) => checked,
-        Err(SourceCheckError::RelationUnavailable(
-            RelationUnavailable::UnsupportedStructuredType(receiver_type),
-        )) if store
-            .intrinsic_bootstrap()
-            .is_some_and(|bootstrap| receiver_type == bootstrap.string_type) =>
-        {
-            let parameter = prepared_parameters
-                .iter()
-                .find(|parameter| {
-                    parameter.type_ == receiver_type
-                        && matches!(&body.kind, PlannedExpressionKind::Property(property)
-                            if matches!(&property.receiver.kind,
-                                PlannedExpressionKind::Identifier(receiver)
-                                    if receiver.kind == PlannedIdentifierReadKind::Variable
-                                        && receiver.value_symbol == parameter.symbol))
-                })
-                .ok_or(SourceCheckError::RelationUnavailable(
-                    RelationUnavailable::UnsupportedStructuredType(receiver_type),
-                ))?;
-            recover_contextual_string_property(
-                store,
-                host,
-                global_types,
-                diagnostics,
-                body,
-                parameter.symbol,
-                receiver_type,
-            )?
+    let checked = if let PlannedArrowBody::StatementList(body) = &arrow.body {
+        if body.syntax.callable != arrow.callable {
+            return Err(SourceCheckError::Arrow(arrow.callable.declaration));
         }
-        Err(error) => return Err(error),
+        let mut values = HashMap::new();
+        let mut value_order = Vec::new();
+        let return_type = check_planned_callable_statement_list_worker(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            flow_types,
+            type_import_execution,
+            deferred,
+            body,
+            &mut values,
+            &mut value_order,
+            outer_capture,
+            Some(&prepared_parameters),
+            None,
+        )?;
+        publish_staged_variable_state(store, source.node_ref(), &values, &value_order, &[], &[])?;
+        CheckedExpressionTypes::leaf(return_type, return_type)
+    } else {
+        let PlannedArrowBody::Return {
+            expression: body, ..
+        } = &arrow.body
+        else {
+            return Err(unsupported());
+        };
+        let checked = check_expression_type_with_capture_context(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            &flow_types,
+            type_import_execution,
+            body,
+            None,
+            deferred,
+            None,
+            outer_capture,
+        );
+        match checked {
+            Ok(checked) => checked,
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::UnsupportedStructuredType(receiver_type),
+            )) if store
+                .intrinsic_bootstrap()
+                .is_some_and(|bootstrap| receiver_type == bootstrap.string_type) =>
+            {
+                let parameter = prepared_parameters
+                    .iter()
+                    .find(|parameter| {
+                        parameter.type_ == receiver_type
+                            && matches!(&body.kind, PlannedExpressionKind::Property(property)
+                                if matches!(&property.receiver.kind,
+                                    PlannedExpressionKind::Identifier(receiver)
+                                        if receiver.kind == PlannedIdentifierReadKind::Variable
+                                            && receiver.value_symbol == parameter.symbol))
+                    })
+                    .ok_or(SourceCheckError::RelationUnavailable(
+                        RelationUnavailable::UnsupportedStructuredType(receiver_type),
+                    ))?;
+                recover_contextual_string_property(
+                    store,
+                    host,
+                    global_types,
+                    diagnostics,
+                    body,
+                    parameter.symbol,
+                    receiver_type,
+                )?
+            }
+            Err(error) => return Err(error),
+        }
     };
     let return_type = widened_fresh_literal_type(store, checked.result)?;
     let return_type = store.get_widened_type_with_global_types(return_type, global_types)?;
@@ -46398,7 +46545,7 @@ fn check_nullish_assignment_expression(
                 arrow_capture,
             )?;
             let (checked, target) =
-                super::source_properties::check_nullish_property_assignment_target(
+                super::source_properties::check_source_property_assignment_target(
                     store,
                     host,
                     global_types,
@@ -76762,7 +76909,7 @@ fn check_source_plan(
                     arrow
                         .contextual_function_expression_target()
                         .is_some_and(|target| {
-                            super::source_callables::stored_returned_arrow_context_is_exact(
+                            super::source_callables::stored_expression_arrow_context_is_exact(
                                 store,
                                 arrow.declaration,
                                 arrow.owner_symbol,

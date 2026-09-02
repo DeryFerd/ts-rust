@@ -694,6 +694,19 @@ struct SourceNullishAssignmentProof {
     revision: NodeArenaRevision,
 }
 
+/// One ordinary member write retains its source nodes and binder assignment edge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceMemberAssignmentProof {
+    pub(super) expression: NodeRef,
+    pub(super) target: NodeRef,
+    pub(super) receiver: NodeRef,
+    pub(super) right: NodeRef,
+    receiver_symbol: SemanticSymbolId,
+    container: NodeRef,
+    flow: FlowRef,
+    revision: NodeArenaRevision,
+}
+
 /// A direct current-class field on the binder's real condition edges.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceClassPropertyTruthinessCondition {
@@ -1908,6 +1921,7 @@ pub(super) struct SourceFlowPlan {
     region: Option<SourceFlowRegion>,
     updates: HashMap<NodeRef, SourceFlowUpdate>,
     nullish_assignments: HashMap<NodeRef, SourceNullishAssignmentProof>,
+    member_assignments: HashMap<NodeRef, SourceMemberAssignmentProof>,
     nullish_calls: HashMap<NodeRef, FlowRef>,
 }
 
@@ -2288,6 +2302,7 @@ struct SourceFlowEffects {
     region: Option<SourceFlowRegion>,
     updates: HashMap<NodeRef, SourceFlowUpdate>,
     nullish_assignments: HashMap<NodeRef, SourceNullishAssignmentProof>,
+    member_assignments: HashMap<NodeRef, SourceMemberAssignmentProof>,
     nullish_calls: HashMap<NodeRef, FlowRef>,
     region_points: HashMap<NodeRef, FlowRef>,
 }
@@ -2730,6 +2745,20 @@ impl SourceFlowPlan {
             statement_list: Some(syntax.clone()),
             ..SourceFlowEffects::default()
         };
+        for expression in syntax.expression_statements() {
+            if let Some(proof) = source_member_assignment_proof(store, host, expression)? {
+                if proof.container != container
+                    || syntax.expression_scope(expression)
+                        != bound.block_scope_container(expression)
+                    || effects
+                        .member_assignments
+                        .insert(proof.target, proof)
+                        .is_some()
+                {
+                    return Err(SourceFlowInvariant::InvalidParameterAssignment(expression).into());
+                }
+            }
+        }
         for update in updates {
             validate_callable_update(arena, bound, store, host, syntax, update)?;
             if effects.updates.insert(update.target, update).is_some()
@@ -3890,6 +3919,7 @@ impl SourceFlowPlan {
             region: effects.region,
             updates: effects.updates,
             nullish_assignments: effects.nullish_assignments,
+            member_assignments: effects.member_assignments,
             nullish_calls: effects.nullish_calls,
         };
         plan.validate_flow_paths(bound)?;
@@ -3917,6 +3947,11 @@ impl SourceFlowPlan {
         bound: &'graph BoundFile,
         base: SourceFlowTypes,
     ) -> Result<SourceFlowFrame<'plan, 'graph>, SourceFlowError> {
+        for proof in self.member_assignments.values() {
+            if source_member_assignment_proof(store, host, proof.expression)? != Some(*proof) {
+                return Err(SourceFlowInvariant::InvalidParameterAssignment(proof.target).into());
+            }
+        }
         if !self.nullish_assignments.is_empty() {
             let (arena, _) = host
                 .source(self.container)
@@ -4061,6 +4096,13 @@ impl SourceFlowPlan {
                     proof.assignment.target,
                 )
                 .into());
+            }
+        }
+        for proof in self.member_assignments.values() {
+            if bound.node_arena_revision() != proof.revision
+                || proof.container != self.container
+            {
+                return Err(SourceFlowInvariant::InvalidParameterAssignment(proof.target).into());
             }
         }
         if let Some(region) = self.region
@@ -4288,6 +4330,11 @@ impl SourceFlowPlan {
                 return Err(SourceFlowInvariant::UnreachedAssignment(*target).into());
             }
         }
+        for target in self.member_assignments.keys() {
+            if !coverage.assignments.contains(target) {
+                return Err(SourceFlowInvariant::UnreachedAssignment(*target).into());
+            }
+        }
         for (target, assignment) in &self.property_assignments {
             if assignment.write.is_some() && !coverage.assignments.contains(target) {
                 return Err(SourceFlowInvariant::UnreachedAssignment(*target).into());
@@ -4376,6 +4423,7 @@ impl SourceFlowPlan {
                 if !self.assignments.contains_key(&declaration)
                     && !self.property_assignments.contains_key(&declaration)
                     && !self.nullish_assignments.contains_key(&declaration)
+                    && !self.member_assignments.contains_key(&declaration)
                 {
                     if source_flow_kind(flow, node.flags)? == SourceFlowKind::ArrayMutation {
                         return Err(SourceFlowUnsupported::FlowKind {
@@ -4388,6 +4436,11 @@ impl SourceFlowPlan {
                 }
                 if let Some(proof) = self.nullish_assignments.get(&declaration)
                     && proof.flow != Some(flow)
+                {
+                    return Err(SourceFlowInvariant::InvalidPayload(flow).into());
+                }
+                if let Some(proof) = self.member_assignments.get(&declaration)
+                    && proof.flow != flow
                 {
                     return Err(SourceFlowInvariant::InvalidPayload(flow).into());
                 }
@@ -6351,6 +6404,20 @@ impl SourceFlowFrame<'_, '_> {
             SourceFlowKind::Assignment | SourceFlowKind::ArrayMutation => {
                 let antecedent = linear_antecedent(flow, &node)?;
                 let declaration = ast_payload(flow, &node)?;
+                if let Some(proof) = self.plan.member_assignments.get(&declaration).copied() {
+                    let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
+                    if !prior.reachable
+                        || self.reference.is_some_and(|symbol| symbol != proof.receiver_symbol)
+                    {
+                        return Ok(prior);
+                    }
+                    let declared = self
+                        .declared_types
+                        .get(&proof.receiver_symbol)
+                        .copied()
+                        .ok_or(SourceFlowInvariant::MissingCurrentType(proof.receiver_symbol))?;
+                    return Ok(prior.with_type(proof.receiver_symbol, declared));
+                }
                 if let Some(proof) = self.plan.nullish_assignments.get(&declaration).copied()
                     && proof.assignment.symbol.is_none()
                 {
@@ -8685,6 +8752,146 @@ pub(super) fn validate_source_nullish_assignment(
     assignment: SourceFlowNullishAssignment,
 ) -> Result<(), SourceFlowError> {
     source_nullish_assignment_proof(arena, bound, store, host, container, assignment).map(|_| ())
+}
+
+#[allow(clippy::too_many_lines)] // Match the AST, lexical owner and retained mutation together.
+pub(super) fn source_member_assignment_proof(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+) -> Result<Option<SourceMemberAssignmentProof>, SourceFlowError> {
+    let (arena, bound) = host
+        .source(expression)
+        .ok_or(SourceFlowInvariant::ForeignNode(expression))?;
+    let record = own_class_flow_node(store, host, expression)?;
+    let NodeData::BinaryExpression(binary) = &record.data else {
+        return Ok(None);
+    };
+    let reference = |node| NodeRef::new(expression.arena, expression.file, node);
+    let target = reference(binary.left);
+    let target_record = own_class_flow_node(store, host, target)?;
+    let NodeData::PropertyAccessExpression(property) = &target_record.data else {
+        return Ok(None);
+    };
+    let operator = reference(binary.operator_token);
+    let operator_record = own_class_flow_node(store, host, operator)?;
+    if operator_record.kind != SyntaxKind::EqualsToken {
+        return Ok(None);
+    }
+    let Some(statement) = record.parent.map(reference) else {
+        return Ok(None);
+    };
+    let statement_record = own_class_flow_node(store, host, statement)?;
+    let NodeData::ExpressionStatement(statement_data) = &statement_record.data else {
+        return Ok(None);
+    };
+    let Some(container) = bound.container(statement) else {
+        return Err(SourceFlowInvariant::ForeignNode(statement).into());
+    };
+    if own_class_flow_node(store, host, container)?.kind != SyntaxKind::ArrowFunction {
+        return Ok(None);
+    }
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(target);
+    let receiver = reference(property.expression);
+    let name = reference(property.name);
+    let right = reference(binary.right);
+    let receiver_record = own_class_flow_node(store, host, receiver)?;
+    let name_record = own_class_flow_node(store, host, name)?;
+    let right_record = own_class_flow_node(store, host, right)?;
+    if record.kind != SyntaxKind::BinaryExpression
+        || record.flags.0 != 0
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.modifiers.is_some()
+        || binary.facts != 0
+        || statement_record.kind != SyntaxKind::ExpressionStatement
+        || statement_record.flags.0 != 0
+        || statement_data.expression != expression.node
+        || statement_data.flow_node.is_some()
+        || target_record.kind != SyntaxKind::PropertyAccessExpression
+        || target_record.flags.0 != 0
+        || target_record.parent != Some(expression.node)
+        || property.question_dot_token.is_some()
+        || property.flow_node.is_some()
+        || property.facts != 0
+        || receiver_record.kind != SyntaxKind::Identifier
+        || !matches!(&receiver_record.data, NodeData::Identifier(identifier)
+            if !identifier.text.is_empty() && identifier.flow_node.is_none())
+        || receiver_record.parent != Some(target.node)
+        || receiver_record.flags.0 != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || !matches!(&name_record.data, NodeData::Identifier(identifier)
+            if !identifier.text.is_empty() && identifier.flow_node.is_none())
+        || name_record.parent != Some(target.node)
+        || name_record.flags.0 != 0
+        || operator_record.parent != Some(expression.node)
+        || operator_record.flags.0 != 0
+        || !matches!(operator_record.data, NodeData::Token(_))
+        || right_record.parent != Some(expression.node)
+    {
+        return Err(SourceFlowUnsupported::PropertyWrite(target).into());
+    }
+    if arena.id() != bound.node_arena_id()
+        || arena.revision() != bound.node_arena_revision()
+        || bound.flow_graph().container_is_complete(container) != Some(true)
+        || bound.symbol(container) != store.source_declaration_symbol(container)
+        || bound.symbol(container).is_none()
+        || record.range.start > target_record.range.start
+        || target_record.range.end > operator_record.range.start
+        || operator_record.range.end > right_record.range.start
+        || right_record.range.end > record.range.end
+        || target_record.range.start > receiver_record.range.start
+        || receiver_record.range.end > name_record.range.start
+        || name_record.range.end > target_record.range.end
+    {
+        return Err(invalid().into());
+    }
+    let scope = bound.block_scope_container(statement);
+    for node in [statement, expression, target, receiver, name, operator, right] {
+        validate_bound_node(bound, bound.flow_graph(), node)?;
+        if bound.container(node) != Some(container) || bound.block_scope_container(node) != scope {
+            return Err(invalid().into());
+        }
+    }
+    validate_nullish_structural_owner(arena, bound, container, expression)?;
+    validate_node_container(bound, bound.flow_graph(), container, target)?;
+    let receiver_symbol = own_class_flow_symbol(store, host, bound, receiver)?;
+    let symbol = store.symbol(receiver_symbol).ok_or_else(invalid)?;
+    let declaration = symbol.value_declaration().ok_or_else(invalid)?;
+    if !symbol.flags().intersects(SymbolFlags::VARIABLE)
+        || bound.container(declaration) != Some(container)
+        || bound.symbol(declaration) != Some(receiver_symbol)
+    {
+        return Err(SourceFlowUnsupported::PropertyWrite(target).into());
+    }
+    let mut assignment_flow = None;
+    for (index, node) in bound.flow_graph().nodes().iter().enumerate() {
+        if node.flags.intersects(FlowFlags::ASSIGNMENT)
+            && node.payload == Some(FlowNodePayload::Ast(target))
+        {
+            let flow = FlowRef::new(
+                arena.id(),
+                bound.file_id(),
+                FlowNodeId(u32::try_from(index).map_err(|_| invalid())?),
+            );
+            if assignment_flow.replace(flow).is_some()
+                || source_flow_kind(flow, node.flags)? != SourceFlowKind::Assignment
+            {
+                return Err(invalid().into());
+            }
+            linear_antecedent(flow, node)?;
+        }
+    }
+    Ok(Some(SourceMemberAssignmentProof {
+        expression,
+        target,
+        receiver,
+        right,
+        receiver_symbol,
+        container,
+        flow: assignment_flow.ok_or_else(invalid)?,
+        revision: arena.revision(),
+    }))
 }
 
 #[allow(clippy::too_many_lines)] // Match the AST, lexical owner and retained mutation together.
