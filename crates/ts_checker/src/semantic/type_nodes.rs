@@ -7463,7 +7463,22 @@ enum CachedTypeAliasRhs {
     NonUnion,
 }
 
+#[track_caller]
 fn type_node_unavailable(reason: TypeNodeUnavailable) -> DeclaredTypeError {
+    if matches!(
+        reason,
+        TypeNodeUnavailable::GenericAliasInstantiationUnsupported { .. }
+    ) {
+        use std::io::Write as _;
+
+        let caller = std::panic::Location::caller();
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "ALIAS_UNSUPPORTED_PRODUCER type_nodes.rs line={} column={}",
+            caller.line(),
+            caller.column(),
+        );
+    }
     DeclaredTypeError::TypeNodeUnavailable(reason)
 }
 
