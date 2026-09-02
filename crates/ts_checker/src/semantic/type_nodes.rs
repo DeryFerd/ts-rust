@@ -24015,6 +24015,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Ok(());
         };
         let react_alias = self.authenticated_react_detailed_html_props_alias(symbol);
+        let function_alias =
+            self.store.type_has_function_type_provenance(declared) && !parameters.is_empty();
         let property_alias =
             super::object_aliases::property_object_alias_nonempty_projection(self.store, declared)
                 .map_err(|_| {
@@ -24057,6 +24059,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             _ if self.source_callable_alias_planning
                 || react_alias.is_some()
                 || property_alias
+                || function_alias
                 || ordinary_intersection
                 || numeric_intersection
                 || mapped_lookup
@@ -24068,6 +24071,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         };
         if parameters.len() < argument_nodes.len()
             || !property_alias
+                && !function_alias
                 && !ordinary_intersection
                 && !numeric_intersection
                 && parameters.len() != argument_nodes.len()
@@ -24117,6 +24121,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         else {
             return if reference_result.is_some()
                 && (property_alias
+                    || function_alias
                     || ordinary_intersection
                     || numeric_intersection
                     || mapped_lookup
@@ -24193,7 +24198,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let Some(cached) = instantiations.get(&key).copied() else {
             if retained_request.is_some()
                 || retained_intersection_request.is_some()
-                || (ordinary_intersection || numeric_intersection || mapped_lookup || key_alias)
+                || (function_alias
+                    || ordinary_intersection
+                    || numeric_intersection
+                    || mapped_lookup
+                    || key_alias)
                     && reference_result.is_some()
             {
                 return Err(type_node_unavailable(
@@ -24229,7 +24238,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         let supplied_arguments = arguments.clone();
         if parameters.len() != arguments.len() {
-            if !property_alias && !ordinary_intersection && !numeric_intersection {
+            if !property_alias && !function_alias && !ordinary_intersection && !numeric_intersection
+            {
                 return Ok(());
             }
             let alias = self.plan.aliases.get(&symbol).ok_or_else(&invalid)?;
@@ -47330,6 +47340,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let mut index = 0usize;
         while index < self.pending_function_parameters.len() {
             let function = self.pending_function_parameters[index].clone();
+            if matches!(
+                functions::function_type_state(self.store, &function, false),
+                Ok(functions::FunctionTypeState::Resolved { .. })
+            ) {
+                index += 1;
+                continue;
+            }
             let mut base_types = Vec::with_capacity(function.parameters.len());
             for parameter in &function.parameters {
                 base_types.push(self.execute_type_node(parameter.type_node, plan, prepared)?);
@@ -47340,6 +47357,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             });
             index += 1;
         }
+        resolved.retain(|function| {
+            !matches!(
+                functions::function_type_state(self.store, &function.plan, false),
+                Ok(functions::FunctionTypeState::Resolved { .. })
+            )
+        });
         functions::publish_parameter_types(
             self.store,
             self.global_types.as_ref(),
@@ -47349,6 +47372,150 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         .map_err(function_type_error)?;
         self.pending_function_parameters.clear();
         Ok(())
+    }
+
+    /// A mapped alias needs its original parameter values and lazy return first.
+    fn prepare_generic_function_alias(
+        &mut self,
+        type_: TypeId,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some(TypeData::Object(object)) = self.store.type_payload(type_).map(TypeRecord::data)
+        else {
+            return Ok(false);
+        };
+        let target = object.target.unwrap_or(type_);
+        if !self.store.type_has_function_type_provenance(target) {
+            return Ok(false);
+        }
+        let record = self
+            .store
+            .type_payload(target)
+            .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery))?;
+        if record
+            .alias()
+            .and_then(|alias| self.store.type_alias(alias))
+            .and_then(super::type_records::TypeAlias::type_arguments)
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let declaration = record
+            .symbol()
+            .and_then(|symbol| self.store.symbol(symbol))
+            .and_then(|symbol| symbol.declarations())
+            .and_then(|declarations| match declarations {
+                [declaration] => Some(*declaration),
+                _ => None,
+            })
+            .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery))?;
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(declaration));
+        let signature = self
+            .store
+            .signature_links(declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .ok_or_else(invalid)?;
+        if let Some(function) = self
+            .pending_function_parameters
+            .iter()
+            .find(|function| function.node == declaration)
+            .cloned()
+            && !matches!(
+                functions::function_type_state(self.store, &function, false),
+                Ok(functions::FunctionTypeState::Resolved { .. })
+            )
+        {
+            if !self.resolving_instantiated_signatures.insert(signature) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: declaration,
+                        kind: SyntaxKind::FunctionType,
+                    },
+                ));
+            }
+            let result = (|| {
+                let base_types = function
+                    .parameters
+                    .iter()
+                    .map(|parameter| self.execute_type_node(parameter.type_node, plan, prepared))
+                    .collect::<Result<Vec<_>, _>>()?;
+                // This publication owns one function, not its pending nested callbacks.
+                for &base in &base_types {
+                    self.store
+                        .validate_cached_array_capability_with_pending_functions(
+                            self.global_types
+                                .as_ref()
+                                .map(CanonicalArrayTargets::from_global_types),
+                            base,
+                            &[],
+                        )
+                        .map_err(Self::literal_cache_error)?;
+                }
+                functions::publish_parameter_types(
+                    self.store,
+                    self.global_types.as_ref(),
+                    &[PendingParameterTypes {
+                        plan: function,
+                        base_types,
+                    }],
+                    prepared,
+                )
+                .map_err(function_type_error)
+            })();
+            let removed = self.resolving_instantiated_signatures.remove(&signature);
+            debug_assert!(removed, "the source signature guard stays balanced");
+            result?;
+        }
+        self.resolve_function_alias_return(signature)?;
+        functions::generic_function_alias_projection(self.store, type_)
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+        Ok(true)
+    }
+
+    /// Outer callbacks keep their pending parameters while this query resolves the return.
+    fn resolve_function_alias_return(
+        &mut self,
+        signature: SignatureId,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        if self.global_types.is_some() && self.instantiation_session.is_some() {
+            let mut context = self.source_query_context()?;
+            let result = context.query(
+                self.store,
+                self.instantiation_session
+                    .as_deref_mut()
+                    .expect("the caller has a session"),
+                self.diagnostics,
+                |query| query.get_return_type_of_signature(signature),
+            );
+            self.global_this_members = context.members;
+            self.completed_source_conditionals = context.completed;
+            self.new_source_conditionals.extend(context.produced);
+            self.completed_global_values = context.values;
+            self.source_branch_recoveries = context.recoveries;
+            self.source_conditional_recoveries = context.semantic_results;
+            self.completed_source_returns = context.returns;
+            result
+        } else {
+            let mut nested =
+                CanonicalTypeQuery::new(self.store, self.host, self.options, self.diagnostics)?;
+            nested.array_type = self.array_type;
+            nested.global_types.clone_from(&self.global_types);
+            nested.instantiation_session = self.instantiation_session.as_deref_mut();
+            nested
+                .type_reference_alias_targets
+                .clone_from(&self.type_reference_alias_targets);
+            nested.jsdoc_import_type_target = self.jsdoc_import_type_target;
+            nested
+                .resolving_property_interfaces
+                .clone_from(&self.resolving_property_interfaces);
+            nested
+                .resolving_instantiated_signatures
+                .clone_from(&self.resolving_instantiated_signatures);
+            nested.get_return_type_of_signature(signature)
+        }
     }
 
     fn execute_array_type(
@@ -50603,6 +50770,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
             ));
         }
+        let function_alias = self.prepare_generic_function_alias(declared_type, plan, prepared)?;
         let union_alias = matches!(
             self.store.type_payload(declared_type).map(TypeRecord::data),
             Some(TypeData::Union(_))
@@ -50631,14 +50799,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .numeric_parameter_intersection_projection(declared_type)
             .map_err(|error| intersection_type_error(error, metadata.type_node))?
             .is_some();
-        let property_limit_mark =
-            if property_object_alias || ordinary_intersection || numeric_intersection {
-                self.instantiation_session
-                    .as_deref()
-                    .map(InstantiationSession::limit_event_mark)
-            } else {
-                None
-            };
+        let property_limit_mark = if property_object_alias
+            || function_alias
+            || ordinary_intersection
+            || numeric_intersection
+        {
+            self.instantiation_session
+                .as_deref()
+                .map(InstantiationSession::limit_event_mark)
+        } else {
+            None
+        };
 
         let alias_identity = if let Some(owner) = reference.alias_owner {
             let owner_plan = plan.aliases.get(&owner).ok_or_else(|| {
@@ -50653,6 +50824,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         } else {
             None
         };
+        if function_alias && alias_identity.is_some() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                    alias: symbol,
+                    declared_type,
+                },
+            ));
+        }
         let mut provided_arguments = Vec::with_capacity(reference.type_arguments.len());
         for argument in &reference.type_arguments {
             provided_arguments.push(self.execute_type_node(*argument, plan, prepared)?);
@@ -50974,6 +51153,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return Ok(cached);
         }
         if (property_object_alias
+            || function_alias
             || ordinary_intersection
             || numeric_intersection
             || matches!(
@@ -51479,7 +51659,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             )?;
             intersection_receipt = receipt;
             result
-        } else if numeric_intersection {
+        } else if numeric_intersection || function_alias {
             self.instantiate_dependent_alias_type(
                 symbol,
                 declared_type,
@@ -51545,6 +51725,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         self.report_property_alias_instantiation_limit(node, property_limit_mark);
         if (literal_method_alias
             || property_object_alias
+            || function_alias
             || (ordinary_intersection || numeric_intersection)
                 && property_limit_mark.is_some_and(|mark| {
                     self.instantiation_session
@@ -53555,6 +53736,30 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         mapped_parameters: &[TypeId],
         type_arguments: &[TypeId],
     ) -> Result<TypeId, DeclaredTypeError> {
+        if functions::generic_function_alias_projection(self.store, type_)
+            .map_err(|_| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                    symbol,
+                ))
+            })?
+            .is_some()
+        {
+            let mapped_parameters =
+                mapped_parameters
+                    .get(..type_arguments.len())
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(
+                            symbol,
+                        ))
+                    })?;
+            return self.instantiate_dependent_alias_type(
+                symbol,
+                type_,
+                mapped_parameters,
+                type_arguments,
+                None,
+            );
+        }
         if self.is_authenticated_dependent_alias_union(symbol, type_, mapped_parameters)? {
             return self.instantiate_dependent_alias_union(
                 symbol,
@@ -54451,6 +54656,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 symbol,
             ))
         })?;
+        if functions::generic_function_alias_projection(self.store, type_)
+            .map_err(|_| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                    symbol,
+                ))
+            })?
+            .is_some()
+        {
+            return Ok(());
+        }
         if super::object_aliases::property_object_alias_projection(self.store, type_)
             .map_err(|_| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(

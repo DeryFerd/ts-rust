@@ -2,8 +2,8 @@
 //!
 //! This module owns nongeneric function types, authenticated implicit, explicit
 //! `any[]`, typed and variadic type-parameter rest parameters, identifier and
-//! assertion predicates, and generic function types with outer lexical
-//! constraints and source-owned conditional returns.
+//! assertion predicates, generic function aliases, and generic function types
+//! with outer lexical constraints and source-owned conditional returns.
 //! The type-node planner/executor only supplies recursive annotation callbacks;
 //! binder proof, cache validation, shell publication, signatures, parameter
 //! value types, and lazy return-type validation stay here.
@@ -17,7 +17,7 @@ use ts_binder::{
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
-    SignatureId, TypeId,
+    RelationUnavailable, SignatureId, TypeId, TypeMapperId,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     callables::{ValidatedSingleCallParameterDisplay, ValidatedSingleCallSignatureDisplay},
@@ -25,6 +25,7 @@ use super::{
     declared::{
         cached_ordinary_type_parameter_owner, execute_type_parameter,
         explicit_type_parameter_symbols, preflight_node, preflight_type_parameter_symbol,
+        type_list_key,
     },
     jsdoc::{JsDocType, plan_javascript_source_jsdoc, validate_stored_source_jsdoc_function_type},
     links::{
@@ -87,6 +88,7 @@ pub(super) struct FunctionTypePlan {
     pub(super) members: SymbolTableId,
     pub(super) call_symbol: SemanticSymbolId,
     pub(super) alias_symbol: Option<SemanticSymbolId>,
+    pub(super) alias_parameters: Vec<SemanticSymbolId>,
     pub(super) type_parameters: Vec<FunctionTypeParameterPlan>,
     pub(super) parameters: Vec<FunctionParameterPlan>,
     pub(super) return_type: NodeRef,
@@ -282,7 +284,7 @@ pub(super) fn plan_function_type(
     alias_is_generic: bool,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<FunctionTypePlan, FunctionTypeError> {
-    if alias_is_generic {
+    if alias_is_generic && alias_symbol.is_none() {
         return Err(FunctionTypeError::Unsupported(
             FunctionTypeUnsupported::GenericAlias(node),
         ));
@@ -363,6 +365,8 @@ pub(super) fn plan_function_type(
         return Err(invariant(FunctionTypeInvariant::InvalidCallSymbol(node)));
     }
     validate_alias_symbol(store, node, alias_symbol)?;
+    let alias_parameters =
+        plan_function_alias_parameters(store, host, node, alias_symbol, alias_is_generic)?;
 
     let return_id = function.type_.ok_or(FunctionTypeError::Unsupported(
         FunctionTypeUnsupported::MissingReturnType(node),
@@ -840,6 +844,7 @@ pub(super) fn plan_function_type(
         members,
         call_symbol,
         alias_symbol,
+        alias_parameters,
         type_parameters,
         parameters,
         return_type,
@@ -1739,19 +1744,59 @@ fn validate_alias_symbol(
     Ok(())
 }
 
+fn plan_function_alias_parameters(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    alias_symbol: Option<SemanticSymbolId>,
+    alias_is_generic: bool,
+) -> Result<Vec<SemanticSymbolId>, FunctionTypeError> {
+    let Some(symbol) = alias_symbol else {
+        return Ok(Vec::new());
+    };
+    let invalid = || invariant(FunctionTypeInvariant::InvalidTypeSymbol(node));
+    let Some([declaration]) = store
+        .symbol(symbol)
+        .and_then(|symbol| symbol.declarations())
+    else {
+        return Err(invalid());
+    };
+    let record = preflight_node(store, host, *declaration)?;
+    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+        return Err(invalid());
+    };
+    if record.kind != SyntaxKind::TypeAliasDeclaration
+        || !host.symbol_matches(store, *declaration, symbol)
+        || peel_parenthesized_type(
+            store,
+            host,
+            NodeRef::new(declaration.arena, declaration.file, alias.type_),
+        )? != node
+    {
+        return Err(invalid());
+    }
+    let parameters = explicit_type_parameter_symbols(
+        store,
+        host,
+        *declaration,
+        alias.type_parameters.as_ref(),
+        &mut HashSet::new(),
+    )?;
+    if alias_is_generic == parameters.is_empty() {
+        return Err(invalid());
+    }
+    Ok(parameters)
+}
+
 pub(super) fn function_type_state(
     store: &CanonicalTypeMapperStore,
     plan: &FunctionTypePlan,
     allow_active_barrier: bool,
 ) -> Result<FunctionTypeState, FunctionTypeError> {
     let type_links = store.type_node_links(plan.node);
-    if type_links.is_some_and(|links| links.outer_type_parameters.is_some()) {
-        return Err(invariant(FunctionTypeInvariant::InvalidTypeCache(
-            plan.node,
-        )));
-    }
     let Some(type_) = type_links.and_then(|links| links.resolved_type) else {
-        if !default_signature_links(store, plan.node)
+        if type_links.is_some_and(|links| links.outer_type_parameters.is_some())
+            || !default_signature_links(store, plan.node)
             || plan
                 .parameters
                 .iter()
@@ -1774,10 +1819,11 @@ pub(super) fn function_type_state(
     if record.flags() != TypeFlags::OBJECT
         || !store.type_has_function_type_provenance(type_)
         || record.symbol() != Some(plan.symbol)
-        || !valid_alias(store, record, plan.alias_symbol)
+        || !valid_alias(store, record, plan.alias_symbol, &plan.alias_parameters)
+        || !valid_function_alias_type_links(store, type_, record, plan.node)
         || object.target.is_some()
         || object.mapper.is_some()
-        || object.instantiations != TypeCacheState::Unallocated
+        || !valid_function_alias_instance_cache(store, type_, record)
     {
         return Err(invariant(FunctionTypeInvariant::InvalidTypeCache(
             plan.node,
@@ -2127,6 +2173,15 @@ pub(super) fn reserve_function_type_capacities(
                     }
                 }
             }
+            for symbol in &plan.alias_parameters {
+                if store
+                    .declared_type_links(*symbol)
+                    .and_then(|links| links.declared_type)
+                    .is_none()
+                {
+                    cold_type_parameters.insert(*symbol);
+                }
+            }
         }
         if strict
             && matches!(
@@ -2181,10 +2236,17 @@ pub(super) fn begin_function_type(
         "the planned function TypeId provenance was prevalidated and reserved"
     );
     if let Some(alias_symbol) = plan.alias_symbol {
+        let arguments = plan
+            .alias_parameters
+            .iter()
+            .map(|symbol| execute_type_parameter(store, *symbol))
+            .collect::<Vec<_>>();
         let alias = store
             .alloc_type_alias(Some(alias_symbol))
             .ok_or_else(|| invariant(FunctionTypeInvariant::Publication(plan.node)))?;
-        if !store.set_type_alias(type_, Some(alias)) {
+        if !store.set_type_alias_arguments(alias, (!arguments.is_empty()).then_some(arguments))
+            || !store.set_type_alias(type_, Some(alias))
+        {
             return Err(invariant(FunctionTypeInvariant::Publication(plan.node)));
         }
     }
@@ -2968,11 +3030,7 @@ pub(super) fn validate_stored_function_type(
         || symbol_record.parent().is_some()
         || symbol_record.export_symbol().is_some()
         || store.get_merged_symbol(symbol) != Some(symbol)
-        || store.type_node_links(declaration)
-            != Some(&TypeNodeLinks {
-                resolved_type: Some(type_),
-                ..TypeNodeLinks::default()
-            })
+        || !valid_function_alias_type_links(store, type_, record, declaration)
         || call_record.flags() != SymbolFlags::SIGNATURE
         || call_record.check_flags() != CheckFlags::NONE
         || call_record.name() != InternalSymbolName::Call.as_ref()
@@ -3011,7 +3069,7 @@ pub(super) fn validate_stored_function_type(
         || object.structured.constrained != ConstrainedTypeData::default()
         || object.target.is_some()
         || object.mapper.is_some()
-        || object.instantiations != TypeCacheState::Unallocated
+        || !valid_function_alias_instance_cache(store, type_, record)
     {
         return StoredFunctionTypeValidation::Malformed;
     }
@@ -3084,6 +3142,13 @@ pub(super) fn validate_stored_function_type(
     {
         parameter_edges.push(narrowed);
     }
+    if let Some(arguments) = record
+        .alias()
+        .and_then(|alias| store.type_alias(alias))
+        .and_then(super::type_records::TypeAlias::type_arguments)
+    {
+        parameter_edges.extend_from_slice(arguments);
+    }
     StoredFunctionTypeValidation::Valid(parameter_edges)
 }
 
@@ -3120,8 +3185,7 @@ fn stored_alias_state(
             let Some(symbol) = alias.symbol() else {
                 return StoredAliasState::Malformed;
             };
-            if alias.type_arguments().is_some()
-                || store.get_merged_symbol(symbol) != Some(symbol)
+            if store.get_merged_symbol(symbol) != Some(symbol)
                 || store.symbol(symbol).is_none_or(|symbol_record| {
                     symbol_record.flags() != SymbolFlags::TYPE_ALIAS
                         || symbol_record.check_flags() != CheckFlags::NONE
@@ -3130,14 +3194,33 @@ fn stored_alias_state(
             {
                 return StoredAliasState::Malformed;
             }
+            let Some(parameters) = stored_function_alias_parameters(store, alias_declaration)
+            else {
+                return StoredAliasState::Malformed;
+            };
+            if alias.type_arguments() != (!parameters.is_empty()).then_some(parameters.as_slice()) {
+                return StoredAliasState::Malformed;
+            }
             match store.type_alias_links(symbol) {
                 None => StoredAliasState::Pending,
                 Some(links) if links == &TypeAliasLinks::default() => StoredAliasState::Pending,
                 Some(links)
-                    if links
-                        == &(TypeAliasLinks {
-                            declared_type: Some(type_),
-                            ..TypeAliasLinks::default()
+                    if parameters.is_empty()
+                        && links
+                            == &(TypeAliasLinks {
+                                declared_type: Some(type_),
+                                ..TypeAliasLinks::default()
+                            }) =>
+                {
+                    StoredAliasState::Exact
+                }
+                Some(links)
+                    if !parameters.is_empty()
+                        && links.declared_type == Some(type_)
+                        && links.type_parameters.as_deref() == Some(parameters.as_slice())
+                        && !links.is_constructor_declared_property
+                        && links.instantiations.as_ref().is_some_and(|entries| {
+                            entries.get(&type_list_key(&parameters)) == Some(&type_)
                         }) =>
                 {
                     StoredAliasState::Exact
@@ -3952,14 +4035,238 @@ fn valid_alias(
     store: &CanonicalTypeMapperStore,
     record: &TypeRecord,
     alias_symbol: Option<SemanticSymbolId>,
+    alias_parameters: &[SemanticSymbolId],
 ) -> bool {
     match (record.alias(), alias_symbol) {
-        (None, None) => true,
+        (None, None) => alias_parameters.is_empty(),
         (Some(alias), Some(symbol)) => store.type_alias(alias).is_some_and(|alias| {
-            alias.symbol() == Some(symbol) && alias.type_arguments().is_none()
+            alias.symbol() == Some(symbol)
+                && match alias.type_arguments() {
+                    None => alias_parameters.is_empty(),
+                    Some(arguments) => {
+                        !alias_parameters.is_empty()
+                            && arguments.len() == alias_parameters.len()
+                            && arguments
+                                .iter()
+                                .zip(alias_parameters)
+                                .all(|(&type_, &symbol)| {
+                                    cached_ordinary_type_parameter_owner(store, type_)
+                                        == Some(symbol)
+                                })
+                    }
+                }
         }),
         _ => false,
     }
+}
+
+fn stored_function_alias_parameters(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> Option<Vec<TypeId>> {
+    store
+        .source_direct_children(declaration)?
+        .into_iter()
+        .filter(|child| store.source_node_kind(*child) == Some(SyntaxKind::TypeParameter))
+        .map(|child| {
+            let symbol = store.source_declaration_symbol(child)?;
+            let type_ = store.declared_type_links(symbol)?.declared_type?;
+            (store.source_node_parent(child) == Some(SourceNodeParent::Parent(declaration))
+                && cached_ordinary_type_parameter_owner(store, type_) == Some(symbol)
+                && store.symbol(symbol)?.declarations() == Some(&[child]))
+            .then_some(type_)
+        })
+        .collect()
+}
+
+fn valid_function_alias_type_links(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    record: &TypeRecord,
+    declaration: NodeRef,
+) -> bool {
+    let Some(links) = store.type_node_links(declaration) else {
+        return false;
+    };
+    let TypeData::Object(object) = record.data() else {
+        return false;
+    };
+    links.resolved_type == Some(type_)
+        && match &object.instantiations {
+            TypeCacheState::Unallocated => links.outer_type_parameters.is_none(),
+            TypeCacheState::Allocated(_) => record
+                .alias()
+                .and_then(|alias| store.type_alias(alias))
+                .and_then(super::type_records::TypeAlias::type_arguments)
+                .is_some_and(|parameters| {
+                    !parameters.is_empty()
+                        && links.outer_type_parameters.as_deref() == Some(parameters)
+                }),
+        }
+}
+
+/// The original alias owns every mapped function and its exact argument key.
+fn valid_function_alias_instance_cache(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    record: &TypeRecord,
+) -> bool {
+    let TypeData::Object(object) = record.data() else {
+        return false;
+    };
+    let TypeCacheState::Allocated(entries) = &object.instantiations else {
+        return object.instantiations == TypeCacheState::Unallocated;
+    };
+    let Some(alias) = record.alias().and_then(|alias| store.type_alias(alias)) else {
+        return false;
+    };
+    let Some(parameters) = alias
+        .type_arguments()
+        .filter(|parameters| !parameters.is_empty())
+    else {
+        return false;
+    };
+    entries.get(&type_list_key(parameters)) == Some(&target)
+        && entries.iter().all(|(key, &type_)| {
+            if type_ == target {
+                return *key == type_list_key(parameters);
+            }
+            let Some(record) = store.type_payload(type_) else {
+                return false;
+            };
+            let TypeData::Object(instance) = record.data() else {
+                return false;
+            };
+            let Some(identity) = record.alias().and_then(|alias| store.type_alias(alias)) else {
+                return false;
+            };
+            let Some(arguments) = identity.type_arguments() else {
+                return false;
+            };
+            let Some(mapper) = instance.mapper else {
+                return false;
+            };
+            instance.target == Some(target)
+                && identity.symbol() == alias.symbol()
+                && arguments.len() == parameters.len()
+                && *key == type_list_key(arguments)
+                && store.type_mapper_has_exact_endpoints(mapper, parameters, arguments)
+                    == Some(true)
+        })
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct GenericFunctionAliasProjection {
+    pub(super) type_: TypeId,
+    pub(super) target: TypeId,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) parameters: Vec<TypeId>,
+    pub(super) arguments: Vec<TypeId>,
+}
+
+/// Reads direct function aliases through their source declaration and owned cache.
+pub(super) fn generic_function_alias_projection(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<GenericFunctionAliasProjection>, RelationUnavailable> {
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let TypeData::Object(object) = record.data() else {
+        return Ok(None);
+    };
+    let target = object.target.unwrap_or(type_);
+    if !store.type_has_function_type_provenance(target) {
+        return Ok(None);
+    }
+    let target_record = store.type_payload(target).ok_or_else(invalid)?;
+    let Some(alias) = target_record
+        .alias()
+        .and_then(|alias| store.type_alias(alias))
+    else {
+        return Ok(None);
+    };
+    let Some(parameters) = alias.type_arguments() else {
+        return Ok(None);
+    };
+    if parameters.is_empty() {
+        return Err(invalid());
+    }
+    match validate_stored_function_type(store, target) {
+        StoredFunctionTypeValidation::Valid(_) => {}
+        StoredFunctionTypeValidation::Pending => {
+            return Err(RelationUnavailable::UnresolvedFunctionType(target));
+        }
+        _ => return Err(invalid()),
+    }
+    let symbol = alias.symbol().ok_or_else(invalid)?;
+    let arguments = if type_ == target {
+        parameters.to_vec()
+    } else {
+        let mapper = object.mapper.ok_or_else(invalid)?;
+        if store
+            .instantiated_property_alias_callable(type_)
+            .is_none_or(|origin| !origin.matches_current_type(store))
+        {
+            return Err(invalid());
+        }
+        function_alias_instance_arguments(store, target, type_, mapper).ok_or_else(invalid)?
+    };
+    Ok(Some(GenericFunctionAliasProjection {
+        type_,
+        target,
+        symbol,
+        parameters: parameters.to_vec(),
+        arguments,
+    }))
+}
+
+pub(super) fn function_alias_instance_arguments(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    actual: TypeId,
+    mapper: TypeMapperId,
+) -> Option<Vec<TypeId>> {
+    let source_record = store.type_payload(source)?;
+    let alias = store.type_alias(source_record.alias()?)?;
+    let parameters = alias
+        .type_arguments()
+        .filter(|parameters| !parameters.is_empty())?;
+    let record = store.type_payload(actual)?;
+    let TypeData::Object(object) = record.data() else {
+        return None;
+    };
+    let identity = store.type_alias(record.alias()?)?;
+    let arguments = identity.type_arguments()?;
+    let TypeData::Object(target) = source_record.data() else {
+        return None;
+    };
+    let TypeCacheState::Allocated(entries) = &target.instantiations else {
+        return None;
+    };
+    (object.target == Some(source)
+        && object.mapper == Some(mapper)
+        && record.symbol() == source_record.symbol()
+        && identity.symbol() == alias.symbol()
+        && arguments.len() == parameters.len()
+        && store.type_mapper_has_exact_endpoints(mapper, parameters, arguments) == Some(true)
+        && entries.get(&type_list_key(arguments)) == Some(&actual))
+    .then(|| arguments.to_vec())
+}
+
+pub(super) fn function_alias_instance_flags(
+    store: &CanonicalTypeMapperStore,
+    arguments: &[TypeId],
+) -> Option<ObjectFlags> {
+    arguments.iter().try_fold(
+        ObjectFlags::ANONYMOUS | ObjectFlags::INSTANTIATED | ObjectFlags::MEMBERS_RESOLVED,
+        |flags, argument| {
+            Some(
+                flags
+                    | store.type_payload(*argument)?.object_flags()
+                        & ObjectFlags::PROPAGATING_FLAGS,
+            )
+        },
+    )
 }
 
 const fn invariant(error: FunctionTypeInvariant) -> FunctionTypeError {

@@ -28,12 +28,15 @@ use super::{
         remap_conditional_with_source, remap_deferred_conditional_with_session,
     },
     declared::{DeclaredTypeError, cached_ordinary_type_parameter_owner, type_list_key},
+    functions::{GenericFunctionAliasProjection, generic_function_alias_projection},
     indexed_access_types::{
         SourceAliasIndexedBoundPlan, SourceAliasIndexedReadMode, SourceAliasIndexedSelection,
         cached_deferred_indexed_access_type, get_instantiated_indexed_access_type,
     },
     instantiated_members::{
-        closed_declared_function_type, instantiated_function_member_type_matches,
+        GenericInterfaceMemberError, cached_generic_function_alias_instance,
+        closed_declared_function_type, instantiate_generic_function_alias,
+        instantiated_function_member_type_matches,
     },
     intersection_types::{
         DeferredIntersectionTypeProjection, IntersectionTypeCacheKey, IntersectionTypeError,
@@ -2093,6 +2096,22 @@ fn closed_mapping_identity_error(
     }
 }
 
+fn function_alias_instantiation_error(
+    type_: TypeId,
+    error: GenericInterfaceMemberError,
+) -> InstantiationError {
+    match error {
+        GenericInterfaceMemberError::Capacity(_) => LiteralTypeCacheError::Capacity.into(),
+        GenericInterfaceMemberError::InvalidTarget(_)
+        | GenericInterfaceMemberError::InvalidMember(_)
+        | GenericInterfaceMemberError::InvalidCachedMembers(_)
+        | GenericInterfaceMemberError::InvalidCachedProperty(_) => {
+            InstantiationError::InvalidType(type_)
+        }
+        _ => InstantiationError::UnsupportedType(type_),
+    }
+}
+
 fn instantiable_intersection_projection(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -2164,7 +2183,27 @@ fn could_contain_installed_type_variables_worker(
             }
         }
         TypeData::Object(_) => {
-            if mapping_invariant_object_type(store, type_, array_targets)? {
+            if let Some(alias) = generic_function_alias_projection(store, type_)
+                .map_err(|error| closed_mapping_identity_error(type_, error))?
+            {
+                store.validate_cached_array_capability_with_pending_functions(
+                    array_targets,
+                    type_,
+                    &[],
+                )?;
+                alias
+                    .arguments
+                    .iter()
+                    .try_fold(false, |contains, argument| {
+                        Ok(contains
+                            | could_contain_installed_type_variables_worker(
+                                store,
+                                *argument,
+                                array_targets,
+                                seen,
+                            )?)
+                    })
+            } else if mapping_invariant_object_type(store, type_, array_targets)? {
                 Ok(false)
             } else if let Some(projection) = source_property_object_projection(store, type_)
                 .map_err(|_| InstantiationError::InvalidType(type_))?
@@ -2669,7 +2708,8 @@ fn supported_instantiable_union_constituent(
             None => store.validate_cached_union_result(type_, None).is_ok(),
         }),
         Some(TypeData::Object(_)) => {
-            if mapping_invariant_object_type(store, type_, array_targets) == Ok(true)
+            if generic_function_alias_projection(store, type_).is_ok_and(|alias| alias.is_some())
+                || mapping_invariant_object_type(store, type_, array_targets) == Ok(true)
                 || matches!(source_property_object_projection(store, type_), Ok(Some(_)))
             {
                 Ok(true)
@@ -2727,7 +2767,19 @@ fn validate_instantiable_member_type_worker(
             })
         }
         TypeData::Object(_) => {
-            if mapping_invariant_object_type(store, type_, array_targets)? {
+            if let Some(alias) = generic_function_alias_projection(store, type_)
+                .map_err(|error| closed_mapping_identity_error(type_, error))?
+            {
+                alias.arguments.iter().try_for_each(|argument| {
+                    validate_instantiable_member_type_worker(
+                        store,
+                        *argument,
+                        mapper_parameters,
+                        array_targets,
+                        active,
+                    )
+                })
+            } else if mapping_invariant_object_type(store, type_, array_targets)? {
                 Ok(())
             } else if let Some(projection) = source_property_object_projection(store, type_)
                 .map_err(|_| InstantiationError::InvalidType(type_))?
@@ -3006,7 +3058,19 @@ fn instantiated_member_type_matches_worker(
                 .map(|expected| expected == Some(actual))
         }
         TypeData::Object(_) if store.type_has_function_type_provenance(template) => {
-            if mapping_invariant_object_type(store, template, array_targets)? {
+            if generic_function_alias_projection(store, template)
+                .map_err(|error| closed_mapping_identity_error(template, error))?
+                .is_some()
+            {
+                cached_instantiated_member_type(
+                    store,
+                    template,
+                    mapper,
+                    array_targets,
+                    &mut HashSet::new(),
+                )
+                .map(|expected| expected == Some(actual))
+            } else if mapping_invariant_object_type(store, template, array_targets)? {
                 Ok(template == actual)
             } else {
                 Ok(instantiated_function_member_type_matches(
@@ -3605,6 +3669,39 @@ fn cached_instantiated_type_with_operand_worker(
             }
         }
         TypeData::Object(_) => {
+            if let Some(source) = generic_function_alias_projection(store, template)
+                .map_err(|error| closed_mapping_identity_error(template, error))?
+            {
+                if alias_override.is_some() {
+                    return Err(InstantiationError::UnsupportedType(template));
+                }
+                let mut arguments = Vec::with_capacity(source.arguments.len());
+                for argument in &source.arguments {
+                    let mapped = if source.type_ == source.target {
+                        cached_apply_mapping(store, *argument, mapping, array_targets)?
+                    } else {
+                        cached_instantiated_type_worker(
+                            store,
+                            *argument,
+                            mapping,
+                            array_targets,
+                            None,
+                            active,
+                        )?
+                    };
+                    let Some(mapped) = mapped else {
+                        return Ok(None);
+                    };
+                    arguments.push(mapped);
+                }
+                return cached_generic_function_alias_instance(
+                    store,
+                    &source,
+                    &arguments,
+                    array_targets,
+                )
+                .map_err(|error| function_alias_instantiation_error(template, error));
+            }
             if mapping_invariant_object_type(store, template, array_targets)? {
                 return Ok(Some(template));
             }
@@ -4567,6 +4664,7 @@ fn recovered_property_alias_argument(
 }
 
 enum InstantiationWork {
+    FunctionAlias(GenericFunctionAliasProjection),
     TypeParameter,
     Identity,
     TemplateLiteral {
@@ -4707,7 +4805,14 @@ fn instantiate_type_worker(
             }
             TypeData::Interface(_) => InstantiationWork::Identity,
             TypeData::Object(_) => {
-                if mapping_invariant_object_type(store, type_, array_targets)? {
+                if let Some(projection) = generic_function_alias_projection(store, type_)
+                    .map_err(|error| closed_mapping_identity_error(type_, error))?
+                {
+                    if alias.is_some() {
+                        return Err(InstantiationError::UnsupportedType(type_));
+                    }
+                    InstantiationWork::FunctionAlias(projection)
+                } else if mapping_invariant_object_type(store, type_, array_targets)? {
                     InstantiationWork::Identity
                 } else {
                     match source_property_object_projection(store, type_)
@@ -4733,6 +4838,32 @@ fn instantiate_type_worker(
         }
     };
     match work {
+        InstantiationWork::FunctionAlias(source) => {
+            let mut arguments = Vec::with_capacity(source.arguments.len());
+            for argument in &source.arguments {
+                let mark = session.limit_event_mark();
+                let mapped = if source.type_ == source.target {
+                    apply_mapping(store, *argument, mapping, array_targets, session)?
+                } else {
+                    instantiate_type_with_alias(
+                        store,
+                        *argument,
+                        mapping,
+                        array_targets,
+                        None,
+                        session,
+                    )?
+                };
+                if session.limit_event_occurred_since(mark)
+                    && let Some(error) = session.recovery_error_type()
+                {
+                    return Ok(error);
+                }
+                arguments.push(mapped);
+            }
+            instantiate_generic_function_alias(store, &source, &arguments, array_targets, session)
+                .map_err(|error| function_alias_instantiation_error(type_, error))
+        }
         InstantiationWork::Index { target } => {
             let mark = session.limit_event_mark();
             let target =

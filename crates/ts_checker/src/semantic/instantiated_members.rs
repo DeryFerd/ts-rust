@@ -45,7 +45,9 @@ use super::{
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
     declared_values::{SelectedDeclaredProperty, selected_source_property_object_property},
     functions::{
-        FunctionTypeDisplayError, StoredFunctionTypeValidation, function_type_display_projection,
+        FunctionTypeDisplayError, GenericFunctionAliasProjection, StoredFunctionTypeValidation,
+        function_alias_instance_arguments, function_alias_instance_flags,
+        function_type_display_projection, generic_function_alias_projection,
         validate_stored_function_type,
     },
     instantiate::{
@@ -153,7 +155,7 @@ pub(super) struct PropertyObjectAliasMembers {
     pub(super) properties: Vec<SemanticSymbolId>,
 }
 
-/// The property-function producer retains the caller's capability on its real copy.
+/// The function-alias producer retains the caller's capability on its real copy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct InstantiatedPropertyAliasCallable {
     type_: TypeId,
@@ -179,6 +181,8 @@ impl InstantiatedPropertyAliasCallable {
         if self.type_ == self.source
             || store.mapper_payload(self.mapper).is_none()
             || instantiated_function_property_owner(store, self.source, self.mapper).is_none()
+                && function_alias_instance_arguments(store, self.source, self.type_, self.mapper)
+                    .is_none()
             || self.array_targets.is_some_and(|targets| {
                 store.type_payload(targets.array_type()).is_none()
                     || store.type_payload(targets.readonly_array_type()).is_none()
@@ -201,10 +205,16 @@ impl InstantiatedPropertyAliasCallable {
         let Some(original) = store.signature(signature.source) else {
             return false;
         };
+        let alias_arguments =
+            function_alias_instance_arguments(store, self.source, self.type_, self.mapper);
+        let expected_flags = alias_arguments.as_ref().map_or(
+            Some(ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED),
+            |arguments| function_alias_instance_flags(store, arguments),
+        );
         record.flags() == TypeFlags::OBJECT
-            && record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+            && Some(record.object_flags()) == expected_flags
             && record.symbol() == Some(symbol)
-            && record.alias().is_none()
+            && (record.alias().is_none() || alias_arguments.is_some())
             && object.target == Some(self.source)
             && object.mapper == Some(self.mapper)
             && object.instantiations == TypeCacheState::Unallocated
@@ -5421,6 +5431,13 @@ fn instantiate_generic_member_type_inner(
     session: &mut InstantiationSession,
     active: &mut HashSet<TypeId>,
 ) -> Result<TypeId, GenericInterfaceMemberError> {
+    if generic_function_alias_projection(store, template)
+        .map_err(|_| GenericInterfaceMemberError::InvalidCachedMembers(template))?
+        .is_some()
+    {
+        return instantiate_type_with_session(store, template, mapper, array_targets, session)
+            .map_err(|error| property_instantiation_error(template, &error));
+    }
     if let Some(tuple) = store
         .canonical_tuple_shape(template)
         .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(template))?
@@ -6126,6 +6143,8 @@ fn function_member_parameters(
     }
     if function_member_declaring_method(store, source).is_none()
         && function_member_declaring_property_alias(store, source).is_none()
+        && !generic_function_alias_projection(store, source)
+            .is_ok_and(|projection| projection.is_some_and(|alias| alias.target == source))
     {
         return None;
     }
@@ -6378,7 +6397,85 @@ fn instantiated_function_property_recovery(
     ))
 }
 
-/// Copies a function-valued member through its authenticated owner mapper.
+pub(super) fn cached_generic_function_alias_instance(
+    store: &CanonicalTypeMapperStore,
+    source: &GenericFunctionAliasProjection,
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, GenericInterfaceMemberError> {
+    let invalid = || GenericInterfaceMemberError::InvalidCachedMembers(source.target);
+    if arguments.len() != source.parameters.len()
+        || arguments
+            .iter()
+            .any(|type_| store.type_payload(*type_).is_none())
+    {
+        return Err(invalid());
+    }
+    if arguments == source.parameters.as_slice() {
+        store
+            .validate_cached_array_capability_with_pending_functions(
+                array_targets,
+                source.target,
+                &[],
+            )
+            .map_err(|_| invalid())?;
+        return Ok(Some(source.target));
+    }
+    let TypeData::Object(target) = store
+        .type_payload(source.target)
+        .ok_or_else(invalid)?
+        .data()
+    else {
+        return Err(invalid());
+    };
+    let TypeCacheState::Allocated(entries) = &target.instantiations else {
+        return Ok(None);
+    };
+    let Some(&type_) = entries.get(&type_list_key(arguments)) else {
+        return Ok(None);
+    };
+    let TypeData::Object(instance) = store.type_payload(type_).ok_or_else(invalid)?.data() else {
+        return Err(invalid());
+    };
+    let mapper = instance.mapper.ok_or_else(invalid)?;
+    if function_alias_instance_arguments(store, source.target, type_, mapper).as_deref()
+        != Some(arguments)
+        || !instantiated_function_member_type_matches(
+            store,
+            source.target,
+            type_,
+            mapper,
+            array_targets,
+        )
+    {
+        return Err(invalid());
+    }
+    Ok(Some(type_))
+}
+
+/// Alias instances use the existing signature mapper and the caller's session.
+pub(super) fn instantiate_generic_function_alias(
+    store: &mut CanonicalTypeMapperStore,
+    source: &GenericFunctionAliasProjection,
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, GenericInterfaceMemberError> {
+    if let Some(cached) =
+        cached_generic_function_alias_instance(store, source, arguments, array_targets)?
+    {
+        return Ok(cached);
+    }
+    if !store.try_reserve_mappers(1) {
+        return Err(GenericInterfaceMemberError::Capacity(source.target));
+    }
+    let mapper = store
+        .new_type_mapper(source.parameters.clone(), arguments.to_vec())
+        .ok_or(GenericInterfaceMemberError::Capacity(source.target))?;
+    instantiate_function_member_type(store, source.target, mapper, array_targets, session)
+}
+
+/// Copies a function-valued member or direct alias through its authenticated mapper.
 #[allow(clippy::too_many_lines)] // Keep cache checks, caller mapping, and publication together.
 fn instantiate_function_member_type(
     store: &mut CanonicalTypeMapperStore,
@@ -6390,6 +6487,25 @@ fn instantiate_function_member_type(
     let (symbol, template) = function_member_signature(store, source)
         .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(source))?;
     let property_alias = function_member_declaring_property_alias(store, source).is_some();
+    let function_alias = generic_function_alias_projection(store, source)
+        .map_err(|_| GenericInterfaceMemberError::InvalidCachedMembers(source))?;
+    let alias_arguments = function_alias
+        .as_ref()
+        .map(|alias| {
+            let arguments = alias
+                .parameters
+                .iter()
+                .map(|parameter| store.map_type(mapper, *parameter))
+                .collect::<Option<Vec<_>>>()
+                .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(source))?;
+            if store.type_mapper_has_exact_endpoints(mapper, &alias.parameters, &arguments)
+                != Some(true)
+            {
+                return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+            }
+            Ok(arguments)
+        })
+        .transpose()?;
     if property_alias && instantiated_function_property_owner(store, source, mapper).is_none() {
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
     }
@@ -6419,7 +6535,32 @@ fn instantiate_function_member_type(
     if let Some(cached) = cached {
         return Ok(cached);
     }
-    let origin = property_alias.then_some((source, mapper, array_targets));
+    let origin =
+        (property_alias || function_alias.is_some()).then_some((source, mapper, array_targets));
+    let mut new_alias_cache = if let Some(alias) = &function_alias {
+        let TypeData::Object(target) = store
+            .type_payload(source)
+            .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(source))?
+            .data()
+        else {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+        };
+        if matches!(target.instantiations, TypeCacheState::Unallocated) {
+            let mut entries = HashMap::new();
+            entries
+                .try_reserve(2)
+                .map_err(|_| GenericInterfaceMemberError::Capacity(source))?;
+            entries.insert(type_list_key(&alias.parameters), source);
+            Some(entries)
+        } else {
+            if !store.try_reserve_object_instantiations(source, 1) {
+                return Err(GenericInterfaceMemberError::Capacity(source));
+            }
+            None
+        }
+    } else {
+        None
+    };
     if origin.is_some()
         && array_targets.is_some_and(|targets| {
             store.type_payload(targets.array_type()).is_none()
@@ -6431,9 +6572,12 @@ fn instantiate_function_member_type(
     if !store.try_reserve_types(1)
         || !store.try_reserve_signatures(1)
         || origin.is_some() && !store.try_reserve_instantiated_property_alias_callables()
+        || function_alias.is_some()
+            && (!store.try_reserve_type_aliases(1) || !store.try_reserve_type_node_links(1))
     {
         return Err(GenericInterfaceMemberError::Capacity(source));
     }
+    let limit_mark = session.limit_event_mark();
     let signature = instantiate_generic_method_signature(
         store,
         template.source,
@@ -6445,6 +6589,11 @@ fn instantiate_function_member_type(
         symbol,
         source,
     )?;
+    if function_alias.is_some() && session.limit_event_occurred_since(limit_mark) {
+        return session
+            .recovery_error_type()
+            .ok_or(GenericInterfaceMemberError::Capacity(source));
+    }
     let predicate = store
         .signature(template.source)
         .and_then(super::signatures::Signature::resolved_type_predicate);
@@ -6468,8 +6617,15 @@ fn instantiate_function_member_type(
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
         }
     }
+    let flags = alias_arguments
+        .as_ref()
+        .map_or(Some(ObjectFlags::ANONYMOUS), |arguments| {
+            function_alias_instance_flags(store, arguments)
+                .map(|flags| flags.without(ObjectFlags::MEMBERS_RESOLVED))
+        })
+        .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(source))?;
     let callable = store
-        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(symbol))
+        .alloc_plain_object_type(flags, Some(symbol))
         .ok_or(GenericInterfaceMemberError::Capacity(source))?;
     if !store.set_object_target_and_mapper(callable, Some(source), Some(mapper))
         || !store.set_structured_type_members(
@@ -6482,6 +6638,38 @@ fn instantiate_function_member_type(
         )
     {
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+    }
+    if let Some(alias) = function_alias {
+        let arguments = alias_arguments.expect("a direct alias has mapped arguments");
+        let identity = store
+            .alloc_type_alias(Some(alias.symbol))
+            .ok_or(GenericInterfaceMemberError::Capacity(source))?;
+        if !store.set_type_alias_arguments(identity, Some(arguments.clone()))
+            || !store.set_type_alias(callable, Some(identity))
+        {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+        }
+        let key = type_list_key(&arguments);
+        if let Some(mut entries) = new_alias_cache.take() {
+            entries.insert(key, callable);
+            if !store.set_object_instantiations(source, TypeCacheState::Allocated(entries)) {
+                return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+            }
+        } else if store.insert_object_instantiation(source, key, callable) != Some(callable) {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+        }
+        let declaration = store
+            .signature(template.source)
+            .and_then(super::signatures::Signature::declaration)
+            .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(source))?;
+        let mut links = store
+            .type_node_links(declaration)
+            .cloned()
+            .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(source))?;
+        links.outer_type_parameters = Some(alias.parameters);
+        if !store.set_type_node_links(declaration, links) {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+        }
     }
     if let Some((source, mapper, array_targets)) = origin {
         assert!(store.publish_instantiated_property_alias_callable(
@@ -6514,7 +6702,9 @@ pub(super) fn instantiated_function_member_type_matches(
         return store.mapper_payload(mapper).is_some()
             && closed_declared_function_type(store, source, array_targets) == Ok(true);
     }
-    if function_member_declaring_property_alias(store, source).is_some() {
+    if function_member_declaring_property_alias(store, source).is_some()
+        || generic_function_alias_projection(store, source).is_ok_and(|alias| alias.is_some())
+    {
         let Some(origin) = store.instantiated_property_alias_callable(actual) else {
             return false;
         };
@@ -6602,6 +6792,11 @@ fn instantiated_function_member_projection(
     let signature_id = *signature;
     let signature = store.signature(signature_id)?;
     let return_type = signature.resolved_return_type()?;
+    let alias_arguments = function_alias_instance_arguments(store, source, actual, mapper);
+    let expected_flags = alias_arguments.as_ref().map_or(
+        Some(ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED),
+        |arguments| function_alias_instance_flags(store, arguments),
+    );
     let recovered = match recovery {
         Some(InstantiatedFunctionRecovery::Property(recovery)) => {
             if recovery.source_type() != source
@@ -6635,9 +6830,9 @@ fn instantiated_function_member_projection(
     };
     if store.mapper_payload(mapper).is_none()
         || record.flags() != TypeFlags::OBJECT
-        || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || Some(record.object_flags()) != expected_flags
         || record.symbol() != Some(symbol)
-        || record.alias().is_some()
+        || record.alias().is_some() && alias_arguments.is_none()
         || object.target != Some(source)
         || object.mapper != Some(mapper)
         || object.instantiations != TypeCacheState::Unallocated
@@ -6964,6 +7159,12 @@ pub(super) fn validate_instantiated_function_member_callable(
                     recovery,
                     Some(source_property_object_projection(store, receiver).ok()??),
                 )
+            } else if function_alias_instance_arguments(store, source, type_, mapper).is_some() {
+                let origin = store.instantiated_property_alias_callable(type_)?;
+                if origin.source != source || origin.mapper != mapper {
+                    return None;
+                }
+                (origin.array_targets, None, None)
             } else {
                 (
                     Some(instantiated_function_member_owner(store, source, mapper)?),
@@ -6988,6 +7189,10 @@ pub(super) fn validate_instantiated_function_member_callable(
             edges.push(source);
             edges.extend(alias.arguments());
             edges.extend(alias.identity_arguments());
+        }
+        if let Some(arguments) = function_alias_instance_arguments(store, source, type_, mapper) {
+            edges.push(source);
+            edges.extend(arguments);
         }
         Some((callable, edges))
     })();
@@ -7143,21 +7348,29 @@ pub(super) fn instantiated_property_function_signature_return_type(
     {
         return Err(invalid());
     }
-    let receiver = instantiated_function_property_owner(store, origin.source, origin.mapper)
-        .ok_or_else(invalid)?;
-    let recovery = match instantiated_function_property_recovery(
-        store,
-        origin.source,
-        type_,
-        origin.mapper,
-        receiver,
-    )
-    .ok_or_else(invalid)?
+    let recovery = if let Some(receiver) =
+        instantiated_function_property_owner(store, origin.source, origin.mapper)
     {
-        FunctionPropertyRecovery::Normal => None,
-        FunctionPropertyRecovery::Recovered(identity) => {
-            Some(InstantiatedFunctionRecovery::Property(identity))
+        match instantiated_function_property_recovery(
+            store,
+            origin.source,
+            type_,
+            origin.mapper,
+            receiver,
+        )
+        .ok_or_else(invalid)?
+        {
+            FunctionPropertyRecovery::Normal => None,
+            FunctionPropertyRecovery::Recovered(identity) => {
+                Some(InstantiatedFunctionRecovery::Property(identity))
+            }
         }
+    } else if function_alias_instance_arguments(store, origin.source, type_, origin.mapper)
+        .is_some()
+    {
+        None
+    } else {
+        return Err(invalid());
     };
     let current = instantiated_function_member_projection(
         store,
