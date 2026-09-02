@@ -4618,6 +4618,9 @@ fn conditional_remap_error(
     observe_instantiation_failure(store, source, "conditional_remap", &error);
     match error {
         ConditionalTypeError::Instantiation(error) => error,
+        ConditionalTypeError::Relation(
+            super::relater::RelationUnavailable::UnresolvedSignatureReturn(signature),
+        ) => InstantiationError::UnresolvedSignatureReturn(signature),
         ConditionalTypeError::Declared(error) => InstantiationError::Declared(error),
         ConditionalTypeError::InvalidMapper(mapper) => InstantiationError::InvalidMapper(mapper),
         ConditionalTypeError::Capacity => {

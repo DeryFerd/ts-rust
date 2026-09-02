@@ -7156,7 +7156,7 @@ fn validate_conditional_operand_with_source(
             }
             let return_type = signature_record
                 .resolved_return_type()
-                .ok_or_else(|| invalid_conditional_signature(store, signature))?;
+                .ok_or(RelationUnavailable::UnresolvedSignatureReturn(signature))?;
             dependencies.push(return_type);
             dependencies.extend(conditional_signature_parameter_types(
                 store,
