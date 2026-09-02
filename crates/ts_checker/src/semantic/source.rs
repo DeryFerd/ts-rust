@@ -48588,11 +48588,17 @@ fn union_assignment_detail(
     ) {
         return Ok(None);
     }
-    let constituents = match store.type_payload(source_type).map(TypeRecord::data) {
-        Some(TypeData::Union(union)) => union.union.types.clone(),
-        Some(_) => return Ok(None),
-        None => return Err(RelationUnavailable::Type(source_type).into()),
+    let source = store
+        .type_payload(source_type)
+        .ok_or(RelationUnavailable::Type(source_type))?;
+    // Primitive unions report the root failure without a constituent error.
+    if source.flags().intersects(TypeFlags::PRIMITIVE) {
+        return Ok(None);
+    }
+    let TypeData::Union(union) = source.data() else {
+        return Ok(None);
     };
+    let constituents = union.union.types.clone();
     for constituent in constituents {
         if store.is_type_assignable_to_with_session(
             constituent,
