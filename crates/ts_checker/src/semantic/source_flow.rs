@@ -743,7 +743,7 @@ pub(super) struct SourceEqualityCondition {
     pub(super) discriminant: Option<NodeRef>,
 }
 
-/// The exact receiver and key of a checked membership condition.
+/// The exact operands of a checked property or class membership condition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceInCondition {
     pub(super) expression: NodeRef,
@@ -762,6 +762,7 @@ pub(super) enum SourceFlowCondition {
     Typeof(SourceTypeofCondition),
     Equality(SourceEqualityCondition),
     In(SourceInCondition),
+    InstanceOf(SourceInCondition),
 }
 
 impl SourceFlowCondition {
@@ -773,7 +774,7 @@ impl SourceFlowCondition {
             Self::ClassPropertyTruthiness(condition) => condition.expression,
             Self::Typeof(condition) => condition.expression,
             Self::Equality(condition) => condition.expression,
-            Self::In(condition) => condition.expression,
+            Self::In(condition) | Self::InstanceOf(condition) => condition.expression,
         }
     }
 
@@ -784,7 +785,7 @@ impl SourceFlowCondition {
             Self::Truthiness(condition) => condition.symbol,
             Self::Typeof(condition) => condition.symbol,
             Self::Equality(condition) => condition.symbol,
-            Self::In(condition) => condition.symbol,
+            Self::In(condition) | Self::InstanceOf(condition) => condition.symbol,
         })
     }
 }
@@ -5711,9 +5712,12 @@ impl SourceFlowFrame<'_, '_> {
     ) -> Result<(), SourceFlowError> {
         let invalid = || SourceFlowInvariant::UnknownCondition(condition.expression);
         let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
-        if self.plan.conditions.get(&condition.expression)
-            != Some(&SourceFlowCondition::In(condition))
-            || self.in_conditions.contains_key(&condition.expression)
+        let instanceof = match self.plan.conditions.get(&condition.expression) {
+            Some(SourceFlowCondition::In(actual)) if *actual == condition => false,
+            Some(SourceFlowCondition::InstanceOf(actual)) if *actual == condition => true,
+            _ => return Err(invalid().into()),
+        };
+        if self.in_conditions.contains_key(&condition.expression)
             || store.type_node_links(condition.expression)
                 != Some(&TypeNodeLinks {
                     resolved_type: Some(bootstrap.boolean_type),
@@ -5732,8 +5736,13 @@ impl SourceFlowFrame<'_, '_> {
             .type_node_links(condition.key)
             .and_then(|links| links.resolved_type)
             .ok_or_else(invalid)?;
-        let [when_true, when_false] =
-            narrow_source_in_type(store, globals, session, condition.expression, input, key)?;
+        let [when_true, when_false] = if instanceof {
+            narrow_source_instanceof_type(
+                store, host, globals, session, condition.expression, input, key,
+            )?
+        } else {
+            narrow_source_in_type(store, globals, session, condition.expression, input, key)?
+        };
         self.in_conditions.insert(
             condition.expression,
             CompletedInCondition {
@@ -6471,7 +6480,8 @@ impl SourceFlowFrame<'_, '_> {
                             ),
                         })?
                     }
-                    SourceFlowCondition::In(condition) => {
+                    SourceFlowCondition::In(condition)
+                    | SourceFlowCondition::InstanceOf(condition) => {
                         let completed = self.in_conditions.get(&condition.expression).ok_or(
                             SourceFlowInvariant::UnreachedCondition(condition.expression),
                         )?;
@@ -6842,6 +6852,130 @@ enum SourceEqualityValueKind {
     Null,
     Undefined,
     Literal(TypeId),
+}
+
+/// Follows only completed, non-generic class base identities.
+fn source_class_derives_from(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    condition: NodeRef,
+    mut source: TypeId,
+    target: TypeId,
+) -> Result<bool, SourceFlowError> {
+    let mut visited = HashSet::new();
+    loop {
+        if source == target {
+            return Ok(true);
+        }
+        if !visited.insert(source) {
+            return Err(SourceFlowInvariant::UnknownCondition(condition).into());
+        }
+        let members = super::in_operators::instanceof_class_members(store, host, source, false)
+            .map_err(SourceFlowError::Relation)?
+            .ok_or(SourceFlowUnsupported::InNarrowing {
+                condition,
+                type_: source,
+            })?;
+        let Some(base) = members.base() else {
+            return Ok(false);
+        };
+        if base.applied_instance_type() != base.instance_type() {
+            return Err(SourceFlowUnsupported::InNarrowing {
+                condition,
+                type_: source,
+            }
+            .into());
+        }
+        source = base.instance_type();
+    }
+}
+
+/// Uses class base identities, as the native instanceof flow check does.
+fn narrow_source_instanceof_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    condition: NodeRef,
+    input: TypeId,
+    constructor: TypeId,
+) -> Result<[TypeId; 2], SourceFlowError> {
+    let invalid = || SourceFlowInvariant::UnknownCondition(condition);
+    let unavailable = |type_| SourceFlowUnsupported::InNarrowing { condition, type_ };
+    let cache_error = |error| SourceFlowError::Narrowing {
+        condition,
+        error: LogicalBinaryError::Literal(error),
+    };
+    store
+        .validate_union_constituent_with_global_types(globals, input)
+        .map_err(cache_error)?;
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let (any, error, unknown, never) = (
+        bootstrap.any_type,
+        bootstrap.error_type,
+        bootstrap.unknown_type,
+        bootstrap.never_type,
+    );
+    let members = super::in_operators::instanceof_class_members(store, host, constructor, true)
+        .map_err(SourceFlowError::Relation)?
+        .ok_or_else(|| unavailable(constructor))?;
+    let instance = members.shells().instance_type();
+    if input == any || input == error || input == unknown {
+        return Ok([instance, input]);
+    }
+    if input == never {
+        return Ok([input, input]);
+    }
+    let (leaves, has_origin) = match store.type_payload(input).ok_or_else(invalid)?.data() {
+        TypeData::Union(union) => (union.union.types.clone(), union.origin.is_some()),
+        _ => (vec![input], false),
+    };
+    let mut present = Vec::with_capacity(leaves.len());
+    let mut absent = Vec::with_capacity(leaves.len());
+    for &leaf in &leaves {
+        let flags = store.type_payload(leaf).ok_or_else(invalid)?.flags();
+        if flags.intersects(TypeFlags::PRIMITIVE) {
+            absent.push(leaf);
+            continue;
+        }
+        let derived = source_class_derives_from(store, host, condition, leaf, instance)?;
+        if derived {
+            present.push(leaf);
+        } else if source_class_derives_from(store, host, condition, instance, leaf)?
+            && !present.contains(&instance)
+        {
+            present.push(instance);
+        }
+        if !derived {
+            absent.push(leaf);
+        }
+    }
+    if present.is_empty() {
+        // Unrelated object types need the native intersection result.
+        return Err(unavailable(input).into());
+    }
+    if has_origin && (present != leaves || absent != leaves) {
+        return Err(unavailable(input).into());
+    }
+    let mut branches = [input, input];
+    for (branch, retained) in branches.iter_mut().zip([present, absent]) {
+        if retained == leaves {
+            continue;
+        }
+        *branch = match retained.as_slice() {
+            [] => never,
+            [only] => *only,
+            _ => store
+                .expression_union_type_with_global_types_and_session(
+                    globals,
+                    &retained,
+                    UnionReduction::Literal,
+                    session,
+                )
+                .map_err(cache_error)?,
+        };
+    }
+    Ok(branches)
 }
 
 /// Checks both membership edges before the flow frame records either result.

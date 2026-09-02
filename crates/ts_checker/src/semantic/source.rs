@@ -3246,7 +3246,8 @@ impl PlannedCallableStatementList {
                             PlannedSourceCondition::Equality(condition) => {
                                 expressions.extend([&condition.operand, &condition.value])
                             }
-                            PlannedSourceCondition::In(condition) => {
+                            PlannedSourceCondition::In(condition)
+                            | PlannedSourceCondition::InstanceOf(condition) => {
                                 expressions.push(&condition.expression)
                             }
                         }
@@ -3325,7 +3326,7 @@ fn callable_for_comparison_values(
                         values.push(&condition.value);
                     }
                 }
-                PlannedSourceCondition::In(_) => return None,
+                PlannedSourceCondition::In(_) | PlannedSourceCondition::InstanceOf(_) => return None,
                 PlannedSourceCondition::Expression { .. }
                 | PlannedSourceCondition::Truthiness { .. }
                 | PlannedSourceCondition::Typeof(_) => {}
@@ -3658,6 +3659,7 @@ enum PlannedSourceCondition {
     Typeof(Box<PlannedTypeofCondition>),
     Equality(Box<PlannedEqualityCondition>),
     In(Box<PlannedInCondition>),
+    InstanceOf(Box<PlannedInCondition>),
 }
 
 #[derive(Clone, Debug)]
@@ -3703,7 +3705,7 @@ impl PlannedSourceCondition {
                 .map_or(expression.node, |(reference, _)| reference.node),
             Self::Typeof(condition) => condition.identifier.node,
             Self::Equality(condition) => condition.identifier,
-            Self::In(condition) => condition.flow_point,
+            Self::In(condition) | Self::InstanceOf(condition) => condition.flow_point,
         }
     }
 
@@ -3733,6 +3735,7 @@ impl PlannedSourceCondition {
                 discriminant: condition.discriminant,
             }),
             Self::In(condition) => SourceFlowCondition::In(condition.flow),
+            Self::InstanceOf(condition) => SourceFlowCondition::InstanceOf(condition.flow),
         })
     }
 
@@ -3772,7 +3775,7 @@ impl PlannedSourceCondition {
             }
             Self::Typeof(condition) => condition.expression,
             Self::Equality(condition) => condition.expression,
-            Self::In(condition) => condition.expression.node,
+            Self::In(condition) | Self::InstanceOf(condition) => condition.expression.node,
         }
     }
 }
@@ -19784,6 +19787,27 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         self.primitive_binary_position_roots.insert(expression);
         let expression = self.plan_expression(expression)?;
         if let PlannedExpressionKind::Binary(binary) = &expression.unparenthesized().kind
+            && binary.operator == SyntaxKind::InstanceOfKeyword
+            && let PlannedExpressionKind::Identifier(read) = &binary.left.unparenthesized().kind
+            && read.kind == PlannedIdentifierReadKind::Variable
+        {
+            let flow = SourceInCondition {
+                expression: expression.node,
+                receiver: binary.left.unparenthesized().node,
+                key: binary.right.node,
+                symbol: read.value_symbol,
+            };
+            let right_entry = self.condition_expression_flow_point(&binary.right, entry);
+            let flow_point = self.condition_expression_flow_point(&binary.left, right_entry);
+            return Ok(PlannedSourceCondition::InstanceOf(Box::new(
+                PlannedInCondition {
+                    expression,
+                    flow_point,
+                    flow,
+                },
+            )));
+        }
+        if let PlannedExpressionKind::Binary(binary) = &expression.unparenthesized().kind
             && binary.operator == SyntaxKind::InKeyword
             && let PlannedExpressionKind::Identifier(read) = &binary.right.unparenthesized().kind
             && read.kind == PlannedIdentifierReadKind::Variable
@@ -19804,7 +19828,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         if matches!(
             &expression.unparenthesized().kind,
-            PlannedExpressionKind::Binary(binary) if binary.operator == SyntaxKind::InKeyword
+            PlannedExpressionKind::Binary(binary)
+                if matches!(binary.operator, SyntaxKind::InKeyword | SyntaxKind::InstanceOfKeyword)
         ) {
             // Property receivers need a checked property-reference flow fact.
             return Err(Self::unsupported_function_body(callable));
@@ -29746,7 +29771,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 | SyntaxKind::QuestionQuestionEqualsToken
         );
         let comma = operator_kind == SyntaxKind::CommaToken;
-        let membership = operator_kind == SyntaxKind::InKeyword;
+        let membership = matches!(
+            operator_kind,
+            SyntaxKind::InKeyword | SyntaxKind::InstanceOfKeyword
+        );
         let Some(operator_text) = (if assignment {
             Some("=")
         } else {
@@ -34421,7 +34449,7 @@ fn preflight_inferred_function_return_dependencies(
                 expression_is_closed(&condition.operand, parameters, locals, functions)
                     && expression_is_closed(&condition.value, parameters, locals, functions)
             }
-            PlannedSourceCondition::In(condition) => {
+            PlannedSourceCondition::In(condition) | PlannedSourceCondition::InstanceOf(condition) => {
                 expression_is_closed(&condition.expression, parameters, locals, functions)
             }
         }
@@ -34831,7 +34859,8 @@ fn preflight_inferred_function_return_dependencies(
                             functions,
                         )
                     }
-                    PlannedSourceCondition::In(condition) => expression_is_closed(
+                    PlannedSourceCondition::In(condition)
+                    | PlannedSourceCondition::InstanceOf(condition) => expression_is_closed(
                         &condition.expression,
                         &function.callable.parameters,
                         &locals,
@@ -34947,6 +34976,9 @@ const fn binary_operator_text(kind: SyntaxKind) -> Option<&'static str> {
     }
     if matches!(kind, SyntaxKind::InKeyword) {
         return Some("in");
+    }
+    if matches!(kind, SyntaxKind::InstanceOfKeyword) {
+        return Some("instanceof");
     }
     match logical_binary_operator_text(kind) {
         Some(text) => Some(text),
@@ -39793,7 +39825,7 @@ fn check_expression_type_with_capture_context(
                     }
                     publish_expression_type(store, node, right.raw)?;
                     left = CheckedExpressionTypes::leaf(right.raw, right.result);
-                } else if operator == SyntaxKind::InKeyword {
+                } else if matches!(operator, SyntaxKind::InKeyword | SyntaxKind::InstanceOfKeyword) {
                     if binary.node != node || !binary.prefix.is_empty() {
                         return Err(SourceCheckError::PrimitiveOperator(node));
                     }
@@ -39801,25 +39833,32 @@ fn check_expression_type_with_capture_context(
                     if options.no_error_truncation {
                         display_flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
                     }
-                    let resolution = super::in_operators::check_in_binary_with_session(
-                        store,
-                        host,
-                        global_types,
-                        options.strict_function_types,
-                        display_flags,
-                        session,
-                        PrimitiveBinaryRequest {
-                            expression: node,
-                            left: left_node,
-                            operator,
-                            right: right_expression.node,
-                            left_type: left.result,
-                            right_type: right.result,
-                            left_recovery: left.primitive_binary_recovery,
-                            right_recovery: right.primitive_binary_recovery,
-                            bigint_exponentiation_target: bigint_exponentiation_target(options),
-                        },
-                    )
+                    let request = PrimitiveBinaryRequest {
+                        expression: node,
+                        left: left_node,
+                        operator,
+                        right: right_expression.node,
+                        left_type: left.result,
+                        right_type: right.result,
+                        left_recovery: left.primitive_binary_recovery,
+                        right_recovery: right.primitive_binary_recovery,
+                        bigint_exponentiation_target: bigint_exponentiation_target(options),
+                    };
+                    let resolution = if operator == SyntaxKind::InstanceOfKeyword {
+                        super::in_operators::check_instanceof_binary(
+                            store, host, global_types, request,
+                        )
+                    } else {
+                        super::in_operators::check_in_binary_with_session(
+                            store,
+                            host,
+                            global_types,
+                            options.strict_function_types,
+                            display_flags,
+                            session,
+                            request,
+                        )
+                    }
                     .map_err(|error| primitive_binary_check_error(host, node, &error))?;
                     for diagnostic in resolution.diagnostics {
                         merge_retry_diagnostic(diagnostics, diagnostic);
@@ -55734,7 +55773,7 @@ fn check_planned_source_condition_with_capture_context(
             callable,
             condition,
         ),
-        PlannedSourceCondition::In(condition) => {
+        PlannedSourceCondition::In(condition) | PlannedSourceCondition::InstanceOf(condition) => {
             let snapshot = frame
                 .snapshot_at(store, global_types, condition.flow_point)
                 .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
@@ -63318,7 +63357,7 @@ fn check_callable_statement_condition_effects(
             check_callable_statement_expression_effects(store, host, callable, &condition.operand)?;
             check_callable_statement_expression_effects(store, host, callable, &condition.value)
         }
-        PlannedSourceCondition::In(condition) => {
+        PlannedSourceCondition::In(condition) | PlannedSourceCondition::InstanceOf(condition) => {
             check_callable_statement_expression_effects(store, host, callable, &condition.expression)
         }
     }

@@ -1,6 +1,6 @@
-//! Operand checks for ordinary `in` expressions.
+//! Operand checks for ordinary `in` and class `instanceof` expressions.
 //!
-//! This follows the pinned `checkInExpression` and `checkNonNullType` paths.
+//! This follows the pinned membership and non-null operand checks.
 //! The source executor checks both expressions first and publishes this batch
 //! only after the complete operation succeeds. Private names remain outside
 //! this entry. Generic non-null projections remain typed unsupported results.
@@ -16,6 +16,7 @@ use super::{
     CanonicalCheckerDiagnostic, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost,
     TypeId,
     bootstrap::UnionReduction,
+    classes::{ClassMembers, completed_source_class_members},
     formatter::{
         CanonicalTypeFormatFlags,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
@@ -27,9 +28,111 @@ use super::{
         PrimitiveBinaryError, PrimitiveBinaryInvariant, PrimitiveBinaryRecovery,
         PrimitiveBinaryRequest, PrimitiveBinaryResolution, PrimitiveBinaryUnsupported,
     },
+    relater::RelationUnavailable,
     type_records::TypeData,
     types::{ObjectFlags, TypeFlags},
 };
+
+/// Checks a completed class shell without changing source or type caches.
+pub(super) fn instanceof_class_members(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+    constructor: bool,
+) -> Result<Option<ClassMembers>, RelationUnavailable> {
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let Some(symbol) = record.symbol() else {
+        return Ok(None);
+    };
+    let Some(members) =
+        completed_source_class_members(store, host, symbol).map_err(|_| invalid())?
+    else {
+        return Ok(None);
+    };
+    let shells = members.shells();
+    let expected = if constructor {
+        shells.value_type()
+    } else {
+        shells.instance_type()
+    };
+    if expected != type_ {
+        // Applied generic class references need their own instance projection.
+        return Ok(None);
+    }
+    if constructor && members.static_properties() != [members.prototype()] {
+        // A static member can supply Symbol.hasInstance. That needs call resolution.
+        return Ok(None);
+    }
+    Ok(Some(members))
+}
+
+/// Checks both operands before returning the canonical boolean result.
+pub(super) fn check_instanceof_binary(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    request: PrimitiveBinaryRequest,
+) -> Result<PrimitiveBinaryResolution, PrimitiveBinaryError> {
+    if request.operator != SyntaxKind::InstanceOfKeyword {
+        return Err(PrimitiveBinaryUnsupported::Operator(request.operator).into());
+    }
+    for (node, type_, recovery) in [
+        (request.left, request.left_type, request.left_recovery),
+        (request.right, request.right_type, request.right_recovery),
+    ] {
+        if host.node(node).is_none() {
+            return Err(unsupported(node, type_));
+        }
+        validate_operand(store, global_types, node, type_, recovery)?;
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
+    if request.left_type == bootstrap.silent_never_type
+        || request.right_type == bootstrap.silent_never_type
+    {
+        return Ok(PrimitiveBinaryResolution {
+            result_type: bootstrap.silent_never_type,
+            recovery: None,
+            diagnostics: Vec::new(),
+        });
+    }
+    store.validate_union_constituent(bootstrap.boolean_type)?;
+    let mut diagnostics = Vec::new();
+    let left = operand_leaves(store, request.left, request.left_type)?;
+    if left.iter().all(|type_| {
+        store.type_payload(*type_).is_some_and(|record| {
+            record
+                .flags()
+                .intersects(TypeFlags::PRIMITIVE | TypeFlags::NEVER)
+        })
+    }) {
+        diagnostics.push(diagnostic(request.left, 2358, Vec::new())?);
+    }
+    let right = store
+        .type_payload(request.right_type)
+        .ok_or(PrimitiveBinaryInvariant::InvalidType(request.right_type))?;
+    if !right.flags().intersects(TypeFlags::ANY) {
+        let leaves = operand_leaves(store, request.right, request.right_type)?;
+        if leaves.iter().all(|type_| {
+            store.type_payload(*type_).is_some_and(|record| {
+                record
+                    .flags()
+                    .intersects(TypeFlags::PRIMITIVE | TypeFlags::UNKNOWN)
+            })
+        }) {
+            diagnostics.push(diagnostic(request.right, 2359, Vec::new())?);
+        } else if instanceof_class_members(store, host, request.right_type, true)?.is_none() {
+            return Err(unsupported(request.right, request.right_type));
+        }
+    }
+    Ok(PrimitiveBinaryResolution {
+        result_type: bootstrap.boolean_type,
+        recovery: None,
+        diagnostics,
+    })
+}
 
 /// Checks both operands without publishing expression links or diagnostics.
 pub(super) fn check_in_binary_with_session(
