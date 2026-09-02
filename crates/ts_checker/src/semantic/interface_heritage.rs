@@ -2239,8 +2239,7 @@ fn plan_interface_type_arguments(
             && !merged_nongeneric_class
             && !merged_nongeneric_value
         || owner_symbol.check_flags() != CheckFlags::NONE
-        || parameters
-            .is_some_and(|parameters| parameters.nodes.is_empty() || parameters.has_trailing_comma)
+        || parameters.is_some_and(|parameters| parameters.nodes.is_empty())
         || arguments
             .is_some_and(|arguments| arguments.has_trailing_comma || arguments.nodes.is_empty())
     {
