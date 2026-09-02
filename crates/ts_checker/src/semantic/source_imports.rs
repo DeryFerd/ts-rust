@@ -2150,9 +2150,6 @@ impl SourceClassAnnotationTypeImportPlan {
                 .source_direct_children(self.declaration)
                 .is_none_or(|children| {
                     children.iter().filter(|node| **node == self.member).count() != 1
-                        || children.iter().any(|node| {
-                            store.source_node_kind(*node) == Some(SyntaxKind::TypeParameter)
-                        })
                 })
         {
             return Err(invalid());
