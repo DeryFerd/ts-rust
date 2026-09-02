@@ -44,6 +44,8 @@ use super::{
     },
     indexed_access_types::{is_template_pattern_index_key, template_pattern_index_matches_name},
     instantiate::{InstantiationLimits, InstantiationSession},
+    instantiated_members::validate_property_object_alias_members_with_array_targets,
+    object_aliases::property_object_alias_projection,
     object_members::{
         DeclaredPropertyTypeGraphValidation, PropertyObjectPlan,
         object_literal_getter_projection_with_host, object_literal_state, plan_object_literal,
@@ -60,6 +62,9 @@ use super::{
         PlannedExpressionKind, PlannedObjectMember, SourceCheckError, SourceCheckProvenanceError,
     },
     spelling::get_spelling_suggestion,
+    structured_members::{
+        InterfaceHeritageMembersValidation, validate_interface_heritage_members_with_array_targets,
+    },
     type_nodes::CanonicalTypeQuery,
     type_records::{StructuredTypeData, TypeCacheState, TypeData},
     types::{ObjectFlags, TypeFlags},
@@ -2312,11 +2317,29 @@ fn interface_heritage_property_mismatch_chain_inner(
     active: &mut HashSet<(TypeId, TypeId)>,
     session: &mut InstantiationSession,
 ) -> Result<Option<Vec<Diagnostic>>, SourceCheckError> {
+    let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
     for type_ in [source_type, target_type] {
         match validate_class_heritage_members(store, type_) {
             ClassHeritageMembersValidation::Malformed => return Err(invalid_structure(type_)),
             ClassHeritageMembersValidation::Valid => continue,
             ClassHeritageMembersValidation::NotClass => {}
+        }
+        match validate_interface_heritage_members_with_array_targets(store, type_, array_targets) {
+            InterfaceHeritageMembersValidation::Malformed => return Err(invalid_structure(type_)),
+            InterfaceHeritageMembersValidation::Valid => continue,
+            InterfaceHeritageMembersValidation::NotHeritage => {}
+        }
+        if property_object_alias_projection(store, type_)?.is_some() {
+            if validate_property_object_alias_members_with_array_targets(
+                store,
+                type_,
+                array_targets,
+            )?
+            .is_none()
+            {
+                return Ok(None);
+            }
+            continue;
         }
         match validate_resolved_declared_property_type_graph(store, type_) {
             DeclaredPropertyTypeGraphValidation::Traversable(_) => {}
