@@ -13454,8 +13454,41 @@ pub(super) fn observe_invalid_structured_members(
                 data.index_infos.as_ref().map(Vec::len),
             )
         });
+    let owner_metadata_skipped = store.relation_read_observation_is_active();
+    let owner_metadata = if owner_metadata_skipped {
+        None
+    } else {
+        owner_record.map(|owner| {
+            let name = owner.name();
+            let bytes = name.as_bytes();
+            let end = bytes.len().min(128);
+            let name_prefix = name.as_utf8().map(|name| {
+                let mut end = end;
+                while !name.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &name[..end]
+            });
+            let mut declarations = [None; 8];
+            let source_declarations = owner.declarations().unwrap_or_default();
+            for (slot, &declaration) in declarations.iter_mut().zip(source_declarations) {
+                *slot = Some((
+                    declaration,
+                    store.source_node_kind(declaration),
+                    store.source_node_start(declaration),
+                ));
+            }
+            (
+                name_prefix,
+                &bytes[..end],
+                bytes.len() > end,
+                declarations,
+                source_declarations.len() > declarations.len(),
+            )
+        })
+    };
     eprintln!(
-        "structured_member_failure site={site} type={type_id:?} inner={inner:?} kind={:?} flags={:?} object_flags={:?} owner={owner:?} canonical_owner={canonical_owner:?} owner_flags={:?} first_declaration={:?} declaration_count={:?} alias={alias:?} alias_owner={alias_owner:?} target={:?} mapper={:?} mapped_declaration_parameter_constraint_template={mapped:?} cache_members_tablelen_properties_signatures_calls_indexes={cache:?}",
+        "structured_member_failure site={site} type={type_id:?} inner={inner:?} kind={:?} flags={:?} object_flags={:?} owner={owner:?} canonical_owner={canonical_owner:?} owner_flags={:?} first_declaration={:?} declaration_count={:?} alias={alias:?} alias_owner={alias_owner:?} target={:?} mapper={:?} mapped_declaration_parameter_constraint_template={mapped:?} cache_members_tablelen_properties_signatures_calls_indexes={cache:?} owner_metadata_skipped={owner_metadata_skipped} owner_name_utf8_bytes_truncated_declarations_kind_start_truncated={owner_metadata:?}",
         record.map(|record| record.data().kind()),
         record.map(TypeRecord::flags),
         record.map(TypeRecord::object_flags),
