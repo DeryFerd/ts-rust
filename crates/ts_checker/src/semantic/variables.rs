@@ -1079,9 +1079,7 @@ fn plan_callable_object_parameter_bindings(
         match (&annotation_record.data, annotation_record.kind) {
             (NodeData::TypeLiteralNode(literal), SyntaxKind::TypeLiteral)
                 if literal.symbol.is_none() => {}
-            (NodeData::TypeReferenceNode(reference), SyntaxKind::TypeReference)
-                if reference.type_arguments.is_none() =>
-            {
+            (NodeData::TypeReferenceNode(reference), SyntaxKind::TypeReference) => {
                 let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
                 let name_record = binding_child_node(arena, store, name, annotation)?;
                 let NodeData::Identifier(identifier) = &name_record.data else {
@@ -1091,10 +1089,36 @@ fn plan_callable_object_parameter_bindings(
                 };
                 if name_record.kind != SyntaxKind::Identifier
                     || name_record.flags.0 != 0
-                    || name_record.range != annotation_record.range
+                    || name_record.range.start != annotation_record.range.start
                     || identifier.flow_node.is_some()
                     || identifier.text.is_empty()
                 {
+                    return Err(VariableInvariant::InvalidBindingPattern(name).into());
+                }
+                if let Some(arguments) = &reference.type_arguments {
+                    if typed_arrow || arguments.nodes.is_empty() {
+                        return Err(VariablePlanError::Unsupported(
+                            VariableUnsupported::BindingPattern(annotation),
+                        ));
+                    }
+                    if arguments.range.start < name_record.range.end
+                        || arguments.range.end > annotation_record.range.end
+                    {
+                        return Err(VariableInvariant::InvalidBindingPattern(annotation).into());
+                    }
+                    let mut previous_end = arguments.range.start;
+                    for argument in &arguments.nodes {
+                        let argument = NodeRef::new(annotation.arena, annotation.file, *argument);
+                        let record = binding_child_node(arena, store, argument, annotation)?;
+                        if record.flags.0 != 0
+                            || record.range.start < previous_end
+                            || record.range.end > arguments.range.end
+                        {
+                            return Err(VariableInvariant::InvalidBindingPattern(argument).into());
+                        }
+                        previous_end = record.range.end;
+                    }
+                } else if name_record.range.end != annotation_record.range.end {
                     return Err(VariableInvariant::InvalidBindingPattern(name).into());
                 }
             }

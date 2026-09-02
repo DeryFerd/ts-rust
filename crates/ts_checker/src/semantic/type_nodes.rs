@@ -5811,6 +5811,16 @@ struct OrdinaryImportAliasChain {
     target: SemanticSymbolId,
 }
 
+/// Source syntax planning can use the same cold import proof as type queries.
+pub(super) fn plan_ordinary_import_alias_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    raw: SemanticSymbolId,
+) -> Result<SemanticSymbolId, DeclaredTypeError> {
+    Ok(ordinary_import_alias_chain(store, host, node, raw)?.target)
+}
+
 fn ordinary_import_alias_chain(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,

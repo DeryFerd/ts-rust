@@ -6755,17 +6755,26 @@ fn source_object_parameter_annotation_plan(
         let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
         let name_record = preflight_node(store, host, name).ok()?;
         if record.kind != SyntaxKind::TypeReference
-            || reference.type_arguments.is_some()
             || name_record.kind != SyntaxKind::Identifier
             || name_record.parent != Some(annotation.node)
             || !matches!(name_record.data, NodeData::Identifier(_))
         {
             return None;
         }
-        let symbol = source_alias_reference_symbol(store, host, annotation).ok()??;
+        let mut symbol = source_alias_reference_symbol(store, host, annotation).ok()??;
+        if store.symbol(symbol)?.flags().intersects(SymbolFlags::ALIAS) {
+            symbol = super::type_nodes::plan_ordinary_import_alias_target(
+                store, host, annotation, symbol,
+            )
+            .ok()?;
+        }
         let owner = store.symbol(symbol)?;
         if owner.flags().contains(SymbolFlags::INTERFACE) {
-            let plan = super::object_members::plan_interface(store, host, symbol).ok()?;
+            let plan = if reference.type_arguments.is_some() {
+                super::object_members::plan_generic_interface(store, host, symbol).ok()?
+            } else {
+                super::object_members::plan_interface(store, host, symbol).ok()?
+            };
             if plan.heritage.as_ref().is_some_and(|heritage| {
                 heritage
                     .bases
@@ -6775,6 +6784,9 @@ fn source_object_parameter_annotation_plan(
                 return None;
             }
             return Some(plan);
+        }
+        if reference.type_arguments.is_some() {
+            return None;
         }
         let [declaration] = owner.declarations()? else {
             return None;
