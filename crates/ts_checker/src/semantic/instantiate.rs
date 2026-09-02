@@ -2,14 +2,14 @@
 //!
 //! This is the first exact slice of pinned `instantiateTypeWorker`. It covers
 //! primitive and literal leaves, direct type-parameter mapping, canonical
-//! Array/ReadonlyArray references under an explicit target capability, direct
-//! full-arity generic class/interface references, indexed accesses, generic
-//! `keyof` indexes, authenticated selection-shaped mapped aliases, deferred
-//! intersections, template literals, intrinsic string mappings, ordinary
-//! property-object aliases, inline intersection objects, authenticated deferred
-//! conditionals, closed declaration-owned values, and unions with canonical
-//! alias arguments and union origins. Other object and signature instantiation
-//! needs its owning caches and is rejected.
+//! Array/ReadonlyArray references under an explicit target capability, fixed
+//! canonical tuples, direct full-arity generic class/interface references,
+//! indexed accesses, generic `keyof` indexes, authenticated selection-shaped
+//! mapped aliases, deferred intersections, template literals, intrinsic string
+//! mappings, ordinary property-object aliases, inline intersection objects,
+//! authenticated deferred conditionals, closed declaration-owned values, and
+//! unions with canonical alias arguments and union origins. Other object and
+//! signature instantiation needs its owning caches and is rejected.
 
 use std::collections::{HashMap, HashSet};
 
@@ -65,8 +65,10 @@ use super::{
         DirectGenericReference, DirectGenericReferenceError, create_direct_generic_reference,
         validate_direct_generic_reference,
     },
+    signatures::ElementFlags,
     store::SourceNodeParent,
     template_types::TemplateTypeError,
+    tuple_types::{CanonicalTupleTypeRequest, TupleShape, TupleTypeError},
     type_nodes::type_alias_instantiation_cache_key,
     type_records::{StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{AccessFlags, ObjectFlags, TypeFlags},
@@ -111,6 +113,7 @@ pub(super) enum InstantiationError {
     UnsupportedUnionOrigin(TypeId),
     UnsupportedUnionConstituent(TypeId),
     Array(ArrayTypeError),
+    Tuple(TupleTypeError),
     Reference(DirectGenericReferenceError),
     Template(TemplateTypeError),
     Union(LiteralTypeCacheError),
@@ -165,6 +168,7 @@ impl std::fmt::Display for InstantiationError {
                 "union constituent {type_:?} is outside the primitive/literal mapper slice"
             ),
             Self::Array(error) => error.fmt(formatter),
+            Self::Tuple(error) => error.fmt(formatter),
             Self::Reference(error) => error.fmt(formatter),
             Self::Template(error) => error.fmt(formatter),
             Self::Union(error) => error.fmt(formatter),
@@ -177,6 +181,7 @@ impl std::error::Error for InstantiationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Array(error) => Some(error),
+            Self::Tuple(error) => Some(error),
             Self::Reference(error) => Some(error),
             Self::Template(error) => Some(error),
             Self::Union(error) => Some(error),
@@ -195,6 +200,17 @@ impl From<LiteralTypeCacheError> for InstantiationError {
 impl From<ArrayTypeError> for InstantiationError {
     fn from(error: ArrayTypeError) -> Self {
         Self::Array(error)
+    }
+}
+
+impl From<TupleTypeError> for InstantiationError {
+    fn from(error: TupleTypeError) -> Self {
+        match error {
+            TupleTypeError::ArrayType(error) => Self::Array(error),
+            TupleTypeError::LengthType(error) => Self::Union(error),
+            TupleTypeError::Capacity => Self::Union(LiteralTypeCacheError::Capacity),
+            error => Self::Tuple(error),
+        }
     }
 }
 
@@ -2320,8 +2336,21 @@ fn could_contain_installed_type_variables_worker(
         {
             Ok(false)
         }
-        TypeData::TypeReference(_) | TypeData::Interface(_) => {
-            if let Some(array_targets) = array_targets
+        TypeData::TypeReference(_) | TypeData::Interface(_) | TypeData::Tuple(_) => {
+            if let Some(tuple) = instantiable_tuple_shape(store, type_)? {
+                tuple
+                    .element_types()
+                    .iter()
+                    .try_fold(false, |contains, element| {
+                        Ok(contains
+                            | could_contain_installed_type_variables_worker(
+                                store,
+                                *element,
+                                array_targets,
+                                seen,
+                            )?)
+                    })
+            } else if let Some(array_targets) = array_targets
                 && let Some(reference) =
                     store.canonical_array_reference_with_targets(array_targets, type_)?
             {
@@ -2563,6 +2592,23 @@ fn authenticated_instantiable_interface_reference(
     .then_some(reference)
 }
 
+/// Fixed tuple elements map in place. Variable elements need tuple normalization.
+fn instantiable_tuple_shape(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<TupleShape<'_>>, InstantiationError> {
+    let shape = store.canonical_tuple_shape(type_)?;
+    if shape.is_some_and(|shape| {
+        shape.combined_flags().intersects(ElementFlags::VARIABLE)
+            || store
+                .type_payload(type_)
+                .is_some_and(|record| record.object_flags().contains(ObjectFlags::ARRAY_LITERAL))
+    }) {
+        return Err(InstantiationError::UnsupportedType(type_));
+    }
+    Ok(shape)
+}
+
 fn supported_instantiable_union_constituent(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -2584,10 +2630,11 @@ fn supported_instantiable_union_constituent(
             .map(|projection| projection.is_some())
             .map_err(|error| mapped_indexed_access_error(type_, error)),
         Some(TypeData::IndexedAccess(_)) => Ok(store.validate_union_constituent(type_).is_ok()),
-        Some(TypeData::TypeReference(_)) => {
+        Some(TypeData::TypeReference(_) | TypeData::Tuple(_)) => {
             Ok(
-                authenticated_instantiable_interface_reference(store, type_, array_targets)
-                    .is_some(),
+                instantiable_tuple_shape(store, type_)?.is_some()
+                    || authenticated_instantiable_interface_reference(store, type_, array_targets)
+                        .is_some(),
             )
         }
         Some(TypeData::Union(_)) => Ok(match array_targets {
@@ -2815,8 +2862,18 @@ fn validate_instantiable_member_type_worker(
                 })
             }
         }
-        TypeData::TypeReference(_) | TypeData::Interface(_) => {
-            if let Some(targets) = array_targets
+        TypeData::TypeReference(_) | TypeData::Interface(_) | TypeData::Tuple(_) => {
+            if let Some(tuple) = instantiable_tuple_shape(store, type_)? {
+                tuple.element_types().iter().try_for_each(|element| {
+                    validate_instantiable_member_type_worker(
+                        store,
+                        *element,
+                        mapper_parameters,
+                        array_targets,
+                        active,
+                    )
+                })
+            } else if let Some(targets) = array_targets
                 && let Some(reference) =
                     store.canonical_array_reference_with_targets(targets, type_)?
             {
@@ -2940,8 +2997,17 @@ fn instantiated_member_type_matches_worker(
         TypeData::Union(_) => {
             instantiated_member_union_matches(store, template, actual, mapper, array_targets)
         }
-        TypeData::TypeReference(_) | TypeData::Interface(_) => {
-            if let Some(targets) = array_targets
+        TypeData::TypeReference(_) | TypeData::Interface(_) | TypeData::Tuple(_) => {
+            if instantiable_tuple_shape(store, template)?.is_some() {
+                cached_instantiated_member_type(
+                    store,
+                    template,
+                    mapper,
+                    array_targets,
+                    &mut HashSet::new(),
+                )
+                .map(|expected| expected == Some(actual))
+            } else if let Some(targets) = array_targets
                 && let Some(source) =
                     store.canonical_array_reference_with_targets(targets, template)?
             {
@@ -3566,7 +3632,43 @@ fn cached_instantiated_type_with_operand_worker(
                 (identity_symbol, &identity_arguments),
             )
         }
-        TypeData::TypeReference(_) | TypeData::Interface(_) => {
+        TypeData::TypeReference(_) | TypeData::Interface(_) | TypeData::Tuple(_) => {
+            if let Some(tuple) = instantiable_tuple_shape(store, template)? {
+                if operand.is_some() {
+                    return Err(InstantiationError::UnsupportedType(template));
+                }
+                let mut elements = Vec::with_capacity(tuple.element_types().len());
+                for &element in tuple.element_types() {
+                    let Some(mapped) = cached_instantiated_type_worker(
+                        store,
+                        element,
+                        mapping,
+                        array_targets,
+                        None,
+                        active,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    elements.push(mapped);
+                }
+                if elements.as_slice() == tuple.element_types() {
+                    return Ok(Some(template));
+                }
+                let Some(cached) =
+                    store.relation_object_instantiation(tuple.target(), type_list_key(&elements))
+                else {
+                    return Ok(None);
+                };
+                let actual = instantiable_tuple_shape(store, cached)?
+                    .ok_or(InstantiationError::InvalidType(cached))?;
+                if actual.target() != tuple.target()
+                    || actual.element_types() != elements.as_slice()
+                {
+                    return Err(InstantiationError::InvalidType(cached));
+                }
+                return Ok(Some(cached));
+            }
             if let Some(targets) = array_targets {
                 store.canonical_array_reference_with_targets(targets, template)?;
             }
@@ -4480,7 +4582,7 @@ fn instantiate_type_worker(
             TypeData::Intersection(_) => InstantiationWork::Intersection(
                 instantiable_intersection_projection(store, type_, array_targets)?,
             ),
-            TypeData::TypeReference(_) => InstantiationWork::TypeReference,
+            TypeData::TypeReference(_) | TypeData::Tuple(_) => InstantiationWork::TypeReference,
             TypeData::Index(_) => InstantiationWork::Index {
                 target: validate_generic_keyof_index_type(store, type_)
                     .map_err(|error| instantiated_keyof_error(type_, error))?,
@@ -5494,6 +5596,30 @@ fn instantiate_reference(
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
+    if let Some(tuple) = instantiable_tuple_shape(store, source)? {
+        let elements = tuple.element_types().to_vec();
+        let infos = tuple.element_infos().to_vec();
+        let readonly = tuple.is_readonly();
+        let mut mapped = Vec::with_capacity(elements.len());
+        for &element in &elements {
+            mapped.push(instantiate_type_with_alias(
+                store,
+                element,
+                mapping,
+                array_targets,
+                None,
+                session,
+            )?);
+        }
+        if mapped == elements {
+            return Ok(source);
+        }
+        let mut request = CanonicalTupleTypeRequest::new(&mapped, &infos, readonly);
+        request.array_targets = array_targets;
+        return store
+            .create_canonical_tuple_type(request)
+            .map_err(Into::into);
+    }
     if let Some(array_targets) = array_targets
         && store
             .canonical_array_reference_with_targets(array_targets, source)?

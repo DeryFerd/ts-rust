@@ -14959,32 +14959,39 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
 
         let record = preflight_node(self.store, self.host, node)?;
-        let NodeData::TypeReferenceNode(reference) = &record.data else {
-            return Ok(false);
+        let children = match (&record.data, record.kind) {
+            // The normal tuple and array planners validate these nodes and their caches.
+            (NodeData::ArrayTypeNode(array), SyntaxKind::ArrayType) => {
+                std::slice::from_ref(&array.element_type)
+            }
+            (NodeData::TupleTypeNode(tuple), SyntaxKind::TupleType) => {
+                tuple.elements.nodes.as_slice()
+            }
+            (NodeData::TypeReferenceNode(reference), SyntaxKind::TypeReference) => {
+                let symbol = self.resolve_uncached_type_reference_symbol(node)?;
+                let Some(arguments) = reference.type_arguments.as_ref() else {
+                    return Ok(parameters.contains(&symbol));
+                };
+                let Some(owner) = self.store.symbol(symbol) else {
+                    return Ok(false);
+                };
+                if !owner
+                    .flags()
+                    .intersects(SymbolFlags::INTERFACE | SymbolFlags::TYPE_ALIAS)
+                    || owner.flags().contains(SymbolFlags::CLASS)
+                {
+                    return Ok(false);
+                }
+                arguments.nodes.as_slice()
+            }
+            _ => return Ok(false),
         };
-        if record.kind != SyntaxKind::TypeReference {
-            return Ok(false);
-        }
-        let symbol = self.resolve_uncached_type_reference_symbol(node)?;
-        let Some(arguments) = reference.type_arguments.as_ref() else {
-            return Ok(parameters.contains(&symbol));
-        };
-        let Some(owner) = self.store.symbol(symbol) else {
-            return Ok(false);
-        };
-        if !owner
-            .flags()
-            .intersects(SymbolFlags::INTERFACE | SymbolFlags::TYPE_ALIAS)
-            || owner.flags().contains(SymbolFlags::CLASS)
-        {
-            return Ok(false);
-        }
 
-        for argument in &arguments.nodes {
-            let argument = NodeRef::new(node.arena, node.file, *argument);
-            if preflight_node(self.store, self.host, argument)?.parent == Some(node.node)
+        for &child in children {
+            let child = NodeRef::new(node.arena, node.file, child);
+            if preflight_node(self.store, self.host, child)?.parent == Some(node.node)
                 && self.generic_union_constituent_references_owned_parameter_worker(
-                    argument, parameters, visited,
+                    child, parameters, visited,
                 )?
             {
                 return Ok(true);
