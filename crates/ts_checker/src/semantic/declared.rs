@@ -514,6 +514,7 @@ struct InterfacePlan {
     type_parameters: Vec<SemanticSymbolId>,
     outer_type_parameter_count: usize,
     has_this_type: bool,
+    ambient_class_heritage: Option<super::source_imports::SourceAmbientClassHeritage>,
 }
 
 #[derive(Debug)]
@@ -612,7 +613,13 @@ pub(super) fn cached_interface_type(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     symbol: SemanticSymbolId,
 ) -> Result<Option<TypeId>, DeclaredTypeError> {
-    cached_class_or_interface_type(store, symbol, ObjectFlags::INTERFACE)
+    let cached = cached_class_or_interface_type(store, symbol, ObjectFlags::INTERFACE)?;
+    if let Some(type_) = cached
+        && let Some(proof) = store.source_ambient_class_heritage(type_)
+    {
+        proof.validate_current(store, type_)?;
+    }
+    Ok(cached)
 }
 
 fn cached_class_or_interface_type(
@@ -1212,6 +1219,7 @@ fn preflight_interface_identity(
             type_parameters,
             outer_type_parameter_count,
             has_this_type: false,
+            ambient_class_heritage: None,
         },
         interface_declarations,
     ))
@@ -1318,15 +1326,17 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
         self.events
             .push(RecursiveInterfacePlanEvent::PublishShell(node));
 
+        let mut ambient_class_heritage = None;
         let has_this_type = if has_type_parameters {
             true
         } else {
-            self.interface_requires_this_type(symbol, &declarations)?
+            self.interface_requires_this_type(symbol, &declarations, &mut ambient_class_heritage)?
         };
         let RecursiveInterfacePlanNode::Interface(plan) = &mut self.nodes[node] else {
             unreachable!("interface planning inserted an interface node")
         };
         plan.has_this_type = has_this_type;
+        plan.ambient_class_heritage = ambient_class_heritage;
         self.states
             .insert(symbol, RecursiveInterfacePlanState::Complete(has_this_type));
         self.events.push(RecursiveInterfacePlanEvent::Finish(node));
@@ -1337,6 +1347,7 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
         &mut self,
         owner: SemanticSymbolId,
         declarations: &[NodeRef],
+        ambient_class_heritage: &mut Option<super::source_imports::SourceAmbientClassHeritage>,
     ) -> Result<bool, DeclaredTypeError> {
         for declaration in declarations {
             let declaration_node = preflight_node(self.store, self.host, *declaration)?;
@@ -1410,6 +1421,7 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
                         *declaration,
                         heritage,
                         expression,
+                        ambient_class_heritage,
                     )? {
                         return Ok(true);
                     }
@@ -1428,6 +1440,7 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
         declaration: NodeRef,
         heritage: NodeRef,
         expression: NodeRef,
+        ambient_class_heritage: &mut Option<super::source_imports::SourceAmbientClassHeritage>,
     ) -> Result<bool, DeclaredTypeError> {
         // Cold type imports need the same owner proof as direct heritage planning.
         let imported = if self.store.source_node_kind(expression) == Some(SyntaxKind::Identifier) {
@@ -1484,6 +1497,18 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
             ));
         }
         if !flags.contains(SymbolFlags::INTERFACE) {
+            if flags.contains(SymbolFlags::CLASS) {
+                *ambient_class_heritage =
+                    super::source_imports::plan_source_ambient_class_heritage(
+                        self.store,
+                        self.host,
+                        owner,
+                        declaration,
+                        heritage,
+                        expression,
+                        base_symbol,
+                    )?;
+            }
             return Ok(true);
         }
         self.plan_class_or_interface(base_symbol)
@@ -1606,6 +1631,11 @@ fn execute_recursive_interface_plan(
                     );
                 }
                 assert!(store.finish_declared_type_initialization(symbol));
+                if let RecursiveInterfacePlanNode::Interface(plan) = &mut plan.nodes[node]
+                    && let Some(proof) = plan.ambient_class_heritage.take()
+                {
+                    assert!(store.publish_source_ambient_class_heritage(declared_type, proof));
+                }
             }
         }
     }
@@ -1655,6 +1685,19 @@ pub(super) fn get_declared_class_interface_or_type_parameter(
             return Ok(Some(declared_type));
         }
         let plan = RecursiveInterfacePlanner::plan(store, host, symbol)?;
+        let ambient_class_count = plan
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(node, RecursiveInterfacePlanNode::Interface(plan)
+                    if plan.ambient_class_heritage.is_some())
+            })
+            .count();
+        if !store.try_reserve_source_ambient_class_heritages(ambient_class_count) {
+            return Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::LiteralTypeCapacity,
+            ));
+        }
         return Ok(Some(execute_recursive_interface_plan(store, plan)));
     }
     if flags.contains(SymbolFlags::TYPE_PARAMETER) {

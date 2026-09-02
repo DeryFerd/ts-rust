@@ -5224,6 +5224,16 @@ pub(super) fn authenticated_ambient_module_import_alias_target(
     reference: NodeRef,
     alias: SemanticSymbolId,
 ) -> Option<SemanticSymbolId> {
+    authenticated_ambient_module_import_alias_identity(store, host, reference, alias)
+        .map(|(target, _)| target)
+}
+
+fn authenticated_ambient_module_import_alias_identity(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    reference: NodeRef,
+    alias: SemanticSymbolId,
+) -> Option<(SemanticSymbolId, Option<SourceAmbientClassImportIdentity>)> {
     let record = store.symbol(alias)?;
     let [declaration] = record.declarations()? else {
         return None;
@@ -5499,10 +5509,392 @@ pub(super) fn authenticated_ambient_module_import_alias_target(
                             if target_record.name().as_utf8() == Some(identifier.text.as_str()))
                 })
         });
-    ((existing_type_target || class_target)
+    if !((existing_type_target || class_target)
         && store.get_parent_of_symbol(target) == Some(expected_owner)
         && cached_target.is_none_or(|cached| cached == target))
-    .then_some(target)
+    {
+        return None;
+    }
+    let class_identity = (|| {
+        if !class_target
+            || expected_owner != imported_module
+            || exports
+                .get(InternalSymbolName::ExportEquals.as_ref())
+                .is_some()
+        {
+            return None;
+        }
+        let [target_declaration] = target_record.declarations()? else {
+            return None;
+        };
+        if store
+            .source_direct_children(*target_declaration)?
+            .iter()
+            .any(|node| store.source_node_kind(*node) == Some(SyntaxKind::TypeParameter))
+        {
+            return None;
+        }
+        let namespace_locals = bound.locals(namespace)?;
+        let source_locals = bound.locals(bound.source_file())?;
+        let raw_module = store
+            .symbol_table(source_locals)?
+            .get(quoted_name.as_ref())?;
+        let module_exports = module_record.exports()?;
+        let raw_target = store
+            .symbol_table(module_exports)?
+            .get_source(&imported_name.text)?;
+        Some(SourceAmbientClassImportIdentity {
+            alias,
+            declaration,
+            name,
+            imported,
+            bindings,
+            clause,
+            import,
+            block,
+            namespace,
+            source: bound.source_file(),
+            module_specifier,
+            namespace_locals,
+            source_locals,
+            quoted_name,
+            raw_module,
+            module: imported_module,
+            module_exports,
+            raw_target,
+            target,
+            target_declaration: *target_declaration,
+        })
+    })();
+    Some((target, class_identity))
+}
+
+/// A direct ambient class export proved by the existing import reader.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceAmbientClassImportIdentity {
+    alias: SemanticSymbolId,
+    declaration: NodeRef,
+    name: NodeRef,
+    imported: NodeRef,
+    bindings: NodeRef,
+    clause: NodeRef,
+    import: NodeRef,
+    block: NodeRef,
+    namespace: NodeRef,
+    source: NodeRef,
+    module_specifier: NodeRef,
+    namespace_locals: SymbolTableId,
+    source_locals: SymbolTableId,
+    quoted_name: EscapedName,
+    raw_module: SemanticSymbolId,
+    module: SemanticSymbolId,
+    module_exports: SymbolTableId,
+    raw_target: SemanticSymbolId,
+    target: SemanticSymbolId,
+    target_declaration: NodeRef,
+}
+
+impl SourceAmbientClassImportIdentity {
+    fn is_current(&self, store: &CanonicalTypeMapperStore) -> bool {
+        let Some(alias) = store.symbol(self.alias) else {
+            return false;
+        };
+        let Some(module) = store.symbol(self.module) else {
+            return false;
+        };
+        let Some(target) = store.symbol(self.target) else {
+            return false;
+        };
+        if alias.flags() != SymbolFlags::ALIAS
+            || alias.check_flags() != CheckFlags::NONE
+            || alias.declarations() != Some(std::slice::from_ref(&self.declaration))
+            || alias.value_declaration().is_some()
+            || alias.members().is_some()
+            || alias.exports().is_some()
+            || alias.parent().is_some()
+            || alias.export_symbol().is_some()
+            || store.get_merged_symbol(self.alias) != Some(self.alias)
+            || !store.source_merged_symbol_declarations_match(self.alias)
+            || !store.source_declaration_belongs_to_symbol(self.declaration, self.alias)
+            || !store.source_is_script_declaration_file(self.source)
+            || store.source_identifier_text(self.name) != alias.name().as_utf8()
+            || store.source_identifier_text(self.imported) != target.name().as_utf8()
+            || store
+                .symbol_table(self.namespace_locals)
+                .and_then(|table| table.get(alias.name()))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(self.alias)
+            || store
+                .symbol_table(self.source_locals)
+                .and_then(|table| table.get(self.quoted_name.as_ref()))
+                != Some(self.raw_module)
+            || store.get_merged_symbol(self.raw_module) != Some(self.module)
+            || !store.source_raw_symbol_declarations_match(self.raw_module)
+            || !store.source_symbol_export_table_matches(self.raw_module)
+            || !store.source_merged_symbol_declarations_match(self.module)
+            || module.exports() != Some(self.module_exports)
+            || store.symbol_table(self.module_exports).is_none_or(|table| {
+                table.get(target.name()) != Some(self.raw_target)
+                    || table
+                        .get(InternalSymbolName::ExportEquals.as_ref())
+                        .is_some()
+            })
+            || store.get_merged_symbol(self.raw_target) != Some(self.target)
+            || target.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::CLASS
+            || target.check_flags() != CheckFlags::NONE
+            || target.export_symbol().is_some()
+            || target.declarations() != Some(std::slice::from_ref(&self.target_declaration))
+            || target.value_declaration() != Some(self.target_declaration)
+            || store.get_parent_of_symbol(self.target) != Some(self.module)
+            || !store.source_merged_symbol_declarations_match(self.target)
+            || !store.source_declaration_belongs_to_symbol(self.target_declaration, self.target)
+        {
+            return false;
+        }
+        for (node, kind, parent) in [
+            (self.name, SyntaxKind::Identifier, self.declaration),
+            (self.imported, SyntaxKind::Identifier, self.declaration),
+            (self.declaration, SyntaxKind::ImportSpecifier, self.bindings),
+            (self.bindings, SyntaxKind::NamedImports, self.clause),
+            (self.clause, SyntaxKind::ImportClause, self.import),
+            (
+                self.module_specifier,
+                SyntaxKind::StringLiteral,
+                self.import,
+            ),
+            (self.import, SyntaxKind::ImportDeclaration, self.block),
+            (self.block, SyntaxKind::ModuleBlock, self.namespace),
+            (self.namespace, SyntaxKind::ModuleDeclaration, self.source),
+        ] {
+            if !node.is_for(self.source.arena, self.source.file)
+                || store.source_node_kind(node) != Some(kind)
+                || store.source_node_parent(node) != Some(SourceNodeParent::Parent(parent))
+            {
+                return false;
+            }
+        }
+        if store.source_node_kind(self.source) != Some(SyntaxKind::SourceFile)
+            || store.source_node_parent(self.source) != Some(SourceNodeParent::Root)
+            || store.source_node_kind(self.target_declaration) != Some(SyntaxKind::ClassDeclaration)
+            || store
+                .source_direct_children(self.target_declaration)
+                .is_none_or(|children| {
+                    children.iter().any(|node| {
+                        store.source_node_kind(*node) == Some(SyntaxKind::TypeParameter)
+                    })
+                })
+            || store
+                .source_child_with_kind(self.target_declaration, SyntaxKind::Identifier)
+                .and_then(|name| store.source_identifier_text(name))
+                != target.name().as_utf8()
+        {
+            return false;
+        }
+        let Some(SourceNodeParent::Parent(block)) =
+            store.source_node_parent(self.target_declaration)
+        else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(namespace)) = store.source_node_parent(block) else {
+            return false;
+        };
+        if store.source_node_kind(block) != Some(SyntaxKind::ModuleBlock)
+            || store.source_node_kind(namespace) != Some(SyntaxKind::ModuleDeclaration)
+            || store.source_declaration_symbol(namespace) != Some(self.module)
+            || !store.source_declaration_belongs_to_symbol(namespace, self.module)
+        {
+            return false;
+        }
+        match store.alias_symbol_links(self.alias) {
+            None => true,
+            Some(links) if links == &super::AliasSymbolLinks::default() => true,
+            Some(links) => {
+                links.alias_target == AliasTargetState::Resolved(self.target)
+                    && links.immediate_target == Some(self.target)
+                    && links.type_only_declaration.is_none()
+            }
+        }
+    }
+}
+
+/// The class base that made a native global interface require a `this` type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceAmbientClassHeritage {
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    clause: NodeRef,
+    heritage: NodeRef,
+    expression: NodeRef,
+    binding: super::interface_heritage::SourceHeritageTypeBinding,
+    import: SourceAmbientClassImportIdentity,
+}
+
+impl SourceAmbientClassHeritage {
+    pub(super) const fn owner(&self) -> SemanticSymbolId {
+        self.owner
+    }
+    pub(super) const fn clause(&self) -> NodeRef {
+        self.clause
+    }
+
+    fn source_is_current(&self, store: &CanonicalTypeMapperStore) -> bool {
+        if !object_members::authenticated_nongeneric_global_interface_owner(store, self.owner)
+            || !self.import.is_current(store)
+            || self.binding.symbol() != self.import.alias
+            || !self
+                .binding
+                .validate_import_target(store, self.expression, self.import.target)
+        {
+            return false;
+        }
+        let Some(declarations) = store
+            .symbol(self.owner)
+            .and_then(|record| record.declarations())
+        else {
+            return false;
+        };
+        if !declarations
+            .iter()
+            .any(|node| store.source_is_default_library_declaration(*node))
+        {
+            return false;
+        }
+        let mut found = false;
+        for &declaration in declarations {
+            if store.source_node_kind(declaration) == Some(SyntaxKind::VariableDeclaration) {
+                continue;
+            }
+            match store.source_plain_interface_heritage(declaration) {
+                Some(super::store::PlainInterfaceHeritageFacts::NoHeritage) => {}
+                Some(super::store::PlainInterfaceHeritageFacts::Plain { clause, bases })
+                    if declaration == self.declaration
+                        && NodeRef::new(declaration.arena, declaration.file, *clause)
+                            == self.clause
+                        && bases.len() == 1
+                        && NodeRef::new(
+                            declaration.arena,
+                            declaration.file,
+                            bases[0].expression,
+                        ) == self.heritage
+                        && NodeRef::new(declaration.arena, declaration.file, bases[0].name)
+                            == self.expression
+                        && !found =>
+                {
+                    found = true;
+                }
+                _ => return false,
+            }
+        }
+        found
+            && store.source_node_parent(self.clause)
+                == Some(SourceNodeParent::Parent(self.declaration))
+            && store.source_node_parent(self.heritage)
+                == Some(SourceNodeParent::Parent(self.clause))
+            && store.source_node_parent(self.expression)
+                == Some(SourceNodeParent::Parent(self.heritage))
+            && store.source_direct_children(self.heritage).as_deref()
+                == Some(std::slice::from_ref(&self.expression))
+    }
+
+    fn validate_base_links(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        invalid: super::declared::DeclaredTypeUnavailable,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        if store.declared_type_initialization_in_progress(self.import.target)
+            || store
+                .type_node_links(self.clause)
+                .is_some_and(|links| links != &TypeNodeLinks::default())
+            || store
+                .symbol_node_links(self.clause)
+                .is_some_and(|links| links.resolved_symbol.is_some())
+        {
+            return Err(invalid.into());
+        }
+        let base = super::declared::cached_class_type(store, self.import.target)?;
+        for node in [self.heritage, self.expression] {
+            if store.type_node_links(node).is_some_and(|links| {
+                links.outer_type_parameters.is_some()
+                    || links.resolved_type.is_some_and(|type_| Some(type_) != base)
+            }) || store.symbol_node_links(node).is_some_and(|links| {
+                links.resolved_symbol.is_some_and(|symbol| {
+                    symbol != self.import.target && symbol != self.import.alias
+                })
+            }) {
+                return Err(invalid.into());
+            }
+        }
+        Ok(base)
+    }
+
+    pub(super) fn validate_current(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        type_: TypeId,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        let invalid = super::declared::DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+            symbol: self.owner,
+            declared_type: type_,
+        };
+        if !self.source_is_current(store)
+            || store.type_payload(type_).and_then(|record| record.symbol()) != Some(self.owner)
+            || super::reference_types::validate_nongeneric_interface_argument_origin(store, type_)
+                .is_err()
+        {
+            return Err(invalid.into());
+        }
+        self.validate_base_links(store, invalid)
+    }
+}
+
+/// Keeps one proved, nongeneric ambient class base without querying its members.
+pub(super) fn plan_source_ambient_class_heritage(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    heritage: NodeRef,
+    expression: NodeRef,
+    target: SemanticSymbolId,
+) -> Result<Option<SourceAmbientClassHeritage>, DeclaredTypeError> {
+    if store.source_node_kind(expression) != Some(SyntaxKind::Identifier)
+        || !object_members::authenticated_nongeneric_global_interface_owner(store, owner)
+    {
+        return Ok(None);
+    }
+    let Some(binding) =
+        super::interface_heritage::plan_source_heritage_type_binding(store, host, expression)?
+    else {
+        return Ok(None);
+    };
+    let Some((actual, Some(import))) = authenticated_ambient_module_import_alias_identity(
+        store,
+        host,
+        expression,
+        binding.symbol(),
+    ) else {
+        return Ok(None);
+    };
+    let Some(SourceNodeParent::Parent(clause)) = store.source_node_parent(heritage) else {
+        return Ok(None);
+    };
+    let proof = SourceAmbientClassHeritage {
+        owner,
+        declaration,
+        clause,
+        heritage,
+        expression,
+        binding,
+        import,
+    };
+    if actual != target || !proof.source_is_current(store) {
+        return Ok(None);
+    }
+    proof.validate_base_links(
+        store,
+        super::declared::DeclaredTypeUnavailable::InvalidInterfaceDeclaration(declaration),
+    )?;
+    Ok(Some(proof))
 }
 
 /// Retains the named import selected by the real module-resolution host.

@@ -81,7 +81,7 @@ use super::{
     },
     source_flow::SourceCapturedLocal,
     source_imports::{
-        SourceFileNamespaceIdentity, SyntheticNamespacePropertyOrigin,
+        SourceAmbientClassHeritage, SourceFileNamespaceIdentity, SyntheticNamespacePropertyOrigin,
         SyntheticNamespacePropertyState,
     },
     source_meta::ImportMetaExpressionIdentity,
@@ -870,6 +870,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     declared_call_set_provenance: HashSet<TypeId>,
     declared_call_set_types_by_signature: HashMap<SignatureId, TypeId>,
     direct_interface_heritage_provenance: HashMap<TypeId, DirectInterfaceHeritageState>,
+    source_ambient_class_heritages: HashMap<TypeId, SourceAmbientClassHeritage>,
     direct_class_heritage_provenance: HashMap<TypeId, DirectClassHeritageProvenance>,
     constructor_annotation_bindings: HashMap<NodeRef, SemanticSymbolId>,
     declared_value_provenance: HashMap<SemanticSymbolId, DeclaredValueProvenance>,
@@ -1102,6 +1103,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             declared_call_set_provenance: HashSet::new(),
             declared_call_set_types_by_signature: HashMap::new(),
             direct_interface_heritage_provenance: HashMap::new(),
+            source_ambient_class_heritages: HashMap::new(),
             direct_class_heritage_provenance: HashMap::new(),
             constructor_annotation_bindings: HashMap::new(),
             declared_value_provenance: HashMap::new(),
@@ -13205,6 +13207,21 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             DirectInterfaceHeritageState::Complete(provenance) => provenance.source.as_ref(),
         }
     }
+
+    /// The declared query owns this proof. Reads must recheck its source and links.
+    pub(super) fn source_ambient_class_heritage(
+        &self,
+        type_: TypeId,
+    ) -> Option<&SourceAmbientClassHeritage> {
+        self.observe_relation_type_read(type_);
+        self.source_ambient_class_heritages.get(&type_)
+    }
+
+    pub(super) fn try_reserve_source_ambient_class_heritages(&mut self, additional: usize) -> bool {
+        self.source_ambient_class_heritages
+            .try_reserve(additional)
+            .is_ok()
+    }
 }
 
 impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
@@ -14025,6 +14042,25 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         );
         assert_eq!(self.insert_symbol(members, name, late), Some(None));
         Some(late)
+    }
+
+    /// Retains the base proof after the canonical interface identity is initialized.
+    pub(super) fn publish_source_ambient_class_heritage(
+        &mut self,
+        type_: TypeId,
+        proof: SourceAmbientClassHeritage,
+    ) -> bool {
+        if proof.validate_current(self, type_).is_err() {
+            return false;
+        }
+        if let Some(previous) = self.source_ambient_class_heritages.get(&type_) {
+            return previous == &proof;
+        }
+        self.source_ambient_class_heritages.insert(type_, proof);
+        if self.relation_type_is_observable(type_) {
+            self.mark_relation_inputs_dirty();
+        }
+        true
     }
 
     /// Publishes only a host-proved source header, without member or result flags.

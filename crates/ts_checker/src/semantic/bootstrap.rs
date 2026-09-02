@@ -2997,6 +2997,26 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     return Ok(());
                 }
                 if let TypeData::Interface(interface) = record.data()
+                    && let Some(edges) = self.source_ambient_class_interface_edges(
+                        type_,
+                        record,
+                        interface,
+                        array_validation,
+                        visited,
+                        allowed_pending,
+                    )?
+                {
+                    for edge in edges {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            visited,
+                            allowed_pending,
+                        )?;
+                    }
+                    return Ok(());
+                }
+                if let TypeData::Interface(interface) = record.data()
                     && let Some(edges) = self.native_global_heritage_interface_edges(
                         type_,
                         record,
@@ -4118,6 +4138,70 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             )
             .ok_or_else(invalid)?,
         );
+        Ok(Some(edges))
+    }
+
+    /// A retained class base permits identity use, not class member resolution.
+    fn source_ambient_class_interface_edges(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+        interface: &InterfaceTypeData,
+        array_validation: UnionArrayValidation<'_>,
+        array_visited: &mut CachedArrayWalk<'_>,
+        allowed_pending: &HashSet<TypeId>,
+    ) -> Result<Option<Vec<TypeId>>, LiteralTypeCacheError> {
+        let Some(proof) = self.source_ambient_class_heritage(type_) else {
+            return Ok(None);
+        };
+        let invalid = || LiteralTypeCacheError::InvalidCachedUnion(type_);
+        let base = proof.validate_current(self, type_).map_err(|_| invalid())?;
+        let flags = record.object_flags()
+            & !(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES);
+        if flags != ObjectFlags::INTERFACE | ObjectFlags::REFERENCE
+            || self.direct_interface_heritage_provenance(type_).is_some()
+            || self.source_interface_heritage_header(type_).is_some()
+            || interface.base_types_resolved
+            || interface.resolved_base_types.is_some()
+            || interface.resolved_base_constructor_type.is_some()
+            || interface.reference.object.structured != StructuredTypeData::default()
+            || interface.declared_members_resolved
+            || interface.declared_members.is_some()
+            || interface.declared_call_signatures.is_some()
+            || interface.declared_construct_signatures.is_some()
+            || interface.declared_index_infos.is_some()
+            || !self.native_global_interface_member_metadata_is_exact(proof.owner())
+        {
+            return Err(invalid());
+        }
+        let declarations = self
+            .native_global_source_declarations(proof.owner())
+            .ok_or_else(invalid)?;
+        let heritage = [proof.clause()];
+        for edge in self
+            .source_interface_cached_member_edges(declarations, &heritage)
+            .ok_or_else(invalid)?
+        {
+            self.validate_cached_array_capability_worker(
+                edge,
+                array_validation,
+                array_visited,
+                allowed_pending,
+            )?;
+        }
+        let mut edges = self
+            .lazy_default_library_interface_member_edges_worker(
+                proof.owner(),
+                array_validation.targets(),
+                None,
+                &heritage,
+                allowed_pending,
+            )
+            .ok_or_else(invalid)?;
+        edges.extend(base);
+        edges.extend(interface.this_type);
+        edges.extend(interface.reference.object.target);
         Ok(Some(edges))
     }
 
@@ -5845,6 +5929,28 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 *stage = "union_constituent.interface_source_identity";
                 if let Some(edges) = self.source_interface_condition_identity_edges(
                     type_,
+                    array_validation,
+                    array_visited,
+                    allowed_pending,
+                )? {
+                    if !visiting.insert(type_) {
+                        return Ok(());
+                    }
+                    for edge in edges {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            array_visited,
+                            allowed_pending,
+                        )?;
+                    }
+                    return Ok(());
+                }
+                *stage = "union_constituent.interface_ambient_class_identity";
+                if let Some(edges) = self.source_ambient_class_interface_edges(
+                    type_,
+                    record,
+                    interface,
                     array_validation,
                     array_visited,
                     allowed_pending,

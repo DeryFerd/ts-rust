@@ -173,6 +173,38 @@ struct SourceInterfaceHeritageResolution {
     direct_reads: Vec<SourceInterfaceHeritageTableRead>,
 }
 
+/// The original lexical binding, before an import target is followed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceHeritageTypeBinding {
+    symbol: SemanticSymbolId,
+    resolution: SourceInterfaceHeritageResolution,
+}
+
+impl SourceHeritageTypeBinding {
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        self.symbol
+    }
+
+    pub(super) fn validate_import_target(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        expression: NodeRef,
+        target: SemanticSymbolId,
+    ) -> bool {
+        store
+            .symbol(self.symbol)
+            .is_some_and(|record| record.flags() == SymbolFlags::ALIAS)
+            && validate_source_heritage_identifier_resolution(
+                store,
+                &self.resolution,
+                expression,
+                self.symbol,
+                target,
+                true,
+            )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceInterfaceHeritageTableRead {
     table: SymbolTableId,
@@ -948,6 +980,17 @@ pub(super) fn resolve_source_heritage_type_binding(
     resolved.map_err(DeclaredTypeError::from)
 }
 
+/// Retains the same source lookup for a separately authenticated import target.
+pub(super) fn plan_source_heritage_type_binding(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+) -> Result<Option<SourceHeritageTypeBinding>, DeclaredTypeError> {
+    Ok(try_resolve_source_heritage_base(store, host, expression)?.map(
+        |(symbol, resolution)| SourceHeritageTypeBinding { symbol, resolution },
+    ))
+}
+
 /// Proves the local namespace lookup before a caller considers a global entry.
 /// An alias binding still needs the existing import resolver's target proof.
 pub(super) fn resolve_source_local_namespace_binding(
@@ -1275,12 +1318,29 @@ fn validate_source_heritage_resolution(
         .import
         .as_ref()
         .map_or(base.symbol, |import| import.alias_symbol());
-    let reads = &base.resolution;
+    validate_source_heritage_identifier_resolution(
+        store,
+        &base.resolution,
+        base.expression,
+        binding,
+        base.symbol,
+        base.import.is_some(),
+    )
+}
+
+fn validate_source_heritage_identifier_resolution(
+    store: &CanonicalTypeMapperStore,
+    reads: &SourceInterfaceHeritageResolution,
+    expression: NodeRef,
+    binding: SemanticSymbolId,
+    target: SemanticSymbolId,
+    imported: bool,
+) -> bool {
     if reads.globals
         != store
             .intrinsic_bootstrap()
             .map(|bootstrap| bootstrap.globals)
-        || reads.scopes.first().map(|(node, _)| *node) != Some(base.expression)
+        || reads.scopes.first().map(|(node, _)| *node) != Some(expression)
         || reads.scopes.is_empty()
     {
         return false;
@@ -1364,7 +1424,7 @@ fn validate_source_heritage_resolution(
         if !valid_entry(&read.entry)
             // Imported aliases need the import resolver's own source receipt.
             || read.entry.flags.is_some_and(|flags| flags.contains(SymbolFlags::ALIAS))
-                && (base.import.is_none() || read.entry.canonical_entry != Some(binding))
+                && (!imported || read.entry.canonical_entry != Some(binding))
         {
             return false;
         }
@@ -1384,11 +1444,11 @@ fn validate_source_heritage_resolution(
         .iter()
         .any(|read| read.result == Some(binding))
         && store
-            .symbol_node_links(base.expression)
+            .symbol_node_links(expression)
             .is_none_or(|links| {
                 links
                     .resolved_symbol
-                    .is_none_or(|symbol| symbol == base.symbol || symbol == binding)
+                    .is_none_or(|symbol| symbol == target || symbol == binding)
             })
 }
 
