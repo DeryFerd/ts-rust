@@ -187,12 +187,13 @@ fn plan_annotated_member(
                 owner.exports().ok_or_else(reject)?,
                 true,
             )?;
-            if !property.optional
+            if !property.optional && !property.definite
                 || property.initializer_node.is_some()
-                || !matches!(
-                    preflight_node(store, host, property.type_node)?.data,
-                    NodeData::TypeReferenceNode(_)
-                )
+                || !property.definite
+                    && !matches!(
+                        preflight_node(store, host, property.type_node)?.data,
+                        NodeData::TypeReferenceNode(_)
+                    )
             {
                 return Err(reject());
             }
