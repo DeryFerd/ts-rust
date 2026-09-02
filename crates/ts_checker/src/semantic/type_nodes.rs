@@ -51781,12 +51781,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     )
                     .map_err(|error| match error {
                         super::conditional_types::ConditionalTypeError::Declared(error) => error,
-                        _ => type_node_unavailable(
-                            TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
-                                alias: symbol,
-                                declared_type,
-                            },
-                        ),
+                        error => {
+                            trace_alias_instantiation_failure(
+                                self.store,
+                                "source_conditional_instantiation",
+                                symbol,
+                                Some(declared_type),
+                                &error,
+                            );
+                            type_node_unavailable(
+                                TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                                    alias: symbol,
+                                    declared_type,
+                                },
+                            )
+                        }
                     });
                 self.global_this_members = source.context.members;
                 self.completed_source_conditionals = source.context.completed;
