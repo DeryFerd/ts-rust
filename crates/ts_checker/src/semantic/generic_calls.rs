@@ -2132,10 +2132,20 @@ fn fixed_contextual_declared_call_owner(
     signature: SignatureId,
 ) -> Option<TypeId> {
     let record = store.signature(signature)?;
-    (store.source_node_kind(record.declaration()?) == Some(SyntaxKind::CallSignature)
+    let declaration = record.declaration()?;
+    (store.source_node_kind(declaration) == Some(SyntaxKind::CallSignature)
         && !record.type_parameters().is_empty()
         && record.target().is_none()
-        && record.mapper().is_none())
+        && record.mapper().is_none()
+        // Written constraints or defaults use ordinary call validation.
+        // A missing or malformed formal view keeps the contextual checks.
+        && !declared_interface_call_type_parameter_view(store, record, declaration).is_some_and(
+            |parameters| {
+                parameters.iter().any(|parameter| {
+                    parameter.constraint.is_some() || parameter.default_type.is_some()
+                })
+            },
+        ))
     .then(|| store.declared_call_set_type_for_signature(signature))
     .flatten()
 }

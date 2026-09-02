@@ -3000,7 +3000,7 @@ pub(super) fn validate_generic_interface_callable(
     Some(validated.unwrap_or(StoredCallableSetValidation::Malformed { family }))
 }
 
-/// Finds an exact declared or copied call in a generic interface's complete call set.
+/// Finds an exact declared or copied call in an interface's complete call set.
 pub(super) fn generic_interface_call_signature_return(
     store: &CanonicalTypeMapperStore,
     signature: SignatureId,
@@ -3009,8 +3009,21 @@ pub(super) fn generic_interface_call_signature_return(
     let Some(owner) = store.declared_call_set_type_for_signature(signature) else {
         return Ok(None);
     };
-    let Some(validation) = validate_generic_interface_callable(store, owner, array_targets) else {
-        return Ok(None);
+    let validation = match validate_generic_interface_callable(store, owner, array_targets) {
+        Some(validation) => validation,
+        None if store.type_payload(owner).is_some_and(|record| {
+            matches!(record.data(), TypeData::Interface(_))
+                && !record.object_flags().contains(ObjectFlags::REFERENCE)
+        }) =>
+        {
+            // A generic call can belong to a nongeneric interface.
+            super::callable_sets::validate_stored_callable_set_with_array_targets(
+                store,
+                owner,
+                array_targets,
+            )
+        }
+        None => return Ok(None),
     };
     let invalid = || GenericInterfaceMemberError::InvalidCachedMembers(owner);
     let StoredCallableSetValidation::Valid { projection, .. } = validation else {
