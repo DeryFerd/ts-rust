@@ -46,6 +46,7 @@ use super::{
         class_member_visibility, source_constructor_base_property_is_exact,
         validate_class_heritage_members, validated_class_derives_from,
     },
+    conditional_types::ConditionalTypeError,
     declared::{DeclaredTypeError, cached_ordinary_type_parameter_owner},
     derived_types::DerivedObjectLiteralValidation,
     enums,
@@ -203,6 +204,94 @@ pub enum RelationUnavailable {
         target: TypeId,
         relation: RelationKind,
     },
+}
+
+#[track_caller]
+fn structural_relation_unavailable(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    target: TypeId,
+    relation: RelationKind,
+) -> RelationUnavailable {
+    let site = std::panic::Location::caller();
+    let observation_active = store.relation_read_observation_is_active();
+    super::source::observe_call_failure_detail(
+        "structural_relation",
+        format_args!(
+            "site={}:{} source={source:?} target={target:?} relation={relation:?} observation_active={observation_active}",
+            site.line(),
+            site.column(),
+        ),
+    );
+    if !observation_active {
+        for (side, type_) in [("source", source), ("target", target)] {
+            let Some(record) = store.type_payload(type_) else {
+                continue;
+            };
+            let symbol = record.symbol().and_then(|symbol| store.symbol(symbol));
+            let declaration = symbol
+                .and_then(|symbol| symbol.declarations())
+                .and_then(|declarations| declarations.first())
+                .map(|node| {
+                    (
+                        *node,
+                        store.source_node_kind(*node),
+                        store.source_node_start(*node),
+                    )
+                });
+            let signatures = record
+                .data()
+                .structured()
+                .and_then(|data| data.signatures.as_deref());
+            let first_signature = signatures
+                .and_then(|signatures| signatures.first())
+                .and_then(|id| {
+                    let signature = store.signature(*id)?;
+                    Some((
+                        *id,
+                        signature.declaration(),
+                        signature.this_parameter(),
+                        signature.parameters(),
+                        signature.type_parameters(),
+                        signature.resolved_return_type(),
+                        signature.target(),
+                        signature.mapper(),
+                    ))
+                });
+            super::source::observe_call_failure_detail(
+                "structural_relation_type",
+                format_args!(
+                    "side={side} type={type_:?} kind={:?} flags={} object_flags={} symbol={:?} name={:?} declaration={declaration:?} signatures={signatures:?} first_signature={first_signature:?}",
+                    record.data().kind(),
+                    record.flags().bits(),
+                    record.object_flags().bits(),
+                    record.symbol(),
+                    symbol.map(|symbol| symbol.name()),
+                ),
+            );
+            if let TypeData::Conditional(conditional) = record.data() {
+                super::source::observe_call_failure_detail(
+                    "structural_relation_conditional",
+                    format_args!(
+                        "side={side} type={type_:?} root={:?} check={:?} extends={:?} true={:?} false={:?} inferred_true={:?} mapper={:?} combined_mapper={:?}",
+                        conditional.root,
+                        conditional.check_type,
+                        conditional.extends_type,
+                        conditional.resolved_true_type,
+                        conditional.resolved_false_type,
+                        conditional.resolved_inferred_true_type,
+                        conditional.mapper,
+                        conditional.combined_mapper,
+                    ),
+                );
+            }
+        }
+    }
+    RelationUnavailable::StructuralRelation {
+        source,
+        target,
+        relation,
+    }
 }
 
 impl std::fmt::Display for RelationUnavailable {
@@ -1325,6 +1414,18 @@ fn authenticated_scalar_source_parameter_nonmatch(
     let Some(symbol) = cached_ordinary_type_parameter_owner(store, parameter) else {
         return Ok(false);
     };
+    if super::classes::source_class_unconstrained_type_parameter(store, parameter) {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?;
+        if scalar == bootstrap.missing_type || scalar == bootstrap.optional_type {
+            return Ok(false);
+        }
+        store
+            .validate_union_constituent(scalar)
+            .map_err(|error| union_validation_unavailable(scalar, error))?;
+        return Ok(true);
+    }
     let Some([declaration]) = store
         .symbol(symbol)
         .and_then(ts_binder::semantic::Symbol::declarations)
@@ -1973,11 +2074,12 @@ impl<'store> RelaterSession<'store> {
                 .as_mut()
                 .limit_event_occurred_since(context.limit_mark)
         }) {
-            return Err(RelationUnavailable::StructuralRelation {
+            return Err(structural_relation_unavailable(
+                self.store,
                 source,
                 target,
-                relation: self.relation,
-            });
+                self.relation,
+            ));
         }
         if result != Ternary::False {
             validate_global_this_relation_inputs(
@@ -2489,19 +2591,21 @@ impl<'store> RelaterSession<'store> {
             || members.exact_callable
             || !members.call_signatures.is_empty()
         {
-            return Err(RelationUnavailable::StructuralRelation {
+            return Err(structural_relation_unavailable(
+                self.store,
                 source,
                 target,
-                relation: self.relation,
-            });
+                self.relation,
+            ));
         }
         if object_to_array {
             if !members.properties.is_empty() && !members.index_infos.is_empty() {
-                return Err(RelationUnavailable::StructuralRelation {
+                return Err(structural_relation_unavailable(
+                    self.store,
                     source,
                     target,
-                    relation: self.relation,
-                });
+                    self.relation,
+                ));
             }
             let names = self.canonical_array_source_property_names(object, &members)?;
             if self.canonical_array_target_missing_required_property(array_target, &names)? {
@@ -2523,11 +2627,7 @@ impl<'store> RelaterSession<'store> {
             return Err(if members.properties.is_empty() {
                 RelationUnavailable::UnsupportedStructuredType(array_target)
             } else {
-                RelationUnavailable::StructuralRelation {
-                    source,
-                    target,
-                    relation: self.relation,
-                }
+                structural_relation_unavailable(self.store, source, target, self.relation)
             });
         }
         if !members.properties.is_empty() {
@@ -3332,11 +3432,12 @@ impl<'store> RelaterSession<'store> {
             if !source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
                 return Ok(Ternary::False);
             }
-            return Err(RelationUnavailable::StructuralRelation {
+            return Err(structural_relation_unavailable(
+                self.store,
                 source,
                 target,
-                relation: self.relation,
-            });
+                self.relation,
+            ));
         }
 
         if source_flags.intersects(TypeFlags::DEFINITELY_NON_NULLABLE)
@@ -3604,11 +3705,12 @@ impl<'store> RelaterSession<'store> {
                 );
             }
 
-            return Err(RelationUnavailable::StructuralRelation {
+            return Err(structural_relation_unavailable(
+                self.store,
                 source,
                 target,
-                relation: self.relation,
-            });
+                self.relation,
+            ));
         }
         Ok(Ternary::False)
     }
@@ -4110,11 +4212,12 @@ impl<'store> RelaterSession<'store> {
             || !source_is_object
             || !target_is_object
         {
-            return Err(RelationUnavailable::StructuralRelation {
+            return Err(structural_relation_unavailable(
+                self.store,
                 source,
                 target,
-                relation: self.relation,
-            });
+                self.relation,
+            ));
         }
         if canonical_fixed_tuple_pair(self.store, source, target)?.is_some() {
             return self.fixed_tuple_types_related_to(source, target, intersection_state);
@@ -4527,14 +4630,10 @@ impl<'store> RelaterSession<'store> {
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
         let comparisons = {
-            let (source_shape, target_shape) = canonical_fixed_tuple_pair(
-                self.store, source, target,
-            )?
-            .ok_or(RelationUnavailable::StructuralRelation {
-                source,
-                target,
-                relation: self.relation,
-            })?;
+            let (source_shape, target_shape) =
+                canonical_fixed_tuple_pair(self.store, source, target)?.ok_or_else(|| {
+                    structural_relation_unavailable(self.store, source, target, self.relation)
+                })?;
             let source_arity = source_shape.fixed_length();
             let target_arity = target_shape.fixed_length();
 
@@ -4729,11 +4828,12 @@ impl<'store> RelaterSession<'store> {
             }
             return Ok(Ternary::False);
         }
-        Err(RelationUnavailable::StructuralRelation {
+        Err(structural_relation_unavailable(
+            self.store,
             source,
             target,
-            relation: self.relation,
-        })
+            self.relation,
+        ))
     }
 
     fn union_origin_contains_aliased_source(
@@ -4990,11 +5090,12 @@ impl<'store> RelaterSession<'store> {
         if flags.intersects(TypeFlags::INTERSECTION) {
             return Ok(self.intersection_projection(type_)?.types);
         }
-        Err(RelationUnavailable::StructuralRelation {
-            source: type_,
-            target: type_,
-            relation: self.relation,
-        })
+        Err(structural_relation_unavailable(
+            self.store,
+            type_,
+            type_,
+            self.relation,
+        ))
     }
 
     fn weak_target_lacks_common_properties(
@@ -6688,9 +6789,54 @@ impl<'store> RelaterSession<'store> {
             self.global_types.map(|globals| globals.array_targets),
             self.instantiation_session.as_mut(),
         )
+        .inspect_err(|error| {
+            super::source::observe_call_failure_detail(
+                "structural_relation_generic_source",
+                format_args!(
+                    "source={:?} target={:?} original={error:?}",
+                    source.owner, target.owner
+                ),
+            );
+        })
         .map(Some)
         .map_err(|error| match error {
             GenericCallVectorError::Relation(error) => error,
+            GenericCallVectorError::Conditional(error) => match error {
+                ConditionalTypeError::Relation(error) => error,
+                ConditionalTypeError::MissingBootstrap => RelationUnavailable::MissingBootstrap,
+                ConditionalTypeError::Capacity => {
+                    RelationUnavailable::UnionValidationCapacity(source.owner)
+                }
+                ConditionalTypeError::InvalidNode(_)
+                | ConditionalTypeError::InvalidType(_)
+                | ConditionalTypeError::InvalidTypeParameter(_)
+                | ConditionalTypeError::DuplicateTypeParameter(_)
+                | ConditionalTypeError::InvalidAlias(_)
+                | ConditionalTypeError::InvalidAliasSymbol(_)
+                | ConditionalTypeError::InvalidRoot(_)
+                | ConditionalTypeError::InvalidConditional(_)
+                | ConditionalTypeError::InvalidMapper(_)
+                | ConditionalTypeError::InvalidInstantiationArity { .. }
+                | ConditionalTypeError::InvalidInstantiationCache(_)
+                | ConditionalTypeError::InvalidTypeNodeCache(_)
+                | ConditionalTypeError::InvalidConditionalResolution(_)
+                | ConditionalTypeError::InvalidSignature(_) => {
+                    RelationUnavailable::MalformedFunctionType(source.owner)
+                }
+                ConditionalTypeError::UnsupportedInference { .. }
+                | ConditionalTypeError::TailRecursionLimit { .. }
+                | ConditionalTypeError::Instantiation(_)
+                | ConditionalTypeError::Declared(_)
+                | ConditionalTypeError::Constraint(_)
+                | ConditionalTypeError::Template(_)
+                | ConditionalTypeError::Tuple(_)
+                | ConditionalTypeError::Union(_) => structural_relation_unavailable(
+                    self.store,
+                    source.owner,
+                    target.owner,
+                    self.relation,
+                ),
+            },
             GenericCallVectorError::Unsupported(
                 GenericCallVectorUnsupported::UnresolvedReturnType(signature),
             ) => RelationUnavailable::UnresolvedSignatureReturn(signature),
@@ -6709,11 +6855,12 @@ impl<'store> RelaterSession<'store> {
             }
             GenericCallVectorError::Unsupported(_)
             | GenericCallVectorError::Inference(_)
-            | GenericCallVectorError::Instantiation(_) => RelationUnavailable::StructuralRelation {
-                source: source.owner,
-                target: target.owner,
-                relation: self.relation,
-            },
+            | GenericCallVectorError::Instantiation(_) => structural_relation_unavailable(
+                self.store,
+                source.owner,
+                target.owner,
+                self.relation,
+            ),
         })
     }
 
@@ -7322,10 +7469,13 @@ impl<'store> RelaterSession<'store> {
                             IntersectionState::NONE,
                             Some(&mut constituent),
                         )?;
-                        let unavailable = || RelationUnavailable::StructuralRelation {
-                            source: *source_type,
-                            target: *target_type,
-                            relation: self.relation,
+                        let unavailable = || {
+                            structural_relation_unavailable(
+                                self.store,
+                                *source_type,
+                                *target_type,
+                                self.relation,
+                            )
                         };
                         if traced != Ternary::False {
                             return Err(unavailable());
@@ -8442,11 +8592,12 @@ impl<'store> RelaterSession<'store> {
             self.ensure_supported_object_kind(target, self.allows_fresh_object_target())?;
             return Ok(());
         }
-        Err(RelationUnavailable::StructuralRelation {
+        Err(structural_relation_unavailable(
+            self.store,
             source,
             target,
-            relation: self.relation,
-        })
+            self.relation,
+        ))
     }
 
     /// Admits branded function objects before any relation-cache read.
@@ -11406,11 +11557,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         loop {
             if session.limit_event_occurred_since(limit_mark) {
                 return Err(SourceRelationError::Relation(
-                    RelationUnavailable::StructuralRelation {
-                        source,
-                        target,
-                        relation,
-                    },
+                    structural_relation_unavailable(self, source, target, relation),
                 ));
             }
             for proof in &member_values {
@@ -12324,11 +12471,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     session.finish(source, target, result)
                 };
             }
-            return Err(RelationUnavailable::StructuralRelation {
-                source,
-                target,
-                relation,
-            });
+            return Err(structural_relation_unavailable(
+                self, source, target, relation,
+            ));
         }
         Ok(false)
     }

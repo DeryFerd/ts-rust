@@ -49,7 +49,7 @@ use super::{
     },
     relation::RelationKind,
     signatures::TypePredicateKind,
-    source::CheckedClassPropertyAssignment,
+    source::{CheckedClassPropertyAssignment, PlannedExpressionKind, PlannedIdentifierRead},
     source_calls::{
         CheckedSourceCall, SourceCallPlan, plan_direct_source_call_syntax,
         resolve_source_call_effects_signature,
@@ -4601,7 +4601,7 @@ struct CompletedClassPropertyPredicate {
     argument_type: TypeId,
     callee: NodeRef,
     callee_type: TypeId,
-    callee_symbol: SymbolNodeLinks,
+    callee_read: PlannedIdentifierRead,
     signature: SignatureId,
     predicate: TypePredicateId,
     predicate_type: TypeId,
@@ -4878,6 +4878,9 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         {
             return Err(invalid().into());
         }
+        let PlannedExpressionKind::Identifier(callee_read) = &plan.callee.kind else {
+            return Err(invalid().into());
+        };
         let (source, edges) = validate_class_property_predicate_condition(
             store,
             host,
@@ -4930,10 +4933,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                 .ok_or_else(invalid)?,
             callee: plan.callee.node,
             callee_type,
-            callee_symbol: store
-                .symbol_node_links(plan.callee.node)
-                .cloned()
-                .ok_or_else(invalid)?,
+            callee_read: *callee_read,
             signature,
             predicate,
             predicate_type,
@@ -5000,7 +5000,14 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                     resolved_type: Some(completed.callee_type),
                     ..TypeNodeLinks::default()
                 })
-            || store.symbol_node_links(completed.callee) != Some(&completed.callee_symbol)
+            || own_class_flow_reference_symbol(store, host, self.flow.bound, completed.callee)
+                .map_err(|_| invalid())?
+                != Some(completed.callee_read.value_symbol)
+            // Source checking publishes identifier links after it checks class bodies.
+            || store
+                .symbol_node_links(completed.callee)
+                .and_then(|links| links.resolved_symbol)
+                .is_some_and(|symbol| symbol != completed.callee_read.resolved_symbol)
             || store.type_node_links(condition.access)
                 != Some(&TypeNodeLinks {
                     resolved_type: Some(completed.argument_type),

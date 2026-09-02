@@ -6891,6 +6891,7 @@ pub(super) fn declared_signature_parameter_is_rest(
                     | SyntaxKind::TupleType
                     | SyntaxKind::UnionType
                     | SyntaxKind::InferType
+                    | SyntaxKind::NeverKeyword
             )
         )
     {
@@ -9655,6 +9656,7 @@ fn authenticated_default_library_builtin_symbol_method(
                 parameter,
                 &method.parameters,
                 false,
+                &[],
             ) else {
                 return false;
             };
@@ -14862,6 +14864,40 @@ fn plan_interface_accessor(
     })
 }
 
+// Keep the original method rejection and its exact source guard together.
+fn interface_method_plan_unsupported(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    method: NodeRef,
+    checked_node: NodeRef,
+    kind: SyntaxKind,
+    site: u32,
+) -> PropertyObjectError {
+    let error = PropertyObjectError::UnsupportedMember { node: method, kind };
+    if kind == SyntaxKind::MethodSignature && !store.relation_read_observation_is_active() {
+        let method_record = host.node(method);
+        let method_name = method_record.and_then(|record| match &record.data {
+            NodeData::MethodSignatureDeclaration(data) => host
+                .node(NodeRef::new(method.arena, method.file, data.name))
+                .and_then(|name| match &name.data {
+                    NodeData::Identifier(identifier) => Some(identifier.text.as_str()),
+                    _ => None,
+                }),
+            _ => None,
+        });
+        let checked_record = host.node(checked_node);
+        super::source::observe_call_failure_detail(
+            "interface_method_plan",
+            format_args!(
+                "site={site} method={method:?} name={method_name:?} method_metadata={:?} checked_node={checked_node:?} checked_metadata={:?} raw_error={error:?}",
+                method_record.map(|record| (record.kind, record.range, record.parent)),
+                checked_record.map(|record| (record.kind, record.range, record.parent)),
+            ),
+        );
+    }
+    error
+}
+
 pub(super) fn plan_interface_method(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -14869,13 +14905,19 @@ pub(super) fn plan_interface_method(
     owner_symbol: SemanticSymbolId,
     declaration: NodeRef,
 ) -> Result<PlannedInterfaceMethod, PropertyObjectError> {
-    let unsupported = || PropertyObjectError::UnsupportedMember {
-        node: declaration,
-        kind: SyntaxKind::MethodSignature,
+    let unsupported = |site| {
+        interface_method_plan_unsupported(
+            store,
+            host,
+            declaration,
+            declaration,
+            SyntaxKind::MethodSignature,
+            site,
+        )
     };
-    let record = preflight_node(store, host, declaration).map_err(|_| unsupported())?;
+    let record = preflight_node(store, host, declaration).map_err(|_| unsupported(line!()))?;
     let NodeData::MethodSignatureDeclaration(method) = &record.data else {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     };
     let optional = method.postfix_token.is_some();
     if record.kind != SyntaxKind::MethodSignature
@@ -14889,11 +14931,11 @@ pub(super) fn plan_interface_method(
         || method.parameters.range.start < record.range.start
         || method.parameters.range.end > record.range.end
     {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     }
 
     let name = NodeRef::new(declaration.arena, declaration.file, method.name);
-    let name_record = preflight_node(store, host, name).map_err(|_| unsupported())?;
+    let name_record = preflight_node(store, host, name).map_err(|_| unsupported(line!()))?;
     let (name_text, computed_key) = match &name_record.data {
         NodeData::Identifier(identifier)
             if name_record.kind == SyntaxKind::Identifier
@@ -14905,22 +14947,23 @@ pub(super) fn plan_interface_method(
         NodeData::ComputedPropertyName(_)
             if name_record.kind == SyntaxKind::ComputedPropertyName =>
         {
-            let key = plan_computed_member_key(store, host, name).map_err(|_| unsupported())?;
+            let key =
+                plan_computed_member_key(store, host, name).map_err(|_| unsupported(line!()))?;
             (None, Some(key))
         }
-        _ => return Err(unsupported()),
+        _ => return Err(unsupported(line!())),
     };
     if name_record.flags.0 != 0
         || name_record.parent != Some(declaration.node)
         || name_record.range.start < record.range.start
         || name_record.range.end > method.parameters.range.start
     {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     }
 
     if let Some(token) = method.postfix_token {
         let token = NodeRef::new(declaration.arena, declaration.file, token);
-        let token_record = preflight_node(store, host, token).map_err(|_| unsupported())?;
+        let token_record = preflight_node(store, host, token).map_err(|_| unsupported(line!()))?;
         if token_record.kind != SyntaxKind::QuestionToken
             || token_record.flags.0 != 0
             || token_record.parent != Some(declaration.node)
@@ -14928,30 +14971,37 @@ pub(super) fn plan_interface_method(
             || token_record.range.end > method.parameters.range.start
             || !matches!(token_record.data, NodeData::Token(_))
         {
-            return Err(unsupported());
+            return Err(unsupported(line!()));
         }
     }
 
     let return_type = method
         .type_
         .map(|type_| NodeRef::new(declaration.arena, declaration.file, type_))
-        .ok_or_else(unsupported)?;
-    let return_record = preflight_node(store, host, return_type).map_err(|_| unsupported())?;
+        .ok_or_else(|| unsupported(line!()))?;
+    let return_record =
+        preflight_node(store, host, return_type).map_err(|_| unsupported(line!()))?;
     if return_record.flags.0 != 0
         || return_record.parent != Some(declaration.node)
         || return_record.range.start < method.parameters.range.end
         || return_record.range.end > record.range.end
     {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     }
 
-    let bound = host.bound_file(declaration).ok_or_else(unsupported)?;
-    let raw_symbol = bound.symbol(declaration).ok_or_else(unsupported)?;
+    let bound = host
+        .bound_file(declaration)
+        .ok_or_else(|| unsupported(line!()))?;
+    let raw_symbol = bound
+        .symbol(declaration)
+        .ok_or_else(|| unsupported(line!()))?;
     let symbol = store
         .get_merged_symbol(raw_symbol)
-        .ok_or_else(unsupported)?;
-    let method_symbol = store.symbol(symbol).ok_or_else(unsupported)?;
-    let declarations = method_symbol.declarations().ok_or_else(unsupported)?;
+        .ok_or_else(|| unsupported(line!()))?;
+    let method_symbol = store.symbol(symbol).ok_or_else(|| unsupported(line!()))?;
+    let declarations = method_symbol
+        .declarations()
+        .ok_or_else(|| unsupported(line!()))?;
     let merged = store.source_merged_method_has_exact_declarations(symbol);
     if symbol != raw_symbol && !merged
         || !host.symbol_matches(store, declaration, symbol)
@@ -14982,7 +15032,7 @@ pub(super) fn plan_interface_method(
             .and_then(|parent| store.get_merged_symbol(parent))
             != Some(owner_symbol)
     {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     }
 
     let local_table = bound.locals(declaration);
@@ -15000,7 +15050,7 @@ pub(super) fn plan_interface_method(
         && type_parameters.is_empty()
         && locals.is_some_and(|locals| !locals.is_empty())
     {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     }
     let mut parameters = Vec::new();
     parameters
@@ -15027,9 +15077,10 @@ pub(super) fn plan_interface_method(
             });
     for (index, parameter) in method.parameters.nodes.iter().copied().enumerate() {
         let parameter = NodeRef::new(declaration.arena, declaration.file, parameter);
-        let parameter_record = preflight_node(store, host, parameter).map_err(|_| unsupported())?;
+        let parameter_record =
+            preflight_node(store, host, parameter).map_err(|_| unsupported(line!()))?;
         if parameter_record.range.start < previous_end {
-            return Err(unsupported());
+            return Err(unsupported(line!()));
         }
         previous_end = parameter_record.range.end;
         let (planned, rest, optional, binding) = plan_interface_method_parameter(
@@ -15039,26 +15090,29 @@ pub(super) fn plan_interface_method(
             parameter,
             &method.parameters,
             numeric_math_rest,
+            &type_parameters,
         )?;
         if preflight_node(store, host, planned.type_node)
-            .map_err(|_| unsupported())?
+            .map_err(|_| unsupported(line!()))?
             .kind
             == SyntaxKind::LiteralType
         {
             flags |= SignatureFlags::HAS_LITERAL_TYPES;
         }
-        let symbol = store.symbol(planned.symbol).ok_or_else(unsupported)?;
+        let symbol = store
+            .symbol(planned.symbol)
+            .ok_or_else(|| unsupported(line!()))?;
         if binding.is_none()
             && locals.and_then(|locals| locals.get(symbol.name())) != Some(planned.symbol)
             || parameters
                 .iter()
                 .any(|parameter: &PlannedCallParameter| parameter.symbol == planned.symbol)
         {
-            return Err(unsupported());
+            return Err(unsupported(line!()));
         }
         if symbol.name().as_utf8() == Some("this") {
             if index != 0 || rest || optional || binding.is_some() {
-                return Err(unsupported());
+                return Err(unsupported(line!()));
             }
             this_parameter = Some(planned);
             continue;
@@ -15066,7 +15120,7 @@ pub(super) fn plan_interface_method(
         if rest && (optional || index + 1 != method.parameters.nodes.len())
             || !rest && !optional && optional_parameter_seen
         {
-            return Err(unsupported());
+            return Err(unsupported(line!()));
         }
         if rest {
             flags |= SignatureFlags::HAS_REST_PARAMETER;
@@ -15081,7 +15135,7 @@ pub(super) fn plan_interface_method(
         parameters.push(planned);
     }
     if i32::try_from(parameters.len()).is_err() {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     }
 
     let planned = PlannedInterfaceMethod {
@@ -15099,7 +15153,7 @@ pub(super) fn plan_interface_method(
         minimum_argument_count,
     };
     if !valid_method_parameter_locals(store, &planned) {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     }
     Ok(planned)
 }
@@ -15114,21 +15168,20 @@ pub(super) fn plan_declared_signature_type_parameters(
     locals: Option<&ts_binder::semantic::SymbolTable>,
     kind: SyntaxKind,
 ) -> Result<Vec<PlannedInterfaceMethodTypeParameter>, PropertyObjectError> {
-    let unsupported = || PropertyObjectError::UnsupportedMember {
-        node: declaration,
-        kind,
-    };
+    let unsupported =
+        |site| interface_method_plan_unsupported(store, host, declaration, declaration, kind, site);
     let Some(parameters) = parameters else {
         return Ok(Vec::new());
     };
-    let declaration_record = preflight_node(store, host, declaration).map_err(|_| unsupported())?;
+    let declaration_record =
+        preflight_node(store, host, declaration).map_err(|_| unsupported(line!()))?;
     if parameters.nodes.is_empty()
         || parameters.range.start < declaration_record.range.start
         || parameters.range.end > value_parameters.range.start
         || parameters.range.start >= parameters.range.end
         || locals.is_none()
     {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     }
 
     let mut planned = Vec::with_capacity(parameters.nodes.len());
@@ -15139,9 +15192,9 @@ pub(super) fn plan_declared_signature_type_parameters(
     let mut default_seen = false;
     for parameter in &parameters.nodes {
         let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
-        let record = preflight_node(store, host, parameter).map_err(|_| unsupported())?;
+        let record = preflight_node(store, host, parameter).map_err(|_| unsupported(line!()))?;
         let NodeData::TypeParameterDeclaration(data) = &record.data else {
-            return Err(unsupported());
+            return Err(unsupported(line!()));
         };
         if record.kind != SyntaxKind::TypeParameter
             || record.flags.0 != 0
@@ -15153,13 +15206,13 @@ pub(super) fn plan_declared_signature_type_parameters(
             || data.symbol.is_some()
             || data.modifiers.is_some()
         {
-            return Err(unsupported());
+            return Err(unsupported(line!()));
         }
 
         let name = NodeRef::new(parameter.arena, parameter.file, data.name);
-        let name_record = preflight_node(store, host, name).map_err(|_| unsupported())?;
+        let name_record = preflight_node(store, host, name).map_err(|_| unsupported(line!()))?;
         let NodeData::Identifier(identifier) = &name_record.data else {
-            return Err(unsupported());
+            return Err(unsupported(line!()));
         };
         if name_record.kind != SyntaxKind::Identifier
             || name_record.flags.0 != 0
@@ -15170,13 +15223,13 @@ pub(super) fn plan_declared_signature_type_parameters(
             || identifier.flow_node.is_some()
             || !names.insert(identifier.text.as_str())
         {
-            return Err(unsupported());
+            return Err(unsupported(line!()));
         }
 
-        let symbol = bound_symbol(store, host, parameter).ok_or_else(unsupported)?;
+        let symbol = bound_symbol(store, host, parameter).ok_or_else(|| unsupported(line!()))?;
         preflight_type_parameter_symbol(store, host, symbol, &mut checked)
-            .map_err(|_| unsupported())?;
-        let symbol_record = store.symbol(symbol).ok_or_else(unsupported)?;
+            .map_err(|_| unsupported(line!()))?;
+        let symbol_record = store.symbol(symbol).ok_or_else(|| unsupported(line!()))?;
         if symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
             || symbol_record.check_flags() != CheckFlags::NONE
             || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
@@ -15189,7 +15242,7 @@ pub(super) fn plan_declared_signature_type_parameters(
             || locals.and_then(|locals| locals.get(symbol_record.name())) != Some(symbol)
             || !symbols.insert(symbol)
         {
-            return Err(unsupported());
+            return Err(unsupported(line!()));
         }
 
         let constraint = data
@@ -15201,18 +15254,18 @@ pub(super) fn plan_declared_signature_type_parameters(
         let mut previous_child_end = name_record.range.end;
         for annotation in [constraint, default_type].into_iter().flatten() {
             let annotation_record =
-                preflight_node(store, host, annotation).map_err(|_| unsupported())?;
+                preflight_node(store, host, annotation).map_err(|_| unsupported(line!()))?;
             if annotation_record.flags.0 != 0
                 || annotation_record.parent != Some(parameter.node)
                 || annotation_record.range.start < previous_child_end
                 || annotation_record.range.end > record.range.end
             {
-                return Err(unsupported());
+                return Err(unsupported(line!()));
             }
             previous_child_end = annotation_record.range.end;
         }
         if default_seen && default_type.is_none() {
-            return Err(unsupported());
+            return Err(unsupported(line!()));
         }
         default_seen |= default_type.is_some();
         planned.push(PlannedInterfaceMethodTypeParameter {
@@ -17003,6 +17056,68 @@ fn valid_method_parameter_locals(
         })
 }
 
+/// Rest references must name one of this method's checked formals, with an
+/// array constraint. The normal type query still checks and publishes its type.
+fn valid_method_type_parameter_rest_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    method: NodeRef,
+    node: NodeRef,
+    type_parameters: &[PlannedInterfaceMethodTypeParameter],
+) -> bool {
+    let Ok(record) = preflight_node(store, host, node) else {
+        return false;
+    };
+    let NodeData::TypeReferenceNode(reference) = &record.data else {
+        return false;
+    };
+    if record.kind != SyntaxKind::TypeReference
+        || record.flags.0 != 0
+        || reference.type_arguments.is_some()
+    {
+        return false;
+    }
+    let name = NodeRef::new(node.arena, node.file, reference.type_name);
+    let Ok(name_record) = preflight_node(store, host, name) else {
+        return false;
+    };
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return false;
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(node.node)
+        || name_record.range != record.range
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return false;
+    }
+    let Some(symbol) = host
+        .bound_file(method)
+        .and_then(|bound| bound.locals(method))
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(&identifier.text))
+    else {
+        return false;
+    };
+    let Some(parameter) = type_parameters
+        .iter()
+        .find(|parameter| parameter.symbol == symbol)
+    else {
+        return false;
+    };
+    let Some(constraint) = parameter.constraint else {
+        return false;
+    };
+    preflight_node(store, host, constraint).is_ok_and(|constraint_record| {
+        constraint_record.kind == SyntaxKind::ArrayType
+            && constraint_record.flags.0 == 0
+            && constraint_record.parent == Some(parameter.declaration.node)
+            && valid_declared_rest_parameter_annotation(store, host, constraint, false)
+    })
+}
+
 fn plan_interface_method_parameter(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -17010,6 +17125,7 @@ fn plan_interface_method_parameter(
     declaration: NodeRef,
     parameter_nodes: &NodeList,
     numeric_math_rest: bool,
+    type_parameters: &[PlannedInterfaceMethodTypeParameter],
 ) -> Result<
     (
         PlannedCallParameter,
@@ -17019,13 +17135,19 @@ fn plan_interface_method_parameter(
     ),
     PropertyObjectError,
 > {
-    let unsupported = || PropertyObjectError::UnsupportedMember {
-        node: method,
-        kind: SyntaxKind::MethodSignature,
+    let unsupported = |site| {
+        interface_method_plan_unsupported(
+            store,
+            host,
+            method,
+            declaration,
+            SyntaxKind::MethodSignature,
+            site,
+        )
     };
-    let record = preflight_node(store, host, declaration).map_err(|_| unsupported())?;
+    let record = preflight_node(store, host, declaration).map_err(|_| unsupported(line!()))?;
     let NodeData::ParameterDeclaration(parameter) = &record.data else {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     };
     if record.kind != SyntaxKind::Parameter
         || record.flags.0 != 0
@@ -17037,20 +17159,20 @@ fn plan_interface_method_parameter(
         || parameter.modifiers.is_some()
         || parameter.facts != 0
     {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     }
     let rest = parameter
         .dot_dot_dot_token
         .map(|rest| NodeRef::new(declaration.arena, declaration.file, rest));
     let rest_end = if let Some(rest) = rest {
-        let rest_record = preflight_node(store, host, rest).map_err(|_| unsupported())?;
+        let rest_record = preflight_node(store, host, rest).map_err(|_| unsupported(line!()))?;
         if rest_record.kind != SyntaxKind::DotDotDotToken
             || rest_record.flags.0 != 0
             || rest_record.parent != Some(declaration.node)
             || rest_record.range.start < record.range.start
             || !matches!(rest_record.data, NodeData::Token(_))
         {
-            return Err(unsupported());
+            return Err(unsupported(line!()));
         }
         rest_record.range.end
     } else {
@@ -17058,12 +17180,12 @@ fn plan_interface_method_parameter(
     };
 
     let name = NodeRef::new(declaration.arena, declaration.file, parameter.name);
-    let name_record = preflight_node(store, host, name).map_err(|_| unsupported())?;
+    let name_record = preflight_node(store, host, name).map_err(|_| unsupported(line!()))?;
     let index = parameter_nodes
         .nodes
         .iter()
         .position(|node| *node == declaration.node)
-        .ok_or_else(unsupported)?;
+        .ok_or_else(|| unsupported(line!()))?;
     let expected_name = match &name_record.data {
         NodeData::Identifier(identifier)
             if name_record.kind == SyntaxKind::Identifier
@@ -17080,31 +17202,31 @@ fn plan_interface_method_parameter(
         {
             format!("__{index}")
         }
-        _ => return Err(unsupported()),
+        _ => return Err(unsupported(line!())),
     };
     if name_record.flags.0 != 0
         || name_record.parent != Some(declaration.node)
         || name_record.range.start < rest_end
         || name_record.range.end > record.range.end
     {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     }
 
     let type_node = parameter
         .type_
         .map(|type_| NodeRef::new(declaration.arena, declaration.file, type_))
-        .ok_or_else(unsupported)?;
-    let type_record = preflight_node(store, host, type_node).map_err(|_| unsupported())?;
+        .ok_or_else(|| unsupported(line!()))?;
+    let type_record = preflight_node(store, host, type_node).map_err(|_| unsupported(line!()))?;
     if type_record.flags.0 != 0
         || type_record.parent != Some(declaration.node)
         || type_record.range.start < name_record.range.end
         || type_record.range.end > record.range.end
     {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     }
     let optional = if let Some(token) = parameter.question_token {
         let token = NodeRef::new(declaration.arena, declaration.file, token);
-        let token_record = preflight_node(store, host, token).map_err(|_| unsupported())?;
+        let token_record = preflight_node(store, host, token).map_err(|_| unsupported(line!()))?;
         if token_record.kind != SyntaxKind::QuestionToken
             || token_record.flags.0 != 0
             || token_record.parent != Some(declaration.node)
@@ -17112,7 +17234,7 @@ fn plan_interface_method_parameter(
             || token_record.range.end > type_record.range.start
             || !matches!(token_record.data, NodeData::Token(_))
         {
-            return Err(unsupported());
+            return Err(unsupported(line!()));
         }
         true
     } else {
@@ -17120,16 +17242,28 @@ fn plan_interface_method_parameter(
     };
     if rest.is_some()
         && !valid_declared_rest_parameter_annotation(store, host, type_node, numeric_math_rest)
+        && (numeric_math_rest
+            || !valid_method_type_parameter_rest_annotation(
+                store,
+                host,
+                method,
+                type_node,
+                type_parameters,
+            ))
     {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     }
 
-    let bound = host.bound_file(declaration).ok_or_else(unsupported)?;
-    let raw_symbol = bound.symbol(declaration).ok_or_else(unsupported)?;
+    let bound = host
+        .bound_file(declaration)
+        .ok_or_else(|| unsupported(line!()))?;
+    let raw_symbol = bound
+        .symbol(declaration)
+        .ok_or_else(|| unsupported(line!()))?;
     let symbol = store
         .get_merged_symbol(raw_symbol)
-        .ok_or_else(unsupported)?;
-    let symbol_record = store.symbol(symbol).ok_or_else(unsupported)?;
+        .ok_or_else(|| unsupported(line!()))?;
+    let symbol_record = store.symbol(symbol).ok_or_else(|| unsupported(line!()))?;
     if symbol != raw_symbol
         || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
         || symbol_record.check_flags() != CheckFlags::NONE
@@ -17141,7 +17275,7 @@ fn plan_interface_method_parameter(
         || symbol_record.parent().is_some()
         || symbol_record.export_symbol().is_some()
     {
-        return Err(unsupported());
+        return Err(unsupported(line!()));
     }
 
     let binding = if name_record.kind == SyntaxKind::ArrayBindingPattern {
@@ -23631,6 +23765,7 @@ fn validate_interface_method_callable(
         let callable = store.signature(signature)?;
         let return_type = callable.resolved_return_type()?;
         let type_parameters = resolved_interface_method_type_parameters(store, method)?;
+        let this_type = resolved_interface_method_this_type(store, method)?;
         if method.declaration != *declaration
             || method.optional != method_record.flags().contains(SymbolFlags::OPTIONAL)
             || !valid_method_parameter_locals(store, method)
@@ -23659,6 +23794,26 @@ fn validate_interface_method_callable(
             || store
                 .callable_signature_parameter_types(signature)
                 .is_some_and(|cached| cached.len() != method.parameters.len())
+        {
+            return None;
+        }
+
+        if let Some(parameter) = method.this_parameter {
+            if store.value_symbol_links(parameter.symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: this_type,
+                    ..ValueSymbolLinks::default()
+                })
+                || store
+                    .callable_signature_parameter_types(signature)
+                    .is_some()
+                    && store.callable_signature_this_parameter_type(signature) != this_type
+            {
+                return None;
+            }
+        } else if store
+            .callable_signature_this_parameter_type(signature)
+            .is_some()
         {
             return None;
         }
@@ -23715,6 +23870,28 @@ pub(super) fn method_parameter_value_type_matches(
     } else {
         base == type_
     }
+}
+
+/// The receiver annotation is resolved by the same query as the value parameters.
+fn resolved_interface_method_this_type(
+    store: &CanonicalTypeMapperStore,
+    method: &PlannedInterfaceMethod,
+) -> Option<Option<TypeId>> {
+    let Some(parameter) = method.this_parameter else {
+        return Some(None);
+    };
+    let type_ = cached_annotation_identity(
+        store,
+        parameter.identity_node,
+        parameter.null_literal_identity,
+    )?;
+    if parameter.optional
+        || parameter.implicit_any_rest
+        || !method_parameter_value_type_matches(store, &parameter, type_)
+    {
+        return None;
+    }
+    Some(Some(type_))
 }
 
 fn resolved_interface_method_type_parameters(
@@ -24068,6 +24245,7 @@ fn publish_interface_method_values_worker(
                 .iter()
                 .all(|property| property.symbol != method.symbol)
             || resolved_signature.parameter_types.len() != method.parameters.len()
+            || resolved_interface_method_this_type(store, method).is_none()
             || cached_planned_type_identity(store, method.return_type)
                 != Some(resolved_signature.return_type)
             || method
@@ -24390,6 +24568,7 @@ fn publish_interface_method_values_worker(
             let resolved_signature = &resolved[*index];
             let minimum = i32::try_from(method.minimum_argument_count)
                 .expect("the interface method plan checked its parameter count");
+            let this_type = this_parameter.map(|(_, type_)| type_);
             let signature = store
                 .alloc_signature(
                     method.flags,
@@ -24428,7 +24607,7 @@ fn publish_interface_method_values_worker(
                     },
                 ));
             }
-            parameter_batches.push((signature, parameter_types));
+            parameter_batches.push((signature, this_type, parameter_types));
         }
         assert!(store.set_structured_type_members(
             callable_type,
@@ -24504,7 +24683,7 @@ fn publish_interface_method_values_worker(
         }
     }
     if !parameter_batches.is_empty()
-        && !store.set_callable_signature_parameter_types_batch(parameter_batches)
+        && !store.set_callable_signature_parameter_types_with_this_batch(parameter_batches)
     {
         return Err(PropertyObjectError::UnsupportedMember {
             node: plan

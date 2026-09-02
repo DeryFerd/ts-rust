@@ -129,6 +129,7 @@ struct SourceNodeFacts {
     type_operator: Option<SyntaxKind>,
     class_annotation_role: Option<NodeId>,
     type_parameter_annotations: Option<Box<TypeParameterAnnotationFacts>>,
+    rest_infer_true_branch: Option<NodeId>,
     alias_type_parameter: Option<Box<AliasTypeParameterSyntaxFacts>>,
     mapped_type: Option<Box<MappedTypeSyntaxFacts>>,
     plain_interface_heritage: Option<Box<PlainInterfaceHeritageFacts>>,
@@ -6810,6 +6811,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             let signature_id = links.resolved_signature.signature()?;
             let signature = self.signature(signature_id)?;
             let return_type = signature.resolved_return_type()?;
+            let this_type = self.declared_method_this_parameter_type(signature)?;
             let return_annotation = self.source_direct_type_annotation(*method_declaration)?;
             let allowed_flags =
                 SignatureFlags::HAS_REST_PARAMETER | SignatureFlags::HAS_LITERAL_TYPES;
@@ -6821,7 +6823,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 || signature.declaration() != Some(*method_declaration)
                 || signature.flags() & !allowed_flags != SignatureFlags::NONE
                 || !self.valid_declared_method_type_parameters(signature, *method_declaration)
-                || self.declared_method_this_parameter_type(signature).is_none()
                 || signature.resolved_min_argument_count() != -1
                 || signature.resolved_type_predicate().is_some()
                 || signature.target().is_some()
@@ -6911,6 +6912,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     )
                 };
                 if parameter_symbol.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    || parameter_symbol.name().as_utf8() == Some("this")
+                    || self
+                        .source_child_with_kind(parameter_declaration, SyntaxKind::Identifier)
+                        .and_then(|name| self.source_identifier_text(name))
+                        == Some("this")
                     || parameter_symbol.check_flags() != CheckFlags::NONE
                     || parameter_symbol.value_declaration() != Some(parameter_declaration)
                     || parameter_symbol.members().is_some()
@@ -6954,7 +6960,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     .callable_signature_parameter_types
                     .get(&signature_id)
                     .is_some_and(|cached| {
-                        cached.parameters.len() != signature.parameters().len()
+                        cached.this_type != this_type
+                            || cached.parameters.len() != signature.parameters().len()
                             || signature.parameters().iter().zip(&cached.parameters).any(
                                 |(parameter, expected)| {
                                     self.value_symbol_links(*parameter)
@@ -10694,6 +10701,33 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .then_some(annotations)
     }
 
+    /// An inferred rest parameter is visible in its conditional's true branch.
+    pub(super) fn source_rest_infer_true_branch_contains(
+        &self,
+        declaration: NodeRef,
+        function: NodeRef,
+    ) -> bool {
+        let Some(branch) = self
+            .source_node_fact(declaration)
+            .and_then(|facts| facts.rest_infer_true_branch)
+        else {
+            return false;
+        };
+        let branch = NodeRef::new(declaration.arena, declaration.file, branch);
+        let mut current = function;
+        let mut visited = HashSet::new();
+        while visited.insert(current) {
+            if current == branch {
+                return true;
+            }
+            let Some(SourceNodeParent::Parent(parent)) = self.source_node_parent(current) else {
+                return false;
+            };
+            current = parent;
+        }
+        false
+    }
+
     /// Returns exact source roles, not mutable heritage or type-query caches.
     pub(super) fn source_plain_interface_heritage(
         &self,
@@ -11164,6 +11198,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     }
                     _ => None,
                 },
+                rest_infer_true_branch: Self::rest_infer_true_branch(arena, node_id),
                 alias_type_parameter: match &node.data {
                     NodeData::TypeParameterDeclaration(parameter)
                         if node
@@ -11239,6 +11274,70 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             node.for_each_child(|child| pending.push((child, Some(node_id))));
         }
         Some(facts)
+    }
+
+    fn rest_infer_true_branch(arena: &NodeArena, declaration: NodeId) -> Option<NodeId> {
+        let record = arena.get(declaration)?;
+        let NodeData::TypeParameterDeclaration(data) = &record.data else {
+            return None;
+        };
+        if record.flags.0 != 0
+            || data.constraint.is_some()
+            || data.default_type.is_some()
+            || data.expression.is_some()
+            || data.modifiers.is_some()
+            || data.symbol.is_some()
+        {
+            return None;
+        }
+        let infer = record.parent?;
+        let infer_record = arena.get(infer)?;
+        if !matches!(&infer_record.data, NodeData::InferTypeNode(data)
+            if data.type_parameter == declaration)
+            || infer_record.flags.0 != 0
+        {
+            return None;
+        }
+        let parameter = infer_record.parent?;
+        let parameter_record = arena.get(parameter)?;
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return None;
+        };
+        let rest = arena.get(parameter_data.dot_dot_dot_token?)?;
+        if parameter_data.type_ != Some(infer)
+            || parameter_data.question_token.is_some()
+            || parameter_data.initializer.is_some()
+            || parameter_data.modifiers.is_some()
+            || rest.kind != SyntaxKind::DotDotDotToken
+            || rest.parent != Some(parameter)
+        {
+            return None;
+        }
+        let function = parameter_record.parent?;
+        let function_record = arena.get(function)?;
+        let NodeData::FunctionTypeNode(function_data) = &function_record.data else {
+            return None;
+        };
+        if function_data.parameters.nodes.last() != Some(&parameter) {
+            return None;
+        }
+        let mut current = function;
+        let mut visited = HashSet::new();
+        while visited.insert(current) {
+            let parent = arena.get(current)?.parent?;
+            let parent_record = arena.get(parent)?;
+            match &parent_record.data {
+                NodeData::ParenthesizedTypeNode(data) if data.type_ == current => {
+                    current = parent;
+                }
+                NodeData::ConditionalTypeNode(data) if data.extends_type == current => {
+                    return (arena.get(data.true_type)?.parent == Some(parent))
+                        .then_some(data.true_type);
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     fn index_source_node_children(facts: &[Option<SourceNodeFacts>]) -> Option<Vec<Box<[NodeId]>>> {
@@ -12177,6 +12276,59 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         &mut self,
         parameter_types: Vec<(SignatureId, Option<TypeId>, Vec<TypeId>)>,
     ) -> bool {
+        let function_receiver_is_valid = |id: SignatureId, this_type: TypeId| -> Option<()> {
+            let signature = self.signature(id)?;
+            let declaration = signature.declaration()?;
+            if !self.node_is_function_type(declaration) {
+                return None;
+            }
+            let owner = self.type_node_links(declaration)?.resolved_type?;
+            let structured = self.types.get(owner)?.data().structured()?;
+            if !self.type_has_function_type_provenance(owner)
+                || structured.signatures.as_deref() != Some([id].as_slice())
+                || structured.call_signature_count != 1
+            {
+                return None;
+            }
+            let parameter = signature.this_parameter()?;
+            let first = self
+                .source_direct_children(declaration)?
+                .into_iter()
+                .find(|child| self.source_node_kind(*child) == Some(SyntaxKind::Parameter))?;
+            let name = self.source_child_with_kind(first, SyntaxKind::Identifier)?;
+            let annotation = self.source_direct_type_annotation(first)?;
+            let children = self.source_direct_children(first)?;
+            let symbol = self.symbol(parameter)?;
+            if self.source_declaration_symbol(first) != Some(parameter)
+                || self.source_node_parent(first) != Some(SourceNodeParent::Parent(declaration))
+                || self.source_node_parent(name) != Some(SourceNodeParent::Parent(first))
+                || self.source_node_parent(annotation) != Some(SourceNodeParent::Parent(first))
+                || self.source_identifier_text(name) != Some("this")
+                || children.len() != 2
+                || !children.contains(&name)
+                || !children.contains(&annotation)
+                || name == annotation
+                || symbol.name().as_utf8() != Some("this")
+                || symbol.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                || symbol.check_flags() != CheckFlags::NONE
+                || symbol.declarations() != Some(&[first])
+                || symbol.value_declaration() != Some(first)
+                || symbol.members().is_some()
+                || symbol.exports().is_some()
+                || symbol.parent().is_some()
+                || symbol.export_symbol().is_some()
+                || self.get_merged_symbol(parameter) != Some(parameter)
+                || !self.source_direct_type_annotation_is_exact(annotation, this_type)
+                || self.value_symbol_links(parameter)
+                    != Some(&ValueSymbolLinks {
+                        resolved_type: Some(this_type),
+                        ..ValueSymbolLinks::default()
+                    })
+            {
+                return None;
+            }
+            Some(())
+        };
         let mut signatures = HashSet::with_capacity(parameter_types.len());
         if parameter_types.iter().any(|(signature, this_type, types)| {
             !signatures.insert(*signature)
@@ -12193,6 +12345,9 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                             record.this_parameter().is_none()
                                 || record.declaration().is_none_or(|declaration| {
                                     !self.node_is_source_callable_declaration(declaration)
+                                        && !self.node_is_interface_method(declaration)
+                                        && !self.node_is_type_literal_method(declaration)
+                                        && function_receiver_is_valid(*signature, type_).is_none()
                                 })
                         })
                 })
@@ -12201,15 +12356,28 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                         self.node_is_global_interface_method(declaration)
                             || self.node_is_interface_method(declaration)
                             || self.node_is_type_literal_method(declaration)
-                    }) && record.parameters().iter().copied().zip(types).any(
-                        |(parameter, type_)| {
+                    }) && (record.this_parameter().is_some() != this_type.is_some()
+                        || record.this_parameter().is_some_and(|parameter| {
                             self.value_symbol_links(parameter)
                                 != Some(&ValueSymbolLinks {
-                                    resolved_type: Some(*type_),
+                                    resolved_type: *this_type,
                                     ..ValueSymbolLinks::default()
                                 })
-                        },
-                    )
+                        })
+                        || record.parameters().iter().copied().zip(types).any(
+                            |(parameter, type_)| {
+                                self.value_symbol_links(parameter)
+                                    != Some(&ValueSymbolLinks {
+                                        resolved_type: Some(*type_),
+                                        ..ValueSymbolLinks::default()
+                                    })
+                            },
+                        ))
+                })
+                || self.signature(*signature).is_some_and(|record| {
+                    record.declaration().is_some_and(|declaration| {
+                        self.node_is_function_type(declaration)
+                    }) && record.this_parameter().is_some() != this_type.is_some()
                 })
                 || !self.valid_optional_types(Some(types))
         }) {

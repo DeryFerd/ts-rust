@@ -169,14 +169,41 @@ fn parts(parsed: &ParseResult, interface: bool) -> Parts {
             SyntaxKind::TypeAliasDeclaration
         },
     );
-    let property = only(parsed, SyntaxKind::PropertySignature);
-    let NodeData::PropertySignatureDeclaration(data) =
-        &parsed.arena.get(property.node).unwrap().data
-    else {
-        unreachable!()
+    let (property_owner, members) = match &parsed.arena.get(config.node).unwrap().data {
+        NodeData::InterfaceDeclaration(data) => (config, &data.members),
+        NodeData::TypeAliasDeclaration(data) => {
+            let literal = child(parsed, config, data.type_);
+            let NodeData::TypeLiteralNode(data) = &parsed.arena.get(literal.node).unwrap().data
+            else {
+                panic!("Config must retain its written type literal")
+            };
+            (literal, &data.members)
+        }
+        _ => unreachable!(),
+    };
+    let [property] = members.nodes.as_slice() else {
+        panic!("Config has one declared property")
+    };
+    let property = child(parsed, property_owner, *property);
+    let NodeData::PropertyDeclaration(data) = &parsed.arena.get(property.node).unwrap().data else {
+        panic!("Config's member must remain a property declaration")
     };
     let property_name = child(parsed, property, data.name);
-    let field = only(parsed, SyntaxKind::PropertyDeclaration);
+    let NodeData::ClassDeclaration(data) = &parsed.arena.get(class.node).unwrap().data else {
+        unreachable!()
+    };
+    let mut fields = data
+        .members
+        .nodes
+        .iter()
+        .copied()
+        .filter(|id| parsed.arena.get(*id).unwrap().kind == SyntaxKind::PropertyDeclaration);
+    let field = child(
+        parsed,
+        class,
+        fields.next().expect("Model has one declared field"),
+    );
+    assert!(fields.next().is_none());
     let NodeData::PropertyDeclaration(data) = &parsed.arena.get(field.node).unwrap().data else {
         unreachable!()
     };

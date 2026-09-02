@@ -5947,11 +5947,21 @@ fn evaluate_conditional_worker(
 
     let mut resolved_check_parameters = HashSet::new();
     for (parameter, argument) in mapped_parameters.iter().zip(type_arguments) {
-        if !contains_type_parameter(store, *argument, &HashSet::new())? {
+        if !contains_type_parameter_with_array_targets(
+            store,
+            *argument,
+            &HashSet::new(),
+            global_types.map(CanonicalArrayTargets::from_global_types),
+        )? {
             resolved_check_parameters.insert(*parameter);
         }
     }
-    if contains_type_parameter(store, check_type, &resolved_check_parameters)? {
+    if conditional_operand_is_deferred(
+        store,
+        check_type,
+        &resolved_check_parameters,
+        global_types.map(CanonicalArrayTargets::from_global_types),
+    )? {
         return deferred_conditional_in_query(
             store,
             root,
@@ -6056,7 +6066,12 @@ fn evaluate_conditional_worker(
         return Ok(recovery);
     }
     let resolved_parameters = combined_parameters.iter().copied().collect::<HashSet<_>>();
-    if contains_type_parameter(store, inferred_extends, &resolved_parameters)? {
+    if conditional_operand_is_deferred(
+        store,
+        inferred_extends,
+        &resolved_parameters,
+        global_types.map(CanonicalArrayTargets::from_global_types),
+    )? {
         return deferred_conditional_in_query(
             store,
             root,
@@ -7143,13 +7158,17 @@ fn validate_conditional_operand_with_source(
                 .resolved_return_type()
                 .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
             dependencies.push(return_type);
-            match store.callable_signature_parameter_types(signature) {
-                Some(parameters) if parameters.len() == signature_record.parameters().len() => {
-                    dependencies.extend_from_slice(parameters);
-                }
-                None if signature_record.parameters().is_empty() => {}
-                _ => return Err(ConditionalTypeError::InvalidSignature(signature)),
-            }
+            dependencies.extend(conditional_signature_parameter_types(
+                store,
+                type_,
+                signature,
+                array_targets,
+            )?);
+            dependencies.extend(conditional_signature_this_type(
+                store,
+                signature,
+                array_targets,
+            )?);
             if let Some(mapper) = signature_record.mapper()
                 && store.mapper_payload(mapper).is_none()
             {
@@ -7508,7 +7527,13 @@ fn map_type(
 ) -> Result<TypeId, ConditionalTypeError> {
     validate_owned_type(store, type_)?;
     if parameters.is_empty()
-        || !contains_mapped_type_parameter(store, type_, parameters, &mut HashSet::new())?
+        || !contains_mapped_type_parameter_with_array_targets(
+            store,
+            type_,
+            parameters,
+            global_types.map(CanonicalArrayTargets::from_global_types),
+            &mut HashSet::new(),
+        )?
     {
         return Ok(type_);
     }
@@ -7750,10 +7775,21 @@ fn map_type_with_stored_mapper(
     .map_err(Into::into)
 }
 
+#[allow(dead_code)] // Retains the existing store-only entry point.
 fn contains_mapped_type_parameter(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
     parameters: &[TypeId],
+    visiting: &mut HashSet<TypeId>,
+) -> Result<bool, ConditionalTypeError> {
+    contains_mapped_type_parameter_with_array_targets(store, type_, parameters, None, visiting)
+}
+
+fn contains_mapped_type_parameter_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<bool, ConditionalTypeError> {
     if !visiting.insert(type_) {
@@ -7762,105 +7798,240 @@ fn contains_mapped_type_parameter(
     let record = store
         .type_payload(type_)
         .ok_or(ConditionalTypeError::InvalidType(type_))?;
-    let result = match record.data() {
-        TypeData::TypeParameter(_) => parameters.contains(&type_),
-        TypeData::Union(union) => union.union.types.iter().try_fold(false, |found, item| {
-            Ok::<_, ConditionalTypeError>(
-                found || contains_mapped_type_parameter(store, *item, parameters, visiting)?,
-            )
-        })?,
-        TypeData::Intersection(intersection) => {
-            intersection
+    let mut result =
+        match record.data() {
+            TypeData::TypeParameter(_) => parameters.contains(&type_),
+            TypeData::Union(union) => union.union.types.iter().try_fold(false, |found, item| {
+                Ok::<_, ConditionalTypeError>(
+                    found
+                        || contains_mapped_type_parameter_with_array_targets(
+                            store,
+                            *item,
+                            parameters,
+                            array_targets,
+                            visiting,
+                        )?,
+                )
+            })?,
+            TypeData::Intersection(intersection) => intersection
                 .intersection
                 .types
                 .iter()
                 .try_fold(false, |found, item| {
                     Ok::<_, ConditionalTypeError>(
                         found
-                            || contains_mapped_type_parameter(store, *item, parameters, visiting)?,
-                    )
-                })?
-        }
-        TypeData::TypeReference(reference) => reference
-            .resolved_type_arguments
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .try_fold(false, |found, item| {
-                Ok::<_, ConditionalTypeError>(
-                    found || contains_mapped_type_parameter(store, *item, parameters, visiting)?,
-                )
-            })?,
-        TypeData::Interface(interface) => interface
-            .reference
-            .resolved_type_arguments
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .try_fold(false, |found, item| {
-                Ok::<_, ConditionalTypeError>(
-                    found || contains_mapped_type_parameter(store, *item, parameters, visiting)?,
-                )
-            })?,
-        TypeData::Tuple(tuple) => tuple
-            .interface
-            .reference
-            .resolved_type_arguments
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .try_fold(false, |found, item| {
-                Ok::<_, ConditionalTypeError>(
-                    found || contains_mapped_type_parameter(store, *item, parameters, visiting)?,
-                )
-            })?,
-        TypeData::Index(index) => {
-            contains_mapped_type_parameter(store, index.target, parameters, visiting)?
-        }
-        TypeData::IndexedAccess(indexed) => {
-            contains_mapped_type_parameter(store, indexed.object_type, parameters, visiting)?
-                || contains_mapped_type_parameter(store, indexed.index_type, parameters, visiting)?
-        }
-        TypeData::Conditional(conditional) => {
-            contains_mapped_type_parameter(store, conditional.check_type, parameters, visiting)?
-                || contains_mapped_type_parameter(
-                    store,
-                    conditional.extends_type,
-                    parameters,
-                    visiting,
-                )?
-        }
-        TypeData::TemplateLiteral(template) => {
-            template
-                .types
-                .iter()
-                .try_fold(false, |found, placeholder| {
-                    Ok::<_, ConditionalTypeError>(
-                        found
-                            || contains_mapped_type_parameter(
+                            || contains_mapped_type_parameter_with_array_targets(
                                 store,
-                                *placeholder,
+                                *item,
                                 parameters,
+                                array_targets,
                                 visiting,
                             )?,
                     )
-                })?
+                })?,
+            TypeData::TypeReference(reference) => reference
+                .resolved_type_arguments
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .try_fold(false, |found, item| {
+                    Ok::<_, ConditionalTypeError>(
+                        found
+                            || contains_mapped_type_parameter_with_array_targets(
+                                store,
+                                *item,
+                                parameters,
+                                array_targets,
+                                visiting,
+                            )?,
+                    )
+                })?,
+            TypeData::Interface(interface) => interface
+                .reference
+                .resolved_type_arguments
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .try_fold(false, |found, item| {
+                    Ok::<_, ConditionalTypeError>(
+                        found
+                            || contains_mapped_type_parameter_with_array_targets(
+                                store,
+                                *item,
+                                parameters,
+                                array_targets,
+                                visiting,
+                            )?,
+                    )
+                })?,
+            TypeData::Tuple(tuple) => tuple
+                .interface
+                .reference
+                .resolved_type_arguments
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .try_fold(false, |found, item| {
+                    Ok::<_, ConditionalTypeError>(
+                        found
+                            || contains_mapped_type_parameter_with_array_targets(
+                                store,
+                                *item,
+                                parameters,
+                                array_targets,
+                                visiting,
+                            )?,
+                    )
+                })?,
+            TypeData::Index(index) => contains_mapped_type_parameter_with_array_targets(
+                store,
+                index.target,
+                parameters,
+                array_targets,
+                visiting,
+            )?,
+            TypeData::IndexedAccess(indexed) => {
+                contains_mapped_type_parameter_with_array_targets(
+                    store,
+                    indexed.object_type,
+                    parameters,
+                    array_targets,
+                    visiting,
+                )? || contains_mapped_type_parameter_with_array_targets(
+                    store,
+                    indexed.index_type,
+                    parameters,
+                    array_targets,
+                    visiting,
+                )?
+            }
+            TypeData::Conditional(conditional) => {
+                contains_mapped_type_parameter_with_array_targets(
+                    store,
+                    conditional.check_type,
+                    parameters,
+                    array_targets,
+                    visiting,
+                )? || contains_mapped_type_parameter_with_array_targets(
+                    store,
+                    conditional.extends_type,
+                    parameters,
+                    array_targets,
+                    visiting,
+                )?
+            }
+            TypeData::TemplateLiteral(template) => {
+                template
+                    .types
+                    .iter()
+                    .try_fold(false, |found, placeholder| {
+                        Ok::<_, ConditionalTypeError>(
+                            found
+                                || contains_mapped_type_parameter_with_array_targets(
+                                    store,
+                                    *placeholder,
+                                    parameters,
+                                    array_targets,
+                                    visiting,
+                                )?,
+                        )
+                    })?
+            }
+            _ => false,
+        };
+    if !result && let Some(structured) = record.data().structured() {
+        for signature in structured.signatures.as_deref().unwrap_or_default() {
+            let signature_record = store
+                .signature(*signature)
+                .ok_or(ConditionalTypeError::InvalidSignature(*signature))?;
+            let outer_parameters: Vec<_> = parameters
+                .iter()
+                .copied()
+                .filter(|parameter| !signature_record.type_parameters().contains(parameter))
+                .collect();
+            let mut edges =
+                conditional_signature_parameter_types(store, type_, *signature, array_targets)?;
+            edges.extend(conditional_signature_this_type(
+                store,
+                *signature,
+                array_targets,
+            )?);
+            edges.extend(signature_record.resolved_return_type());
+            for edge in edges {
+                if contains_mapped_type_parameter_with_array_targets(
+                    store,
+                    edge,
+                    &outer_parameters,
+                    array_targets,
+                    visiting,
+                )? {
+                    result = true;
+                    break;
+                }
+            }
+            if result {
+                break;
+            }
         }
-        _ => false,
-    };
+    }
     visiting.remove(&type_);
     Ok(result)
 }
 
+// Callable edges can need mapping without making the callable a deferred operand.
+fn conditional_operand_is_deferred(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    excluded: &HashSet<TypeId>,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, ConditionalTypeError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(ConditionalTypeError::InvalidType(type_))?;
+    if matches!(record.data(), TypeData::Object(_)) {
+        match super::callable_sets::validate_stored_callable_set_with_array_targets(
+            store,
+            type_,
+            array_targets,
+        ) {
+            StoredCallableSetValidation::Valid { projection, .. }
+                if !projection.call_signatures.is_empty()
+                    && projection.construct_signatures.is_empty() =>
+            {
+                return Ok(false);
+            }
+            StoredCallableSetValidation::Malformed { .. } => {
+                return Err(ConditionalTypeError::InvalidType(type_));
+            }
+            StoredCallableSetValidation::Pending { .. } => {
+                return Err(RelationUnavailable::UnresolvedStructuredMembers(type_).into());
+            }
+            _ => {}
+        }
+    }
+    contains_type_parameter_with_array_targets(store, type_, excluded, array_targets)
+}
+
+#[allow(dead_code)] // Retains the existing store-only entry point.
 fn contains_type_parameter(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
     excluded: &HashSet<TypeId>,
 ) -> Result<bool, ConditionalTypeError> {
+    contains_type_parameter_with_array_targets(store, type_, excluded, None)
+}
+
+fn contains_type_parameter_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    excluded: &HashSet<TypeId>,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, ConditionalTypeError> {
     fn visit(
         store: &CanonicalTypeMapperStore,
         type_: TypeId,
         excluded: &HashSet<TypeId>,
+        array_targets: Option<CanonicalArrayTargets>,
         visiting: &mut HashSet<TypeId>,
     ) -> Result<bool, ConditionalTypeError> {
         if !visiting.insert(type_) {
@@ -7872,14 +8043,18 @@ fn contains_type_parameter(
         let mut result = match record.data() {
             TypeData::TypeParameter(_) => !excluded.contains(&type_),
             TypeData::Union(union) => union.union.types.iter().try_fold(false, |found, item| {
-                Ok::<_, ConditionalTypeError>(found || visit(store, *item, excluded, visiting)?)
+                Ok::<_, ConditionalTypeError>(
+                    found || visit(store, *item, excluded, array_targets, visiting)?,
+                )
             })?,
             TypeData::Intersection(intersection) => intersection
                 .intersection
                 .types
                 .iter()
                 .try_fold(false, |found, item| {
-                    Ok::<_, ConditionalTypeError>(found || visit(store, *item, excluded, visiting)?)
+                    Ok::<_, ConditionalTypeError>(
+                        found || visit(store, *item, excluded, array_targets, visiting)?,
+                    )
                 })?,
             TypeData::TypeReference(reference) => reference
                 .resolved_type_arguments
@@ -7887,7 +8062,9 @@ fn contains_type_parameter(
                 .unwrap_or_default()
                 .iter()
                 .try_fold(false, |found, item| {
-                    Ok::<_, ConditionalTypeError>(found || visit(store, *item, excluded, visiting)?)
+                    Ok::<_, ConditionalTypeError>(
+                        found || visit(store, *item, excluded, array_targets, visiting)?,
+                    )
                 })?,
             TypeData::Interface(interface) => interface
                 .reference
@@ -7896,7 +8073,9 @@ fn contains_type_parameter(
                 .unwrap_or_default()
                 .iter()
                 .try_fold(false, |found, item| {
-                    Ok::<_, ConditionalTypeError>(found || visit(store, *item, excluded, visiting)?)
+                    Ok::<_, ConditionalTypeError>(
+                        found || visit(store, *item, excluded, array_targets, visiting)?,
+                    )
                 })?,
             TypeData::Tuple(tuple) => tuple
                 .interface
@@ -7906,17 +8085,28 @@ fn contains_type_parameter(
                 .unwrap_or_default()
                 .iter()
                 .try_fold(false, |found, item| {
-                    Ok::<_, ConditionalTypeError>(found || visit(store, *item, excluded, visiting)?)
+                    Ok::<_, ConditionalTypeError>(
+                        found || visit(store, *item, excluded, array_targets, visiting)?,
+                    )
                 })?,
-            TypeData::Index(index) => visit(store, index.target, excluded, visiting)?,
+            TypeData::Index(index) => {
+                visit(store, index.target, excluded, array_targets, visiting)?
+            }
             TypeData::IndexedAccess(indexed) => {
-                visit(store, indexed.object_type, excluded, visiting)?
-                    || visit(store, indexed.index_type, excluded, visiting)?
+                visit(
+                    store,
+                    indexed.object_type,
+                    excluded,
+                    array_targets,
+                    visiting,
+                )? || visit(store, indexed.index_type, excluded, array_targets, visiting)?
             }
             TypeData::Conditional(_) => true,
             TypeData::TemplateLiteral(template) => {
                 template.types.iter().try_fold(false, |found, item| {
-                    Ok::<_, ConditionalTypeError>(found || visit(store, *item, excluded, visiting)?)
+                    Ok::<_, ConditionalTypeError>(
+                        found || visit(store, *item, excluded, array_targets, visiting)?,
+                    )
                 })?
             }
             _ => false,
@@ -7935,7 +8125,13 @@ fn contains_type_parameter(
                         return Err(ConditionalTypeError::InvalidSignature(*signature));
                     };
                     if let Some(constraint) = parameter.constraint
-                        && visit(store, constraint, &signature_excluded, visiting)?
+                        && visit(
+                            store,
+                            constraint,
+                            &signature_excluded,
+                            array_targets,
+                            visiting,
+                        )?
                     {
                         result = true;
                         break;
@@ -7947,20 +8143,37 @@ fn contains_type_parameter(
                 let return_type = signature_record
                     .resolved_return_type()
                     .ok_or(ConditionalTypeError::InvalidSignature(*signature))?;
-                if visit(store, return_type, &signature_excluded, visiting)? {
+                if visit(
+                    store,
+                    return_type,
+                    &signature_excluded,
+                    array_targets,
+                    visiting,
+                )? {
                     result = true;
                     break;
                 }
-                if let Some(parameters) = store.callable_signature_parameter_types(*signature) {
-                    for parameter in parameters {
-                        if visit(store, *parameter, &signature_excluded, visiting)? {
-                            result = true;
-                            break;
-                        }
-                    }
-                    if result {
+                let mut dependencies =
+                    conditional_signature_parameter_types(store, type_, *signature, array_targets)?;
+                dependencies.extend(conditional_signature_this_type(
+                    store,
+                    *signature,
+                    array_targets,
+                )?);
+                for parameter in dependencies {
+                    if visit(
+                        store,
+                        parameter,
+                        &signature_excluded,
+                        array_targets,
+                        visiting,
+                    )? {
+                        result = true;
                         break;
                     }
+                }
+                if result {
+                    break;
                 }
             }
         }
@@ -7968,7 +8181,7 @@ fn contains_type_parameter(
         Ok(result)
     }
 
-    visit(store, type_, excluded, &mut HashSet::new())
+    visit(store, type_, excluded, array_targets, &mut HashSet::new())
 }
 
 /// Reuses the conditional engine's deferred-operand proof for a simple source tuple.
@@ -7998,7 +8211,7 @@ pub(super) fn simple_tuple_operand_is_deferred(
         None => store.validate_cached_array_capability(type_)?,
     }
     validate_conditional_operand(store, type_, &mut HashSet::new(), array_targets)?;
-    contains_type_parameter(store, type_, &HashSet::new())
+    contains_type_parameter_with_array_targets(store, type_, &HashSet::new(), array_targets)
 }
 
 #[derive(Clone, Copy)]
@@ -8148,7 +8361,14 @@ fn infer_from_types_worker(
             store, source, target, context, candidates, session, query,
         );
     }
-    if contains_type_parameter(store, target, &HashSet::new())? {
+    if contains_type_parameter_with_array_targets(
+        store,
+        target,
+        &HashSet::new(),
+        context
+            .global_types
+            .map(CanonicalArrayTargets::from_global_types),
+    )? {
         Err(ConditionalTypeError::UnsupportedInference { source, target })
     } else {
         inference_assignability(store, source, target, context.global_types, session, query)
@@ -8641,21 +8861,41 @@ fn infer_from_structured_types(
         for (index, target_signature) in targets.iter().copied().enumerate() {
             let source_index = sources.len().saturating_sub(targets.len()) + index;
             let source_signature = sources[source_index.min(sources.len() - 1)];
-            let (source_parameters, source_minimum, source_return) =
+            let (source_this, source_parameters, source_minimum, source_return) =
                 base_inference_signature_parts(
                     store,
+                    source,
                     source_signature,
                     context.global_types,
                     session,
                     query,
                 )?;
-            let (target_parameters, _, target_return) =
-                inference_signature_parts(store, target_signature)?;
-            if source_minimum > target_parameters.len() {
+            let (target_this, target_parameters, _, target_return) = inference_signature_parts(
+                store,
+                target,
+                target_signature,
+                context
+                    .global_types
+                    .map(CanonicalArrayTargets::from_global_types),
+            )?;
+            let target_never_rest = store
+                .signature(target_signature)
+                .is_some_and(|signature| signature.has_rest_parameter())
+                && store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+                    target_parameters.as_slice() == [bootstrap.never_type]
+                });
+            if !target_never_rest && source_minimum > target_parameters.len() {
                 return Ok(false);
             }
+            // A sole never rest type accepts every source parameter list and
+            // contains no inference parameters. Its receiver still participates.
+            let value_pairs = source_parameters
+                .into_iter()
+                .zip(target_parameters)
+                .filter(|_| !target_never_rest);
+            // An absent source receiver produces no inference candidate.
             for (source_parameter, target_parameter) in
-                source_parameters.into_iter().zip(target_parameters)
+                source_this.zip(target_this).into_iter().chain(value_pairs)
             {
                 let source_parameter = map_inference_type(
                     store,
@@ -8675,10 +8915,13 @@ fn infer_from_structured_types(
                     session,
                     query,
                 )?;
-                let compatible = if contains_mapped_type_parameter(
+                let compatible = if contains_mapped_type_parameter_with_array_targets(
                     store,
                     target_parameter,
                     context.infer_parameters,
+                    context
+                        .global_types
+                        .map(CanonicalArrayTargets::from_global_types),
                     &mut HashSet::new(),
                 )? {
                     infer_from_types(
@@ -8793,44 +9036,163 @@ fn inference_property_type(
     Ok(Some(proof.type_id()))
 }
 
-fn inference_signature_parts(
+fn conditional_signature_parameter_types(
+    store: &CanonicalTypeMapperStore,
+    owner: TypeId,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Vec<TypeId>, ConditionalTypeError> {
+    if let Some((_, mapped)) = super::instantiate::instantiated_function_signature_projection(
+        store,
+        signature,
+        array_targets,
+    ) {
+        let (callable, _) = mapped?;
+        if callable.owner != owner {
+            return Err(ConditionalTypeError::InvalidSignature(signature));
+        }
+        let mut parameters = callable.parameters;
+        parameters.extend(callable.rest_parameter);
+        return Ok(parameters);
+    }
+    let record = store
+        .signature(signature)
+        .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
+    if let Some(parameters) = store.callable_signature_parameter_types(signature) {
+        return if parameters.len() == record.parameters().len() {
+            Ok(parameters.to_vec())
+        } else {
+            Err(ConditionalTypeError::InvalidSignature(signature))
+        };
+    }
+    if record.parameters().is_empty() {
+        return Ok(Vec::new());
+    }
+    if record
+        .declaration()
+        .and_then(|node| store.source_node_kind(node))
+        != Some(SyntaxKind::MethodDeclaration)
+    {
+        return Err(ConditionalTypeError::InvalidSignature(signature));
+    }
+    let method = store
+        .type_payload(owner)
+        .and_then(TypeRecord::symbol)
+        .and_then(|symbol| store.symbol(symbol));
+    if !method.is_some_and(|method| {
+        method.flags() == SymbolFlags::METHOD
+            && method
+                .parent()
+                .and_then(|class| store.source_class_provenance_for_symbol(class))
+                .is_some()
+    }) {
+        return Err(ConditionalTypeError::InvalidSignature(signature));
+    }
+    let StoredCallableSetValidation::Valid { projection, .. } =
+        super::callable_sets::validate_stored_callable_set_with_array_targets(
+            store,
+            owner,
+            array_targets,
+        )
+    else {
+        return Err(ConditionalTypeError::InvalidSignature(signature));
+    };
+    if projection.owner != owner {
+        return Err(ConditionalTypeError::InvalidSignature(signature));
+    }
+    let Some(callable) = projection
+        .call_signatures
+        .iter()
+        .find(|callable| callable.owner == owner && callable.signature == signature)
+    else {
+        return Err(ConditionalTypeError::InvalidSignature(signature));
+    };
+    let mut parameters = callable.parameters.clone();
+    parameters.extend(callable.rest_parameter);
+    if parameters.len() != record.parameters().len()
+        || callable.rest_parameter.is_some() != record.has_rest_parameter()
+    {
+        return Err(ConditionalTypeError::InvalidSignature(signature));
+    }
+    Ok(parameters)
+}
+
+fn conditional_signature_this_type(
     store: &CanonicalTypeMapperStore,
     signature: SignatureId,
-) -> Result<(Vec<TypeId>, usize, TypeId), ConditionalTypeError> {
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, ConditionalTypeError> {
+    if let Some((_, mapped)) = super::instantiate::instantiated_function_signature_projection(
+        store,
+        signature,
+        array_targets,
+    ) {
+        return mapped.map(|(_, this_type)| this_type).map_err(Into::into);
+    }
+    let record = store
+        .signature(signature)
+        .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
+    match (
+        record.this_parameter(),
+        store.callable_signature_this_parameter_type(signature),
+    ) {
+        (None, None) => Ok(None),
+        (Some(parameter), Some(type_))
+            if store
+                .value_symbol_links(parameter)
+                .and_then(|links| links.resolved_type)
+                == Some(type_)
+                && store.type_payload(type_).is_some() =>
+        {
+            Ok(Some(type_))
+        }
+        _ => Err(ConditionalTypeError::InvalidSignature(signature)),
+    }
+}
+
+fn inference_signature_parts(
+    store: &CanonicalTypeMapperStore,
+    owner: TypeId,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(Option<TypeId>, Vec<TypeId>, usize, TypeId), ConditionalTypeError> {
     let record = store
         .signature(signature)
         .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
     let minimum = usize::try_from(record.min_argument_count())
         .map_err(|_| ConditionalTypeError::InvalidSignature(signature))?;
-    let parameters = match store.callable_signature_parameter_types(signature) {
-        Some(parameters) if parameters.len() == record.parameters().len() => parameters.to_vec(),
-        None if record.parameters().is_empty() => Vec::new(),
-        _ => return Err(ConditionalTypeError::InvalidSignature(signature)),
-    };
+    let parameters = conditional_signature_parameter_types(store, owner, signature, array_targets)?;
+    let this_type = conditional_signature_this_type(store, signature, array_targets)?;
     if minimum > parameters.len() {
         return Err(ConditionalTypeError::InvalidSignature(signature));
     }
     let return_type = record
         .resolved_return_type()
         .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
-    Ok((parameters, minimum, return_type))
+    Ok((this_type, parameters, minimum, return_type))
 }
 
 fn base_inference_signature_parts(
     store: &mut CanonicalTypeMapperStore,
+    owner: TypeId,
     signature: SignatureId,
     global_types: Option<&CanonicalGlobalTypes>,
     session: &mut InstantiationSession,
     query: &mut Option<&mut dyn ConditionalBranchSource>,
-) -> Result<(Vec<TypeId>, usize, TypeId), ConditionalTypeError> {
-    let (parameters, minimum, return_type) = inference_signature_parts(store, signature)?;
+) -> Result<(Option<TypeId>, Vec<TypeId>, usize, TypeId), ConditionalTypeError> {
+    let (this_type, parameters, minimum, return_type) = inference_signature_parts(
+        store,
+        owner,
+        signature,
+        global_types.map(CanonicalArrayTargets::from_global_types),
+    )?;
     let local_parameters = store
         .signature(signature)
         .ok_or(ConditionalTypeError::InvalidSignature(signature))?
         .type_parameters()
         .to_vec();
     if local_parameters.is_empty() {
-        return Ok((parameters, minimum, return_type));
+        return Ok((this_type, parameters, minimum, return_type));
     }
 
     let bootstrap = store
@@ -8886,6 +9248,19 @@ fn base_inference_signature_parts(
         )?;
     }
 
+    let base_this = this_type
+        .map(|receiver| {
+            map_inference_type(
+                store,
+                receiver,
+                &local_parameters,
+                &constraints,
+                global_types,
+                session,
+                query,
+            )
+        })
+        .transpose()?;
     let mut base_parameters = Vec::with_capacity(parameters.len());
     for parameter in parameters {
         base_parameters.push(map_inference_type(
@@ -8907,7 +9282,7 @@ fn base_inference_signature_parts(
         session,
         query,
     )?;
-    Ok((base_parameters, minimum, base_return))
+    Ok((base_this, base_parameters, minimum, base_return))
 }
 
 fn template_inference_candidate(

@@ -46,6 +46,7 @@ use super::{
         optional_constructor_parameter_type, plan_nongeneric_class_member_query,
         preflight_nongeneric_class_member_query, source_class_plan_is_current,
     },
+    conditional_types::ConditionalTypeError,
     constructor_values::{
         GlobalConstructorValueKind, GlobalConstructorValuePlan, plan_global_constructor_value,
         plan_global_generic_constructor_value, plan_global_named_constructor,
@@ -6450,6 +6451,57 @@ fn generic_constructor_error(node: NodeRef, error: GenericMethodCallError) -> So
     record[length] = b'\n';
     let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &record[..=length]);
     match error {
+        GenericMethodCallError::Generic(GenericCallVectorError::Conditional(error)) => {
+            match error {
+                ConditionalTypeError::Relation(error) => SourceNewError::Call {
+                    node,
+                    error: super::calls::DirectCallError::Relation(error),
+                },
+                ConditionalTypeError::Declared(error) => error.into(),
+                ConditionalTypeError::Instantiation(error) => generic_constructor_error(
+                    node,
+                    GenericMethodCallError::Generic(GenericCallVectorError::Instantiation(error)),
+                ),
+                ConditionalTypeError::MissingBootstrap => SourceNewError::Call {
+                    node,
+                    error: super::calls::DirectCallError::Relation(
+                        super::RelationUnavailable::MissingBootstrap,
+                    ),
+                },
+                ConditionalTypeError::Capacity => invariant(SourceNewInvariant::Capacity(node)),
+                ConditionalTypeError::InvalidNode(node)
+                | ConditionalTypeError::InvalidTypeNodeCache(node) => {
+                    invariant(SourceNewInvariant::InvalidExpressionCache(node))
+                }
+                ConditionalTypeError::InvalidSignature(signature) => SourceNewError::Call {
+                    node,
+                    error: super::calls::DirectCallError::Invariant(
+                        super::calls::DirectCallInvariant::InvalidSignature(signature),
+                    ),
+                },
+                ConditionalTypeError::InvalidType(_)
+                | ConditionalTypeError::InvalidTypeParameter(_)
+                | ConditionalTypeError::DuplicateTypeParameter(_)
+                | ConditionalTypeError::InvalidAlias(_)
+                | ConditionalTypeError::InvalidAliasSymbol(_)
+                | ConditionalTypeError::InvalidRoot(_)
+                | ConditionalTypeError::InvalidConditional(_)
+                | ConditionalTypeError::InvalidMapper(_)
+                | ConditionalTypeError::InvalidInstantiationArity { .. }
+                | ConditionalTypeError::InvalidInstantiationCache(_)
+                | ConditionalTypeError::InvalidConditionalResolution(_) => {
+                    invariant(SourceNewInvariant::InvalidExpressionCache(node))
+                }
+                ConditionalTypeError::UnsupportedInference { .. }
+                | ConditionalTypeError::TailRecursionLimit { .. }
+                | ConditionalTypeError::Constraint(_)
+                | ConditionalTypeError::Template(_)
+                | ConditionalTypeError::Tuple(_)
+                | ConditionalTypeError::Union(_) => {
+                    unsupported(SourceNewUnsupported::Arguments(node))
+                }
+            }
+        }
         GenericMethodCallError::Relation(error)
         | GenericMethodCallError::Direct(super::calls::DirectCallError::Relation(error))
         | GenericMethodCallError::Generic(GenericCallVectorError::Relation(error))

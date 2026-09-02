@@ -7616,6 +7616,23 @@ pub(super) fn instantiated_function_member_signature_return(
     signature: SignatureId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<Result<TypeId, GenericInterfaceMemberError>> {
+    if let Some((owner, mapped)) = super::instantiate::instantiated_function_signature_projection(
+        store,
+        signature,
+        array_targets,
+    ) {
+        return Some(
+            mapped
+                .map_err(|error| property_instantiation_error(owner, &error))
+                .and_then(|(callable, _)| {
+                    callable
+                        .return_type
+                        .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
+                            callable.owner,
+                        ))
+                }),
+        );
+    }
     // This retained source only claims malformed instances. It cannot authorize a return.
     let source_claim = store
         .signature(signature)

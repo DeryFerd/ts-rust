@@ -23,10 +23,14 @@
 
 use std::collections::HashSet;
 
+use ts_binder::SymbolFlags;
+
 use super::{
     CanonicalGlobalTypes, RelationUnavailable, TypeId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::{LiteralTypeCacheError, UnionReduction},
+    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
+    callables::CallableFamily,
     derived_types::{DerivedObjectLiteralValidation, DerivedTypeError},
     instantiate::canonical_anonymous_union,
     mapper::CanonicalTypeMapperStore,
@@ -1113,6 +1117,31 @@ fn validate_inference_candidate(
         TypeData::Intrinsic(_) if intrinsic_leaf_flags(record.flags()) => Ok(()),
         TypeData::Literal(_) if literal_leaf_flags(record.flags()) => Ok(()),
         TypeData::UniqueEsSymbol(_) if record.flags() == TypeFlags::UNIQUE_ES_SYMBOL => Ok(()),
+        TypeData::Object(_)
+            if allow_declared_object
+                && record
+                    .symbol()
+                    .and_then(|symbol| store.symbol(symbol))
+                    .is_some_and(|method| {
+                        method.flags().contains(SymbolFlags::METHOD)
+                            && method
+                                .parent()
+                                .and_then(|owner| store.symbol(owner))
+                                .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
+                    })
+                && matches!(
+                    validate_stored_callable_set_with_array_targets(store, candidate, array_targets),
+                    StoredCallableSetValidation::Valid {
+                        family: CallableFamily::DeclaredCallSignatures,
+                        projection,
+                        ..
+                    } if projection.owner == candidate
+                        && !projection.call_signatures.is_empty()
+                        && projection.construct_signatures.is_empty()
+                ) =>
+        {
+            Ok(())
+        }
         TypeData::Object(_)
             if allow_widening && store.validate_fresh_object_literal_for_relation(candidate) =>
         {

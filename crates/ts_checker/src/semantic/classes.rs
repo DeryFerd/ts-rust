@@ -4260,6 +4260,34 @@ pub(super) fn source_class_this_type_owner(
     .then_some(symbol)
 }
 
+/// An unconstrained class formal remains arbitrary while its body is checked.
+pub(super) fn source_class_unconstrained_type_parameter(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> bool {
+    let Some(symbol) = cached_ordinary_type_parameter_owner(store, type_) else {
+        return false;
+    };
+    let Some(owner) = store.get_parent_of_symbol(symbol) else {
+        return false;
+    };
+    let Some(provenance) = store.source_class_provenance_for_symbol(owner) else {
+        return false;
+    };
+    provenance.symbol() == owner
+        && validate_source_class_stored_header(store, provenance).is_ok()
+        && provenance
+            .prepared
+            .plan
+            .type_parameters
+            .iter()
+            .any(|parameter| {
+                parameter.symbol == symbol
+                    && parameter.constraint.is_none()
+                    && parameter.default_type.is_none()
+            })
+}
+
 fn completed_source_class_header_is_valid(
     store: &CanonicalTypeMapperStore,
     symbol: SemanticSymbolId,

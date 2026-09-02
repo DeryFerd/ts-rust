@@ -3073,6 +3073,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         record,
                         interface,
                         array_validation.targets(),
+                        allowed_pending,
                     )
                 {
                     for edge in edges {
@@ -3464,7 +3465,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 )?;
             }
             let Some(edges) =
-                self.native_global_heritage_source_edges(&source, false, array_targets)
+                self.native_global_heritage_source_edges(&source, false, array_targets, &pending)
             else {
                 return Ok(false);
             };
@@ -3879,12 +3880,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         source: &NativeGlobalHeritageSource,
         require_base_types: bool,
         array_targets: Option<CanonicalArrayTargets>,
+        allowed_pending: &HashSet<TypeId>,
     ) -> Option<Vec<TypeId>> {
         let mut edges = self.lazy_default_library_interface_member_edges_worker(
             source.symbol,
             array_targets,
             None,
             &source.clauses,
+            allowed_pending,
         )?;
         for base in &source.bases {
             let cached = cached_interface_type(self, base.symbol).ok()?;
@@ -3902,12 +3905,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     record,
                     interface,
                     array_targets,
+                    allowed_pending,
                 )?);
             } else {
                 edges.extend(self.lazy_default_library_interface_member_edges(
                     base.symbol,
                     array_targets,
                     None,
+                    allowed_pending,
                 )?);
             }
         }
@@ -3979,9 +3984,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 allowed_pending,
             )?;
         }
-        self.native_global_heritage_source_edges(&source, true, array_validation.targets())
-            .map(Some)
-            .ok_or_else(invalid)
+        self.native_global_heritage_source_edges(
+            &source,
+            true,
+            array_validation.targets(),
+            allowed_pending,
+        )
+        .map(Some)
+        .ok_or_else(invalid)
     }
 
     /// A source heritage header proves identity, not a selected alias base or member absence.
@@ -4095,6 +4105,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 array_validation.targets(),
                 None,
                 &clauses,
+                allowed_pending,
             )
             .ok_or_else(invalid)?,
         );
@@ -4108,6 +4119,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         record: &TypeRecord,
         interface: &InterfaceTypeData,
         array_targets: Option<CanonicalArrayTargets>,
+        allowed_pending: &HashSet<TypeId>,
     ) -> Option<Vec<TypeId>> {
         let symbol = record.symbol()?;
         let library_owner =
@@ -4138,7 +4150,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return if library_owner {
                 Some(Vec::new())
             } else {
-                self.lazy_default_library_interface_member_edges(symbol, array_targets, None)
+                self.lazy_default_library_interface_member_edges(
+                    symbol,
+                    array_targets,
+                    None,
+                    allowed_pending,
+                )
             };
         }
         let resolved = flags == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
@@ -4170,6 +4187,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             symbol,
             array_targets,
             resolved.then_some(structured),
+            allowed_pending,
         )
     }
 
@@ -4282,12 +4300,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         symbol: SemanticSymbolId,
         array_targets: Option<CanonicalArrayTargets>,
         resolved: Option<&StructuredTypeData>,
+        allowed_pending: &HashSet<TypeId>,
     ) -> Option<Vec<TypeId>> {
         self.lazy_default_library_interface_member_edges_worker(
             symbol,
             array_targets,
             resolved,
             &[],
+            allowed_pending,
         )
     }
 
@@ -4298,6 +4318,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         array_targets: Option<CanonicalArrayTargets>,
         resolved: Option<&StructuredTypeData>,
         heritage: &[NodeRef],
+        allowed_pending: &HashSet<TypeId>,
     ) -> Option<Vec<TypeId>> {
         let owner = self.symbol(symbol)?;
         let declarations = owner.declarations()?;
@@ -4372,7 +4393,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             resolved_members.push(published);
                         }
                     }
-                    edges.extend(self.lazy_default_library_member_edges(member, array_targets)?);
+                    edges.extend(self.lazy_default_library_member_edges(
+                        member,
+                        array_targets,
+                        allowed_pending,
+                    )?);
                 }
             }
         }
@@ -4407,6 +4432,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &self,
         source: SemanticSymbolId,
         array_targets: Option<CanonicalArrayTargets>,
+        allowed_pending: &HashSet<TypeId>,
     ) -> Option<Vec<TypeId>> {
         let source_record = self.symbol(source)?;
         let member = self
@@ -4441,6 +4467,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             *declaration,
                             array_targets,
                             &mut HashSet::new(),
+                            allowed_pending,
                         )
                     })
                 {
@@ -4465,10 +4492,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             for &declaration in record.declarations()? {
                 let annotation = self.source_direct_type_annotation(declaration)?;
-                let annotation_type = self.lazy_default_library_annotation_type(
+                let annotation_type = self.lazy_default_library_annotation_type_with_pending(
                     annotation,
                     array_targets,
                     &mut HashSet::new(),
+                    allowed_pending,
                 )?;
                 // Nongeneric properties store the annotation. Reads add optionality.
                 if value != annotation_type {
@@ -4491,10 +4519,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 if !kind.is_keyword_type()
                     && !(SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
                         .contains(&(kind as u16))
-                    || self.lazy_default_library_annotation_type(
+                    || self.lazy_default_library_annotation_type_with_pending(
                         node,
                         array_targets,
                         &mut HashSet::new(),
+                        allowed_pending,
                     ) != Some(type_)
                 {
                     return None;
@@ -4503,10 +4532,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 if matches!(
                     self.source_node_kind(node),
                     Some(SyntaxKind::FunctionType | SyntaxKind::ConstructorType)
-                ) && matches!(
-                    validate_stored_callable_set(self, type_),
-                    StoredCallableSetValidation::Valid { .. }
-                ) {
+                ) && match validate_stored_callable_set(self, type_) {
+                    StoredCallableSetValidation::Valid { .. } => true,
+                    StoredCallableSetValidation::Pending {
+                        family: CallableFamily::FunctionType,
+                    } => allowed_pending.contains(&type_),
+                    _ => false,
+                } {
                     continue;
                 }
             } else if self
@@ -4536,12 +4568,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     }
 
     /// Rebuilds the annotation identity from source before accepting a cached type.
-    #[allow(clippy::too_many_lines)] // Each syntax case uses its canonical type validator.
     pub(super) fn lazy_default_library_annotation_type(
         &self,
         node: NodeRef,
         array_targets: Option<CanonicalArrayTargets>,
         active: &mut HashSet<NodeRef>,
+    ) -> Option<TypeId> {
+        self.lazy_default_library_annotation_type_with_pending(
+            node,
+            array_targets,
+            active,
+            &HashSet::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)] // Each syntax case uses its canonical type validator.
+    fn lazy_default_library_annotation_type_with_pending(
+        &self,
+        node: NodeRef,
+        array_targets: Option<CanonicalArrayTargets>,
+        active: &mut HashSet<NodeRef>,
+        allowed_pending: &HashSet<TypeId>,
     ) -> Option<TypeId> {
         if !active.insert(node) {
             return None;
@@ -4553,8 +4600,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 let [child] = children.as_slice() else {
                     return None;
                 };
-                let expected =
-                    self.lazy_default_library_annotation_type(*child, array_targets, active)?;
+                let expected = self.lazy_default_library_annotation_type_with_pending(
+                    *child,
+                    array_targets,
+                    active,
+                    allowed_pending,
+                )?;
                 return self
                     .type_node_links(node)
                     .is_none_or(|links| {
@@ -4608,8 +4659,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     let array = self
                         .canonical_array_reference_with_targets(targets, cached)
                         .ok()??;
-                    let expected_element =
-                        self.lazy_default_library_annotation_type(*element, array_targets, active)?;
+                    let expected_element = self.lazy_default_library_annotation_type_with_pending(
+                        *element,
+                        array_targets,
+                        active,
+                        allowed_pending,
+                    )?;
                     (array.base_type == cached && array.element_type == expected_element)
                         .then_some(cached)
                 }
@@ -4644,10 +4699,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             return None;
                         }
                         let body = self.source_direct_type_annotation(*declaration)?;
-                        return (self.lazy_default_library_annotation_type(
+                        return (self.lazy_default_library_annotation_type_with_pending(
                             body,
                             array_targets,
                             active,
+                            allowed_pending,
                         )? == cached)
                             .then_some(cached);
                     }
@@ -4677,10 +4733,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         return None;
                     }
                     for (&argument, expected) in arguments.iter().zip(reference.type_arguments) {
-                        if self.lazy_default_library_annotation_type(
+                        if self.lazy_default_library_annotation_type_with_pending(
                             argument,
                             array_targets,
                             active,
+                            allowed_pending,
                         )? != expected
                         {
                             return None;
@@ -4692,7 +4749,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     let types = children
                         .into_iter()
                         .map(|child| {
-                            self.lazy_default_library_annotation_type(child, array_targets, active)
+                            self.lazy_default_library_annotation_type_with_pending(
+                                child,
+                                array_targets,
+                                active,
+                                allowed_pending,
+                            )
                         })
                         .collect::<Option<Vec<_>>>()?;
                     let mut parent = node;
@@ -4721,8 +4783,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     let [child] = children.as_slice() else {
                         return None;
                     };
-                    (self.lazy_default_library_annotation_type(*child, array_targets, active)?
-                        == cached)
+                    (self.lazy_default_library_annotation_type_with_pending(
+                        *child,
+                        array_targets,
+                        active,
+                        allowed_pending,
+                    )? == cached)
                         .then_some(cached)
                 }
                 SyntaxKind::LiteralType
@@ -4732,20 +4798,30 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     (cached == self.intrinsic_bootstrap()?.null_type).then_some(cached)
                 }
                 SyntaxKind::FunctionType | SyntaxKind::ConstructorType => {
-                    let StoredCallableSetValidation::Valid {
-                        family: CallableFamily::FunctionType,
-                        projection,
-                        ..
-                    } = validate_stored_callable_set(self, cached)
-                    else {
-                        return None;
+                    // Recursive member annotations can revisit a callback whose
+                    // parameter publication is still owned by the prepared query.
+                    let signatures = match validate_stored_callable_set(self, cached) {
+                        StoredCallableSetValidation::Valid {
+                            family: CallableFamily::FunctionType,
+                            projection,
+                            ..
+                        } => projection
+                            .call_signatures
+                            .iter()
+                            .map(|callable| callable.signature)
+                            .chain(projection.construct_signatures.iter().copied())
+                            .collect::<Vec<_>>(),
+                        StoredCallableSetValidation::Pending {
+                            family: CallableFamily::FunctionType,
+                        } if allowed_pending.contains(&cached) => self
+                            .type_payload(cached)?
+                            .data()
+                            .structured()?
+                            .signatures
+                            .as_deref()?
+                            .to_vec(),
+                        _ => return None,
                     };
-                    let signatures = projection
-                        .call_signatures
-                        .iter()
-                        .map(|callable| callable.signature)
-                        .chain(projection.construct_signatures.iter().copied())
-                        .collect::<Vec<_>>();
                     let [signature] = signatures.as_slice() else {
                         return None;
                     };
@@ -4754,6 +4830,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             node,
                             array_targets,
                             active,
+                            allowed_pending,
                         ))
                     .then_some(cached)
                 }
@@ -4769,6 +4846,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         node: NodeRef,
         array_targets: Option<CanonicalArrayTargets>,
         active: &mut HashSet<NodeRef>,
+        allowed_pending: &HashSet<TypeId>,
     ) -> bool {
         let Some(mut pending) = self.source_direct_children(node) else {
             return false;
@@ -4782,8 +4860,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         || (SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
                             .contains(&(kind as u16))
                 })
-                && self.lazy_default_library_annotation_type(child, array_targets, active)
-                    != Some(type_)
+                && self.lazy_default_library_annotation_type_with_pending(
+                    child,
+                    array_targets,
+                    active,
+                    allowed_pending,
+                ) != Some(type_)
             {
                 return false;
             }
@@ -5780,6 +5862,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     record,
                     interface,
                     array_validation.targets(),
+                    allowed_pending,
                 ) {
                     if !visiting.insert(type_) {
                         return Ok(());

@@ -7556,8 +7556,40 @@ fn trace_alias_instantiation_failure(
         bytes: [0; 1024],
         len: 0,
     };
-    let symbol = store.symbol(alias);
-    let type_record = type_.and_then(|type_| store.type_payload(type_));
+    let observation_active = store.relation_read_observation_is_active();
+    let (symbol, type_record) = if observation_active {
+        (None, None)
+    } else {
+        (
+            store.symbol(alias),
+            type_.and_then(|type_| store.type_payload(type_)),
+        )
+    };
+    let metadata = (!observation_active).then(|| {
+        (
+            symbol.and_then(|symbol| symbol.name().as_utf8()),
+            symbol
+                .and_then(|symbol| symbol.declarations())
+                .and_then(|declarations| match declarations {
+                    [declaration] => Some(*declaration),
+                    _ => None,
+                })
+                .map(|node| {
+                    (
+                        node,
+                        store.source_node_kind(node),
+                        store.source_node_start(node),
+                    )
+                }),
+            type_record.map(|record| {
+                (
+                    record.data().kind(),
+                    record.flags().bits(),
+                    record.object_flags().bits(),
+                )
+            }),
+        )
+    });
     let kind = type_record.map(|record| match record.data() {
         TypeData::Conditional(_) => "conditional",
         TypeData::Mapped(_) => "mapped",
@@ -7570,7 +7602,7 @@ fn trace_alias_instantiation_failure(
     });
     let _ = write!(
         trace,
-        "ALIAS_INSTANTIATION_FAILURE stage={stage} alias={alias:?} name={:?} declaration={:?} type={type_:?} kind={kind:?} flags={:?} object_flags={:?} error={error:?}",
+        "ALIAS_INSTANTIATION_FAILURE stage={stage} alias={alias:?} name={:?} declaration={:?} type={type_:?} kind={kind:?} flags={:?} object_flags={:?} error={error:?} metadata={metadata:?} observation_active={observation_active}",
         symbol.and_then(|symbol| symbol.name().as_utf8()),
         symbol
             .and_then(|symbol| symbol.declarations())
@@ -15749,6 +15781,23 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             alias_is_generic,
             self.array_targets,
         )
+        .inspect_err(|error| {
+            let syntax = self.host.node(node).map(|record| {
+                (record.kind, record.range.start, record.range.end, record.parent)
+            });
+            let error_node = error.node();
+            let error_syntax = error_node.and_then(|node| {
+                self.host.node(node).map(|record| {
+                    (record.kind, record.range.start, record.range.end, record.parent)
+                })
+            });
+            super::source::observe_call_failure_detail(
+                "function_type_plan",
+                format_args!(
+                    "node={node:?} syntax={syntax:?} error_node={error_node:?} error_syntax={error_syntax:?} original={error:?}",
+                ),
+            );
+        })
         .map_err(function_type_error)?;
         if let Some(existing) = self.plan.functions.get(&node) {
             if existing != &planned {
@@ -15773,7 +15822,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .checked_add(1)
             .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(node)))?;
         let result = (|| {
-            for parameter in &planned.parameters {
+            for parameter in planned.all_parameters() {
                 self.plan_type_node_in_context(parameter.type_node, None, false)?;
             }
             // A resolved return must still match its annotation. Cold returns stay lazy.
@@ -37185,6 +37234,179 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         )
     }
 
+    /// Resolves a generic member call with the caller's source and receiver context.
+    pub(super) fn resolve_source_generic_method_call(
+        &mut self,
+        request: super::generic_calls::GenericCallVectorRequest<'_>,
+        existing_call_signature: Option<SignatureId>,
+        this_argument: Option<TypeId>,
+    ) -> Result<
+        Option<(
+            super::generic_method_calls::GenericMethodCallResolution,
+            SignatureId,
+            TypeId,
+        )>,
+        super::generic_method_calls::GenericMethodCallError,
+    > {
+        let source_error = |error| {
+            super::generic_method_calls::GenericMethodCallError::Generic(
+                super::generic_calls::GenericCallVectorError::Instantiation(
+                    super::instantiate::InstantiationError::Declared(error),
+                ),
+            )
+        };
+        self.begin_source_query();
+        let result = (|| {
+            let context = self.source_query_context().map_err(source_error)?;
+            let globals = context.globals.clone();
+            let strict = self.options.strict_function_types.ok_or_else(|| {
+                source_error(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidPreparedTypeQuery,
+                ))
+            })?;
+            let session = self.instantiation_session.as_deref_mut().ok_or_else(|| {
+                source_error(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidPreparedTypeQuery,
+                ))
+            })?;
+            let mut adapter = SourceTypeQueryAdapter {
+                context,
+                diagnostics: self.diagnostics,
+            };
+            let result = (|| {
+                let Some(resolution) =
+                    super::generic_method_calls::resolve_generic_method_call_with_source(
+                        self.store,
+                        &globals,
+                        strict,
+                        request,
+                        existing_call_signature,
+                        session,
+                        this_argument,
+                        &mut adapter,
+                    )?
+                else {
+                    return Ok(None);
+                };
+                let (signature, return_type) = match &resolution.selected {
+                    super::generic_method_calls::GenericMethodCallSelection::Fixed {
+                        signature,
+                        return_type,
+                    } => (*signature, *return_type),
+                    super::generic_method_calls::GenericMethodCallSelection::Generic(candidate) => {
+                        let materialized =
+                            super::generic_calls::materialize_generic_call_vector_source_with_source(
+                                self.store,
+                                candidate,
+                                existing_call_signature,
+                                &globals,
+                                &adapter,
+                            )?;
+                        let return_type =
+                            super::generic_calls::demand_generic_call_vector_return_with_source(
+                                self.store,
+                                candidate,
+                                &globals,
+                                session,
+                                &mut Some(&mut adapter),
+                            )?;
+                        (materialized.call_signature, return_type)
+                    }
+                };
+                Ok(Some((resolution, signature, return_type)))
+            })();
+            self.global_this_members = adapter.context.members;
+            self.completed_source_conditionals = adapter.context.completed;
+            self.new_source_conditionals
+                .extend(adapter.context.produced);
+            self.completed_global_values = adapter.context.values;
+            self.source_branch_recoveries = adapter.context.recoveries;
+            self.source_conditional_recoveries = adapter.context.semantic_results;
+            self.completed_source_returns = adapter.context.returns;
+            result
+        })();
+        self.finish_source_query();
+        result
+    }
+
+    pub(super) fn resolve_source_generic_call_vector(
+        &mut self,
+        request: super::generic_calls::GenericCallVectorRequest<'_>,
+        existing_call_signature: Option<SignatureId>,
+        this_argument: Option<TypeId>,
+    ) -> Result<
+        (
+            super::generic_calls::GenericCallVectorResolution,
+            SignatureId,
+            TypeId,
+        ),
+        super::generic_calls::GenericCallVectorError,
+    > {
+        let source_error = |error| {
+            super::generic_calls::GenericCallVectorError::Instantiation(
+                super::instantiate::InstantiationError::Declared(error),
+            )
+        };
+        self.begin_source_query();
+        let result = (|| {
+            let context = self.source_query_context().map_err(source_error)?;
+            let globals = context.globals.clone();
+            let strict = self.options.strict_function_types.ok_or_else(|| {
+                source_error(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidPreparedTypeQuery,
+                ))
+            })?;
+            let session = self.instantiation_session.as_deref_mut().ok_or_else(|| {
+                source_error(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidPreparedTypeQuery,
+                ))
+            })?;
+            let mut adapter = SourceTypeQueryAdapter {
+                context,
+                diagnostics: self.diagnostics,
+            };
+            let result = (|| {
+                let resolution = super::generic_calls::resolve_generic_call_vector_with_source(
+                    self.store,
+                    &globals,
+                    strict,
+                    request,
+                    existing_call_signature,
+                    session,
+                    this_argument,
+                    &mut adapter,
+                )?;
+                let materialized =
+                    super::generic_calls::materialize_generic_call_vector_source_with_source(
+                        self.store,
+                        &resolution,
+                        existing_call_signature,
+                        &globals,
+                        &adapter,
+                    )?;
+                let return_type = super::generic_calls::demand_generic_call_vector_return_with_source(
+                    self.store,
+                    &resolution,
+                    &globals,
+                    session,
+                    &mut Some(&mut adapter),
+                )?;
+                Ok((resolution, materialized.call_signature, return_type))
+            })();
+            self.global_this_members = adapter.context.members;
+            self.completed_source_conditionals = adapter.context.completed;
+            self.new_source_conditionals
+                .extend(adapter.context.produced);
+            self.completed_global_values = adapter.context.values;
+            self.source_branch_recoveries = adapter.context.recoveries;
+            self.source_conditional_recoveries = adapter.context.semantic_results;
+            self.completed_source_returns = adapter.context.returns;
+            result
+        })();
+        self.finish_source_query();
+        result
+    }
+
     pub(super) fn relate_source_types(
         &mut self,
         source: TypeId,
@@ -38519,7 +38741,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 &mut prepared,
             )?;
             for method in &methods {
-                for parameter in &method.parameters {
+                for parameter in method.source_parameters() {
                     self.execute_type_node(parameter.type_node, &plan, &mut prepared)?;
                 }
                 if method.return_type != node {
@@ -43254,7 +43476,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             };
             functions::finalize_function_structure(self.store, function, pending)
                 .map_err(function_type_error)?;
-            if function.parameters.is_empty() {
+            if function.all_parameters().next().is_none() {
                 continue;
             }
             let proof = functions::pending_function_type_proof(self.store, function)
@@ -45918,8 +46140,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let signature_annotation = plan.functions.values().any(|function| {
             function.return_type == node
                 || function
-                    .parameters
-                    .iter()
+                    .all_parameters()
                     .any(|parameter| parameter.type_node == node)
         }) || plan
             .interfaces
@@ -47466,7 +47687,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         functions::finalize_function_structure(self.store, &function, pending)
             .map_err(function_type_error)?;
         let resolved_type = pending.type_;
-        if !function.parameters.is_empty() {
+        if function.all_parameters().next().is_some() {
             let proof = functions::pending_function_type_proof(self.store, &function)
                 .map_err(function_type_error)?
                 .ok_or_else(|| {
@@ -47740,8 +47961,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 index += 1;
                 continue;
             }
-            let mut base_types = Vec::with_capacity(function.parameters.len());
-            for parameter in &function.parameters {
+            let mut base_types = Vec::with_capacity(function.all_parameters().count());
+            for parameter in function.all_parameters() {
                 base_types.push(self.execute_type_node(parameter.type_node, plan, prepared)?);
             }
             resolved.push(PendingParameterTypes {
@@ -52039,7 +52260,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     self.global_types.as_ref(),
                     self.instantiation_session.as_deref_mut(),
                 )
-                .map_err(|_| {
+                .map_err(|error| {
+                    trace_alias_instantiation_failure(
+                        self.store,
+                        "conditional_alias_instantiation",
+                        symbol,
+                        Some(declared_type),
+                        &error,
+                    );
                     type_node_unavailable(
                         TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
                             alias: symbol,
@@ -55187,12 +55415,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 }
                 self.validate_direct_alias_type(symbol, array.element_type, mapped_parameters)
             }
-            _ => Err(type_node_unavailable(
-                TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
-                    alias: symbol,
-                    declared_type: type_,
-                },
-            )),
+            _ => {
+                trace_alias_instantiation_failure(
+                    self.store,
+                    "direct_alias_kind",
+                    symbol,
+                    Some(type_),
+                    &mapped_parameters,
+                );
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                        alias: symbol,
+                        declared_type: type_,
+                    },
+                ))
+            }
         }
     }
 

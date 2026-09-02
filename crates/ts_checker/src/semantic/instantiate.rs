@@ -2,23 +2,26 @@
 //!
 //! This is the first exact slice of pinned `instantiateTypeWorker`. It covers
 //! primitive and literal leaves, direct type-parameter mapping, canonical
-//! Array/ReadonlyArray references under an explicit target capability, fixed
+//! Array/ReadonlyArray references under an explicit target capability, normalized
 //! canonical tuples, closed Record instances, direct full-arity generic
 //! class/interface references, indexed accesses, generic `keyof` indexes,
 //! authenticated selection-shaped mapped aliases, deferred intersections,
 //! template literals, intrinsic string mappings, ordinary property-object
 //! aliases, inline intersection objects,
 //! authenticated deferred conditionals, closed declaration-owned values,
-//! function return annotations under a checked source-call mapper, and unions
-//! with canonical alias arguments and union origins. Other object and
-//! signature instantiation needs its owning caches and is rejected.
+//! function return annotations under a checked source-call mapper, nongeneric
+//! source function signatures, and unions with canonical alias arguments and
+//! union origins. Other object and signature instantiation needs its owning
+//! caches and is rejected.
 
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    CanonicalGlobalTypes, TypeAliasId, TypeId, TypeMapperId,
+    CanonicalGlobalTypes, SignatureId, TypeAliasId, TypeId, TypeMapperId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
+    callable_sets::{CallableSetProjection, StoredCallableSetValidation},
+    callables::{CallableFamily, ValidatedSingleCallable},
     conditional_types::{
         ConditionalAliasIdentity, ConditionalBranchSource, ConditionalRemapLookup,
         ConditionalRemapProjection, ConditionalRemapResult, ConditionalTypeError,
@@ -29,7 +32,10 @@ use super::{
         remap_conditional_with_source, remap_deferred_conditional_with_session,
     },
     declared::{DeclaredTypeError, cached_ordinary_type_parameter_owner, type_list_key},
-    functions::{GenericFunctionAliasProjection, generic_function_alias_projection},
+    functions::{
+        GenericFunctionAliasProjection, StoredFunctionTypeValidation,
+        generic_function_alias_projection, validate_stored_function_type,
+    },
     indexed_access_types::{
         SourceAliasIndexedBoundPlan, SourceAliasIndexedReadMode, SourceAliasIndexedSelection,
         cached_deferred_indexed_access_type, get_instantiated_indexed_access_type,
@@ -71,7 +77,7 @@ use super::{
         DirectGenericReference, DirectGenericReferenceError, create_direct_generic_reference,
         validate_direct_generic_reference,
     },
-    signatures::ElementFlags,
+    signatures::{ElementFlags, SignatureFlags, SignatureInstantiationError, TupleElementInfo},
     store::{CachedSignatureLookup, SourceNodeParent},
     template_types::TemplateTypeError,
     tuple_types::{CanonicalTupleTypeRequest, TupleShape, TupleTypeError},
@@ -1848,6 +1854,7 @@ fn instantiate_type_with_alias_input_and_operand(
                     Some(TypeData::Conditional(_))
                 )
                 && source_callable_function_type_owner(store, type_).is_none()
+                && !store.type_has_function_type_provenance(type_)
             {
                 return Ok(());
             }
@@ -2082,6 +2089,522 @@ fn mapping_invariant_object_type(
     Ok(false)
 }
 
+pub(super) struct FunctionInstantiationShape {
+    pub(super) signature: SignatureId,
+    symbol: SemanticSymbolId,
+    pub(super) this_type: Option<TypeId>,
+    pub(super) parameters: Vec<TypeId>,
+    pub(super) return_type: TypeId,
+}
+
+/// The original function keeps its declaration-owned caches. Only its captured
+/// types are mapped here. Local generic signatures need fresh constraint proofs.
+pub(super) fn function_instantiation_shape(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+) -> Result<FunctionInstantiationShape, InstantiationError> {
+    let invalid = || InstantiationError::InvalidType(source);
+    if !store.type_has_function_type_provenance(source) {
+        return Err(InstantiationError::UnsupportedType(source));
+    }
+    match validate_stored_function_type(store, source) {
+        StoredFunctionTypeValidation::Valid(_) => {}
+        StoredFunctionTypeValidation::Pending => {
+            return Err(InstantiationError::UnsupportedType(source));
+        }
+        _ => return Err(invalid()),
+    }
+    let record = store.type_payload(source).ok_or_else(invalid)?;
+    let structured = record.data().structured().ok_or_else(invalid)?;
+    let Some([signature]) = structured.signatures.as_deref() else {
+        return Err(invalid());
+    };
+    let signature_record = store.signature(*signature).ok_or_else(invalid)?;
+    if !signature_record.type_parameters().is_empty()
+        || signature_record.resolved_type_predicate().is_some()
+        || record.alias().is_some()
+    {
+        return Err(InstantiationError::UnsupportedType(source));
+    }
+    if signature_record.target().is_some()
+        || signature_record.mapper().is_some()
+        || signature_record.composite().is_some()
+        || signature_record.flags().contains(SignatureFlags::CONSTRUCT)
+        || structured.call_signature_count != 1
+    {
+        return Err(invalid());
+    }
+    let parameters = store
+        .callable_signature_parameter_types(*signature)
+        .ok_or_else(invalid)?;
+    let this_type = store.callable_signature_this_parameter_type(*signature);
+    if parameters.len() != signature_record.parameters().len()
+        || this_type.is_some() != signature_record.this_parameter().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(FunctionInstantiationShape {
+        signature: *signature,
+        symbol: record.symbol().ok_or_else(invalid)?,
+        this_type,
+        parameters: parameters.to_vec(),
+        return_type: signature_record
+            .resolved_return_type()
+            .ok_or(InstantiationError::UnsupportedType(source))?,
+    })
+}
+
+fn function_mapper_matches(
+    store: &CanonicalTypeMapperStore,
+    actual: TypeMapperId,
+    mapping: InstantiationMapping<'_>,
+) -> bool {
+    match mapping {
+        InstantiationMapping::Stored(expected) => actual == expected,
+        InstantiationMapping::Vector { sources, targets } => {
+            store.type_mapper_has_exact_endpoints(actual, sources, targets) == Some(true)
+        }
+    }
+}
+
+/// Reads every mapped edge through the same canonical mapper used by publication.
+fn mapped_function_projection(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    actual: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+    active: &mut HashSet<TypeId>,
+) -> Result<(ValidatedSingleCallable, Option<TypeId>), InstantiationError> {
+    let invalid = || InstantiationError::InvalidType(actual);
+    let shape = function_instantiation_shape(store, source)?;
+    let record = store.type_payload(actual).ok_or_else(invalid)?;
+    let TypeData::Object(object) = record.data() else {
+        return Err(invalid());
+    };
+    let structured = record.data().structured().ok_or_else(invalid)?;
+    let Some([signature]) = structured.signatures.as_deref() else {
+        return Err(invalid());
+    };
+    let original = store.signature(shape.signature).ok_or_else(invalid)?;
+    let instantiated = store.signature(*signature).ok_or_else(invalid)?;
+    if actual == source
+        || record.flags() != TypeFlags::OBJECT
+        || record.object_flags()
+            != ObjectFlags::ANONYMOUS | ObjectFlags::INSTANTIATED | ObjectFlags::MEMBERS_RESOLVED
+        || record.symbol() != Some(shape.symbol)
+        || record.alias().is_some()
+        || object.target != Some(source)
+        || object.mapper != Some(mapper)
+        || store.mapper_payload(mapper).is_none()
+        || structured.members.is_some()
+        || structured.properties.is_some()
+        || structured.index_infos.is_some()
+        || structured.call_signature_count != 1
+        || *signature == shape.signature
+        || instantiated.target() != Some(shape.signature)
+        || instantiated.mapper() != Some(mapper)
+        || instantiated.declaration() != original.declaration()
+        || instantiated.flags() != original.flags() & SignatureFlags::PROPAGATING_FLAGS
+        || instantiated.min_argument_count() != original.min_argument_count()
+        || !instantiated.type_parameters().is_empty()
+        || instantiated.resolved_type_predicate().is_some()
+        || instantiated.composite().is_some()
+        || instantiated.parameters().len() != shape.parameters.len()
+        || instantiated.this_parameter().is_some() != shape.this_type.is_some()
+        || store
+            .callable_signature_parameter_types(*signature)
+            .is_some()
+    {
+        return Err(invalid());
+    }
+    for (other, candidate) in store.types() {
+        if other == actual {
+            continue;
+        }
+        if candidate.data().structured().is_some_and(|data| {
+            data.signatures
+                .as_deref()
+                .is_some_and(|signatures| signatures.contains(signature))
+        }) || candidate.object_flags().contains(ObjectFlags::INSTANTIATED)
+            && matches!(candidate.data(), TypeData::Object(data)
+                if data.target == Some(source) && data.mapper == Some(mapper))
+        {
+            return Err(invalid());
+        }
+    }
+    let mut parameters = Vec::with_capacity(shape.parameters.len());
+    let mut this_type = None;
+    for ((source_symbol, actual_symbol), template) in original
+        .this_parameter()
+        .into_iter()
+        .zip(instantiated.this_parameter())
+        .chain(
+            original
+                .parameters()
+                .iter()
+                .copied()
+                .zip(instantiated.parameters().iter().copied()),
+        )
+        .zip(
+            shape
+                .this_type
+                .into_iter()
+                .chain(shape.parameters.iter().copied()),
+        )
+    {
+        if !store.instantiated_signature_symbol_matches(source_symbol, actual_symbol, mapper) {
+            return Err(invalid());
+        }
+        let value = store
+            .value_symbol_links(actual_symbol)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(invalid)?;
+        if cached_instantiated_type_worker(
+            store,
+            template,
+            InstantiationMapping::Stored(mapper),
+            array_targets,
+            None,
+            active,
+        )? != Some(value)
+        {
+            return Err(invalid());
+        }
+        if original.this_parameter() == Some(source_symbol) {
+            this_type = Some(value);
+        } else {
+            parameters.push(value);
+        }
+    }
+    let return_type = instantiated.resolved_return_type().ok_or_else(invalid)?;
+    if cached_instantiated_type_worker(
+        store,
+        shape.return_type,
+        InstantiationMapping::Stored(mapper),
+        array_targets,
+        None,
+        active,
+    )? != Some(return_type)
+    {
+        return Err(invalid());
+    }
+    let rest_parameter = if instantiated.has_rest_parameter() {
+        Some(parameters.pop().ok_or_else(invalid)?)
+    } else {
+        None
+    };
+    let minimum = usize::try_from(instantiated.min_argument_count()).map_err(|_| invalid())?;
+    if minimum > parameters.len() {
+        return Err(invalid());
+    }
+    Ok((
+        ValidatedSingleCallable {
+            owner: actual,
+            signature: *signature,
+            parameters,
+            rest_parameter,
+            min_argument_count: minimum,
+            return_type: Some(return_type),
+            strict_variance_exempt: false,
+        },
+        this_type,
+    ))
+}
+
+/// Mapped source functions use the normal callable provider and retain all edges.
+pub(super) fn validate_instantiated_function_callable(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<StoredCallableSetValidation> {
+    let record = store.type_payload(type_)?;
+    let TypeData::Object(object) = record.data() else {
+        return None;
+    };
+    if !record.object_flags().contains(ObjectFlags::INSTANTIATED)
+        || !object
+            .target
+            .is_some_and(|target| store.type_has_function_type_provenance(target))
+    {
+        return None;
+    }
+    let family = CallableFamily::FunctionType;
+    let result = (|| {
+        let target = object.target?;
+        let mapper = object.mapper?;
+        let (callable, this_type) = mapped_function_projection(
+            store,
+            target,
+            type_,
+            mapper,
+            array_targets,
+            &mut HashSet::from([target]),
+        )
+        .ok()?;
+        let mut edges = vec![target];
+        edges.extend(callable.parameters.iter().copied());
+        edges.extend(callable.rest_parameter);
+        edges.extend(callable.return_type);
+        edges.extend(this_type);
+        Some((callable, edges))
+    })();
+    Some(match result {
+        Some((callable, edges)) => StoredCallableSetValidation::Valid {
+            family,
+            projection: CallableSetProjection {
+                owner: type_,
+                call_signatures: Box::new([callable]),
+                construct_signatures: Box::new([]),
+            },
+            edges,
+        },
+        None => StoredCallableSetValidation::Malformed { family },
+    })
+}
+
+/// Signature readers use the same owner proof as overload and relation readers.
+pub(super) fn instantiated_function_signature_projection(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<(
+    TypeId,
+    Result<(ValidatedSingleCallable, Option<TypeId>), InstantiationError>,
+)> {
+    let mut owner = None;
+    for (type_, record) in store.types() {
+        if record.object_flags().contains(ObjectFlags::INSTANTIATED)
+            && matches!(record.data(), TypeData::Object(object)
+                if object.target.is_some_and(|target| store.type_has_function_type_provenance(target)))
+            && record.data().structured().is_some_and(|structured| {
+                structured
+                    .signatures
+                    .as_deref()
+                    .is_some_and(|signatures| signatures.contains(&signature))
+            })
+        {
+            if owner.replace(type_).is_some() {
+                return Some((type_, Err(InstantiationError::InvalidType(type_))));
+            }
+        }
+    }
+    let owner = owner?;
+    Some((
+        owner,
+        (|| {
+            let invalid = || InstantiationError::InvalidType(owner);
+            let TypeData::Object(object) = store.type_payload(owner).ok_or_else(invalid)?.data()
+            else {
+                return Err(invalid());
+            };
+            let source = object.target.ok_or_else(invalid)?;
+            mapped_function_projection(
+                store,
+                source,
+                owner,
+                object.mapper.ok_or_else(invalid)?,
+                array_targets,
+                &mut HashSet::from([source]),
+            )
+        })(),
+    ))
+}
+
+fn cached_function_instantiation(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    active: &mut HashSet<TypeId>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    let shape = function_instantiation_shape(store, source)?;
+    let mut unchanged = true;
+    for template in shape
+        .this_type
+        .into_iter()
+        .chain(shape.parameters)
+        .chain([shape.return_type])
+    {
+        let Some(mapped) =
+            cached_instantiated_type_worker(store, template, mapping, array_targets, None, active)?
+        else {
+            return Ok(None);
+        };
+        unchanged &= mapped == template;
+    }
+    let mut cached = None;
+    for (actual, record) in store.types() {
+        let TypeData::Object(object) = record.data() else {
+            continue;
+        };
+        if record.object_flags().contains(ObjectFlags::INSTANTIATED)
+            && object.target == Some(source)
+            && object
+                .mapper
+                .is_some_and(|mapper| function_mapper_matches(store, mapper, mapping))
+        {
+            if unchanged || cached.replace(actual).is_some() {
+                return Err(InstantiationError::InvalidType(actual));
+            }
+            mapped_function_projection(
+                store,
+                source,
+                actual,
+                object
+                    .mapper
+                    .ok_or(InstantiationError::InvalidType(actual))?,
+                array_targets,
+                active,
+            )?;
+        }
+    }
+    Ok(if unchanged { Some(source) } else { cached })
+}
+
+fn instantiate_function_type(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    if let Some(cached) = cached_function_instantiation(
+        store,
+        source,
+        mapping,
+        array_targets,
+        &mut HashSet::from([source]),
+    )? {
+        return Ok(cached);
+    }
+    let shape = function_instantiation_shape(store, source)?;
+    let mark = session.limit_event_mark();
+    let mut mapped = Vec::new();
+    for template in shape
+        .this_type
+        .into_iter()
+        .chain(shape.parameters.iter().copied())
+        .chain([shape.return_type])
+    {
+        mapped.push(instantiate_type_with_alias(
+            store,
+            template,
+            mapping,
+            array_targets,
+            None,
+            session,
+        )?);
+        if session.limit_event_occurred_since(mark) {
+            return session
+                .recovery_error_type()
+                .ok_or(InstantiationError::InvalidType(source));
+        }
+    }
+    for (template, actual) in shape
+        .this_type
+        .into_iter()
+        .chain(shape.parameters.iter().copied())
+        .chain([shape.return_type])
+        .zip(&mapped)
+    {
+        if cached_instantiated_type_worker(
+            store,
+            template,
+            mapping,
+            array_targets,
+            None,
+            &mut HashSet::from([source]),
+        )? != Some(*actual)
+        {
+            return Err(InstantiationError::InvalidType(source));
+        }
+    }
+    if let Some(cached) = cached_function_instantiation(
+        store,
+        source,
+        mapping,
+        array_targets,
+        &mut HashSet::from([source]),
+    )? {
+        return Ok(cached);
+    }
+    if !store.try_reserve_types(1) || !store.try_reserve_mappers(1) {
+        return Err(InstantiationError::Union(LiteralTypeCacheError::Capacity));
+    }
+    let mapper = match mapping {
+        InstantiationMapping::Stored(mapper) => mapper,
+        InstantiationMapping::Vector { sources, targets } => store
+            .new_type_mapper(sources.to_vec(), targets.to_vec())
+            .ok_or(InstantiationError::InvalidType(source))?,
+    };
+    let signature = store
+        .instantiate_signature(shape.signature, mapper)
+        .map_err(|error| match error {
+            SignatureInstantiationError::Capacity(_) => {
+                InstantiationError::Union(LiteralTypeCacheError::Capacity)
+            }
+            _ => InstantiationError::InvalidType(source),
+        })?;
+    let instantiated = store
+        .signature(signature)
+        .ok_or(InstantiationError::InvalidType(source))?;
+    let symbols = instantiated
+        .this_parameter()
+        .into_iter()
+        .chain(instantiated.parameters().iter().copied())
+        .collect::<Vec<_>>();
+    let return_type = mapped
+        .pop()
+        .ok_or(InstantiationError::InvalidType(source))?;
+    for (symbol, type_) in symbols.into_iter().zip(mapped) {
+        let links = store
+            .value_symbol_links(symbol)
+            .cloned()
+            .ok_or(InstantiationError::InvalidType(source))?;
+        if links
+            .resolved_type
+            .is_some_and(|previous| previous != type_)
+        {
+            return Err(InstantiationError::InvalidType(source));
+        }
+        if links.resolved_type.is_none() {
+            assert!(store.set_value_symbol_links(
+                symbol,
+                super::links::ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..links
+                }
+            ));
+        }
+    }
+    assert!(store.set_signature_resolved_return_type(signature, Some(return_type)));
+    let actual = store
+        .alloc_plain_object_type(
+            ObjectFlags::ANONYMOUS | ObjectFlags::INSTANTIATED,
+            Some(shape.symbol),
+        )
+        .ok_or(InstantiationError::Union(LiteralTypeCacheError::Capacity))?;
+    assert!(store.set_object_target_and_mapper(actual, Some(source), Some(mapper)));
+    assert!(store.set_structured_type_members(
+        actual,
+        None,
+        None,
+        Some(vec![signature]),
+        None,
+        None
+    ));
+    mapped_function_projection(
+        store,
+        source,
+        actual,
+        mapper,
+        array_targets,
+        &mut HashSet::from([source]),
+    )?;
+    Ok(actual)
+}
+
 fn closed_mapping_identity_error(
     type_: TypeId,
     error: super::relater::RelationUnavailable,
@@ -2169,6 +2692,22 @@ fn could_contain_installed_type_variables_worker(
     let record = store
         .type_payload(type_)
         .ok_or(InstantiationError::InvalidType(type_))?;
+    if let Some(tuple) = normalizable_tuple_shape(store, type_)? {
+        let result = tuple
+            .element_types()
+            .iter()
+            .try_fold(false, |contains, element| {
+                Ok(contains
+                    | could_contain_installed_type_variables_worker(
+                        store,
+                        *element,
+                        array_targets,
+                        seen,
+                    )?)
+            });
+        seen.remove(&type_);
+        return result;
+    }
     let result = match record.data() {
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(false),
         TypeData::Object(_)
@@ -2654,13 +3193,25 @@ fn instantiable_tuple_shape(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> Result<Option<TupleShape<'_>>, InstantiationError> {
-    let shape = store.canonical_tuple_shape(type_)?;
+    let shape = normalizable_tuple_shape(store, type_)?;
     if shape.is_some_and(|shape| {
         shape.combined_flags().intersects(ElementFlags::VARIABLE)
-            || store
-                .type_payload(type_)
-                .is_some_and(|record| record.object_flags().contains(ObjectFlags::ARRAY_LITERAL))
     }) {
+        return Err(InstantiationError::UnsupportedType(type_));
+    }
+    Ok(shape)
+}
+
+fn normalizable_tuple_shape(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<TupleShape<'_>>, InstantiationError> {
+    let shape = store.canonical_tuple_shape(type_)?;
+    if shape.is_some()
+        && store
+            .type_payload(type_)
+            .is_some_and(|record| record.object_flags().contains(ObjectFlags::ARRAY_LITERAL))
+    {
         return Err(InstantiationError::UnsupportedType(type_));
     }
     Ok(shape)
@@ -2955,7 +3506,7 @@ fn validate_instantiable_member_type_worker(
             }
         }
         TypeData::TypeReference(_) | TypeData::Interface(_) | TypeData::Tuple(_) => {
-            if let Some(tuple) = instantiable_tuple_shape(store, type_)? {
+            if let Some(tuple) = normalizable_tuple_shape(store, type_)? {
                 tuple.element_types().iter().try_for_each(|element| {
                     validate_instantiable_member_type_worker(
                         store,
@@ -3075,6 +3626,23 @@ fn instantiated_member_type_matches_worker(
                 .map(|expected| expected == Some(actual))
             } else if mapping_invariant_object_type(store, template, array_targets)? {
                 Ok(template == actual)
+            } else if source_callable_function_type_owner(store, template).is_some() {
+                Ok(instantiated_function_member_type_matches(
+                    store,
+                    template,
+                    actual,
+                    mapper,
+                    array_targets,
+                ))
+            } else if function_instantiation_shape(store, template).is_ok() {
+                cached_function_instantiation(
+                    store,
+                    template,
+                    InstantiationMapping::Stored(mapper),
+                    array_targets,
+                    active,
+                )
+                .map(|expected| expected == Some(actual))
             } else {
                 Ok(instantiated_function_member_type_matches(
                     store,
@@ -3102,7 +3670,7 @@ fn instantiated_member_type_matches_worker(
             instantiated_member_union_matches(store, template, actual, mapper, array_targets)
         }
         TypeData::TypeReference(_) | TypeData::Interface(_) | TypeData::Tuple(_) => {
-            if instantiable_tuple_shape(store, template)?.is_some() {
+            if normalizable_tuple_shape(store, template)?.is_some() {
                 cached_instantiated_member_type(
                     store,
                     template,
@@ -3332,6 +3900,12 @@ fn cached_instantiated_type_with_operand_worker(
         .type_payload(template)
         .ok_or(InstantiationError::InvalidType(template))?;
     let result = (|| match record.data() {
+        TypeData::Tuple(_) => {
+            if alias_override.is_some() || operand.is_some() {
+                return Err(InstantiationError::UnsupportedType(template));
+            }
+            cached_tuple_instantiation(store, template, mapping, array_targets, active)
+        }
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => {
             Ok(Some(template))
         }
@@ -3718,6 +4292,15 @@ fn cached_instantiated_type_with_operand_worker(
                 return cached_function_member_type(store, template, mapper, array_targets)
                     .map_err(|error| function_member_instantiation_error(template, error));
             }
+            if store.type_has_function_type_provenance(template) {
+                return cached_function_instantiation(
+                    store,
+                    template,
+                    mapping,
+                    array_targets,
+                    active,
+                );
+            }
             let Some(projection) = source_property_object_projection(store, template)
                 .map_err(|_| InstantiationError::InvalidType(template))?
             else {
@@ -3790,42 +4373,12 @@ fn cached_instantiated_type_with_operand_worker(
                 (identity_symbol, &identity_arguments),
             )
         }
-        TypeData::TypeReference(_) | TypeData::Interface(_) | TypeData::Tuple(_) => {
-            if let Some(tuple) = instantiable_tuple_shape(store, template)? {
-                if operand.is_some() {
+        TypeData::TypeReference(_) | TypeData::Interface(_) => {
+            if normalizable_tuple_shape(store, template)?.is_some() {
+                if alias_override.is_some() || operand.is_some() {
                     return Err(InstantiationError::UnsupportedType(template));
                 }
-                let mut elements = Vec::with_capacity(tuple.element_types().len());
-                for &element in tuple.element_types() {
-                    let Some(mapped) = cached_instantiated_type_worker(
-                        store,
-                        element,
-                        mapping,
-                        array_targets,
-                        None,
-                        active,
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    elements.push(mapped);
-                }
-                if elements.as_slice() == tuple.element_types() {
-                    return Ok(Some(template));
-                }
-                let Some(cached) =
-                    store.relation_object_instantiation(tuple.target(), type_list_key(&elements))
-                else {
-                    return Ok(None);
-                };
-                let actual = instantiable_tuple_shape(store, cached)?
-                    .ok_or(InstantiationError::InvalidType(cached))?;
-                if actual.target() != tuple.target()
-                    || actual.element_types() != elements.as_slice()
-                {
-                    return Err(InstantiationError::InvalidType(cached));
-                }
-                return Ok(Some(cached));
+                return cached_tuple_instantiation(store, template, mapping, array_targets, active);
             }
             if let Some(targets) = array_targets {
                 store.canonical_array_reference_with_targets(targets, template)?;
@@ -4775,6 +5328,12 @@ fn instantiate_type_worker(
     mut source: Option<&mut InstantiationSource<'_>>,
     operand: Option<&SourceAliasOperandGraph>,
 ) -> Result<TypeId, InstantiationError> {
+    if normalizable_tuple_shape(store, type_)?.is_some() {
+        if alias.is_some() || operand.is_some() {
+            return Err(InstantiationError::UnsupportedType(type_));
+        }
+        return instantiate_tuple_type(store, type_, mapping, array_targets, session);
+    }
     let work = {
         let record = store
             .type_payload(type_)
@@ -4889,6 +5448,17 @@ fn instantiate_type_worker(
                         return Err(InstantiationError::UnsupportedType(type_));
                     }
                     InstantiationWork::FunctionType
+                } else if store.type_has_function_type_provenance(type_) {
+                    if alias.is_some() {
+                        return Err(InstantiationError::UnsupportedType(type_));
+                    }
+                    return instantiate_function_type(
+                        store,
+                        type_,
+                        mapping,
+                        array_targets,
+                        session,
+                    );
                 } else {
                     match source_property_object_projection(store, type_)
                         .map_err(|_| InstantiationError::InvalidType(type_))?
@@ -5847,6 +6417,157 @@ fn instantiate_string_mapping(
             session,
         )
         .map_err(Into::into)
+}
+
+fn tuple_instantiation_error(source: TypeId, error: TupleTypeError) -> InstantiationError {
+    match error {
+        TupleTypeError::Capacity => InstantiationError::Union(LiteralTypeCacheError::Capacity),
+        TupleTypeError::ArrayType(error) => InstantiationError::Array(error),
+        TupleTypeError::LengthType(error) => InstantiationError::Union(error),
+        TupleTypeError::UnsupportedElementFlags { .. }
+        | TupleTypeError::UnsupportedElementOrder { .. }
+        | TupleTypeError::ArrayRestCollapseUnavailable => {
+            InstantiationError::UnsupportedType(source)
+        }
+        _ => InstantiationError::InvalidType(source),
+    }
+}
+
+/// Expands mapped variadic elements before the canonical tuple constructor runs.
+/// Union spreads and layouts that need a rest-element union remain unsupported.
+fn normalized_tuple_elements(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    elements: &[TypeId],
+    infos: &[TupleElementInfo],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(Vec<TypeId>, Vec<TupleElementInfo>), InstantiationError> {
+    if elements.len() != infos.len() {
+        return Err(InstantiationError::InvalidType(source));
+    }
+    let mut types = Vec::new();
+    let mut normalized_infos = Vec::new();
+    for (&element, &info) in elements.iter().zip(infos) {
+        if info.flags() != ElementFlags::VARIADIC {
+            types.push(element);
+            normalized_infos.push(info);
+            continue;
+        }
+        let record = store
+            .type_payload(element)
+            .ok_or(InstantiationError::InvalidType(element))?;
+        if matches!(record.data(), TypeData::TypeParameter(_)) {
+            types.push(element);
+            normalized_infos.push(info);
+        } else if let Some(tuple) = store
+            .canonical_tuple_shape(element)
+            .map_err(|error| tuple_instantiation_error(element, error))?
+        {
+            if types.len().saturating_add(tuple.element_types().len()) >= 10_000 {
+                return Err(InstantiationError::UnsupportedType(source));
+            }
+            types.extend_from_slice(tuple.element_types());
+            normalized_infos.extend_from_slice(tuple.element_infos());
+        } else if record.flags().intersects(TypeFlags::ANY) {
+            types.push(element);
+            normalized_infos.push(TupleElementInfo::new(
+                ElementFlags::REST,
+                info.labeled_declaration(),
+            ));
+        } else if let Some(targets) = array_targets
+            && let Some(array) = store.canonical_array_reference_with_targets(targets, element)?
+        {
+            types.push(array.element_type);
+            normalized_infos.push(TupleElementInfo::new(
+                ElementFlags::REST,
+                info.labeled_declaration(),
+            ));
+        } else {
+            return Err(InstantiationError::UnsupportedType(element));
+        }
+    }
+    if let Some(last_required) = normalized_infos
+        .iter()
+        .rposition(|info| info.flags() == ElementFlags::REQUIRED)
+    {
+        for info in &mut normalized_infos[..last_required] {
+            if info.flags() == ElementFlags::OPTIONAL {
+                *info = TupleElementInfo::new(ElementFlags::REQUIRED, info.labeled_declaration());
+            }
+        }
+    }
+    Ok((types, normalized_infos))
+}
+
+fn cached_tuple_instantiation(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    active: &mut HashSet<TypeId>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    let tuple = normalizable_tuple_shape(store, source)?
+        .ok_or(InstantiationError::InvalidType(source))?;
+    let mut elements = Vec::with_capacity(tuple.element_types().len());
+    for &element in tuple.element_types() {
+        let Some(mapped) =
+            cached_instantiated_type_worker(store, element, mapping, array_targets, None, active)?
+        else {
+            return Ok(None);
+        };
+        elements.push(mapped);
+    }
+    if elements == tuple.element_types() {
+        return Ok(Some(source));
+    }
+    let (elements, infos) = normalized_tuple_elements(
+        store,
+        source,
+        &elements,
+        tuple.element_infos(),
+        array_targets,
+    )?;
+    let mut request = CanonicalTupleTypeRequest::new(&elements, &infos, tuple.is_readonly());
+    request.array_targets = array_targets;
+    store
+        .cached_canonical_tuple_type(request)
+        .map_err(|error| tuple_instantiation_error(source, error))
+}
+
+fn instantiate_tuple_type(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    let tuple = normalizable_tuple_shape(store, source)?
+        .ok_or(InstantiationError::InvalidType(source))?;
+    let original = tuple.element_types().to_vec();
+    let infos = tuple.element_infos().to_vec();
+    let readonly = tuple.is_readonly();
+    let mut elements = Vec::with_capacity(original.len());
+    let mark = session.limit_event_mark();
+    for &element in &original {
+        let mapped =
+            instantiate_type_with_alias(store, element, mapping, array_targets, None, session)?;
+        if session.limit_event_occurred_since(mark) {
+            return session
+                .recovery_error_type()
+                .ok_or(InstantiationError::InvalidType(source));
+        }
+        elements.push(mapped);
+    }
+    if elements == original {
+        return Ok(source);
+    }
+    let (elements, infos) =
+        normalized_tuple_elements(store, source, &elements, &infos, array_targets)?;
+    let mut request = CanonicalTupleTypeRequest::new(&elements, &infos, readonly);
+    request.array_targets = array_targets;
+    store
+        .create_canonical_tuple_type(request)
+        .map_err(|error| tuple_instantiation_error(source, error))
 }
 
 fn instantiate_reference(

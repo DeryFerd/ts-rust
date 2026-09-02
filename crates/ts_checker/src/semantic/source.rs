@@ -1396,6 +1396,32 @@ fn observe_loop_failure(
     }
 }
 
+// Keep raw call failures bounded before a source converter reduces their detail.
+pub(super) fn observe_call_failure_detail(stage: &'static str, detail: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let mut record = [0_u8; 1024];
+    let Some(mut output) = record.get_mut(..1000) else {
+        return;
+    };
+    let truncated = write!(output, "call_failure stage={stage} {detail}").is_err();
+    let used = 1000_usize.saturating_sub(output.len());
+    let suffix = if truncated {
+        b" record_truncated=1\n"
+    } else {
+        b" record_truncated=0\n"
+    };
+    let Some(end) = used.checked_add(suffix.len()) else {
+        return;
+    };
+    let Some(tail) = record.get_mut(used..end) else {
+        return;
+    };
+    tail.copy_from_slice(suffix);
+    if let Some(bytes) = record.get(..end) {
+        let _ = std::io::stderr().write_all(bytes);
+    }
+}
+
 // This records an error at one propagation boundary, not a final project failure.
 fn observe_import_value_failure(
     stage: &'static str,
@@ -39540,10 +39566,16 @@ fn check_expression_type_with_capture_context(
             )? {
                 checked
             } else if property.class_access_context().is_none()
-                && super::source_properties::is_cold_direct_nongeneric_interface(
+                && (super::source_properties::is_cold_direct_nongeneric_interface(
                     store,
                     receiver.result,
+                ) || super::source_properties::is_source_class_method_receiver(
+                    store,
+                    host,
+                    property.node,
+                    receiver.result,
                 )
+                .map_err(|error| SourcePlanner::property_plan_error(expression.node, error))?)
             {
                 check_direct_source_property_with_source(
                     store,

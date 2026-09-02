@@ -1913,17 +1913,36 @@ fn plan_direct_interface_heritage_inner(
             let mut callback_host = host
                 .name_resolver_host(store)
                 .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
-            CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
-                .map_err(|_| DirectInterfaceHeritageError::Invalid)?
-                .resolve(
-                    Some(CanonicalResolutionLocation::Bound(expression)),
-                    &identifier.text,
-                    SymbolFlags::TYPE,
-                    None,
-                    false,
-                    false,
-                )
-                .map_err(|_| DirectInterfaceHeritageError::Invalid)?
+            let resolved =
+                CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+                    .map_err(|_| DirectInterfaceHeritageError::Invalid)?
+                    .resolve(
+                        Some(CanonicalResolutionLocation::Bound(expression)),
+                        &identifier.text,
+                        SymbolFlags::TYPE,
+                        None,
+                        false,
+                        false,
+                    );
+            match resolved {
+                Ok(symbol) => symbol,
+                Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias)) => {
+                    // A real ambient class is outside the source-alias header.
+                    // Member demand keeps the class-base limit below.
+                    Some(
+                        super::source_imports::authenticated_ambient_module_import_alias_target(
+                            store, host, expression, alias,
+                        )
+                        .filter(|target| {
+                            store.symbol(*target).is_some_and(|record| {
+                                record.flags().contains(SymbolFlags::CLASS)
+                            })
+                        })
+                        .ok_or(DirectInterfaceHeritageError::Invalid)?,
+                    )
+                }
+                Err(_) => return Err(DirectInterfaceHeritageError::Invalid),
+            }
         } else {
             Some(resolve_qualified_interface_base(store, host, expression)?)
         };

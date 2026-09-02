@@ -967,6 +967,73 @@ impl CanonicalTypeMapperStore {
             .map_err(|_| preparation_error(error_node, TupleTypeError::InvalidPreparedQuery))
     }
 
+    /// Reads the exact tuple or array destination without allocating a type.
+    pub(super) fn cached_canonical_tuple_type(
+        &self,
+        request: CanonicalTupleTypeRequest<'_>,
+    ) -> Result<Option<TypeId>, TupleTypeError> {
+        self.validate_tuple_request(request)?;
+        if request.element_infos.is_empty()
+            && !request.readonly
+            && let Some(cached) = self.canonical_empty_tuple_type_cache()
+        {
+            self.validate_canonical_empty_tuple_type(cached)
+                .map_err(|_| TupleTypeError::InvalidTargetCache(cached))?;
+            return Ok(Some(cached));
+        }
+        if request.element_infos.len() == 1
+            && request.element_infos[0].flags() == ElementFlags::REST
+        {
+            let targets = request
+                .array_targets
+                .ok_or(TupleTypeError::ArrayRestCollapseUnavailable)?;
+            let target = if request.readonly {
+                targets.readonly_array_type()
+            } else {
+                targets.array_type()
+            };
+            let Some(cached) =
+                self.relation_object_instantiation(target, type_list_key(request.element_types))
+            else {
+                return Ok(None);
+            };
+            let reference = self
+                .canonical_array_reference_with_targets(targets, cached)?
+                .ok_or(TupleTypeError::InvalidTargetCache(cached))?;
+            if reference.element_type != request.element_types[0]
+                || reference.readonly != request.readonly
+                || reference.array_literal
+            {
+                return Err(TupleTypeError::InvalidTargetCache(cached));
+            }
+            return Ok(Some(cached));
+        }
+        let key = CanonicalTupleTargetKey {
+            element_infos: clone_with_capacity(request.element_infos)?,
+            readonly: request.readonly,
+        };
+        let Some(target) = self.canonical_tuple_target(&key).map(|entry| entry.target) else {
+            return Ok(None);
+        };
+        self.validate_canonical_tuple_target(target)?;
+        let Some(cached) =
+            self.relation_object_instantiation(target, type_list_key(request.element_types))
+        else {
+            return Ok(None);
+        };
+        if cached == target {
+            let shape = self
+                .canonical_tuple_shape(target)?
+                .ok_or(TupleTypeError::InvalidTargetCache(target))?;
+            if shape.element_types() != request.element_types {
+                return Err(TupleTypeError::InvalidTargetCache(target));
+            }
+        } else {
+            self.validate_canonical_tuple_instance(target, cached, request.element_types)?;
+        }
+        Ok(Some(cached))
+    }
+
     /// Creates or reuses one supported concrete tuple identity.
     ///
     /// Target ownership is keyed only by element flags, label declarations,

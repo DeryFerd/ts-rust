@@ -3226,6 +3226,19 @@ fn check_direct_source_property_with_source_mode(
                 .map(Some)
                 .map_err(SourcePropertyQueryError::Source);
             }
+            if let Some(property) = resolve_source_class_callable_library_property(
+                store,
+                host,
+                global_types,
+                options,
+                plan.node,
+                receiver,
+                name,
+                session,
+                diagnostics,
+            )? {
+                return Ok(Some(property));
+            }
             let property_alias =
                 super::object_aliases::property_object_alias_projection(store, receiver)?.is_some();
             let target = store
@@ -3365,6 +3378,90 @@ fn check_direct_source_property_with_source_mode(
             .map_err(SourcePropertyQueryError::Source)
         },
     )
+}
+
+/// Proves that a method value can use the source-aware Function member lookup.
+pub(super) fn is_source_class_method_receiver(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    receiver: TypeId,
+) -> Result<bool, SourcePropertyError> {
+    let Some(member) = store.type_payload(receiver).and_then(TypeRecord::symbol) else {
+        return Ok(false);
+    };
+    let Some(symbol) = store.symbol(member) else {
+        return Err(SourcePropertyError::InvalidCache(node));
+    };
+    if !symbol.flags().contains(SymbolFlags::METHOD)
+        || symbol.flags().contains(SymbolFlags::OPTIONAL)
+        || symbol
+            .parent()
+            .and_then(|owner| store.source_class_provenance_for_symbol(owner))
+            .is_none()
+    {
+        return Ok(false);
+    }
+    // This validates the retained class plan, method value and signature caches.
+    let source = classes::class_member_source(store, host, member)
+        .map_err(|error| class_member_query_error(node, error))?;
+    if source.origin != ClassMemberOrigin::Method || source.side != ClassPropertySide::Instance {
+        return Ok(false);
+    }
+    if store
+        .value_symbol_links(member)
+        .and_then(|links| links.resolved_type)
+        != Some(receiver)
+    {
+        return Err(SourcePropertyError::InvalidCache(node));
+    }
+    let structured = store
+        .type_payload(receiver)
+        .and_then(|record| record.data().structured())
+        .ok_or(SourcePropertyError::InvalidCache(node))?;
+    if structured.members.is_some()
+        || structured.properties.is_some()
+        || structured.call_signature_count == 0
+        || structured.signatures.as_ref().map(Vec::len) != Some(structured.call_signature_count)
+    {
+        return Err(SourcePropertyError::InvalidCache(node));
+    }
+    Ok(true)
+}
+
+/// Source class methods have no own properties. Validate that fact before
+/// querying the selected Function interface with the caller's query state.
+#[allow(clippy::too_many_arguments)]
+fn resolve_source_class_callable_library_property(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    node: NodeRef,
+    receiver: TypeId,
+    name: &str,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<Option<ResolvedOwnProperty>, SourcePropertyQueryError> {
+    if !is_source_class_method_receiver(store, host, node, receiver)? {
+        return Ok(None);
+    }
+    let property = super::object_members::resolve_object_property_by_key_with_source(
+        store,
+        host,
+        global_types,
+        options,
+        global_types.callable_function_type,
+        EscapedNameRef::source(name),
+        session,
+        diagnostics,
+    )
+    .map_err(SourcePropertyQueryError::Source)?;
+    // Object augmentation is separate. Do not report a missing property until
+    // that lookup is supported for this receiver too.
+    property
+        .map(Some)
+        .ok_or_else(|| RelationUnavailable::StructuredSignatures(receiver).into())
 }
 
 /// Full member resolution is needed only after an exact own-name miss with heritage.

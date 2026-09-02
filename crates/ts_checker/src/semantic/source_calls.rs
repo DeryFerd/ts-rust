@@ -57,17 +57,14 @@ use super::{
         GenericCallVectorApplicability, GenericCallVectorError, GenericCallVectorRequest,
         GenericCallVectorResolution, GenericCallVectorUnsupported, IdentityGenericCallError,
         IdentityGenericCallRequest, IdentityGenericCallResolution, IdentityGenericCallUnsupported,
-        demand_generic_call_vector_return_with_session,
         demand_identity_generic_call_return_with_session,
         generic_call_signature_minimum_argument_count,
-        instantiate_generic_signature_in_fixed_context, materialize_generic_call_vector_source,
-        resolve_generic_call_vector_with_session,
+        instantiate_generic_signature_in_fixed_context,
         resolve_source_identity_generic_call_with_session,
         source_declared_inference_candidate_is_exported,
     },
     generic_method_calls::{
         GenericMethodCallDiagnostic, GenericMethodCallError, GenericMethodCallResolution,
-        GenericMethodCallSelection, resolve_generic_method_call,
     },
     inference::{NakedTypeCandidateError, NakedTypeInferenceError},
     instantiate::{InstantiationLimits, InstantiationSession},
@@ -82,8 +79,8 @@ use super::{
         CheckedExpressionTypes, PlannedExpression, PlannedExpressionKind,
         PlannedIdentifierReadKind, SourceCheckError, UnsupportedSourceSyntax,
         logical_binary_operator_text, merge_retry_diagnostic, merge_retry_diagnostics,
-        primitive_binary_operator_text, retry_source_generic_member_failure,
-        source_call_effects_target_type,
+        observe_call_failure_detail, primitive_binary_operator_text,
+        retry_source_generic_member_failure, source_call_effects_target_type,
     },
     source_callables::{
         CallableTypePredicatePlan, StoredSourceCallableValidation,
@@ -3583,6 +3580,68 @@ pub(super) fn finish_source_super_call_plan(
     })
 }
 
+// Retain the rejecting guard and its actual AST metadata without changing the error.
+fn unsupported_direct_call_syntax(
+    arena: &NodeArena,
+    call: NodeRef,
+    subject: NodeRef,
+    expected_parent: Option<NodeRef>,
+    stage: &'static str,
+) -> SourceCheckError {
+    let error = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(call));
+    let metadata = arena.get(subject.node).map(|record| {
+        (
+            record.kind,
+            record.flags.0,
+            record.parent.map(|parent| parent.index()),
+            record.range.start.get(),
+            record.range.end.get(),
+        )
+    });
+    let (flow_present, question_dot_present, symbol_present, facts) =
+        match arena.get(subject.node).map(|record| &record.data) {
+            Some(NodeData::KeywordExpression(keyword)) => {
+                (Some(keyword.flow_node.is_some()), None, None, None)
+            }
+            Some(NodeData::Identifier(identifier)) => {
+                (Some(identifier.flow_node.is_some()), None, None, None)
+            }
+            Some(NodeData::CallExpression(call)) => (
+                None,
+                Some(call.question_dot_token.is_some()),
+                Some(call.symbol.is_some()),
+                Some(call.facts),
+            ),
+            Some(NodeData::PropertyAccessExpression(access)) => (
+                Some(access.flow_node.is_some()),
+                Some(access.question_dot_token.is_some()),
+                None,
+                Some(access.facts),
+            ),
+            _ => (None, None, None, None),
+        };
+    let valid_name = arena
+        .get(subject.node)
+        .and_then(|record| match &record.data {
+            NodeData::Identifier(identifier) => Some(!identifier.text.is_empty()),
+            NodeData::PrivateIdentifier(identifier) => {
+                Some(identifier.text.starts_with('#') && identifier.text.len() > 1)
+            }
+            _ => None,
+        });
+    let expected_parent = expected_parent.map(|parent| parent.node.index());
+    observe_call_failure_detail(
+        stage,
+        format_args!(
+            "raw_error={error:?} call_file_id={} call_node_local_id={} subject_node_local_id={} subject_kind_flags_parent_start_end={metadata:?} expected_parent={expected_parent:?} valid_name={valid_name:?} flow_present={flow_present:?} question_dot_present={question_dot_present:?} symbol_present={symbol_present:?} facts={facts:?}",
+            call.file.index(),
+            call.node.index(),
+            subject.node.index(),
+        ),
+    );
+    error
+}
+
 /// Proves ordinary call syntax without admitting constructor invocations.
 pub(super) fn plan_direct_source_call_syntax(
     arena: &NodeArena,
@@ -3608,8 +3667,12 @@ pub(super) fn plan_direct_source_call_syntax(
         || call.symbol.is_some()
         || call.facts != 0
     {
-        return Err(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::Call(node),
+        return Err(unsupported_direct_call_syntax(
+            arena,
+            node,
+            node,
+            None,
+            "syntax_call_header",
         ));
     }
 
@@ -3618,8 +3681,12 @@ pub(super) fn plan_direct_source_call_syntax(
         return Err(SourceCheckError::Call(node));
     };
     if callee_record.parent != Some(node.node) {
-        return Err(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::Call(node),
+        return Err(unsupported_direct_call_syntax(
+            arena,
+            node,
+            actual_callee,
+            Some(node),
+            "syntax_callee_parent",
         ));
     }
     let parameterized_function = match (callee_record.kind, &callee_record.data) {
@@ -3693,8 +3760,12 @@ pub(super) fn plan_direct_source_call_syntax(
                             if identifier.text.starts_with('#') && identifier.text.len() > 1
                     )
                 {
-                    return Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Call(node),
+                    return Err(unsupported_direct_call_syntax(
+                        arena,
+                        node,
+                        name,
+                        Some(actual_callee),
+                        "syntax_property_name",
                     ));
                 }
                 (
@@ -3758,8 +3829,12 @@ pub(super) fn plan_direct_source_call_syntax(
                 )
             }
             _ => {
-                return Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Call(node),
+                return Err(unsupported_direct_call_syntax(
+                    arena,
+                    node,
+                    actual_callee,
+                    Some(node),
+                    "syntax_callee_form",
                 ));
             }
         };
@@ -3777,14 +3852,22 @@ pub(super) fn plan_direct_source_call_syntax(
         if argument_record.parent != Some(node.node)
             || !is_supported_call_argument_syntax(arena, argument)
         {
-            return Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Call(node),
+            return Err(unsupported_direct_call_syntax(
+                arena,
+                node,
+                argument,
+                Some(node),
+                "syntax_argument",
             ));
         }
         let mut array_arrows = Vec::new();
         if !collect_array_argument_arrow_syntax(arena, argument, &mut array_arrows) {
-            return Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Call(node),
+            return Err(unsupported_direct_call_syntax(
+                arena,
+                node,
+                argument,
+                Some(node),
+                "syntax_argument_arrows",
             ));
         }
         argument_arrow_nodes.push(unparenthesized_arrow_argument_node(arena, argument));
@@ -4456,6 +4539,9 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
         | SyntaxKind::NoSubstitutionTemplateLiteral
         | SyntaxKind::NumericLiteral
         | SyntaxKind::BigIntLiteral => true,
+        SyntaxKind::ThisKeyword => matches!(&record.data,
+            NodeData::KeywordExpression(keyword)
+                if record.flags.0 == 0 && keyword.flow_node.is_none()),
         SyntaxKind::MetaProperty => matches!(&record.data,
             NodeData::MetaProperty(meta) if meta.keyword_token == SyntaxKind::ImportKeyword),
         SyntaxKind::TypeOfExpression => {
@@ -5217,6 +5303,7 @@ fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
         | PlannedExpressionKind::Property(_)
         | PlannedExpressionKind::Element(_)
         | PlannedExpressionKind::Arrow(_) => true,
+        PlannedExpressionKind::ClassReceiver(context) => context.receiver() == expression.node,
         PlannedExpressionKind::Call(call) => {
             call.node == expression.node
                 && call.arguments.iter().all(is_supported_call_argument_plan)
@@ -5266,7 +5353,6 @@ fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
                 && is_supported_call_argument_plan(right)
         }
         PlannedExpressionKind::TypeImportValueUse(_)
-        | PlannedExpressionKind::ClassReceiver(_)
         | PlannedExpressionKind::SuperCall(_)
         | PlannedExpressionKind::New(_)
         | PlannedExpressionKind::Conditional(_) => false,
@@ -5429,9 +5515,9 @@ struct ResolvedLegacySourceCall {
 enum ResolvedSourceCall {
     Legacy(ResolvedLegacySourceCall),
     NongenericTypeArguments(ResolvedLegacySourceCall),
-    Vector(GenericCallVectorResolution),
+    Vector(GenericCallVectorResolution, SignatureId, TypeId),
     Identity(IdentityGenericCallResolution),
-    Method(Box<GenericMethodCallResolution>),
+    Method(Box<GenericMethodCallResolution>, SignatureId, TypeId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5458,6 +5544,7 @@ fn resolve_source_call_once(
     options: CanonicalCheckerOptions,
     existing_call_signature: Option<SignatureId>,
     session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     request: SourceCallResolutionRequest<'_>,
 ) -> Result<ResolvedSourceCall, SourceCallResolutionError> {
     let SourceCallResolutionRequest {
@@ -5479,10 +5566,16 @@ fn resolve_source_call_once(
             RelationUnavailable::UnresolvedStructuredMembers(callee_type),
         ));
     }
-    match resolve_generic_method_call(
+    match CanonicalTypeQuery::new_with_global_types_and_session(
         store,
+        host,
         global_types,
-        options.strict_function_types,
+        options,
+        session,
+        diagnostics,
+    )
+    .map_err(|_| SourceCallResolutionError::Invariant)?
+    .resolve_source_generic_method_call(
         GenericCallVectorRequest {
             form,
             optional_chain: false,
@@ -5492,9 +5585,21 @@ fn resolve_source_call_once(
             arguments: argument_types,
         },
         existing_call_signature,
-        session,
-    ) {
-        Ok(Some(resolution)) => return Ok(ResolvedSourceCall::Method(Box::new(resolution))),
+        receiver,
+    )
+    .inspect_err(|error| {
+        observe_call_failure_detail(
+            "resolve_generic_method",
+            format_args!("callee={callee_type:?} receiver={receiver:?} raw_error={error:?}"),
+        );
+    }) {
+        Ok(Some((resolution, signature, return_type))) => {
+            return Ok(ResolvedSourceCall::Method(
+                Box::new(resolution),
+                signature,
+                return_type,
+            ));
+        }
         Ok(None) => {}
         Err(
             GenericMethodCallError::Direct(
@@ -5536,6 +5641,7 @@ fn resolve_source_call_once(
             | GenericMethodCallError::Generic(
                 GenericCallVectorError::Unsupported(_)
                 | GenericCallVectorError::Inference(_)
+                | GenericCallVectorError::Conditional(_)
                 | GenericCallVectorError::Instantiation(_),
             ),
         ) => return Err(SourceCallResolutionError::Unsupported),
@@ -5619,7 +5725,13 @@ fn resolve_source_call_once(
             receiver,
             existing_call_signature,
             session,
-        ) {
+        )
+        .inspect_err(|error| {
+            observe_call_failure_detail(
+                "resolve_direct",
+                format_args!("callee={callee_type:?} receiver={receiver:?} raw_error={error:?}"),
+            );
+        }) {
             Ok(resolution) => {
                 let resolved = ResolvedLegacySourceCall {
                     signature: resolution.projection.signature,
@@ -5658,8 +5770,14 @@ fn resolve_source_call_once(
 
     match validate_stored_source_callable(store, callee_type) {
         StoredSourceCallableValidation::Valid(_) => {}
-        StoredSourceCallableValidation::NotSourceCallable
-        | StoredSourceCallableValidation::Pending => {
+        validation @ (StoredSourceCallableValidation::NotSourceCallable
+        | StoredSourceCallableValidation::Pending) => {
+            observe_call_failure_detail(
+                "source_callable_gate",
+                format_args!(
+                    "callee={callee_type:?} receiver={receiver:?} raw_validation={validation:?}"
+                ),
+            );
             return Err(SourceCallResolutionError::Unsupported);
         }
         StoredSourceCallableValidation::Malformed => {
@@ -5674,15 +5792,29 @@ fn resolve_source_call_once(
         callee: callee_type,
         arguments: argument_types,
     };
-    match resolve_generic_call_vector_with_session(
+    match CanonicalTypeQuery::new_with_global_types_and_session(
         store,
+        host,
         global_types,
-        options.strict_function_types,
-        vector_request,
-        existing_call_signature,
+        options,
         session,
-    ) {
-        Ok(resolution) => return Ok(ResolvedSourceCall::Vector(resolution)),
+        diagnostics,
+    )
+    .map_err(|_| SourceCallResolutionError::Invariant)?
+    .resolve_source_generic_call_vector(vector_request, existing_call_signature, receiver)
+    .inspect_err(|error| {
+        observe_call_failure_detail(
+            "resolve_generic_vector",
+            format_args!("callee={callee_type:?} receiver={receiver:?} raw_error={error:?}"),
+        );
+    }) {
+        Ok((resolution, signature, return_type)) => {
+            return Ok(ResolvedSourceCall::Vector(
+                resolution,
+                signature,
+                return_type,
+            ));
+        }
         Err(
             GenericCallVectorError::Unsupported(
                 GenericCallVectorUnsupported::UnresolvedReturnType(signature),
@@ -5710,6 +5842,7 @@ fn resolve_source_call_once(
         Err(
             GenericCallVectorError::Unsupported(_)
             | GenericCallVectorError::Inference(_)
+            | GenericCallVectorError::Conditional(_)
             | GenericCallVectorError::Instantiation(_),
         ) => return Err(SourceCallResolutionError::Unsupported),
     }
@@ -5827,6 +5960,7 @@ fn resolve_jsx_call_signature(
             options,
             existing,
             &mut session,
+            diagnostics,
             SourceCallResolutionRequest {
                 form: DirectCallForm::Call,
                 callee_type: callee,
@@ -5886,7 +6020,7 @@ fn resolve_jsx_call_signature(
                 .map_err(|_| SourceCheckError::Call(node))?;
             Ok(resolution.projection.signature)
         }
-        ResolvedSourceCall::Vector(resolution) => {
+        ResolvedSourceCall::Vector(resolution, signature, _) => {
             let applicable = matches!(
                 resolution.applicability(),
                 GenericCallVectorApplicability::Applicable
@@ -5898,13 +6032,9 @@ fn resolve_jsx_call_signature(
             if !applicable {
                 return Err(SourceCheckError::Call(node));
             }
-            let materialized = materialize_generic_call_vector_source(store, &resolution, existing)
-                .map_err(|_| SourceCheckError::Call(node))?;
-            demand_generic_call_vector_return_with_session(store, &resolution, &mut session)
-                .map_err(|_| SourceCheckError::Call(node))?;
-            Ok(materialized.call_signature)
+            Ok(signature)
         }
-        ResolvedSourceCall::Method(_) => Err(SourceCheckError::Call(node)),
+        ResolvedSourceCall::Method(_, _, _) => Err(SourceCheckError::Call(node)),
     }
 }
 
@@ -7280,6 +7410,38 @@ fn prepare_generic_candidate_diagnostic(
                 ),
                 related_information: Vec::new(),
             }
+        }
+        GenericCallVectorApplicability::ThisArgumentNotAssignable {
+            argument_type,
+            parameter_type,
+        } => {
+            let actual_receiver = match plan.receiver {
+                Some(receiver) => store
+                    .type_node_links(receiver.node)
+                    .and_then(|links| links.resolved_type),
+                None => store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.void_type),
+            };
+            if actual_receiver != Some(argument_type)
+                || store
+                    .signature(signature)
+                    .and_then(super::signatures::Signature::this_parameter)
+                    .is_none()
+            {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            this_context_mismatch_diagnostic(
+                store,
+                host,
+                global_types,
+                argument_type,
+                parameter_type,
+                plan.receiver.map_or(plan.node, |receiver| receiver.node),
+                source_call_display_flags(options),
+                options,
+                session,
+            )?
         }
         GenericCallVectorApplicability::ArgumentNotAssignable {
             index,
@@ -9080,17 +9242,7 @@ pub(super) fn check_direct_source_call(
     let mut retried_members = HashSet::new();
     let mut retried_properties = HashSet::new();
     let mut relation_candidates = Vec::new();
-    let has_this_parameter =
-        store
-            .source_callable_provenance(callee_type)
-            .is_some_and(|provenance| {
-                store
-                    .signature(provenance.signature)
-                    .is_some_and(|signature| signature.this_parameter().is_some())
-            });
-    let receiver = has_this_parameter
-        .then(|| source_call_receiver(&plan.callee))
-        .flatten()
+    let receiver = source_call_receiver(&plan.callee)
         .map(|receiver| {
             store
                 .type_node_links(receiver.node)
@@ -9106,6 +9258,7 @@ pub(super) fn check_direct_source_call(
             options,
             existing_call_signature,
             session,
+            diagnostics,
             SourceCallResolutionRequest {
                 form: plan.form,
                 callee_type,
@@ -9134,7 +9287,15 @@ pub(super) fn check_direct_source_call(
             )) => {
                 if relation_candidates.is_empty() {
                     relation_candidates.extend_from_slice(argument_types);
-                    if has_this_parameter {
+                    if receiver.is_some()
+                        || store
+                            .source_callable_provenance(callee_type)
+                            .is_some_and(|provenance| {
+                                store
+                                    .signature(provenance.signature)
+                                    .is_some_and(|signature| signature.this_parameter().is_some())
+                            })
+                    {
                         relation_candidates.push(callee_type);
                         relation_candidates.extend(receiver);
                     }
@@ -9230,7 +9391,7 @@ pub(super) fn check_direct_source_call(
                 vec![diagnostic],
             )
         }
-        ResolvedSourceCall::Method(resolution) => {
+        ResolvedSourceCall::Method(resolution, signature, return_type) => {
             let call_diagnostics = match &resolution.diagnostic {
                 None => Vec::new(),
                 Some(GenericMethodCallDiagnostic::Fixed(candidate)) => {
@@ -9282,21 +9443,6 @@ pub(super) fn check_direct_source_call(
                     return Err(SourceCheckError::Call(plan.node));
                 }
             };
-            let (signature, return_type) = match &resolution.selected {
-                GenericMethodCallSelection::Fixed {
-                    signature,
-                    return_type,
-                } => (*signature, *return_type),
-                GenericMethodCallSelection::Generic(candidate) => {
-                    materialize_generic_source_call_selection(
-                        store,
-                        session,
-                        plan.node,
-                        candidate,
-                        existing_call_signature,
-                    )?
-                }
-            };
             if preflight_call_publication(store, plan.node, return_type)? != existing_call_signature
                 || existing_call_signature.is_some_and(|existing| existing != signature)
             {
@@ -9304,7 +9450,7 @@ pub(super) fn check_direct_source_call(
             }
             (signature, return_type, call_diagnostics)
         }
-        ResolvedSourceCall::Vector(resolution) => {
+        ResolvedSourceCall::Vector(resolution, signature, return_type) => {
             let diagnostic = prepare_vector_source_call_diagnostic(
                 store,
                 host,
@@ -9316,13 +9462,6 @@ pub(super) fn check_direct_source_call(
                 argument_types,
                 explicit_type_arguments.as_deref(),
                 &resolution,
-            )?;
-            let (signature, return_type) = materialize_generic_source_call_selection(
-                store,
-                session,
-                plan.node,
-                &resolution,
-                existing_call_signature,
             )?;
             if preflight_call_publication(store, plan.node, return_type)? != existing_call_signature
             {
@@ -9399,31 +9538,6 @@ fn legacy_method_call_resolution(candidate: &DirectCallResolution) -> ResolvedLe
         applicability: candidate.applicability,
         overload_failure: None,
     }
-}
-
-fn materialize_generic_source_call_selection(
-    store: &mut CanonicalTypeMapperStore,
-    session: &mut InstantiationSession,
-    node: NodeRef,
-    resolution: &GenericCallVectorResolution,
-    existing_call_signature: Option<SignatureId>,
-) -> Result<(SignatureId, TypeId), SourceCheckError> {
-    let error = |error| match error {
-        GenericCallVectorError::Relation(error)
-        | GenericCallVectorError::Inference(NakedTypeCandidateError::Relation(error)) => {
-            SourceCheckError::from(error)
-        }
-        GenericCallVectorError::Unsupported(_)
-        | GenericCallVectorError::Invariant(_)
-        | GenericCallVectorError::Inference(_)
-        | GenericCallVectorError::Instantiation(_) => SourceCheckError::Call(node),
-    };
-    let materialized =
-        materialize_generic_call_vector_source(store, resolution, existing_call_signature)
-            .map_err(error)?;
-    let return_type = demand_generic_call_vector_return_with_session(store, resolution, session)
-        .map_err(error)?;
-    Ok((materialized.call_signature, return_type))
 }
 
 #[allow(clippy::too_many_arguments)]

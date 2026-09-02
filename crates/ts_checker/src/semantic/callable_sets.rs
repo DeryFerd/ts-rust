@@ -96,6 +96,11 @@ pub(super) fn validate_stored_callable_set_with_array_targets(
     type_: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> StoredCallableSetValidation {
+    if let Some(validation) =
+        super::instantiate::validate_instantiated_function_callable(store, type_, array_targets)
+    {
+        return validation;
+    }
     if let Some(validation) = super::instantiated_members::validate_generic_interface_callable(
         store,
         type_,

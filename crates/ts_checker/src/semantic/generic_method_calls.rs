@@ -16,15 +16,17 @@ use super::{
         get_min_argument_count, get_parameter_count, has_effective_rest_parameter,
         project_validated_direct_call, reorder_direct_call_candidates,
     },
+    conditional_types::ConditionalBranchSource,
     generic_calls::{
         GenericCallArgumentRelation, GenericCallVectorApplicability, GenericCallVectorCandidate,
         GenericCallVectorError, GenericCallVectorRequest, GenericCallVectorResolution,
         GenericConstructorContextMethod, PreparedGenericConstructorContext,
-        check_generic_call_candidate_with_context, check_generic_call_candidate_with_session,
-        finish_generic_call_candidate_with_session, generic_class_constructor_candidates,
-        generic_class_constructor_type_argument_bounds, generic_method_signature_callee,
-        generic_method_type_argument_bounds, generic_named_constructor_candidates,
-        preflight_generic_class_constructor_signature,
+        check_generic_call_candidate_with_context,
+        check_generic_call_candidate_with_receiver_context,
+        demand_generic_call_vector_return_with_source, finish_generic_call_candidate_with_source,
+        generic_class_constructor_candidates, generic_class_constructor_type_argument_bounds,
+        generic_method_signature_callee, generic_method_type_argument_bounds,
+        generic_named_constructor_candidates, preflight_generic_class_constructor_signature,
         prepare_generic_constructor_context_with_session, validate_generic_call_vector_request,
         validate_generic_class_constructor_request,
     },
@@ -133,6 +135,7 @@ impl CheckedMethodCandidate {
             Self::Generic(candidate) => matches!(
                 candidate.applicability(),
                 GenericCallVectorApplicability::ArgumentNotAssignable { .. }
+                    | GenericCallVectorApplicability::ThisArgumentNotAssignable { .. }
             ),
         }
     }
@@ -213,6 +216,8 @@ fn check_candidate(
     callable: &ValidatedSingleCallable,
     relation: GenericCallArgumentRelation,
     session: &mut InstantiationSession,
+    this_argument: Option<TypeId>,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<CheckedMethodCandidate, GenericMethodCallError> {
     if !store
         .signature(callable.signature)
@@ -220,14 +225,17 @@ fn check_candidate(
         .type_parameters()
         .is_empty()
     {
-        return check_generic_call_candidate_with_session(
+        return check_generic_call_candidate_with_receiver_context(
             store,
             globals,
             strict_function_types,
             request,
             callable,
             relation,
+            None,
             session,
+            this_argument,
+            source,
         )
         .map(CheckedMethodCandidate::Generic)
         .map_err(Into::into);
@@ -278,6 +286,7 @@ fn finish_candidate(
     candidate: CheckedMethodCandidate,
     existing_call_signature: Option<SignatureId>,
     session: &mut InstantiationSession,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<GenericMethodCallSelection, GenericMethodCallError> {
     match candidate {
         CheckedMethodCandidate::Fixed(candidate) => fixed_selection(
@@ -286,17 +295,28 @@ fn finish_candidate(
             candidate.projection.return_type,
             existing_call_signature,
         ),
-        CheckedMethodCandidate::Generic(candidate) => finish_generic_call_candidate_with_session(
-            store,
-            globals,
-            strict_function_types,
-            request,
-            candidate,
-            existing_call_signature,
-            session,
-        )
-        .map(GenericMethodCallSelection::Generic)
-        .map_err(Into::into),
+        CheckedMethodCandidate::Generic(candidate) => {
+            let resolution = finish_generic_call_candidate_with_source(
+                store,
+                globals,
+                strict_function_types,
+                request,
+                candidate,
+                existing_call_signature,
+                session,
+                source,
+            )?;
+            if source.is_some() {
+                demand_generic_call_vector_return_with_source(
+                    store,
+                    &resolution,
+                    globals,
+                    session,
+                    source,
+                )?;
+            }
+            Ok(GenericMethodCallSelection::Generic(resolution))
+        }
     }
 }
 
@@ -310,6 +330,8 @@ fn check_candidate_with_context(
     relation: GenericCallArgumentRelation,
     session: &mut InstantiationSession,
     context: Option<&PreparedGenericConstructorContext>,
+    this_argument: Option<TypeId>,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<CheckedMethodCandidate, GenericMethodCallError> {
     match context {
         None => check_candidate(
@@ -320,6 +342,8 @@ fn check_candidate_with_context(
             callable,
             relation,
             session,
+            this_argument,
+            source,
         ),
         Some(context) => check_generic_call_candidate_with_context(
             store,
@@ -385,6 +409,52 @@ pub(super) fn resolve_generic_method_call(
     existing_call_signature: Option<SignatureId>,
     session: &mut InstantiationSession,
 ) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
+    resolve_generic_method_call_worker(
+        store,
+        globals,
+        strict_function_types,
+        request,
+        existing_call_signature,
+        session,
+        None,
+        &mut None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_generic_method_call_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: GenericCallVectorRequest<'_>,
+    existing_call_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
+    this_argument: Option<TypeId>,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
+    resolve_generic_method_call_worker(
+        store,
+        globals,
+        strict_function_types,
+        request,
+        existing_call_signature,
+        session,
+        this_argument,
+        &mut Some(source),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_generic_method_call_worker(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: GenericCallVectorRequest<'_>,
+    existing_call_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
+    this_argument: Option<TypeId>,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
     if request.form != DirectCallForm::Call || request.optional_chain || request.has_spread_argument
     {
         return Ok(None);
@@ -435,7 +505,7 @@ pub(super) fn resolve_generic_method_call(
             }
             _ => return Err(GenericMethodCallError::Unsupported(request.callee)),
         };
-    resolve_generic_candidates(
+    resolve_generic_candidates_with_context(
         store,
         globals,
         strict_function_types,
@@ -444,6 +514,9 @@ pub(super) fn resolve_generic_method_call(
         GenericCandidateFamily::Call(family),
         existing_call_signature,
         session,
+        None,
+        this_argument,
+        source,
     )
 }
 
@@ -527,6 +600,8 @@ pub(super) fn resolve_generic_class_constructor_with_context(
         existing_new_signature,
         session,
         context,
+        None,
+        &mut None,
     )?;
     if session.limit_event_occurred_since(limit_mark) {
         return Err(GenericMethodCallError::Unsupported(request.callee));
@@ -596,6 +671,8 @@ fn resolve_generic_candidates(
         existing_call_signature,
         session,
         None,
+        None,
+        &mut None,
     )
 }
 
@@ -610,6 +687,8 @@ fn resolve_generic_candidates_with_context(
     existing_call_signature: Option<SignatureId>,
     session: &mut InstantiationSession,
     context: Option<&PreparedGenericConstructorContext>,
+    this_argument: Option<TypeId>,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
     let array_targets = Some(CanonicalArrayTargets::from_global_types(globals));
     let ordered = reorder_direct_call_candidates(store, request.callee, candidates)?;
@@ -655,6 +734,8 @@ fn resolve_generic_candidates_with_context(
                 relation,
                 session,
                 context,
+                this_argument,
+                source,
             )?;
             if candidate.applicable() {
                 return finish_candidate(
@@ -665,6 +746,7 @@ fn resolve_generic_candidates_with_context(
                     candidate,
                     existing_call_signature,
                     session,
+                    source,
                 )
                 .map(|selected| {
                     Some(GenericMethodCallResolution {
@@ -719,6 +801,8 @@ fn resolve_generic_candidates_with_context(
                 GenericCallArgumentRelation::Assignable,
                 session,
                 context,
+                this_argument,
+                source,
             )?
             .diagnostic()
         } else if eligible.is_empty() {
@@ -766,6 +850,8 @@ fn resolve_generic_candidates_with_context(
                 GenericCallArgumentRelation::Assignable,
                 session,
                 context,
+                this_argument,
+                source,
             )?;
             if candidate.applicable() {
                 return Err(GenericMethodCallError::Invalid(request.callee));
@@ -808,6 +894,8 @@ fn resolve_generic_candidates_with_context(
             GenericCallArgumentRelation::Assignable,
             session,
             context,
+            this_argument,
+            source,
         )?;
         finish_candidate(
             store,
@@ -817,6 +905,7 @@ fn resolve_generic_candidates_with_context(
             candidate,
             existing_call_signature,
             session,
+            source,
         )?
     };
     Ok(Some(GenericMethodCallResolution {
