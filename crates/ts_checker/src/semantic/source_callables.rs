@@ -5763,12 +5763,44 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
     let container_record = preflight_node(store, host, container)?;
     let container_valid = match &container_record.data {
         NodeData::ExpressionStatement(statement) => {
+            let Some(scope) = source_direct_call_statement_container(store, container) else {
+                return Ok(false);
+            };
+            let body_valid = if scope == bound.source_file() {
+                true
+            } else {
+                let Some(SourceNodeParent::Parent(body)) = store.source_node_parent(container)
+                else {
+                    return Ok(false);
+                };
+                let body_record = preflight_node(store, host, body)?;
+                let NodeData::Block(block) = &body_record.data else {
+                    return Ok(false);
+                };
+                let scope_record = preflight_node(store, host, scope)?;
+                let owns_body = match &scope_record.data {
+                    NodeData::ArrowFunction(arrow) => arrow.body == body.node,
+                    NodeData::FunctionDeclaration(function) => function.body == Some(body.node),
+                    _ => false,
+                };
+                body_record.kind == SyntaxKind::Block
+                    && body_record.flags.0 == 0
+                    && owns_body
+                    && block
+                        .statements
+                        .nodes
+                        .iter()
+                        .filter(|statement| **statement == container.node)
+                        .count()
+                        == 1
+            };
             container_record.kind == SyntaxKind::ExpressionStatement
                 && container_record.flags.0 == 0
                 && statement.expression == call.node
                 && statement.flow_node.is_none()
-                && store.source_node_parent(container)
-                    == Some(SourceNodeParent::Parent(bound.source_file()))
+                && body_valid
+                && bound.container(call) == Some(scope)
+                && bound.container(container) == Some(scope)
         }
         NodeData::VariableDeclaration(variable)
             if matches!(&callee_record.data, NodeData::PropertyAccessExpression(_)) =>
@@ -7402,6 +7434,39 @@ pub(super) fn stored_captured_assignment_callback_is_exact<TypePayload, MapperPa
     exact().is_some()
 }
 
+/// Keeps a direct callback statement tied to its registered lexical body owner.
+fn source_direct_call_statement_container(
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+) -> Option<NodeRef> {
+    let SourceNodeParent::Parent(parent) = store.source_node_parent(statement)? else {
+        return None;
+    };
+    if store.source_node_kind(parent) == Some(SyntaxKind::SourceFile) {
+        return Some(parent);
+    }
+    if store.source_node_kind(parent) != Some(SyntaxKind::Block) {
+        return None;
+    }
+    let SourceNodeParent::Parent(container) = store.source_node_parent(parent)? else {
+        return None;
+    };
+    if !matches!(
+        store.source_node_kind(container),
+        Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionDeclaration)
+    ) || store.source_child_with_kind(container, SyntaxKind::Block) != Some(parent)
+    {
+        return None;
+    }
+    let symbol = store.source_declaration_symbol(container)?;
+    let owner = store.symbol(symbol)?;
+    (owner.flags().contains(SymbolFlags::FUNCTION)
+        && owner.check_flags() == CheckFlags::NONE
+        && owner.value_declaration() == Some(container)
+        && store.source_symbol_declarations_match(symbol))
+    .then_some(container)
+}
+
 fn stored_direct_call_argument_arrow_is_exact(
     store: &CanonicalTypeMapperStore,
     declaration: NodeRef,
@@ -7465,12 +7530,12 @@ fn stored_direct_call_argument_arrow_is_exact(
     let Some(SourceNodeParent::Parent(container)) = store.source_node_parent(call) else {
         return false;
     };
-    let source = match store.source_node_kind(container) {
+    let container_valid = match store.source_node_kind(container) {
         Some(SyntaxKind::ExpressionStatement) => {
-            let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(container) else {
-                return false;
-            };
-            source
+            source_direct_call_statement_container(store, container).is_some_and(|scope| {
+                store.source_node_kind(scope) == Some(SyntaxKind::SourceFile)
+                    || store.source_node_kind(call) == Some(SyntaxKind::CallExpression)
+            })
         }
         Some(SyntaxKind::VariableDeclaration) => {
             let Some(SourceNodeParent::Parent(list)) = store.source_node_parent(container) else {
@@ -7487,7 +7552,7 @@ fn stored_direct_call_argument_arrow_is_exact(
             {
                 return false;
             }
-            source
+            store.source_node_kind(source) == Some(SyntaxKind::SourceFile)
         }
         _ => return false,
     };
@@ -7495,7 +7560,7 @@ fn stored_direct_call_argument_arrow_is_exact(
         && (store.source_node_kind(call) == Some(SyntaxKind::CallExpression)
             || store.source_node_kind(call) == Some(SyntaxKind::NewExpression)
                 && store.source_node_kind(container) == Some(SyntaxKind::ExpressionStatement))
-        && store.source_node_kind(source) == Some(SyntaxKind::SourceFile)
+        && container_valid
         && owner.flags() == SymbolFlags::FUNCTION
         && owner.check_flags() == CheckFlags::NONE
         && owner.name() == InternalSymbolName::Function.as_ref()
