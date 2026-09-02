@@ -280,8 +280,9 @@ use super::{
         PlannedSourceImportRead, PreparedSourceImportPublication, PreparedSourceImportValue,
         ResolvedSourceImportBinding, ResolvedSourceJsDocTypedefImport,
         ResolvedSourceTypeImportBinding, SourceClassImportDemand, SourceClassImportPlan,
-        SourceImportBindingPlan, SourceImportError, SourceImportPlan, SourceImportUnsupported,
-        SourceNamedReexportBindingPlan, SourceNamedReexportPlan, plan_source_class_import_read,
+        SourceClassProviderDemand, SourceImportBindingPlan, SourceImportError, SourceImportPlan,
+        SourceImportUnsupported, SourceNamedReexportBindingPlan, SourceNamedReexportPlan,
+        plan_source_class_import_read, plan_source_class_type_import,
         plan_source_import_default_arrow_export, plan_source_import_identifier_read,
         plan_source_jsdoc_typedef_import, plan_source_property_type_import,
         plan_source_type_import_reference, plan_top_level_import_equals,
@@ -4383,7 +4384,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     meta_options: Option<CanonicalCheckerOptions>,
     class_type_context: Option<ClassTypeQueryContext>,
     source_class_imports: &'semantic [SourceClassImportPlan],
-    source_class_import_demand: Option<&'semantic RefCell<Option<SourceClassImportDemand>>>,
+    source_class_import_demand: Option<&'semantic RefCell<Option<SourceClassProviderDemand>>>,
     hoisted_functions: HashSet<SemanticSymbolId>,
     prior_variables: HashSet<SemanticSymbolId>,
     readable_variables: HashSet<SemanticSymbolId>,
@@ -4553,7 +4554,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     fn with_source_class_imports(
         mut self,
         imports: &'semantic [SourceClassImportPlan],
-        demand: &'semantic RefCell<Option<SourceClassImportDemand>>,
+        demand: &'semantic RefCell<Option<SourceClassProviderDemand>>,
     ) -> Self {
         self.source_class_imports = imports;
         self.source_class_import_demand = Some(demand);
@@ -12040,7 +12041,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     )
                     .map_err(|error| Self::import_plan_error(node, &error))?
                 {
-                    if request.replace(Some(demand)).is_some() {
+                    if request
+                        .replace(Some(SourceClassProviderDemand::Value(Box::new(demand))))
+                        .is_some()
+                    {
                         return Err(SourceCheckError::Import(node));
                     }
                     return Err(Self::class_plan_error(declaration, error));
@@ -12050,6 +12054,33 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             Err(super::classes::ClassError::Unsupported(_)) => return Ok(None),
             Err(error) => return Err(Self::class_plan_error(declaration, error)),
         };
+        if let Some(request) = self.source_class_import_demand {
+            for reference in source.implementation_type_nodes() {
+                let Some(demand) = plan_source_class_type_import(store, host, reference)
+                    .map_err(|error| Self::import_plan_error(reference, &error))?
+                else {
+                    continue;
+                };
+                let globals = self.global_types.ok_or(SourceCheckError::Import(reference))?;
+                let options = self.meta_options.ok_or(SourceCheckError::Import(reference))?;
+                if demand
+                    .completed_type(store, host, globals, options)
+                    .map_err(|error| Self::import_plan_error(reference, &error))?
+                    .is_some()
+                {
+                    continue;
+                }
+                if request
+                    .replace(Some(SourceClassProviderDemand::Type(Box::new(demand))))
+                    .is_some()
+                {
+                    return Err(SourceCheckError::Import(reference));
+                }
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Import(reference),
+                ));
+            }
+        }
         if let Some(imported) = source.imported_base() {
             self.import_reads.push(imported.demand.read);
             self.identifier_reads.push((
@@ -76482,7 +76513,7 @@ pub(super) fn check_source_file(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     source_class_imports: &[SourceClassImportPlan],
-    source_class_import_demand: &RefCell<Option<SourceClassImportDemand>>,
+    source_class_import_demand: &RefCell<Option<SourceClassProviderDemand>>,
 ) -> Result<(), SourceCheckError> {
     if !store.contains_source_file(source) {
         return Err(SourceCheckError::Provenance(
@@ -76590,7 +76621,7 @@ fn check_source_plan(
     classic_jsx_factories: Option<(&str, &str)>,
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
-    source_class_import_demand: &RefCell<Option<SourceClassImportDemand>>,
+    source_class_import_demand: &RefCell<Option<SourceClassProviderDemand>>,
     plan: SourceCheckPlan,
     selected_variable: Option<NodeRef>,
 ) -> Result<(), SourceCheckError> {
@@ -78330,10 +78361,12 @@ fn check_source_plan(
             .is_none()
         {
             if source_class_import_demand
-                .replace(Some(SourceClassImportDemand {
-                    binding: resolved.binding.clone(),
-                    read: *read,
-                }))
+                .replace(Some(SourceClassProviderDemand::Value(Box::new(
+                    SourceClassImportDemand {
+                        binding: resolved.binding.clone(),
+                        read: *read,
+                    },
+                ))))
                 .is_some()
             {
                 return Err(SourceCheckError::Import(read.node));

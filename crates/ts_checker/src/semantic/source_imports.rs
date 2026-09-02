@@ -70,7 +70,8 @@ use super::{
     array_types::CanonicalArrayTargets,
     classes::{
         ClassMemberQueryPlan, SourceClassImportOwner, SourceClassImportValue,
-        completed_source_class_import_value, execute_nongeneric_class_member_query,
+        completed_source_class_import_type, completed_source_class_import_value,
+        execute_nongeneric_class_member_query,
         plan_nongeneric_class_member_query, preflight_nongeneric_class_member_query,
         source_class_import_owner, validate_source_class_import_value,
     },
@@ -99,6 +100,7 @@ use super::{
     type_nodes::{
         CanonicalJsDocImportTypeTarget, CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget,
         OrdinaryImportAliasChain, ordinary_import_alias_chain,
+        plan_source_class_implementation_import,
         validate_ordinary_import_alias_links,
     },
     type_records::{TypeData, TypeRecord},
@@ -226,6 +228,87 @@ pub(super) struct ResolvedSourceImportBinding {
 pub(super) struct SourceClassImportDemand {
     pub(super) binding: SourceImportBindingPlan,
     pub(super) read: PlannedSourceImportRead,
+}
+
+/// Type and value reads use the same source driver with separate completion checks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum SourceClassProviderDemand {
+    Value(Box<SourceClassImportDemand>),
+    Type(Box<SourceClassTypeImportDemand>),
+}
+
+impl SourceClassProviderDemand {
+    pub(super) fn node(&self) -> NodeRef {
+        match self {
+            Self::Value(demand) => demand.read.node,
+            Self::Type(demand) => demand.reference,
+        }
+    }
+}
+
+/// An implements reference keeps the ordinary alias route and declared class owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassTypeImportDemand {
+    reference: NodeRef,
+    import: OrdinaryImportAliasChain,
+    pub(super) owner: SourceClassImportOwner,
+}
+
+impl SourceClassTypeImportDemand {
+    pub(super) fn validate(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+    ) -> Result<(), SourceImportError> {
+        if self.import.target() != self.owner.symbol
+            || plan_source_class_type_import(store, host, self.reference)?.as_ref() != Some(self)
+        {
+            return Err(invariant(SourceImportInvariant::ReadBindingMismatch(
+                self.reference,
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn completed_type(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        global_types: &CanonicalGlobalTypes,
+        options: CanonicalCheckerOptions,
+    ) -> Result<Option<TypeId>, SourceImportError> {
+        self.validate(store, host)?;
+        completed_source_class_import_type(store, host, global_types, options, self.owner)
+            .map_err(|error| {
+                imported_ambient_class_error(self.owner.symbol, self.owner.declaration, error)
+            })
+    }
+}
+
+/// Reads only a type dependency. Alias value links and constructor values stay untouched.
+pub(super) fn plan_source_class_type_import(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    reference: NodeRef,
+) -> Result<Option<SourceClassTypeImportDemand>, SourceImportError> {
+    let Some(import) = plan_source_class_implementation_import(store, host, reference)? else {
+        return Ok(None);
+    };
+    let Some(owner) = source_class_import_owner(store, host, import.target()).map_err(|error| {
+        imported_ambient_class_error(import.target(), reference, error)
+    })? else {
+        return Ok(None);
+    };
+    if owner.source.file() == reference.file {
+        return Err(invariant(SourceImportInvariant::ReadBindingMismatch(
+            reference,
+        )));
+    }
+    Ok(Some(SourceClassTypeImportDemand {
+        reference,
+        import,
+        owner,
+    }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

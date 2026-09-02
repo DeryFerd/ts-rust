@@ -560,6 +560,14 @@ impl SourceClassPlan {
             .and_then(|base| base.imported.as_deref())
     }
 
+    pub(super) fn implementation_type_nodes(&self) -> impl Iterator<Item = NodeRef> + '_ {
+        self.header
+            .implementations
+            .iter()
+            .filter(|implementation| implementation.source_type)
+            .map(|implementation| implementation.node)
+    }
+
     /// Written field, constructor, and method types checked by the source type query.
     pub(super) fn annotation_nodes(&self) -> &[NodeRef] {
         &self.annotations
@@ -2110,6 +2118,56 @@ fn completed_source_class_import_value_in_context(
     type_context: &ClassTypeQueryContext,
     owner: SourceClassImportOwner,
 ) -> Result<Option<SourceClassImportValue>, ClassError> {
+    let Some(members) = completed_source_class_import_members_in_context(
+        store,
+        host,
+        global_types,
+        type_context,
+        owner,
+    )? else {
+        return Ok(None);
+    };
+    if store.value_symbol_links(owner.export_local)
+        != Some(&ValueSymbolLinks {
+            resolved_type: Some(members.shells.value_type),
+            ..ValueSymbolLinks::default()
+        })
+    {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(owner.symbol)));
+    }
+    Ok(Some(SourceClassImportValue {
+        owner,
+        members: members.clone(),
+        array_targets: CanonicalArrayTargets::from_global_types(global_types),
+        type_context: type_context.clone(),
+    }))
+}
+
+/// A type dependency needs checked instance members, not an imported constructor value.
+pub(super) fn completed_source_class_import_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    owner: SourceClassImportOwner,
+) -> Result<Option<TypeId>, ClassError> {
+    completed_source_class_import_members_in_context(
+        store,
+        host,
+        global_types,
+        &ClassTypeQueryContext::new(global_types, options),
+        owner,
+    )
+    .map(|members| members.map(|members| members.shells.instance_type))
+}
+
+fn completed_source_class_import_members_in_context<'store>(
+    store: &'store CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    type_context: &ClassTypeQueryContext,
+    owner: SourceClassImportOwner,
+) -> Result<Option<&'store ClassMembers>, ClassError> {
     let invalid = || invariant(ClassInvariant::InvalidOwnerSymbol(owner.symbol));
     if source_class_import_owner(store, host, owner.symbol)? != Some(owner) {
         return Err(invalid());
@@ -2138,20 +2196,7 @@ fn completed_source_class_import_value_in_context(
     {
         return Ok(None);
     }
-    if store.value_symbol_links(owner.export_local)
-        != Some(&ValueSymbolLinks {
-            resolved_type: Some(provenance.prepared.value_type),
-            ..ValueSymbolLinks::default()
-        })
-    {
-        return Err(invalid());
-    }
-    Ok(Some(SourceClassImportValue {
-        owner,
-        members: provenance.members.clone(),
-        array_targets,
-        type_context: type_context.clone(),
-    }))
+    Ok(Some(&provenance.members))
 }
 
 pub(super) fn validate_source_class_import_value(

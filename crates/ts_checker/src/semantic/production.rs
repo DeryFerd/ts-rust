@@ -12,7 +12,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
 };
 
 use ts_ast::{
@@ -59,7 +59,10 @@ use super::{
     relater::SourceRelationError,
     relation::RelationKind,
     source,
-    source_imports::{SourceClassImportDemand, SourceClassImportPlan, resolve_source_class_import},
+    source_imports::{
+        SourceClassImportDemand, SourceClassImportPlan, SourceClassProviderDemand,
+        resolve_source_class_import,
+    },
     symbol_display::{SymbolDisplayContext, SymbolDisplayError},
     type_nodes::CanonicalTypeQuery,
     types::{ObjectFlags, TypeFlags},
@@ -2002,6 +2005,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         active.push(source_file);
         let result = (|| {
             let mut imports = Vec::<SourceClassImportPlan>::new();
+            let mut type_requests = HashSet::new();
             loop {
                 let request = RefCell::new(None);
                 let result =
@@ -2009,25 +2013,41 @@ impl<'arena> CanonicalCheckerContext<'arena> {
                 let Some(demand) = request.into_inner() else {
                     return result;
                 };
-                let error = result
-                    .err()
-                    .ok_or(SourceCheckError::Import(demand.read.node))?;
-                if imports.iter().any(|known| known.demand.read == demand.read) {
-                    return Err(error);
-                }
-                let Some(imported) = self.resolve_source_class_import_demand(&demand)? else {
-                    return Err(error);
+                let node = demand.node();
+                let error = result.err().ok_or(SourceCheckError::Import(node))?;
+                let (owner, imported) = match &demand {
+                    SourceClassProviderDemand::Value(value) => {
+                        if imports.iter().any(|known| known.demand.read == value.read) {
+                            return Err(error);
+                        }
+                        let Some(imported) = self.resolve_source_class_import_demand(value)? else {
+                            return Err(error);
+                        };
+                        (imported.owner, Some(imported))
+                    }
+                    SourceClassProviderDemand::Type(type_) => {
+                        if !type_requests.insert(node) {
+                            return Err(error);
+                        }
+                        let host = DeclaredTypeHost::from_registry(
+                            &self.store,
+                            &self.files,
+                            GlobalMergeCompletion::new(self.options.name_resolution),
+                        )
+                        .map(|host| host.with_program_file_order(&self.file_order))
+                        .map_err(DeclaredTypeError::from)?
+                        .with_module_resolutions(&self.module_resolutions);
+                        type_.validate(&self.store, &host)
+                            .map_err(|error| source::source_class_import_error(node, &error))?;
+                        (type_.owner, None)
+                    }
                 };
-                if active.contains(&imported.owner.source) {
+                if active.contains(&owner.source) {
                     return Err(SourceCheckError::Unsupported(
-                        source::UnsupportedSourceSyntax::Import(demand.read.node),
+                        source::UnsupportedSourceSyntax::Import(node),
                     ));
                 }
-                self.check_source_file_with_class_imports(
-                    imported.owner.source.file(),
-                    None,
-                    active,
-                )?;
+                self.check_source_file_with_class_imports(owner.source.file(), None, active)?;
                 let host = DeclaredTypeHost::from_registry(
                     &self.store,
                     &self.files,
@@ -2036,17 +2056,25 @@ impl<'arena> CanonicalCheckerContext<'arena> {
                 .map(|host| host.with_program_file_order(&self.file_order))
                 .map_err(DeclaredTypeError::from)?
                 .with_module_resolutions(&self.module_resolutions);
-                if imported
-                    .completed_value(&self.store, &host, &self.global_types, self.options)
-                    .map_err(|error| source::source_class_import_error(demand.read.node, &error))?
-                    .is_none()
-                {
+                let complete = match (&demand, &imported) {
+                    (SourceClassProviderDemand::Value(_), Some(imported)) => imported
+                        .completed_value(&self.store, &host, &self.global_types, self.options)
+                        .map(|value| value.is_some()),
+                    (SourceClassProviderDemand::Type(type_), None) => type_
+                        .completed_type(&self.store, &host, &self.global_types, self.options)
+                        .map(|type_| type_.is_some()),
+                    _ => return Err(SourceCheckError::Import(node)),
+                }
+                .map_err(|error| source::source_class_import_error(node, &error))?;
+                if !complete {
                     return Err(error);
                 }
-                imports
-                    .try_reserve(1)
-                    .map_err(|_| SourceCheckError::Import(demand.read.node))?;
-                imports.push(imported);
+                if let Some(imported) = imported {
+                    imports
+                        .try_reserve(1)
+                        .map_err(|_| SourceCheckError::Import(node))?;
+                    imports.push(imported);
+                }
             }
         })();
         if active.pop() != Some(source_file) {
@@ -2093,7 +2121,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         file: FileId,
         classic_jsx_factories: Option<(&str, &str)>,
         class_imports: &[SourceClassImportPlan],
-        class_import_demand: &RefCell<Option<SourceClassImportDemand>>,
+        class_import_demand: &RefCell<Option<SourceClassProviderDemand>>,
     ) -> Result<(), SourceCheckError> {
         let Self {
             options,

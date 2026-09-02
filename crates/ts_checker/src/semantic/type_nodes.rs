@@ -638,8 +638,8 @@ fn source_class_implementation_owner(
     Ok(Some(owner))
 }
 
-/// Uses the ordinary import chain for a class's type-only heritage reference.
-fn plan_source_class_implementation_import(
+/// Uses the ordinary import chain for a class's implements reference.
+pub(super) fn plan_source_class_implementation_import(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
