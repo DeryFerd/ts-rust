@@ -2,6 +2,53 @@
 
 Updated 2026-09-02. No complete real-world project has passed in Rust yet.
 
+## Query and Hono checkpoint
+
+Query core and Hono are the primary targets again. New Pathe-only work,
+runner redesign and the UFO dependency task are paused.
+
+The fresh compiler is `ece9344d`. These results measure the combined repair
+branch, not an accepted merge into the primary branch.
+
+| Project | August 31 | September 2 |
+| --- | --- | --- |
+| Query core | 1 of 23 isolated source checks complete, no internal errors | 1 of 23 complete, 1 internal error |
+| Hono | 29 of 188 complete, 3 internal errors | 30 of 188 complete, 5 internal errors |
+
+Both ordinary project checks still fail. These counts are not passing-file
+or diagnostic-parity counts. Every original root was attempted. The root
+lists, loaded graphs and empty load diagnostics match the previous census.
+Hono newly completes `utils/headers.ts`. Query has no new completion.
+
+The full [current results](../target/wave202-query-hono-current-results.md)
+link the raw reports and logs. Query's census took 38 seconds. Hono's took
+333 seconds. The runs reused the existing compiler.
+
+The current repairs follow measured project failures:
+
+1. Query's ordinary check stops at a parameter in `timeoutManager.ts`.
+   Trace its contextual parameter type through the existing checker.
+2. The shared `Subscribable` class blocks eight Query source checks.
+   Its measured failure is the `new Set<TListener>()` field initializer.
+   A source worker and a test worker own this repair in a separate worktree.
+3. Query's new internal error is `InvalidArrayMutation` at
+   `queue.push(callback)` in `notifyManager.ts`. Repair its real guard.
+4. Hono's ordinary check stops at `HTTPException`. The trace identifies
+   `options?: HTTPExceptionOptions` in its constructor. Reuse the source-class
+   annotation path and preserve the optional union type.
+5. Query also rejects the inferred imported `isServer` variable. Use the
+   normal initializer type query, with its existing cache and cycle checks.
+
+Each repair must preserve the original projects, options and dependencies.
+Run focused type and diagnostic tests, then rerun the affected project.
+Count complete project checks and diagnostic parity as the outcome.
+Do not count source reviews, logging changes or compiler builds as fixes.
+
+## Earlier Pathe checkpoint
+
+The sections below are retained history. Their priorities and pending build
+status do not describe the current Query and Hono work above.
+
 ## Current result
 
 The latest combined run passed 425 of 500 selected tests. All tests ran.
