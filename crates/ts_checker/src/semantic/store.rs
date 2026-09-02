@@ -10921,6 +10921,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         facts.identifier_text.as_deref()
     }
 
+    pub(super) fn source_private_identifier_text(&self, node: NodeRef) -> Option<&str> {
+        let facts = self.source_node_fact(node)?;
+        if facts.kind != SyntaxKind::PrivateIdentifier {
+            return None;
+        }
+        facts.identifier_text.as_deref()
+    }
+
     pub(super) fn source_type_operator(&self, node: NodeRef) -> Option<SyntaxKind> {
         self.source_node_fact(node)?.type_operator
     }
@@ -11433,6 +11441,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 start: node.range.start.get(),
                 identifier_text: match &node.data {
                     NodeData::Identifier(identifier) if node.kind == SyntaxKind::Identifier => {
+                        Some(identifier.text.clone().into_boxed_str())
+                    }
+                    NodeData::PrivateIdentifier(identifier)
+                        if node.kind == SyntaxKind::PrivateIdentifier =>
+                    {
                         Some(identifier.text.clone().into_boxed_str())
                     }
                     _ => None,

@@ -4327,6 +4327,48 @@ pub(super) fn source_class_type_parameter_plan(
         .find(|parameter| parameter.symbol == symbol)
 }
 
+/// Reads an annotated field while the owning constructor is being checked.
+pub(super) fn source_class_constructor_field_type(
+    store: &CanonicalTypeMapperStore,
+    this_type: TypeId,
+    constructor: NodeRef,
+    member: SemanticSymbolId,
+) -> Option<(NodeRef, TypeId)> {
+    let owner = source_class_this_type_owner(store, this_type)?;
+    let provenance = store.source_class_provenance_for_symbol(owner)?;
+    let plan = &provenance.prepared.plan;
+    if plan.constructor.as_ref()?.declaration != constructor
+        || !plan.bodies.iter().any(|body| {
+            body.declaration == constructor && body.kind == ClassBodyKind::Constructor
+        })
+    {
+        return None;
+    }
+    let source = plan.sources.iter().find(|source| source.symbol == member)?;
+    let property = plan
+        .annotated_properties
+        .iter()
+        .find(|property| property.symbol == member)?;
+    if source.declaring_class != owner
+        || source.declaration != property.declaration
+        || source.side != ClassPropertySide::Instance
+        || !matches!(source.origin, ClassMemberOrigin::Field { .. })
+        || property.optional
+        || property.auto_accessor
+        || property.parameter_property
+        || store.source_node_kind(property.name_node) != Some(SyntaxKind::PrivateIdentifier)
+    {
+        return None;
+    }
+    let type_ = provenance
+        .prepared
+        .annotation_types
+        .iter()
+        .find_map(|(node, type_)| (*node == property.type_node).then_some(*type_))?;
+    (store.value_symbol_links(member)?.resolved_type == Some(type_))
+        .then_some((property.declaration, type_))
+}
+
 /// An unconstrained class formal remains arbitrary while its body is checked.
 pub(super) fn source_class_unconstrained_type_parameter(
     store: &CanonicalTypeMapperStore,

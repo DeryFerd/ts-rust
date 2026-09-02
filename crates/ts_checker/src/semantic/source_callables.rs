@@ -5207,7 +5207,7 @@ fn source_context_root(
     None
 }
 
-/// Keeps an assigned arrow tied to the containing arrow's real member write.
+/// Keeps an assigned arrow tied to its checked member write.
 pub(super) fn source_member_assignment_arrow_target(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -5224,20 +5224,89 @@ pub(super) fn source_member_assignment_arrow_target(
     if store.source_node_kind(assignment) != Some(SyntaxKind::BinaryExpression) {
         return Ok(None);
     }
-    let proof = match super::source_flow::source_member_assignment_proof(store, host, assignment) {
-        Ok(Some(proof)) => proof,
-        Ok(None) | Err(super::source_flow::SourceFlowError::Unsupported(_)) => return Ok(None),
+    let target = if let Some(target) =
+        source_class_assignment_arrow_target(store, host, assignment, right)?
+    {
+        target
+    } else {
+        let proof =
+            match super::source_flow::source_member_assignment_proof(store, host, assignment) {
+                Ok(Some(proof)) => proof,
+                Ok(None) | Err(super::source_flow::SourceFlowError::Unsupported(_)) => {
+                    return Ok(None);
+                }
+                Err(_) => {
+                    return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+                        declaration,
+                    )));
+                }
+            };
+        if proof.right != right {
+            return Ok(None);
+        }
+        proof.target
+    };
+    let bound = host
+        .bound_file(declaration)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidTypeCache(declaration)))?;
+    Ok((bound.symbol(declaration).is_some()
+        && bound.symbol(declaration) == store.source_declaration_symbol(declaration))
+    .then_some(target))
+}
+
+fn source_class_assignment_arrow_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    assignment: NodeRef,
+    right: NodeRef,
+) -> Result<Option<NodeRef>, SourceCallableError> {
+    let Some(children) = store.source_direct_children(assignment) else {
+        return Ok(None);
+    };
+    let [target, _, value] = children.as_slice() else {
+        return Ok(None);
+    };
+    let Some(access) = store.source_direct_children(*target) else {
+        return Ok(None);
+    };
+    let [receiver, name] = access.as_slice() else {
+        return Ok(None);
+    };
+    if *value != right
+        || store.source_node_kind(*target) != Some(SyntaxKind::PropertyAccessExpression)
+        || store.source_node_kind(*receiver) != Some(SyntaxKind::ThisKeyword)
+        || store.source_node_kind(*name) != Some(SyntaxKind::PrivateIdentifier)
+    {
+        return Ok(None);
+    }
+    let plan = match super::source_properties::plan_class_property_write(store, host, assignment) {
+        Ok(plan) => plan,
+        Err(super::source_properties::SourcePropertyError::Unsupported(_)) => return Ok(None),
         Err(_) => {
-            return Err(invariant(SourceCallableInvariant::InvalidTypeCache(declaration)));
+            return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+                assignment,
+            )));
         }
     };
-    let bound = host.bound_file(declaration).ok_or_else(|| {
-        invariant(SourceCallableInvariant::InvalidTypeCache(declaration))
-    })?;
-    Ok((proof.right == right
-        && bound.symbol(declaration).is_some()
-        && bound.symbol(declaration) == store.source_declaration_symbol(declaration))
-    .then_some(proof.target))
+    let Some(property) = store
+        .symbol(plan.member())
+        .and_then(|member| member.value_declaration())
+    else {
+        return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+            assignment,
+        )));
+    };
+    let Some(NodeData::PropertyDeclaration(field)) = host.node(property).map(|node| &node.data)
+    else {
+        return Ok(None);
+    };
+    Ok((plan.target() == *target
+        && plan.value() == right
+        && store.source_node_kind(plan.context().body_declaration())
+            == Some(SyntaxKind::Constructor)
+        && field.type_.is_some()
+        && field.postfix_token.is_none())
+    .then_some(*target))
 }
 
 fn stored_member_assignment_arrow_context(
@@ -5264,6 +5333,11 @@ fn stored_member_assignment_arrow_context(
     let [receiver, name] = access.as_slice() else {
         return None;
     };
+    if store.source_node_kind(*receiver) == Some(SyntaxKind::ThisKeyword)
+        && store.source_node_kind(*name) == Some(SyntaxKind::PrivateIdentifier)
+    {
+        return stored_class_assignment_arrow_context(store, assignment, *target, *receiver, *name);
+    }
     if store.source_node_kind(*receiver) != Some(SyntaxKind::Identifier)
         || store.source_node_kind(*name) != Some(SyntaxKind::Identifier)
     {
@@ -5319,6 +5393,74 @@ fn stored_member_assignment_arrow_context(
         return None;
     }
     Some((property, type_))
+}
+
+fn stored_class_assignment_arrow_context(
+    store: &CanonicalTypeMapperStore,
+    assignment: NodeRef,
+    target: NodeRef,
+    receiver: NodeRef,
+    name: NodeRef,
+) -> Option<(NodeRef, TypeId)> {
+    let member = store.symbol_node_links(target)?.resolved_symbol?;
+    let type_ = store.type_node_links(target)?.resolved_type?;
+    let this_type = store.type_node_links(receiver)?.resolved_type?;
+    let owner = super::classes::source_class_this_type_owner(store, this_type)?;
+    let name = store.source_private_identifier_text(name)?;
+    if store.symbol_node_links(target)
+        != Some(&SymbolNodeLinks {
+            resolved_symbol: Some(member),
+            ..SymbolNodeLinks::default()
+        })
+        || store.type_node_links(target)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(type_),
+                ..TypeNodeLinks::default()
+            })
+        || store.symbol_node_links(receiver)
+            != Some(&SymbolNodeLinks {
+                resolved_symbol: Some(owner),
+                ..SymbolNodeLinks::default()
+            })
+        || store.type_node_links(receiver)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(this_type),
+                ..TypeNodeLinks::default()
+            })
+        || super::classes::authenticated_private_class_symbol_name(store, owner, member)
+            != Some(name)
+    {
+        return None;
+    }
+    let SourceNodeParent::Parent(statement) = store.source_node_parent(assignment)? else {
+        return None;
+    };
+    if store.source_node_kind(statement) != Some(SyntaxKind::ExpressionStatement)
+        || store.source_direct_children(statement)?.as_slice() != [assignment]
+    {
+        return None;
+    }
+    let mut current = statement;
+    let mut seen = HashSet::new();
+    let constructor = loop {
+        if !seen.insert(current) {
+            return None;
+        }
+        let SourceNodeParent::Parent(parent) = store.source_node_parent(current)? else {
+            return None;
+        };
+        if !store.source_direct_children(parent)?.contains(&current) {
+            return None;
+        }
+        match store.source_node_kind(parent)? {
+            SyntaxKind::Constructor => break parent,
+            SyntaxKind::Block | SyntaxKind::IfStatement => current = parent,
+            _ => return None,
+        }
+    };
+    let (property, expected) =
+        super::classes::source_class_constructor_field_type(store, this_type, constructor, member)?;
+    (expected == type_).then_some((property, type_))
 }
 
 /// Reads the sole written annotation from its registered source owner.
