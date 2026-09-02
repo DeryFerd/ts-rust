@@ -15393,12 +15393,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
         let record = preflight_node(self.store, self.host, node)?;
         let children = match (&record.data, record.kind) {
-            // The normal tuple and array planners validate these nodes and their caches.
+            // The normal tuple, array and intersection planners validate these nodes and caches.
             (NodeData::ArrayTypeNode(array), SyntaxKind::ArrayType) => {
                 std::slice::from_ref(&array.element_type)
             }
             (NodeData::TupleTypeNode(tuple), SyntaxKind::TupleType) => {
                 tuple.elements.nodes.as_slice()
+            }
+            (NodeData::IntersectionTypeNode(intersection), SyntaxKind::IntersectionType) => {
+                intersection.types.nodes.as_slice()
             }
             (NodeData::TypeReferenceNode(reference), SyntaxKind::TypeReference) => {
                 let symbol = self.resolve_uncached_type_reference_symbol(node)?;
