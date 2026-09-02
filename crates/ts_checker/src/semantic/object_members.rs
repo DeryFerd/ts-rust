@@ -820,6 +820,100 @@ pub(super) fn resolve_object_property_by_key_with_source(
     }))
 }
 
+/// Resolves a selected array data property while retaining its source symbol.
+/// A receiver proxy supplies the mapped type, not the property-access identity.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_source_array_property(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    receiver: TypeId,
+    name: EscapedNameRef<'_>,
+    source_symbol: SemanticSymbolId,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<ResolvedOwnProperty, SourceCheckError> {
+    let mut staged = CanonicalCheckerDiagnostics::default();
+    let result = (|| {
+        let array = store
+            .canonical_array_reference(global_types, receiver)?
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+        let target = if array.readonly {
+            global_types.readonly_array_type
+        } else {
+            global_types.array_type
+        };
+        let owner = store
+            .type_payload(target)
+            .and_then(TypeRecord::symbol)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+        let source = store
+            .symbol(source_symbol)
+            .ok_or(RelationUnavailable::Symbol(source_symbol))?;
+        if source.name() != name
+            || store.get_parent_of_symbol(source_symbol) != Some(owner)
+            || source.flags() != SymbolFlags::PROPERTY
+                && source.flags() != (SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+            || store
+                .symbol(owner)
+                .and_then(|owner| owner.members())
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get(name))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(source_symbol)
+        {
+            return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
+        }
+        let optional = source.flags().contains(SymbolFlags::OPTIONAL);
+        let readonly = source.check_flags().contains(CheckFlags::READONLY);
+        let resolved = resolve_object_property_by_key_with_source(
+            store,
+            host,
+            global_types,
+            options,
+            receiver,
+            name,
+            session,
+            &mut staged,
+        )?
+        .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+        if resolved.symbol != source_symbol {
+            let members = validate_generic_interface_members(
+                store,
+                array.base_type,
+                Some(CanonicalArrayTargets::from_global_types(global_types)),
+            )
+            .map_err(|error| source_generic_member_error(receiver, &error))?
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+            if members
+                .members()
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get(name))
+                != Some(resolved.symbol)
+                || store
+                    .value_symbol_links(resolved.symbol)
+                    .and_then(|links| links.target)
+                    != Some(source_symbol)
+            {
+                return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
+            }
+        }
+        if resolved.optional != optional || resolved.readonly != readonly {
+            return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
+        }
+        Ok(ResolvedOwnProperty {
+            symbol: source_symbol,
+            type_: resolved.type_,
+            optional,
+            readonly,
+        })
+    })();
+    super::source::merge_retry_diagnostics(diagnostics, staged);
+    result
+}
+
 #[allow(clippy::too_many_arguments)] // Keep the source host and limits with the selected proxy.
 fn resolve_completed_class_origin_property_by_key_with_source(
     store: &mut CanonicalTypeMapperStore,

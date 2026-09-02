@@ -116,6 +116,8 @@ pub(super) struct SourceCallPlan {
 pub(super) enum SourceCallCalleeForm {
     /// An identifier or nested call planned through the ordinary expression path.
     Identifier,
+    /// The actual synchronous function expression with declared parameters.
+    ParameterizedFunction(NodeRef),
     MetaProperty,
     RequiredOwnProperty,
     /// One authenticated zero-argument parenthesized async arrow.
@@ -3619,6 +3621,13 @@ pub(super) fn plan_direct_source_call_syntax(
             UnsupportedSourceSyntax::Call(node),
         ));
     }
+    let parameterized_function = match (callee_record.kind, &callee_record.data) {
+        (
+            SyntaxKind::ParenthesizedExpression | SyntaxKind::FunctionExpression,
+            NodeData::ParenthesizedExpression(_) | NodeData::FunctionExpression(_),
+        ) => immediately_invoked_parameterized_function(arena, node),
+        _ => None,
+    };
     let (callee, callee_form, callee_diagnostic_node) =
         match (callee_record.kind, &callee_record.data) {
             (SyntaxKind::Identifier, NodeData::Identifier(_)) => (
@@ -3651,6 +3660,16 @@ pub(super) fn plan_direct_source_call_syntax(
             ) if is_immediately_invoked_source_callable(arena, node) => (
                 actual_callee,
                 SourceCallCalleeForm::Identifier,
+                actual_callee,
+            ),
+            (
+                SyntaxKind::ParenthesizedExpression | SyntaxKind::FunctionExpression,
+                NodeData::ParenthesizedExpression(_) | NodeData::FunctionExpression(_),
+            ) if parameterized_function.is_some() => (
+                actual_callee,
+                SourceCallCalleeForm::ParameterizedFunction(
+                    parameterized_function.ok_or(SourceCheckError::Call(node))?,
+                ),
                 actual_callee,
             ),
             (
@@ -3834,6 +3853,63 @@ pub(super) fn is_immediately_invoked_source_callable(arena: &NodeArena, node: No
                 return arrow.parameters.nodes.is_empty() && arrow.modifiers.is_none();
             }
             _ => return false,
+        }
+    }
+}
+
+/// Authenticates a parameterized function callee without changing flow-effect admission.
+pub(super) fn immediately_invoked_parameterized_function(
+    arena: &NodeArena,
+    node: NodeRef,
+) -> Option<NodeRef> {
+    if node.arena != arena.id() {
+        return None;
+    }
+    let record = arena.get(node.node)?;
+    let NodeData::CallExpression(call) = &record.data else {
+        return None;
+    };
+    if record.kind != SyntaxKind::CallExpression
+        || record.flags.0 != 0
+        || call.question_dot_token.is_some()
+        || call.symbol.is_some()
+        || call.type_arguments.is_some()
+        || call.facts != 0
+        || call.arguments.has_trailing_comma
+        || call.arguments.range.end != record.range.end
+    {
+        return None;
+    }
+    let mut current = NodeRef::new(node.arena, node.file, call.expression);
+    let mut expected_parent = node.node;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current.node) {
+            return None;
+        }
+        let expression = arena.get(current.node)?;
+        if expression.flags.0 != 0 || expression.parent != Some(expected_parent) {
+            return None;
+        }
+        match (&expression.data, expression.kind) {
+            (
+                NodeData::ParenthesizedExpression(parenthesized),
+                SyntaxKind::ParenthesizedExpression,
+            ) => {
+                expected_parent = current.node;
+                current = NodeRef::new(current.arena, current.file, parenthesized.expression);
+            }
+            (NodeData::FunctionExpression(function), SyntaxKind::FunctionExpression)
+                if function.name.is_none()
+                    && function.modifiers.is_none()
+                    && function.asterisk_token.is_none()
+                    && function.type_parameters.is_none()
+                    && !function.parameters.nodes.is_empty()
+                    && !function.parameters.has_trailing_comma =>
+            {
+                return Some(current);
+            }
+            _ => return None,
         }
     }
 }
@@ -4229,6 +4305,21 @@ pub(super) fn finish_direct_source_call_plan(
                 && matches!(
                     callee.unparenthesized().kind,
                     PlannedExpressionKind::Arrow(_)
+                )
+        }
+        (
+            PlannedExpressionKind::Parenthesized(_) | PlannedExpressionKind::Arrow(_),
+            SourceCallCalleeForm::ParameterizedFunction(declaration),
+        ) => {
+            syntax.type_arguments.is_none()
+                && syntax.callee_diagnostic_node == syntax.callee
+                && matches!(
+                    &callee.unparenthesized().kind,
+                    PlannedExpressionKind::Arrow(arrow)
+                        if arrow.callable.declaration == declaration
+                            && !arrow.callable.parameters.is_empty()
+                            && arrow.callable.type_parameters.is_empty()
+                            && !arrow.callable.is_async
                 )
         }
         (PlannedExpressionKind::Property(property), SourceCallCalleeForm::RequiredOwnProperty) => {

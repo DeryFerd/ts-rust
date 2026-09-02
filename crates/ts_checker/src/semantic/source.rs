@@ -25854,7 +25854,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 NodeData::CallExpression(call)
                     if parent_record.kind == SyntaxKind::CallExpression
                         && call.expression == position.node
-                        && is_immediately_invoked_source_callable(self.arena, parent) => {}
+                        && (is_immediately_invoked_source_callable(self.arena, parent)
+                            || super::source_calls::immediately_invoked_parameterized_function(
+                                self.arena, parent,
+                            ) == Some(declaration)) => {}
                 NodeData::CallExpression(call)
                     if parent_record.kind == SyntaxKind::CallExpression
                         && call
@@ -27252,6 +27255,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let syntax = plan_direct_source_element_syntax(self.arena, store, expression)
                     .map_err(|error| Self::element_plan_error(expression, error))?;
                 let receiver = self.plan_expression(syntax.receiver())?;
+                self.primitive_binary_position_roots.insert(syntax.index());
                 let index = self.plan_expression(syntax.index())?;
                 let element = finish_direct_source_element_plan(syntax, receiver, index)
                     .map_err(|error| Self::element_plan_error(expression, error))?;
@@ -27360,6 +27364,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     .extend(argument_nodes.iter().copied());
                 let callee = match syntax.callee_form() {
                     SourceCallCalleeForm::Identifier
+                    | SourceCallCalleeForm::ParameterizedFunction(_)
                     | SourceCallCalleeForm::MetaProperty
                     | SourceCallCalleeForm::ParenthesizedAsyncArrow => {
                         self.plan_expression(callee_node).map_err(|error| {
@@ -47504,6 +47509,16 @@ fn source_type_is_assignable_to(
         }
         return Ok(assignable);
     }
+    prepare_source_array_relation_target(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        source,
+        target,
+    )?;
     let wrapper_types = [
         global_types.object_type,
         global_types.string_type,
@@ -47626,6 +47641,102 @@ fn source_type_is_assignable_to(
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+/// The mixed Array relation reads the non-array target's members first.
+#[allow(clippy::too_many_arguments)] // Member demand retains the caller's complete query state.
+fn prepare_source_array_relation_target(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    source: TypeId,
+    target: TypeId,
+) -> Result<(), SourceCheckError> {
+    if source == target
+        || store
+            .claimed_strict_function_types()
+            .is_some_and(|established| established != options.strict_function_types)
+    {
+        return Ok(());
+    }
+    let (Some(source_record), Some(target_record)) =
+        (store.type_payload(source), store.type_payload(target))
+    else {
+        return Ok(());
+    };
+    if source_record.flags() != TypeFlags::OBJECT || target_record.flags() != TypeFlags::OBJECT {
+        return Ok(());
+    }
+    let (TypeData::TypeReference(source_reference), TypeData::TypeReference(target_reference)) =
+        (source_record.data(), target_record.data())
+    else {
+        return Ok(());
+    };
+    let arrays = [
+        Some(global_types.array_type),
+        Some(global_types.readonly_array_type),
+    ];
+    if !arrays.contains(&source_reference.object.target)
+        || arrays.contains(&target_reference.object.target)
+    {
+        return Ok(());
+    }
+    let Some(target_origin) = target_reference
+        .object
+        .target
+        .and_then(|target| store.type_payload(target))
+    else {
+        return Ok(());
+    };
+    let TypeData::Interface(interface) = target_origin.data() else {
+        return Ok(());
+    };
+    let Some(globals) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+    else {
+        return Ok(());
+    };
+    if let Some(global) = globals.get_source("ConcatArray") {
+        let (Some(owner), Some(actual_owner)) = (
+            store.get_merged_symbol(global),
+            target_origin
+                .symbol()
+                .and_then(|symbol| store.get_merged_symbol(symbol)),
+        ) else {
+            return Ok(());
+        };
+        if actual_owner == owner {
+            return Ok(());
+        }
+    }
+    if target_origin.object_flags().contains(ObjectFlags::CLASS)
+        || interface.base_types_resolved
+        || interface.declared_members_resolved
+        || store
+            .canonical_array_reference(global_types, source)
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        return Ok(());
+    }
+    let mut member_diagnostics = CanonicalCheckerDiagnostics::default();
+    let prepared = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        &mut member_diagnostics,
+    )?
+    .prepare_generic_interface_declared_members(target);
+    merge_retry_diagnostics(diagnostics, member_diagnostics);
+    prepared?;
+    Ok(())
 }
 
 /// Resolves members only after a source operation needs a nongeneric interface.
@@ -76094,6 +76205,23 @@ pub(super) fn check_source_file(
                         )?
                         .get_type_from_type_node(annotation);
                         merge_retry_diagnostics(diagnostics, call_diagnostics);
+                        result?;
+                    }
+                }
+                for method in &interface.methods {
+                    for parameter in &method.parameters {
+                        session.reset_query();
+                        let mut parameter_diagnostics = CanonicalCheckerDiagnostics::default();
+                        let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            &mut parameter_diagnostics,
+                        )?
+                        .get_type_from_type_node(parameter.type_node);
+                        merge_retry_diagnostics(diagnostics, parameter_diagnostics);
                         result?;
                     }
                 }

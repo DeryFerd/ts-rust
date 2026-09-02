@@ -15900,21 +15900,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         result
     }
 
-    fn plan_concrete_generic_interface_base(
+    fn plan_generic_interface_declared_members(
         &mut self,
-        base: &DirectInterfaceBasePlan,
+        symbol: SemanticSymbolId,
     ) -> Result<(), DeclaredTypeError> {
         let replay_imported = self.checking_imported_arguments
-            && self.imported_argument_generic_members.insert(base.symbol);
-        if !self.plan.generic_member_plans.contains_key(&base.symbol) || replay_imported {
-            let members =
-                object_members::plan_generic_interface(self.store, self.host, base.symbol)
-                    .map_err(property_object_error)?;
+            && self.imported_argument_generic_members.insert(symbol);
+        if !self.plan.generic_member_plans.contains_key(&symbol) || replay_imported {
+            let members = object_members::plan_generic_interface(self.store, self.host, symbol)
+                .map_err(property_object_error)?;
             self.plan
                 .generic_member_plans
-                .insert(base.symbol, members.clone());
-            if self.has_generic_interface_heritage(base.symbol)? {
-                self.plan_generic_interface_heritage(base.symbol)?;
+                .insert(symbol, members.clone());
+            if self.has_generic_interface_heritage(symbol)? {
+                self.plan_generic_interface_heritage(symbol)?;
             }
             if let Some(heritage) = &members.heritage {
                 for inherited in &heritage.bases {
@@ -15943,6 +15942,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.plan_type_node_in_context(property.key.type_node, None, false)?;
             }
         }
+        Ok(())
+    }
+
+    fn plan_concrete_generic_interface_base(
+        &mut self,
+        base: &DirectInterfaceBasePlan,
+    ) -> Result<(), DeclaredTypeError> {
+        self.plan_generic_interface_declared_members(base.symbol)?;
         for argument in &base.type_arguments {
             self.plan_type_node_in_context(*argument, None, false)?;
         }
@@ -42021,6 +42028,155 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ) -> Result<TypeId, DeclaredTypeError> {
         self.begin_source_query();
         let result = self.get_declared_type_of_symbol_worker(symbol, true);
+        self.finish_source_query();
+        result
+    }
+
+    /// Selects only a cold, noncallable interface with no heritage.
+    /// Other states remain subject to the existing member validator.
+    fn cold_generic_interface_declared_member_target(
+        &self,
+        reference: TypeId,
+    ) -> Option<(SemanticSymbolId, TypeId)> {
+        let record = self.store.type_payload(reference)?;
+        let TypeData::TypeReference(data) = record.data() else {
+            return None;
+        };
+        let target = data.object.target?;
+        let target_record = self.store.type_payload(target)?;
+        let TypeData::Interface(interface) = target_record.data() else {
+            return None;
+        };
+        let owner = target_record.symbol()?;
+        let owner_record = self.store.symbol(owner)?;
+        let raw_members = owner_record
+            .members()
+            .and_then(|members| self.store.symbol_table(members))?;
+        let declarations = owner_record
+            .declarations()
+            .filter(|declarations| !declarations.is_empty())?;
+        let variable_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+        let reference_flags = ObjectFlags::REFERENCE
+            | ObjectFlags::FROM_TYPE_NODE
+            | ObjectFlags::PROPAGATING_FLAGS
+            | variable_flags;
+        let target_flags = ObjectFlags::INTERFACE | ObjectFlags::REFERENCE | variable_flags;
+        if record.flags() != TypeFlags::OBJECT
+            || !(record.object_flags() & !reference_flags).is_empty()
+            || data.object.structured != StructuredTypeData::default()
+            || data.object.source_computed_literal.is_some()
+            || target_record.flags() != TypeFlags::OBJECT
+            || target_record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK
+                != (ObjectFlags::INTERFACE | ObjectFlags::REFERENCE)
+            || !(target_record.object_flags() & !target_flags).is_empty()
+            || interface.reference.object.structured != StructuredTypeData::default()
+            || interface.reference.object.source_computed_literal.is_some()
+            || interface.base_types_resolved
+            || interface.declared_members_resolved
+            || interface.resolved_base_constructor_type.is_some()
+            || interface.resolved_base_types.is_some()
+            || interface.declared_members.is_some()
+            || interface.declared_call_signatures.is_some()
+            || interface.declared_construct_signatures.is_some()
+            || interface.declared_index_infos.is_some()
+            || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || owner_record.check_flags() != CheckFlags::NONE
+            || owner_record.value_declaration().is_some()
+            || owner_record.exports().is_some()
+            || owner_record.export_symbol().is_some()
+            || self.store.get_merged_symbol(owner) != Some(owner)
+            || self.store.declared_type_initialization_in_progress(owner)
+            || raw_members.get(InternalSymbolName::Call.as_ref()).is_some()
+            || raw_members.get(InternalSymbolName::New.as_ref()).is_some()
+            || declarations.iter().any(|declaration| {
+                !matches!(
+                    self.host.node(*declaration).map(|node| &node.data),
+                    Some(NodeData::InterfaceDeclaration(interface))
+                        if interface.heritage_clauses.is_none()
+                )
+            })
+        {
+            return None;
+        }
+        let direct = validate_direct_generic_reference(self.store, reference).ok()?;
+        let identity =
+            object_members::plan_generic_interface_identity(self.store, self.host, owner).ok()?;
+        let parameters = interface.reference.resolved_type_arguments.as_deref()?;
+        if direct.target != target
+            || identity.symbol != owner
+            || identity.heritage.is_some()
+            || parameters.len() != identity.parameters.len()
+            || parameters
+                .iter()
+                .zip(&identity.parameters)
+                .any(|(parameter, symbol)| {
+                    cached_ordinary_type_parameter_owner(self.store, *parameter) != Some(*symbol)
+                })
+        {
+            return None;
+        }
+        Some((owner, target))
+    }
+
+    /// Prepares the declared target before a source relation demands its members.
+    pub(super) fn prepare_generic_interface_declared_members(
+        &mut self,
+        reference: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        self.begin_source_query();
+        let result = (|| {
+            self.reject_type_reference_alias_capabilities()?;
+            let Some((symbol, target)) =
+                self.cold_generic_interface_declared_member_target(reference)
+            else {
+                return Ok(());
+            };
+            if self.instantiation_session.is_none() || !self.pending_function_parameters.is_empty()
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidPreparedTypeQuery,
+                ));
+            }
+            let mut planner = TypeQueryPlanner::new(
+                self.store,
+                self.host,
+                self.array_type,
+                self.global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types),
+                self.options.strict_builtin_iterator_return,
+                &self.type_reference_alias_targets,
+            )
+            .with_jsdoc_import_type_target(self.jsdoc_import_type_target)
+            .with_source_globals(self.global_types.as_ref());
+            planner.source_context = Some(self.source_query_context()?);
+            planner.plan_generic_interface_declared_members(symbol)?;
+            let plan = planner.finish();
+            let mut prepared = self.prepare_literal_types(&plan)?;
+            if let Err(error) = self.seed_pending_function_parameters(&plan, &mut prepared) {
+                self.pending_function_parameters.clear();
+                prepared.clear_pending_function_types();
+                return Err(error);
+            }
+            let result = (|| {
+                if self.execute_declared_type(symbol, &plan, &mut prepared)? != target {
+                    return Err(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                            symbol,
+                            declared_type: target,
+                        },
+                    ));
+                }
+                self.execute_generic_interface_declared_members(
+                    symbol,
+                    target,
+                    &plan,
+                    &mut prepared,
+                )
+            })();
+            self.complete_type_query(result, &plan, &mut prepared)
+        })();
         self.finish_source_query();
         result
     }

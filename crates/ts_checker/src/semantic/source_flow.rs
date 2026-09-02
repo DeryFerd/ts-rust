@@ -6404,12 +6404,7 @@ impl SourceFlowFrame<'_, '_> {
         let result = (|| {
             for antecedent in &antecedents[1..] {
                 let reference_loop = self.reference.is_some()
-                    && (self.plan.region.is_some()
-                        || self
-                            .plan
-                            .statement_list
-                            .as_ref()
-                            .is_some_and(SourceCallableStatementListSyntax::contains_counted_for));
+                    && (self.plan.region.is_some() || self.uses_callable_loop_queries());
                 let next = if reference_loop {
                     // The backedge can repeat the demand's prefix before reaching this loop.
                     let outer_visiting = std::mem::take(&mut self.visiting);

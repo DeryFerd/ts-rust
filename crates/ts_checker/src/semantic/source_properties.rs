@@ -2483,6 +2483,12 @@ enum CanonicalArrayProperty {
     Missing,
 }
 
+#[derive(Clone, Copy)]
+enum SourcePropertyLookup {
+    Own,
+    ArrayProperty(SemanticSymbolId),
+}
+
 /// Proves property syntax and existing access caches before recursive receiver
 /// planning can publish semantic state.
 pub(super) fn plan_direct_source_property_syntax(
@@ -2782,8 +2788,11 @@ pub(super) fn check_direct_source_property_with_session(
         receiver_type,
         session,
         true,
-        |store, receiver, name, session| {
-            resolve_direct_source_own_property(store, global_types, receiver, name, session)
+        |store, receiver, name, lookup, session| match lookup {
+            SourcePropertyLookup::Own => {
+                resolve_direct_source_own_property(store, global_types, receiver, name, session)
+            }
+            SourcePropertyLookup::ArrayProperty(_) => Ok(None),
         },
     )
     .map(|(checked, _)| checked)
@@ -3139,7 +3148,22 @@ fn check_direct_source_property_with_source_mode(
         receiver_type,
         session,
         publish,
-        |store, receiver, name, session| {
+        |store, receiver, name, lookup, session| {
+            if let SourcePropertyLookup::ArrayProperty(symbol) = lookup {
+                return super::object_members::resolve_source_array_property(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    receiver,
+                    EscapedNameRef::source(name),
+                    symbol,
+                    session,
+                    diagnostics,
+                )
+                .map(Some)
+                .map_err(SourcePropertyQueryError::Source);
+            }
             let property_alias =
                 super::object_aliases::property_object_alias_projection(store, receiver)?.is_some();
             let target = store
@@ -3491,6 +3515,7 @@ fn check_direct_source_property_worker<E>(
         &mut CanonicalTypeMapperStore,
         TypeId,
         &str,
+        SourcePropertyLookup,
         &mut InstantiationSession,
     ) -> Result<Option<ResolvedOwnProperty>, E>,
 ) -> Result<(CheckedSourceProperty, Option<SemanticSymbolId>), E>
@@ -3716,17 +3741,24 @@ where
                         receiver_type,
                     )? {
                         Some(method) => Some(method),
-                        None => match resolve_published_canonical_array_property(
+                        None => match resolve_canonical_array_property_with_lookup(
                             store,
                             global_types,
                             plan,
                             receiver_type,
                             session,
+                            &mut resolve_own_property,
                         )? {
                             Some(CanonicalArrayProperty::Present(property)) => Some(property),
                             Some(CanonicalArrayProperty::Missing) => None,
                             None => {
-                                resolve_own_property(store, receiver_type, &plan.name, session)?
+                                resolve_own_property(
+                                    store,
+                                    receiver_type,
+                                    &plan.name,
+                                    SourcePropertyLookup::Own,
+                                    session,
+                                )?
                             }
                         },
                     },
@@ -5495,6 +5527,116 @@ fn resolve_published_global_object_constructor_method(
         optional: false,
         readonly: false,
     }))
+}
+
+/// Source reads can demand one array property after the published lookup validates it.
+/// Store-only reads decline the source lookup and retain the original result.
+fn resolve_canonical_array_property_with_lookup<E>(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+    session: &mut InstantiationSession,
+    lookup: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        &str,
+        SourcePropertyLookup,
+        &mut InstantiationSession,
+    ) -> Result<Option<ResolvedOwnProperty>, E>,
+) -> Result<Option<CanonicalArrayProperty>, E>
+where
+    E: From<SourcePropertyError> + From<RelationUnavailable>,
+{
+    let published = resolve_published_canonical_array_property(
+        store,
+        global_types,
+        plan,
+        receiver_type,
+        session,
+    );
+    let (symbol, cached) = match published {
+        Ok(Some(CanonicalArrayProperty::Present(property)))
+            if store
+                .symbol(property.symbol)
+                .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::PROPERTY))
+                && store
+                    .value_symbol_links(property.symbol)
+                    .and_then(|links| links.resolved_type)
+                    .is_some_and(|type_| !store.type_has_function_type_provenance(type_)) =>
+        {
+            (property.symbol, Some(property))
+        }
+        Err(SourcePropertyError::Relation(RelationUnavailable::UnresolvedPropertyType(symbol)))
+            if store
+                .symbol(symbol)
+                .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::PROPERTY)) =>
+        {
+            (symbol, None)
+        }
+        result => return result.map_err(E::from),
+    };
+    if cached.is_none() {
+        // A missing array name can produce an unrelated global Object error.
+        // Admit only the exact member selected from this array's source owner.
+        let selected = global_types.and_then(|global_types| {
+            let array = store
+                .canonical_array_reference(global_types, receiver_type)
+                .ok()??;
+            let target = if array.readonly {
+                global_types.readonly_array_type
+            } else {
+                global_types.array_type
+            };
+            let owner = store.type_payload(target)?.symbol()?;
+            let owner = store.get_merged_symbol(owner)?;
+            let members = store.symbol(owner)?.members()?;
+            let selected = store.symbol_table(members)?.get_source(&plan.name)?;
+            store.get_merged_symbol(selected)
+        });
+        if selected != Some(symbol) {
+            return Err(RelationUnavailable::UnresolvedPropertyType(symbol).into());
+        }
+    }
+    let Some(resolved) = lookup(
+        store,
+        receiver_type,
+        &plan.name,
+        SourcePropertyLookup::ArrayProperty(symbol),
+        session,
+    )?
+    else {
+        return match cached {
+            Some(property) => Ok(Some(CanonicalArrayProperty::Present(property))),
+            None => Err(RelationUnavailable::UnresolvedPropertyType(symbol).into()),
+        };
+    };
+    // Recheck the same selected member after a cold source query. Do not publish
+    // a raw owner type parameter from this validation result.
+    let validated = match resolve_published_canonical_array_property(
+        store,
+        global_types,
+        plan,
+        receiver_type,
+        session,
+    )? {
+        Some(CanonicalArrayProperty::Present(property)) => property,
+        _ => return Err(SourcePropertyError::InvalidCache(plan.node).into()),
+    };
+    if validated.symbol != symbol
+        || resolved.symbol != symbol
+        || resolved.optional != validated.optional
+        || resolved.readonly != validated.readonly
+        || store
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .is_some_and(|type_| {
+                store.type_has_function_type_provenance(type_) && resolved.type_ != validated.type_
+            })
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node).into());
+    }
+    Ok(Some(CanonicalArrayProperty::Present(resolved)))
 }
 
 /// Reads a published member from the exact global target of a canonical array.
