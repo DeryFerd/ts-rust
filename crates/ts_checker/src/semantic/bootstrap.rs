@@ -711,6 +711,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.union_cache_validation_scans
     }
 
+    #[cfg(test)]
+    pub(super) fn union_cache_len(&self) -> usize {
+        self.intrinsic_bootstrap()
+            .map_or(0, IntrinsicBootstrap::union_cache_len)
+    }
+
     /// Reserves one dependency-closed batch of regular/fresh literal pairs.
     ///
     /// This is the mutation barrier for literal type-node execution. Every

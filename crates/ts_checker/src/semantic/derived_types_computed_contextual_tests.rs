@@ -8,8 +8,8 @@ use ts_parser::{ParseResult, parse_source_file};
 use super::DerivedTypeError;
 use crate::semantic::bootstrap::UnionReduction;
 use crate::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, ObjectFlags,
-    TypeData, TypeFlags, TypeId,
+    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, types::ObjectFlags,
+    TypeData, types::TypeFlags, TypeId,
 };
 
 const FILE: FileId = FileId::new(20_242);

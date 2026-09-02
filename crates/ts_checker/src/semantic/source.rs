@@ -80675,7 +80675,7 @@ mod tests {
         );
         planner.plan_parameter_initializers_and_enter_scope(&callable).unwrap();
         let mut locals = Vec::new();
-        planner.finish_callable_statements(&callable, &syntax.statements[..2], &mut locals, true).unwrap();
+        planner.finish_callable_statements(&callable, &syntax.statements[..2], &mut locals, crate::semantic::source::CallableLocalWrites::Linear).unwrap();
         let before = (
             planner.prior_variables.clone(), planner.readable_variables.clone(),
             planner.assignable_uninitialized_variables.clone(), planner.assigned_variables.clone(),
