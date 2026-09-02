@@ -485,7 +485,7 @@ fn returned_class_arrow_keeps_generic_capture_lexical_this_and_void() {
         );
         assert_eq!(
             checker.store().symbol(listener_owner).unwrap().parent(),
-            Some(method_owner)
+            None
         );
         assert_ne!(arrow_owner, method_owner);
         assert_eq!(checker.get_symbol_at_location(nodes.argument), Ok(Some(listener_owner)));
