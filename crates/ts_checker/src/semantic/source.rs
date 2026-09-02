@@ -32099,6 +32099,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         NodeRef::new(self.arena.id(), self.bound.file_id(), node)
     }
 
+    #[track_caller]
     fn unsupported(
         &self,
         node: NodeRef,
@@ -32106,6 +32107,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         role: SourceSyntaxRole,
     ) -> SourceCheckError {
         debug_assert!(node.is_for(self.arena.id(), self.bound.file_id()));
+        if kind == SyntaxKind::NamedExports && role == SourceSyntaxRole::ExportClause {
+            let _ = std::io::Write::write_fmt(
+                &mut std::io::stderr().lock(),
+                format_args!(
+                    "SOURCE_NAMED_EXPORT_FAILURE node={node:?} caller={}\n",
+                    std::panic::Location::caller(),
+                ),
+            );
+        }
         SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax { node, kind, role })
     }
 }
