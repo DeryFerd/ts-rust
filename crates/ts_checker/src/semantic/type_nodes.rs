@@ -8199,6 +8199,45 @@ fn keyof_type_error(error: NongenericKeyofError, root: NodeRef) -> DeclaredTypeE
     }
 }
 
+// Record the failed function and its source owners without starting another query.
+fn observe_function_query_failure(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    stage: &'static str,
+    node: Option<NodeRef>,
+    error: impl std::fmt::Debug,
+) {
+    if store.relation_read_observation_is_active() {
+        return;
+    }
+    let Some(mut node) = node else {
+        return;
+    };
+    for depth in 0..4 {
+        let record = host.node(node);
+        let owner = host.bound_file(node).and_then(|bound| bound.symbol(node));
+        let symbol = owner.and_then(|owner| store.symbol(owner));
+        let parent = record
+            .and_then(|record| record.parent)
+            .map(|parent| NodeRef::new(node.arena, node.file, parent));
+        super::source::observe_call_failure_detail(
+            stage,
+            format_args!(
+                "depth={depth} node={node:?} syntax={:?} owner={owner:?} name={:?} owner_flags={:?} cached_type={:?} signature={:?} parent={parent:?} original={error:?}",
+                record.map(|record| (record.kind, record.range.start, record.range.end)),
+                symbol.map(|symbol| symbol.name()),
+                symbol.map(|symbol| symbol.flags().bits()),
+                store.type_node_links(node).and_then(|links| links.resolved_type),
+                store.signature_links(node).and_then(|links| links.resolved_signature.signature()),
+            ),
+        );
+        let Some(parent) = parent else {
+            break;
+        };
+        node = parent;
+    }
+}
+
 fn function_type_error(error: FunctionTypeError) -> DeclaredTypeError {
     match error {
         FunctionTypeError::DeclaredType(error) => error,
@@ -16140,6 +16179,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.plan.functions.insert(node, planned.clone());
         }
         if let Some(proof) = functions::pending_function_type_proof(self.store, &planned)
+            .inspect_err(|error| {
+                observe_function_query_failure(
+                    self.store,
+                    self.host,
+                    "function_plan_pending",
+                    error.node(),
+                    error,
+                );
+            })
             .map_err(function_type_error)?
             && !self.plan.pending_function_proofs.contains(&proof)
         {
@@ -16161,6 +16209,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     .is_some_and(|links| links.resolved_type.is_some())
                     || matches!(
                         functions::function_type_state(self.store, &planned, true)
+                            .inspect_err(|error| {
+                                observe_function_query_failure(
+                                    self.store,
+                                    self.host,
+                                    "function_plan_replay",
+                                    error.node(),
+                                    error,
+                                );
+                            })
                             .map_err(function_type_error)?,
                         functions::FunctionTypeState::Resolved { signature, .. }
                             if self.store.signature(signature)
@@ -43922,6 +43979,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         reference: TypeId,
     ) -> Result<(), DeclaredTypeError> {
         self.begin_source_query();
+        let mut stage = "interface_members_identity";
         let result = (|| {
             self.reject_type_reference_alias_capabilities()?;
             let Some((symbol, target)) =
@@ -43948,15 +44006,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .with_jsdoc_import_type_target(self.jsdoc_import_type_target)
             .with_source_globals(self.global_types.as_ref());
             planner.source_context = Some(self.source_query_context()?);
+            stage = "interface_members_plan";
             planner.plan_generic_interface_declared_members(symbol)?;
             let plan = planner.finish();
+            stage = "interface_members_prepare";
             let mut prepared = self.prepare_literal_types(&plan)?;
+            stage = "interface_members_seed";
             if let Err(error) = self.seed_pending_function_parameters(&plan, &mut prepared) {
                 self.pending_function_parameters.clear();
                 prepared.clear_pending_function_types();
                 return Err(error);
             }
             let result = (|| {
+                stage = "interface_members_execute_identity";
                 if self.execute_declared_type(symbol, &plan, &mut prepared)? != target {
                     return Err(DeclaredTypeError::Unavailable(
                         DeclaredTypeUnavailable::InvalidCachedDeclaredType {
@@ -43965,6 +44027,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         },
                     ));
                 }
+                stage = "interface_members_execute_members";
                 self.execute_generic_interface_declared_members(
                     symbol,
                     target,
@@ -43972,8 +44035,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     &mut prepared,
                 )
             })();
+            if result.is_ok() {
+                stage = "interface_members_complete";
+            }
             self.complete_type_query(result, &plan, &mut prepared)
         })();
+        if let Err(error @ DeclaredTypeError::TypeNodeUnavailable(
+            TypeNodeUnavailable::InvalidFunctionType(node),
+        )) = &result
+        {
+            observe_function_query_failure(self.store, self.host, stage, Some(*node), error);
+        }
         self.finish_source_query();
         result
     }
@@ -44445,16 +44517,43 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 continue;
             }
             let Some(pending) = functions::resumable_function_type(self.store, function)
+                .inspect_err(|error| {
+                    observe_function_query_failure(
+                        self.store,
+                        self.host,
+                        "function_seed_resume",
+                        error.node(),
+                        error,
+                    );
+                })
                 .map_err(function_type_error)?
             else {
                 continue;
             };
             functions::finalize_function_structure(self.store, function, pending)
+                .inspect_err(|error| {
+                    observe_function_query_failure(
+                        self.store,
+                        self.host,
+                        "function_seed_structure",
+                        error.node(),
+                        error,
+                    );
+                })
                 .map_err(function_type_error)?;
             if function.all_parameters().next().is_none() {
                 continue;
             }
             let proof = functions::pending_function_type_proof(self.store, function)
+                .inspect_err(|error| {
+                    observe_function_query_failure(
+                        self.store,
+                        self.host,
+                        "function_seed_pending",
+                        error.node(),
+                        error,
+                    );
+                })
                 .map_err(function_type_error)?
                 .ok_or_else(|| {
                     type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(function.node))
@@ -44873,6 +44972,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let function_plans = plan.functions.values().collect::<Vec<_>>();
         let (cold_function_types, function_type_aliases, optional_parameter_unions) =
             functions::reserve_function_type_capacities(self.store, &function_plans)
+                .inspect_err(|error| {
+                    observe_function_query_failure(
+                        self.store,
+                        self.host,
+                        "function_reserve",
+                        error.node(),
+                        error,
+                    );
+                })
                 .map_err(function_type_error)?;
         let cold_constructors = plan
             .constructors
@@ -48924,23 +49032,60 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .iter()
             .find(|pending| pending.node == node)
         {
-            return functions::active_alias_shell(self.store, pending).map_err(function_type_error);
+            return functions::active_alias_shell(self.store, pending)
+                .inspect_err(|error| {
+                    observe_function_query_failure(
+                        self.store,
+                        self.host,
+                        "function_execute_active",
+                        error.node(),
+                        error,
+                    );
+                })
+                .map_err(function_type_error);
         }
         let function =
             plan.functions.get(&node).cloned().ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(node))
             })?;
         let pending = match functions::begin_function_type(self.store, &function)
+            .inspect_err(|error| {
+                observe_function_query_failure(
+                    self.store,
+                    self.host,
+                    "function_execute_begin",
+                    error.node(),
+                    error,
+                );
+            })
             .map_err(function_type_error)?
         {
             Ok(pending) => pending,
             Err(resolved) => return Ok(resolved),
         };
         functions::finalize_function_structure(self.store, &function, pending)
+            .inspect_err(|error| {
+                observe_function_query_failure(
+                    self.store,
+                    self.host,
+                    "function_execute_structure",
+                    error.node(),
+                    error,
+                );
+            })
             .map_err(function_type_error)?;
         let resolved_type = pending.type_;
         if function.all_parameters().next().is_some() {
             let proof = functions::pending_function_type_proof(self.store, &function)
+                .inspect_err(|error| {
+                    observe_function_query_failure(
+                        self.store,
+                        self.host,
+                        "function_execute_pending",
+                        error.node(),
+                        error,
+                    );
+                })
                 .map_err(function_type_error)?
                 .ok_or_else(|| {
                     type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(node))
@@ -49235,6 +49380,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             &resolved,
             prepared,
         )
+        .inspect_err(|error| {
+            observe_function_query_failure(
+                self.store,
+                self.host,
+                "function_publish_parameters",
+                error.node(),
+                error,
+            );
+        })
         .map_err(function_type_error)?;
         self.pending_function_parameters.clear();
         Ok(())
