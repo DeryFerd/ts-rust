@@ -25419,10 +25419,11 @@ pub(super) fn publish_declared_members(
         return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
     }
     let type_ = state.type_id();
+    // A canonical interface with only a `this` parameter uses ordinary member publication.
     let generic_interface = store.type_payload(type_).is_some_and(|record| {
         matches!(record.data(), TypeData::Interface(_))
             && record.object_flags().contains(ObjectFlags::REFERENCE)
-    });
+    }) && validate_nongeneric_interface_argument_origin(store, type_).is_err();
     if generic_interface
         && (!supported_generic_interface_calls(plan)
             || state.is_resolved()
