@@ -1513,6 +1513,11 @@ fn display_object_type(
             TypeData::TypeReference(_) | TypeData::Interface(_)
         )
     {
+        if matches!(record.data(), TypeData::Interface(interface)
+            if interface.reference.resolved_type_arguments.as_deref() == Some(&[]))
+        {
+            return display_interface_name(store, Some(host), type_id, record, state);
+        }
         return display_direct_generic_reference(
             store,
             host,
@@ -6313,17 +6318,29 @@ fn display_interface_name(
     let TypeData::Interface(interface) = record.data() else {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     };
-    let resolved =
-        record.object_flags() == (ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED);
-    if record.object_flags() != ObjectFlags::INTERFACE && !resolved
-        || interface.all_type_parameters.is_some()
-        || interface.outer_type_parameter_count != 0
-        || interface.this_type.is_some()
-        || interface.reference.resolved_type_arguments.is_some()
-        || interface.reference.node.is_some()
-        || interface.reference.object.target.is_some()
-        || interface.reference.object.mapper.is_some()
-        || interface.reference.object.instantiations != TypeCacheState::Unallocated
+    let nongeneric_reference = record.object_flags().contains(ObjectFlags::REFERENCE);
+    if nongeneric_reference {
+        super::reference_types::validate_nongeneric_interface_argument_origin(store, type_id)
+            .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+    }
+    let resolved = if nongeneric_reference {
+        record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+    } else {
+        record.object_flags() == (ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED)
+    };
+    if nongeneric_reference && !resolved
+        || !nongeneric_reference
+            && (record.object_flags() != ObjectFlags::INTERFACE && !resolved
+                || interface.all_type_parameters.is_some()
+                || interface.outer_type_parameter_count != 0
+                || interface.this_type.is_some()
+                || interface.reference.resolved_type_arguments.is_some()
+                || interface.reference.node.is_some()
+                || interface.reference.object.target.is_some()
+                || interface.reference.object.mapper.is_some()
+                || interface.reference.object.instantiations != TypeCacheState::Unallocated)
     {
         return Err(TypeDisplayUnavailable::UnsupportedType {
             type_id,

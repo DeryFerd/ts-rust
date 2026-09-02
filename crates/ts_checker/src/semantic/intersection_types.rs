@@ -959,6 +959,38 @@ impl CanonicalTypeMapperStore {
             }
             return Ok(());
         }
+        if let TypeData::Mapped(mapped) = record.data() {
+            let members = self
+                .validate_mapped_type_relation_endpoint(type_)
+                .map_err(|_| IntersectionTypeError::MalformedConstituent(type_))?
+                .ok_or(IntersectionTypeError::UnsupportedConstituent(type_))?;
+            let structured = &mapped.object.structured;
+            if structured.call_signature_count != 0
+                || structured
+                    .signatures
+                    .as_ref()
+                    .is_some_and(|items| !items.is_empty())
+                || structured
+                    .index_infos
+                    .as_ref()
+                    .is_some_and(|items| !items.is_empty())
+            {
+                return Err(IntersectionTypeError::UnsupportedConstituent(type_));
+            }
+            for property in members.properties() {
+                if self
+                    .value_symbol_links(*property)
+                    .and_then(|links| links.resolved_type)
+                    .is_none()
+                {
+                    return Err(IntersectionTypeError::UnsupportedConstituent(type_));
+                }
+            }
+            if !output.contains(&type_) {
+                output.push(type_);
+            }
+            return Ok(());
+        }
         if source_property_object_projection(self, type_)
             .map_err(|error| source_property_constituent_error(type_, error))?
             .is_some()
