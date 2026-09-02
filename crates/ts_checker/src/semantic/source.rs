@@ -41054,32 +41054,78 @@ fn check_expression_type_with_capture_context(
                             diagnostics,
                             construction.written_type_argument_nodes(),
                         )?;
-                    let prepared = if let Some(context) = &constructor_context {
-                        super::source_new::check_source_generic_library_new_with_context(
-                            store,
-                            host,
-                            global_types,
-                            options,
-                            session,
-                            construction,
-                            &argument_types,
-                            explicit_type_arguments.as_deref(),
-                            Some(context),
-                        )
-                    } else {
-                        super::source_new::check_source_generic_class_new(
-                            store,
-                            host,
-                            global_types,
-                            options,
-                            session,
-                            construction,
-                            access.as_ref(),
-                            &argument_types,
-                            explicit_type_arguments.as_deref(),
-                        )
-                    }
-                    .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+                    let mut prepared_member_targets = HashSet::new();
+                    let limit_mark = session.limit_event_mark();
+                    // Retry signature checks with the original checked argument types.
+                    let prepared = loop {
+                        let checked = if let Some(context) = &constructor_context {
+                            super::source_new::check_source_generic_library_new_with_context(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                session,
+                                construction,
+                                &argument_types,
+                                explicit_type_arguments.as_deref(),
+                                Some(context),
+                            )
+                        } else {
+                            super::source_new::check_source_generic_class_new(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                session,
+                                construction,
+                                access.as_ref(),
+                                &argument_types,
+                                explicit_type_arguments.as_deref(),
+                            )
+                        };
+                        match checked {
+                            Ok(prepared) => break prepared,
+                            Err(error @ SourceNewError::Call {
+                                error: super::calls::DirectCallError::Relation(
+                                    RelationUnavailable::InvalidStructuredMembers(target),
+                                ),
+                                ..
+                            }) if construction.is_generic_library_constructor()
+                                && prepared_member_targets.insert(target) =>
+                            {
+                                let mut prepared_members = false;
+                                for &argument in &argument_types {
+                                    if prepare_source_array_relation_target(
+                                        store,
+                                        host,
+                                        global_types,
+                                        options,
+                                        session,
+                                        diagnostics,
+                                        argument,
+                                        target,
+                                    )? {
+                                        prepared_members = true;
+                                        break;
+                                    }
+                                }
+                                if !prepared_members
+                                    || session.limit_event_occurred_since(limit_mark)
+                                {
+                                    return Err(SourcePlanner::new_plan_error(
+                                        construction.node(),
+                                        error,
+                                    ));
+                                }
+                            }
+                            Err(error) => {
+                                return Err(SourcePlanner::new_plan_error(
+                                    construction.node(),
+                                    error,
+                                ));
+                            }
+                        }
+                    };
                     let mut staged = CanonicalCheckerDiagnostics::default();
                     let call_diagnostics =
                         match (prepared.resolution(), prepared.access_diagnostic()) {
@@ -49627,7 +49673,7 @@ fn source_type_is_assignable_to(
     }
 }
 
-/// The mixed Array relation reads the non-array target's members first.
+/// Prepares a cold non-array target and reports whether its members became ready.
 #[allow(clippy::too_many_arguments)] // Member demand retains the caller's complete query state.
 fn prepare_source_array_relation_target(
     store: &mut CanonicalTypeMapperStore,
@@ -49638,26 +49684,26 @@ fn prepare_source_array_relation_target(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     source: TypeId,
     target: TypeId,
-) -> Result<(), SourceCheckError> {
+) -> Result<bool, SourceCheckError> {
     if source == target
         || store
             .claimed_strict_function_types()
             .is_some_and(|established| established != options.strict_function_types)
     {
-        return Ok(());
+        return Ok(false);
     }
     let (Some(source_record), Some(target_record)) =
         (store.type_payload(source), store.type_payload(target))
     else {
-        return Ok(());
+        return Ok(false);
     };
     if source_record.flags() != TypeFlags::OBJECT || target_record.flags() != TypeFlags::OBJECT {
-        return Ok(());
+        return Ok(false);
     }
     let (TypeData::TypeReference(source_reference), TypeData::TypeReference(target_reference)) =
         (source_record.data(), target_record.data())
     else {
-        return Ok(());
+        return Ok(false);
     };
     let arrays = [
         Some(global_types.array_type),
@@ -49666,23 +49712,20 @@ fn prepare_source_array_relation_target(
     if !arrays.contains(&source_reference.object.target)
         || arrays.contains(&target_reference.object.target)
     {
-        return Ok(());
+        return Ok(false);
     }
-    let Some(target_origin) = target_reference
-        .object
-        .target
-        .and_then(|target| store.type_payload(target))
-    else {
-        return Ok(());
+    let target_id = target_reference.object.target;
+    let Some(target_origin) = target_id.and_then(|target| store.type_payload(target)) else {
+        return Ok(false);
     };
     let TypeData::Interface(interface) = target_origin.data() else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(globals) = store
         .intrinsic_bootstrap()
         .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
     else {
-        return Ok(());
+        return Ok(false);
     };
     if let Some(global) = globals.get_source("ConcatArray") {
         let (Some(owner), Some(actual_owner)) = (
@@ -49691,10 +49734,10 @@ fn prepare_source_array_relation_target(
                 .symbol()
                 .and_then(|symbol| store.get_merged_symbol(symbol)),
         ) else {
-            return Ok(());
+            return Ok(false);
         };
         if actual_owner == owner {
-            return Ok(());
+            return Ok(false);
         }
     }
     if target_origin.object_flags().contains(ObjectFlags::CLASS)
@@ -49706,7 +49749,7 @@ fn prepare_source_array_relation_target(
             .flatten()
             .is_none()
     {
-        return Ok(());
+        return Ok(false);
     }
     let mut member_diagnostics = CanonicalCheckerDiagnostics::default();
     let prepared = CanonicalTypeQuery::new_with_global_types_and_session(
@@ -49720,7 +49763,12 @@ fn prepare_source_array_relation_target(
     .prepare_generic_interface_declared_members(target);
     merge_retry_diagnostics(diagnostics, member_diagnostics);
     prepared?;
-    Ok(())
+    Ok(target_id
+        .and_then(|target| store.type_payload(target))
+        .is_some_and(|record| {
+            matches!(record.data(), TypeData::Interface(interface)
+                if interface.base_types_resolved && interface.declared_members_resolved)
+        }))
 }
 
 /// Resolves members only after a source operation needs a nongeneric interface.

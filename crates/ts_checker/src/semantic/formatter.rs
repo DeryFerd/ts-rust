@@ -4595,6 +4595,9 @@ fn display_direct_generic_reference(
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
     let ordinary_interface =
         symbol_record.flags().without(SymbolFlags::TRANSIENT) == SymbolFlags::INTERFACE;
+    let mixed_owner = store
+        .source_global_interface_value_owner(symbol)
+        .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
     // Removing a merged declaration must not bypass the source identity check.
     if ordinary_interface
         && (store.get_merged_symbol(symbol) != Some(symbol)
@@ -4602,9 +4605,57 @@ fn display_direct_generic_reference(
     {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
-    let declaration = match declarations {
-        [declaration] => *declaration,
-        declarations if ordinary_interface => {
+    let declaration = match (declarations, mixed_owner.as_ref()) {
+        (declarations, Some(mixed)) => {
+            let TypeData::Interface(interface) = target.data() else {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            };
+            let parameters = interface
+                .reference
+                .resolved_type_arguments
+                .as_deref()
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+            if mixed.symbol() != symbol || mixed.declarations() != declarations {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            }
+            for &declaration in mixed.interfaces() {
+                let record = host
+                    .node(declaration)
+                    .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return Err(TypeDisplayUnavailable::MalformedType(type_id));
+                };
+                let written = interface
+                    .type_parameters
+                    .as_ref()
+                    .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                if record.kind != SyntaxKind::InterfaceDeclaration
+                    || written.nodes.len() != parameters.len()
+                    || !host.symbol_matches(store, declaration, symbol)
+                {
+                    return Err(TypeDisplayUnavailable::MalformedType(type_id));
+                }
+                for (&node, &parameter) in written.nodes.iter().zip(parameters) {
+                    let node = NodeRef::new(declaration.arena, declaration.file, node);
+                    let owner = cached_ordinary_type_parameter_owner(store, parameter)
+                        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                    if !host.node(node).is_some_and(|record| {
+                        record.kind == SyntaxKind::TypeParameter
+                            && record.parent == Some(declaration.node)
+                    }) || !host.symbol_matches(store, node, owner)
+                        || store.get_parent_of_symbol(owner) != Some(symbol)
+                    {
+                        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+                    }
+                }
+            }
+            *mixed
+                .interfaces()
+                .first()
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?
+        }
+        ([declaration], None) => *declaration,
+        (declarations, None) if ordinary_interface => {
             let identity = object_members::plan_generic_interface_identity(store, host, symbol)
                 .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
             let TypeData::Interface(interface) = target.data() else {
@@ -4630,7 +4681,7 @@ fn display_direct_generic_reference(
             }
             identity.node
         }
-        declarations => {
+        (declarations, None) => {
             let name = symbol_record
                 .name()
                 .as_utf8()
