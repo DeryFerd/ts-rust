@@ -4073,11 +4073,20 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .map_err(|_| invalid())?;
                 let record = self.symbol(member).ok_or_else(invalid)?;
                 if !record.flags().contains(SymbolFlags::SIGNATURE) {
-                    let name = self
-                        .source_child_with_kind(node, SyntaxKind::Identifier)
-                        .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
-                    if record.name().as_utf8() != self.source_identifier_text(name) {
-                        return Err(invalid());
+                    if record.name() == InternalSymbolName::Computed.as_ref() {
+                        let name = self
+                            .source_child_with_kind(node, SyntaxKind::ComputedPropertyName)
+                            .ok_or_else(invalid)?;
+                        if self.source_node_parent(name) != Some(SourceNodeParent::Parent(node)) {
+                            return Err(invalid());
+                        }
+                    } else {
+                        let name = self
+                            .source_child_with_kind(node, SyntaxKind::Identifier)
+                            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+                        if record.name().as_utf8() != self.source_identifier_text(name) {
+                            return Err(invalid());
+                        }
                     }
                 }
             }
