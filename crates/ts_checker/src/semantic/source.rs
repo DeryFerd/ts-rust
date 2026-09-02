@@ -33858,6 +33858,36 @@ fn preflight_inferred_function_return_dependencies(
                             && !parameter.rest
                     });
                 }
+                if let PlannedArrowBody::StatementList(body) = &arrow.body {
+                    if arrow.callable.declaration != expression.node
+                        || arrow.callable.body_mode != SourceCallableBodyMode::Present
+                        || arrow.callable.is_async
+                        || arrow.loop_body.is_some()
+                        || arrow.prototype_this.is_some()
+                        || !functions.host.node(expression.node).is_some_and(|record| {
+                            record.kind == SyntaxKind::ArrowFunction
+                                && matches!(record.data, NodeData::ArrowFunction(_))
+                        })
+                        || !arrow.callable.parameters.iter().all(|parameter| {
+                            parameter.explicit_type_node().is_some()
+                                && parameter.initializer.is_none()
+                                && !parameter.optional
+                                && !parameter.rest
+                        })
+                    {
+                        return false;
+                    }
+                    // Captured symbols remain visible without exposing child locals to the parent.
+                    let mut body_locals = locals.clone();
+                    body_locals.extend(parameters.iter().map(|parameter| parameter.symbol));
+                    return statement_list_is_closed(
+                        body,
+                        &body.statements,
+                        &arrow.callable.parameters,
+                        &mut body_locals,
+                        functions,
+                    );
+                }
                 let PlannedArrowBody::Return { expression, .. } = &arrow.body else {
                     return false;
                 };
