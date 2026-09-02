@@ -48740,7 +48740,7 @@ pub(super) fn retry_source_generic_member_failure(
                     )?
                     .is_some_and(|members| members.properties.contains(&symbol))
                 {
-                    super::instantiated_members::demand_property_object_alias_property(
+                    let result = super::instantiated_members::demand_property_object_alias_property(
                         store,
                         host,
                         global_types,
@@ -48749,7 +48749,75 @@ pub(super) fn retry_source_generic_member_failure(
                         diagnostics,
                         candidate,
                         symbol,
-                    )?;
+                    );
+                    if let Err(SourceCheckError::RelationUnavailable(
+                        RelationUnavailable::UnresolvedStructuredMembers(type_),
+                    )) = &result
+                    {
+                        let record = store.type_payload(*type_);
+                        let owner = record.and_then(|record| record.symbol());
+                        let declaration = owner
+                            .and_then(|symbol| store.symbol(symbol))
+                            .and_then(|symbol| symbol.declarations())
+                            .and_then(|declarations| declarations.first().copied());
+                        let kind = record.map(|record| match record.data() {
+                            TypeData::Intrinsic(_) => "Intrinsic",
+                            TypeData::Literal(_) => "Literal",
+                            TypeData::UniqueEsSymbol(_) => "UniqueEsSymbol",
+                            TypeData::Object(_) => "Object",
+                            TypeData::TypeReference(_) => "TypeReference",
+                            TypeData::Interface(_) => "Interface",
+                            TypeData::Tuple(_) => "Tuple",
+                            TypeData::InstantiationExpression(_) => "InstantiationExpression",
+                            TypeData::Mapped(_) => "Mapped",
+                            TypeData::ReverseMapped(_) => "ReverseMapped",
+                            TypeData::EvolvingArray(_) => "EvolvingArray",
+                            TypeData::Union(_) => "Union",
+                            TypeData::Intersection(_) => "Intersection",
+                            TypeData::TypeParameter(_) => "TypeParameter",
+                            TypeData::Index(_) => "Index",
+                            TypeData::IndexedAccess(_) => "IndexedAccess",
+                            TypeData::TemplateLiteral(_) => "TemplateLiteral",
+                            TypeData::StringMapping(_) => "StringMapping",
+                            TypeData::Substitution(_) => "Substitution",
+                            TypeData::Conditional(_) => "Conditional",
+                        });
+                        eprintln!(
+                            "source.member-preparation receiver={candidate:?} property={symbol:?} retry={error:?} error={result:?} type={type_:?} kind={kind:?} flags={:?} object_flags={:?} owner={owner:?} declaration={declaration:?} declaration_kind={:?}",
+                            record.map(|record| record.flags()),
+                            record.map(|record| record.object_flags()),
+                            declaration.and_then(|node| store.source_node_kind(node)),
+                        );
+                        if let Some(structured) = record.and_then(|record| record.data().structured())
+                        {
+                            eprintln!(
+                                "source.member-preparation type={type_:?} members={:?} properties={} signatures={} call_signature_count={}",
+                                structured.members,
+                                structured.properties.is_some(),
+                                structured.signatures.is_some(),
+                                structured.call_signature_count,
+                            );
+                            for signature in structured
+                                .signatures
+                                .as_deref()
+                                .unwrap_or(&[])
+                                .iter()
+                                .take(4)
+                            {
+                                eprintln!(
+                                    "source.member-preparation type={type_:?} signature={signature:?} state={:?}",
+                                    store.signature(*signature).map(|signature| (
+                                        signature.declaration(),
+                                        signature.parameters().len(),
+                                        signature.resolved_return_type(),
+                                        signature.target(),
+                                        signature.mapper(),
+                                    )),
+                                );
+                            }
+                        }
+                    }
+                    result?;
                     return Ok(());
                 }
             }
