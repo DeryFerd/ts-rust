@@ -455,13 +455,13 @@ pub(super) struct SourceCallableTypeParameterPlan {
     pub(super) default_type: Option<NodeRef>,
 }
 
-/// Exact syntax and parameter ownership for one identifier type predicate.
+/// Exact syntax and parameter ownership for one declared type predicate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CallableTypePredicatePlan {
     pub(super) node: NodeRef,
     pub(super) owner: NodeRef,
     pub(super) parameter_name: NodeRef,
-    pub(super) parameter_symbol: SemanticSymbolId,
+    pub(super) parameter_symbol: Option<SemanticSymbolId>,
     pub(super) parameter_index: i32,
     pub(super) narrowed_type: Option<NodeRef>,
     pub(super) kind: TypePredicateKind,
@@ -2762,7 +2762,7 @@ fn validate_global_wrapper_annotation(
     Ok(())
 }
 
-/// Validates predicate syntax against its exact callable-owned parameter.
+/// Validates predicate syntax against its exact callable or receiver.
 pub(super) fn plan_callable_type_predicate(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2817,6 +2817,17 @@ pub(super) fn plan_callable_type_predicate(
         {
             (&signature.parameters, signature.type_)
         }
+        NodeData::MethodSignatureDeclaration(method)
+            if owner_record.kind == SyntaxKind::MethodSignature
+                && owner_record.parent.is_some_and(|parent| {
+                    matches!(
+                        store.source_node_kind(NodeRef::new(owner.arena, owner.file, parent)),
+                        Some(SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral)
+                    )
+                }) =>
+        {
+            (&method.parameters, method.type_)
+        }
         _ => return Err(invalid()),
     };
     if return_type != Some(current.node) {
@@ -2825,17 +2836,7 @@ pub(super) fn plan_callable_type_predicate(
 
     let parameter_name = NodeRef::new(node.arena, node.file, predicate.parameter_name);
     let name_record = preflight_node(store, host, parameter_name)?;
-    let NodeData::Identifier(identifier) = &name_record.data else {
-        return Err(SourceCallableError::Unsupported(
-            SourceCallableUnsupported::TypePredicate(node),
-        ));
-    };
-    if name_record.kind != SyntaxKind::Identifier
-        || name_record.flags.0 != 0
-        || name_record.parent != Some(node.node)
-        || identifier.flow_node.is_some()
-        || identifier.text.is_empty()
-    {
+    if name_record.flags.0 != 0 || name_record.parent != Some(node.node) {
         return Err(invalid());
     }
 
@@ -2863,6 +2864,51 @@ pub(super) fn plan_callable_type_predicate(
         if narrowed.parent != Some(node.node) || narrowed.range.start < name_record.range.end {
             return Err(invalid());
         }
+    }
+
+    if name_record.kind == SyntaxKind::ThisType
+        && matches!(name_record.data, NodeData::ThisTypeNode(_))
+    {
+        if owner_record.kind != SyntaxKind::MethodSignature {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::TypePredicate(node),
+            ));
+        }
+        if store
+            .symbol_node_links(parameter_name)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+        {
+            return Err(invalid());
+        }
+        return Ok(CallableTypePredicatePlan {
+            node,
+            owner,
+            parameter_name,
+            parameter_symbol: None,
+            parameter_index: 0,
+            narrowed_type,
+            kind: if asserts.is_some() {
+                TypePredicateKind::AssertsThis
+            } else {
+                TypePredicateKind::This
+            },
+        });
+    }
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::TypePredicate(node),
+        ));
+    };
+    if owner_record.kind == SyntaxKind::MethodSignature {
+        return Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::TypePredicate(node),
+        ));
+    }
+    if name_record.kind != SyntaxKind::Identifier
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Err(invalid());
     }
 
     let bound = host.bound_file(owner).ok_or_else(invalid)?;
@@ -2926,11 +2972,46 @@ pub(super) fn plan_callable_type_predicate(
         node,
         owner,
         parameter_name,
-        parameter_symbol,
+        parameter_symbol: Some(parameter_symbol),
         parameter_index,
         narrowed_type,
         kind,
     })
+}
+
+/// Reads a receiver predicate only after its written return and narrowing are prepared.
+pub(super) fn prepared_receiver_type_predicate(
+    store: &CanonicalTypeMapperStore,
+    planned: CallableTypePredicatePlan,
+) -> Option<Option<TypeId>> {
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let expected_return = match planned.kind {
+        TypePredicateKind::This if planned.narrowed_type.is_some() => bootstrap.boolean_type,
+        TypePredicateKind::AssertsThis => bootstrap.void_type,
+        _ => return None,
+    };
+    if planned.parameter_symbol.is_some()
+        || planned.parameter_index != 0
+        || store.source_node_kind(planned.owner) != Some(SyntaxKind::MethodSignature)
+        || store.source_node_kind(planned.node) != Some(SyntaxKind::TypePredicate)
+        || store.source_node_kind(planned.parameter_name) != Some(SyntaxKind::ThisType)
+        || store.source_node_parent(planned.parameter_name)
+            != Some(SourceNodeParent::Parent(planned.node))
+        || store.type_node_links(planned.node)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(expected_return),
+                outer_type_parameters: None,
+            })
+        || store
+            .symbol_node_links(planned.parameter_name)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+    {
+        return None;
+    }
+    match planned.narrowed_type {
+        Some(node) => Some(Some(cached_annotation_identity(store, node, false)?)),
+        None => Some(None),
+    }
 }
 
 /// Checks the exact published predicate metadata without requiring AST access.
@@ -2953,22 +3034,33 @@ pub(super) fn valid_stored_callable_type_predicate(
                 return false;
             };
             let expected_return = match predicate.kind() {
-                TypePredicateKind::Identifier if predicate.type_id().is_some() => {
+                TypePredicateKind::Identifier | TypePredicateKind::This
+                    if predicate.type_id().is_some() =>
+                {
                     bootstrap.boolean_type
                 }
-                TypePredicateKind::AssertsIdentifier => bootstrap.void_type,
+                TypePredicateKind::AssertsIdentifier | TypePredicateKind::AssertsThis => {
+                    bootstrap.void_type
+                }
                 _ => return false,
             };
-            let Ok(index) = usize::try_from(predicate.parameter_index()) else {
-                return false;
+            let valid_target = match predicate.kind() {
+                TypePredicateKind::This | TypePredicateKind::AssertsThis => {
+                    store.declared_method_type_predicate_is_exact(signature, annotation)
+                }
+                TypePredicateKind::Identifier | TypePredicateKind::AssertsIdentifier => {
+                    let Ok(index) = usize::try_from(predicate.parameter_index()) else {
+                        return false;
+                    };
+                    let Some(parameter) = signature.parameters().get(index).copied() else {
+                        return false;
+                    };
+                    store.symbol(parameter).is_some_and(|parameter| {
+                        parameter.name().as_utf8() == Some(predicate.parameter_name())
+                    })
+                }
             };
-            let Some(parameter) = signature.parameters().get(index).copied() else {
-                return false;
-            };
-            let Some(parameter_record) = store.symbol(parameter) else {
-                return false;
-            };
-            parameter_record.name().as_utf8() == Some(predicate.parameter_name())
+            valid_target
                 && predicate
                     .type_id()
                     .is_none_or(|type_| store.type_payload(type_).is_some())
@@ -3020,10 +3112,31 @@ pub(super) fn valid_planned_callable_type_predicate(
                 && record.parameter_index() == planned.parameter_index
                 && record.type_id() == narrowed.flatten()
                 && narrowed.is_none_or(|narrowed| narrowed.is_some())
-                && store.symbol_node_links(planned.parameter_name)
-                    == Some(&SymbolNodeLinks {
-                        resolved_symbol: Some(planned.parameter_symbol),
-                    })
+                && match planned.parameter_symbol {
+                    Some(symbol) => {
+                        matches!(
+                            planned.kind,
+                            TypePredicateKind::Identifier | TypePredicateKind::AssertsIdentifier
+                        )
+                            && store.symbol_node_links(planned.parameter_name)
+                                == Some(&SymbolNodeLinks {
+                                    resolved_symbol: Some(symbol),
+                                })
+                    }
+                    None => {
+                        matches!(
+                            planned.kind,
+                            TypePredicateKind::This | TypePredicateKind::AssertsThis
+                        )
+                            && record.parameter_name().is_empty()
+                            && planned.parameter_index == 0
+                            && store.source_node_kind(planned.parameter_name)
+                                == Some(SyntaxKind::ThisType)
+                            && store
+                                .symbol_node_links(planned.parameter_name)
+                                .is_none_or(|links| links == &SymbolNodeLinks::default())
+                    }
+                }
         }
     }
 }
@@ -4385,7 +4498,7 @@ fn plan_source_callable_with_owner_shape(
             if predicate.owner != declaration
                 || parameters
                     .get(usize::try_from(predicate.parameter_index).unwrap_or(usize::MAX))
-                    .is_none_or(|parameter| parameter.symbol != predicate.parameter_symbol)
+                    .is_none_or(|parameter| Some(parameter.symbol) != predicate.parameter_symbol)
             {
                 return Err(invariant(SourceCallableInvariant::InvalidSyntax(
                     identity_node,
@@ -13792,7 +13905,7 @@ pub(super) fn publish_array_filter_predicate_source_callable(
         || parameter.rest
         || parameter.initializer.is_some()
         || predicate.owner != plan.declaration
-        || predicate.parameter_symbol != parameter.symbol
+        || predicate.parameter_symbol != Some(parameter.symbol)
         || predicate.parameter_index != 0
         || predicate.kind != TypePredicateKind::Identifier
         || plan.return_type.annotation_identity() != Some((predicate.node, false))

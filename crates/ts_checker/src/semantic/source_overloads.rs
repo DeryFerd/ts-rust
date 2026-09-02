@@ -655,7 +655,7 @@ fn plan_namespace_ambient_overload_declaration(
         if predicate.owner != declaration
             || parameters
                 .get(usize::try_from(predicate.parameter_index).unwrap_or(usize::MAX))
-                .is_none_or(|parameter| parameter.symbol != predicate.parameter_symbol)
+                .is_none_or(|parameter| Some(parameter.symbol) != predicate.parameter_symbol)
         {
             return Err(namespace_overload_group_error(return_type));
         }

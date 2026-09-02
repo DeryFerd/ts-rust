@@ -14430,7 +14430,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(planned.owner == signature
             && planned.kind == TypePredicateKind::Identifier
             && planned.parameter_index == 0
-            && Some(planned.parameter_symbol) == value_symbol
+            && planned.parameter_symbol == value_symbol
             && planned.parameter_name == predicate_name
             && planned.narrowed_type == Some(narrowed))
     }
@@ -48336,7 +48336,7 @@ fn authenticated_filter_predicate_nullish_comparison(
     if predicate.owner != arrow
         || predicate.kind != TypePredicateKind::Identifier
         || predicate.parameter_index != 0
-        || predicate.parameter_symbol != read.value_symbol
+        || predicate.parameter_symbol != Some(read.value_symbol)
         || predicate.narrowed_type.is_none()
     {
         return Ok(None);
@@ -64649,12 +64649,13 @@ fn check_stored_arrow_type_predicate(
     }
     let invalid = || SourceCheckError::Arrow(callable.declaration);
     let narrowed = predicate.narrowed_type.ok_or_else(invalid)?;
+    let parameter_symbol = predicate.parameter_symbol.ok_or_else(invalid)?;
     let parameter_index = usize::try_from(predicate.parameter_index).map_err(|_| invalid())?;
     let record = store.signature(signature).ok_or_else(invalid)?;
     if predicate.owner != callable.declaration
         || predicate.kind != TypePredicateKind::Identifier
         || record.declaration() != Some(predicate.owner)
-        || record.parameters().get(parameter_index) != Some(&predicate.parameter_symbol)
+        || record.parameters().get(parameter_index) != Some(&parameter_symbol)
         || !super::source_callables::valid_planned_callable_type_predicate(
             store,
             record,
@@ -64670,7 +64671,7 @@ fn check_stored_arrow_type_predicate(
         .and_then(super::signatures::TypePredicate::type_id)
         .ok_or_else(invalid)?;
     let parameter_type = store
-        .value_symbol_links(predicate.parameter_symbol)
+        .value_symbol_links(parameter_symbol)
         .and_then(|links| links.resolved_type)
         .ok_or_else(invalid)?;
     let limit_mark = session.limit_event_mark();

@@ -47292,6 +47292,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .get(&node)
             .copied()
             .ok_or_else(invalid)?;
+        if predicate.parameter_symbol.is_none() {
+            return self.execute_receiver_type_predicate(predicate, plan, prepared);
+        }
+        let parameter_symbol = predicate.parameter_symbol.ok_or_else(invalid)?;
         let signature = self
             .store
             .signature_links(predicate.owner)
@@ -47303,7 +47307,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         };
         if signature_record.declaration() != Some(predicate.owner)
             || signature_record.parameters().get(parameter_index).copied()
-                != Some(predicate.parameter_symbol)
+                != Some(parameter_symbol)
             || self.store.function_signature_return_annotation(signature) != Some((node, false))
         {
             return Err(invalid());
@@ -47320,7 +47324,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .transpose()?;
         let parameter_name = self
             .store
-            .symbol(predicate.parameter_symbol)
+            .symbol(parameter_symbol)
             .and_then(|symbol| symbol.name().as_utf8())
             .map(str::to_owned)
             .ok_or_else(invalid)?;
@@ -47329,7 +47333,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             outer_type_parameters: None,
         };
         let expected_symbol_links = SymbolNodeLinks {
-            resolved_symbol: Some(predicate.parameter_symbol),
+            resolved_symbol: Some(parameter_symbol),
         };
         let type_links = self.store.type_node_links(node);
         let symbol_links = self.store.symbol_node_links(predicate.parameter_name);
@@ -47392,6 +47396,85 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.store
                 .set_signature_resolved_type_predicate(signature, Some(identity))
         );
+        Ok(expected_return)
+    }
+
+    /// Method signatures publish their receiver predicate after their annotations are ready.
+    fn execute_receiver_type_predicate(
+        &mut self,
+        predicate: CallableTypePredicatePlan,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(predicate.node))
+        };
+        let method = plan
+            .interfaces
+            .values()
+            .chain(plan.generic_interfaces.values())
+            .chain(plan.generic_member_plans.values())
+            .chain(plan.type_literals.values())
+            .flat_map(|members| &members.methods)
+            .find(|method| method.declaration == predicate.owner)
+            .ok_or_else(invalid)?;
+        if method.type_predicate != Some(predicate)
+            || self.store.source_direct_type_annotation(method.declaration)
+                != Some(method.return_type)
+            || self
+                .store
+                .symbol_node_links(predicate.parameter_name)
+                .is_some_and(|links| links != &SymbolNodeLinks::default())
+        {
+            return Err(invalid());
+        }
+        let bootstrap = self.store.intrinsic_bootstrap().ok_or_else(invalid)?;
+        let expected_return = match predicate.kind {
+            TypePredicateKind::This if predicate.narrowed_type.is_some() => bootstrap.boolean_type,
+            TypePredicateKind::AssertsThis => bootstrap.void_type,
+            _ => return Err(invalid()),
+        };
+        if let Some(narrowed) = predicate.narrowed_type {
+            self.execute_type_node(narrowed, plan, prepared)?;
+        }
+        let expected_links = TypeNodeLinks {
+            resolved_type: Some(expected_return),
+            outer_type_parameters: None,
+        };
+        if self
+            .store
+            .type_node_links(predicate.node)
+            .is_some_and(|links| links != &TypeNodeLinks::default() && links != &expected_links)
+        {
+            return Err(invalid());
+        }
+        if let Some(links) = self.store.signature_links(predicate.owner)
+            && links != &SignatureLinks::default()
+        {
+            let signature = links.resolved_signature.signature().ok_or_else(invalid)?;
+            let record = self.store.signature(signature).ok_or_else(invalid)?;
+            if !source_callables::valid_planned_callable_type_predicate(
+                self.store,
+                record,
+                Some(predicate.node),
+                Some(predicate),
+            ) {
+                return Err(invalid());
+            }
+            return Ok(expected_return);
+        }
+        if !self.store.try_reserve_type_node_links(usize::from(
+            self.store.type_node_links(predicate.node).is_none(),
+        )) {
+            return Err(invalid());
+        }
+        assert!(
+            self.store
+                .set_type_node_links(predicate.node, expected_links)
+        );
+        if source_callables::prepared_receiver_type_predicate(self.store, predicate).is_none() {
+            return Err(invalid());
+        }
         Ok(expected_return)
     }
 

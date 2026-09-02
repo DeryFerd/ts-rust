@@ -4621,6 +4621,20 @@ fn plan_published_interface_method(
         for type_ in parameter_types.iter().copied().chain([return_type]) {
             member_type_requires_instantiation(store, type_, &signature_parameters, targets)?;
         }
+        if let Some(predicate) = record.resolved_type_predicate() {
+            let narrowed = store
+                .type_predicate(predicate)
+                .ok_or(GenericInterfaceMemberError::InvalidMember(method))?
+                .type_id();
+            if let Some(narrowed) = narrowed {
+                member_type_requires_instantiation(
+                    store,
+                    narrowed,
+                    &signature_parameters,
+                    targets,
+                )?;
+            }
+        }
         planned.push(PublishedInterfaceMethodSignature {
             source: signature,
             parameter_types,
@@ -5416,7 +5430,13 @@ fn validate_published_interface_method_signature(
         || instantiated.parameters().len() != original.parameters().len()
         || instantiated.min_argument_count() != original.min_argument_count()
         || instantiated.resolved_min_argument_count() != -1
-        || instantiated.resolved_type_predicate().is_some()
+        || !instantiated_method_predicate_matches(
+            store,
+            original,
+            instantiated,
+            signature_mapper,
+            Some(targets),
+        )
         || instantiated.target() != Some(source.source)
         || instantiated.mapper() != Some(signature_mapper)
         || instantiated.isolated_signature_type().is_some()
@@ -5505,6 +5525,46 @@ fn validate_published_interface_method_signature(
         }
     }
     Ok(())
+}
+
+pub(super) fn instantiated_method_predicate_matches(
+    store: &CanonicalTypeMapperStore,
+    original: &super::signatures::Signature,
+    instantiated: &super::signatures::Signature,
+    mapper: TypeMapperId,
+    targets: Option<CanonicalArrayTargets>,
+) -> bool {
+    match (
+        original.resolved_type_predicate(),
+        instantiated.resolved_type_predicate(),
+    ) {
+        (None, None) => true,
+        (Some(original), Some(instantiated)) => {
+            let (Some(original), Some(instantiated)) = (
+                store.type_predicate(original),
+                store.type_predicate(instantiated),
+            ) else {
+                return false;
+            };
+            original.kind() == instantiated.kind()
+                && original.parameter_name() == instantiated.parameter_name()
+                && original.parameter_index() == instantiated.parameter_index()
+                && match (original.type_id(), instantiated.type_id()) {
+                    (None, None) => true,
+                    (Some(original), Some(instantiated)) => {
+                        instantiated_method_type_matches(
+                            store,
+                            original,
+                            instantiated,
+                            mapper,
+                            targets,
+                        )
+                    }
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn property_instantiation_error(
@@ -8801,6 +8861,30 @@ fn instantiate_generic_method_signature_worker(
     owner_type: TypeId,
     mut source: Option<&mut SignatureInstantiationSource<'_>>,
 ) -> Result<SignatureId, MethodSignatureError> {
+    let receiver_predicate = match store.signature(original) {
+        Some(signature)
+            if signature.declaration().is_some_and(|node| {
+                store.source_node_kind(node) == Some(SyntaxKind::MethodSignature)
+            }) =>
+        {
+            signature
+                .resolved_type_predicate()
+                .map(|id| {
+                    let predicate = store
+                        .type_predicate(id)
+                        .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+                    Ok::<_, GenericInterfaceMemberError>((
+                        id,
+                        predicate.kind(),
+                        predicate.parameter_index(),
+                        predicate.parameter_name().to_owned(),
+                        predicate.type_id(),
+                    ))
+                })
+                .transpose()?
+        }
+        _ => None,
+    };
     let source_parameters = store
         .signature(original)
         .ok_or(GenericInterfaceMemberError::InvalidMember(method))?
@@ -8924,10 +9008,34 @@ fn instantiate_generic_method_signature_worker(
             mapper,
             array_targets,
             session,
-            source,
+            source.as_deref_mut(),
         )?;
         (parameters, return_type)
     };
+    if let Some((original_predicate, kind, index, name, narrowed)) = receiver_predicate {
+        let instantiated_narrowed = narrowed
+            .map(|type_| {
+                instantiate_signature_member_type(
+                    store,
+                    type_,
+                    mapper,
+                    array_targets,
+                    session,
+                    source.as_deref_mut(),
+                )
+            })
+            .transpose()?;
+        let predicate = if instantiated_narrowed == narrowed {
+            original_predicate
+        } else {
+            store
+                .alloc_type_predicate(kind, index, name, instantiated_narrowed)
+                .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(owner_type))?
+        };
+        if !store.set_signature_resolved_type_predicate(signature, Some(predicate)) {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(owner_type).into());
+        }
+    }
     let parameters = store
         .signature(signature)
         .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(

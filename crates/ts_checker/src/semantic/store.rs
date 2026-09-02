@@ -6985,6 +6985,64 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
+    /// Checks a declared method's predicate against its registered source children.
+    pub(super) fn declared_method_type_predicate_is_exact(
+        &self,
+        signature: &Signature,
+        annotation: NodeRef,
+    ) -> bool {
+        let Some(predicate) = signature.resolved_type_predicate() else {
+            return self.source_node_kind(annotation) != Some(SyntaxKind::TypePredicate);
+        };
+        let Some(predicate) = self.type_predicate(predicate) else {
+            return false;
+        };
+        let Some(owner) = signature.declaration() else {
+            return false;
+        };
+        let Some(children) = self.source_direct_children(annotation) else {
+            return false;
+        };
+        let Some(bootstrap) = self.intrinsic_bootstrap.as_ref() else {
+            return false;
+        };
+        let (name, narrowed, return_type) = match (predicate.kind(), children.as_slice()) {
+            (TypePredicateKind::This, [name, narrowed]) => {
+                (*name, Some(*narrowed), bootstrap.boolean_type)
+            }
+            (TypePredicateKind::AssertsThis, [asserts, name])
+                if self.source_node_kind(*asserts) == Some(SyntaxKind::AssertsKeyword) =>
+            {
+                (*name, None, bootstrap.void_type)
+            }
+            (TypePredicateKind::AssertsThis, [asserts, name, narrowed])
+                if self.source_node_kind(*asserts) == Some(SyntaxKind::AssertsKeyword) =>
+            {
+                (*name, Some(*narrowed), bootstrap.void_type)
+            }
+            _ => return false,
+        };
+        self.source_node_kind(owner) == Some(SyntaxKind::MethodSignature)
+            && self.source_node_kind(annotation) == Some(SyntaxKind::TypePredicate)
+            && self.source_node_parent(annotation) == Some(SourceNodeParent::Parent(owner))
+            && self.source_node_kind(name) == Some(SyntaxKind::ThisType)
+            && predicate.parameter_name().is_empty()
+            && predicate.parameter_index() == 0
+            && signature.resolved_return_type() == Some(return_type)
+            && self.source_direct_type_annotation_is_exact(annotation, return_type)
+            && self
+                .symbol_node_links(name)
+                .is_none_or(|links| links == &SymbolNodeLinks::default())
+            && match (narrowed, predicate.type_id()) {
+                (None, None) => true,
+                (Some(annotation), Some(type_)) => {
+                    self.types.get(type_).is_some()
+                        && self.source_direct_type_annotation_is_exact(annotation, type_)
+                }
+                _ => false,
+            }
+    }
+
     fn declared_method_linked_type(
         &self,
         requested: SignatureId,
@@ -7028,7 +7086,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 || signature.flags() & !allowed_flags != SignatureFlags::NONE
                 || !self.valid_declared_method_type_parameters(signature, *method_declaration)
                 || signature.resolved_min_argument_count() != -1
-                || signature.resolved_type_predicate().is_some()
+                || !self.declared_method_type_predicate_is_exact(signature, return_annotation)
                 || signature.target().is_some()
                 || signature.mapper().is_some()
                 || signature.isolated_signature_type().is_some()

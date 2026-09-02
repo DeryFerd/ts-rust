@@ -4041,6 +4041,7 @@ pub(super) struct PlannedInterfaceMethod {
     locals: Option<SymbolTableId>,
     binding_parameters: Vec<PlannedMethodBindingParameter>,
     pub return_type: NodeRef,
+    pub(super) type_predicate: Option<CallableTypePredicatePlan>,
     pub flags: SignatureFlags,
     optional: bool,
     minimum_argument_count: usize,
@@ -15314,6 +15315,19 @@ pub(super) fn plan_interface_method(
         return Err(unsupported(line!()));
     }
 
+    let return_identity = peel_parenthesized_type(store, host, return_type)?;
+    let type_predicate =
+        if store.source_node_kind(return_identity) == Some(SyntaxKind::TypePredicate) {
+            if return_identity != return_type {
+                return Err(unsupported(line!()));
+            }
+            Some(
+                plan_callable_type_predicate(store, host, return_identity)
+                    .map_err(|_| unsupported(line!()))?,
+            )
+        } else {
+            None
+        };
     let planned = PlannedInterfaceMethod {
         declaration,
         symbol,
@@ -15324,6 +15338,7 @@ pub(super) fn plan_interface_method(
         locals: local_table,
         binding_parameters,
         return_type,
+        type_predicate,
         flags,
         optional,
         minimum_argument_count,
@@ -18041,7 +18056,7 @@ pub(super) fn plan_call_signature(
             || predicate.owner != declaration
             || predicate.kind != TypePredicateKind::Identifier
             || predicate.parameter_index != 0
-            || predicate.parameter_symbol != parameter.symbol
+            || predicate.parameter_symbol != Some(parameter.symbol)
             || planned_predicate_type_parameter_reference(
                 store,
                 host,
@@ -22134,7 +22149,7 @@ fn valid_planned_signature_return(
             || predicate.owner != signature.declaration
             || predicate.kind != TypePredicateKind::Identifier
             || predicate.parameter_index != 0
-            || predicate.parameter_symbol != parameter.symbol
+            || predicate.parameter_symbol != Some(parameter.symbol)
             || type_ != boolean
             || cached_planned_type_identity(store, narrowed)
                 != planned_call_parameter_type(store, parameter)
@@ -24017,7 +24032,16 @@ fn validate_interface_method_callable(
             || usize::try_from(callable.min_argument_count()).ok()
                 != Some(method.minimum_argument_count)
             || callable.resolved_min_argument_count() != -1
-            || callable.resolved_type_predicate().is_some()
+            || !valid_planned_callable_type_predicate(
+                store,
+                callable,
+                Some(
+                    method
+                        .type_predicate
+                        .map_or(method.return_type, |predicate| predicate.node),
+                ),
+                method.type_predicate,
+            )
             || callable.target().is_some()
             || callable.mapper().is_some()
             || callable.isolated_signature_type().is_some()
@@ -24489,6 +24513,11 @@ fn publish_interface_method_values_worker(
             || resolved_interface_method_this_type(store, method).is_none()
             || cached_planned_type_identity(store, method.return_type)
                 != Some(resolved_signature.return_type)
+            || method.type_predicate.is_some_and(|predicate| {
+                predicate.owner != method.declaration
+                    || super::source_callables::prepared_receiver_type_predicate(store, predicate)
+                        .is_none()
+            })
             || method
                 .parameters
                 .iter()
@@ -24918,6 +24947,14 @@ fn publish_interface_method_values_worker(
             let minimum = i32::try_from(method.minimum_argument_count)
                 .expect("the interface method plan checked its parameter count");
             let this_type = this_parameter.map(|(_, type_)| type_);
+            let type_predicate = method.type_predicate.map(|predicate| {
+                let narrowed =
+                    super::source_callables::prepared_receiver_type_predicate(store, predicate)
+                        .expect("the interface method transaction checked its receiver predicate");
+                store
+                    .alloc_type_predicate(predicate.kind, 0, String::new(), narrowed)
+                    .expect("the receiver predicate's narrowed type belongs to this store")
+            });
             let signature = store
                 .alloc_signature(
                     method.flags,
@@ -24926,7 +24963,7 @@ fn publish_interface_method_values_worker(
                     this_parameter.map(|(symbol, _)| symbol),
                     parameter_symbols,
                     Some(resolved_signature.return_type),
-                    None,
+                    type_predicate,
                     minimum,
                 )
                 .expect("the interface method transaction reserved its signature");

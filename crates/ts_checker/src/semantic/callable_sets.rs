@@ -1521,7 +1521,13 @@ fn validate_stored_instantiated_interface_method_callable_set(
                 || signature.parameters().len() != original_signature.parameters().len()
                 || signature.min_argument_count() != original_signature.min_argument_count()
                 || signature.resolved_min_argument_count() != -1
-                || signature.resolved_type_predicate().is_some()
+                || !super::instantiated_members::instantiated_method_predicate_matches(
+                    store,
+                    original_signature,
+                    signature,
+                    signature_mapper,
+                    array_targets,
+                )
                 || signature.target() != Some(source_callable.signature)
                 || signature.mapper() != Some(signature_mapper)
                 || signature.isolated_signature_type().is_some()
@@ -1541,6 +1547,9 @@ fn validate_stored_instantiated_interface_method_callable_set(
             edges.extend(callable.parameters.iter().copied());
             edges.extend(callable.rest_parameter);
             edges.push(return_type);
+            if let Some(predicate) = signature.resolved_type_predicate() {
+                edges.extend(store.type_predicate(predicate)?.type_id());
+            }
         }
 
         Some((projection, edges))
@@ -1668,7 +1677,13 @@ fn validate_stored_instantiated_type_literal_method_callable_set(
                 || signature.parameters().len() != original_signature.parameters().len()
                 || signature.min_argument_count() != original_signature.min_argument_count()
                 || signature.resolved_min_argument_count() != -1
-                || signature.resolved_type_predicate().is_some()
+                || !super::instantiated_members::instantiated_method_predicate_matches(
+                    store,
+                    original_signature,
+                    signature,
+                    signature_mapper,
+                    None,
+                )
                 || signature.target() != Some(source_callable.signature)
                 || signature.mapper() != Some(signature_mapper)
                 || signature.isolated_signature_type().is_some()
@@ -1688,6 +1703,9 @@ fn validate_stored_instantiated_type_literal_method_callable_set(
             edges.extend(callable.parameters.iter().copied());
             edges.extend(callable.rest_parameter);
             edges.push(return_type);
+            if let Some(predicate) = signature.resolved_type_predicate() {
+                edges.extend(store.type_predicate(predicate)?.type_id());
+            }
         }
 
         Some((projection, edges))
@@ -2357,7 +2375,10 @@ pub(super) fn validate_stored_declared_method_callable_set(
                 || signature.flags() & !allowed_flags != SignatureFlags::NONE
                 || !valid_declared_method_type_parameters(store, signature, *declaration)
                 || signature.resolved_min_argument_count() != -1
-                || signature.resolved_type_predicate().is_some()
+                || !store.declared_method_type_predicate_is_exact(
+                    signature,
+                    store.source_direct_type_annotation(*declaration)?,
+                )
                 || signature.target().is_some()
                 || signature.mapper().is_some()
                 || signature.isolated_signature_type().is_some()
@@ -2390,6 +2411,9 @@ pub(super) fn validate_stored_declared_method_callable_set(
             edges.extend(callable.parameters.iter().copied());
             edges.extend(callable.rest_parameter);
             edges.push(return_type);
+            if let Some(predicate) = signature.resolved_type_predicate() {
+                edges.extend(store.type_predicate(predicate)?.type_id());
+            }
         }
 
         Some((projection, edges, pending_value))

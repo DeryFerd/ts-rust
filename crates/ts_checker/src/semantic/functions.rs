@@ -799,7 +799,7 @@ pub(super) fn plan_function_type(
             if predicate.owner != node
                 || parameters
                     .get(usize::try_from(predicate.parameter_index).unwrap_or(usize::MAX))
-                    .is_none_or(|parameter| parameter.symbol != predicate.parameter_symbol)
+                    .is_none_or(|parameter| Some(parameter.symbol) != predicate.parameter_symbol)
             {
                 return Err(invariant(FunctionTypeInvariant::InvalidSyntax(
                     return_identity_node,
