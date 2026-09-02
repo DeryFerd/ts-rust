@@ -14909,7 +14909,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 || !self.source_spelling_matches(export, "export")
                 || modifier_node.flags.0 != 0
                 || modifier_node.parent != Some(declaration.node)
-                || modifier_node.range.end.get() > modifiers.list.range.end.get()
+                || modifier_node.range.end.get() > name_start
                 || !matches!(modifier_node.data, NodeData::Token(_))
                 || !self.source_spelling_matches(modifier, spelling)
             {
