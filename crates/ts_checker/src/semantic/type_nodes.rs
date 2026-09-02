@@ -23187,6 +23187,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let cached_syntax_contains_builtin_array = cached_type.is_some()
             && self.type_node_contains_builtin_array_reference(node, &mut HashSet::new())?;
         let exact_import = self.type_reference_alias_targets.get(&node).copied();
+        let exact_import = if exact_import.is_none() && !qualified && !record_heritage {
+            self.cached_function_parameter_type_import(node)?
+        } else {
+            exact_import
+        };
         let property_import = if qualified || record_heritage {
             None
         } else {
@@ -32123,6 +32128,62 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             _ => Ok(()),
         }
+    }
+
+    fn cached_function_parameter_type_import(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<CanonicalTypeReferenceAliasTarget>, DeclaredTypeError> {
+        if self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let record = preflight_node(self.store, self.host, node)?;
+        let Some(parameter) = record.parent else {
+            return Ok(None);
+        };
+        let parameter = NodeRef::new(node.arena, node.file, parameter);
+        let parameter_node = preflight_node(self.store, self.host, parameter)?;
+        let NodeData::ParameterDeclaration(syntax) = &parameter_node.data else {
+            return Ok(None);
+        };
+        let Some(declaration) = parameter_node.parent else {
+            return Ok(None);
+        };
+        let declaration = NodeRef::new(node.arena, node.file, declaration);
+        if syntax.type_ != Some(node.node)
+            || super::source_callables::authenticated_function_object_parameter_bindings(
+                self.store,
+                self.host,
+                declaration,
+                parameter,
+            )
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let Some(resolved) =
+            source_imports::plan_source_named_type_import_target(self.store, self.host, node)
+                .map_err(|error| property_type_import_error(node, error))?
+        else {
+            return Ok(None);
+        };
+        if self
+            .store
+            .symbol(resolved.target_symbol)
+            .is_none_or(|target| target.flags() != SymbolFlags::INTERFACE)
+        {
+            return Ok(None);
+        }
+        source_imports::plan_source_type_import_reference(
+            self.store, self.host, &resolved, node, node,
+        )
+        .map(Some)
+        .map_err(|error| property_type_import_error(node, error))
     }
 
     fn resolve_type_reference_alias_target(

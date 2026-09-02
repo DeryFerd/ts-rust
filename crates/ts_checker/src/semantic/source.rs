@@ -41536,6 +41536,18 @@ fn check_expression_type_with_capture_context(
                     diagnostics,
                     contextual_type,
                 )?;
+                let mut member_diagnostics = CanonicalCheckerDiagnostics::default();
+                let prepared = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut member_diagnostics,
+                )?
+                .prepare_generic_interface_declared_members(contextual_type);
+                merge_retry_diagnostics(diagnostics, member_diagnostics);
+                prepared?;
                 // Contextual preflight reads members without a source query session.
                 if super::object_aliases::source_property_object_projection(store, contextual_type)?
                     .is_some()
