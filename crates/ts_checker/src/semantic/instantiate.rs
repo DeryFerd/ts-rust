@@ -42,10 +42,11 @@ use super::{
         cached_deferred_indexed_access_type, get_instantiated_indexed_access_type,
     },
     instantiated_members::{
-        GenericInterfaceMemberError, cached_function_member_type,
-        cached_generic_function_alias_instance, closed_declared_function_type,
-        instantiate_function_member_type, instantiate_generic_function_alias,
-        instantiated_function_member_type_matches, source_callable_function_type_owner,
+        GenericInterfaceMemberError, InstantiatedGenericInterfaceCallback,
+        cached_function_member_type, cached_generic_function_alias_instance,
+        closed_declared_function_type, instantiate_function_member_type,
+        instantiate_generic_function_alias, instantiated_function_member_type_matches,
+        instantiated_generic_interface_callback_projection, source_callable_function_type_owner,
     },
     intersection_types::{
         DeferredIntersectionTypeProjection, IntersectionTypeCacheKey, IntersectionTypeError,
@@ -1869,6 +1870,9 @@ fn instantiate_type_with_alias_input_and_operand(
                 && source_callable_function_type_owner(store, type_).is_none()
                 && !store.type_has_function_type_provenance(type_)
                 && !source_mapped
+                && !matches!(store.type_payload(type_).map(TypeRecord::data),
+                    Some(TypeData::Object(object))
+                        if object.target.is_some_and(|target| store.type_has_function_type_provenance(target)))
             {
                 return Ok(());
             }
@@ -2579,6 +2583,118 @@ fn cached_function_instantiation(
         }
     }
     Ok(if unchanged { Some(source) } else { cached })
+}
+
+fn cached_generic_interface_callback_instantiation(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    callback: &InstantiatedGenericInterfaceCallback,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    active: &mut HashSet<TypeId>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    let mut targets = Vec::with_capacity(callback.outer_parameters.len());
+    let mut unchanged = true;
+    for &parameter in &callback.outer_parameters {
+        let Some(inherited) = cached_instantiated_type_worker(
+            store,
+            parameter,
+            InstantiationMapping::Stored(callback.mapper),
+            array_targets,
+            None,
+            active,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(mapped) = cached_instantiated_type_worker(
+            store,
+            inherited,
+            mapping,
+            array_targets,
+            None,
+            active,
+        )?
+        else {
+            return Ok(None);
+        };
+        unchanged &= inherited == mapped;
+        targets.push(mapped);
+    }
+    if unchanged {
+        return Ok(Some(source));
+    }
+    cached_function_instantiation(
+        store,
+        callback.target,
+        InstantiationMapping::Vector {
+            sources: &callback.outer_parameters,
+            targets: &targets,
+        },
+        array_targets,
+        active,
+    )
+}
+
+/// Keeps the original callback target and the ordered outer-parameter cache key.
+fn instantiate_generic_interface_callback(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    callback: &InstantiatedGenericInterfaceCallback,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    if let Some(cached) = cached_generic_interface_callback_instantiation(
+        store,
+        source,
+        callback,
+        mapping,
+        array_targets,
+        &mut HashSet::from([source]),
+    )? {
+        return Ok(cached);
+    }
+    let mark = session.limit_event_mark();
+    let mut targets = Vec::with_capacity(callback.outer_parameters.len());
+    let mut unchanged = true;
+    for &parameter in &callback.outer_parameters {
+        let inherited = instantiate_type_with_alias(
+            store,
+            parameter,
+            InstantiationMapping::Stored(callback.mapper),
+            array_targets,
+            None,
+            session,
+        )?;
+        if session.limit_event_occurred_since(mark) {
+            return session
+                .recovery_error_type()
+                .ok_or(InstantiationError::InvalidType(source));
+        }
+        let mapped =
+            instantiate_type_with_alias(store, inherited, mapping, array_targets, None, session)?;
+        if session.limit_event_occurred_since(mark) {
+            return session
+                .recovery_error_type()
+                .ok_or(InstantiationError::InvalidType(source));
+        }
+        unchanged &= inherited == mapped;
+        targets.push(mapped);
+    }
+    if unchanged {
+        return Ok(source);
+    }
+    instantiate_function_type(
+        store,
+        callback.target,
+        InstantiationMapping::Vector {
+            sources: &callback.outer_parameters,
+            targets: &targets,
+        },
+        array_targets,
+        session,
+    )
 }
 
 fn instantiate_function_type(
@@ -4530,6 +4646,21 @@ fn cached_instantiated_type_with_operand_worker(
                     active,
                 );
             }
+            if let Some(callback) =
+                instantiated_generic_interface_callback_projection(store, template, array_targets)
+            {
+                if alias_override.is_some() {
+                    return Err(InstantiationError::UnsupportedType(template));
+                }
+                return cached_generic_interface_callback_instantiation(
+                    store,
+                    template,
+                    &callback,
+                    mapping,
+                    array_targets,
+                    active,
+                );
+            }
             let Some(projection) = source_property_object_projection(store, template)
                 .map_err(|_| InstantiationError::InvalidType(template))?
             else {
@@ -5759,6 +5890,20 @@ fn instantiate_type_worker(
                     return instantiate_function_type(
                         store,
                         type_,
+                        mapping,
+                        array_targets,
+                        session,
+                    );
+                } else if let Some(callback) =
+                    instantiated_generic_interface_callback_projection(store, type_, array_targets)
+                {
+                    if alias.is_some() {
+                        return Err(InstantiationError::UnsupportedType(type_));
+                    }
+                    return instantiate_generic_interface_callback(
+                        store,
+                        type_,
+                        &callback,
                         mapping,
                         array_targets,
                         session,

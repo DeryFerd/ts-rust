@@ -157,7 +157,7 @@ pub(super) struct PropertyObjectAliasMembers {
     pub(super) properties: Vec<SemanticSymbolId>,
 }
 
-/// The function-alias producer retains the caller's capability on its real copy.
+/// Function aliases and interface callbacks retain the caller's capability on their copies.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct InstantiatedPropertyAliasCallable {
     type_: TypeId,
@@ -185,6 +185,13 @@ impl InstantiatedPropertyAliasCallable {
             || instantiated_function_property_owner(store, self.source, self.mapper).is_none()
                 && function_alias_instance_arguments(store, self.source, self.type_, self.mapper)
                     .is_none()
+                && generic_interface_callback_mapping(
+                    store,
+                    self.source,
+                    self.mapper,
+                    self.array_targets,
+                )
+                .is_none()
             || self.array_targets.is_some_and(|targets| {
                 store.type_payload(targets.array_type()).is_none()
                     || store.type_payload(targets.readonly_array_type()).is_none()
@@ -5711,24 +5718,24 @@ fn instantiate_generic_member_type_inner(
         }
         return instantiate_function_member_type(store, template, mapper, array_targets, session);
     }
-    if let Some((callback, undefined)) = optional_function_member(store, template)? {
+    if let Some(optional) = optional_function_member(store, template)? {
         let instantiated_callback = instantiate_generic_member_type_worker(
             store,
-            callback,
+            optional.callback,
             mapper,
             array_targets,
             session,
             active,
         )?;
-        if instantiated_callback == callback {
+        if instantiated_callback == optional.callback {
             return Ok(template);
         }
+        let members = std::iter::once(instantiated_callback)
+            .chain(optional.undefined)
+            .chain(optional.null)
+            .collect::<Vec<_>>();
         return store
-            .literal_union_type_with_alias_and_array_targets(
-                &[instantiated_callback, undefined],
-                None,
-                array_targets,
-            )
+            .literal_union_type_with_alias_and_array_targets(&members, None, array_targets)
             .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(template));
     }
     let indexed = match store
@@ -5823,27 +5830,40 @@ fn method_tuple_union_members(
     Ok(Some(&union.union.types))
 }
 
+#[derive(Clone, Copy)]
+struct OptionalFunctionMember {
+    callback: TypeId,
+    undefined: Option<TypeId>,
+    null: Option<TypeId>,
+}
+
+/// A nullable callback retains each written nullish member through mapping.
 fn optional_function_member(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
-) -> Result<Option<(TypeId, TypeId)>, GenericInterfaceMemberError> {
+) -> Result<Option<OptionalFunctionMember>, GenericInterfaceMemberError> {
     let invalid = || GenericInterfaceMemberError::UnsupportedPropertyType(type_);
     let record = store.type_payload(type_).ok_or_else(invalid)?;
     let TypeData::Union(union) = record.data() else {
         return Ok(None);
     };
-    let [first, second] = union.union.types.as_slice() else {
+    if !(2..=3).contains(&union.union.types.len()) {
         return Ok(None);
-    };
-    let undefined = store
-        .intrinsic_bootstrap()
-        .ok_or_else(invalid)?
-        .undefined_type;
-    let callback = if *first == undefined {
-        *second
-    } else if *second == undefined {
-        *first
-    } else {
+    }
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let mut callback = None;
+    let mut undefined = None;
+    let mut null = None;
+    for &member in &union.union.types {
+        if member == bootstrap.undefined_type {
+            undefined = Some(member);
+        } else if member == bootstrap.null_type {
+            null = Some(member);
+        } else if callback.replace(member).is_some() {
+            return Ok(None);
+        }
+    }
+    let Some(callback) = callback else {
         return Ok(None);
     };
     let callback_source = store.type_has_function_type_provenance(callback)
@@ -5862,7 +5882,11 @@ fn optional_function_member(
     {
         return Err(invalid());
     }
-    Ok(Some((callback, undefined)))
+    Ok(Some(OptionalFunctionMember {
+        callback,
+        undefined,
+        null,
+    }))
 }
 
 fn method_parameter_contains_function(
@@ -5872,7 +5896,7 @@ fn method_parameter_contains_function(
 ) -> bool {
     parameter == callback
         || optional_function_member(store, parameter)
-            .is_ok_and(|optional| optional.is_some_and(|(source, _)| source == callback))
+            .is_ok_and(|optional| optional.is_some_and(|member| member.callback == callback))
 }
 
 pub(super) fn instantiated_optional_function_member_type_matches(
@@ -5882,19 +5906,20 @@ pub(super) fn instantiated_optional_function_member_type_matches(
     mapper: TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<bool> {
-    let (source, undefined) = match optional_function_member(store, template) {
+    let source = match optional_function_member(store, template) {
         Ok(Some(optional)) => optional,
         Ok(None) => return None,
         Err(_) => return Some(false),
     };
     Some(
         optional_function_member(store, actual).is_ok_and(|optional| {
-            optional.is_some_and(|(mapped, sentinel)| {
-                sentinel == undefined
+            optional.is_some_and(|mapped| {
+                mapped.undefined == source.undefined
+                    && mapped.null == source.null
                     && instantiated_function_member_type_matches(
                         store,
-                        source,
-                        mapped,
+                        source.callback,
+                        mapped.callback,
                         mapper,
                         array_targets,
                     )
@@ -6327,6 +6352,7 @@ fn function_member_parameters(
         return None;
     }
     if function_member_declaring_method(store, source).is_none()
+        && generic_interface_callback_owner(store, source).is_none()
         && function_member_declaring_property_alias(store, source).is_none()
         && !generic_function_alias_projection(store, source)
             .is_ok_and(|projection| projection.is_some_and(|alias| alias.target == source))
@@ -6718,7 +6744,345 @@ fn source_callable_function_type_mapper_owner(
     }
 }
 
-/// The installed function-type mapping covers direct global Array method parameters.
+#[derive(Clone, Copy)]
+struct GenericInterfaceCallbackOwner {
+    method: SemanticSymbolId,
+    target: TypeId,
+    signature: SignatureId,
+}
+
+/// Proves the actual callback annotation and its declared generic interface method.
+#[allow(clippy::too_many_lines)] // Annotation ancestry and the method's source identity form one proof.
+fn generic_interface_callback_owner(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+) -> Option<GenericInterfaceCallbackOwner> {
+    if function_member_declaring_method(store, source).is_some() {
+        return None;
+    }
+    let record = store.type_payload(source)?;
+    let [declaration] = store.symbol(record.symbol()?)?.declarations()? else {
+        return None;
+    };
+    if store.source_node_kind(*declaration) != Some(SyntaxKind::FunctionType)
+        || !matches!(
+            validate_stored_function_type(store, source),
+            StoredFunctionTypeValidation::Valid(_)
+        )
+    {
+        return None;
+    }
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let mut annotation = *declaration;
+    let mut annotation_type = source;
+    let mut visited = HashSet::new();
+    let parameter = loop {
+        if visited.len() >= InstantiationLimits::default().max_depth || !visited.insert(annotation)
+        {
+            return None;
+        }
+        let SourceNodeParent::Parent(parent) = store.source_node_parent(annotation)? else {
+            return None;
+        };
+        match store.source_node_kind(parent)? {
+            SyntaxKind::ParenthesizedType => {
+                if store.source_direct_children(parent)?.as_slice() != [annotation]
+                    || store.type_node_links(parent).is_some_and(|links| {
+                        links != &super::TypeNodeLinks::default()
+                            && (links.resolved_type != Some(annotation_type)
+                                || links.outer_type_parameters.is_some())
+                    })
+                {
+                    return None;
+                }
+            }
+            SyntaxKind::UnionType => {
+                let union = store.type_node_links(parent)?.resolved_type?;
+                let optional = optional_function_member(store, union).ok()??;
+                if optional.callback != source
+                    || store.source_direct_children(parent)?.iter().any(|child| {
+                        *child != annotation
+                            && !store.source_direct_type_annotation_is_exact(
+                                *child,
+                                bootstrap.undefined_type,
+                            )
+                            && !store
+                                .source_direct_type_annotation_is_exact(*child, bootstrap.null_type)
+                    })
+                {
+                    return None;
+                }
+                annotation_type = union;
+            }
+            SyntaxKind::Parameter => break parent,
+            _ => return None,
+        }
+        if store
+            .symbol_node_links(parent)
+            .is_some_and(|links| links != &super::SymbolNodeLinks::default())
+        {
+            return None;
+        }
+        annotation = parent;
+    };
+    let SourceNodeParent::Parent(declaration) = store.source_node_parent(parameter)? else {
+        return None;
+    };
+    if store.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature)
+        || store.source_direct_type_annotation(parameter) != Some(annotation)
+        || !store.source_direct_type_annotation_is_exact(annotation, annotation_type)
+    {
+        return None;
+    }
+    let method = store.get_merged_symbol(store.source_declaration_symbol(declaration)?)?;
+    let (_, target) = store.authenticated_interface_method_owner(method)?;
+    let reference = validate_direct_generic_reference(store, target).ok()?;
+    if reference.target != target || reference.type_arguments.is_empty() {
+        return None;
+    }
+    let method_type = store.value_symbol_links(method)?.resolved_type?;
+    valid_interface_method_value(store, method, method_type)?;
+    let signature = store
+        .signature_links(declaration)?
+        .resolved_signature
+        .signature()?;
+    let callable = store.signature(signature)?;
+    let parameter_symbol = store.source_declaration_symbol(parameter)?;
+    let index = callable
+        .parameters()
+        .iter()
+        .position(|symbol| *symbol == parameter_symbol)?;
+    let parameter_type = *store
+        .callable_signature_parameter_types(signature)?
+        .get(index)?;
+    if callable.declaration() != Some(declaration)
+        || store.interface_method_linked_type(signature) != Some(method_type)
+        || !method_parameter_contains_function(store, parameter_type, source)
+    {
+        return None;
+    }
+    Some(GenericInterfaceCallbackOwner {
+        method,
+        target,
+        signature,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct GenericInterfaceCallbackMapping {
+    owner: GenericInterfaceCallbackOwner,
+    receiver: TypeId,
+    owner_mapper: TypeMapperId,
+    copied_signature: Option<SignatureId>,
+}
+
+/// A callback uses the enclosing reference mapper and the method's own fresh formals.
+fn generic_interface_callback_mapping(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<GenericInterfaceCallbackMapping> {
+    let owner = generic_interface_callback_owner(store, source)?;
+    let TypeData::Interface(interface) = store.type_payload(owner.target)?.data() else {
+        return None;
+    };
+    let this_type = interface.this_type?;
+    let original = store.signature(owner.signature)?;
+    let owner_mapper = if original.type_parameters().is_empty() {
+        mapper
+    } else {
+        let TypeMapperApplication::Composite { second, .. } =
+            store.mapper_application(mapper, this_type)?
+        else {
+            return None;
+        };
+        second
+    };
+    let receiver = store.map_type(owner_mapper, this_type)?;
+    let reference = validate_direct_generic_reference(store, receiver).ok()?;
+    let parameters = interface.reference.resolved_type_arguments.as_deref()?;
+    let sources = parameters
+        .iter()
+        .copied()
+        .chain([this_type])
+        .collect::<Vec<_>>();
+    let targets = reference
+        .type_arguments
+        .iter()
+        .copied()
+        .chain([receiver])
+        .collect::<Vec<_>>();
+    if reference.target != owner.target
+        || store.type_mapper_has_exact_endpoints(owner_mapper, &sources, &targets) != Some(true)
+    {
+        return None;
+    }
+    let copied_signature = if original.type_parameters().is_empty() {
+        None
+    } else {
+        let mut copies = store.signatures().filter(|(_, signature)| {
+            signature.target() == Some(owner.signature) && signature.mapper() == Some(mapper)
+        });
+        let (id, copied) = copies.next()?;
+        if copies.next().is_some()
+            || copied.declaration() != original.declaration()
+            || copied.flags() != original.flags() & SignatureFlags::PROPAGATING_FLAGS
+            || copied.this_parameter().is_some()
+            || copied.parameters().len() != original.parameters().len()
+            || copied.min_argument_count() != original.min_argument_count()
+            || copied.resolved_min_argument_count() != -1
+            || copied.isolated_signature_type().is_some()
+            || copied.composite().is_some()
+            || validated_instantiated_method_mapper(
+                store,
+                original,
+                copied,
+                owner_mapper,
+                array_targets,
+            ) != Some(mapper)
+        {
+            return None;
+        }
+        Some(id)
+    };
+    for type_ in [owner.target, receiver] {
+        store
+            .validate_cached_array_capability_with_pending_functions(array_targets, type_, &[])
+            .ok()?;
+    }
+    Some(GenericInterfaceCallbackMapping {
+        owner,
+        receiver,
+        owner_mapper,
+        copied_signature,
+    })
+}
+
+/// Cold callbacks use the real proxy. Warm callbacks also validate its complete method copy.
+fn generic_interface_callback_member_origin(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<TypeId> {
+    let mapping = generic_interface_callback_mapping(store, source, mapper, array_targets)?;
+    let members =
+        validate_generic_interface_members(store, mapping.receiver, array_targets).ok()??;
+    let method = store.symbol(mapping.owner.method)?;
+    let property = store.symbol_table(members.members()?)?.get(method.name())?;
+    let links = store.value_symbol_links(property)?;
+    if members.target() != mapping.owner.target
+        || !members.properties().contains(&property)
+        || links.target != Some(mapping.owner.method)
+        || links.mapper != Some(mapping.owner_mapper)
+    {
+        return None;
+    }
+    if let Some(callable) = links.resolved_type {
+        let record = store.type_payload(callable)?;
+        let TypeData::Object(object) = record.data() else {
+            return None;
+        };
+        let original_type = store
+            .value_symbol_links(mapping.owner.method)?
+            .resolved_type?;
+        let original_signatures = store
+            .type_payload(original_type)?
+            .data()
+            .structured()?
+            .signatures
+            .as_deref()?;
+        let index = original_signatures
+            .iter()
+            .position(|signature| *signature == mapping.owner.signature)?;
+        let signatures = object.structured.signatures.as_deref()?;
+        let copied = *signatures.get(index)?;
+        if record.symbol() != Some(mapping.owner.method)
+            || object.target != Some(original_type)
+            || object.mapper != Some(mapping.owner_mapper)
+            || signatures.len() != original_signatures.len()
+            || mapping
+                .copied_signature
+                .is_some_and(|expected| copied != expected)
+            || store.signature(copied)?.mapper() != Some(mapper)
+            || store.proxy_interface_method_type_for_signature(copied) != Some(callable)
+        {
+            return None;
+        }
+    }
+    Some(mapping.receiver)
+}
+
+pub(super) struct InstantiatedGenericInterfaceCallback {
+    pub(super) target: TypeId,
+    pub(super) mapper: TypeMapperId,
+    pub(super) method_signature: SignatureId,
+    pub(super) outer_parameters: Vec<TypeId>,
+    pub(super) callable: ValidatedSingleCallable,
+}
+
+/// A method call remaps the original callback through both existing mapper steps.
+pub(super) fn instantiated_generic_interface_callback_projection(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<InstantiatedGenericInterfaceCallback> {
+    let TypeData::Object(object) = store.type_payload(type_)?.data() else {
+        return None;
+    };
+    let target = object.target?;
+    let mapper = object.mapper?;
+    let origin = store.instantiated_property_alias_callable(type_)?;
+    if origin.source != target || origin.mapper != mapper {
+        return None;
+    }
+    let mapping = generic_interface_callback_mapping(store, target, mapper, array_targets)?;
+    generic_interface_callback_member_origin(store, target, mapper, origin.array_targets)?;
+    if origin.array_targets != array_targets {
+        generic_interface_callback_member_origin(store, target, mapper, array_targets)?;
+    }
+    let callable =
+        instantiated_function_member_projection(store, target, type_, mapper, array_targets, None)?;
+    store
+        .validate_cached_array_capability_with_pending_functions(array_targets, type_, &[])
+        .ok()?;
+    let TypeData::Interface(interface) = store.type_payload(mapping.owner.target)?.data() else {
+        return None;
+    };
+    let outer_parameters = interface
+        .reference
+        .resolved_type_arguments
+        .as_deref()?
+        .iter()
+        .copied()
+        .chain([interface.this_type?])
+        .chain(
+            store
+                .signature(mapping.owner.signature)?
+                .type_parameters()
+                .iter()
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    let declaration = store.signature(callable.signature)?.declaration()?;
+    if store
+        .type_node_links(declaration)
+        .and_then(|links| links.outer_type_parameters.as_deref())
+        .is_some_and(|cached| cached != outer_parameters)
+    {
+        return None;
+    }
+    Some(InstantiatedGenericInterfaceCallback {
+        target,
+        mapper,
+        method_signature: mapping.copied_signature?,
+        outer_parameters,
+        callable,
+    })
+}
+
+/// The existing Array callback path keeps its own array capability checks.
 fn function_member_declaring_method(
     store: &CanonicalTypeMapperStore,
     source: TypeId,
@@ -7041,6 +7405,7 @@ pub(super) fn instantiate_function_member_type(
     let (symbol, template) = function_member_signature(store, source)
         .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(source))?;
     let property_alias = function_member_declaring_property_alias(store, source).is_some();
+    let interface_callback = generic_interface_callback_owner(store, source).is_some();
     let function_alias = generic_function_alias_projection(store, source)
         .map_err(|_| GenericInterfaceMemberError::InvalidCachedMembers(source))?;
     let alias_arguments = function_alias
@@ -7063,6 +7428,11 @@ pub(super) fn instantiate_function_member_type(
     if property_alias && instantiated_function_property_owner(store, source, mapper).is_none() {
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
     }
+    if interface_callback
+        && generic_interface_callback_mapping(store, source, mapper, array_targets).is_none()
+    {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+    }
     let source_callable = source_callable_function_type_owner(store, source).is_some();
     if source_callable
         && source_callable_function_type_mapper_owner(store, source, mapper).is_none_or(|targets| {
@@ -7074,8 +7444,11 @@ pub(super) fn instantiate_function_member_type(
     if let Some(cached) = cached_function_member_type(store, source, mapper, array_targets)? {
         return Ok(cached);
     }
-    let origin =
-        (property_alias || function_alias.is_some()).then_some((source, mapper, array_targets));
+    let origin = (property_alias || function_alias.is_some() || interface_callback).then_some((
+        source,
+        mapper,
+        array_targets,
+    ));
     let mut new_alias_cache = if let Some(alias) = &function_alias {
         let TypeData::Object(target) = store
             .type_payload(source)
@@ -7128,7 +7501,7 @@ pub(super) fn instantiate_function_member_type(
         symbol,
         source,
     )?;
-    if (function_alias.is_some() || source_callable)
+    if (function_alias.is_some() || source_callable || interface_callback)
         && session.limit_event_occurred_since(limit_mark)
     {
         return session
@@ -7235,7 +7608,8 @@ pub(super) fn cached_function_member_type(
 ) -> Result<Option<TypeId>, GenericInterfaceMemberError> {
     function_member_signature(store, source)
         .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(source))?;
-    let property_alias = function_member_declaring_property_alias(store, source).is_some();
+    let retained_origin = function_member_declaring_property_alias(store, source).is_some()
+        || generic_interface_callback_owner(store, source).is_some();
     let mut cached = None;
     for (type_, record) in store.types() {
         let TypeData::Object(object) = record.data() else {
@@ -7244,7 +7618,7 @@ pub(super) fn cached_function_member_type(
         if object.target == Some(source)
             && object.mapper == Some(mapper)
             && (cached.replace(type_).is_some()
-                || property_alias
+                || retained_origin
                     && store
                         .instantiated_property_alias_callable(type_)
                         .is_none_or(|origin| origin.source != source || origin.mapper != mapper)
@@ -7281,6 +7655,7 @@ pub(super) fn instantiated_function_member_type_matches(
     }
     if function_member_declaring_property_alias(store, source).is_some()
         || generic_function_alias_projection(store, source).is_ok_and(|alias| alias.is_some())
+        || generic_interface_callback_owner(store, source).is_some()
     {
         let Some(origin) = store.instantiated_property_alias_callable(actual) else {
             return false;
@@ -7359,6 +7734,13 @@ fn instantiated_function_member_projection(
     }
     if function_member_declaring_property_alias(store, source).is_some() {
         instantiated_function_property_owner(store, source, mapper)?;
+        let origin = store.instantiated_property_alias_callable(actual)?;
+        if origin.source != source || origin.mapper != mapper {
+            return None;
+        }
+    }
+    if generic_interface_callback_owner(store, source).is_some() {
+        generic_interface_callback_mapping(store, source, mapper, array_targets)?;
         let origin = store.instantiated_property_alias_callable(actual)?;
         if origin.source != source || origin.mapper != mapper {
             return None;
@@ -7728,42 +8110,50 @@ pub(super) fn validate_instantiated_function_member_callable(
     let family = CallableFamily::FunctionType;
     let validated = (|| {
         let mapper = object.mapper?;
-        let (targets, recovery, alias) =
-            if let Some(receiver) = instantiated_function_property_owner(store, source, mapper) {
-                let origin = store.instantiated_property_alias_callable(type_)?;
-                if origin.source != source || origin.mapper != mapper {
-                    return None;
+        let (targets, recovery, alias) = if let Some(receiver) =
+            instantiated_function_property_owner(store, source, mapper)
+        {
+            let origin = store.instantiated_property_alias_callable(type_)?;
+            if origin.source != source || origin.mapper != mapper {
+                return None;
+            }
+            let recovery = match instantiated_function_property_recovery(
+                store, source, type_, mapper, receiver,
+            )? {
+                FunctionPropertyRecovery::Normal => None,
+                FunctionPropertyRecovery::Recovered(identity) => {
+                    Some(InstantiatedFunctionRecovery::Property(identity))
                 }
-                let recovery = match instantiated_function_property_recovery(
-                    store, source, type_, mapper, receiver,
-                )? {
-                    FunctionPropertyRecovery::Normal => None,
-                    FunctionPropertyRecovery::Recovered(identity) => {
-                        Some(InstantiatedFunctionRecovery::Property(identity))
-                    }
-                };
-                (
-                    origin.array_targets,
-                    recovery,
-                    Some(source_property_object_projection(store, receiver).ok()??),
-                )
-            } else if function_alias_instance_arguments(store, source, type_, mapper).is_some() {
-                let origin = store.instantiated_property_alias_callable(type_)?;
-                if origin.source != source || origin.mapper != mapper {
-                    return None;
-                }
-                (origin.array_targets, None, None)
-            } else if let Some(targets) =
-                source_callable_function_type_mapper_owner(store, source, mapper)
-            {
-                (targets, None, None)
-            } else {
-                (
-                    Some(instantiated_function_member_owner(store, source, mapper)?),
-                    None,
-                    None,
-                )
             };
+            (
+                origin.array_targets,
+                recovery,
+                Some(source_property_object_projection(store, receiver).ok()??),
+            )
+        } else if function_alias_instance_arguments(store, source, type_, mapper).is_some() {
+            let origin = store.instantiated_property_alias_callable(type_)?;
+            if origin.source != source || origin.mapper != mapper {
+                return None;
+            }
+            (origin.array_targets, None, None)
+        } else if let Some(targets) =
+            source_callable_function_type_mapper_owner(store, source, mapper)
+        {
+            (targets, None, None)
+        } else if generic_interface_callback_owner(store, source).is_some() {
+            let origin = store.instantiated_property_alias_callable(type_)?;
+            if origin.source != source || origin.mapper != mapper {
+                return None;
+            }
+            generic_interface_callback_member_origin(store, source, mapper, origin.array_targets)?;
+            (origin.array_targets, None, None)
+        } else {
+            (
+                Some(instantiated_function_member_owner(store, source, mapper)?),
+                None,
+                None,
+            )
+        };
         let callable = instantiated_function_member_projection(
             store, source, type_, mapper, targets, recovery,
         )?;
@@ -7976,6 +8366,13 @@ pub(super) fn instantiated_property_function_signature_return_type(
             }
         }
     } else if function_alias_instance_arguments(store, origin.source, type_, origin.mapper)
+        .is_some()
+        || generic_interface_callback_member_origin(
+            store,
+            origin.source,
+            origin.mapper,
+            origin.array_targets,
+        )
         .is_some()
     {
         None
@@ -9305,10 +9702,10 @@ fn member_type_requires_instantiation_inner(
         }
         return Ok(requires);
     }
-    if let Some((callback, _)) = optional_function_member(store, type_)? {
+    if let Some(optional) = optional_function_member(store, type_)? {
         return member_type_requires_instantiation_worker(
             store,
-            callback,
+            optional.callback,
             mapper_parameters,
             array_targets,
             active,

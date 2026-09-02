@@ -77,8 +77,10 @@ use super::{
         instantiable_intersection_projection,
     },
     instantiated_members::{
-        generic_interface_call_signature_return, instantiated_interface_method_signature_return,
-        source_callable_function_type_owner, source_parameter_function_type_owner,
+        generic_interface_call_signature_return,
+        instantiated_generic_interface_callback_projection,
+        instantiated_interface_method_signature_return, source_callable_function_type_owner,
+        source_parameter_function_type_owner,
     },
     keyof_types::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
@@ -4288,7 +4290,10 @@ fn validate_generic_parameter_template(
         return Ok(true);
     }
 
-    if store.type_has_function_type_provenance(type_) {
+    if store.type_has_function_type_provenance(type_)
+        || instantiated_generic_interface_callback_projection(store, type_, array_targets)
+            .is_some_and(|callback| callback.method_signature == signature)
+    {
         validate_generic_mapper_type(
             store,
             type_,
@@ -5298,6 +5303,23 @@ fn validate_generic_mapper_type_worker(
         .map_err(|_| GenericCallVectorInvariant::CallableSignatureMismatch(signature))?
     {
         Some(tuple.element_types().to_vec())
+    } else if let Some(callback) =
+        instantiated_generic_interface_callback_projection(store, type_, array_targets)
+    {
+        if callback.method_signature != signature {
+            return Err(
+                GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into(),
+            );
+        }
+        Some(
+            callback
+                .callable
+                .parameters
+                .into_iter()
+                .chain(callback.callable.rest_parameter)
+                .chain(callback.callable.return_type)
+                .collect(),
+        )
     } else if store.type_has_function_type_provenance(type_)
         && source_callable_function_type_owner(store, type_).is_none()
     {
@@ -6813,7 +6835,10 @@ fn collect_generic_call_inferences_pair(
         if valid_fixed_generic_source_parameter_type(store, target) {
             return Ok(());
         }
-        if store.type_has_function_type_provenance(target) {
+        if store.type_has_function_type_provenance(target)
+            || instantiated_generic_interface_callback_projection(store, target, array_targets)
+                .is_some_and(|callback| callback.method_signature == signature)
+        {
             if !generic_constructor_type_contains_parameter(
                 store,
                 target,
@@ -9750,6 +9775,8 @@ fn generic_call_type_instantiation_matches(
                 .intersects(ElementFlags::VARIABLE);
     }
     if store.type_has_function_type_provenance(template)
+        || instantiated_generic_interface_callback_projection(store, template, array_targets)
+            .is_some()
         || matches!(store.canonical_tuple_shape(template), Ok(Some(_)))
     {
         return !active_templates.contains(&template)
