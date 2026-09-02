@@ -299,7 +299,7 @@ fn lambda_callback_captures_its_alias_parameter_without_a_generic_call_signature
             .symbol()
             .unwrap();
         let error_symbol = checker.store().symbol(error_owner).unwrap();
-        assert_eq!(error_symbol.name(), "Error");
+        assert_eq!(error_symbol.name().as_utf8(), Some("Error"));
         assert!(
             error_symbol
                 .declarations()
