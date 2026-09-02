@@ -28946,7 +28946,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         };
                         if cached_ordinary_type_parameter_owner(self.store, parameter_type)
                             != Some(parameter_symbol)
-                            || parameter_data.constraint.is_none() && cached.constraint.is_some()
+                            || parameter_data.constraint.is_none()
+                                && cached.constraint.is_some_and(|constraint| {
+                                    !ordinary_interface
+                                        || self.store.intrinsic_bootstrap().is_none_or(|bootstrap| {
+                                            constraint != bootstrap.no_constraint_type
+                                        })
+                                        || self
+                                            .store
+                                            .source_type_parameter_annotations(parameter)
+                                            .is_none_or(|annotations| annotations.constraint.is_some())
+                                })
                             || parameter_data.default_type.is_none()
                                 && cached.resolved_default_type.is_some()
                         {
@@ -39138,6 +39148,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     /// Checks written call defaults before source value and return annotations.
     pub(super) fn check_source_interface_call_type_parameter_defaults(
         &mut self,
+        interface: &PropertyObjectPlan,
         call: &object_members::PlannedCallSignature,
     ) -> Result<(), DeclaredTypeError> {
         let invalid =
@@ -39188,6 +39199,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 &plan,
                 &mut prepared,
             )?;
+            self.prepare_source_interface_no_constraints(interface, call, &plan)?;
             let formals = object_members::resolved_declared_signature_type_parameters(
                 self.store,
                 call.declaration,
@@ -39209,6 +39221,139 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             Ok(())
         })();
         self.complete_type_query(result, &plan, &mut prepared)
+    }
+
+    /// Complete absent outer bounds only when this call's annotations use those formals.
+    #[allow(clippy::too_many_lines)] // Source ownership and cold/warm formal state share one proof.
+    fn prepare_source_interface_no_constraints(
+        &mut self,
+        interface: &PropertyObjectPlan,
+        call: &object_members::PlannedCallSignature,
+        plan: &TypeQueryPlan,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(call.declaration));
+        if interface.declarations.as_slice() != [interface.node]
+            || !interface.call_signatures.contains(call)
+            || call.is_construct()
+            || !call
+                .declaration
+                .is_for(interface.node.arena, interface.node.file)
+            || preflight_node(self.store, self.host, call.declaration)?.parent
+                != Some(interface.node.node)
+            || object_members::plan_generic_interface(self.store, self.host, interface.symbol)
+                .map_err(property_object_error)?
+                != *interface
+        {
+            return Err(invalid());
+        }
+        let record = preflight_node(self.store, self.host, interface.node)?;
+        let NodeData::InterfaceDeclaration(declaration) = &record.data else {
+            return Err(invalid());
+        };
+        let parameters = declaration.type_parameters.as_ref().ok_or_else(invalid)?;
+        let symbols = explicit_type_parameter_symbols(
+            self.store,
+            self.host,
+            interface.node,
+            Some(parameters),
+            &mut HashSet::new(),
+        )?;
+        if symbols.len() != parameters.nodes.len() {
+            return Err(invalid());
+        }
+        let no_constraint = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or_else(invalid)?
+            .no_constraint_type;
+        let mut pending = Vec::new();
+        for (&node, symbol) in parameters.nodes.iter().zip(symbols) {
+            if !plan
+                .references
+                .values()
+                .any(|reference| reference.symbol == symbol)
+            {
+                continue;
+            }
+            let parameter = NodeRef::new(interface.node.arena, interface.node.file, node);
+            let parameter_record = preflight_node(self.store, self.host, parameter)?;
+            let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+                return Err(invalid());
+            };
+            let annotations = self
+                .store
+                .source_type_parameter_annotations(parameter)
+                .ok_or_else(invalid)?;
+            if annotations.constraint
+                != parameter_data
+                    .constraint
+                    .map(|node| NodeRef::new(parameter.arena, parameter.file, node))
+                || annotations.default_type
+                    != parameter_data
+                        .default_type
+                        .map(|node| NodeRef::new(parameter.arena, parameter.file, node))
+                || self.store.source_declaration_symbol(parameter) != Some(symbol)
+                || !self.store.source_symbol_declarations_match(symbol)
+                || self.store.get_parent_of_symbol(symbol) != Some(interface.symbol)
+                || self.store.source_node_parent(parameter)
+                    != Some(SourceNodeParent::Parent(interface.node))
+            {
+                return Err(invalid());
+            }
+            // Written bounds keep their existing resolution path.
+            if annotations.constraint.is_some() {
+                continue;
+            }
+            if parameter_record.flags.0 != 0
+                || parameter_data.expression.is_some()
+                || parameter_data.modifiers.is_some()
+                || parameter_data.symbol.is_some()
+            {
+                return Err(invalid());
+            }
+            let type_ = self
+                .store
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .ok_or_else(invalid)?;
+            if cached_ordinary_type_parameter_owner(self.store, type_) != Some(symbol) {
+                return Err(invalid());
+            }
+            let Some(TypeData::TypeParameter(data)) =
+                self.store.type_payload(type_).map(TypeRecord::data)
+            else {
+                return Err(invalid());
+            };
+            if data
+                .constraint
+                .is_some_and(|constraint| constraint != no_constraint)
+                || data
+                    .constrained
+                    .resolved_base_constraint
+                    .is_some_and(|constraint| constraint != no_constraint)
+                || data
+                    .resolved_default_type
+                    .is_some_and(|default_type| self.store.type_payload(default_type).is_none())
+            {
+                return Err(invalid());
+            }
+            if data.constraint.is_none() {
+                pending.push((type_, data.resolved_default_type));
+            }
+        }
+        for (type_, default_type) in pending {
+            if !self.store.set_type_parameter_resolution(
+                type_,
+                Some(no_constraint),
+                None,
+                None,
+                default_type,
+            ) {
+                return Err(invalid());
+            }
+        }
+        Ok(())
     }
 
     fn check_source_type_parameter_default(

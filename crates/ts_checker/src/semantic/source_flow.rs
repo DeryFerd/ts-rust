@@ -2591,9 +2591,12 @@ impl SourceFlowPlan {
         Self::preflight_with_effects(
             bound,
             container,
-            (syntax.callable.family
-                == super::source_callables::SourceCallableFamily::ArrowFunction)
-                .then_some(container),
+            matches!(
+                syntax.callable.family,
+                super::source_callables::SourceCallableFamily::ArrowFunction
+                    | super::source_callables::SourceCallableFamily::ObjectLiteralMethod
+            )
+            .then_some(container),
             points,
             conditions,
             assignments,

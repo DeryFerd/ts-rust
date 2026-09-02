@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeRef, SyntaxKind};
-use ts_binder::{EscapedName, EscapedNameRef, SemanticSymbolId, SymbolFlags};
+use ts_binder::{EscapedName, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolFlags};
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, IndexInfoId,
@@ -27,11 +27,11 @@ use super::{
     instantiated_members::{GenericInterfaceMemberError, validated_generic_interface_type_edges},
     keyof_types::validate_generic_keyof_index_type,
     mapped_types::{FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers},
-    object_members::PlannedProperty,
+    object_members::{PlannedProperty, PropertyObjectError, object_literal_state},
     relater::ResolvedDeclaredPropertyObject,
     source::{
         PlannedExpression, PlannedExpressionKind, PlannedIdentifierReadKind, PlannedObjectMember,
-        SourceCheckError, SourceSyntaxRole, UnsupportedSourceSyntax,
+        SourceCheckError, SourceObjectLiteralError, SourceSyntaxRole, UnsupportedSourceSyntax,
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -725,23 +725,64 @@ fn prepare_expression(
                 properties,
                 state.current_flow_types,
             )?;
+            let computed_without_context =
+                contextual_type.is_none() && plan.has_source_computed_properties();
+            if computed_without_context {
+                object_literal_state(store, plan).map_err(|error| {
+                    let error = match error {
+                        PropertyObjectError::Capacity(node) => {
+                            SourceObjectLiteralError::Capacity(node)
+                        }
+                        PropertyObjectError::InvalidCachedTypeLiteral { node, type_ } => {
+                            SourceObjectLiteralError::InvalidCache {
+                                node,
+                                type_: Some(type_),
+                            }
+                        }
+                        PropertyObjectError::InvalidObjectLiteral(node)
+                        | PropertyObjectError::InvalidTypeLiteral(node)
+                        | PropertyObjectError::UnsupportedMember { node, .. } => {
+                            SourceObjectLiteralError::InvalidCache { node, type_: None }
+                        }
+                        PropertyObjectError::InvalidInterface { declaration, .. } => {
+                            SourceObjectLiteralError::InvalidCache {
+                                node: declaration,
+                                type_: None,
+                            }
+                        }
+                        PropertyObjectError::InvalidInterfaceSymbol(_)
+                        | PropertyObjectError::InvalidCachedInterface { .. } => {
+                            unreachable!(
+                                "object-literal execution cannot produce an interface cache error"
+                            )
+                        }
+                    };
+                    SourceCheckError::ObjectLiteral(error)
+                })?;
+            }
             let mut prepared = Vec::with_capacity(properties.len());
             for (property, member) in plan.properties.iter().zip(properties) {
                 let Some(expression) = member.eager_expression() else {
                     prepared.push(PreparedObjectMember::Getter);
                     continue;
                 };
-                let name = property
-                    .name
-                    .as_utf8()
-                    .ok_or(RelationUnavailable::UnsupportedProperty(property.symbol))?;
-                let property_context = contextual_property_type(
-                    store,
-                    &contextual,
-                    name,
-                    expression,
-                    state.current_flow_types,
-                )?;
+                let property_context = if computed_without_context
+                    && property.name.as_ref() == InternalSymbolName::Computed.as_ref()
+                {
+                    None
+                } else {
+                    let name = property
+                        .name
+                        .as_utf8()
+                        .ok_or(RelationUnavailable::UnsupportedProperty(property.symbol))?;
+                    contextual_property_type(
+                        store,
+                        &contextual,
+                        name,
+                        expression,
+                        state.current_flow_types,
+                    )?
+                };
                 prepared.push(PreparedObjectMember::Eager(prepare_expression(
                     store,
                     host,

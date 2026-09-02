@@ -46,8 +46,8 @@ use super::{
         preflight_nongeneric_class_member_query, source_class_plan_is_current,
     },
     constructor_values::{
-        GlobalConstructorValuePlan, plan_global_constructor_value,
-        plan_global_generic_constructor_value,
+        GlobalConstructorValueKind, GlobalConstructorValuePlan, plan_global_constructor_value,
+        plan_global_generic_constructor_value, plan_global_named_constructor,
         prepare_global_constructor_candidates, resolve_global_constructor_candidates,
     },
     declared::{execute_type_parameter, preflight_class_or_interface_reference},
@@ -1132,7 +1132,7 @@ fn plan_direct_default_new_with_context(
             early_preparation,
         );
     }
-    let library = source_context
+    let mut library = source_context
         .map(|(globals, options)| {
             plan_global_constructor_value(store, host, globals, options, symbol)
                 .map_err(|error| {
@@ -1151,20 +1151,21 @@ fn plan_direct_default_new_with_context(
         && prior_source_classes
             .get(&symbol)
             .is_some_and(SourceClassPlan::has_checked_constructor_arguments);
-    let expression_arguments =
-        (source_arguments || library.is_some()).then(|| SourceNewExpressionArguments {
-            nodes: new_expression
-                .arguments
-                .as_ref()
-                .map_or_else(Vec::new, |arguments| {
-                    arguments
-                        .nodes
-                        .iter()
-                        .map(|&argument| NodeRef::new(node.arena, node.file, argument))
-                        .collect()
-                }),
-            expressions: None,
-        });
+    let expression_argument_plan = || SourceNewExpressionArguments {
+        nodes: new_expression
+            .arguments
+            .as_ref()
+            .map_or_else(Vec::new, |arguments| {
+                arguments
+                    .nodes
+                    .iter()
+                    .map(|&argument| NodeRef::new(node.arena, node.file, argument))
+                    .collect()
+            }),
+        expressions: None,
+    };
+    let mut expression_arguments =
+        (source_arguments || library.is_some()).then(expression_argument_plan);
     if source_arguments || library.is_some() {
         if library.is_some() && executor.is_some() {
             return Err(unsupported(SourceNewUnsupported::Arguments(node)));
@@ -1215,8 +1216,8 @@ fn plan_direct_default_new_with_context(
         || global_date
         || global_promise)
         && let Some((globals, options)) = source_context
-        && let Some(library) =
-            plan_global_generic_constructor_value(store, host, globals, options, symbol)
+        && let Some(named) =
+            plan_global_named_constructor(store, host, globals, options, symbol)
                 .map_err(|error| {
                     trace_constructor_failure(
                         "provider_plan_named",
@@ -1227,17 +1228,29 @@ fn plan_direct_default_new_with_context(
                     global_error::provider_error(constructor, symbol, error)
                 })?
     {
-        return plan_generic_library_new(
-            store,
-            host,
-            globals,
-            options,
-            node,
-            constructor,
-            resolved_symbol,
-            library,
-            early_preparation,
-        );
+        if named.is_named_generic() {
+            return plan_generic_library_new(
+                store,
+                host,
+                globals,
+                options,
+                node,
+                constructor,
+                resolved_symbol,
+                named,
+                early_preparation,
+            );
+        }
+        expression_arguments = Some(expression_argument_plan());
+        if executor.is_some() {
+            return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+        }
+        arguments.clear();
+        executor = None;
+        if new_expression.type_arguments.is_some() {
+            return Err(unsupported(SourceNewUnsupported::TypeArguments(node)));
+        }
+        library = Some(named);
     }
     if has_expression_arguments && !(source_arguments || library.is_some()) {
         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
@@ -7051,10 +7064,16 @@ fn resolve_library_new_candidates(
     {
         return Err(invalid());
     }
-    let current = if library.is_named_generic() {
-        plan_global_generic_constructor_value(store, host, globals, options, plan.resolved_symbol)
-    } else {
-        plan_global_constructor_value(store, host, globals, options, plan.resolved_symbol)
+    let current = match library.kind() {
+        GlobalConstructorValueKind::TypeLiteral => {
+            plan_global_constructor_value(store, host, globals, options, plan.resolved_symbol)
+        }
+        GlobalConstructorValueKind::NamedNongeneric => {
+            plan_global_named_constructor(store, host, globals, options, plan.resolved_symbol)
+        }
+        GlobalConstructorValueKind::NamedGeneric => {
+            plan_global_generic_constructor_value(store, host, globals, options, plan.resolved_symbol)
+        }
     }
     .map_err(|error| {
         trace_constructor_failure(

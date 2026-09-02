@@ -1134,6 +1134,21 @@ struct SourceTypeImportExecution<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceDeferredAnnotatedConstRead {
+    node: NodeRef,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    annotation: NodeRef,
+    callable: NodeRef,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedSourceDeferredAnnotatedConstRead {
+    read: SourceDeferredAnnotatedConstRead,
+    type_: TypeId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PlannedSourceTypeImportReference {
     root: NodeRef,
     node: NodeRef,
@@ -25560,6 +25575,40 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     expression,
                     &name,
                 );
+                let variable_read = match variable_read {
+                    Err(VariablePlanError::Unsupported(
+                        VariableUnsupported::IdentifierNotPrior {
+                            node,
+                            symbol,
+                            declaration,
+                        },
+                    )) if node == expression
+                        && source_deferred_annotated_const_read(
+                            store,
+                            host,
+                            node,
+                            symbol,
+                            declaration,
+                        )
+                        .is_some() =>
+                    {
+                        let mut prior = self.prior_variables.clone();
+                        let mut readable = self.readable_variables.clone();
+                        prior.insert(symbol);
+                        readable.insert(symbol);
+                        plan_identifier_read(
+                            self.arena,
+                            self.bound,
+                            store,
+                            host,
+                            &prior,
+                            &readable,
+                            expression,
+                            &name,
+                        )
+                    }
+                    result => result,
+                };
                 let global_this_type = match (&variable_read, self.global_types) {
                     (
                         Err(VariablePlanError::Unsupported(
@@ -41593,6 +41642,19 @@ fn check_planned_arrow_argument(
             preflight_source_expression_cache(store, this, any)?;
             publish_expression_type(store, this, any)?;
         }
+        let deferred_body_types = source_deferred_const_body_flow_types(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            type_import_execution.annotation_capabilities,
+            expression,
+            outer_capture,
+            current_flow_types,
+        )?;
+        let current_flow_types = deferred_body_types.as_ref().unwrap_or(current_flow_types);
         if let Some(statements) = &arrow.loop_body {
             let mut staged_values = HashMap::new();
             let mut value_order = Vec::new();
@@ -41856,7 +41918,7 @@ fn check_planned_arrow_argument(
         },
         value_exports: &[],
     });
-    let flow_types = check_callable_parameter_initializers_with_capture_context(
+    let mut flow_types = check_callable_parameter_initializers_with_capture_context(
         store,
         host,
         global_types,
@@ -41872,6 +41934,20 @@ fn check_planned_arrow_argument(
         &[],
         arrow_capture,
     )?;
+    if let Some(body_types) = source_deferred_const_body_flow_types(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        type_import_execution.annotation_capabilities,
+        expression,
+        outer_capture,
+        &flow_types,
+    )? {
+        flow_types = body_types;
+    }
     add_arrow_object_parameter_entries(store, host, &arrow.callable, &mut captured_entry_types)?;
     let mut linear_values = HashMap::new();
     let mut linear_value_order = Vec::new();
@@ -61581,6 +61657,391 @@ fn source_capture_identifier_is_assignment_target(
     Err(invalid())
 }
 
+fn source_deferred_annotated_const_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Option<NodeRef> {
+    let bound = host.bound_file(declaration)?;
+    if bound
+        .source_facts()
+        .is_none_or(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
+    {
+        return None;
+    }
+    let owner = store.symbol(symbol)?;
+    if owner.value_declaration() != Some(declaration)
+        || owner.declarations() != Some([declaration].as_slice())
+        || store.get_merged_symbol(bound.symbol(declaration)?) != Some(symbol)
+    {
+        return None;
+    }
+    let record = host.node(declaration)?;
+    let NodeData::VariableDeclaration(variable) = &record.data else {
+        return None;
+    };
+    if record.kind != SyntaxKind::VariableDeclaration
+        || record.flags.0 != 0
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+    {
+        return None;
+    }
+    let reference = |node| NodeRef::new(declaration.arena, declaration.file, node);
+    let annotation = reference(variable.type_?);
+    let initializer = reference(variable.initializer?);
+    if host.node(annotation)?.parent != Some(declaration.node) {
+        return None;
+    }
+    let initializer_record = host.node(initializer)?;
+    if initializer_record.parent != Some(declaration.node)
+        || initializer_record.flags.0 != 0
+        || !matches!(
+            (&initializer_record.data, initializer_record.kind),
+            (NodeData::FunctionExpression(function), SyntaxKind::FunctionExpression)
+                if function.modifiers.is_none() && function.asterisk_token.is_none()
+        ) && !matches!(
+            (&initializer_record.data, initializer_record.kind),
+            (NodeData::ArrowFunction(arrow), SyntaxKind::ArrowFunction)
+                if arrow.modifiers.is_none() && arrow.asterisk_token.is_none()
+        )
+    {
+        return None;
+    }
+    let list = reference(record.parent?);
+    let list_record = host.node(list)?;
+    let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
+        return None;
+    };
+    if list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.flags.0 != NODE_FLAG_CONST
+        || list_data.facts != 0
+        || list_data.declarations.has_trailing_comma
+        || list_data.declarations.range != list_record.range
+        || list_data
+            .declarations
+            .nodes
+            .iter()
+            .filter(|node| **node == declaration.node)
+            .count()
+            != 1
+    {
+        return None;
+    }
+    let statement = reference(list_record.parent?);
+    if !matches!(
+        host.node(statement).map(|record| (&record.data, record.kind)),
+        Some((NodeData::VariableStatement(variable), SyntaxKind::VariableStatement))
+            if variable.declaration_list == list.node
+    ) {
+        return None;
+    }
+    Some(annotation)
+}
+
+// This entry supports a direct source-level function expression. Its body, not
+// its parameter defaults or enclosing initializer, may use the later annotation.
+fn source_deferred_annotated_const_callable(
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    declaration: NodeRef,
+) -> Option<NodeRef> {
+    if node.arena != declaration.arena
+        || node.file != declaration.file
+        || host.node(node)?.range.start >= host.node(declaration)?.range.start
+    {
+        return None;
+    }
+    let bound = host.bound_file(node)?;
+    let scope = bound.block_scope_container(declaration)?;
+    let reference = |node| NodeRef::new(declaration.arena, declaration.file, node);
+    let mut current = node;
+    let mut visited = HashSet::new();
+    while current != scope && visited.insert(current) {
+        let parent = reference(host.node(current)?.parent?);
+        if parent == scope {
+            return None;
+        }
+        let parent_record = host.node(parent)?;
+        match (&parent_record.data, parent_record.kind) {
+            (NodeData::FunctionExpression(function), SyntaxKind::FunctionExpression) => {
+                if function.body != current.node
+                    || function.modifiers.is_some()
+                    || function.asterisk_token.is_some()
+                    || bound.container(current) != Some(parent)
+                    || source_closure_is_immediately_invoked(host, parent)
+                {
+                    return None;
+                }
+                let variable = reference(parent_record.parent?);
+                let variable_record = host.node(variable)?;
+                if !matches!(
+                    (&variable_record.data, variable_record.kind),
+                    (NodeData::VariableDeclaration(variable), SyntaxKind::VariableDeclaration)
+                        if variable.initializer == Some(parent.node)
+                ) {
+                    return None;
+                }
+                let list = reference(variable_record.parent?);
+                let list_record = host.node(list)?;
+                let statement = reference(list_record.parent?);
+                let statement_record = host.node(statement)?;
+                let source = reference(statement_record.parent?);
+                if list_record.kind != SyntaxKind::VariableDeclarationList
+                    || !matches!(
+                        (&statement_record.data, statement_record.kind),
+                        (NodeData::VariableStatement(variable), SyntaxKind::VariableStatement)
+                            if variable.declaration_list == list.node
+                    )
+                    || source != scope
+                    || host.node(source)?.kind != SyntaxKind::SourceFile
+                    || bound.block_scope_container(variable) != Some(source)
+                {
+                    return None;
+                }
+                return Some(parent);
+            }
+            _ if matches!(
+                parent_record.kind,
+                SyntaxKind::ArrowFunction
+                    | SyntaxKind::FunctionDeclaration
+                    | SyntaxKind::MethodDeclaration
+                    | SyntaxKind::Constructor
+                    | SyntaxKind::GetAccessor
+                    | SyntaxKind::SetAccessor
+            ) =>
+            {
+                return None;
+            }
+            _ => current = parent,
+        }
+    }
+    None
+}
+
+fn source_deferred_annotated_const_read(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Option<SourceDeferredAnnotatedConstRead> {
+    if host.node(node)?.kind != SyntaxKind::Identifier {
+        return None;
+    }
+    let annotation = source_deferred_annotated_const_declaration(store, host, symbol, declaration)?;
+    let callable = source_deferred_annotated_const_callable(host, node, declaration)?;
+    Some(SourceDeferredAnnotatedConstRead {
+        node,
+        symbol,
+        declaration,
+        annotation,
+        callable,
+    })
+}
+
+fn source_deferred_const_annotation_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    annotation_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+    annotation: NodeRef,
+) -> Result<TypeId, SourceCheckError> {
+    let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+    let result = (|| -> Result<TypeId, SourceCheckError> {
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            &mut annotation_diagnostics,
+        )?
+        .with_type_reference_alias_targets(
+            annotation_capabilities
+                .get(&annotation)
+                .into_iter()
+                .flatten()
+                .copied(),
+        )?;
+        query.check_type_node_declaration_children(annotation)?;
+        Ok(query.get_type_from_type_node(annotation)?)
+    })();
+    merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+    result
+}
+
+fn prepare_source_deferred_annotated_const_reads(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    annotation_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+    identifier_reads: &[(NodeRef, SemanticSymbolId)],
+) -> Result<Vec<PreparedSourceDeferredAnnotatedConstRead>, SourceCheckError> {
+    let empty = HashSet::new();
+    let mut types = HashMap::new();
+    let mut prepared = Vec::new();
+    for &(node, resolved_symbol) in identifier_reads {
+        let Some((arena, bound)) = host.source(node) else {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbol(resolved_symbol),
+            ));
+        };
+        let Some(NodeData::Identifier(identifier)) = host.node(node).map(|record| &record.data)
+        else {
+            continue;
+        };
+        let Err(VariablePlanError::Unsupported(VariableUnsupported::IdentifierNotPrior {
+            symbol,
+            declaration,
+            ..
+        })) = plan_identifier_read(
+            arena,
+            bound,
+            store,
+            host,
+            &empty,
+            &empty,
+            node,
+            &identifier.text,
+        )
+        else {
+            continue;
+        };
+        let Some(read) =
+            source_deferred_annotated_const_read(store, host, node, symbol, declaration)
+        else {
+            continue;
+        };
+        let visible = HashSet::from([symbol]);
+        let checked = plan_identifier_read(
+            arena,
+            bound,
+            store,
+            host,
+            &visible,
+            &visible,
+            node,
+            &identifier.text,
+        )
+        .map_err(SourcePlanner::variable_plan_error)?;
+        if checked.resolved_symbol != resolved_symbol || checked.value_symbol != symbol {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(symbol),
+            ));
+        }
+        let type_ = if let Some(type_) = types.get(&read.annotation) {
+            *type_
+        } else {
+            let type_ = source_deferred_const_annotation_type(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                annotation_capabilities,
+                read.annotation,
+            )?;
+            types.insert(read.annotation, type_);
+            type_
+        };
+        prepared.push(PreparedSourceDeferredAnnotatedConstRead { read, type_ });
+    }
+    Ok(prepared)
+}
+
+fn source_deferred_const_capture_types(
+    prepared: &[PreparedSourceDeferredAnnotatedConstRead],
+    callable: NodeRef,
+) -> Result<HashMap<SemanticSymbolId, TypeId>, SourceCheckError> {
+    let mut capture_types = HashMap::new();
+    for prepared in prepared
+        .iter()
+        .filter(|entry| entry.read.callable == callable)
+    {
+        if capture_types
+            .insert(prepared.read.symbol, prepared.type_)
+            .is_some_and(|previous| previous != prepared.type_)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(prepared.read.symbol),
+            ));
+        }
+    }
+    Ok(capture_types)
+}
+
+fn source_deferred_const_body_flow_types(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    annotation_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+    callable: NodeRef,
+    capture: Option<SourceArrowCaptureContext<'_>>,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+) -> Result<Option<HashMap<SemanticSymbolId, TypeId>>, SourceCheckError> {
+    let Some(capture) = capture else {
+        return Ok(None);
+    };
+    let Some(NodeData::FunctionExpression(function)) = host.node(callable).map(|node| &node.data)
+    else {
+        return Ok(None);
+    };
+    let body = NodeRef::new(callable.arena, callable.file, function.body);
+    let mut body_types = None;
+    for (&symbol, &type_) in capture.declared_types {
+        if current_flow_types.contains_key(&symbol) {
+            continue;
+        }
+        let Some(declaration) = store
+            .symbol(symbol)
+            .and_then(|owner| owner.value_declaration())
+        else {
+            continue;
+        };
+        let Some(annotation) =
+            source_deferred_annotated_const_declaration(store, host, symbol, declaration)
+        else {
+            continue;
+        };
+        if source_deferred_annotated_const_callable(host, body, declaration) != Some(callable) {
+            continue;
+        }
+        if source_deferred_const_annotation_type(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            annotation_capabilities,
+            annotation,
+        )? != type_
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(symbol),
+            ));
+        }
+        body_types
+            .get_or_insert_with(|| current_flow_types.clone())
+            .insert(symbol, type_);
+    }
+    Ok(body_types)
+}
+
 fn source_closure_is_immediately_invoked(host: &DeclaredTypeHost<'_>, arrow: NodeRef) -> bool {
     let Some((arena, _)) = host.source(arrow) else {
         return false;
@@ -72404,6 +72865,16 @@ pub(super) fn check_source_file(
             .get_type_of_declared_value(*property)?;
         }
     }
+    let prepared_deferred_const_reads = prepare_source_deferred_annotated_const_reads(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        &type_import_capabilities,
+        &identifier_reads,
+    )?;
     let mut deferred = Vec::new();
     // Publication owns every source value, including function-local symbols.
     // Top-level assignment/capture semantics must remain a separate map so a
@@ -73978,7 +74449,9 @@ pub(super) fn check_source_file(
                             &mut call_diagnostics,
                         )
                         .and_then(|mut query| {
-                            query.check_source_interface_call_type_parameter_defaults(call)
+                            query.check_source_interface_call_type_parameter_defaults(
+                                &interface, call,
+                            )
                         });
                         merge_retry_diagnostics(diagnostics, call_diagnostics);
                         result?;
@@ -76320,7 +76793,24 @@ pub(super) fn check_source_file(
             }
             PlannedStatement::Variables(variables) => {
                 for variable in variables {
-                    let capture = match &variable.initializer {
+                    let deferred_capture_types = match &variable.initializer {
+                        PlannedVariableInitializer::Expression(expression) => {
+                            match &expression.unparenthesized().kind {
+                                PlannedExpressionKind::Arrow(arrow)
+                                    if store.source_node_kind(arrow.callable.declaration)
+                                        == Some(SyntaxKind::FunctionExpression) =>
+                                {
+                                    Some(source_deferred_const_capture_types(
+                                        &prepared_deferred_const_reads,
+                                        arrow.callable.declaration,
+                                    )?)
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    let enclosing_capture = match &variable.initializer {
                         PlannedVariableInitializer::Expression(expression)
                             if expression_has_deferred_object_members(expression)
                                 || matches!(&expression.unparenthesized().kind,
@@ -76339,6 +76829,19 @@ pub(super) fn check_source_file(
                         }
                         _ => None,
                     };
+                    // Prepared declarations are consts, not mutable captures.
+                    let deferred_mutable_symbols = HashSet::new();
+                    let capture = deferred_capture_types
+                        .as_ref()
+                        .map(|declared_types| SourceArrowCaptureContext {
+                            declared_types,
+                            mutable_symbols: Some(&deferred_mutable_symbols),
+                            outer: enclosing_capture.as_ref(),
+                            flow: None,
+                            assignments: &[],
+                            value_exports: &[],
+                        })
+                        .or(enclosing_capture);
                     let (declared_type, current_flow_type) = match (
                         &variable.initializer,
                         variable.type_node,
@@ -79829,6 +80332,21 @@ pub(super) fn check_source_file(
         &prepared_imports,
     )
     .map_err(|error| SourcePlanner::import_plan_error(source.node_ref(), &error))?;
+    for prepared in &prepared_deferred_const_reads {
+        if staged_value_types.get(&prepared.read.symbol) != Some(&prepared.type_)
+            || source_deferred_annotated_const_read(
+                store,
+                host,
+                prepared.read.node,
+                prepared.read.symbol,
+                prepared.read.declaration,
+            ) != Some(prepared.read)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(prepared.read.symbol),
+            ));
+        }
+    }
     publish_staged_variable_state(
         store,
         source.node_ref(),
