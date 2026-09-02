@@ -1430,6 +1430,75 @@ pub(super) fn observe_call_failure_detail(stage: &'static str, detail: std::fmt:
     }
 }
 
+fn observe_source_member_cache_failure(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    operation: &'static str,
+    expression: Option<NodeRef>,
+    operands: &[(&'static str, TypeId)],
+    error: &SourceCheckError,
+) {
+    if store.relation_read_observation_is_active() {
+        return;
+    }
+    let SourceCheckError::RelationUnavailable(RelationUnavailable::InvalidStructuredMembers(
+        failed,
+    )) = error
+    else {
+        return;
+    };
+    for (role, type_) in
+        std::iter::once(("failed", *failed)).chain(operands.iter().take(2).copied())
+    {
+        let record = store.type_payload(type_);
+        let target = record.and_then(|record| match record.data() {
+            TypeData::Interface(interface) => interface.reference.object.target,
+            TypeData::TypeReference(reference) => reference.object.target,
+            _ => None,
+        });
+        for (edge, observed) in [
+            ("type", Some(type_)),
+            ("target", target.filter(|target| *target != type_)),
+        ] {
+            let Some(observed) = observed else {
+                continue;
+            };
+            let record = store.type_payload(observed);
+            let owner = record.and_then(TypeRecord::symbol);
+            let symbol = owner.and_then(|owner| store.symbol(owner));
+            let declaration = symbol
+                .and_then(|symbol| symbol.declarations())
+                .and_then(|declarations| declarations.first())
+                .copied();
+            let member_state = record.and_then(|record| match record.data() {
+                TypeData::Interface(interface) => Some((
+                    interface.base_types_resolved,
+                    interface.declared_members_resolved,
+                    record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED),
+                )),
+                _ => None,
+            });
+            observe_call_failure_detail(
+                "source_member_cache_failure",
+                format_args!(
+                    "operation={operation} expression={expression:?} expression_ast={:?} role={role} edge={edge} type={observed:?} kind={:?} owner={owner:?} name={:?} owner_flags={:?} object_flags={:?} member_state={member_state:?} reference_target={target:?} declaration={declaration:?} declaration_ast={:?} value_declaration={:?}",
+                    expression
+                        .and_then(|node| host.node(node))
+                        .map(|node| (node.kind, node.range)),
+                    record.map(|record| record.data().kind()),
+                    symbol.map(|symbol| symbol.name()),
+                    symbol.map(|symbol| symbol.flags().bits()),
+                    record.map(|record| record.object_flags().bits()),
+                    declaration
+                        .and_then(|node| host.node(node))
+                        .map(|node| (node.kind, node.range)),
+                    symbol.and_then(|symbol| symbol.value_declaration()),
+                ),
+            );
+        }
+    }
+}
+
 // This records an error at one propagation boundary, not a final project failure.
 fn observe_import_value_failure(
     stage: &'static str,
@@ -39983,7 +40052,18 @@ fn check_expression_type_with_capture_context(
                 receiver.result,
                 &type_import_execution.property_flow,
             )
-            .map_err(|error| SourcePlanner::property_plan_error(expression.node, error))?
+            .map_err(|error| {
+                let error = SourcePlanner::property_plan_error(expression.node, error);
+                observe_source_member_cache_failure(
+                    store,
+                    host,
+                    "property_flow",
+                    Some(expression.node),
+                    &[("receiver", receiver.result)],
+                    &error,
+                );
+                error
+            })?
             {
                 checked
             } else {
@@ -39997,11 +40077,22 @@ fn check_expression_type_with_capture_context(
                     session,
                     diagnostics,
                 )
-                .map_err(|error| match error {
-                    SourcePropertyQueryError::Property(error) => {
-                        SourcePlanner::property_plan_error(expression.node, error)
-                    }
-                    SourcePropertyQueryError::Source(error) => error,
+                .map_err(|error| {
+                    let error = match error {
+                        SourcePropertyQueryError::Property(error) => {
+                            SourcePlanner::property_plan_error(expression.node, error)
+                        }
+                        SourcePropertyQueryError::Source(error) => error,
+                    };
+                    observe_source_member_cache_failure(
+                        store,
+                        host,
+                        "property",
+                        Some(expression.node),
+                        &[("receiver", receiver.result)],
+                        &error,
+                    );
+                    error
                 })?
             };
             let recovery = checked
@@ -40121,10 +40212,23 @@ fn check_expression_type_with_capture_context(
                         }
                         return Err(SourcePlanner::element_plan_error(element.node, error));
                     }
-                    Err(SourceElementReadError::Element(error)) => {
-                        return Err(SourcePlanner::element_plan_error(element.node, error));
+                    Err(error) => {
+                        let error = match error {
+                            SourceElementReadError::Element(error) => {
+                                SourcePlanner::element_plan_error(element.node, error)
+                            }
+                            SourceElementReadError::Source(error) => error,
+                        };
+                        observe_source_member_cache_failure(
+                            store,
+                            host,
+                            "element",
+                            Some(element.node),
+                            &[("receiver", receiver.result), ("index", index.result)],
+                            &error,
+                        );
+                        return Err(error);
                     }
-                    Err(SourceElementReadError::Source(error)) => return Err(error),
                 }
             };
             if let Some(diagnostic) = checked.diagnostic {
@@ -49746,7 +49850,18 @@ fn source_type_is_assignable_to(
             {
                 return Ok(false);
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                let error = error.into();
+                observe_source_member_cache_failure(
+                    store,
+                    host,
+                    "assignability",
+                    None,
+                    &[("source", source), ("target", target)],
+                    &error,
+                );
+                return Err(error);
+            }
         }
     }
 }
