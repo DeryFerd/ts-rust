@@ -5363,6 +5363,7 @@ pub(super) fn property_instantiation_error(
     type_: TypeId,
     error: &InstantiationError,
 ) -> GenericInterfaceMemberError {
+    eprintln!("copied-call instantiation failure: template={type_:?} error={error:?}");
     match error {
         InstantiationError::DepthLimit { .. }
         | InstantiationError::CountLimit { .. }
@@ -5387,14 +5388,51 @@ fn instantiate_generic_member_type(
             template,
         ));
     }
-    instantiate_generic_member_type_worker(
+    let result = instantiate_generic_member_type_worker(
         store,
         template,
         mapper,
         array_targets,
         session,
         &mut HashSet::new(),
-    )
+    );
+    if let Err(GenericInterfaceMemberError::UnsupportedPropertyType(rejected)) = &result {
+        let describe = |type_| {
+            let record = store.type_payload(type_);
+            let state = record.map(|record| (record.data().kind(), record.flags(), record.alias()));
+            let formal = record.and_then(|record| match record.data() {
+                TypeData::TypeParameter(parameter) => Some((
+                    parameter.target,
+                    parameter.mapper,
+                    parameter.constraint,
+                    parameter.resolved_default_type,
+                )),
+                _ => None,
+            });
+            let declaration = record
+                .and_then(|record| record.symbol())
+                .and_then(|owner| store.symbol(owner))
+                .and_then(|owner| owner.declarations())
+                .and_then(|declarations| declarations.first())
+                .copied();
+            (type_, state, formal, declaration)
+        };
+        eprintln!(
+            "copied-call mapped type failure: template={template:?} mapper={mapper:?} rejected={:?}",
+            describe(*rejected),
+        );
+        if let Some(TypeData::Union(union)) = store.type_payload(*rejected).map(|record| record.data())
+        {
+            for (index, &member) in union.union.types.iter().take(2).enumerate() {
+                eprintln!(
+                    "copied-call rejected union member: count={} index={index} member={:?}",
+                    union.union.types.len(),
+                    describe(member),
+                );
+            }
+        }
+    }
+    result
 }
 
 fn instantiate_generic_member_type_worker(
