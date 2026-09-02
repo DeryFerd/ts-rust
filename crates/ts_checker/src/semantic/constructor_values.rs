@@ -21,7 +21,8 @@ use super::{
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
     declared::preflight_class_or_interface_reference,
     declared_values::{
-        plan_global_named_constructor_value, plan_global_type_literal_value, publish_declared_value,
+        plan_declared_value, plan_global_named_constructor_value, plan_global_type_literal_value,
+        publish_declared_value,
     },
     instantiate::InstantiationSession,
     object_members::{
@@ -145,9 +146,10 @@ pub(super) enum GlobalConstructorValueKind {
     TypeLiteral,
     NamedNongeneric,
     NamedGeneric,
+    SourceNamedGeneric,
 }
 
-/// A current global binding and its actual annotation owner.
+/// A current declared binding and its actual annotation owner.
 /// This request proof does not publish a value or replace a source declaration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct GlobalConstructorValuePlan {
@@ -167,7 +169,11 @@ impl GlobalConstructorValuePlan {
     }
 
     pub(super) const fn is_named_generic(&self) -> bool {
-        matches!(self.kind, GlobalConstructorValueKind::NamedGeneric)
+        matches!(
+            self.kind,
+            GlobalConstructorValueKind::NamedGeneric
+                | GlobalConstructorValueKind::SourceNamedGeneric
+        )
     }
 
     pub(super) const fn value_symbol(&self) -> SemanticSymbolId {
@@ -293,7 +299,14 @@ pub(super) fn plan_global_named_constructor(
     options: CanonicalCheckerOptions,
     value_symbol: SemanticSymbolId,
 ) -> Result<Option<GlobalConstructorValuePlan>, DeclaredConstructorValueError> {
-    plan_global_named_constructor_worker(store, host, globals, options, value_symbol, false)
+    plan_named_constructor_worker(
+        store,
+        host,
+        globals,
+        options,
+        value_symbol,
+        GlobalConstructorValueKind::NamedNongeneric,
+    )
 }
 
 pub(super) fn plan_global_generic_constructor_value(
@@ -303,29 +316,92 @@ pub(super) fn plan_global_generic_constructor_value(
     options: CanonicalCheckerOptions,
     value_symbol: SemanticSymbolId,
 ) -> Result<Option<GlobalConstructorValuePlan>, DeclaredConstructorValueError> {
-    plan_global_named_constructor_worker(store, host, globals, options, value_symbol, true)
+    plan_named_constructor_worker(
+        store,
+        host,
+        globals,
+        options,
+        value_symbol,
+        GlobalConstructorValueKind::NamedGeneric,
+    )
 }
 
-fn plan_global_named_constructor_worker(
+pub(super) fn plan_source_generic_constructor_value(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     globals: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
     value_symbol: SemanticSymbolId,
-    require_generic: bool,
 ) -> Result<Option<GlobalConstructorValuePlan>, DeclaredConstructorValueError> {
-    let Some(value) = plan_global_named_constructor_value(store, host, value_symbol)? else {
+    let Some(declaration) = store
+        .symbol(value_symbol)
+        .and_then(ts_binder::semantic::Symbol::value_declaration)
+    else {
         return Ok(None);
     };
-    let declared = plan_declared_constructor_value_worker(store, host, value_symbol, true)?;
+    let Some(NodeData::VariableDeclaration(variable)) =
+        host.node(declaration).map(|node| &node.data)
+    else {
+        return Ok(None);
+    };
+    if store.source_is_default_library_declaration(declaration)
+        || variable.initializer.is_some()
+        || variable.type_.is_none_or(|node| {
+            store.source_node_kind(NodeRef::new(declaration.arena, declaration.file, node))
+                != Some(SyntaxKind::TypeReference)
+        })
+    {
+        return Ok(None);
+    }
+    plan_named_constructor_worker(
+        store,
+        host,
+        globals,
+        options,
+        value_symbol,
+        GlobalConstructorValueKind::SourceNamedGeneric,
+    )
+}
+
+fn plan_named_constructor_worker(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    value_symbol: SemanticSymbolId,
+    requested_kind: GlobalConstructorValueKind,
+) -> Result<Option<GlobalConstructorValuePlan>, DeclaredConstructorValueError> {
+    let value = if requested_kind == GlobalConstructorValueKind::SourceNamedGeneric {
+        None
+    } else {
+        let Some(value) = plan_global_named_constructor_value(store, host, value_symbol)? else {
+            return Ok(None);
+        };
+        Some(value)
+    };
+    let declared = match plan_declared_constructor_value_worker(store, host, value_symbol, true) {
+        Ok(declared) => declared,
+        Err(DeclaredConstructorValueError::Unsupported { .. })
+            if requested_kind == GlobalConstructorValueKind::SourceNamedGeneric =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     let generic = declared
         .owner
         .call_signatures
         .iter()
         .any(|signature| signature.is_construct() && !signature.type_parameters.is_empty());
-    if declared.construct_indexes.is_empty() || require_generic && !generic {
+    if declared.construct_indexes.is_empty()
+        || requested_kind != GlobalConstructorValueKind::NamedNongeneric && !generic
+    {
         return Ok(None);
     }
+    let value = match value {
+        Some(value) => value,
+        None => plan_declared_value(store, host, value_symbol)?,
+    };
     let invalid = || DeclaredConstructorValueError::InvalidValue(value_symbol);
     let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
     if value.annotation != declared.value_annotation
@@ -350,7 +426,9 @@ fn plan_global_named_constructor_worker(
         construct_indexes: declared.construct_indexes,
         options,
         array_targets: CanonicalArrayTargets::from_global_types(globals),
-        kind: if generic {
+        kind: if requested_kind == GlobalConstructorValueKind::SourceNamedGeneric {
+            GlobalConstructorValueKind::SourceNamedGeneric
+        } else if generic {
             GlobalConstructorValueKind::NamedGeneric
         } else {
             GlobalConstructorValueKind::NamedNongeneric
@@ -385,6 +463,13 @@ fn validate_global_plan(
         GlobalConstructorValueKind::NamedGeneric => {
             plan_global_generic_constructor_value(store, host, globals, options, plan.value_symbol())?
         }
+        GlobalConstructorValueKind::SourceNamedGeneric => plan_source_generic_constructor_value(
+            store,
+            host,
+            globals,
+            options,
+            plan.value_symbol(),
+        )?,
     };
     if current.as_ref() != Some(plan) {
         return Err(DeclaredConstructorValueError::InvalidValue(
@@ -733,7 +818,11 @@ pub(super) fn prepare_global_constructor_candidates(
         let ready = read_global_constructor_literal(store, plan)?.ok_or_else(invalid)?;
         let value = if plan.kind != GlobalConstructorValueKind::TypeLiteral {
             observation = ("value_plan_named", "value_annotation", annotation);
-            plan_global_named_constructor_value(store, host, plan.value_symbol)?
+            if plan.kind == GlobalConstructorValueKind::SourceNamedGeneric {
+                Some(plan_declared_value(store, host, plan.value_symbol)?)
+            } else {
+                plan_global_named_constructor_value(store, host, plan.value_symbol)?
+            }
         } else {
             observation = ("value_plan_literal", "value_annotation", annotation);
             plan_global_type_literal_value(store, host, plan.value_symbol)?

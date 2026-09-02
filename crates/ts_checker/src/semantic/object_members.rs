@@ -23935,17 +23935,20 @@ fn resolved_declared_parameter_types_match(
 }
 
 pub(super) fn optional_interface_call_union_operations(plan: &PropertyObjectPlan) -> Option<usize> {
-    if plan.kind != PropertyObjectKind::Interface
-        || plan
-            .call_signatures
-            .iter()
-            .any(PlannedCallSignature::is_construct)
-    {
+    if plan.kind != PropertyObjectKind::Interface {
         return Some(0);
     }
+    let has_constructs = plan
+        .call_signatures
+        .iter()
+        .any(PlannedCallSignature::is_construct);
     plan.call_signatures
         .iter()
-        .filter(|call| call.type_parameters.is_empty() || call.type_predicate.is_none())
+        .filter(|call| {
+            call.is_construct()
+                || !has_constructs
+                    && (call.type_parameters.is_empty() || call.type_predicate.is_none())
+        })
         .try_fold(0usize, |count, call| {
             count.checked_add(
                 call.parameters
@@ -23973,12 +23976,27 @@ pub(super) fn prepare_interface_call_optional_parameters(
     let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
     let strict = bootstrap.options.strict_null_checks;
     let undefined = bootstrap.undefined_type;
+    let has_constructs = plan
+        .call_signatures
+        .iter()
+        .any(PlannedCallSignature::is_construct);
     let mut missing = Vec::new();
     for call in &plan.call_signatures {
-        if !call.type_parameters.is_empty() && call.type_predicate.is_some() {
+        if !call.is_construct()
+            && (has_constructs
+                || !call.type_parameters.is_empty() && call.type_predicate.is_some())
+        {
             continue;
         }
-        if !signature_uses_interface_call_optional_types(store, call.declaration) {
+        if !signature_uses_interface_call_optional_types(store, call.declaration)
+            && !signature_uses_constructor_interface_optional_types(store, call.declaration)
+            || resolved_declared_signature_type_parameters(
+                store,
+                call.declaration,
+                &call.type_parameters,
+            )
+            .is_none()
+        {
             return Err(invalid());
         }
         if store

@@ -49,7 +49,8 @@ use super::{
     constructor_values::{
         GlobalConstructorValueKind, GlobalConstructorValuePlan, plan_global_constructor_value,
         plan_global_generic_constructor_value, plan_global_named_constructor,
-        prepare_global_constructor_candidates, resolve_global_constructor_candidates,
+        plan_source_generic_constructor_value, prepare_global_constructor_candidates,
+        resolve_global_constructor_candidates,
     },
     declared::{execute_type_parameter, preflight_class_or_interface_reference},
     functions::plan_function_type,
@@ -1217,17 +1218,22 @@ fn plan_direct_default_new_with_context(
         || global_date
         || global_promise)
         && let Some((globals, options)) = source_context
-        && let Some(named) =
-            plan_global_named_constructor(store, host, globals, options, symbol)
-                .map_err(|error| {
-                    trace_constructor_failure(
-                        "provider_plan_named",
-                        node,
-                        constructor,
-                        format_args!("provider={symbol:?} raw_error={error:?}"),
-                    );
-                    global_error::provider_error(constructor, symbol, error)
-                })?
+        && let Some(named) = plan_global_named_constructor(store, host, globals, options, symbol)
+            .and_then(|named| match named {
+                Some(named) => Ok(Some(named)),
+                None => {
+                    plan_source_generic_constructor_value(store, host, globals, options, symbol)
+                }
+            })
+            .map_err(|error| {
+                trace_constructor_failure(
+                    "provider_plan_named",
+                    node,
+                    constructor,
+                    format_args!("provider={symbol:?} raw_error={error:?}"),
+                );
+                global_error::provider_error(constructor, symbol, error)
+            })?
     {
         if named.is_named_generic() {
             return plan_generic_library_new(
@@ -7154,6 +7160,13 @@ fn resolve_library_new_candidates(
         GlobalConstructorValueKind::NamedGeneric => {
             plan_global_generic_constructor_value(store, host, globals, options, plan.resolved_symbol)
         }
+        GlobalConstructorValueKind::SourceNamedGeneric => plan_source_generic_constructor_value(
+            store,
+            host,
+            globals,
+            options,
+            plan.resolved_symbol,
+        ),
     }
     .map_err(|error| {
         trace_constructor_failure(
