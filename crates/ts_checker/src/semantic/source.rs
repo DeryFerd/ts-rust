@@ -118,7 +118,7 @@ use ts_jsnum::{Number, PseudoBigInt};
 use ts_scanner::Scanner;
 
 use super::{
-    ArrayTypeError, AssertionLinks, AssignmentInvariant, AssignmentUnsupported,
+    ArrayTypeError, AssertionLinks, AssignmentInvariant, AssignmentUnsupported, AwaitedTypeError,
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
     CanonicalCheckerOptions, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DerivedTypeError,
@@ -38501,7 +38501,37 @@ fn check_expression_type_with_capture_context(
             arrow_capture,
         )?;
         let awaited = if class_flow.as_ref().is_some_and(|context| context.is_async) {
-            source_class_awaited_expression_type(store, expression.node, checked.result)?
+            let awaited = source_class_awaited_expression_type(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                expression.node,
+                checked.result,
+            )?;
+            // A generic await expression may need an Awaited<T> alias wrapper.
+            let mut pending = vec![awaited];
+            let mut seen = HashSet::new();
+            while let Some(type_) = pending.pop() {
+                if !seen.insert(type_) {
+                    continue;
+                }
+                let record = store
+                    .type_payload(type_)
+                    .ok_or(SourceCheckError::Class(expression.node))?;
+                match record.data() {
+                    TypeData::TypeParameter(_) => {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Class(expression.node),
+                        ));
+                    }
+                    TypeData::Union(union) => pending.extend_from_slice(&union.union.types),
+                    _ => {}
+                }
+            }
+            awaited
         } else {
             source_awaited_expression_type(store, expression.node, checked.result)?
         };
@@ -42251,7 +42281,18 @@ fn check_planned_class_body(
             .transpose()?;
         let return_type = if is_async {
             return_type
-                .map(|declared| source_async_class_return_type(store, body, declared))
+                .map(|declared| {
+                    source_async_class_return_type(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        body,
+                        declared,
+                    )
+                })
                 .transpose()?
         } else {
             return_type
@@ -42420,7 +42461,7 @@ fn check_planned_class_body(
                 )?
             };
             Some(if is_async {
-                source_async_inferred_return_type(
+                let inferred = source_class_awaited_expression_type(
                     store,
                     host,
                     global_types,
@@ -42429,7 +42470,19 @@ fn check_planned_class_body(
                     diagnostics,
                     body.declaration,
                     inferred,
+                )?;
+                let mut promise_diagnostics = CanonicalCheckerDiagnostics::default();
+                let promise = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut promise_diagnostics,
                 )?
+                .get_global_promise_type(inferred);
+                merge_retry_diagnostics(diagnostics, promise_diagnostics);
+                promise?
             } else {
                 inferred
             })
@@ -43017,7 +43070,12 @@ fn check_class_statements(
                         )?;
                         let actual = source_class_awaited_expression_type(
                             store,
-                            expression.node,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            diagnostics,
+                            *statement,
                             checked.result,
                         )?;
                         if let Some(expected) = return_type {
@@ -63965,8 +64023,14 @@ fn source_callable_inferred_return_type(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn source_async_class_return_type(
-    store: &CanonicalTypeMapperStore,
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     body: &ClassBodyPlan,
     declared: TypeId,
 ) -> Result<TypeId, SourceCheckError> {
@@ -63992,36 +64056,56 @@ fn source_async_class_return_type(
     {
         return Err(invalid());
     }
-    source_class_awaited_expression_type(store, body.declaration, declared)
+    source_class_awaited_expression_type(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        body.declaration,
+        declared,
+    )
 }
 
-/// Keep class async checking within the existing Promise resolver's proven
-/// cases. Objects, type parameters and Promise unions need general Awaited support.
+/// Class awaits and returns share the caller's canonical query state.
+#[allow(clippy::too_many_arguments)]
 fn source_class_awaited_expression_type(
-    store: &CanonicalTypeMapperStore,
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     expression: NodeRef,
     type_: TypeId,
 ) -> Result<TypeId, SourceCheckError> {
-    let awaited = source_awaited_expression_type(store, expression, type_)?;
-    let scalar = |type_| {
-        store.type_payload(type_).is_some_and(|record| {
-            record.flags().intersects(
-                TypeFlags::PRIMITIVE | TypeFlags::ANY | TypeFlags::UNKNOWN | TypeFlags::NEVER,
-            )
-        })
-    };
-    if scalar(awaited)
-        || store.type_payload(awaited).is_some_and(|record| {
-            matches!(record.data(), TypeData::Union(union)
-                if union.union.types.iter().copied().all(scalar))
-        })
-    {
-        Ok(awaited)
-    } else {
-        Err(SourceCheckError::Unsupported(
+    CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+    )?
+    .get_awaited_type_no_alias(type_, options)
+    .map_err(|error| match error {
+        AwaitedTypeError::Query(error) => SourceCheckError::DeclaredType(error),
+        AwaitedTypeError::Relation(error) => SourceCheckError::RelationUnavailable(error),
+        AwaitedTypeError::Source(error) => error,
+        AwaitedTypeError::InvalidType(_) | AwaitedTypeError::InvalidSignature(_) => {
+            SourceCheckError::Class(expression)
+        }
+        AwaitedTypeError::InvalidThenable { .. } | AwaitedTypeError::CircularThenable(_) => {
+            // Native thenable diagnostics need a source recovery type before publication.
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(expression))
+        }
+        AwaitedTypeError::UnsupportedGeneric(_)
+        | AwaitedTypeError::UnsupportedSignatureUnion(_)
+        | AwaitedTypeError::UnsupportedSignature(_) => SourceCheckError::Unsupported(
             UnsupportedSourceSyntax::Class(expression),
-        ))
-    }
+        ),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

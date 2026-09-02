@@ -5,8 +5,8 @@ use super::{
     ClassHeritageMembersValidation, ClassInvariant, ClassPropertySide, ClassTypeQueryContext,
     DeclaredTypeHost, NodeData, NodeRef, ObjectFlags, SemanticSymbolId, SourceClassPlan,
     StructuredTypeData, SymbolFlags, SyntaxKind, TypeData, TypeId, TypeRecord, ValueSymbolLinks,
-    bound_symbol, class_property_modifiers, exact_class_instance_identity, invariant,
-    preflight_class_or_interface_reference, preflight_source_class_annotation,
+    bound_symbol, class_member_modifiers, class_property_modifiers, exact_class_instance_identity,
+    invariant, preflight_class_or_interface_reference, preflight_source_class_annotation,
     source_class_binding, source_class_plan_is_current, source_class_type_owner_declaration,
     source_class_type_parameter_plans, validate_class_heritage_members,
     validate_direct_generic_reference, validate_source_class_header,
@@ -106,13 +106,14 @@ fn source_annotation_instance_member(
         }
         _ => return Ok(false),
     };
-    let (side, _) = class_property_modifiers(
+    let (side, _) = class_member_modifiers(
         store,
         host,
         member,
         NodeRef::new(member.arena, member.file, name),
         modifiers,
         None,
+        flags == SymbolFlags::METHOD,
     )?;
     if side != ClassPropertySide::Instance {
         return Ok(false);
@@ -476,13 +477,14 @@ pub(in crate::semantic) fn source_class_method_return_annotation_is_owned(
         }
         let symbol = bound_symbol(store, host, method)?;
         let method_owner = store.symbol(symbol)?;
-        let (side, readonly) = class_property_modifiers(
+        let (side, readonly) = class_member_modifiers(
             store,
             host,
             method,
             NodeRef::new(method.arena, method.file, data.name),
             data.modifiers.as_ref(),
             None,
+            true,
         )
         .ok()?;
         let class_owner = store.symbol(owner)?;

@@ -14020,9 +14020,8 @@ fn plan_class_method_parameter_with_body_mode(
                     source_class_method_type_parameter_plan(store, host, owner, type_node)
                         .is_ok_and(|formals| formals.is_some())
                 }));
-        let optional_named_annotation = source_body
+        let named_annotation = source_body
             && type_context.is_some()
-            && data.question_token.is_some()
             && type_record.kind == SyntaxKind::TypeReference
             && matches!(type_record.data, NodeData::TypeReferenceNode(_))
             && source_owner.is_some_and(|owner| {
@@ -14030,7 +14029,7 @@ fn plan_class_method_parameter_with_body_mode(
                     Ok(Some(SourceClassAnnotationRole::MethodParameter { method: actual, parameter: actual_parameter }))
                         if actual == method && actual_parameter == parameter)
             });
-        if generic_annotation || optional_named_annotation {
+        if generic_annotation || named_annotation {
             (
                 Some(type_node),
                 ClassBodyParameterType::Annotation(type_node),
