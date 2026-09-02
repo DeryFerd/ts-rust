@@ -5,7 +5,7 @@ Updated 2026-09-02. No complete real-world project has passed in Rust yet.
 ## Latest Query and Hono checkpoint
 
 Both projects still fail a full type check. The latest complete runs use
-`513293ad6`. Hono gained two completed isolated roots. Query gained none.
+`6ea8d71a6`. Neither project gained a completed root in this batch.
 
 | Project | Completed isolated roots | Unsupported | Internal errors | Original policy skip |
 | --- | ---: | ---: | ---: | ---: |
@@ -16,57 +16,56 @@ An isolated root is one original project entry file checked on its own. It is
 not a full project pass or proof of diagnostic parity. Both runs retained all
 original roots, loaded files, options and load diagnostics.
 
-Query's ordinary check now gets past the merged global callable. It stops at
-a parameter in the original DOM library. The isolated `timeoutManager.ts`
-check has the same new stop. All other root outcomes are unchanged.
+Query's ordinary check now gets past the DOM rest parameter. It stops at a
+generic overload in the original Node `timers.d.ts`. The isolated timeout
+manager check has the same stop. Three class-related roots now reach a private
+field in `removable.ts`. These are later failures, not completed checks.
 
-Hono now completes `src/router.ts` and `src/adapter/aws-lambda/types.ts`.
-No completed root was lost. Its ordinary check still stops in
-`http-exception.ts` with `GenericReferenceUnsupported`.
+All 188 Hono outcomes match the previous run. Its ordinary check still stops
+in `http-exception.ts`. The rejected library type is now identified:
+`ArrayBufferView<ArrayBuffer>`. Its constraint is the `ArrayBufferLike` type
+alias, which the current constraint planner rejects.
 
-Complete evidence: [Query census 6](../target/wave202-query-combined-census-6-result.md)
-and [Hono census 5](../target/wave202-hono-combined-census-5-result.md).
+Complete evidence: [Query census 7](../target/wave202-query-combined-census-7-result.md)
+and [Hono census 6](../target/wave202-hono-combined-census-6-result.md).
 Both processes and their services are closed.
 
 ### Verified test progress
 
-[Combined tests 13](../target/wave202-query-hono-combined-tests-13-result.md)
-compiled all 35 targets and ran all 105 tests. It passed 75 and failed 30.
+[Combined tests 14](../target/wave202-query-hono-combined-tests-14-result.md)
+compiled all 37 targets and ran all 110 tests. It passed 85 and failed 25.
 No test was ignored or filtered out.
 
-On the same 91 tests as tests 10, passes increased from 57 to 65. Eight
-earlier failures now pass. No earlier passing test regressed. The 14 new
-tests contribute 10 passes and four failures.
+On the same 105 tests as tests 13, passes increased from 75 to 83. Eight
+earlier failures now pass. No earlier passing test regressed. The five new
+tests contribute two passes and three failures.
 
-The eight fixed tests cover callback parameter types, imported arrow return
-queries, boolean diagnostics, a router tuple-union assignment, and two
-`instanceof` cases. The new tests cover augmented global callables, Hono
-handler call signatures, generic callable aliases, ambient namespace values,
-and async class methods. Some passes confirm that unsupported cases retain
-their expected error.
+The eight fixed tests cover callback ownership, imported class heritage,
+returned arrows, and object-rest diagnostic display. The new tests cover
+shared awaited types and DOM callable parameters. Some passing tests confirm
+expected errors. The pass count is not a count of supported language features.
 
-A new lambda test needed a Rust name-accessor correction before compilation.
+A new DOM test needed a Rust name-accessor correction before compilation.
 Its TypeScript and expected name stayed fixed. That correction is not a
 checker gain.
 
 | Remaining failure | Failed tests |
 | --- | ---: |
 | Abstract class checks | 3 |
-| Nested callback publication | 3 |
 | Imported generic object parameters | 3 |
-| Returned arrow types and repeat queries | 3 |
 | Ambient namespace values | 2 |
-| Imported class heritage queries | 2 |
 | Async class methods | 2 |
 | Numeric default parameters | 2 |
 | Native `Set` cache checks | 2 |
 | Generic constructor expression cache | 2 |
+| Shared awaited-type inputs | 2 |
+| Returned generic block arrow | 1 |
 | Contextual object type query | 1 |
 | Class `instanceof` narrowing | 1 |
 | Router alias default cache | 1 |
 | Copied generic call relation | 1 |
 | Imported class alias instantiation | 1 |
-| Object-rest diagnostic type display | 1 |
+| DOM overload argument diagnostic | 1 |
 
 ### Why project progress is slow
 
@@ -75,25 +74,26 @@ operation often exposes another one in the same file. Query's retry code
 has moved through constructor checks, `instanceof`, and now a new expression
 without completing the file.
 
-Build failures also delayed feedback. Tests 11 and 12 ran no tests because
-of Rust compilation errors. Both errors were corrected before tests 13.
-The separate bind check still passes only one of four tests. Its latest
-run gets past the library rest-parameter stops, then hits an internal
-function-edge assertion. Moving the first failure is not a passing test.
+Build failures delayed earlier feedback. Tests 13 and 14 both compiled and
+ran their full selected sets. The separate bind check still passes only one
+of four tests. Bind 15 gets past the earlier rest-parameter and function-edge
+stops, then fails while instantiating `OmitThisParameter`. Moving the first
+failure is not a passing test.
 
-The next priorities are Query's shared `Subscribable` bind call, which blocks
-eight roots, and its DOM library parameter. Hono needs imported class queries,
-returned generic functions, async class methods, and shared awaited types.
+The direct project priorities are Query's shared `Subscribable` bind call,
+its Node timer overloads, and Hono's DOM buffer constraint. The Hono repair
+also needs indexed access on a merged named interface. It must preserve both
+`ArrayBuffer` and `SharedArrayBuffer`, not replace the constraint with `any`.
 
 ### Next measured batch
 
-The next integration tree, `query-hono-core-followups`, already has reviewed
-abstract-class and returned-function fixes. Reviewed follow-ups are also
-ready for imported object parameters, imported heritage queries, nested
-callback publication, router default caching, object-rest display, and the
-shared awaited-type query. These changes are not yet measured together.
+The next integration tree, `query-hono-core-followups-2`, has reviewed fixes
+for generic constructors, computed properties, class unions, async class
+methods, numeric defaults, namespace values, imported interface defaults,
+copied call formals, and abstract classes with optional private fields.
+These changes are not yet measured together.
 
-The next test run must retain the same 105 tests and report changed results
+The next test run must retain the same 110 tests and report changed results
 separately from new tests. Both original project checks must run on that same
 source version after it compiles. Temporary traces help locate remaining
 erased errors. They are not checker fixes.
