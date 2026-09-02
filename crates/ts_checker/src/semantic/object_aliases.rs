@@ -1734,7 +1734,10 @@ fn inline_source_syntax<M>(
                 }
                 root = parent;
             }
-            SyntaxKind::IntersectionType if children.len() >= 2 => {
+            kind @ (SyntaxKind::IntersectionType | SyntaxKind::UnionType)
+                if children.len() >= 2
+                    && (intersection || kind == SyntaxKind::IntersectionType) =>
+            {
                 let mut previous = None;
                 for child in children {
                     let start = store.source_node_start(child)?;

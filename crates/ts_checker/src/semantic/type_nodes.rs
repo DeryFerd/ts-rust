@@ -15658,7 +15658,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             {
                 return Err(invalid());
             }
-            match &parent_record.data {
+            let constituents = match &parent_record.data {
                 NodeData::TypeAliasDeclaration(alias)
                     if parent == header.alias_declaration
                         && parent_record.kind == SyntaxKind::TypeAliasDeclaration
@@ -15668,32 +15668,43 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
                 NodeData::ParenthesizedTypeNode(parenthesized)
                     if parent_record.kind == SyntaxKind::ParenthesizedType
-                        && parenthesized.type_ == child.node => {}
+                        && parenthesized.type_ == child.node => None,
                 NodeData::IntersectionTypeNode(intersection)
-                    if parent_record.kind == SyntaxKind::IntersectionType
-                        && intersection.types.range == parent_record.range
-                        && !intersection.types.has_trailing_comma
-                        && intersection.types.nodes.len() >= 2 =>
+                    if parent_record.kind == SyntaxKind::IntersectionType =>
                 {
-                    let mut previous_end = parent_record.range.start;
-                    let mut siblings = HashSet::new();
-                    for sibling in &intersection.types.nodes {
-                        let sibling = NodeRef::new(parent.arena, parent.file, *sibling);
-                        let record = preflight_node(self.store, self.host, sibling)?;
-                        if record.parent != Some(parent.node)
-                            || record.range.start < previous_end
-                            || record.range.end > parent_record.range.end
-                            || !siblings.insert(sibling)
-                        {
-                            return Err(invalid());
-                        }
-                        previous_end = record.range.end;
-                    }
-                    if !siblings.contains(&child) {
-                        return Err(invalid());
-                    }
+                    Some(&intersection.types)
+                }
+                NodeData::UnionTypeNode(union)
+                    if parent_record.kind == SyntaxKind::UnionType =>
+                {
+                    Some(&union.types)
                 }
                 _ => return Err(invalid()),
+            };
+            if let Some(constituents) = constituents {
+                if constituents.range != parent_record.range
+                    || constituents.has_trailing_comma
+                    || constituents.nodes.len() < 2
+                {
+                    return Err(invalid());
+                }
+                let mut previous_end = parent_record.range.start;
+                let mut siblings = HashSet::new();
+                for sibling in &constituents.nodes {
+                    let sibling = NodeRef::new(parent.arena, parent.file, *sibling);
+                    let record = preflight_node(self.store, self.host, sibling)?;
+                    if record.parent != Some(parent.node)
+                        || record.range.start < previous_end
+                        || record.range.end > parent_record.range.end
+                        || !siblings.insert(sibling)
+                    {
+                        return Err(invalid());
+                    }
+                    previous_end = record.range.end;
+                }
+                if !siblings.contains(&child) {
+                    return Err(invalid());
+                }
             }
             child = parent;
         }
