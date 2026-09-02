@@ -3455,6 +3455,9 @@ fn plan_source_callable_with_owner_shape(
             if global_namespace_functions.as_deref() == Some(declarations)
                 && declarations.contains(&declaration)
     );
+    let global_augmentation_local = global_namespace_overload
+        .then(|| store.source_global_callable_augmentation_local(owner_symbol, declaration))
+        .flatten();
     if (bound.symbol(declaration) != Some(owner_symbol)
         && !(global_namespace_overload
             && bound
@@ -3493,7 +3496,7 @@ fn plan_source_callable_with_owner_shape(
                 && (owner.declarations() == Some(declarations) || global_namespace_overload)
                 && owner.value_declaration() == declarations.first().copied()
                 && owner.parent().is_none()
-                && export_local.is_none()
+                && export_local == global_augmentation_local
         }
         SourceCallableOwnerShape::ExportedImplementationOverload(declarations) => {
             declarations.contains(&declaration)
@@ -3526,6 +3529,7 @@ fn plan_source_callable_with_owner_shape(
         declaration,
         owner,
         export_local,
+        global_augmentation_local,
         body_mode,
         &view,
     )?;
@@ -4600,7 +4604,7 @@ fn plan_source_callable_with_owner_shape(
                 || plan.body_mode != SourceCallableBodyMode::AmbientDeclaration
                 || !plan.type_parameters.is_empty()
                 || plan.return_type.is_inferred()
-                || plan.export_local.is_some()
+                || plan.export_local != global_augmentation_local
                 || plan.owner_parent.is_some()
                 || plan
                     .parameters
@@ -11483,12 +11487,14 @@ fn valid_async_jsx_source_function(
         ))
 }
 
+#[allow(clippy::too_many_arguments)] // Retain the canonical owner and its verified augmentation local.
 fn validate_owner_name_and_export_route(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
     owner: &ts_binder::semantic::Symbol,
     local_symbol: Option<SemanticSymbolId>,
+    global_augmentation_local: Option<SemanticSymbolId>,
     body_mode: SourceCallableBodyMode,
     view: &SourceSyntaxView<'_>,
 ) -> Result<(), SourceCallableError> {
@@ -11564,6 +11570,8 @@ fn validate_owner_name_and_export_route(
                 )));
             }
             match local_symbol {
+                Some(local)
+                    if body_mode.is_ambient() && Some(local) == global_augmentation_local => {}
                 None if owner.parent().is_none()
                     && (view.modifiers.is_none()
                         || body_mode.is_ambient()

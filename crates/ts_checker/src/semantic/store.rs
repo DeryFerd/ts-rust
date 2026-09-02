@@ -2746,6 +2746,141 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .all(|declaration| self.source_declaration_belongs_to_symbol(*declaration, symbol))
     }
 
+    /// Proves a callable contribution's global block, raw export and local placeholder.
+    #[allow(clippy::too_many_lines)] // Keep the complete raw and local declaration group in one proof.
+    pub(super) fn source_global_callable_augmentation_local(
+        &self,
+        owner: SemanticSymbolId,
+        declaration: NodeRef,
+    ) -> Option<SemanticSymbolId> {
+        let owner_record = self.symbol(owner)?;
+        let declarations = owner_record.declarations()?;
+        let source = self.source_files.get(&declaration.file)?.node_ref();
+        let facts = self.source_file_facts.get(&declaration.file)?;
+        let SourceNodeParent::Parent(block) = self.source_node_parent(declaration)? else {
+            return None;
+        };
+        let SourceNodeParent::Parent(module) = self.source_node_parent(block)? else {
+            return None;
+        };
+        let name = self.source_child_with_kind(module, SyntaxKind::Identifier)?;
+        if !facts.is_declaration_file()
+            || facts.is_default_library()
+            || facts.is_javascript_file()
+            || facts.is_common_js_module()
+            || self.source_node_kind(block) != Some(SyntaxKind::ModuleBlock)
+            || self.source_node_kind(module) != Some(SyntaxKind::ModuleDeclaration)
+            || !self.source_global_augmentation_parent_is_exact(module, source)
+            || self.source_child_with_kind(module, SyntaxKind::ModuleBlock) != Some(block)
+            || self.source_identifier_text(name) != Some("global")
+            || self.source_node_parent(name) != Some(SourceNodeParent::Parent(module))
+            || self.source_file_rank(declaration.file).is_none()
+        {
+            return None;
+        }
+        let owners = self.source_declaration_owners.get(&declaration)?;
+        let mut raw_owners = owners.iter().copied().filter(|symbol| {
+            self.get_merged_symbol(*symbol) == Some(owner)
+                && self
+                    .source_symbol_declarations
+                    .get(symbol)
+                    .is_some_and(|source| {
+                        source.flags.contains(SymbolFlags::FUNCTION)
+                            && source.flags.without(SymbolFlags::FUNCTION | SymbolFlags::MODULE)
+                                == SymbolFlags::NONE
+                    })
+        });
+        let raw = raw_owners.next()?;
+        if raw_owners.next().is_some() {
+            return None;
+        }
+        let mut locals = owners.iter().copied().filter(|symbol| {
+            self.source_symbol_declarations
+                .get(symbol)
+                .is_some_and(|source| source.flags == SymbolFlags::EXPORT_VALUE)
+        });
+        let local = locals.next()?;
+        if locals.next().is_some() {
+            return None;
+        }
+        let namespace = self.source_declaration_symbol(module)?;
+        let namespace_record = self.symbol(namespace)?;
+        let raw_record = self.symbol(raw)?;
+        let local_record = self.symbol(local)?;
+        let raw_source = self.source_symbol_declarations.get(&raw)?;
+        let local_source = self.source_symbol_declarations.get(&local)?;
+        let raw_declarations = declarations
+            .iter()
+            .copied()
+            .filter(|declaration| {
+                self.source_declaration_owners
+                    .get(declaration)
+                    .is_some_and(|owners| owners.contains(&raw))
+            })
+            .collect::<Vec<_>>();
+        let value = raw_declarations.iter().copied().find(|declaration| {
+            self.source_node_kind(*declaration) == Some(SyntaxKind::FunctionDeclaration)
+        })?;
+        if !namespace_record.flags().intersects(SymbolFlags::MODULE)
+            || namespace_record.flags().without(SymbolFlags::TRANSIENT)
+                != self.source_symbol_flags(namespace)?
+            || namespace_record.name() != InternalSymbolName::Global.as_ref()
+            || namespace_record.check_flags() != CheckFlags::NONE
+            || !self.source_symbol_declarations_match(namespace)
+            || !self.source_symbol_export_table_matches(namespace)
+            || namespace_record
+                .exports()
+                .and_then(|table| self.symbol_table(table))
+                .and_then(|table| table.get(owner_record.name()))
+                != Some(raw)
+            || raw == owner
+            || !self.source_raw_symbol_declarations_match(raw)
+            || !self.source_symbol_export_table_matches(raw)
+            || raw_record.name() != owner_record.name()
+            || raw_record.check_flags() != CheckFlags::NONE
+            || raw_record.members().is_some()
+            || raw_record.export_symbol().is_some()
+            || raw_record
+                .parent()
+                .and_then(|parent| self.get_merged_symbol(parent))
+                != Some(namespace)
+            || raw_source.declarations.as_ref() != raw_declarations.as_slice()
+            || raw_source.value_declaration != Some(value)
+            || local == raw
+            || local == owner
+            || self.get_merged_symbol(local) != Some(local)
+            || local_record.flags() != SymbolFlags::EXPORT_VALUE
+            || local_record.check_flags() != CheckFlags::NONE
+            || local_record.name() != owner_record.name()
+            || local_source.declarations.as_ref() != raw_declarations.as_slice()
+            || !self.source_symbol_declarations_match(local)
+            || local_record.value_declaration().is_some()
+            || local_record.parent().is_some()
+            || local_record.members().is_some()
+            || local_record.exports().is_some()
+            || local_record.export_symbol() != Some(raw)
+            || self
+                .value_symbol_links(local)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+        {
+            return None;
+        }
+        for declaration in raw_declarations {
+            let name = self.source_child_with_kind(declaration, SyntaxKind::Identifier)?;
+            if !declaration.is_for(source.arena, source.file)
+                || self.source_node_parent(declaration) != Some(SourceNodeParent::Parent(block))
+                || !matches!(
+                    self.source_node_kind(declaration),
+                    Some(SyntaxKind::FunctionDeclaration | SyntaxKind::ModuleDeclaration)
+                )
+                || self.source_identifier_text(name) != owner_record.name().as_utf8()
+            {
+                return None;
+            }
+        }
+        Some(local)
+    }
+
     /// Retains the function rows of a global ambient function and namespace merge.
     /// Each row and export must still belong to its original binder contribution.
     pub(super) fn source_global_function_namespace_declarations(
@@ -2780,8 +2915,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         for &declaration in declarations {
             let source = self.source_files.get(&declaration.file)?.node_ref();
             let name = self.source_child_with_kind(declaration, SyntaxKind::Identifier)?;
-            if !self.source_is_script_declaration_file(declaration)
-                || self.source_node_parent(declaration) != Some(SourceNodeParent::Parent(source))
+            let script = self.source_is_script_declaration_file(declaration)
+                && self.source_node_parent(declaration) == Some(SourceNodeParent::Parent(source));
+            if !script
+                && self.source_global_callable_augmentation_local(symbol, declaration).is_none()
                 || self.source_identifier_text(name) != owner.name().as_utf8()
             {
                 return None;
@@ -12049,6 +12186,13 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                     && declaration_order.iter().any(|declaration| {
                         self.source_child_with_kind(*declaration, SyntaxKind::ExportKeyword)
                             .is_some()
+                            && !(global_namespace
+                                && self
+                                    .source_global_callable_augmentation_local(
+                                        group.owner_symbol,
+                                        *declaration,
+                                    )
+                                    .is_some())
                     })
                 || owner.export_symbol().is_some()
                 || self.get_merged_symbol(group.owner_symbol) != Some(group.owner_symbol)

@@ -818,6 +818,10 @@ fn plan_source_overload_group(
                 store
                     .source_child_with_kind(*declaration, SyntaxKind::ExportKeyword)
                     .is_some()
+                    && !(global_namespace
+                        && store
+                            .source_global_callable_augmentation_local(owner_symbol, *declaration)
+                            .is_some())
             })
         || owner.export_symbol().is_some()
     {
@@ -850,7 +854,12 @@ fn plan_source_overload_group(
                 SourceOverloadInvariant::Group(*declaration),
             ));
         }
-        if bound.local_symbol(*declaration) != export_local {
+        let expected_local = if global_namespace {
+            store.source_global_callable_augmentation_local(owner_symbol, *declaration)
+        } else {
+            export_local
+        };
+        if bound.local_symbol(*declaration) != expected_local {
             return Err(SourceOverloadError::Unsupported(*declaration));
         }
         if let Some(local) = export_local
@@ -1492,6 +1501,10 @@ pub(super) fn validate_stored_source_overload(
                 store
                     .source_child_with_kind(*declaration, SyntaxKind::ExportKeyword)
                     .is_some()
+                    && !(global_namespace
+                        && store
+                            .source_global_callable_augmentation_local(owner_symbol, *declaration)
+                            .is_some())
             })
         || owner.export_symbol().is_some()
         || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
