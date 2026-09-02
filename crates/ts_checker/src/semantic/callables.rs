@@ -334,7 +334,7 @@ pub(super) fn fixed_method_display_projection(
         else {
             return Err(invalid());
         };
-        if projection.owner != type_ {
+        if projection.owner != type_ || !projection.construct_signatures.is_empty() {
             return Err(invalid());
         }
         for edge in edges {
@@ -342,8 +342,52 @@ pub(super) fn fixed_method_display_projection(
                 .validate_cached_array_capability_with_pending_functions(array_targets, edge, &[])
                 .map_err(|_| invalid())?;
         }
-        // Proven copies keep their existing display provider and fresh parameter scope.
-        return Ok(None);
+        let [callable] = projection.call_signatures.as_ref() else {
+            return Ok(None);
+        };
+        let source = object.target.ok_or_else(invalid)?;
+        if source == type_
+            || object.mapper.is_none()
+            || store.type_payload(source).and_then(|record| record.symbol()) != Some(method)
+        {
+            return Err(invalid());
+        }
+        let Some(source_display) =
+            fixed_method_display_projection(store, host, source, global_types)?
+        else {
+            return Ok(None);
+        };
+        let signature = store.signature(callable.signature).ok_or_else(invalid)?;
+        if source_display.owner != source
+            || signature.target() != Some(source_display.signature)
+            || signature.mapper() != object.mapper
+            || source_display.parameters.len() != callable.parameters.len()
+            || callable.min_argument_count != source_display.parameters.len()
+            || callable.rest_parameter.is_some()
+            || callable.return_type.is_none()
+        {
+            return Err(invalid());
+        }
+        // Keep declaration names and use the copy's mapped signature values.
+        return Ok(Some(ValidatedSingleCallSignatureDisplay {
+            owner: type_,
+            signature: callable.signature,
+            parameters: source_display
+                .parameters
+                .into_iter()
+                .zip(&callable.parameters)
+                .map(
+                    |(source, &value_type)| ValidatedSingleCallParameterDisplay {
+                        name: source.name,
+                        value_type,
+                        annotation_type: None,
+                        optional: source.optional,
+                        rest: source.rest,
+                    },
+                )
+                .collect(),
+            return_type: callable.return_type,
+        }));
     }
     let declaration = method_record.value_declaration().ok_or_else(invalid)?;
     let node = host.node(declaration).ok_or_else(invalid)?;

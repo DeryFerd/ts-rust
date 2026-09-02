@@ -23597,7 +23597,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && self.type_node_contains_builtin_array_reference(node, &mut HashSet::new())?;
         let exact_import = self.type_reference_alias_targets.get(&node).copied();
         let exact_import = if exact_import.is_none() && !qualified && !record_heritage {
-            self.cached_source_callable_type_import(node)?
+            self.cached_source_annotation_type_import(node)?
         } else {
             exact_import
         };
@@ -32634,7 +32634,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
     }
 
     #[allow(clippy::too_many_lines)] // Keep annotation, callable, and import ownership checks together.
-    fn cached_source_callable_type_import(
+    fn cached_source_annotation_type_import(
         &self,
         node: NodeRef,
     ) -> Result<Option<CanonicalTypeReferenceAliasTarget>, DeclaredTypeError> {
@@ -32651,6 +32651,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         };
         let holder = NodeRef::new(node.arena, node.file, holder);
         let holder_node = preflight_node(self.store, self.host, holder)?;
+        let variable = matches!(
+            (&holder_node.data, holder_node.kind),
+            (NodeData::VariableDeclaration(variable), SyntaxKind::VariableDeclaration)
+                if variable.type_ == Some(node.node)
+        );
         let returned = match (&holder_node.data, holder_node.kind) {
             (NodeData::FunctionDeclaration(function), SyntaxKind::FunctionDeclaration) => {
                 function.type_ == Some(node.node)
@@ -32663,7 +32668,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             _ => false,
         };
-        if !returned {
+        if !returned && !variable {
             let NodeData::ParameterDeclaration(syntax) = &holder_node.data else {
                 return Ok(None);
             };
@@ -32695,9 +32700,41 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .is_none_or(|target| {
                 target.flags() != SymbolFlags::INTERFACE
                     && !(returned && target.flags() == SymbolFlags::TYPE_ALIAS)
+                    && !(variable && target.flags() == SymbolFlags::CLASS)
             })
         {
             return Ok(None);
+        }
+        if variable {
+            let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+            let bound = self.host.bound_file(holder).ok_or_else(invalid)?;
+            if self
+                .store
+                .source_file_links(bound.source_file())
+                .is_none_or(|links| !links.type_checked)
+            {
+                return Ok(None);
+            }
+            let owner = bound
+                .symbol(holder)
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                .ok_or_else(invalid)?;
+            let symbol = self.store.symbol(owner).ok_or_else(invalid)?;
+            if !matches!(
+                symbol.flags(),
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE
+            ) || symbol.check_flags() != CheckFlags::NONE
+                || symbol.declarations() != Some(&[holder])
+                || symbol.value_declaration() != Some(holder)
+                || !self.host.symbol_matches(self.store, holder, owner)
+                || super::declared_values::plan_declared_value_cache(
+                    self.store, owner, node, None,
+                )?
+                .cached_type
+                    != Some(cached)
+            {
+                return Err(invalid());
+            }
         }
         if returned {
             let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
