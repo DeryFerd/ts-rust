@@ -1451,7 +1451,20 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
             Some(imported)
         } else {
             let mut callback_host = self.host.name_resolver_host(self.store)?;
-            callback_host.resolve_entity_name(expression, SymbolFlags::TYPE)?
+            match callback_host.resolve_entity_name(expression, SymbolFlags::TYPE) {
+                Ok(symbol) => symbol,
+                Err(error @ CanonicalNameResolutionError::AliasResolutionUnavailable(alias))
+                    if self.store.source_node_kind(expression) == Some(SyntaxKind::Identifier) =>
+                {
+                    Some(
+                        super::source_imports::authenticated_ambient_module_import_alias_target(
+                            self.store, self.host, expression, alias,
+                        )
+                        .ok_or(error)?,
+                    )
+                }
+                Err(error) => return Err(error.into()),
+            }
         };
         let Some(base_symbol) = base_symbol else {
             return Ok(true);

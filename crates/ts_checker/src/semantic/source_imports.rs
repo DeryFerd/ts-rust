@@ -5033,6 +5033,296 @@ pub(super) fn plan_source_property_type_import(
     Ok(Some(plan))
 }
 
+/// Resolves one named import from a retained same-file ambient module.
+/// The target must be a direct type export, not another alias.
+#[allow(clippy::too_many_lines)]
+pub(super) fn authenticated_ambient_module_import_alias_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    reference: NodeRef,
+    alias: SemanticSymbolId,
+) -> Option<SemanticSymbolId> {
+    let record = store.symbol(alias)?;
+    let [declaration] = record.declarations()? else {
+        return None;
+    };
+    let declaration = *declaration;
+    let bound = host.bound_file(declaration)?;
+    let facts = bound.source_facts()?;
+    let cached_target = match store.alias_symbol_links(alias) {
+        None => None,
+        Some(links) if links == &super::AliasSymbolLinks::default() => None,
+        Some(links) => {
+            let super::AliasTargetState::Resolved(target) = links.alias_target else {
+                return None;
+            };
+            if store.get_merged_symbol(target) != Some(target)
+                || links.immediate_target != Some(target)
+                || links.type_only_declaration.is_some()
+            {
+                return None;
+            }
+            Some(target)
+        }
+    };
+    if record.flags() != SymbolFlags::ALIAS
+        || record.check_flags() != CheckFlags::NONE
+        || record.value_declaration().is_some()
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent().is_some()
+        || record.export_symbol().is_some()
+        || !facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || facts.is_external_or_common_js_module()
+        || !declaration.is_for(reference.arena, reference.file)
+        || bound.symbol(declaration) != Some(alias)
+        || store.get_merged_symbol(alias) != Some(alias)
+    {
+        return None;
+    }
+
+    let declaration_record = host.node(declaration)?;
+    let NodeData::ImportSpecifier(specifier) = &declaration_record.data else {
+        return None;
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, specifier.name);
+    let name_record = host.node(name)?;
+    let NodeData::Identifier(local) = &name_record.data else {
+        return None;
+    };
+    let imported = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        specifier.property_name.unwrap_or(specifier.name),
+    );
+    let imported_record = host.node(imported)?;
+    let NodeData::Identifier(imported_name) = &imported_record.data else {
+        return None;
+    };
+    if declaration_record.kind != SyntaxKind::ImportSpecifier
+        || declaration_record.flags.0 != 0
+        || specifier.is_type_only
+        || specifier.local_symbol.is_some()
+        || specifier.symbol.is_some()
+        || specifier.facts != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || local.flow_node.is_some()
+        || record.name().as_utf8() != Some(local.text.as_str())
+        || imported_record.kind != SyntaxKind::Identifier
+        || imported_record.flags.0 != 0
+        || imported_record.parent != Some(declaration.node)
+        || imported_name.flow_node.is_some()
+    {
+        return None;
+    }
+
+    let bindings = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        declaration_record.parent?,
+    );
+    let bindings_record = host.node(bindings)?;
+    let NodeData::NamedImports(named) = &bindings_record.data else {
+        return None;
+    };
+    let clause = NodeRef::new(bindings.arena, bindings.file, bindings_record.parent?);
+    let clause_record = host.node(clause)?;
+    let NodeData::ImportClause(import_clause) = &clause_record.data else {
+        return None;
+    };
+    let import = NodeRef::new(clause.arena, clause.file, clause_record.parent?);
+    let import_record = host.node(import)?;
+    let NodeData::ImportDeclaration(import_data) = &import_record.data else {
+        return None;
+    };
+    let block = NodeRef::new(import.arena, import.file, import_record.parent?);
+    let block_record = host.node(block)?;
+    let NodeData::ModuleBlock(module_block) = &block_record.data else {
+        return None;
+    };
+    let namespace = NodeRef::new(block.arena, block.file, block_record.parent?);
+    let namespace_record = host.node(namespace)?;
+    let NodeData::ModuleDeclaration(module) = &namespace_record.data else {
+        return None;
+    };
+    let namespace_name = NodeRef::new(namespace.arena, namespace.file, module.name);
+    let namespace_name_record = host.node(namespace_name)?;
+    let module_specifier =
+        NodeRef::new(import.arena, import.file, import_data.module_specifier);
+    let module_specifier_record = host.node(module_specifier)?;
+    let NodeData::StringLiteral(module_name) = &module_specifier_record.data else {
+        return None;
+    };
+    if bindings_record.kind != SyntaxKind::NamedImports
+        || !named.elements.nodes.contains(&declaration.node)
+        || clause_record.kind != SyntaxKind::ImportClause
+        || import_clause.named_bindings != Some(bindings.node)
+        || import_record.kind != SyntaxKind::ImportDeclaration
+        || import_data.import_clause != Some(clause.node)
+        || block_record.kind != SyntaxKind::ModuleBlock
+        || !module_block.statements.nodes.contains(&import.node)
+        || namespace_record.kind != SyntaxKind::ModuleDeclaration
+        || namespace_record.parent != Some(bound.source_file().node)
+        || module.body != Some(block.node)
+        || namespace_name_record.kind != SyntaxKind::StringLiteral
+        || module_specifier_record.kind != SyntaxKind::StringLiteral
+        || module_specifier_record.parent != Some(import.node)
+        || module_name.text.is_empty()
+        || bound
+            .locals(namespace)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&local.text))
+            .and_then(|candidate| store.get_merged_symbol(candidate))
+            != Some(alias)
+    {
+        return None;
+    }
+
+    let mut current = reference;
+    for _ in 0..64 {
+        if current == block {
+            break;
+        }
+        current = NodeRef::new(
+            current.arena,
+            current.file,
+            host.node(current)?.parent?,
+        );
+        if current == bound.source_file() {
+            return None;
+        }
+    }
+    if current != block {
+        return None;
+    }
+
+    let quoted_name = EscapedName::source(format!("\"{}\"", module_name.text));
+    let imported_module = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get(quoted_name.as_ref()))
+        .and_then(|symbol| store.get_merged_symbol(symbol))?;
+    let module_record = store.symbol(imported_module)?;
+    let exports = module_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))?;
+    let expected_owner =
+        if let Some(export_equals) = exports.get(InternalSymbolName::ExportEquals.as_ref()) {
+            let assignment = store.symbol(export_equals)?;
+            let [assignment_declaration] = assignment.declarations()? else {
+                return None;
+            };
+            let assignment_declaration = *assignment_declaration;
+            let assignment_record = host.node(assignment_declaration)?;
+            let NodeData::ExportAssignment(export_assignment) = &assignment_record.data else {
+                return None;
+            };
+            let expression = NodeRef::new(
+                assignment_declaration.arena,
+                assignment_declaration.file,
+                export_assignment.expression,
+            );
+            let expression_record = host.node(expression)?;
+            let NodeData::Identifier(identifier) = &expression_record.data else {
+                return None;
+            };
+            let module_declaration = module_record.declarations()?.first().copied()?;
+            let local = bound
+                .locals(module_declaration)
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(&identifier.text))
+                .and_then(|symbol| store.get_merged_symbol(symbol))?;
+            store
+                .symbol(local)
+                .map(|symbol| symbol.export_symbol().unwrap_or(local))
+                .and_then(|symbol| store.get_merged_symbol(symbol))?
+        } else {
+            imported_module
+        };
+    let target = store
+        .symbol(expected_owner)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source(&imported_name.text))
+        .and_then(|symbol| store.get_merged_symbol(symbol))?;
+    let target_record = store.symbol(target)?;
+    let allowed = SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT;
+    let existing_type_target = target_record
+        .flags()
+        .intersects(SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE)
+        && target_record.flags().without(allowed) == SymbolFlags::NONE;
+    let class_target = target_record.flags().without(SymbolFlags::TRANSIENT) == SymbolFlags::CLASS
+        && target_record.check_flags() == CheckFlags::NONE
+        && target_record.export_symbol().is_none()
+        && store.source_merged_symbol_declarations_match(target)
+        && target_record.declarations().is_some_and(|declarations| {
+            let [declaration] = declarations else {
+                return false;
+            };
+            let Some(record) = host.node(*declaration) else {
+                return false;
+            };
+            let NodeData::ClassDeclaration(class) = &record.data else {
+                return false;
+            };
+            let Some(name) = class.name else {
+                return false;
+            };
+            let name = NodeRef::new(declaration.arena, declaration.file, name);
+            let Some(bound) = host.bound_file(*declaration) else {
+                return false;
+            };
+            let Some((block, block_record)) = record
+                .parent
+                .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+                .and_then(|node| host.node(node).map(|record| (node, record)))
+            else {
+                return false;
+            };
+            let NodeData::ModuleBlock(body) = &block_record.data else {
+                return false;
+            };
+            let Some((module, module_record)) = block_record
+                .parent
+                .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+                .and_then(|node| host.node(node).map(|record| (node, record)))
+            else {
+                return false;
+            };
+            let NodeData::ModuleDeclaration(module_data) = &module_record.data else {
+                return false;
+            };
+            record.kind == SyntaxKind::ClassDeclaration
+                && target_record.value_declaration() == Some(*declaration)
+                && bound
+                    .symbol(*declaration)
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    == Some(target)
+                && block_record.kind == SyntaxKind::ModuleBlock
+                && body.statements.nodes.contains(&declaration.node)
+                && module_record.kind == SyntaxKind::ModuleDeclaration
+                && module_data.body == Some(block.node)
+                && bound
+                    .symbol(module)
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    == Some(expected_owner)
+                && target_record.name().as_utf8() == Some(imported_name.text.as_str())
+                && host.node(name).is_some_and(|name| {
+                    name.kind == SyntaxKind::Identifier
+                        && name.parent == Some(declaration.node)
+                        && matches!(&name.data, NodeData::Identifier(identifier)
+                            if target_record.name().as_utf8() == Some(identifier.text.as_str()))
+                })
+        });
+    ((existing_type_target || class_target)
+        && store.get_parent_of_symbol(target) == Some(expected_owner)
+        && cached_target.is_none_or(|cached| cached == target))
+    .then_some(target)
+}
+
 /// Proves a named type import at its real interface heritage expression.
 /// Base types and omitted defaults still use the existing heritage workers.
 #[allow(clippy::too_many_lines)]
