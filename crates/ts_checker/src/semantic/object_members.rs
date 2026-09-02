@@ -18854,6 +18854,21 @@ pub(super) fn validate_resolved_declared_property_object(
     }
 }
 
+fn authenticated_merged_global_declared_property_interface(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+) -> bool {
+    store.symbol(owner).is_some_and(|record| {
+        record.flags() == (SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+            && record
+                .declarations()
+                .is_some_and(|declarations| declarations.len() > 1)
+            && record.value_declaration().is_none()
+            && store.source_merged_symbol_declarations_match(owner)
+            && authenticated_nongeneric_global_interface_owner(store, owner)
+    })
+}
+
 fn authenticated_merged_react_declared_property_interface(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
@@ -19036,6 +19051,7 @@ fn validate_resolved_declared_property_object_detailed(
             };
             if owner_record.flags() != SymbolFlags::INTERFACE
                 && !authenticated_merged_react_declared_property_interface(store, owner)
+                && !authenticated_merged_global_declared_property_interface(store, owner)
             {
                 return NotDeclared;
             }
@@ -21092,7 +21108,8 @@ fn validate_declared_property_owner(
     if store.get_merged_symbol(owner) != Some(owner)
         || owner_record.flags() != expected_flags
             && (proof != DeclaredPropertyObjectProof::Interface
-                || !authenticated_merged_react_declared_property_interface(store, owner))
+                || !authenticated_merged_react_declared_property_interface(store, owner)
+                    && !authenticated_merged_global_declared_property_interface(store, owner))
         || owner_record.check_flags() != CheckFlags::NONE
         || !valid_name
         || owner_record.value_declaration().is_some()

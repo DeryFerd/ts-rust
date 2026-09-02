@@ -11,7 +11,7 @@
 //! operands retain an authenticated, allocation-free syntax proof so the
 //! type-node owner can issue the pinned generic and tuple cycle diagnostics.
 //! Other named operands, optional properties, overlapping non-string indexes,
-//! union keys, tuples, and apparent types remain explicit concrete boundaries.
+//! general union keys, tuples, and apparent types remain explicit boundaries.
 //!
 //! Planning chooses the exact property symbol or index-info slot before any
 //! semantic child executes. Finishing only validates the already-resolved
@@ -21,6 +21,8 @@
 //! A separate sealed alias-bound plan admits one own string-keyed property of
 //! a closed named object. Its source read uses the existing optional union
 //! operation without changing the declared property or the nil-access path.
+//! Named nongeneric interfaces also support `I[keyof I]`. That plan keeps the
+//! merged member proof and uses the canonical keyof and union caches.
 
 use std::collections::HashSet;
 
@@ -35,9 +37,12 @@ use super::{
     array_types::CanonicalArrayTargets,
     bootstrap::{IntrinsicBootstrapOptions, LiteralTypeCacheError},
     callable_sets::{StoredCallableSetValidation, validate_stored_declared_method_callable_set},
-    declared::{cached_ordinary_type_parameter_owner, preflight_node},
+    declared::{
+        cached_ordinary_type_parameter_owner, preflight_class_or_interface_reference, preflight_node,
+    },
     instantiate::{self, InstantiationError, InstantiationSession},
-    links::{TypeNodeLinks, ValueSymbolLinks},
+    keyof_types::{cached_nongeneric_keyof_type, plan_nongeneric_keyof_type_with_array_targets},
+    links::{SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks},
     object_aliases::{self, ClosedTypeAliasSourceHeader, SourceAliasOperandGraph},
     object_members::{
         self, PlannedProperty, PropertyObjectError, PropertyObjectPlan, PropertyObjectState,
@@ -165,6 +170,271 @@ impl ConcreteIndexedAccessPlan {
     pub(super) const fn index(&self) -> NodeRef {
         self.index
     }
+}
+
+/// A closed interface read keeps both references and the whole merged owner.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct NamedInterfaceKeyofIndexedAccessPlan {
+    node: NodeRef,
+    object: NodeRef,
+    index: NodeRef,
+    keyof_object: NodeRef,
+    object_plan: PropertyObjectPlan,
+    alias: Option<SemanticSymbolId>,
+}
+
+impl NamedInterfaceKeyofIndexedAccessPlan {
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        self.object_plan.symbol
+    }
+
+    pub(super) const fn object(&self) -> NodeRef {
+        self.object
+    }
+
+    pub(super) const fn index(&self) -> NodeRef {
+        self.index
+    }
+}
+
+/// Admits the actual same-owner keyof read, including merged interfaces.
+pub(super) fn plan_named_interface_keyof_indexed_access(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    alias: Option<SemanticSymbolId>,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<NamedInterfaceKeyofIndexedAccessPlan>, ConcreteIndexedAccessError> {
+    let record = preflight_node(store, host, node)?;
+    let NodeData::IndexedAccessTypeNode(indexed) = &record.data else {
+        return Err(ConcreteIndexedAccessError::InvalidSyntax(node));
+    };
+    let object = NodeRef::new(node.arena, node.file, indexed.object_type);
+    let index = NodeRef::new(node.arena, node.file, indexed.index_type);
+    let object_record = preflight_node(store, host, object)?;
+    let index_record = preflight_node(store, host, index)?;
+    let NodeData::TypeOperatorNode(operator) = &index_record.data else {
+        return Ok(None);
+    };
+    if object_record.kind != SyntaxKind::TypeReference
+        || index_record.kind != SyntaxKind::TypeOperator
+        || operator.operator != SyntaxKind::KeyOfKeyword
+    {
+        return Ok(None);
+    }
+    let keyof_object = NodeRef::new(node.arena, node.file, operator.type_);
+    let keyof_record = preflight_node(store, host, keyof_object)?;
+    if record.kind != SyntaxKind::IndexedAccessType
+        || record.flags.0 != 0
+        || index_record.flags.0 != 0
+        || object == index
+        || object_record.parent != Some(node.node)
+        || index_record.parent != Some(node.node)
+        || keyof_record.parent != Some(index.node)
+        || object_record.range.start != record.range.start
+        || object_record.range.end > index_record.range.start
+        || index_record.range.end >= record.range.end
+        || keyof_record.range.start < index_record.range.start
+        || keyof_record.range.end != index_record.range.end
+    {
+        return Err(ConcreteIndexedAccessError::InvalidSyntax(node));
+    }
+    if [node, index].into_iter().any(|operand| {
+        store
+            .symbol_node_links(operand)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+    }) {
+        return Err(ConcreteIndexedAccessError::InvalidCache(node));
+    }
+    let symbol = named_interface_indexed_reference(store, host, object)?;
+    if named_interface_indexed_reference(store, host, keyof_object)? != symbol {
+        return Err(ConcreteIndexedAccessError::UnsupportedIndex(index));
+    }
+    let object_plan = object_members::plan_interface(store, host, symbol)?;
+    if !object_plan.methods.is_empty()
+        || !object_plan.accessors.is_empty()
+        || !object_plan.call_signatures.is_empty()
+        || !object_plan.indexes.is_empty()
+        || !object_plan.spreads.is_empty()
+        || object_plan.heritage.is_some()
+        || object_plan.properties.iter().any(|property| {
+            store.source_node_kind(property.name_node) == Some(SyntaxKind::ComputedPropertyName)
+        })
+    {
+        return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(object));
+    }
+    if let Some(property) = object_plan
+        .properties
+        .iter()
+        .find(|property| property.optional)
+    {
+        return Err(ConcreteIndexedAccessError::OptionalProperty {
+            node,
+            property: property.symbol,
+        });
+    }
+    let plan = NamedInterfaceKeyofIndexedAccessPlan {
+        node,
+        object,
+        index,
+        keyof_object,
+        object_plan,
+        alias,
+    };
+    if validate_parent_links(store, node)?.is_some() {
+        let object_type = object_members::cached_planned_type_identity(store, object)
+            .ok_or(ConcreteIndexedAccessError::InvalidCache(object))?;
+        let index_type = object_members::cached_planned_type_identity(store, index)
+            .ok_or(ConcreteIndexedAccessError::InvalidCache(index))?;
+        cached_named_interface_keyof_indexed_access(
+            store, &plan, object_type, index_type, array_targets,
+        )?;
+    }
+    Ok(Some(plan))
+}
+
+fn named_interface_indexed_reference(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<SemanticSymbolId, ConcreteIndexedAccessError> {
+    let record = preflight_node(store, host, node)?;
+    let NodeData::TypeReferenceNode(reference) = &record.data else {
+        return Err(ConcreteIndexedAccessError::UnsupportedObject(node));
+    };
+    if reference.type_arguments.is_some() {
+        return Err(ConcreteIndexedAccessError::UnsupportedObject(node));
+    }
+    let name = NodeRef::new(node.arena, node.file, reference.type_name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(ConcreteIndexedAccessError::UnsupportedObject(node));
+    };
+    if record.kind != SyntaxKind::TypeReference
+        || record.flags.0 != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(node.node)
+        || name_record.range != record.range
+        || identifier.text.is_empty()
+        || identifier.flow_node.is_some()
+    {
+        return Err(ConcreteIndexedAccessError::InvalidSyntax(node));
+    }
+    let (arena, bound) = host
+        .source(node)
+        .ok_or(ConcreteIndexedAccessError::InvalidSyntax(node))?;
+    let mut name_host = host
+        .name_resolver_host(store)
+        .map_err(DeclaredTypeError::from)?;
+    let symbol = CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut name_host)
+        .map_err(DeclaredTypeError::from)?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(name)),
+            &identifier.text,
+            SymbolFlags::TYPE,
+            None,
+            true,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or(ConcreteIndexedAccessError::UnsupportedObject(node))?;
+    let flags = store
+        .symbol(symbol)
+        .ok_or(ConcreteIndexedAccessError::UnsupportedObject(node))?
+        .flags();
+    if flags.without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+        || preflight_class_or_interface_reference(store, host, symbol, flags)? != 0
+    {
+        return Err(ConcreteIndexedAccessError::UnsupportedObject(node));
+    }
+    Ok(symbol)
+}
+
+fn named_interface_keyof_value_types(
+    store: &CanonicalTypeMapperStore,
+    plan: &NamedInterfaceKeyofIndexedAccessPlan,
+    object_type: TypeId,
+    index_type: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Vec<TypeId>, ConcreteIndexedAccessError> {
+    let invalid = || ConcreteIndexedAccessError::InvalidCache(plan.node);
+    if !matches!(object_members::interface_state(store, &plan.object_plan, object_type)?,
+        PropertyObjectState::Resolved(actual) if actual == object_type)
+        || object_members::cached_planned_type_identity(store, plan.object) != Some(object_type)
+        || object_members::cached_planned_type_identity(store, plan.keyof_object)
+            != Some(object_type)
+        || object_members::cached_planned_type_identity(store, plan.index) != Some(index_type)
+    {
+        return Err(invalid());
+    }
+    let keyof = plan_nongeneric_keyof_type_with_array_targets(store, object_type, array_targets)
+        .map_err(|_| invalid())?;
+    if cached_nongeneric_keyof_type(store, &keyof).map_err(|_| invalid())? != Some(index_type) {
+        return Err(invalid());
+    }
+    plan.object_plan
+        .properties
+        .iter()
+        .map(|property| {
+            store
+                .value_symbol_links(property.symbol)
+                .and_then(|links| links.resolved_type)
+                .filter(|type_| {
+                    store.type_payload(*type_).is_some()
+                        && object_members::cached_planned_type_identity(store, property.type_node)
+                            == Some(*type_)
+                })
+                .ok_or_else(invalid)
+        })
+        .collect()
+}
+
+pub(super) fn cached_named_interface_keyof_indexed_access(
+    store: &CanonicalTypeMapperStore,
+    plan: &NamedInterfaceKeyofIndexedAccessPlan,
+    object_type: TypeId,
+    index_type: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, ConcreteIndexedAccessError> {
+    let types =
+        named_interface_keyof_value_types(store, plan, object_type, index_type, array_targets)?;
+    let expected = store.cached_literal_union_type_with_alias(
+        &types,
+        plan.alias.map(|symbol| (symbol, &[][..])),
+        array_targets,
+    )?;
+    if validate_parent_links(store, plan.node)?.is_some_and(|cached| Some(cached) != expected) {
+        return Err(ConcreteIndexedAccessError::InvalidCache(plan.node));
+    }
+    Ok(expected)
+}
+
+/// Uses the read union operation with the caller's session and alias identity.
+pub(super) fn finish_named_interface_keyof_indexed_access(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &NamedInterfaceKeyofIndexedAccessPlan,
+    object_type: TypeId,
+    index_type: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, ConcreteIndexedAccessError> {
+    if let Some(cached) = cached_named_interface_keyof_indexed_access(
+        store, plan, object_type, index_type, array_targets,
+    )? {
+        return Ok(cached);
+    }
+    let types =
+        named_interface_keyof_value_types(store, plan, object_type, index_type, array_targets)?;
+    store
+        .literal_union_type_with_alias_and_array_targets_and_session(
+            &types,
+            plan.alias.map(|symbol| (symbol, &[][..])),
+            array_targets,
+            session,
+        )
+        .map_err(Into::into)
 }
 
 /// This read has a real indexed type node. It is not the mapper's nil-access read.

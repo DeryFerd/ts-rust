@@ -71,11 +71,15 @@ use super::{
         validate_generic_global_type_instantiation,
     },
     indexed_access_types::{
-        ConcreteIndexedAccessError, ConcreteIndexedAccessPlan, RecursiveIndexedAccessPlan,
-        SourceAliasIndexedBoundPlan, cached_deferred_indexed_access_type,
+        ConcreteIndexedAccessError, ConcreteIndexedAccessPlan,
+        NamedInterfaceKeyofIndexedAccessPlan, RecursiveIndexedAccessPlan,
+        SourceAliasIndexedBoundPlan,
+        cached_deferred_indexed_access_type, cached_named_interface_keyof_indexed_access,
         cached_source_alias_indexed_bound, finish_concrete_indexed_access,
+        finish_named_interface_keyof_indexed_access,
         finish_source_alias_indexed_bound_with_session, get_deferred_indexed_access_type,
-        plan_concrete_indexed_access, plan_recursive_indexed_access,
+        plan_concrete_indexed_access,
+        plan_named_interface_keyof_indexed_access, plan_recursive_indexed_access,
         plan_source_alias_indexed_bound,
     },
     instantiate::{
@@ -99,7 +103,7 @@ use super::{
     intersection_types::{IntersectionTypeCacheKey, IntersectionTypeError},
     keyof_types::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
-        resolve_nongeneric_keyof_type,
+        resolve_nongeneric_keyof_type, resolve_nongeneric_keyof_type_with_session,
     },
     links::{
         ResolvedSignatureState, SignatureLinks, SymbolNodeLinks, TypeAliasLinks, TypeNodeLinks,
@@ -1973,6 +1977,8 @@ impl TypeQueryPlan {
             }
         } else if let Some(target) = self.keyofs.get(&node) {
             children.push(*target);
+        } else if let Some(indexed) = self.named_interface_indexed_accesses.get(&node) {
+            children.extend([indexed.object(), indexed.index()]);
         } else if let Some(indexed) = self.source_callable_indexed_return(store, callable, node)? {
             children.extend([indexed.object, indexed.index]);
         } else if let Some(union) = self.unions.get(&node) {
@@ -2821,6 +2827,17 @@ impl TypeQueryPlan {
             if let Some(target) = child(*target, active)? {
                 let plan = plan_nongeneric_keyof_type(store, target).map_err(|_| invalid())?;
                 cached_nongeneric_keyof_type(store, &plan).map_err(|_| invalid())?
+            } else {
+                None
+            }
+        } else if let Some(indexed) = self.named_interface_indexed_accesses.get(&node) {
+            let object = child(indexed.object(), active)?;
+            let index = child(indexed.index(), active)?;
+            if let (Some(object), Some(index)) = (object, index) {
+                cached_named_interface_keyof_indexed_access(
+                    store, indexed, object, index, array_targets,
+                )
+                .map_err(|error| indexed_access_error(error, node))?
             } else {
                 None
             }
@@ -5727,6 +5744,7 @@ struct TypeQueryPlan {
     imported_argument_nodes: BTreeSet<NodeRef>,
     arrays: BTreeMap<NodeRef, PlannedArrayType>,
     indexed_accesses: BTreeMap<NodeRef, ConcreteIndexedAccessPlan>,
+    named_interface_indexed_accesses: BTreeMap<NodeRef, NamedInterfaceKeyofIndexedAccessPlan>,
     source_alias_indexed_bounds: BTreeMap<NodeRef, SourceAliasIndexedBoundPlan>,
     source_alias_operands: BTreeMap<NodeRef, SourceAliasOperandPlan>,
     recovered_indexed_accesses: BTreeMap<NodeRef, PlannedRecoveredIndexedAccess>,
@@ -9607,6 +9625,23 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
         let record = preflight_node(self.store, self.host, node)?;
         let links = self.store.type_node_links(node);
+        if let Some(indexed) = self.plan.named_interface_indexed_accesses.get(&node) {
+            let cached = links.and_then(|links| links.resolved_type);
+            let object = object_members::cached_planned_type_identity(self.store, indexed.object());
+            let index = object_members::cached_planned_type_identity(self.store, indexed.index());
+            if let (Some(object), Some(index)) = (object, index) {
+                let expected = cached_named_interface_keyof_indexed_access(
+                    self.store, indexed, object, index, self.array_targets,
+                )
+                .map_err(|error| indexed_access_error(error, node))?;
+                if cached.is_some() && cached != expected {
+                    return Err(invalid());
+                }
+            } else if cached.is_some() {
+                return Err(invalid());
+            }
+            return Ok(());
+        }
         if let Some(indexed) = self.plan.source_alias_indexed_bounds.get(&node) {
             let cached = links.and_then(|links| links.resolved_type);
             let object = object_members::cached_planned_type_identity(self.store, indexed.object());
@@ -13440,6 +13475,30 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
         }
         if self.try_plan_recovered_indexed_access_type(node)? {
+            return Ok(());
+        }
+        if let Some(planned) = plan_named_interface_keyof_indexed_access(
+            self.store,
+            self.host,
+            node,
+            alias_owner,
+            self.array_targets,
+        )
+        .map_err(|error| indexed_access_error(error, node))?
+        {
+            if self
+                .plan
+                .named_interface_indexed_accesses
+                .insert(node, planned.clone())
+                .is_some_and(|existing| existing != planned)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidIndexedAccessType(node),
+                ));
+            }
+            self.plan_property_interface(planned.symbol())?;
+            self.plan_type_node_in_context(planned.object(), None, false)?;
+            self.plan_type_node_in_context(planned.index(), None, false)?;
             return Ok(());
         }
         let planned = plan_concrete_indexed_access(self.store, self.host, node)
@@ -30042,18 +30101,27 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             })
                         })
                     });
-            let supported_constraint = constraint_flags == SymbolFlags::INTERFACE
-                || react_interface_constraint
-                || self.is_default_library_dom_interface_argument(constraint, constraint_symbol);
-            if constraint_symbol == symbol
-                || !supported_constraint
-                || preflight_class_or_interface_reference(
-                    self.store,
-                    self.host,
-                    constraint_symbol,
-                    constraint_flags,
-                )? != argument_count
-            {
+            let supported_constraint = if constraint_flags == SymbolFlags::TYPE_ALIAS {
+                argument_count == 0
+                    && plan_type_alias_header(self.store, self.host, constraint_symbol)?
+                        .1
+                        .type_parameters
+                        .is_empty()
+            } else {
+                (constraint_flags == SymbolFlags::INTERFACE
+                    || react_interface_constraint
+                    || self.is_default_library_dom_interface_argument(
+                        constraint,
+                        constraint_symbol,
+                    ))
+                    && preflight_class_or_interface_reference(
+                        self.store,
+                        self.host,
+                        constraint_symbol,
+                        constraint_flags,
+                    )? == argument_count
+            };
+            if constraint_symbol == symbol || !supported_constraint {
                 return Err(unsupported());
             }
 
@@ -43217,6 +43285,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .len()
             .checked_add(readonly_array_operators)
             .and_then(|count| count.checked_add(plan.indexed_accesses.len()))
+            .and_then(|count| count.checked_add(plan.named_interface_indexed_accesses.len()))
             .and_then(|count| count.checked_add(plan.source_alias_indexed_bounds.len()))
             .and_then(|count| count.checked_add(plan.recovered_indexed_accesses.len()))
             .and_then(|count| count.checked_add(plan.keyofs.len()))
@@ -43253,6 +43322,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .arrays
             .keys()
             .chain(plan.indexed_accesses.keys())
+            .chain(plan.named_interface_indexed_accesses.keys())
             .chain(plan.source_alias_indexed_bounds.keys())
             .chain(plan.recovered_indexed_accesses.keys())
             .chain(plan.keyofs.keys())
@@ -46887,6 +46957,40 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         plan: &TypeQueryPlan,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, DeclaredTypeError> {
+        if let Some(indexed) = plan.named_interface_indexed_accesses.get(&node) {
+            let object_type = self.execute_type_node(indexed.object(), plan, prepared)?;
+            let index_type = self.execute_type_node(indexed.index(), plan, prepared)?;
+            let invalid =
+                || type_node_unavailable(TypeNodeUnavailable::InvalidIndexedAccessType(node));
+            let session = self
+                .instantiation_session
+                .as_deref_mut()
+                .ok_or_else(invalid)?;
+            let resolved = finish_named_interface_keyof_indexed_access(
+                self.store,
+                indexed,
+                object_type,
+                index_type,
+                self.global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types),
+                session,
+            )
+            .map_err(|error| indexed_access_error(error, node))?;
+            let mut links = self
+                .store
+                .type_node_links(node)
+                .cloned()
+                .unwrap_or_default();
+            if links.resolved_type.is_some_and(|cached| cached != resolved) {
+                return Err(invalid());
+            }
+            links.resolved_type = Some(resolved);
+            if !self.store.set_type_node_links(node, links) {
+                return Err(invalid());
+            }
+            return Ok(resolved);
+        }
         if let Some(indexed) = plan.source_alias_indexed_bounds.get(&node) {
             let object_type = self.execute_type_node(indexed.object(), plan, prepared)?;
             let index_type = self.execute_type_node(indexed.index(), plan, prepared)?;
@@ -47061,6 +47165,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let resolved = if keyof_plan.mapped_cross_product_too_large().is_some() {
             let diagnostic_node = self.mapped_keyof_overflow_diagnostic_node(target_type, node);
             self.recover_excessive_type_complexity(diagnostic_node)?
+        } else if plan
+            .named_interface_indexed_accesses
+            .values()
+            .any(|indexed| indexed.index() == node)
+        {
+            let session = self.instantiation_session.as_deref_mut().ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidKeyofType(node))
+            })?;
+            resolve_nongeneric_keyof_type_with_session(self.store, &keyof_plan, session)
+                .map_err(|error| keyof_type_error(error, node))?
         } else {
             resolve_nongeneric_keyof_type(self.store, &keyof_plan)
                 .map_err(|error| keyof_type_error(error, node))?
@@ -48061,6 +48175,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ) -> Option<NodeRef> {
         loop {
             if plan.indexed_accesses.contains_key(&node)
+                || plan.named_interface_indexed_accesses.contains_key(&node)
                 || plan.recovered_indexed_accesses.contains_key(&node)
             {
                 return Some(node);
