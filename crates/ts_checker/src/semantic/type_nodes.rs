@@ -41164,7 +41164,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     return Err(invalid());
                 };
                 let default_type = data.resolved_default_type.ok_or_else(invalid)?;
-                self.check_source_type_parameter_default(type_, default_type, default_node)?;
+                // Declared signatures keep absent bounds lazy. The checked source
+                // formal has no inferred constraint, so only written bounds apply.
+                if parameter.constraint.is_some() {
+                    self.check_source_type_parameter_default(type_, default_type, default_node)?;
+                }
             }
             Ok(())
         })();
