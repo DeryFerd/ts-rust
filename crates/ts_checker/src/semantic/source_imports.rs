@@ -5425,9 +5425,151 @@ pub(super) fn authenticated_ambient_module_import_alias_target(
     .then_some(target)
 }
 
-/// Proves a named type import at its real interface heritage expression.
-/// Base types and omitted defaults still use the existing heritage workers.
-#[allow(clippy::too_many_lines)]
+/// Retains the named import selected by the real module-resolution host.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceInterfaceHeritageImport {
+    reference: NodeRef,
+    module_specifier: NodeRef,
+    expected: ResolvedSourceTypeImportBinding,
+    alias_chain: Option<OrdinaryImportAliasChain>,
+    module: Option<SourceFileNamespacePlan>,
+}
+
+impl SourceInterfaceHeritageImport {
+    pub(super) fn alias_symbol(&self) -> SemanticSymbolId {
+        self.expected.binding.alias_symbol
+    }
+
+    pub(super) fn target_symbol(&self) -> SemanticSymbolId {
+        self.expected.target_symbol
+    }
+
+    pub(super) fn validate_current(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        reference: NodeRef,
+    ) -> Result<(), SourceImportError> {
+        if reference != self.reference
+            || self
+                .module
+                .as_ref()
+                .is_some_and(|plan| !retained_namespace_plan_is_exact(store, plan))
+        {
+            return Err(invariant(SourceImportInvariant::InvalidNode(reference)));
+        }
+        validate_named_type_import_owner(
+            store,
+            reference,
+            self.module_specifier,
+            &self.expected,
+            self.alias_chain.as_ref(),
+        )?;
+        validate_named_type_import_caches(
+            store,
+            reference,
+            &self.expected,
+            self.alias_chain.as_ref(),
+        )?;
+        if store
+            .symbol_node_links(reference)
+            .is_some_and(|links| links.resolved_symbol.is_some())
+            || store
+                .type_node_links(reference)
+                .is_some_and(|links| links.resolved_type.is_some())
+        {
+            return Err(invariant(SourceImportInvariant::InvalidTypeReferenceCache(
+                reference,
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Syntax admission retains the import binding, not an inferred target type.
+pub(super) fn namespace_heritage_type_import_binding(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    name: NodeRef,
+    alias: SemanticSymbolId,
+) -> Result<bool, SourceImportError> {
+    let record = checked_node(arena, bound, store, name)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Ok(false);
+    };
+    let host = DeclaredTypeHost::new([(arena, bound)]).map_err(DeclaredTypeError::from)?;
+    Ok(plan_named_type_import_binding(store, &host, name, &identifier.text, alias)?.is_some())
+}
+
+fn source_augmentation_interface_owner(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    owner: SemanticSymbolId,
+) -> Result<bool, SourceImportError> {
+    let invalid = || invariant(SourceImportInvariant::InvalidNode(declaration));
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let record = checked_node(arena, bound, store, declaration)?;
+    let Some(parent) = record.parent else {
+        return Ok(false);
+    };
+    let block = NodeRef::new(declaration.arena, declaration.file, parent);
+    let block_record = checked_node(arena, bound, store, block)?;
+    let NodeData::ModuleBlock(body) = &block_record.data else {
+        return Ok(false);
+    };
+    let augmentation = block_record
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(invalid)?;
+    let module_record = checked_node(arena, bound, store, augmentation)?;
+    let NodeData::ModuleDeclaration(module) = &module_record.data else {
+        return Err(invalid());
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, module.name);
+    if block_record.kind != SyntaxKind::ModuleBlock
+        || body
+            .statements
+            .nodes
+            .iter()
+            .filter(|&&node| node == declaration.node)
+            .count()
+            != 1
+        || module_record.kind != SyntaxKind::ModuleDeclaration
+        || module_record.parent != Some(bound.source_file().node)
+        || module.body != Some(block.node)
+        || !matches!(
+            host.node(name).map(|record| &record.data),
+            Some(NodeData::StringLiteral(_))
+        )
+        || !bound
+            .module_augmentations()
+            .iter()
+            .any(|entry| entry.name() == name)
+        || !host.symbol_matches(store, declaration, owner)
+        || !store.source_merged_symbol_declarations_match(owner)
+    {
+        return Err(invalid());
+    }
+    let module_symbol = bound
+        .symbol(augmentation)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    source_file_namespace_declaration(store, host, module_symbol)?;
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    if store
+        .symbol(module_symbol)
+        .and_then(|record| record.exports())
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get(owner_record.name()))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        != Some(owner)
+    {
+        return Err(invalid());
+    }
+    Ok(true)
+}
+
 pub(super) fn plan_source_interface_heritage_type_import(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -5435,6 +5577,22 @@ pub(super) fn plan_source_interface_heritage_type_import(
     owner: SemanticSymbolId,
     reference: NodeRef,
 ) -> Result<Option<SemanticSymbolId>, SourceImportError> {
+    Ok(
+        plan_source_interface_heritage_import(store, host, declaration, owner, reference)?
+            .map(|plan| plan.target_symbol()),
+    )
+}
+
+/// Proves a named type import at its real interface heritage expression.
+/// Base types and omitted defaults still use the existing heritage workers.
+#[allow(clippy::too_many_lines)]
+pub(super) fn plan_source_interface_heritage_import(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    owner: SemanticSymbolId,
+    reference: NodeRef,
+) -> Result<Option<SourceInterfaceHeritageImport>, SourceImportError> {
     let invalid = || invariant(SourceImportInvariant::InvalidNode(reference));
     let (arena, bound) = host.source(reference).ok_or_else(invalid)?;
     if bound.source_facts().is_none_or(|facts| {
@@ -5501,6 +5659,7 @@ pub(super) fn plan_source_interface_heritage_type_import(
     let NodeData::InterfaceDeclaration(interface) = &declaration_record.data else {
         return Err(invalid());
     };
+    let augmentation = source_augmentation_interface_owner(store, host, declaration, owner)?;
     if record.kind != SyntaxKind::ExpressionWithTypeArguments
         || record.flags.0 != 0
         || base.facts != 0
@@ -5518,12 +5677,16 @@ pub(super) fn plan_source_interface_heritage_type_import(
             != 1
         || declaration_record.kind != SyntaxKind::InterfaceDeclaration
         || declaration_record.flags.0 != 0
-        || declaration_record.parent != Some(bound.source_file().node)
+        || declaration_record.parent != Some(bound.source_file().node) && !augmentation
         || interface.heritage_clauses.as_ref().is_none_or(|clauses| {
             clauses.nodes.as_slice() != [clause.node] || clauses.has_trailing_comma
         })
         || !host.symbol_matches(store, declaration, owner)
-        || !store.source_symbol_declarations_match(owner)
+        || !(if augmentation {
+            store.source_merged_symbol_declarations_match(owner)
+        } else {
+            store.source_symbol_declarations_match(owner)
+        })
         || !range_contains(record, checked_node(arena, bound, store, name)?)
         || !range_contains(clause_record, record)
         || !range_contains(declaration_record, clause_record)
@@ -5535,36 +5698,50 @@ pub(super) fn plan_source_interface_heritage_type_import(
     }
 
     let (expected, alias_chain) = plan_named_type_import_target(store, host, &import, &binding)?;
-    if store
-        .symbol(expected.target_symbol)
-        .map(|symbol| symbol.flags())
-        != Some(SymbolFlags::INTERFACE)
+    let plain_alias = augmentation
+        && base.type_arguments.is_none()
+        && store
+            .symbol(expected.target_symbol)
+            .is_some_and(|record| record.flags() == SymbolFlags::TYPE_ALIAS)
+        && super::interface_heritage::source_interface_alias_base_request(
+            store,
+            expected.target_symbol,
+        )?
+        .is_some_and(|request| {
+            store.source_node_kind(request.root()) == Some(SyntaxKind::TypeLiteral)
+        });
+    if !plain_alias
+        && store
+            .symbol(expected.target_symbol)
+            .map(|symbol| symbol.flags())
+            != Some(SymbolFlags::INTERFACE)
     {
         return Err(unsupported(SourceImportUnsupported::TargetTypeShape(
             expected.target_declaration,
         )));
     }
-    validate_named_type_import_owner(
-        store,
+    let plan = SourceInterfaceHeritageImport {
         reference,
-        import.module_specifier,
-        &expected,
-        alias_chain.as_ref(),
-    )?;
-    validate_named_type_import_caches(store, reference, &expected, alias_chain.as_ref())?;
-    // Heritage execution records the base on the interface, not as a type-node query.
-    if store
-        .symbol_node_links(reference)
-        .is_some_and(|links| links.resolved_symbol.is_some())
-        || store
-            .type_node_links(reference)
-            .is_some_and(|links| links.resolved_type.is_some())
-    {
-        return Err(invariant(SourceImportInvariant::InvalidTypeReferenceCache(
-            reference,
-        )));
-    }
-    Ok(Some(expected.target_symbol))
+        module_specifier: import.module_specifier,
+        expected,
+        alias_chain,
+        module: if augmentation {
+            let Some(CanonicalModuleResolutionLookup::Resolved(resolved)) = host
+                .module_resolutions()
+                .map(|manifest| manifest.lookup(import.module_specifier))
+            else {
+                return Err(invalid());
+            };
+            let module = store
+                .get_merged_symbol(resolved.target_symbol())
+                .ok_or_else(invalid)?;
+            Some(plan_source_file_namespace(store, host, module)?)
+        } else {
+            None
+        },
+    };
+    plan.validate_current(store, reference)?;
+    Ok(Some(plan))
 }
 
 /// Reads a named type import's real target without publishing alias or type links.
@@ -6724,15 +6901,20 @@ fn validate_source_type_import_reference_source(
         )));
     }
     if let Some(links) = store.type_node_links(reference) {
-        let target_type = match store
+        let mut flags = store
             .symbol(resolved.target_symbol)
             .ok_or_else(|| {
                 invariant(SourceImportInvariant::InvalidTargetSymbol(
                     resolved.target_symbol,
                 ))
             })?
-            .flags()
+            .flags();
+        if source_merged_augmentation_interface_declaration(store, host, resolved.target_symbol)?
+            .is_some()
         {
+            flags = SymbolFlags::INTERFACE;
+        }
+        let target_type = match flags {
             SymbolFlags::TYPE_ALIAS => store
                 .type_alias_links(resolved.target_symbol)
                 .and_then(|links| links.declared_type),
@@ -8756,12 +8938,94 @@ fn validate_planned_import_read(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+/// Proves the original exported interface and every merged augmentation declaration.
+pub(super) fn source_merged_augmentation_interface_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    target: SemanticSymbolId,
+) -> Result<Option<NodeRef>, SourceImportError> {
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetSymbol(target));
+    let symbol = store.symbol(target).ok_or_else(invalid)?;
+    if symbol.flags() != (SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT) {
+        return Ok(None);
+    }
+    let declarations = symbol.declarations().ok_or_else(invalid)?;
+    if declarations.len() < 2
+        || store.get_merged_symbol(target) != Some(target)
+        || !store.source_merged_symbol_declarations_match(target)
+        || symbol.check_flags() != CheckFlags::NONE
+        || symbol.value_declaration().is_some()
+        || symbol.export_symbol().is_some()
+        || symbol.exports().is_some()
+    {
+        return Err(invalid());
+    }
+    for (index, &declaration) in declarations.iter().enumerate() {
+        let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+        let record = checked_node(arena, bound, store, declaration)?;
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            return Err(invalid());
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
+        if record.kind != SyntaxKind::InterfaceDeclaration
+            || record.flags.0 != 0
+            || interface.type_parameters.is_some()
+            || !host.symbol_matches(store, declaration, target)
+            || !matches!(host.node(name).map(|record| &record.data),
+                Some(NodeData::Identifier(identifier)) if symbol.name().as_utf8() == Some(identifier.text.as_str()))
+            || host
+                .node(name)
+                .is_none_or(|record| record.parent != Some(declaration.node))
+            || bound.source_facts().is_none_or(|facts| {
+                !facts.is_external_module()
+                    || facts.is_javascript_file()
+                    || facts.is_common_js_module()
+            })
+        {
+            return Err(invalid());
+        }
+        if index == 0 {
+            let source = bound.source_file();
+            let module = bound
+                .symbol(source)
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .ok_or_else(invalid)?;
+            if record.parent != Some(source.node)
+                || !has_exact_export_modifier(
+                    arena,
+                    bound,
+                    store,
+                    declaration,
+                    interface.modifiers.as_ref(),
+                )?
+                || source_file_namespace_declaration(store, host, module)? != source
+                || store.get_parent_of_symbol(target) != Some(module)
+                || store
+                    .symbol(module)
+                    .and_then(|record| record.exports())
+                    .and_then(|table| store.symbol_table(table))
+                    .and_then(|table| table.get(symbol.name()))
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    != Some(target)
+            {
+                return Err(invalid());
+            }
+        } else if !source_augmentation_interface_owner(store, host, declaration, target)? {
+            return Err(invalid());
+        }
+    }
+    Ok(Some(declarations[0]))
+}
+
 fn plan_direct_exported_type_target(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     alias: SemanticSymbolId,
     target: SemanticSymbolId,
 ) -> Result<NodeRef, SourceImportError> {
+    if let Some(declaration) = source_merged_augmentation_interface_declaration(store, host, target)? {
+        return Ok(declaration);
+    }
     let target_record = store
         .symbol(target)
         .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(target)))?;

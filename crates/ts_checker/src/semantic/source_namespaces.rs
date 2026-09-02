@@ -2915,6 +2915,20 @@ fn plan_namespace_interface_heritage(
         let name = child(base, reference.expression);
         let name_record = owned_node(arena, bound, store, name)?;
         let symbol = namespace_interface_heritage_symbol(arena, bound, store, namespace, name)?;
+        let imported = symbol
+            .filter(|symbol| {
+                store
+                    .symbol(*symbol)
+                    .is_some_and(|record| record.flags().contains(SymbolFlags::ALIAS))
+            })
+            .map(|symbol| {
+                super::source_imports::namespace_heritage_type_import_binding(
+                    arena, bound, store, name, symbol,
+                )
+            })
+            .transpose()
+            .map_err(|_| SourceCheckError::Import(name))?
+            .unwrap_or(false);
         if base_record.kind != SyntaxKind::ExpressionWithTypeArguments
             || base_record.flags.0 != 0
             || base_record.parent != Some(clause.node)
@@ -2923,9 +2937,10 @@ fn plan_namespace_interface_heritage(
             || symbol
                 .and_then(|symbol| store.symbol(symbol))
                 .is_none_or(|record| {
-                    !record.flags().intersects(
-                        SymbolFlags::INTERFACE | SymbolFlags::CLASS | SymbolFlags::TYPE_ALIAS,
-                    )
+                    !imported
+                        && !record.flags().intersects(
+                            SymbolFlags::INTERFACE | SymbolFlags::CLASS | SymbolFlags::TYPE_ALIAS,
+                        )
                 })
         {
             return Err(invalid(base, base_record.kind));

@@ -32281,6 +32281,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .get_merged_symbol(capability.immediate_target)
             .ok_or_else(&invalid)?;
         let target_flags = self.store.symbol(target).ok_or_else(&invalid)?.flags();
+        let merged_interface = source_imports::source_merged_augmentation_interface_declaration(
+            self.store, self.host, target,
+        )
+        .map_err(|error| property_type_import_error(node, error))?
+        .is_some();
         let immediate_flags = self
             .store
             .symbol(immediate_target)
@@ -32294,7 +32299,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || immediate_target != capability.immediate_target
             || (target_flags != SymbolFlags::TYPE_ALIAS
                 && target_flags != SymbolFlags::INTERFACE
-                && target_flags != SymbolFlags::CLASS)
+                && target_flags != SymbolFlags::CLASS
+                && !merged_interface)
             || (immediate_target != target && immediate_flags != SymbolFlags::ALIAS)
             || alias_links.immediate_target != Some(immediate_target)
             || alias_links.alias_target != super::AliasTargetState::Resolved(target)
@@ -37524,6 +37530,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .and_then(|symbol| symbol.declarations());
             let target = self.canonical_symbol(capability.target)?;
             let target_flags = self.symbol_flags(target)?;
+            let merged_interface =
+                source_imports::source_merged_augmentation_interface_declaration(
+                    self.store, self.host, target,
+                )
+                .map_err(|error| property_type_import_error(capability.reference, error))?
+                .is_some();
             let immediate_target = self.canonical_symbol(capability.immediate_target)?;
             let immediate_flags = self.symbol_flags(immediate_target)?;
             let links = self
@@ -37552,7 +37564,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 || immediate_target != capability.immediate_target
                 || (target_flags != SymbolFlags::TYPE_ALIAS
                     && target_flags != SymbolFlags::INTERFACE
-                    && target_flags != SymbolFlags::CLASS)
+                    && target_flags != SymbolFlags::CLASS
+                    && !merged_interface)
                 || (immediate_target != target && immediate_flags != SymbolFlags::ALIAS)
                 || links.immediate_target != Some(immediate_target)
                 || links.alias_target != super::AliasTargetState::Resolved(target)

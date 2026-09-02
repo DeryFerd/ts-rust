@@ -531,6 +531,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             &module_resolutions,
             &mut alias_host,
             &mut diagnostics,
+            options.name_resolution,
         )
         .map_err(CanonicalCheckerContextError::GlobalInitialization)?;
         if !store.finalize_native_ambient_module_exports(&files) {
@@ -3471,14 +3472,15 @@ impl SymbolMergeHost<super::TypeRecord, super::TypeMapper>
     }
 }
 
-/// Merges star-reexport targets before any source can cache their declared types.
-fn merge_reexported_module_augmentations<'arena>(
+/// Merges reexport targets before any source can cache their declared types.
+fn merge_reexported_module_augmentations<'source, 'arena>(
     store: &mut CanonicalTypeMapperStore,
     file_order: &[FileId],
-    files: &ProductionAliasSourceRegistry<'arena>,
+    files: &'source ProductionAliasSourceRegistry<'arena>,
     resolutions: &CanonicalModuleResolutionManifest,
-    aliases: &mut ProductionAliasTargetHost<'_, 'arena, '_>,
+    aliases: &mut ProductionAliasTargetHost<'source, 'arena, '_>,
     diagnostics: &mut CanonicalCheckerDiagnostics,
+    name_resolution_options: CanonicalNameResolverOptions,
 ) -> Result<(), CanonicalGlobalInitializationError> {
     for &file in file_order {
         let (arena, bound) = files
@@ -3527,9 +3529,29 @@ fn merge_reexported_module_augmentations<'arena>(
                     table: target_exports,
                 },
             )?;
-            if exports
+            let star_reexport = exports
                 .get(InternalSymbolName::ExportStar.as_ref())
-                .is_none()
+                .is_some();
+            let members = ordered_table_entries(store, file, source_exports)?;
+            // Earlier augmentations can replace a named export with its merged interface.
+            // The manifest still identifies the original source module and export binding.
+            let original_exports = store
+                .symbol(resolved.target_symbol())
+                .and_then(|record| record.exports())
+                .and_then(|table| store.symbol_table(table));
+            let named_type_reexport = members.iter().any(|(name, member)| {
+                store.symbol(*member).is_some_and(|record| record.flags().contains(SymbolFlags::INTERFACE))
+                    && original_exports.and_then(|exports| exports.get(name.as_ref()))
+                        .and_then(|symbol| store.symbol(symbol))
+                        .is_some_and(|record| {
+                            record.flags().contains(SymbolFlags::ALIAS)
+                                && record.declarations().is_some_and(|declarations| {
+                                    matches!(declarations, [declaration]
+                                        if store.source_node_kind(*declaration) == Some(SyntaxKind::ExportSpecifier))
+                                })
+                        })
+            });
+            if !star_reexport && !named_type_reexport
                 || exports
                     .get(InternalSymbolName::ExportEquals.as_ref())
                     .is_some()
@@ -3539,10 +3561,9 @@ fn merge_reexported_module_augmentations<'arena>(
             aliases
                 .direct_source_module(store, declaration, resolved, true)
                 .map_err(CanonicalGlobalInitializationError::ModuleAugmentationTarget)?;
-            let members = ordered_table_entries(store, file, source_exports)?;
             let mut reexports = Vec::new();
             for (name, member) in members {
-                if exports.get(name.as_ref()).is_some() {
+                if !star_reexport || exports.get(name.as_ref()).is_some() {
                     continue;
                 }
                 let Some(name) = name.as_utf8() else {
@@ -3558,11 +3579,22 @@ fn merge_reexported_module_augmentations<'arena>(
                     }
                 }
             }
-            let mut host = ModuleAugmentationMergeHost { files, diagnostics };
+            let mut host = AmbientModuleMergeHost {
+                files,
+                aliases,
+                diagnostics,
+                name_resolution_options,
+                target_error: None,
+            };
             for (previous, member) in reexports {
                 store.merge_symbol_with_host(&mut host, previous, member, false)?;
             }
-            store.merge_symbol_with_host(&mut host, target, source, false)?;
+            if let Err(error) = store.merge_symbol_with_host(&mut host, target, source, false) {
+                return Err(host.target_error.map_or_else(
+                    || CanonicalGlobalInitializationError::Merge(error),
+                    CanonicalGlobalInitializationError::ModuleAugmentationTarget,
+                ));
+            }
         }
     }
     Ok(())

@@ -86,6 +86,7 @@ pub(super) struct SourceInterfaceHeritageBase {
     symbol: SemanticSymbolId,
     alias: Option<SourceInterfaceAliasBaseRequest>,
     resolution: SourceInterfaceHeritageResolution,
+    import: Option<super::source_imports::SourceInterfaceHeritageImport>,
 }
 
 impl SourceInterfaceHeritageBase {
@@ -857,8 +858,13 @@ fn try_resolve_source_heritage_base(
     host: &DeclaredTypeHost<'_>,
     expression: NodeRef,
 ) -> Result<Option<(SemanticSymbolId, SourceInterfaceHeritageResolution)>, DeclaredTypeError> {
-    let (resolved, reads) =
-        resolve_source_identifier_with_origins(store, host, expression, SymbolFlags::TYPE, false)?;
+    let (resolved, reads) = resolve_source_identifier_with_origins(
+        store,
+        host,
+        expression,
+        SymbolFlags::TYPE | SymbolFlags::ALIAS,
+        false,
+    )?;
     let Some(symbol) = resolved
         .ok()
         .flatten()
@@ -1133,12 +1139,27 @@ pub(super) fn plan_source_interface_heritage_header(
                 .find(|(expression, _)| *expression == base.expression)
                 .and_then(|(_, resolution)| resolution.take())
                 .ok_or_else(|| source_heritage_error(base.expression))?;
-            if symbol != base.symbol {
+            let import = super::source_imports::plan_source_interface_heritage_import(
+                store,
+                host,
+                declaration,
+                owner,
+                base.node,
+            )
+            .map_err(|_| source_heritage_error(base.expression))?;
+            let expected_binding = import
+                .as_ref()
+                .map_or(base.symbol, |import| import.alias_symbol());
+            if symbol != expected_binding
+                || import
+                    .as_ref()
+                    .is_some_and(|import| import.target_symbol() != base.symbol)
+            {
                 return Err(source_heritage_error(base.expression));
             }
             let alias = if base.kind == DirectInterfaceBaseKind::NongenericTypeLiteralAlias {
                 Some(
-                    source_interface_alias_base_request(store, symbol)?
+                    source_interface_alias_base_request(store, base.symbol)?
                         .ok_or_else(|| source_heritage_error(base.expression))?,
                 )
             } else {
@@ -1149,9 +1170,10 @@ pub(super) fn plan_source_interface_heritage_header(
                 clause: planned.clause,
                 node: base.node,
                 expression: base.expression,
-                symbol,
+                symbol: base.symbol,
                 alias,
                 resolution,
+                import,
             });
         }
     }
@@ -1172,6 +1194,15 @@ fn validate_source_heritage_resolution(
     store: &CanonicalTypeMapperStore,
     base: &SourceInterfaceHeritageBase,
 ) -> bool {
+    if base.import.as_ref().is_some_and(|import| {
+        import.target_symbol() != base.symbol || import.validate_current(store, base.node).is_err()
+    }) {
+        return false;
+    }
+    let binding = base
+        .import
+        .as_ref()
+        .map_or(base.symbol, |import| import.alias_symbol());
     let reads = &base.resolution;
     if reads.globals
         != store
@@ -1261,6 +1292,7 @@ fn validate_source_heritage_resolution(
         if !valid_entry(&read.entry)
             // Imported aliases need the import resolver's own source receipt.
             || read.entry.flags.is_some_and(|flags| flags.contains(SymbolFlags::ALIAS))
+                && (base.import.is_none() || read.entry.canonical_entry != Some(binding))
         {
             return false;
         }
@@ -1278,13 +1310,13 @@ fn validate_source_heritage_resolution(
     reads
         .lookups
         .iter()
-        .any(|read| read.result == Some(base.symbol))
+        .any(|read| read.result == Some(binding))
         && store
             .symbol_node_links(base.expression)
             .is_none_or(|links| {
                 links
                     .resolved_symbol
-                    .is_none_or(|symbol| symbol == base.symbol)
+                    .is_none_or(|symbol| symbol == base.symbol || symbol == binding)
             })
 }
 
