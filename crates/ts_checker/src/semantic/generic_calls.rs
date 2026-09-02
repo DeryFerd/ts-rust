@@ -3,7 +3,8 @@
 //! The full-vector branch admits one stored signature with ordered type
 //! parameters, fixed or optional parameters whose targets are naked type
 //! parameters, canonical nested Array/interface references, nonempty property
-//! aliases in explicit calls, or authenticated fixed primitives and callbacks,
+//! aliases and queried property-object unions/intersections in explicit calls,
+//! or authenticated fixed primitives and callbacks,
 //! homogeneous Array rest parameters, queried global Array-constrained rest
 //! formals, canonical tuple rest inference, captured function-type parameters,
 //! and a mapper-supported return. Variadic tuple
@@ -73,6 +74,7 @@ use super::{
         cached_instantiation_with_vector, cached_instantiation_with_vector_and_source,
         function_instantiation_shape, instantiate_type_with_session, instantiate_type_with_source,
         instantiate_type_with_vector_and_session, instantiate_type_with_vector_and_source,
+        instantiable_intersection_projection,
     },
     instantiated_members::{
         generic_interface_call_signature_return, instantiated_interface_method_signature_return,
@@ -83,7 +85,10 @@ use super::{
         validate_generic_keyof_index_type,
     },
     mapped_types::{MappedTypeError, supported_mapped_alias_projection},
-    object_aliases::property_object_alias_nonempty_projection,
+    object_aliases::{
+        SourcePropertyObjectProjection, property_object_alias_nonempty_projection,
+        source_property_object_projection,
+    },
     object_members::{
         DeclaredMethodTypeParameterView, declared_class_method_type_parameter_view,
         declared_interface_call_type_parameter_view, declared_method_type_parameter_view,
@@ -3976,7 +3981,7 @@ fn validate_generic_call_signature_shape_worker(
         .zip(parameter_templates.iter().copied())
         .enumerate()
     {
-        let valid_template = validate_generic_parameter_template(
+        let mut valid_template = validate_generic_parameter_template(
             store,
             projected,
             &type_parameter_ids,
@@ -3984,6 +3989,31 @@ fn validate_generic_call_signature_shape_worker(
             callable.signature,
             &mut Vec::new(),
         )?;
+        if !valid_template
+            && let Some(evidence) = query_evidence
+            && let Some(parameter) = evidence.callable().parameters.get(index)
+            && parameter.symbol == symbol
+            && !parameter.optional
+            && !parameter.rest
+            && parameter.base_type(store) == Some(projected)
+            && parameter
+                .explicit_type_node()
+                .and_then(|node| evidence.annotation_type(node))
+                == Some(projected)
+            && matches!(
+                store.type_payload(projected).map(|record| record.data()),
+                Some(TypeData::Union(_) | TypeData::Intersection(_))
+            )
+        {
+            valid_template = validate_generic_object_parameter_template(
+                store,
+                projected,
+                &type_parameter_ids,
+                array_targets,
+                callable.signature,
+                &mut Vec::new(),
+            )?;
+        }
         if !valid_template
             && (index >= fixed_parameter_count
                 || !valid_fixed_generic_source_parameter_type(store, projected))
@@ -4087,6 +4117,100 @@ fn validate_generic_call_signature_shape_worker(
         return_requires_exact_cache,
         array_targets,
     })
+}
+
+/// Explicit calls map the complete queried parameter, including object intersections.
+/// Every leaf keeps its source owner and physical arguments from the normal mapper.
+fn validate_generic_object_parameter_template(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    type_parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    signature: SignatureId,
+    active_types: &mut Vec<TypeId>,
+) -> Result<bool, GenericCallVectorError> {
+    let unsupported = || GenericCallVectorUnsupported::InstantiationType { signature, type_ };
+    if active_types.len() >= InstantiationLimits::default().max_depth
+        || active_types.contains(&type_)
+    {
+        return Err(unsupported().into());
+    }
+    let record = store.type_payload(type_).ok_or_else(unsupported)?;
+    let (constituents, arguments) = match record.data() {
+        TypeData::Union(union) if union.origin.is_none() => {
+            match array_targets {
+                Some(targets) => {
+                    store.validate_cached_union_result_with_array_targets(targets, type_, None)
+                }
+                None => store.validate_cached_union_result(type_, None),
+            }
+            .map_err(|_| GenericCallVectorInvariant::InvalidUnionParameter { signature, type_ })?;
+            let arguments = match record.alias() {
+                Some(alias) => store
+                    .type_alias(alias)
+                    .ok_or_else(unsupported)?
+                    .type_arguments()
+                    .unwrap_or_default()
+                    .to_vec(),
+                None => Vec::new(),
+            };
+            (union.union.types.clone(), arguments)
+        }
+        TypeData::Intersection(_) => {
+            let projection = instantiable_intersection_projection(store, type_, array_targets)?;
+            (projection.types, projection.alias_arguments)
+        }
+        _ => {
+            let Some(projection) = source_property_object_projection(store, type_)? else {
+                return Ok(false);
+            };
+            if projection.properties().is_empty() {
+                return Ok(false);
+            }
+            let identity_arguments = if projection.identity_arguments() == projection.arguments() {
+                &[]
+            } else {
+                projection.identity_arguments()
+            };
+            (
+                Vec::new(),
+                projection
+                    .arguments()
+                    .iter()
+                    .chain(identity_arguments)
+                    .copied()
+                    .collect(),
+            )
+        }
+    };
+    active_types.push(type_);
+    let result = (|| {
+        for constituent in constituents {
+            if !validate_generic_object_parameter_template(
+                store,
+                constituent,
+                type_parameters,
+                array_targets,
+                signature,
+                active_types,
+            )? {
+                return Ok(false);
+            }
+        }
+        for argument in arguments {
+            validate_generic_mapper_type(
+                store,
+                argument,
+                type_parameters,
+                array_targets,
+                signature,
+                active_types,
+            )?;
+        }
+        Ok(true)
+    })();
+    active_types.pop();
+    result
 }
 
 fn validate_generic_parameter_template(
@@ -9645,6 +9769,27 @@ fn generic_call_type_instantiation_matches(
     let Some(template_record) = store.type_payload(template) else {
         return false;
     };
+    let canonical_compound = match template_record.data() {
+        TypeData::Intersection(_) => true,
+        TypeData::Union(_) => template_record.alias().is_some(),
+        TypeData::Object(_) => matches!(
+            source_property_object_projection(store, template),
+            Ok(Some(SourcePropertyObjectProjection::Inline(_)))
+        ),
+        _ => false,
+    };
+    if canonical_compound {
+        return !active_templates.contains(&template)
+            && cached_instantiation_with_vector(
+                store,
+                template,
+                sources,
+                targets,
+                array_targets,
+                None,
+            )
+            .is_ok_and(|cached| cached == Some(actual));
+    }
     match property_object_alias_nonempty_projection(store, template) {
         Err(_) => return false,
         Ok(Some(template_projection)) => {

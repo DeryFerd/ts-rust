@@ -2753,7 +2753,7 @@ fn function_alias_instantiation_error(
     }
 }
 
-fn instantiable_intersection_projection(
+pub(super) fn instantiable_intersection_projection(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
