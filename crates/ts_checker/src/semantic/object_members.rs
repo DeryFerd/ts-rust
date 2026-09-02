@@ -13304,19 +13304,6 @@ fn plan_members(
             return Err(invalid_plan(&provisional));
         }
     }
-    if kind != PropertyObjectKind::Interface
-        && policy == TypeLiteralMemberPolicy::General
-        && !indexes.is_empty()
-        && !properties.is_empty()
-        && indexes.iter().any(|index| {
-            store.source_node_kind(index.key_type_node) != Some(SyntaxKind::TemplateLiteralType)
-        })
-    {
-        return Err(PropertyObjectError::UnsupportedMember {
-            node: indexes[0].declaration,
-            kind: SyntaxKind::IndexSignature,
-        });
-    }
     if !call_signatures.is_empty()
         && (kind != PropertyObjectKind::Interface && !indexes.is_empty()
             || !properties.is_empty()

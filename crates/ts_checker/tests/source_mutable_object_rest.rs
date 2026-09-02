@@ -470,3 +470,46 @@ fn invalid_selected_and_rest_assignments_keep_native_errors_and_declared_types()
         );
     }
 }
+
+#[test]
+fn mixed_literal_rejects_a_property_incompatible_with_its_string_index() {
+    let parsed = parse_source_file(concat!(
+        "type Mixed = { value: string; [key: string]: number };\n",
+        "declare const input: Mixed;\n",
+        "const selected: string = input.value;\n",
+    ));
+    let read = initializer(&parsed, "selected");
+    let property_name = parsed
+        .arena
+        .iter()
+        .find_map(|(_, record)| {
+            let NodeData::PropertyDeclaration(property) = &record.data else {
+                return None;
+            };
+            named(&parsed, property.name, "value").then_some(node(&parsed, property.name))
+        })
+        .expect("the mixed literal has a real value property");
+    for query_first in [false, true] {
+        let mut checker = start(&parsed, read, query_first);
+        let [diagnostic] = checker.diagnostics().as_slice() else {
+            panic!(
+                "expected one TS2411 diagnostic: {:?}",
+                checker.diagnostics()
+            )
+        };
+        assert_eq!(diagnostic.node, Some(property_name));
+        assert_eq!(diagnostic.range_override, None);
+        assert!(diagnostic.related_information.is_empty());
+        assert_eq!(diagnostic.diagnostic.code(), 2411);
+        assert_eq!(
+            diagnostic.diagnostic.arguments,
+            ["value", "string", "string", "number"]
+        );
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Property 'value' of type 'string' is not assignable to 'string' index type 'number'."
+        );
+        let string = checker.store().intrinsic_bootstrap().unwrap().string_type;
+        replay(&mut checker, &parsed, &[(read, string)]);
+    }
+}

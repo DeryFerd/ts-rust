@@ -47797,7 +47797,6 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 &call_types,
             )
             .map_err(property_object_error)?;
-            Ok(state.type_id())
         } else {
             object_members::publish_declared_members(
                 self.store,
@@ -47807,8 +47806,182 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 &index_types,
                 &call_types,
             )
-            .map_err(property_object_error)
+            .map_err(property_object_error)?;
         }
+        self.check_type_literal_index_constraints(&literal, &types, &index_types)?;
+        Ok(state.type_id())
+    }
+
+    /// Checks the completed property types against their applicable index signatures.
+    #[allow(clippy::too_many_lines)]
+    fn check_type_literal_index_constraints(
+        &mut self,
+        literal: &PropertyObjectPlan,
+        property_types: &[TypeId],
+        index_types: &[(TypeId, TypeId)],
+    ) -> Result<(), DeclaredTypeError> {
+        if index_types.is_empty() || property_types.is_empty() {
+            return Ok(());
+        }
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidLiteralType(literal.node));
+        let unsupported = || {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node: literal.node,
+                kind: SyntaxKind::TypeLiteral,
+            })
+        };
+        let relation_error = |error| {
+            use super::relater::RelationUnavailable as Error;
+            match error {
+                Error::MissingBootstrap
+                | Error::Type(_)
+                | Error::Symbol(_)
+                | Error::MalformedLiteral(_)
+                | Error::MalformedUnion(_)
+                | Error::MalformedIntersection(_)
+                | Error::InvalidUnionAlias(_)
+                | Error::InvalidUnionPreparation(_)
+                | Error::MalformedStructuredType(_)
+                | Error::MalformedEnumType(_)
+                | Error::InvalidSymbolMembers(_)
+                | Error::RelationKeyType(_)
+                | Error::InvalidUnknownLikeUnionState(_)
+                | Error::InvalidStructuredMembers(_)
+                | Error::MalformedFunctionType(_)
+                | Error::StrictFunctionTypesOptionMismatch { .. }
+                | Error::MalformedCanonicalArrayReference(_) => invalid(),
+                _ => unsupported(),
+            }
+        };
+        let bootstrap = self.store.intrinsic_bootstrap().ok_or_else(invalid)?;
+        let number = bootstrap.number_type;
+        let undefined = bootstrap.undefined_type;
+        let include_undefined = bootstrap.options.strict_null_checks
+            && !bootstrap.options.exact_optional_property_types;
+        let mut owned_session = InstantiationSession::new(InstantiationLimits::default());
+        let session = self
+            .instantiation_session
+            .as_deref_mut()
+            .unwrap_or(&mut owned_session);
+        for (property, &declared_type) in literal.properties.iter().zip(property_types) {
+            if property.name.is_late_bound() || property.name.is_private_identifier() {
+                continue;
+            }
+            let name = property.name.as_utf8().ok_or_else(invalid)?.to_owned();
+            let limit_mark = session.limit_event_mark();
+            let property_type = if property.optional && include_undefined {
+                let mut prepared = if let Some(globals) = self.global_types.as_ref() {
+                    self.store
+                        .prepare_type_query_types_with_global_types_and_session(
+                            &[],
+                            &[],
+                            &[],
+                            1,
+                            0,
+                            globals,
+                            session,
+                        )
+                } else {
+                    self.store
+                        .prepare_type_query_types_with_session(&[], &[], &[], 1, 0, session)
+                }
+                .map_err(type_construction_error)?;
+                self.store
+                    .literal_union_type_with_alias_prepared(
+                        &[declared_type, undefined],
+                        None,
+                        &mut prepared,
+                        self.global_types.as_ref(),
+                    )
+                    .map_err(type_construction_error)?
+            } else {
+                declared_type
+            };
+            let name_type = self
+                .store
+                .regular_string_literal_type(name.clone())
+                .map_err(type_construction_error)?;
+            for &(key_type, value_type) in index_types {
+                let applies = (key_type == number
+                    && ts_jsnum::from_string(&name).to_string() == name)
+                    || self
+                        .store
+                        .is_type_assignable_to_with_session(
+                            name_type,
+                            key_type,
+                            self.global_types.as_ref(),
+                            self.options.strict_function_types,
+                            session,
+                        )
+                        .map_err(relation_error)?;
+                if !applies {
+                    continue;
+                }
+                let assignable = self
+                    .store
+                    .is_type_assignable_to_with_session(
+                        property_type,
+                        value_type,
+                        self.global_types.as_ref(),
+                        self.options.strict_function_types,
+                        session,
+                    )
+                    .map_err(relation_error)?;
+                if !assignable {
+                    let mut arguments = vec![name.clone()];
+                    for type_ in [property_type, key_type, value_type] {
+                        let text = if let Some(globals) = self.global_types.as_ref() {
+                            super::formatter::type_to_string_with_host_global_types_and_flags(
+                                self.store,
+                                self.host,
+                                globals,
+                                type_,
+                                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                            )
+                        } else {
+                            super::formatter::type_to_string_with_host_and_flags(
+                                self.store,
+                                self.host,
+                                type_,
+                                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                            )
+                        }
+                        .map_err(|error| {
+                            use super::formatter::TypeDisplayUnavailable as Error;
+                            match error {
+                                Error::Type(_)
+                                | Error::MalformedType(_)
+                                | Error::InvalidUnion(_)
+                                | Error::InvalidIntersection(_)
+                                | Error::InvalidLiteralLinks(_)
+                                | Error::MissingBootstrap
+                                | Error::SourceHost(_)
+                                | Error::Utf8TruncationBoundary { .. } => invalid(),
+                                _ => unsupported(),
+                            }
+                        })?;
+                        arguments.push(text);
+                    }
+                    self.diagnostics.lookup_or_issue(
+                        Some(property.name_node),
+                        Diagnostic::with_arguments(
+                            message_by_code(2411).expect("TS2411 is in the diagnostic catalog"),
+                            arguments,
+                        ),
+                    );
+                }
+            }
+            if session.limit_event_occurred_since(limit_mark) {
+                self.diagnostics.lookup_or_issue(
+                    Some(property.name_node),
+                    Diagnostic::new(
+                        message_by_code(2589).expect("TS2589 is in the diagnostic catalog"),
+                    ),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn execute_union_type(
