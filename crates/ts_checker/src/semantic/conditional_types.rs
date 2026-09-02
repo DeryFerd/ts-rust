@@ -2289,7 +2289,7 @@ fn conditional_identity_requires_source(
         for signature in structured.signatures.as_deref().unwrap_or_default() {
             let signature_record = store
                 .signature(*signature)
-                .ok_or(ConditionalTypeError::InvalidSignature(*signature))?;
+                .ok_or_else(|| invalid_conditional_signature(store, *signature))?;
             edges.extend(signature_record.resolved_return_type());
             edges.extend_from_slice(
                 store
@@ -2810,7 +2810,7 @@ fn validate_signature_capture_source(
             declaration,
         )
     {
-        return Err(ConditionalTypeError::InvalidSignature(signature));
+        return Err(invalid_conditional_signature(store, signature));
     }
 
     let mut parameters = Vec::new();
@@ -7140,12 +7140,12 @@ fn validate_conditional_operand_with_source(
         for (index, signature) in signatures.iter().copied().enumerate() {
             let signature_record = store
                 .signature(signature)
-                .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
+                .ok_or_else(|| invalid_conditional_signature(store, signature))?;
             if !unique.insert(signature)
                 || signature_record.flags().contains(SignatureFlags::CONSTRUCT)
                     != (index >= structured.call_signature_count)
             {
-                return Err(ConditionalTypeError::InvalidSignature(signature));
+                return Err(invalid_conditional_signature(store, signature));
             }
             if matches!(record.data(), TypeData::Object(_) | TypeData::Interface(_))
                 && store
@@ -7156,7 +7156,7 @@ fn validate_conditional_operand_with_source(
             }
             let return_type = signature_record
                 .resolved_return_type()
-                .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
+                .ok_or_else(|| invalid_conditional_signature(store, signature))?;
             dependencies.push(return_type);
             dependencies.extend(conditional_signature_parameter_types(
                 store,
@@ -7943,7 +7943,7 @@ fn contains_mapped_type_parameter_with_array_targets(
         for signature in structured.signatures.as_deref().unwrap_or_default() {
             let signature_record = store
                 .signature(*signature)
-                .ok_or(ConditionalTypeError::InvalidSignature(*signature))?;
+                .ok_or_else(|| invalid_conditional_signature(store, *signature))?;
             let outer_parameters: Vec<_> = parameters
                 .iter()
                 .copied()
@@ -8115,14 +8115,14 @@ fn contains_type_parameter_with_array_targets(
             for signature in structured.signatures.as_deref().unwrap_or_default() {
                 let signature_record = store
                     .signature(*signature)
-                    .ok_or(ConditionalTypeError::InvalidSignature(*signature))?;
+                    .ok_or_else(|| invalid_conditional_signature(store, *signature))?;
                 let mut signature_excluded = excluded.clone();
                 signature_excluded.extend(signature_record.type_parameters().iter().copied());
                 for parameter in signature_record.type_parameters() {
                     let Some(TypeData::TypeParameter(parameter)) =
                         store.type_payload(*parameter).map(TypeRecord::data)
                     else {
-                        return Err(ConditionalTypeError::InvalidSignature(*signature));
+                        return Err(invalid_conditional_signature(store, *signature));
                     };
                     if let Some(constraint) = parameter.constraint
                         && visit(
@@ -8142,7 +8142,7 @@ fn contains_type_parameter_with_array_targets(
                 }
                 let return_type = signature_record
                     .resolved_return_type()
-                    .ok_or(ConditionalTypeError::InvalidSignature(*signature))?;
+                    .ok_or_else(|| invalid_conditional_signature(store, *signature))?;
                 if visit(
                     store,
                     return_type,
@@ -9036,6 +9036,46 @@ fn inference_property_type(
     Ok(Some(proof.type_id()))
 }
 
+#[track_caller]
+fn invalid_conditional_signature(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+) -> ConditionalTypeError {
+    if !store.relation_read_observation_is_active() {
+        let record = store.signature(signature);
+        let declaration = record.and_then(|record| record.declaration());
+        let this = record.and_then(|record| record.this_parameter());
+        super::source::observe_call_failure_detail(
+            "conditional_signature_producer",
+            format_args!(
+                "line={} signature={signature:?} declaration={:?} target={:?} mapper={:?} return={:?} this={:?} arity={:?}",
+                std::panic::Location::caller().line(),
+                declaration.map(|node| (
+                    node,
+                    store.source_node_kind(node),
+                    store.source_node_start(node),
+                )),
+                record.and_then(|record| record.target()),
+                record.and_then(|record| record.mapper()),
+                record.and_then(|record| record.resolved_return_type()),
+                this.map(|symbol| (
+                    symbol,
+                    store
+                        .value_symbol_links(symbol)
+                        .and_then(|links| links.resolved_type),
+                )),
+                record.map(|record| (
+                    record.min_argument_count(),
+                    record.parameters().len(),
+                    record.has_rest_parameter(),
+                    record.type_parameters().len(),
+                )),
+            ),
+        );
+    }
+    ConditionalTypeError::InvalidSignature(signature)
+}
+
 fn conditional_signature_parameter_types(
     store: &CanonicalTypeMapperStore,
     owner: TypeId,
@@ -9049,7 +9089,7 @@ fn conditional_signature_parameter_types(
     ) {
         let (callable, _) = mapped?;
         if callable.owner != owner {
-            return Err(ConditionalTypeError::InvalidSignature(signature));
+            return Err(invalid_conditional_signature(store, signature));
         }
         let mut parameters = callable.parameters;
         parameters.extend(callable.rest_parameter);
@@ -9057,12 +9097,12 @@ fn conditional_signature_parameter_types(
     }
     let record = store
         .signature(signature)
-        .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
+        .ok_or_else(|| invalid_conditional_signature(store, signature))?;
     if let Some(parameters) = store.callable_signature_parameter_types(signature) {
         return if parameters.len() == record.parameters().len() {
             Ok(parameters.to_vec())
         } else {
-            Err(ConditionalTypeError::InvalidSignature(signature))
+            Err(invalid_conditional_signature(store, signature))
         };
     }
     if record.parameters().is_empty() {
@@ -9073,7 +9113,7 @@ fn conditional_signature_parameter_types(
         .and_then(|node| store.source_node_kind(node))
         != Some(SyntaxKind::MethodDeclaration)
     {
-        return Err(ConditionalTypeError::InvalidSignature(signature));
+        return Err(invalid_conditional_signature(store, signature));
     }
     let method = store
         .type_payload(owner)
@@ -9086,7 +9126,7 @@ fn conditional_signature_parameter_types(
                 .and_then(|class| store.source_class_provenance_for_symbol(class))
                 .is_some()
     }) {
-        return Err(ConditionalTypeError::InvalidSignature(signature));
+        return Err(invalid_conditional_signature(store, signature));
     }
     let StoredCallableSetValidation::Valid { projection, .. } =
         super::callable_sets::validate_stored_callable_set_with_array_targets(
@@ -9095,24 +9135,24 @@ fn conditional_signature_parameter_types(
             array_targets,
         )
     else {
-        return Err(ConditionalTypeError::InvalidSignature(signature));
+        return Err(invalid_conditional_signature(store, signature));
     };
     if projection.owner != owner {
-        return Err(ConditionalTypeError::InvalidSignature(signature));
+        return Err(invalid_conditional_signature(store, signature));
     }
     let Some(callable) = projection
         .call_signatures
         .iter()
         .find(|callable| callable.owner == owner && callable.signature == signature)
     else {
-        return Err(ConditionalTypeError::InvalidSignature(signature));
+        return Err(invalid_conditional_signature(store, signature));
     };
     let mut parameters = callable.parameters.clone();
     parameters.extend(callable.rest_parameter);
     if parameters.len() != record.parameters().len()
         || callable.rest_parameter.is_some() != record.has_rest_parameter()
     {
-        return Err(ConditionalTypeError::InvalidSignature(signature));
+        return Err(invalid_conditional_signature(store, signature));
     }
     Ok(parameters)
 }
@@ -9131,7 +9171,7 @@ fn conditional_signature_this_type(
     }
     let record = store
         .signature(signature)
-        .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
+        .ok_or_else(|| invalid_conditional_signature(store, signature))?;
     match (
         record.this_parameter(),
         store.callable_signature_this_parameter_type(signature),
@@ -9146,7 +9186,7 @@ fn conditional_signature_this_type(
         {
             Ok(Some(type_))
         }
-        _ => Err(ConditionalTypeError::InvalidSignature(signature)),
+        _ => Err(invalid_conditional_signature(store, signature)),
     }
 }
 
@@ -9158,17 +9198,17 @@ fn inference_signature_parts(
 ) -> Result<(Option<TypeId>, Vec<TypeId>, usize, TypeId), ConditionalTypeError> {
     let record = store
         .signature(signature)
-        .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
+        .ok_or_else(|| invalid_conditional_signature(store, signature))?;
     let minimum = usize::try_from(record.min_argument_count())
-        .map_err(|_| ConditionalTypeError::InvalidSignature(signature))?;
+        .map_err(|_| invalid_conditional_signature(store, signature))?;
     let parameters = conditional_signature_parameter_types(store, owner, signature, array_targets)?;
     let this_type = conditional_signature_this_type(store, signature, array_targets)?;
     if minimum > parameters.len() {
-        return Err(ConditionalTypeError::InvalidSignature(signature));
+        return Err(invalid_conditional_signature(store, signature));
     }
     let return_type = record
         .resolved_return_type()
-        .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
+        .ok_or_else(|| invalid_conditional_signature(store, signature))?;
     Ok((this_type, parameters, minimum, return_type))
 }
 
@@ -9188,7 +9228,7 @@ fn base_inference_signature_parts(
     )?;
     let local_parameters = store
         .signature(signature)
-        .ok_or(ConditionalTypeError::InvalidSignature(signature))?
+        .ok_or_else(|| invalid_conditional_signature(store, signature))?
         .type_parameters()
         .to_vec();
     if local_parameters.is_empty() {
@@ -9209,7 +9249,7 @@ fn base_inference_signature_parts(
         let Some(TypeData::TypeParameter(data)) =
             store.type_payload(*parameter).map(TypeRecord::data)
         else {
-            return Err(ConditionalTypeError::InvalidSignature(signature));
+            return Err(invalid_conditional_signature(store, signature));
         };
         let constraint = data.constraint.unwrap_or(unknown);
         constraints.push(
