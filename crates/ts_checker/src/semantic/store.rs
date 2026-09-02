@@ -2746,6 +2746,113 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .all(|declaration| self.source_declaration_belongs_to_symbol(*declaration, symbol))
     }
 
+    /// Retains the function rows of a global ambient function and namespace merge.
+    /// Each row and export must still belong to its original binder contribution.
+    pub(super) fn source_global_function_namespace_declarations(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<Vec<NodeRef>> {
+        let owner = self.symbol(symbol)?;
+        let globals = self.source_global_bindings.as_ref()?;
+        let original = globals.get(owner.name())?;
+        let declarations = owner.declarations()?;
+        let flags = owner.flags().without(SymbolFlags::TRANSIENT);
+        if !flags.contains(SymbolFlags::FUNCTION)
+            || !flags.intersects(SymbolFlags::MODULE)
+            || flags.bits() & !(SymbolFlags::FUNCTION | SymbolFlags::MODULE).bits() != 0
+            || owner.flags() != original.flags
+            || declarations != original.declarations()?
+            || original.symbol != symbol
+            || self.get_merged_symbol(original.table_symbol) != Some(symbol)
+            || self.get_merged_symbol(symbol) != Some(symbol)
+            || self.intrinsic_bootstrap.as_ref()?.globals != globals.table
+            || self.symbol_table(globals.table)?.get(owner.name()) != Some(original.table_symbol)
+            || !self.source_merged_symbol_declarations_match(symbol)
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.parent().is_some()
+            || owner.members().is_some()
+            || owner.export_symbol().is_some()
+        {
+            return None;
+        }
+        let mut functions = Vec::new();
+        let mut namespaces = Vec::new();
+        for &declaration in declarations {
+            let source = self.source_files.get(&declaration.file)?.node_ref();
+            let name = self.source_child_with_kind(declaration, SyntaxKind::Identifier)?;
+            if !self.source_is_script_declaration_file(declaration)
+                || self.source_node_parent(declaration) != Some(SourceNodeParent::Parent(source))
+                || self.source_identifier_text(name) != owner.name().as_utf8()
+            {
+                return None;
+            }
+            match self.source_node_kind(declaration)? {
+                SyntaxKind::FunctionDeclaration => functions.push(declaration),
+                SyntaxKind::ModuleDeclaration => namespaces.push(declaration),
+                _ => return None,
+            }
+        }
+        if functions.is_empty()
+            || namespaces.is_empty()
+            || owner.value_declaration() != functions.first().copied()
+        {
+            return None;
+        }
+        let mut expected_exports = HashMap::new();
+        for raw in std::iter::once(symbol).chain(self.merged_symbols.keys().copied()) {
+            if self.get_merged_symbol(raw) != Some(symbol) {
+                continue;
+            }
+            let Some(original) = self.source_symbol_declarations.get(&raw) else {
+                continue;
+            };
+            if !self.source_raw_symbol_declarations_match(raw)
+                || !self.source_symbol_export_table_matches(raw)
+            {
+                return None;
+            }
+            if let Some(exports) = original.exports {
+                for (name, member) in self.symbol_table(exports)?.iter() {
+                    let member = self.get_merged_symbol(member)?;
+                    if expected_exports
+                        .insert(name.to_owned(), member)
+                        .is_some_and(|previous| previous != member)
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+        let actual = owner.exports().and_then(|table| self.symbol_table(table));
+        if actual.map_or(0, |table| table.len()) != expected_exports.len() {
+            return None;
+        }
+        for (name, member) in expected_exports {
+            if actual?
+                .get(name.as_ref())
+                .and_then(|raw| self.get_merged_symbol(raw)) != Some(member)
+                || self.symbol(member)?.name() != name.as_ref()
+                || self.get_parent_of_symbol(member) != Some(symbol)
+                || !self.source_merged_symbol_declarations_match(member)
+            {
+                return None;
+            }
+            for &declaration in self.symbol(member)?.declarations()? {
+                let mut ancestor = declaration;
+                loop {
+                    let SourceNodeParent::Parent(parent) = self.source_node_parent(ancestor)? else {
+                        return None;
+                    };
+                    if namespaces.contains(&parent) {
+                        break;
+                    }
+                    ancestor = parent;
+                }
+            }
+        }
+        Some(functions)
+    }
+
     /// Proves a call member against every original interface contribution.
     pub(super) fn source_interface_call_owner(
         &self,
@@ -11917,7 +12024,12 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             let export_local = group.implementation.and_then(|_| {
                 self.source_exported_overload_local(group.owner_symbol, &declaration_order)
             });
-            if group.signatures.len() < 2
+            let global_namespace = group.implementation.is_none()
+                && self
+                    .source_global_function_namespace_declarations(group.owner_symbol)
+                    .as_deref()
+                    == Some(declaration_order.as_slice());
+            if group.signatures.len() < 2 && !global_namespace
                 || group.implementation.is_some_and(|implementation| {
                     declaration_order.last().copied() != Some(implementation.declaration)
                         || self.source_node_kind(implementation.body) != Some(SyntaxKind::Block)
@@ -11925,12 +12037,13 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                             != Some(SourceNodeParent::Parent(implementation.declaration))
                 })
                 || !owners.insert(group.owner_symbol)
-                || owner.flags() != SymbolFlags::FUNCTION
+                || !global_namespace
+                    && (owner.flags() != SymbolFlags::FUNCTION
+                        || owner.declarations() != Some(declaration_order.as_slice())
+                        || owner.exports().is_some())
                 || owner.check_flags() != CheckFlags::NONE
-                || owner.declarations() != Some(declaration_order.as_slice())
                 || owner.value_declaration() != declaration_order.first().copied()
                 || owner.members().is_some()
-                || owner.exports().is_some()
                 || owner.parent().is_some() && export_local.is_none()
                 || export_local.is_none()
                     && declaration_order.iter().any(|declaration| {
@@ -11968,7 +12081,8 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                 if !declarations.insert(signature.declaration)
                     || self.source_node_kind(signature.declaration)
                         != Some(SyntaxKind::FunctionDeclaration)
-                    || self.source_node_parent(signature.declaration) != common_parent
+                    || !global_namespace
+                        && self.source_node_parent(signature.declaration) != common_parent
                     || self
                         .signature_links(signature.declaration)
                         .is_some_and(|links| links != &SignatureLinks::default())
@@ -12126,6 +12240,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
 
         let mut published = Vec::with_capacity(group_count);
         for group in prepared {
+            let members = self.symbol(group.owner_symbol).and_then(Symbol::exports);
             let type_ = self
                 .alloc_plain_object_type(
                     super::types::ObjectFlags::ANONYMOUS,
@@ -12260,7 +12375,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             assert!(
                 self.set_structured_type_members(
                     type_,
-                    None,
+                    members,
                     None,
                     Some(
                         signature_ids

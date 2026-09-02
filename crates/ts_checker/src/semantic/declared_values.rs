@@ -163,7 +163,11 @@ pub(super) fn plan_declared_value(
             };
             let bound = host.bound_file(declaration).ok_or_else(invalid)?;
             let block_scoped = list_node.flags.0 & 3 != 0;
-            plan_variable_owner(store, host, symbol, declaration, statement)?;
+            let namespace_variable =
+                global_callable_namespace_variable(store, host, symbol, declaration, statement);
+            if !namespace_variable {
+                plan_variable_owner(store, host, symbol, declaration, statement)?;
+            }
             if list_node.kind != SyntaxKind::VariableDeclarationList
                 || list_node.flags.0 & !3 != 0
                 || declarations
@@ -175,7 +179,7 @@ pub(super) fn plan_declared_value(
                     != 1
                 || statement_node.kind != SyntaxKind::VariableStatement
                 || statement_data.declaration_list != list.node
-                || statement_node.parent != Some(bound.source_file().node)
+                || !namespace_variable && statement_node.parent != Some(bound.source_file().node)
                 || block_scoped != record.flags().contains(SymbolFlags::BLOCK_SCOPED_VARIABLE)
             {
                 return Err(invalid());
@@ -818,6 +822,82 @@ fn plan_global_augmentation_parent(
         }
     }
     Ok(())
+}
+
+fn global_callable_namespace_variable(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    statement: NodeRef,
+) -> bool {
+    let Some(owner) = store.get_parent_of_symbol(symbol) else {
+        return false;
+    };
+    if store
+        .source_global_function_namespace_declarations(owner)
+        .is_none()
+    {
+        return false;
+    }
+    let Some(bound) = host.bound_file(declaration) else {
+        return false;
+    };
+    let Some(statement_node) = host.node(statement) else {
+        return false;
+    };
+    let NodeData::VariableStatement(variable) = &statement_node.data else {
+        return false;
+    };
+    let Some(block) = statement_node
+        .parent
+        .map(|node| NodeRef::new(statement.arena, statement.file, node))
+    else {
+        return false;
+    };
+    let Some(block_node) = host.node(block) else {
+        return false;
+    };
+    let NodeData::ModuleBlock(block_data) = &block_node.data else {
+        return false;
+    };
+    let Some(module) = block_node
+        .parent
+        .map(|node| NodeRef::new(block.arena, block.file, node))
+    else {
+        return false;
+    };
+    let Some(NodeData::ModuleDeclaration(module_data)) = host.node(module).map(|node| &node.data)
+    else {
+        return false;
+    };
+    statement_node.flags.0 == 0
+        && variable.flow_node.is_none()
+        && variable.facts == 0
+        && module_data.body == Some(block.node)
+        && bound.symbol(module).and_then(|raw| store.get_merged_symbol(raw)) == Some(owner)
+        && block_data
+            .statements
+            .nodes
+            .iter()
+            .filter(|&&node| node == statement.node)
+            .count() == 1
+        && store.symbol(symbol).is_some_and(|value| {
+            value.declarations() == Some(&[declaration])
+                && bound.local_symbol(declaration).is_none_or(|local| {
+                    store.symbol(local).is_some_and(|local| {
+                        local.flags() == SymbolFlags::EXPORT_VALUE
+                            && local.check_flags() == CheckFlags::NONE
+                            && local.name() == value.name()
+                            && local.declarations() == Some(&[declaration])
+                            && local.value_declaration().is_none()
+                            && local.parent().is_none()
+                            && local.members().is_none()
+                            && local.exports().is_none()
+                            && local.export_symbol() == bound.symbol(declaration)
+                    })
+                })
+        })
 }
 
 fn plan_variable_owner(

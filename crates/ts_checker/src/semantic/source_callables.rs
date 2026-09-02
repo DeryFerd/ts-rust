@@ -3413,7 +3413,20 @@ fn plan_source_callable_with_owner_shape(
             SourceCallableUnsupported::Modifiers(declaration),
         ));
     }
-    if bound.symbol(declaration) != Some(owner_symbol)
+    let global_namespace_functions =
+        store.source_global_function_namespace_declarations(owner_symbol);
+    let global_namespace_overload = matches!(
+        owner_shape,
+        SourceCallableOwnerShape::AmbientOverload(declarations)
+            if global_namespace_functions.as_deref() == Some(declarations)
+                && declarations.contains(&declaration)
+    );
+    if (bound.symbol(declaration) != Some(owner_symbol)
+        && !(global_namespace_overload
+            && bound
+                .symbol(declaration)
+                .and_then(|raw| store.get_merged_symbol(raw))
+                == Some(owner_symbol)))
         || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
     {
         return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
@@ -3441,9 +3454,9 @@ fn plan_source_callable_with_owner_shape(
         }
         SourceCallableOwnerShape::AmbientOverload(declarations)
         | SourceCallableOwnerShape::JavaScriptOverload(declarations) => {
-            declarations.len() >= 2
+            (declarations.len() >= 2 || global_namespace_overload)
                 && declarations.contains(&declaration)
-                && owner.declarations() == Some(declarations)
+                && (owner.declarations() == Some(declarations) || global_namespace_overload)
                 && owner.value_declaration() == declarations.first().copied()
                 && owner.parent().is_none()
                 && export_local.is_none()
@@ -3482,7 +3495,9 @@ fn plan_source_callable_with_owner_shape(
         body_mode,
         &view,
     )?;
-    let exports_valid = if object_literal_method {
+    let exports_valid = if global_namespace_overload {
+        true
+    } else if object_literal_method {
         owner.exports().is_none()
     } else if view.family == SourceCallableFamily::ArrowFunction {
         bound_source_arrow_owner_expando_exports_are_valid(store, host, declaration, owner_symbol)

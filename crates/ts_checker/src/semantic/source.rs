@@ -32664,32 +32664,42 @@ fn valid_range(
     source_text.is_none_or(|text| usize::try_from(end).is_ok_and(|end| end <= text.len()))
 }
 
+enum PlannedGlobalSourceCallable {
+    Single(SourceCallablePlan),
+    Namespace(SourceOverloadPlan),
+}
+
 fn plan_default_library_source_callable(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
     symbol: SemanticSymbolId,
     array_targets: Option<CanonicalArrayTargets>,
-) -> Result<Option<SourceCallablePlan>, SourceCheckError> {
+) -> Result<Option<PlannedGlobalSourceCallable>, SourceCheckError> {
     let invalid = || SourceCheckError::Function(SourceFunctionInvariant::Callable(node));
     let owner = store.symbol(symbol).ok_or_else(invalid)?;
-    let Some([declaration]) = owner.declarations() else {
+    let namespace_functions = store.source_global_function_namespace_declarations(symbol);
+    let declaration = if let Some(declarations) = &namespace_functions {
+        *declarations.first().ok_or_else(invalid)?
+    } else if let Some([declaration]) = owner.declarations() {
+        *declaration
+    } else {
         return Ok(None);
     };
-    let declaration = *declaration;
     let Some(bound) = host.bound_file(declaration) else {
         return Ok(None);
     };
-    if !bound
-        .source_facts()
-        .is_some_and(|facts| facts.is_default_library() && facts.is_declaration_file())
+    if namespace_functions.is_none()
+        && !bound
+            .source_facts()
+            .is_some_and(|facts| facts.is_default_library() && facts.is_declaration_file())
     {
         return Ok(None);
     }
     let Some(NodeData::Identifier(identifier)) = host.node(node).map(|record| &record.data) else {
         return Err(invalid());
     };
-    if owner.flags() != SymbolFlags::FUNCTION
+    if namespace_functions.is_none() && owner.flags() != SymbolFlags::FUNCTION
         || owner.parent().is_some()
         || owner.value_declaration() != Some(declaration)
         || owner.name().as_utf8() != Some(identifier.text.as_str())
@@ -32728,6 +32738,17 @@ fn plan_default_library_source_callable(
     if resolved != Some(symbol) {
         return Err(invalid());
     }
+    if let Some(declarations) = namespace_functions {
+        let plan = plan_source_ambient_overload_group(
+            store,
+            host,
+            symbol,
+            &declarations,
+            array_targets,
+        )
+        .map_err(|error| SourcePlanner::overload_plan_error(node, error))?;
+        return Ok(Some(PlannedGlobalSourceCallable::Namespace(plan)));
+    }
     let callable = plan_source_callable(store, host, declaration, symbol, array_targets)
         .map_err(SourcePlanner::callable_plan_error)?;
     if callable.body_mode != SourceCallableBodyMode::AmbientDeclaration
@@ -32753,7 +32774,7 @@ fn plan_default_library_source_callable(
             UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(declaration)),
         ));
     }
-    Ok(Some(callable))
+    Ok(Some(PlannedGlobalSourceCallable::Single(callable)))
 }
 
 pub(super) fn source_new_error(expression: NodeRef, error: SourceNewError) -> SourceCheckError {
@@ -38346,16 +38367,36 @@ fn check_expression_type_with_capture_context(
             .ok_or(SourceCheckError::Function(
                 SourceFunctionInvariant::MissingCallableType(read.value_symbol),
             ))?;
-            session.reset_query();
-            let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                diagnostics,
-            )?
-            .get_type_of_source_callable(callable.declaration, callable.owner_symbol)?;
+            let type_ = match callable {
+                PlannedGlobalSourceCallable::Single(callable) => {
+                    session.reset_query();
+                    CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                    )?
+                    .get_type_of_source_callable(callable.declaration, callable.owner_symbol)?
+                }
+                PlannedGlobalSourceCallable::Namespace(overload) => {
+                    materialize_source_overloads(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        std::slice::from_ref(&overload),
+                    )?
+                    .first()
+                    .ok_or(SourceCheckError::Function(
+                        SourceFunctionInvariant::MissingCallableType(read.value_symbol),
+                    ))?
+                    .type_
+                }
+            };
             publish_expression_type(store, expression.node, type_)?;
             if !store.try_reserve_symbol_node_links(1)
                 || !store.set_symbol_node_links(
@@ -39134,6 +39175,40 @@ fn check_expression_type_with_capture_context(
                 class_flow.as_deref_mut(),
                 arrow_capture,
             )?;
+            let namespace_member = store
+                .type_payload(receiver.result)
+                .and_then(|record| record.symbol())
+                .filter(|owner| {
+                    store.source_overload_type_for_owner(*owner) == Some(receiver.result)
+                        && store.source_global_function_namespace_declarations(*owner).is_some()
+                })
+                .and_then(|owner| store.symbol(owner).and_then(|record| record.exports()))
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get_source(&property.name))
+                .and_then(|member| store.get_merged_symbol(member))
+                .filter(|member| {
+                    store.symbol(*member).is_some_and(|record| {
+                        record.flags().intersects(
+                            SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                                | SymbolFlags::BLOCK_SCOPED_VARIABLE,
+                        )
+                    })
+                });
+            if let Some(member) = namespace_member {
+                session.reset_query();
+                let mut member_diagnostics = CanonicalCheckerDiagnostics::default();
+                let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut member_diagnostics,
+                )?
+                .get_type_of_declared_value(member);
+                merge_retry_diagnostics(diagnostics, member_diagnostics);
+                result?;
+            }
             let checked = if let Some(checked) = check_own_class_property_flow_read(
                 store,
                 host,

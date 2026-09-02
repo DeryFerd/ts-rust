@@ -778,7 +778,12 @@ fn plan_source_overload_group(
             SourceOverloadInvariant::EmptyGroup,
         ));
     };
-    if declarations.len() < 2
+    let global_namespace = implementation.is_none()
+        && store
+            .source_global_function_namespace_declarations(owner_symbol)
+            .as_deref()
+            == Some(declarations);
+    if declarations.len() < 2 && !global_namespace
         || declarations
             .iter()
             .enumerate()
@@ -788,9 +793,10 @@ fn plan_source_overload_group(
             SourceOverloadInvariant::Group(first),
         ));
     }
-    if declarations
-        .iter()
-        .any(|declaration| !declaration.is_for(first.arena, first.file))
+    if !global_namespace
+        && declarations
+            .iter()
+            .any(|declaration| !declaration.is_for(first.arena, first.file))
     {
         return Err(SourceOverloadError::Unsupported(first));
     }
@@ -801,10 +807,11 @@ fn plan_source_overload_group(
         ))?;
     let export_local = implementation
         .and_then(|_| store.source_exported_overload_local(owner_symbol, declarations));
-    if owner.flags() != SymbolFlags::FUNCTION
-        || owner.declarations() != Some(declarations)
+    if !global_namespace
+        && (owner.flags() != SymbolFlags::FUNCTION
+            || owner.declarations() != Some(declarations)
+            || owner.exports().is_some())
         || owner.value_declaration() != Some(first)
-        || owner.exports().is_some()
         || owner.parent().is_some() && export_local.is_none()
         || export_local.is_none()
             && declarations.iter().any(|declaration| {
@@ -832,7 +839,13 @@ fn plan_source_overload_group(
             .ok_or(SourceOverloadError::Invariant(
                 SourceOverloadInvariant::Group(*declaration),
             ))?;
-        if bound.symbol(*declaration) != Some(owner_symbol) {
+        if bound.symbol(*declaration) != Some(owner_symbol)
+            && !(global_namespace
+                && bound
+                    .symbol(*declaration)
+                    .and_then(|raw| store.get_merged_symbol(raw))
+                    == Some(owner_symbol))
+        {
             return Err(SourceOverloadError::Invariant(
                 SourceOverloadInvariant::Group(*declaration),
             ));
@@ -1175,7 +1188,17 @@ fn source_overload_state(
         .ok_or(SourceOverloadError::Invariant(
             SourceOverloadInvariant::EmptyGroup,
         ))?;
-    if plan.declarations.len() < 2
+    let declaration_nodes = plan
+        .declarations
+        .iter()
+        .map(|row| row.declaration)
+        .collect::<Vec<_>>();
+    let global_namespace = plan.implementation.is_none()
+        && store
+            .source_global_function_namespace_declarations(plan.owner_symbol)
+            .as_deref()
+            == Some(declaration_nodes.as_slice());
+    if plan.declarations.len() < 2 && !global_namespace
         || plan
             .declarations
             .iter()
@@ -1446,17 +1469,23 @@ pub(super) fn validate_stored_source_overload(
     let export_local = provenance
         .implementation
         .and_then(|_| store.source_exported_overload_local(owner_symbol, &declarations));
+    let global_namespace = provenance.implementation.is_none()
+        && store
+            .source_global_function_namespace_declarations(owner_symbol)
+            .as_deref()
+            == Some(declarations.as_slice());
     let TypeData::Object(object) = record.data() else {
         return StoredSourceOverloadValidation::Malformed;
     };
     if provenance.owner_symbol != owner_symbol
-        || provenance.signatures.len() < 2
-        || owner.flags() != SymbolFlags::FUNCTION
+        || provenance.signatures.len() < 2 && !global_namespace
+        || !global_namespace
+            && (owner.flags() != SymbolFlags::FUNCTION
+                || owner.declarations() != Some(declarations.as_slice())
+                || owner.exports().is_some())
         || owner.check_flags() != CheckFlags::NONE
-        || owner.declarations() != Some(declarations.as_slice())
         || owner.value_declaration() != declarations.first().copied()
         || owner.members().is_some()
-        || owner.exports().is_some()
         || owner.parent().is_some() && export_local.is_none()
         || export_local.is_none()
             && declarations.iter().any(|declaration| {
@@ -1479,7 +1508,7 @@ pub(super) fn validate_stored_source_overload(
         || object.mapper.is_some()
         || object.instantiations != TypeCacheState::Unallocated
         || object.structured.constrained != ConstrainedTypeData::default()
-        || object.structured.members.is_some()
+        || object.structured.members != if global_namespace { owner.exports() } else { None }
         || object.structured.properties.is_some()
         || object.structured.signatures.as_deref() != Some(&signatures[..public_count])
         || object.structured.call_signature_count != public_count
