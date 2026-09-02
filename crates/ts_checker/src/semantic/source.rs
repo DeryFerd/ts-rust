@@ -24993,6 +24993,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     let target = self.reference(satisfaction.type_);
                     return Ok(self.node(target)?.parent == Some(parent.node));
                 }
+                NodeData::VariableDeclaration(variable)
+                    if record.kind == SyntaxKind::VariableDeclaration
+                        && variable.initializer == Some(object.node) =>
+                {
+                    let Some(annotation) = variable.type_ else {
+                        return Ok(false);
+                    };
+                    let target = self.reference(annotation);
+                    return Ok(self.node(target)?.parent == Some(parent.node));
+                }
                 NodeData::CallExpression(call)
                     if record.kind == SyntaxKind::CallExpression
                         && call
