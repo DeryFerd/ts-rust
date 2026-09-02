@@ -1333,15 +1333,21 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.validate_union_structure(union)?;
         let record = self
             .type_payload(union)
-            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
+            .ok_or_else(|| self.invalid_cached_union_at(union, "union_cache.missing_type"))?;
         let TypeData::Union(data) = record.data() else {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            return Err(self.invalid_cached_union_at(union, "union_cache.not_union"));
         };
-        if data.union.types != key.types
-            || self.checked_union_alias(union, record.alias())? != key.alias
-            || !self.union_origin_matches(union, data.origin, key.origin.as_ref())
-        {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        let guard = if data.union.types != key.types {
+            Some("union_cache.members")
+        } else if self.checked_union_alias(union, record.alias())? != key.alias {
+            Some("union_cache.alias")
+        } else if !self.union_origin_matches(union, data.origin, key.origin.as_ref()) {
+            Some("union_cache.origin")
+        } else {
+            None
+        };
+        if let Some(guard) = guard {
+            return Err(self.invalid_cached_union_at(union, guard));
         }
         Ok(())
     }
@@ -1470,14 +1476,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         };
         let alias = self
             .type_alias(alias)
-            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
+            .ok_or_else(|| self.invalid_cached_union_at(union, "union_alias.missing_identity"))?;
         let symbol = alias
             .symbol()
             .filter(|symbol| self.valid_union_alias_symbol(*symbol))
-            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
+            .ok_or_else(|| self.invalid_cached_union_at(union, "union_alias.symbol"))?;
         let key = UnionAliasCacheKey::new(symbol, alias.type_arguments().unwrap_or_default());
         if !self.valid_union_alias_key(Some(&key)) {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            return Err(self.invalid_cached_union_at(union, "union_alias.key"));
         }
         Ok(Some(key))
     }
@@ -1522,22 +1528,29 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return if alias.is_none() && data.origin.is_none() {
                 Ok(())
             } else {
-                Err(LiteralTypeCacheError::InvalidCachedUnion(union))
+                Err(self.invalid_cached_union_at(union, "union_creation.missing_proof"))
             };
         };
-        if proof.key.alias != alias
-            || proof.key.types != data.union.types
-            || !self.union_origin_matches(union, data.origin, proof.key.origin.as_ref())
-            || proof.owners.iter().any(|expected| {
-                self.symbol(expected.symbol).is_none_or(|owner| {
-                    self.get_merged_symbol(expected.symbol) != Some(expected.symbol)
-                        || owner.flags() != expected.flags
-                        || owner.parent() != expected.parent
-                        || owner.declarations() != expected.declarations.as_deref()
-                })
+        let guard = if proof.key.alias != alias {
+            Some("union_creation.alias")
+        } else if proof.key.types != data.union.types {
+            Some("union_creation.members")
+        } else if !self.union_origin_matches(union, data.origin, proof.key.origin.as_ref()) {
+            Some("union_creation.origin")
+        } else if proof.owners.iter().any(|expected| {
+            self.symbol(expected.symbol).is_none_or(|owner| {
+                self.get_merged_symbol(expected.symbol) != Some(expected.symbol)
+                    || owner.flags() != expected.flags
+                    || owner.parent() != expected.parent
+                    || owner.declarations() != expected.declarations.as_deref()
             })
-        {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        }) {
+            Some("union_creation.source_owner")
+        } else {
+            None
+        };
+        if let Some(guard) = guard {
+            return Err(self.invalid_cached_union_at(union, guard));
         }
         Ok(())
     }
@@ -1676,10 +1689,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         origin: TypeId,
     ) -> Result<(), LiteralTypeCacheError> {
         let Some(record) = self.type_payload(origin) else {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            return Err(self.invalid_cached_union_at(union, "union_origin.missing_type"));
         };
         if origin == union {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            return Err(self.invalid_cached_union_at(union, "union_origin.self_reference"));
         }
         match record.data() {
             TypeData::Union(data)
@@ -1703,29 +1716,179 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             {
                 Ok(())
             }
-            _ => Err(LiteralTypeCacheError::InvalidCachedUnion(union)),
+            _ => {
+                self.trace_cached_union_failure("union_origin.shape", origin, &union);
+                Err(LiteralTypeCacheError::InvalidCachedUnion(union))
+            }
         }
+    }
+
+    pub(super) fn invalid_cached_union_at(
+        &self,
+        union: TypeId,
+        guard: &str,
+    ) -> LiteralTypeCacheError {
+        let error = LiteralTypeCacheError::InvalidCachedUnion(union);
+        self.trace_cached_union_failure(guard, union, &error);
+        error
+    }
+
+    /// Records one failed check without demanding types or extending observations.
+    pub(super) fn trace_cached_union_failure(
+        &self,
+        guard: &str,
+        type_: TypeId,
+        cause: &dyn std::fmt::Debug,
+    ) {
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+
+        if self.relation_read_observation_is_active() {
+            return;
+        }
+        struct TraceBuffer {
+            bytes: [u8; 4096],
+            len: usize,
+        }
+        impl std::fmt::Write for TraceBuffer {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                let mut count = text.len().min(self.bytes.len() - 1 - self.len);
+                while !text.is_char_boundary(count) {
+                    count -= 1;
+                }
+                self.bytes[self.len..self.len + count].copy_from_slice(&text.as_bytes()[..count]);
+                self.len += count;
+                if count == text.len() {
+                    Ok(())
+                } else {
+                    Err(std::fmt::Error)
+                }
+            }
+        }
+        let mut trace = TraceBuffer {
+            bytes: [0; 4096],
+            len: 0,
+        };
+        let _ = write!(
+            trace,
+            "CACHED_UNION_FAILURE guard={guard} type={type_:?} cause={cause:?}"
+        );
+        let root = self.type_payload(type_);
+        let alias = root
+            .and_then(TypeRecord::alias)
+            .and_then(|alias| self.type_alias(alias));
+        let alias_symbol = alias.and_then(super::type_records::TypeAlias::symbol);
+        let owner = alias_symbol.and_then(|symbol| self.symbol(symbol));
+        let arguments = alias
+            .and_then(super::type_records::TypeAlias::type_arguments)
+            .unwrap_or_default();
+        let formals = alias_symbol
+            .and_then(|symbol| self.type_alias_links(symbol))
+            .and_then(|links| links.type_parameters.as_deref());
+        let (origin, members) = match root.map(TypeRecord::data) {
+            Some(TypeData::Union(data)) => (data.origin, data.union.types.as_slice()),
+            _ => (None, &[][..]),
+        };
+        let _ = write!(
+            trace,
+            " alias={alias_symbol:?} alias_name={:?} declaration={:?} argument_count={} formal_count={:?} origin={origin:?} member_count={}",
+            owner.and_then(|symbol| symbol.name().as_utf8()),
+            owner
+                .and_then(|symbol| symbol.declarations())
+                .and_then(|nodes| nodes.first()),
+            arguments.len(),
+            formals.map(|parameters| parameters.len()),
+            members.len(),
+        );
+        for (role, candidate) in std::iter::once(("root", type_))
+            .chain(
+                formals
+                    .unwrap_or_default()
+                    .iter()
+                    .take(2)
+                    .map(|type_| ("formal", *type_)),
+            )
+            .chain(arguments.iter().take(2).map(|type_| ("alias_argument", *type_)))
+            .chain(members.iter().take(2).map(|type_| ("member", *type_)))
+        {
+            let record = self.type_payload(candidate);
+            let symbol = record.and_then(TypeRecord::symbol);
+            let owner = symbol.and_then(|symbol| self.symbol(symbol));
+            let kind = record.map(|record| match record.data() {
+                TypeData::Intrinsic(_) => "intrinsic",
+                TypeData::Literal(_) => "literal",
+                TypeData::TypeParameter(_) => "parameter",
+                TypeData::Tuple(_) => "tuple",
+                TypeData::TypeReference(_) => "reference",
+                TypeData::Mapped(_) => "mapped",
+                TypeData::Union(_) => "union",
+                _ => "other",
+            });
+            let parameter = match record.map(TypeRecord::data) {
+                Some(TypeData::TypeParameter(data)) => Some((
+                    data.constraint,
+                    data.target,
+                    data.mapper,
+                    data.resolved_default_type,
+                )),
+                _ => None,
+            };
+            let reference = match record.map(TypeRecord::data) {
+                Some(TypeData::TypeReference(data)) => {
+                    let arguments = data.resolved_type_arguments.as_deref().unwrap_or_default();
+                    Some((
+                        data.object.target,
+                        arguments.len(),
+                        &arguments[..arguments.len().min(2)],
+                    ))
+                }
+                _ => None,
+            };
+            let _ = write!(
+                trace,
+                "\nCACHED_UNION_TYPE role={role} type={candidate:?} kind={kind:?} flags={:?} object_flags={:?} symbol={symbol:?} name={:?} declaration={:?} parameter={parameter:?} reference={reference:?}",
+                record.map(TypeRecord::flags),
+                record.map(TypeRecord::object_flags),
+                owner.and_then(|symbol| symbol.name().as_utf8()),
+                owner
+                    .and_then(|symbol| symbol.declarations())
+                    .and_then(|nodes| nodes.first()),
+            );
+        }
+        trace.bytes[trace.len] = b'\n';
+        trace.len += 1;
+        let _ = std::io::stderr().lock().write_all(&trace.bytes[..trace.len]);
     }
 
     fn validate_union_structure(&self, union: TypeId) -> Result<(), LiteralTypeCacheError> {
         let Some(record) = self.type_payload(union) else {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            return Err(self.invalid_cached_union_at(union, "union_structure.missing_type"));
         };
         let TypeData::Union(data) = record.data() else {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            return Err(self.invalid_cached_union_at(union, "union_structure.not_union"));
         };
-        if data.union.types.len() < 2
-            || record.symbol().is_some()
-            || data
-                .union
-                .types
-                .iter()
-                .any(|constituent| self.type_payload(*constituent).is_none())
-            || record.flags() != self.expected_union_type_flags(&data.union.types)?
-            || !self.union_object_flags_match(&data.union.types, record.object_flags())?
-            || !self.union_types_are_strictly_sorted(&data.union.types)
+        let guard = if data.union.types.len() < 2 {
+            Some("union_structure.member_count")
+        } else if record.symbol().is_some() {
+            Some("union_structure.symbol")
+        } else if data
+            .union
+            .types
+            .iter()
+            .any(|constituent| self.type_payload(*constituent).is_none())
         {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            Some("union_structure.missing_member")
+        } else if record.flags() != self.expected_union_type_flags(&data.union.types)? {
+            Some("union_structure.type_flags")
+        } else if !self.union_object_flags_match(&data.union.types, record.object_flags())? {
+            Some("union_structure.object_flags")
+        } else if !self.union_types_are_strictly_sorted(&data.union.types) {
+            Some("union_structure.member_order")
+        } else {
+            None
+        };
+        if let Some(guard) = guard {
+            return Err(self.invalid_cached_union_at(union, guard));
         }
         self.validate_union_creation(union, record, data)?;
         if let Some(origin) = data.origin {
@@ -1886,13 +2049,18 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     ) -> Result<(), LiteralTypeCacheError> {
         let record = self
             .type_payload(type_)
-            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
+            .ok_or_else(|| self.invalid_cached_union_at(type_, "union_identity.missing_type"))?;
         // Union reduction returns the remaining type without a new alias.
         if matches!(record.data(), TypeData::Union(_)) {
             self.validate_union_structure(type_)?;
             if self.checked_union_alias(type_, record.alias())?
                 != Some(UnionAliasCacheKey::new(symbol, arguments))
             {
+                self.trace_cached_union_failure(
+                    "union_identity.expected_alias",
+                    type_,
+                    &(symbol, arguments),
+                );
                 return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
             }
         }
@@ -2114,6 +2282,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .map(|alias| alias.symbol)
                 != Some(expected_alias)
         {
+            self.trace_cached_union_failure("union_result.expected_alias", type_, &expected_alias);
             return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
         }
         Ok(())
@@ -2311,7 +2480,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let alias = self.checked_union_alias(union, record.alias())?;
         let origin = data.origin.map(|origin| {
             let Some(record) = self.type_payload(origin) else {
-                return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+                return Err(self.invalid_cached_union_at(union, "union_key.missing_origin"));
             };
             match record.data() {
                 TypeData::Union(origin) => Ok(UnionOriginCacheKey::DenormalizedUnion(
@@ -2320,7 +2489,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 TypeData::Index(_) if self.valid_index_union_origin(origin) => {
                     Ok(UnionOriginCacheKey::Index(origin))
                 }
-                _ => Err(LiteralTypeCacheError::InvalidCachedUnion(union)),
+                _ => Err(self.invalid_cached_union_at(union, "union_key.origin_kind")),
             }
         });
         let origin = match origin {
@@ -2338,6 +2507,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .and_then(|bootstrap| bootstrap.union_types.get(&key))
             .copied();
         if cached != Some(union) {
+            self.trace_cached_union_failure("union_key.cache_entry", union, &cached);
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         }
         Ok(key)
@@ -4738,10 +4908,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     ) -> Result<(), LiteralTypeCacheError> {
         let tuple = self
             .canonical_tuple_shape(type_)
-            .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?
+            .map_err(|error| {
+                self.trace_cached_union_failure("union_tuple.canonical_shape", type_, &error);
+                LiteralTypeCacheError::InvalidCachedUnion(type_)
+            })?
             .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
         if !visiting.insert(type_) {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+            return Err(self.invalid_cached_union_at(type_, "union_tuple.cycle"));
         }
         // Declared members can refer back to this tuple. Direct containment
         // cycles still fail through the separate structural visiting set.
@@ -5092,7 +5265,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             Ok(()) => return Ok(()),
             Err(LiteralTypeCacheError::UnsupportedUnionConstituent(rejected))
                 if rejected == type_ => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                if matches!(&error, LiteralTypeCacheError::InvalidCachedUnion(_)) {
+                    self.trace_cached_union_failure("union_record.callable_proof", type_, &error);
+                }
+                return Err(error);
+            }
         }
         // Callable Records retain the signature checks on their existing path.
         if mapped.template_type.is_none_or(|value| {
@@ -5105,10 +5283,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
         let edges = self
             .record_mapped_alias_type_edges(type_)
-            .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?
+            .map_err(|error| {
+                self.trace_cached_union_failure("union_record.source_proof", type_, &error);
+                LiteralTypeCacheError::InvalidCachedUnion(type_)
+            })?
             .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
         if !visiting.insert(type_) {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+            return Err(self.invalid_cached_union_at(type_, "union_record.cycle"));
         }
         let result = edges.into_iter().try_for_each(|edge| {
             self.validate_union_constituent_worker(
@@ -5789,7 +5970,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         TypeFlags::NONE
                     };
                 if record.flags() != expected_flags {
-                    return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                    return Err(self.invalid_cached_union_at(type_, "union_constituent.type_flags"));
                 }
                 if let Some(origin) = data.origin {
                     self.validate_supported_union_origin(
@@ -5902,6 +6083,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             )?;
         }
         if leaf_count != normalized.len() || flattened != normalized {
+            self.trace_cached_union_failure(
+                "union_origin.normalized_members",
+                union,
+                &(leaf_count, normalized, &flattened),
+            );
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         }
         Ok(())

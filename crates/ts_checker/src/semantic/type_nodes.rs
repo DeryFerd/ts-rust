@@ -8061,6 +8061,13 @@ fn generic_global_instantiation_argument(
 }
 
 fn type_construction_error(error: LiteralTypeCacheError) -> DeclaredTypeError {
+    if matches!(&error, LiteralTypeCacheError::InvalidCachedUnion(_)) {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "UNION_TYPE_CONVERSION original={error:?}"
+        );
+    }
     match error {
         LiteralTypeCacheError::BootstrapUninitialized => DeclaredTypeError::Unavailable(
             DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
@@ -19346,7 +19353,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             if let Some(cycle_start) = visited.get(&symbol).copied() {
                 if remains_union {
                     return Err(type_construction_error(
-                        LiteralTypeCacheError::InvalidCachedUnion(declared_type),
+                        self.store
+                            .invalid_cached_union_at(declared_type, "alias_replay.cycle"),
                     ));
                 }
                 let is_canonical_cycle_error = self
@@ -19564,7 +19572,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     }
                     if remains_union {
                         return Err(type_construction_error(
-                            LiteralTypeCacheError::InvalidCachedUnion(declared_type),
+                            self.store.invalid_cached_union_at(
+                                declared_type,
+                                "alias_replay.non_union_rhs",
+                            ),
                         ));
                     }
                     return Ok(());
@@ -20009,7 +20020,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         }
                         if remains_union {
                             return Err(type_construction_error(
-                                LiteralTypeCacheError::InvalidCachedUnion(declared_type),
+                                self.store.invalid_cached_union_at(
+                                    declared_type,
+                                    "alias_replay.non_alias_reference",
+                                ),
                             ));
                         }
                         return Ok(());
@@ -42943,10 +42957,39 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         &error,
                     );
                 }
+                if let DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidCachedUnionType(type_),
+                ) = &error
+                    && !self.store.relation_read_observation_is_active()
+                {
+                    trace_alias_instantiation_failure(
+                        self.store,
+                        "union_declaration_children",
+                        symbol,
+                        Some(*type_),
+                        &error,
+                    );
+                }
                 error
             })?;
         }
-        let type_ = self.get_declared_type_of_symbol_worker(symbol, true)?;
+        let type_ = self
+            .get_declared_type_of_symbol_worker(symbol, true)
+            .inspect_err(|error| {
+                if let DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidCachedUnionType(type_),
+                ) = error
+                    && !self.store.relation_read_observation_is_active()
+                {
+                    trace_alias_instantiation_failure(
+                        self.store,
+                        "union_declaration_defaults_or_body",
+                        symbol,
+                        Some(*type_),
+                        error,
+                    );
+                }
+            })?;
         let projection = super::object_aliases::property_object_alias_projection(self.store, type_)
             .map_err(|_| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(symbol))
