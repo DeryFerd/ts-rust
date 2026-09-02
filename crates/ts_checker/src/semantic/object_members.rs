@@ -8530,7 +8530,9 @@ pub(super) fn plan_interface(
             }
             return Ok(plan);
         }
-        if let Some(index) = plan.indexes.first() {
+        if let Some(index) = plan.indexes.first()
+            && !plan.call_signatures.is_empty()
+        {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: index.declaration,
                 kind: SyntaxKind::IndexSignature,
@@ -8793,6 +8795,17 @@ pub(super) fn check_source_interface_property_heritage(
         Some(CanonicalArrayTargets::from_global_types(global_types)),
     )
     .map_err(|_| invalid())?;
+    // Member queries support these indexes. Source checks still need index
+    // constraints and index-only base checks before this declaration can pass.
+    if let Some(index) = plan.indexes.first() {
+        return Err(DeclaredTypeError::TypeNodeUnavailable(
+            super::TypeNodeUnavailable::UnsupportedSyntax {
+                node: index.declaration,
+                kind: SyntaxKind::IndexSignature,
+            },
+        )
+        .into());
+    }
     // Alias-base and method-only providers still enforce their existing rules.
     if heritage
         .bases
@@ -18854,14 +18867,38 @@ pub(super) fn prepare_direct_interface_declared_properties(
     type_: TypeId,
     property_types: &[TypeId],
 ) -> Result<DirectInterfaceDeclaredState, PropertyObjectError> {
+    prepare_direct_interface_declared_members(store, plan, type_, property_types, &[])
+}
+
+pub(super) fn prepare_direct_interface_declared_members(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    type_: TypeId,
+    property_types: &[TypeId],
+    index_types: &[(TypeId, TypeId)],
+) -> Result<DirectInterfaceDeclaredState, PropertyObjectError> {
+    let mut index_keys = HashSet::with_capacity(index_types.len());
     if plan.kind != PropertyObjectKind::Interface
         || plan.heritage.is_none()
-        || !plan.indexes.is_empty()
         || !plan.call_signatures.is_empty()
         || property_types.len() != plan.properties.len()
+        || index_types.len() != plan.indexes.len()
         || property_types
             .iter()
             .any(|type_| store.type_payload(*type_).is_none())
+        || plan
+            .indexes
+            .iter()
+            .zip(index_types)
+            .any(|(planned, (key, value))| {
+                !index_keys.insert(*key)
+                    || store.type_payload(*key).is_none()
+                    || store.type_payload(*value).is_none()
+                    || cached_planned_type_identity(store, planned.key_type_node) != Some(*key)
+                    || cached_planned_type_identity(store, planned.value_type_node) != Some(*value)
+                    || !store.source_direct_type_annotation_is_exact(planned.key_type_node, *key)
+                    || !store.source_direct_type_annotation_is_exact(planned.value_type_node, *value)
+            })
     {
         return Err(observed_invalid_cache(store, plan, type_, &"plan_shape"));
     }
@@ -18930,7 +18967,7 @@ pub(super) fn prepare_direct_interface_declared_properties(
         && interface.declared_members == plan.members
         && interface.declared_call_signatures.is_none()
         && interface.declared_construct_signatures.is_none()
-        && interface.declared_index_infos.is_none()
+        && valid_declared_index_infos(store, interface.declared_index_infos.as_deref(), plan)
         && exact_property_types
     {
         return Ok(DirectInterfaceDeclaredState::Resolved);
@@ -18959,6 +18996,24 @@ pub(super) fn publish_prepared_direct_interface_declared_properties(
     plan: &PropertyObjectPlan,
     type_: TypeId,
     property_types: &[TypeId],
+    state: DirectInterfaceDeclaredState,
+) {
+    publish_prepared_direct_interface_declared_members(
+        store,
+        plan,
+        type_,
+        property_types,
+        None,
+        state,
+    );
+}
+
+pub(super) fn publish_prepared_direct_interface_declared_members(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    type_: TypeId,
+    property_types: &[TypeId],
+    index_infos: Option<Vec<super::IndexInfoId>>,
     state: DirectInterfaceDeclaredState,
 ) {
     if state == DirectInterfaceDeclaredState::Resolved {
@@ -19006,7 +19061,14 @@ pub(super) fn publish_prepared_direct_interface_declared_properties(
             ));
         }
     }
-    assert!(store.set_interface_declared_members(type_, true, plan.members, None, None, None));
+    assert!(store.set_interface_declared_members(
+        type_,
+        true,
+        plan.members,
+        None,
+        None,
+        index_infos,
+    ));
 }
 
 fn validate_object_record(
@@ -21957,7 +22019,7 @@ fn valid_declared_structured_members(
             .is_none()
 }
 
-fn valid_declared_index_infos(
+pub(super) fn valid_declared_index_infos(
     store: &CanonicalTypeMapperStore,
     index_infos: Option<&[super::IndexInfoId]>,
     plan: &PropertyObjectPlan,

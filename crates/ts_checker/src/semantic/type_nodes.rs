@@ -46009,11 +46009,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .map(|_| self.source_query_context())
                     .transpose()?;
                 return if call_types.is_empty() {
-                    structured_members::resolve_direct_interface_members_with_query_context(
+                    structured_members::resolve_direct_interface_members_with_declared_indexes(
                         self.store,
                         &interface,
                         declared_type,
                         &types,
+                        &index_types,
                         &base_types,
                         self.global_types
                             .as_ref()

@@ -622,6 +622,29 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
     array_targets: Option<CanonicalArrayTargets>,
     query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
 ) -> Result<TypeId, PropertyObjectError> {
+    resolve_direct_interface_members_with_declared_indexes(
+        store,
+        plan,
+        type_,
+        property_types,
+        &[],
+        base_types,
+        array_targets,
+        query,
+    )
+}
+
+/// Keeps declared index identities before inherited keys, as member resolution does.
+pub(super) fn resolve_direct_interface_members_with_declared_indexes(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    type_: TypeId,
+    property_types: &[TypeId],
+    index_types: &[(TypeId, TypeId)],
+    base_types: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Result<TypeId, PropertyObjectError> {
     let Some(heritage) = plan.heritage.as_ref() else {
         return Err(invalid(plan, type_));
     };
@@ -659,10 +682,7 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
     {
         return Err(invalid(plan, type_));
     }
-    if plan.kind != PropertyObjectKind::Interface
-        || !plan.indexes.is_empty()
-        || !plan.call_signatures.is_empty()
-    {
+    if plan.kind != PropertyObjectKind::Interface || !plan.call_signatures.is_empty() {
         return Err(invalid(plan, type_));
     }
 
@@ -751,8 +771,46 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
         .filter(|_| !multiple_bases)
         .map(|surface| surface.index_infos.as_slice())
         .unwrap_or_default();
-    let declared_state =
-        prepare_direct_interface_declared_properties(store, plan, type_, property_types)?;
+    let declared_state = if plan.indexes.is_empty() {
+        if !index_types.is_empty() {
+            return Err(invalid(plan, type_));
+        }
+        prepare_direct_interface_declared_properties(store, plan, type_, property_types)?
+    } else {
+        super::object_members::prepare_direct_interface_declared_members(
+            store,
+            plan,
+            type_,
+            property_types,
+            index_types,
+        )?
+    };
+    let own_index_symbol = plan.indexes.first().map(|index| index.symbol);
+    if plan
+        .indexes
+        .iter()
+        .any(|index| Some(index.symbol) != own_index_symbol)
+        || plan
+            .members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(InternalSymbolName::Index.as_ref()))
+            != own_index_symbol
+    {
+        return Err(invalid(plan, type_));
+    }
+    let mut retained_index_infos = Vec::new();
+    retained_index_infos
+        .try_reserve_exact(inherited_index_infos.len())
+        .map_err(|_| capacity(plan))?;
+    for &index in inherited_index_infos {
+        let key = store
+            .index_info(index)
+            .ok_or_else(|| invalid(plan, type_))?
+            .key_type();
+        if index_types.iter().all(|(own_key, _)| *own_key != key) {
+            retained_index_infos.push(index);
+        }
+    }
     let total_properties = base_surfaces
         .iter()
         .try_fold(plan.properties.len(), |count, base| {
@@ -767,7 +825,11 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
         .try_reserve_exact(total_properties)
         .map_err(|_| capacity(plan))?;
     expected_entries
-        .try_reserve_exact(total_properties)
+        .try_reserve_exact(
+            total_properties
+                .checked_add(usize::from(own_index_symbol.is_some()))
+                .ok_or_else(|| capacity(plan))?,
+        )
         .map_err(|_| capacity(plan))?;
     seen_names
         .try_reserve(total_properties)
@@ -812,6 +874,9 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
         }
         expected_entries.push((name, property.symbol));
         expected_properties.push(property.symbol);
+    }
+    if let Some(symbol) = own_index_symbol {
+        expected_entries.push((InternalSymbolName::Index.as_ref().to_owned(), symbol));
     }
     for (planned, surface) in effective_bases.iter().zip(&base_surfaces) {
         for &property in &surface.properties {
@@ -895,6 +960,8 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
         else {
             return Err(invalid(plan, type_));
         };
+        let mut expected_index_infos = interface.declared_index_infos.clone().unwrap_or_default();
+        expected_index_infos.extend_from_slice(&retained_index_infos);
         if interface.resolved_base_types.as_deref() != Some(base_types)
             || !validate_planned_interface_heritage_members_with_query_context(
                 store,
@@ -906,7 +973,7 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
             || interface.reference.object.structured.properties.as_deref()
                 != (!expected_properties.is_empty()).then_some(expected_properties.as_slice())
             || interface.reference.object.structured.index_infos.as_deref()
-                != (!inherited_index_infos.is_empty()).then_some(inherited_index_infos)
+                != (!expected_index_infos.is_empty()).then_some(expected_index_infos.as_slice())
             || !exact_member_table(
                 store,
                 &expected_entries,
@@ -935,9 +1002,17 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
     );
     let mut staged_index_infos = Vec::new();
     staged_index_infos
-        .try_reserve_exact(inherited_index_infos.len())
+        .try_reserve_exact(
+            plan.indexes
+                .len()
+                .checked_add(retained_index_infos.len())
+                .ok_or_else(|| capacity(plan))?,
+        )
         .map_err(|_| capacity(plan))?;
-    staged_index_infos.extend_from_slice(inherited_index_infos);
+    let mut declared_index_infos = Vec::new();
+    declared_index_infos
+        .try_reserve_exact(plan.indexes.len())
+        .map_err(|_| capacity(plan))?;
     let source = if source_alias_heritage {
         Some(
             store
@@ -969,6 +1044,7 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
         .ok_or_else(|| capacity(plan))?;
     if !store.try_reserve_checker_symbol_allocations(0, usize::from(prepared_members.is_some()))
         || !store.try_reserve_value_symbol_links(missing_value_links)
+        || !store.try_reserve_index_infos(plan.indexes.len())
         || !store.try_reserve_direct_interface_heritage_provenance(1)
     {
         return Err(capacity(plan));
@@ -988,19 +1064,44 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
     ) {
         return Err(invalid(plan, type_));
     }
+    for (planned, (key, value)) in plan.indexes.iter().zip(index_types) {
+        let index = store
+            .alloc_index_info(
+                *key,
+                *value,
+                planned.readonly,
+                Some(planned.declaration),
+                Vec::new(),
+            )
+            .expect("the direct-interface plan reserved and checked its declared indexes");
+        declared_index_infos.push(index);
+        staged_index_infos.push(index);
+    }
+    staged_index_infos.extend_from_slice(&retained_index_infos);
     let members = prepared_members.map(|prepared| store.alloc_prepared_symbol_table(prepared));
     if let Some(members) = members {
         for (name, property) in expected_entries {
             assert_eq!(store.insert_symbol(members, name, property), Some(None));
         }
     }
-    publish_prepared_direct_interface_declared_properties(
-        store,
-        plan,
-        type_,
-        property_types,
-        declared_state,
-    );
+    if declared_index_infos.is_empty() {
+        publish_prepared_direct_interface_declared_properties(
+            store,
+            plan,
+            type_,
+            property_types,
+            declared_state,
+        );
+    } else {
+        super::object_members::publish_prepared_direct_interface_declared_members(
+            store,
+            plan,
+            type_,
+            property_types,
+            Some(declared_index_infos),
+            declared_state,
+        );
+    }
     assert!(store.set_interface_base_resolution(type_, true, None, Some(staged_base_types),));
     assert!(store.set_structured_type_members(
         type_,
@@ -1305,6 +1406,11 @@ pub(super) fn validate_planned_interface_heritage_members_with_query_context(
     surface.owner == plan.symbol
         && surface.declared_properties == planned_properties
         && surface.declared_call_signatures == planned_calls
+        && super::object_members::valid_declared_index_infos(
+            store,
+            interface.declared_index_infos.as_deref(),
+            plan,
+        )
         && plan
             .properties
             .iter()
@@ -1758,9 +1864,8 @@ fn validate_property_interface_worker(
         interface.declared_index_infos.as_deref(),
         interface.declared_call_signatures.as_deref(),
     )?;
-    if requires_direct_base && !declared.index_infos.is_empty()
-        || !declared.call_signatures.is_empty()
-            && (!declared.properties.is_empty() || !declared.index_infos.is_empty())
+    if !declared.call_signatures.is_empty()
+        && (!declared.properties.is_empty() || !declared.index_infos.is_empty())
     {
         return None;
     }
@@ -1957,11 +2062,16 @@ fn validate_property_interface_worker(
             }
         }
     }
-    let expected_index_infos = if requires_direct_base {
-        inherited_index_infos
-    } else {
-        declared.index_infos
-    };
+    let mut expected_index_infos = declared.index_infos.clone();
+    let mut index_keys = expected_index_infos
+        .iter()
+        .map(|index| store.index_info(*index).map(IndexInfo::key_type))
+        .collect::<Option<HashSet<_>>>()?;
+    for index in inherited_index_infos {
+        if index_keys.insert(store.index_info(index)?.key_type()) {
+            expected_index_infos.push(index);
+        }
+    }
     let mut expected_call_signatures = declared.call_signatures.clone();
     expected_call_signatures.extend_from_slice(&inherited_call_signatures);
     let actual = structured.properties.as_deref().unwrap_or_default();
@@ -1976,11 +2086,7 @@ fn validate_property_interface_worker(
             store,
             &expected,
             structured.members,
-            if requires_direct_base {
-                None
-            } else {
-                declared.index_symbol
-            },
+            declared.index_symbol,
             declared.call_symbol,
         )
     {
