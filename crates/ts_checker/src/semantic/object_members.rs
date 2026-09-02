@@ -421,6 +421,17 @@ pub(super) fn resolve_object_property_by_key_with_source(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
+    if store.source_interface_heritage_header(receiver).is_some() {
+        return CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_property_of_source_interface(receiver, name);
+    }
     let conditional_mapped = store.type_payload(receiver).is_some_and(|record| {
         matches!(record.data(), TypeData::Mapped(mapped)
         if mapped.template_type.is_some_and(|template| {
@@ -8534,7 +8545,7 @@ pub(super) fn plan_interface(
         for base in &heritage.bases[1..] {
             if base.symbol != heritage.bases[0].symbol
                 && base.kind != DirectInterfaceBaseKind::NongenericTypeLiteralAlias
-                && base.kind != DirectInterfaceBaseKind::InstantiatedTypeAlias
+                && !base.kind.is_instantiated_alias()
                 && store
                     .symbol(base.symbol)
                     .ok_or(PropertyObjectError::InvalidInterfaceSymbol(base.symbol))?
@@ -8567,6 +8578,7 @@ pub(super) fn plan_interface(
                 base.kind,
                 DirectInterfaceBaseKind::NongenericTypeLiteralAlias
                     | DirectInterfaceBaseKind::InstantiatedTypeAlias
+                    | DirectInterfaceBaseKind::RecordMappedAlias
             ) {
                 // The normal alias query selects the real property object.
                 // Member construction checks its properties and all overlaps.
@@ -11939,6 +11951,7 @@ pub(super) fn plan_generic_interface_identity(
                     base.kind,
                     DirectInterfaceBaseKind::Interface
                         | DirectInterfaceBaseKind::InstantiatedTypeAlias
+                        | DirectInterfaceBaseKind::RecordMappedAlias
                 )
             }) {
                 return Err(PropertyObjectError::UnsupportedMember {
@@ -12062,6 +12075,7 @@ pub(super) fn plan_generic_interface(
                         base.kind,
                         DirectInterfaceBaseKind::Interface
                             | DirectInterfaceBaseKind::InstantiatedTypeAlias
+                            | DirectInterfaceBaseKind::RecordMappedAlias
                     )
                 })
             {
@@ -22957,7 +22971,9 @@ fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyOb
                 if plan.kind != PropertyObjectKind::Interface
                     || record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
                     || !valid_cold_declared_member_cache(interface)
-                    || !valid_generic_publication_target(store, plan, receiver, record, interface)
+                    || !valid_generic_publication_target(
+                        store, plan, receiver, record, interface, None,
+                    )
                 {
                     return false;
                 }
@@ -25406,7 +25422,7 @@ pub(super) fn publish_declared_members(
                 let TypeData::Interface(interface) = record.data() else {
                     return true;
                 };
-                !valid_generic_publication_target(store, plan, type_, record, interface)
+                !valid_generic_publication_target(store, plan, type_, record, interface, None)
             }))
     {
         return Err(invalid_cache(plan, type_));
@@ -25867,7 +25883,14 @@ pub(super) fn publish_generic_interface_declared_members(
     target: TypeId,
     property_types: &[TypeId],
 ) -> Result<TypeId, PropertyObjectError> {
-    publish_generic_interface_declared_members_worker(store, plan, target, property_types, None)
+    publish_generic_interface_declared_members_worker(
+        store,
+        plan,
+        target,
+        property_types,
+        None,
+        None,
+    )
 }
 
 pub(super) fn publish_generic_interface_declared_members_with_global_types(
@@ -25894,6 +25917,7 @@ pub(super) fn publish_generic_interface_declared_members_with_global_types(
             target,
             property_types,
             None,
+            Some(CanonicalArrayTargets::from_global_types(globals)),
         );
     }
     let mut preparation = store
@@ -25905,6 +25929,7 @@ pub(super) fn publish_generic_interface_declared_members_with_global_types(
         target,
         property_types,
         Some((&mut preparation, Some(globals))),
+        Some(CanonicalArrayTargets::from_global_types(globals)),
     )
 }
 
@@ -25914,6 +25939,7 @@ fn publish_generic_interface_declared_members_worker(
     target: TypeId,
     property_types: &[TypeId],
     preparation: Option<(&mut PreparedTypeQueryTypes, Option<&CanonicalGlobalTypes>)>,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<TypeId, PropertyObjectError> {
     let invalid = || PropertyObjectError::InvalidCachedInterface {
         symbol: plan.symbol,
@@ -25945,7 +25971,7 @@ fn publish_generic_interface_declared_members_worker(
     let TypeData::Interface(interface) = record.data() else {
         return Err(invalid());
     };
-    if !valid_generic_publication_target(store, plan, target, record, interface)
+    if !valid_generic_publication_target(store, plan, target, record, interface, array_targets)
         || !valid_generic_property_types(store, plan, property_types)
     {
         return Err(invalid());
@@ -25958,7 +25984,7 @@ fn publish_generic_interface_declared_members_worker(
             || declared_members
                 .and_then(|members| store.symbol_table(members))
                 .is_some_and(|table| table.len() != plan.properties.len())
-            || !valid_generic_structured_members(store, plan, target, interface)
+            || !valid_generic_structured_members(store, plan, target, interface, array_targets)
             || !plan
                 .properties
                 .iter()
@@ -26204,12 +26230,44 @@ fn generic_method_signature_types(
     Some(signatures)
 }
 
+fn effective_generic_interface_bases<'a>(
+    store: &CanonicalTypeMapperStore,
+    plan: &'a PropertyObjectPlan,
+    interface: &InterfaceTypeData,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<Vec<&'a super::interface_heritage::DirectInterfaceBasePlan>> {
+    let bases = match plan.heritage.as_ref() {
+        Some(heritage) => {
+            if heritage.bases.is_empty() || heritage.bases.len() > 2 {
+                return None;
+            }
+            super::interface_heritage::effective_interface_heritage_bases(
+                store,
+                heritage,
+                array_targets,
+            )
+            .ok()?
+        }
+        None => Vec::new(),
+    };
+    (interface.base_types_resolved
+        && interface.resolved_base_types.is_none() == bases.is_empty()
+        && interface
+            .resolved_base_types
+            .as_deref()
+            .unwrap_or_default()
+            .len()
+            == bases.len())
+    .then_some(bases)
+}
+
 fn valid_generic_publication_target(
     store: &CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,
     target: TypeId,
     record: &TypeRecord,
     interface: &InterfaceTypeData,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
     let allowed_flags = ObjectFlags::INTERFACE
         | ObjectFlags::REFERENCE
@@ -26302,84 +26360,86 @@ fn valid_generic_publication_target(
     {
         return false;
     }
-    match (
-        plan.heritage.as_ref(),
-        interface.resolved_base_types.as_deref(),
-    ) {
-        (None, None) => {}
-        (Some(heritage), Some(bases)) => {
-            if heritage.bases.is_empty()
-                || heritage.bases.len() > 2
-                || heritage.bases.len() != bases.len()
+    let Some(effective_bases) =
+        effective_generic_interface_bases(store, plan, interface, array_targets)
+    else {
+        return false;
+    };
+    for (planned, base) in effective_bases
+        .into_iter()
+        .zip(interface.resolved_base_types.as_deref().unwrap_or_default())
+    {
+        if planned.kind.is_instantiated_alias() {
+            if super::interface_heritage::validated_instantiated_interface_base_members(
+                store,
+                planned,
+                *base,
+                array_targets,
+                None,
+            )
+            .is_none()
             {
                 return false;
             }
-            for (planned, base) in heritage.bases.iter().zip(bases) {
-                if planned.kind != DirectInterfaceBaseKind::Interface {
-                    return false;
-                }
-                if planned.defaults.iter().any(|default| {
-                    planned.type_arguments.get(default.index) != Some(&default.argument)
-                        || super::interface_heritage::validate_heritage_default_cache(
-                            store, default, true,
-                        )
-                        .is_err()
-                }) {
-                    return false;
-                }
-                if planned.type_arguments.is_empty() {
-                    if !matches!(
-                        validate_resolved_declared_property_object(store, *base),
-                        DeclaredPropertyObjectValidation::Valid(
-                            DeclaredPropertyObjectProof::Interface,
-                        )
-                    ) || store
-                        .type_payload(*base)
-                        .and_then(TypeRecord::symbol)
-                        .and_then(|symbol| store.get_merged_symbol(symbol))
-                        != Some(planned.symbol)
-                    {
+            continue;
+        }
+        if planned.kind != DirectInterfaceBaseKind::Interface {
+            return false;
+        }
+        if planned.defaults.iter().any(|default| {
+            planned.type_arguments.get(default.index) != Some(&default.argument)
+                || super::interface_heritage::validate_heritage_default_cache(store, default, true)
+                    .is_err()
+        }) {
+            return false;
+        }
+        if planned.type_arguments.is_empty() {
+            if !matches!(
+                validate_resolved_declared_property_object(store, *base),
+                DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface,)
+            ) || store
+                .type_payload(*base)
+                .and_then(TypeRecord::symbol)
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(planned.symbol)
+            {
+                return false;
+            }
+            continue;
+        }
+
+        let Ok(base_reference) = validate_direct_generic_reference(store, *base) else {
+            return false;
+        };
+        let arguments_match = planned.type_arguments.len() == base_reference.type_arguments.len()
+            && planned
+                .type_arguments
+                .iter()
+                .zip(&base_reference.type_arguments)
+                .all(|(annotation, argument)| {
+                    if cached_planned_type_identity(store, *annotation) != Some(*argument) {
                         return false;
                     }
-                    continue;
-                }
-
-                let Ok(base_reference) = validate_direct_generic_reference(store, *base) else {
-                    return false;
-                };
-                let arguments_match = planned.type_arguments.len()
-                    == base_reference.type_arguments.len()
-                    && planned
+                    let Some(_) = reference
                         .type_arguments
                         .iter()
-                        .zip(&base_reference.type_arguments)
-                        .all(|(annotation, argument)| {
-                            if cached_planned_type_identity(store, *annotation) != Some(*argument) {
-                                return false;
-                            }
-                            let Some(_) = reference
-                                .type_arguments
-                                .iter()
-                                .position(|parameter| parameter == argument)
-                            else {
-                                return true;
-                            };
-                            cached_ordinary_type_parameter_owner(store, *argument)
-                                .and_then(|parameter| store.get_parent_of_symbol(parameter))
-                                == Some(plan.symbol)
-                        });
-                if !arguments_match
-                    || store
-                        .type_payload(base_reference.target)
-                        .and_then(TypeRecord::symbol)
-                        .and_then(|symbol| store.get_merged_symbol(symbol))
-                        != Some(planned.symbol)
-                {
-                    return false;
-                }
-            }
+                        .position(|parameter| parameter == argument)
+                    else {
+                        return true;
+                    };
+                    cached_ordinary_type_parameter_owner(store, *argument)
+                        .and_then(|parameter| store.get_parent_of_symbol(parameter))
+                        == Some(plan.symbol)
+                });
+        if !arguments_match
+            || store
+                .type_payload(base_reference.target)
+                .and_then(TypeRecord::symbol)
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(planned.symbol)
+        {
+            return false;
         }
-        _ => return false,
     }
 
     let parent = store.get_parent_of_symbol(plan.symbol);
@@ -26705,6 +26765,7 @@ fn valid_generic_structured_members(
     plan: &PropertyObjectPlan,
     target: TypeId,
     interface: &InterfaceTypeData,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
     let structured = &interface.reference.object.structured;
     if !store.type_payload(target).is_some_and(|record| {
@@ -26764,58 +26825,73 @@ fn valid_generic_structured_members(
     else {
         return false;
     };
-    if let Some(heritage) = plan.heritage.as_ref() {
-        let Some(bases) = interface.resolved_base_types.as_deref() else {
+    let Some(effective_bases) =
+        effective_generic_interface_bases(store, plan, interface, array_targets)
+    else {
+        return false;
+    };
+    for (planned, base) in effective_bases
+        .into_iter()
+        .zip(interface.resolved_base_types.as_deref().unwrap_or_default())
+    {
+        let Some(record) = store.type_payload(*base) else {
             return false;
         };
-        if bases.len() != heritage.bases.len() {
-            return false;
-        }
-        for (planned, base) in heritage.bases.iter().zip(bases) {
-            let Some(record) = store.type_payload(*base) else {
-                return false;
-            };
-            let owner = if planned.type_arguments.is_empty() {
-                if !matches!(
-                    validate_resolved_declared_property_object(store, *base),
-                    DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface,)
-                ) {
-                    return false;
-                }
-                record.symbol()
-            } else {
-                let Ok(reference) = validate_direct_generic_reference(store, *base) else {
-                    return false;
-                };
-                store
-                    .type_payload(reference.target)
-                    .and_then(TypeRecord::symbol)
-            };
-            if owner.and_then(|symbol| store.get_merged_symbol(symbol)) != Some(planned.symbol)
-                || !record
-                    .object_flags()
-                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+        let owner = if planned.kind.is_instantiated_alias() {
+            if super::interface_heritage::validated_instantiated_interface_base_members(
+                store,
+                planned,
+                *base,
+                array_targets,
+                None,
+            )
+            .is_none()
             {
                 return false;
             }
-            let Some(base_members) = record.data().structured() else {
+            Some(planned.symbol)
+        } else if planned.kind != DirectInterfaceBaseKind::Interface {
+            return false;
+        } else if planned.type_arguments.is_empty() {
+            if !matches!(
+                validate_resolved_declared_property_object(store, *base),
+                DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface,)
+            ) {
+                return false;
+            }
+            record.symbol()
+        } else {
+            let Ok(reference) = validate_direct_generic_reference(store, *base) else {
                 return false;
             };
-            for property in base_members.properties.as_deref().unwrap_or_default() {
-                let Some(property_record) = store.symbol(*property) else {
-                    return false;
-                };
-                if names.insert(property_record.name().to_owned()) {
-                    expected.push(*property);
-                }
+            store
+                .type_payload(reference.target)
+                .and_then(TypeRecord::symbol)
+        };
+        if owner.and_then(|symbol| store.get_merged_symbol(symbol)) != Some(planned.symbol)
+            || !record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        {
+            return false;
+        }
+        let Some(base_members) = record.data().structured() else {
+            return false;
+        };
+        for property in base_members.properties.as_deref().unwrap_or_default() {
+            let Some(property_record) = store.symbol(*property) else {
+                return false;
+            };
+            if names.insert(property_record.name().to_owned()) {
+                expected.push(*property);
             }
-            for index in base_members.index_infos.as_deref().unwrap_or_default() {
-                let Some(info) = store.index_info(*index) else {
-                    return false;
-                };
-                if index_keys.insert(info.key_type()) {
-                    expected_indexes.push(*index);
-                }
+        }
+        for index in base_members.index_infos.as_deref().unwrap_or_default() {
+            let Some(info) = store.index_info(*index) else {
+                return false;
+            };
+            if index_keys.insert(info.key_type()) {
+                expected_indexes.push(*index);
             }
         }
     }

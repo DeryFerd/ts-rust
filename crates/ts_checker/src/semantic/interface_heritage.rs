@@ -57,6 +57,12 @@ pub(super) enum DirectInterfaceBaseKind {
     InstantiatedTypeAlias,
 }
 
+impl DirectInterfaceBaseKind {
+    pub(super) const fn is_instantiated_alias(self) -> bool {
+        matches!(self, Self::InstantiatedTypeAlias | Self::RecordMappedAlias)
+    }
+}
+
 /// Source bindings only. A header does not complete a base or its members.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceInterfaceHeritageHeader {
@@ -1180,8 +1186,8 @@ pub(super) fn plan_source_interface_heritage_header(
                 DirectInterfaceBaseKind::Interface
                     | DirectInterfaceBaseKind::NongenericTypeLiteralAlias
                     | DirectInterfaceBaseKind::InstantiatedTypeAlias
-            ) || base.kind != DirectInterfaceBaseKind::InstantiatedTypeAlias
-                && !base.type_arguments.is_empty()
+                    | DirectInterfaceBaseKind::RecordMappedAlias
+            ) || !base.kind.is_instantiated_alias() && !base.type_arguments.is_empty()
                 || !base.defaults.is_empty()
                 || store.source_node_kind(base.expression) != Some(SyntaxKind::Identifier)
             {
@@ -1193,7 +1199,7 @@ pub(super) fn plan_source_interface_heritage_header(
                 .and_then(|(_, resolution)| resolution.take());
             let (symbol, resolution) = match resolution {
                 Some(resolution) => resolution,
-                None if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias => {
+                None if base.kind.is_instantiated_alias() => {
                     try_resolve_source_heritage_base(store, host, base.expression)?
                         .ok_or_else(|| source_heritage_error(base.expression))?
                 }
@@ -1217,9 +1223,11 @@ pub(super) fn plan_source_interface_heritage_header(
             {
                 return Err(source_heritage_error(base.expression));
             }
-            let alias = if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+            let alias = if base.kind.is_instantiated_alias() {
                 Some(source_interface_alias_reference_request(
-                    store, base.symbol, base.node,
+                    store,
+                    base.symbol,
+                    base.node,
                 )?)
             } else if base.kind == DirectInterfaceBaseKind::NongenericTypeLiteralAlias {
                 Some(
@@ -1783,8 +1791,11 @@ pub(super) fn effective_interface_heritage_bases<'a>(
 ) -> Result<Vec<&'a DirectInterfaceBasePlan>, DeclaredTypeError> {
     let mut bases = Vec::with_capacity(plan.bases.len());
     for base in &plan.bases {
-        if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+        if base.kind.is_instantiated_alias() {
             let request = source_interface_alias_reference_request(store, base.symbol, base.node)?;
+            if request.arguments() != base.type_arguments.as_slice() || !base.defaults.is_empty() {
+                return Err(source_heritage_error(base.node));
+            }
             if source_interface_alias_base_is_ignored(store, &request, array_targets)? {
                 continue;
             }
@@ -1896,6 +1907,27 @@ pub(super) fn interface_base_has_statically_known_members(
 pub(super) struct InterfaceAliasBaseMembers {
     pub(super) properties: Vec<SemanticSymbolId>,
     pub(super) indexes: Vec<super::IndexInfoId>,
+}
+
+/// Proves the written alias request before exposing its completed members.
+pub(super) fn validated_instantiated_interface_base_members(
+    store: &CanonicalTypeMapperStore,
+    base: &DirectInterfaceBasePlan,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Option<InterfaceAliasBaseMembers> {
+    if !base.kind.is_instantiated_alias() || !base.defaults.is_empty() {
+        return None;
+    }
+    let request = source_interface_alias_reference_request(store, base.symbol, base.node).ok()?;
+    if request.arguments() != base.type_arguments.as_slice()
+        || !matches!(source_interface_alias_base_state(store, &request, array_targets, query).ok()?,
+            SourceInterfaceAliasBaseState::Ready { type_: result, .. } if result == type_)
+    {
+        return None;
+    }
+    interface_alias_base_members(store, type_, array_targets).ok()?
 }
 
 /// Reads only members proved by their existing object, mapped, or intersection provider.
@@ -2348,9 +2380,10 @@ pub(super) fn plan_interface_alias_base_reference(
         .ok_or_else(invalid)?;
     let clauses = interface.heritage_clauses.as_ref().ok_or_else(invalid)?;
     let plan = plan_direct_interface_heritage(store, host, declaration, owner, clauses)?;
-    Ok(plan.bases.into_iter().find(|base| {
-        base.node == node && base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias
-    }))
+    Ok(plan
+        .bases
+        .into_iter()
+        .find(|base| base.node == node && base.kind.is_instantiated_alias()))
 }
 
 fn plan_direct_interface_heritage_inner(
@@ -2778,6 +2811,7 @@ fn plan_direct_interface_heritage_inner(
                         DirectInterfaceBaseKind::Interface
                             | DirectInterfaceBaseKind::NongenericTypeLiteralAlias
                             | DirectInterfaceBaseKind::InstantiatedTypeAlias
+                            | DirectInterfaceBaseKind::RecordMappedAlias
                     )
                 }) {
                     return Err(DirectInterfaceHeritageError::Unsupported {

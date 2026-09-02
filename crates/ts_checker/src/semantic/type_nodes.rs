@@ -5944,6 +5944,8 @@ struct TypeQueryPlan {
     generic_member_plans: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
     generic_interface_identities:
         BTreeMap<SemanticSymbolId, object_members::GenericInterfaceIdentityPlan>,
+    generic_interface_constraints:
+        BTreeMap<SemanticSymbolId, (NodeRef, Vec<PlannedDirectGenericConstraint>)>,
     functions: BTreeMap<NodeRef, FunctionTypePlan>,
     constructors: BTreeMap<NodeRef, PlannedConstructorType>,
     type_predicates: BTreeMap<NodeRef, CallableTypePredicatePlan>,
@@ -16551,7 +16553,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 && let Some(heritage) = &planned.heritage
             {
                 for base in &heritage.bases {
-                    if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+                    if base.kind.is_instantiated_alias() {
                         self.plan_type_node(base.node)?;
                     } else if base.kind == DirectInterfaceBaseKind::NongenericTypeLiteralAlias {
                         self.plan_type_alias(base.symbol, false)?;
@@ -16645,7 +16647,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             if let Some(heritage) = &members.heritage {
                 for inherited in &heritage.bases {
-                    if inherited.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+                    if inherited.kind.is_instantiated_alias() {
                         self.plan_type_node(inherited.node)?;
                     } else if inherited.type_arguments.is_empty() {
                         self.plan_property_interface(inherited.symbol)?;
@@ -17489,8 +17491,31 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
 
         let result = (|| {
+            if bases.iter().any(|base| base.kind.is_instantiated_alias()) {
+                let owner =
+                    object_members::plan_generic_interface_identity(self.store, self.host, symbol)
+                        .map_err(property_object_error)?;
+                let count = owner.parameters.len();
+                let constraints = self
+                    .preflight_direct_generic_reference_target(owner.node, symbol, count, count)?
+                    .constraints;
+                for constraint in &constraints {
+                    self.plan_type_node_in_context(constraint.node, None, false)?;
+                }
+                let expected = (owner.node, constraints);
+                if self
+                    .plan
+                    .generic_interface_constraints
+                    .insert(symbol, expected.clone())
+                    .is_some_and(|previous| previous != expected)
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(owner.node),
+                    ));
+                }
+            }
             for base in bases {
-                if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+                if base.kind.is_instantiated_alias() {
                     self.plan_type_node(base.node)?;
                     continue;
                 }
@@ -32219,6 +32244,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 {
                     return Ok(());
                 }
+                if let NodeData::TypeReferenceNode(reference) = &target_record.data
+                    && reference.type_arguments.is_none()
+                {
+                    let source = self.resolve_uncached_type_reference_symbol(target)?;
+                    if earlier_parameters
+                        .iter()
+                        .any(|earlier| earlier.symbol == source)
+                    {
+                        return Ok(());
+                    }
+                }
                 if self
                     .plan
                     .mapped_utility_aliases
@@ -37815,6 +37851,71 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             session,
             Some(&heritage),
         )
+    }
+
+    /// Keeps source-dependent alias proofs alive through the inherited member read.
+    pub(super) fn get_property_of_source_interface(
+        &mut self,
+        receiver: TypeId,
+        name: EscapedNameRef<'_>,
+    ) -> Result<Option<super::relater::ResolvedOwnProperty>, super::source::SourceCheckError> {
+        self.begin_source_query();
+        let result = (|| {
+            self.prepare_source_interface_heritage(SourceInterfaceHeritageRequest::Header {
+                receiver,
+            })?;
+            let header = self
+                .store
+                .source_interface_heritage_header(receiver)
+                .cloned()
+                .ok_or(super::RelationUnavailable::InvalidStructuredMembers(
+                    receiver,
+                ))?;
+            for alias in header.bases().iter().filter_map(|base| base.alias()) {
+                self.prepare_source_interface_heritage(SourceInterfaceHeritageRequest::Alias {
+                    receiver,
+                    alias: alias.symbol(),
+                    root: alias.root(),
+                })?;
+            }
+            let context = self.source_query_context()?;
+            let arrays = Some(CanonicalArrayTargets::from_global_types(&context.globals));
+            let inherited = self
+                .store
+                .type_payload(receiver)
+                .and_then(|record| record.data().structured())
+                .and_then(|members| members.members)
+                .and_then(|members| self.store.symbol_table(members))
+                .and_then(|members| members.get(name));
+            if let Some(property) = inherited
+                && let Some(reference) =
+                    structured_members::inherited_generic_property_reference_with_query_context(
+                        self.store,
+                        receiver,
+                        property,
+                        arrays,
+                        Some(&context.heritage()),
+                    )
+            {
+                let session = self.instantiation_session.as_deref_mut().ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery)
+                })?;
+                super::instantiated_members::demand_instantiated_property_type(
+                    self.store, reference, property, arrays, session,
+                )
+                .map_err(|error| object_members::source_generic_member_error(receiver, &error))?;
+            }
+            structured_members::validated_interface_property_by_key_with_query_context(
+                self.store,
+                receiver,
+                name,
+                arrays,
+                Some(&context.heritage()),
+            )
+            .ok_or_else(|| super::RelationUnavailable::InvalidStructuredMembers(receiver).into())
+        })();
+        self.finish_source_query();
+        result
     }
 
     fn prepare_source_interface_heritage(
@@ -44823,16 +44924,37 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return Err(invalid());
         }
 
+        if heritage
+            .bases
+            .iter()
+            .any(|base| base.kind.is_instantiated_alias())
+        {
+            let (node, constraints) = plan
+                .generic_interface_constraints
+                .get(&symbol)
+                .ok_or_else(invalid)?;
+            self.resolve_generic_type_parameter_constraints(
+                *node,
+                symbol,
+                constraints,
+                target,
+                plan,
+                prepared,
+            )?;
+        }
+
         let mut bases = Vec::with_capacity(heritage.bases.len());
         for base in &heritage.bases {
             if !matches!(
                 base.kind,
-                DirectInterfaceBaseKind::Interface | DirectInterfaceBaseKind::InstantiatedTypeAlias
+                DirectInterfaceBaseKind::Interface
+                    | DirectInterfaceBaseKind::InstantiatedTypeAlias
+                    | DirectInterfaceBaseKind::RecordMappedAlias
             ) || base.symbol == symbol
             {
                 return Err(invalid());
             }
-            let reference = if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+            let reference = if base.kind.is_instantiated_alias() {
                 let Some(type_) = self.execute_interface_alias_base(base, plan, prepared)? else {
                     continue;
                 };
@@ -45168,7 +45290,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .ok_or_else(invalid)?;
         if let Some(heritage) = &members.heritage {
             for base in &heritage.bases {
-                if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+                if base.kind.is_instantiated_alias() {
                     self.execute_interface_alias_base(base, plan, prepared)?;
                 } else if base.type_arguments.is_empty() {
                     self.execute_declared_type(base.symbol, plan, prepared)?;
@@ -45384,7 +45506,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             if let Some(heritage) = &interface.heritage {
                 base_types.reserve(heritage.bases.len());
                 for base in &heritage.bases {
-                    let type_ = if base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+                    let type_ = if base.kind.is_instantiated_alias() {
                         let Some(type_) =
                             self.execute_interface_alias_base(base, plan, prepared)?
                         else {
@@ -45419,9 +45541,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             .and_then(|members| self.store.symbol_table(members))
                             .and_then(|members| members.get(key));
                         if let Some(inherited) = inherited {
-                            let reference = if base.kind
-                                == DirectInterfaceBaseKind::InstantiatedTypeAlias
-                            {
+                            let reference = if base.kind.is_instantiated_alias() {
                                 None
                             } else if !base.type_arguments.is_empty() {
                                 Some(type_)
@@ -51047,7 +51167,26 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         plan: &TypeQueryPlan,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<Vec<(usize, TypeId)>, DeclaredTypeError> {
-        if reference.direct_generic_constraints.is_empty() {
+        self.resolve_generic_type_parameter_constraints(
+            node,
+            reference.symbol,
+            &reference.direct_generic_constraints,
+            declared_type,
+            plan,
+            prepared,
+        )
+    }
+
+    fn resolve_generic_type_parameter_constraints(
+        &mut self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+        constraints: &[PlannedDirectGenericConstraint],
+        declared_type: TypeId,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<Vec<(usize, TypeId)>, DeclaredTypeError> {
+        if constraints.is_empty() {
             return Ok(Vec::new());
         }
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
@@ -51065,8 +51204,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .as_deref()
             .ok_or_else(&invalid)?
             .to_vec();
-        let mut resolved = Vec::with_capacity(reference.direct_generic_constraints.len());
-        for constraint in &reference.direct_generic_constraints {
+        let mut resolved = Vec::with_capacity(constraints.len());
+        for constraint in constraints {
             let Some(index) = parameters.iter().position(|parameter| {
                 cached_ordinary_type_parameter_owner(self.store, *parameter)
                     == Some(constraint.parameter)
@@ -51076,7 +51215,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let mut expected = self.execute_type_node(constraint.node, plan, prepared)?;
             if self
                 .store
-                .symbol(reference.symbol)
+                .symbol(symbol)
                 .is_some_and(|owner| owner.flags() == SymbolFlags::CLASS)
                 && let Some(bootstrap) = self.store.intrinsic_bootstrap()
                 && expected == bootstrap.any_type
@@ -52263,6 +52402,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     &type_parameters,
                     &effective_arguments,
                     plan,
+                    prepared,
                     plan.react_detailed_html_props_aliases.get(&symbol).copied(),
                     plan.mapped_utility_aliases.get(&symbol).copied(),
                 )?;
@@ -52344,6 +52484,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             &type_parameters,
             &type_arguments,
             plan,
+            prepared,
             plan.react_detailed_html_props_aliases.get(&symbol).copied(),
             plan.mapped_utility_aliases.get(&symbol).copied(),
         )?;
@@ -54015,6 +54156,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         type_parameters: &[TypeId],
         type_arguments: &[TypeId],
         plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
         dependent_react_alias: Option<ReactDetailedHtmlPropsPlan>,
         mapped_utility: Option<MappedUtilityPlan>,
     ) -> Result<(), DeclaredTypeError> {
@@ -54041,7 +54183,53 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     reference.symbol,
                 ))
             })?;
-            let constraint = if mapped_utility.is_some_and(|utility| {
+            let keyof_source = self.source_generic_alias_keyof_constraint(
+                reference.symbol,
+                metadata,
+                index,
+                constraint,
+                type_parameters,
+                type_arguments,
+                plan,
+            )?;
+            let constraint = if let Some(source) = keyof_source {
+                self.prepare_interface_alias_base_sources(
+                    source,
+                    plan,
+                    prepared,
+                    &mut HashSet::new(),
+                )?;
+                if validate_direct_generic_reference(self.store, source).is_ok() {
+                    let arrays = self
+                        .global_types
+                        .as_ref()
+                        .map(CanonicalArrayTargets::from_global_types);
+                    let mut fallback = InstantiationSession::new(InstantiationLimits::default());
+                    super::instantiated_members::resolve_members_with_array_targets_and_session(
+                        self.store,
+                        source,
+                        arrays,
+                        self.instantiation_session
+                            .as_deref_mut()
+                            .unwrap_or(&mut fallback),
+                    )
+                    .map_err(|_| {
+                        type_node_unavailable(
+                            TypeNodeUnavailable::GenericAliasConstraintUnsupported {
+                                alias: reference.symbol,
+                                parameter: parameter.declaration,
+                            },
+                        )
+                    })?;
+                }
+                self.instantiate_dependent_alias_type(
+                    reference.symbol,
+                    constraint,
+                    type_parameters,
+                    type_arguments,
+                    None,
+                )?
+            } else if mapped_utility.is_some_and(|utility| {
                 utility.kind == MappedUtilityKind::Pick
                     && utility.key_parameter == Some(parameter.symbol)
             }) {
@@ -54107,6 +54295,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 _ => argument,
             };
             let assignable = if comparison_argument == constraint
+                || keyof_source.is_some()
+                    && self.authenticated_source_keyof_argument(node, argument, constraint)
                 || mapped_utility.is_some_and(|utility| {
                     utility.kind == MappedUtilityKind::Pick
                         && self.authenticated_deferred_pick_key(argument, constraint)
@@ -54176,6 +54366,89 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             );
         }
         Ok(())
+    }
+
+    fn source_generic_alias_keyof_constraint(
+        &self,
+        alias: SemanticSymbolId,
+        metadata: &TypeAliasPlan,
+        index: usize,
+        constraint: TypeId,
+        parameters: &[TypeId],
+        arguments: &[TypeId],
+        plan: &TypeQueryPlan,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        if !matches!(
+            self.store.type_payload(constraint).map(TypeRecord::data),
+            Some(TypeData::Index(_))
+        ) {
+            return Ok(None);
+        }
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                alias,
+            ))
+        };
+        let parameter = metadata.type_parameters.get(index).ok_or_else(&invalid)?;
+        let root = parameter.constraint.ok_or_else(&invalid)?;
+        if self
+            .store
+            .source_type_parameter_annotations(parameter.declaration)
+            .is_none_or(|annotations| annotations.constraint != Some(root))
+            || object_members::cached_planned_type_identity(self.store, root) != Some(constraint)
+        {
+            return Err(invalid());
+        }
+        let mut node = root;
+        while let NodeData::ParenthesizedTypeNode(parenthesized) =
+            &preflight_node(self.store, self.host, node)?.data
+        {
+            let inner = NodeRef::new(node.arena, node.file, parenthesized.type_);
+            if preflight_node(self.store, self.host, inner)?.parent != Some(node.node)
+                || object_members::cached_planned_type_identity(self.store, inner)
+                    != Some(constraint)
+            {
+                return Err(invalid());
+            }
+            node = inner;
+        }
+        let NodeData::TypeOperatorNode(operator) =
+            &preflight_node(self.store, self.host, node)?.data
+        else {
+            return Err(invalid());
+        };
+        let target = NodeRef::new(node.arena, node.file, operator.type_);
+        let source = super::keyof_types::validate_generic_keyof_index_type(self.store, constraint)
+            .map_err(|_| invalid())?;
+        let source_index = parameters
+            .get(..index)
+            .ok_or_else(&invalid)?
+            .iter()
+            .position(|parameter| *parameter == source)
+            .ok_or_else(&invalid)?;
+        let expected = metadata
+            .type_parameters
+            .get(source_index)
+            .ok_or_else(&invalid)?
+            .symbol;
+        if operator.operator != SyntaxKind::KeyOfKeyword
+            || plan.keyofs.get(&node) != Some(&target)
+            || preflight_node(self.store, self.host, target)?.parent != Some(node.node)
+            || cached_ordinary_type_parameter_owner(self.store, source) != Some(expected)
+            || object_members::cached_planned_type_identity(self.store, target) != Some(source)
+            || !plan.references.get(&target).is_some_and(|reference| {
+                reference.symbol == expected
+                    && reference.type_arguments.is_empty()
+                    && reference.arity == PlannedTypeReferenceArity::Valid
+            })
+        {
+            return Err(invalid());
+        }
+        arguments
+            .get(source_index)
+            .copied()
+            .map(Some)
+            .ok_or_else(invalid)
     }
 
     fn authenticated_generic_interface_constraint(
@@ -54719,6 +54992,76 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             )
         };
         result.map_err(|_| unsupported())
+    }
+
+    fn authenticated_source_keyof_argument(
+        &self,
+        node: NodeRef,
+        key: TypeId,
+        constraint: TypeId,
+    ) -> bool {
+        if !self.authenticated_deferred_pick_key(key, constraint) {
+            return false;
+        }
+        let Some(TypeData::Conditional(conditional)) =
+            self.store.type_payload(key).map(TypeRecord::data)
+        else {
+            return true;
+        };
+        let arrays = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types);
+        if !super::conditional_types::validate_conditional_reference_result_with_array_targets(
+            self.store, node, key, arrays,
+        )
+        .is_ok_and(|valid| valid)
+        {
+            return false;
+        }
+        let Some(root) = self.store.conditional_root(conditional.root) else {
+            return false;
+        };
+        let Some(parameter) = cached_ordinary_type_parameter_owner(self.store, root.check_type())
+        else {
+            return false;
+        };
+        let Some(NodeData::ConditionalTypeNode(syntax)) =
+            self.host.node(root.node()).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let when_false = NodeRef::new(root.node().arena, root.node().file, syntax.false_type);
+        let Some(NodeData::TypeReferenceNode(reference)) =
+            self.host.node(when_false).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let name = NodeRef::new(when_false.arena, when_false.file, reference.type_name);
+        let planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            arrays,
+            self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
+        );
+        planner
+            .resolve_uncached_type_reference_symbol(when_false)
+            .ok()
+            == Some(parameter)
+            && [when_false, name].into_iter().all(|node| {
+                self.store.symbol_node_links(node).is_none_or(|links| {
+                    links
+                        .resolved_symbol
+                        .is_none_or(|symbol| symbol == parameter)
+                }) && self.store.type_node_links(node).is_none_or(|links| {
+                    links.outer_type_parameters.is_none()
+                        && links
+                            .resolved_type
+                            .is_none_or(|type_| type_ == root.check_type())
+                })
+            })
     }
 
     fn authenticated_deferred_pick_key(&self, key: TypeId, constraint: TypeId) -> bool {

@@ -73,6 +73,9 @@ pub(super) struct NongenericKeyofPlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum NongenericKeyofProof {
     Declared(DeclaredPropertyObjectProof),
+    GenericInterface {
+        target: TypeId,
+    },
     FreshObjectLiteral {
         owner: SemanticSymbolId,
     },
@@ -296,7 +299,9 @@ pub(super) fn plan_nongeneric_keyof_type_with_array_targets(
         _ => {}
     }
 
-    let proof = match source_object_literal_proof(store, target, array_targets)? {
+    let proof = match generic_interface_keyof_proof(store, target, array_targets)?
+        .or(source_object_literal_proof(store, target, array_targets)?)
+    {
         Some(proof) => proof,
         None => match validate_resolved_declared_property_object(store, target) {
             DeclaredPropertyObjectValidation::Valid(proof) => NongenericKeyofProof::Declared(proof),
@@ -360,6 +365,81 @@ pub(super) fn plan_nongeneric_keyof_type_with_array_targets(
         preserves_origin,
         composition: None,
     })
+}
+
+fn generic_interface_keyof_proof(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<NongenericKeyofProof>, NongenericKeyofError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(NongenericKeyofError::InvalidType(type_))?;
+    let reference = match record.data() {
+        TypeData::TypeReference(reference) => reference,
+        TypeData::Interface(interface)
+            if record.object_flags().contains(ObjectFlags::REFERENCE) =>
+        {
+            &interface.reference
+        }
+        _ => return Ok(None),
+    };
+    let Some(target) = reference.object.target else {
+        return Ok(None);
+    };
+    let target_record = store
+        .type_payload(target)
+        .ok_or(NongenericKeyofError::MalformedObject(type_))?;
+    if !matches!(target_record.data(), TypeData::Interface(_))
+        || target_record.object_flags() & ObjectFlags::CLASS_OR_INTERFACE != ObjectFlags::INTERFACE
+    {
+        return Ok(None);
+    }
+    let declarations = target_record
+        .symbol()
+        .and_then(|symbol| store.symbol(symbol))
+        .and_then(|symbol| symbol.declarations())
+        .ok_or(NongenericKeyofError::MalformedObject(type_))?;
+    let mut has_local_formals = false;
+    for &declaration in declarations {
+        let children = store
+            .source_direct_children(declaration)
+            .ok_or(NongenericKeyofError::MalformedObject(type_))?;
+        has_local_formals |= children
+            .iter()
+            .any(|child| store.source_node_kind(*child) == Some(SyntaxKind::TypeParameter));
+    }
+    if !has_local_formals {
+        return Ok(None);
+    }
+    let members = super::instantiated_members::validate_generic_interface_members(
+        store,
+        type_,
+        array_targets,
+    )
+    .map_err(|error| match error {
+        super::instantiated_members::GenericInterfaceMemberError::UnsupportedTarget(_)
+        | super::instantiated_members::GenericInterfaceMemberError::UnsupportedMember(_)
+        | super::instantiated_members::GenericInterfaceMemberError::UnsupportedPropertyType(_) => {
+            NongenericKeyofError::UnsupportedObject(type_)
+        }
+        _ => NongenericKeyofError::MalformedObject(type_),
+    })?
+    .ok_or(NongenericKeyofError::UnsupportedObject(type_))?;
+    if members.reference() != type_
+        || members.target() != target
+        || members.members() != reference.object.structured.members
+        || members.properties()
+            != reference
+                .object
+                .structured
+                .properties
+                .as_deref()
+                .unwrap_or_default()
+    {
+        return Err(NongenericKeyofError::MalformedObject(type_));
+    }
+    Ok(Some(NongenericKeyofProof::GenericInterface { target }))
 }
 
 fn source_object_literal_proof(

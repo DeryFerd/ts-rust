@@ -113,21 +113,20 @@ fn validate_alias_base_property_object(
 
 fn validate_instantiated_alias_base_property_object(
     store: &CanonicalTypeMapperStore,
-    request: &super::interface_heritage::SourceInterfaceAliasBaseRequest,
+    base: &super::interface_heritage::DirectInterfaceBasePlan,
     type_: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
     query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
 ) -> Option<ValidatedInterfaceSurface> {
-    if !matches!(source_interface_alias_base_state(store, request, array_targets, query).ok()?,
-        SourceInterfaceAliasBaseState::Ready { type_: result, .. } if result == type_)
-    {
-        return None;
-    }
-    let members =
-        super::interface_heritage::interface_alias_base_members(store, type_, array_targets)
-            .ok()??;
+    let members = super::interface_heritage::validated_instantiated_interface_base_members(
+        store,
+        base,
+        type_,
+        array_targets,
+        query,
+    )?;
     Some(ValidatedInterfaceSurface {
-        owner: request.symbol(),
+        owner: base.symbol,
         declared_properties: Vec::new(),
         properties: members.properties,
         index_infos: members.indexes,
@@ -158,7 +157,7 @@ fn planned_base_matches(
     array_targets: Option<CanonicalArrayTargets>,
     query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
 ) -> bool {
-    if planned.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
+    if planned.kind.is_instantiated_alias() {
         return super::interface_heritage::source_interface_alias_reference_request(store, planned.symbol, planned.node)
             .is_ok_and(|request| {
                 request.arguments() == planned.type_arguments.as_slice()
@@ -360,6 +359,7 @@ fn planned_interface_base_sequence_is_exact(
             base.kind,
             DirectInterfaceBaseKind::NongenericTypeLiteralAlias
                 | DirectInterfaceBaseKind::InstantiatedTypeAlias
+                | DirectInterfaceBaseKind::RecordMappedAlias
         )
     }) {
         let Some(actual_type) = store
@@ -396,6 +396,7 @@ fn planned_interface_base_sequence_is_exact(
                                 planned.kind,
                                 DirectInterfaceBaseKind::NongenericTypeLiteralAlias
                                     | DirectInterfaceBaseKind::InstantiatedTypeAlias
+                                    | DirectInterfaceBaseKind::RecordMappedAlias
                             )
                 })
             && validate_source_interface_heritage_complete_bases(
@@ -616,7 +617,7 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
         || heritage
             .bases
             .iter()
-            .any(|base| base.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias);
+            .any(|base| base.kind.is_instantiated_alias());
     let multiple_bases = base_types.len() > 1;
     let owner = store
         .symbol(plan.symbol)
@@ -667,16 +668,10 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
             });
         }
         let inherited_base = store.direct_interface_heritage_provenance(base).is_some();
-        let surface = if planned.kind == DirectInterfaceBaseKind::InstantiatedTypeAlias {
-            let request = super::interface_heritage::source_interface_alias_reference_request(
-                store,
-                planned.symbol,
-                planned.node,
-            )
-            .map_err(|_| invalid(plan, type_))?;
+        let surface = if planned.kind.is_instantiated_alias() {
             validate_instantiated_alias_base_property_object(
                 store,
-                &request,
+                planned,
                 base,
                 array_targets,
                 query,
@@ -695,6 +690,7 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
             planned.kind,
             DirectInterfaceBaseKind::NongenericTypeLiteralAlias
                 | DirectInterfaceBaseKind::InstantiatedTypeAlias
+                | DirectInterfaceBaseKind::RecordMappedAlias
         ) && surface.owner != planned.symbol
         {
             return Err(invalid(plan, type_));
@@ -713,6 +709,7 @@ pub(super) fn resolve_direct_interface_members_with_query_context(
                     planned.kind,
                     DirectInterfaceBaseKind::NongenericTypeLiteralAlias
                         | DirectInterfaceBaseKind::InstantiatedTypeAlias
+                        | DirectInterfaceBaseKind::RecordMappedAlias
                 ) && !distinct_later_interface_base_is_supported(store, planned.symbol, base))
         {
             return Err(PropertyObjectError::UnsupportedMember {

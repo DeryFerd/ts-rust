@@ -3328,6 +3328,7 @@ fn check_direct_source_property_with_source_mode(
                 && !source_class_reference
                 && !completed_applied_class_origin
                 && !conditional_mapped
+                && store.source_interface_heritage_header(receiver).is_none()
                 && !is_cold_direct_nongeneric_interface(store, receiver)
             {
                 return resolve_direct_source_own_property(
@@ -3356,14 +3357,17 @@ fn check_direct_source_property_with_source_mode(
                 if resolved != receiver {
                     return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
                 }
-                return resolve_direct_source_own_property(
+                return super::object_members::resolve_object_property_by_key_with_source(
                     store,
-                    Some(global_types),
+                    host,
+                    global_types,
+                    options,
                     receiver,
-                    name,
+                    EscapedNameRef::source(name),
                     session,
+                    diagnostics,
                 )
-                .map_err(SourcePropertyQueryError::Property);
+                .map_err(SourcePropertyQueryError::Source);
             }
             super::object_members::resolve_object_property_by_key_with_source(
                 store,

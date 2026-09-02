@@ -79622,7 +79622,13 @@ fn check_source_plan(
                     session,
                     &mut statement_diagnostics,
                 )
-                .and_then(|mut query| query.get_declared_type_of_symbol(interface.symbol));
+                .and_then(|mut query| {
+                    if interface.heritage.is_some() {
+                        query.get_declared_interface_for_source_check(interface.symbol)
+                    } else {
+                        query.get_declared_type_of_symbol(interface.symbol)
+                    }
+                });
                 merge_retry_diagnostics(diagnostics, statement_diagnostics);
                 let target = target?;
 
