@@ -233,7 +233,7 @@ fn assert_dom_signature(
         .symbol()
         .unwrap();
     let function_symbol = checker.store().symbol(function_owner).unwrap();
-    assert_eq!(function_symbol.name(), "Function");
+    assert_eq!(function_symbol.name().as_utf8(), Some("Function"));
     assert!(
         function_symbol
             .declarations()
