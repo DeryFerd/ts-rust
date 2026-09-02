@@ -1118,7 +1118,7 @@ pub(super) fn check_own_class_property_flow_read(
     }))
 }
 
-/// A class field assignment with a separate left-hand-side position proof.
+/// A class member assignment with a separate left-hand-side position proof.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceClassPropertyWritePlan {
     statement: NodeRef,
@@ -1536,7 +1536,10 @@ fn plan_class_property_write_at(
     }
     .ok_or_else(|| unsupported_access(target))?;
     let member_record = store.symbol(member).ok_or_else(invalid)?;
-    if !member_record.flags().contains(SymbolFlags::PROPERTY)
+    let method_write = member_record.flags() == SymbolFlags::METHOD
+        && destructuring.is_none()
+        && property.privacy == SourcePropertyPrivacy::Identifier;
+    if (!member_record.flags().contains(SymbolFlags::PROPERTY) && !method_write)
         || member_record.parent() != Some(context.class_symbol)
         || store.get_merged_symbol(member) != Some(member)
     {
@@ -1548,6 +1551,16 @@ fn plan_class_property_write_at(
         return Err(invalid());
     }
     let origin = match &declaration_record.data {
+        NodeData::MethodDeclaration(method)
+            if method_write
+                && declaration_record.kind == SyntaxKind::MethodDeclaration
+                && declaration_record.parent == Some(context.class_declaration.node)
+                && method.postfix_token.is_none()
+                && class_member_side(store, host, declaration, method.modifiers.as_ref())?
+                    == ClassPropertySide::Instance =>
+        {
+            ClassMemberOrigin::Method
+        }
         NodeData::PropertyDeclaration(field)
             if declaration_record.parent == Some(context.class_declaration.node)
                 && class_member_side(store, host, declaration, field.modifiers.as_ref())?
