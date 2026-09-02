@@ -2,7 +2,98 @@
 
 Updated 2026-09-02. No complete real-world project has passed in Rust yet.
 
-## Query and Hono checkpoint
+## Latest Query and Hono checkpoint
+
+Both projects still fail a full type check. The latest complete runs use
+`72bc51f5`. No completed isolated root was gained or lost.
+
+| Project | Completed isolated roots | Unsupported | Internal errors | Original policy skip |
+| --- | ---: | ---: | ---: | ---: |
+| Query core | 1 of 23 | 22 | 0 | 0 |
+| Hono | 30 of 188 | 152 | 5 | 1 |
+
+An isolated root is one original project entry file checked on its own. It is
+not a full project pass or proof of diagnostic parity. Both runs retained all
+original roots, loaded files, options and load diagnostics.
+
+Query's ordinary check still rejects a merged global callable. Four isolated
+roots now stop at different operations. None completes. The merged-callable
+fix must preserve the library declaration, two augmented declarations and
+the namespace declaration, including their overload order.
+
+Hono still stops in `http-exception.ts` during its ordinary check with
+`GenericReferenceUnsupported`. Seventeen isolated root outcomes changed.
+The Netlify handler changed from unsupported to `InvalidImportAliasTarget`,
+so internal errors increased from four to five. No completed root was lost.
+
+Complete evidence: [Query census 5](../target/wave202-query-combined-census-5-result.md)
+and [Hono census 4](../target/wave202-hono-combined-census-4-result.md).
+Both processes and their services are closed.
+
+### Verified test progress
+
+[Combined tests 10](../target/wave202-query-hono-combined-tests-10-result.md)
+compiled and ran all 91 tests. It passed 57 and failed 34. No test was ignored
+or filtered out.
+
+On the previous 59 tests, the result is unchanged: 43 pass and 16 fail.
+The 32 added tests contribute 14 passes and 18 failures. Some passes confirm
+that unsupported cases still fail correctly. This batch adds coverage but
+does not fix an earlier failing test. Do not compare 57 of 91 directly with
+43 of 59 as a measure of progress.
+
+The copied-generic-call test also received a canonical API correction. It
+still fails later in a relation check. That correction is not a checker gain.
+
+| Unchanged earlier failure | Failed tests |
+| --- | ---: |
+| Abstract class checks | 3 |
+| Contextual object parameters | 3 |
+| Class `instanceof` checks | 3 |
+| Native `Set` cache checks | 2 |
+| Generic constructor expression cache | 2 |
+| Copied generic call relation | 1 |
+| Imported class alias instantiation | 1 |
+| Object-rest diagnostic type display | 1 |
+
+### Why project progress is slow
+
+Each source check stops at its first unsupported operation. Fixing that
+operation often exposes another one in the same file. Query's retry code
+has moved through constructor checks, `instanceof`, and now a new expression
+without completing the file.
+
+Build failures also delayed feedback. Two combined attempts ran no tests.
+The latest complete combined batch compiled. The separate bind check ran all
+four tests. One passed and three stopped at an unsupported function type in
+the library call path. Its next reviewed fix admits the library's actual
+`any[]` rest constraint and retains exact type and cache checks.
+
+The next priorities are Query's shared `Subscribable` bind call, its merged
+global callable, Hono's generic callable and class types, and the concrete
+cache and contextual-type failures in the table above.
+
+### Next measured batch
+
+The next batch combines reviewed fixes for native `Set` members, contextual
+object parameters, `instanceof`, augmented global calls, imported arrow
+return queries, imported heritage queries and nested callback bodies.
+Additional work covers Hono's generic rest calls, ambient namespace values
+and async class methods. Shared awaited types and generic callable aliases
+have separate source and test owners.
+
+The next test run must retain the same 91 tests and report changed results
+separately from new tests. Both original project checks must run on that same
+source version after it compiles. Temporary traces help locate remaining
+erased errors. They are not checker fixes.
+
+None of these repair branches is accepted on primary yet. Acceptance still
+requires the unchanged corpus checks and removal of temporary traces.
+
+## Earlier Query and Hono checkpoint
+
+The section below is retained history. Its pending work and counts are
+superseded by the latest checkpoint above.
 
 Query core and Hono are the primary targets again. New Pathe-only work,
 runner redesign and the UFO dependency task are paused.
