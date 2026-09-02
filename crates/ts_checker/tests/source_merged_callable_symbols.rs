@@ -582,19 +582,20 @@ fn native_merged_function_namespace_keeps_real_overloads_and_source_owners() {
         assert_eq!(diagnostic.diagnostic.code(), 2769);
         assert_eq!(diagnostic.node, Some(bad_arguments[0]));
         assert_eq!(diagnostic.range_override, None);
+        // Later declaration files are tried first, so the string overload fails last.
         assert_eq!(
             diagnostic.diagnostic.render().unwrap(),
             concat!(
                 "No overload matches this call.\n",
                 "  The last overload gave the following error.\n",
-                "    Argument of type 'boolean' is not assignable to parameter of type 'number'.",
+                "    Argument of type 'boolean' is not assignable to parameter of type 'string'.",
             )
         );
         let [related] = diagnostic.related_information.as_slice() else {
             panic!("the failure must point to the real last overload")
         };
         assert_eq!(related.diagnostic.code(), 2771);
-        assert_eq!(related.node, Some(functions[1]));
+        assert_eq!(related.node, Some(functions[0]));
         assert_eq!(
             related.diagnostic.render().unwrap(),
             "The last overload is declared here."
