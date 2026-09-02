@@ -7018,23 +7018,20 @@ fn source_object_parameter_annotation_plan(
         {
             return None;
         }
-        let mut symbol = source_alias_reference_symbol(store, host, annotation)
-            .inspect_err(|error| {
-                observe_object_parameter_plan_failure(
-                    "name",
-                    annotation,
-                    format_args!("{error:?}"),
-                );
-            })
-            .ok()?
-            .or_else(|| {
-                observe_object_parameter_plan_failure(
-                    "name",
-                    annotation,
-                    format_args!("not found"),
-                );
-                None
-            })?;
+        let mut symbol = source_alias_reference_symbol(
+            store,
+            host,
+            annotation,
+            SymbolFlags::TYPE | SymbolFlags::ALIAS,
+        )
+        .inspect_err(|error| {
+            observe_object_parameter_plan_failure("name", annotation, format_args!("{error:?}"));
+        })
+        .ok()?
+        .or_else(|| {
+            observe_object_parameter_plan_failure("name", annotation, format_args!("not found"));
+            None
+        })?;
         if store.symbol(symbol)?.flags().intersects(SymbolFlags::ALIAS) {
             symbol = super::type_nodes::plan_ordinary_import_alias_target(
                 store, host, annotation, symbol,
@@ -10678,6 +10675,7 @@ fn source_alias_reference_symbol(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
+    meaning: SymbolFlags,
 ) -> Result<Option<SemanticSymbolId>, SourceCallableError> {
     let record = preflight_node(store, host, node)?;
     let NodeData::TypeReferenceNode(reference) = &record.data else {
@@ -10711,7 +10709,7 @@ fn source_alias_reference_symbol(
             .resolve(
                 Some(CanonicalResolutionLocation::Bound(name)),
                 &identifier.text,
-                SymbolFlags::TYPE,
+                meaning,
                 None,
                 true,
                 false,
@@ -10846,7 +10844,9 @@ fn collect_source_alias_declarations(
             }
             let record = preflight_node(store, host, node)?;
             if record.kind == SyntaxKind::TypeReference {
-                let Some(target) = source_alias_reference_symbol(store, host, node)? else {
+                let Some(target) =
+                    source_alias_reference_symbol(store, host, node, SymbolFlags::TYPE)?
+                else {
                     return Ok(false);
                 };
                 if store
@@ -10876,7 +10876,9 @@ fn plan_source_generic_alias_annotation(
     let Some(arguments) = reference.type_arguments.as_ref() else {
         return Ok(None);
     };
-    let Some(symbol) = source_alias_reference_symbol(store, host, annotation)? else {
+    let Some(symbol) =
+        source_alias_reference_symbol(store, host, annotation, SymbolFlags::TYPE)?
+    else {
         return Ok(None);
     };
     if store
