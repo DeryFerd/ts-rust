@@ -1951,10 +1951,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             _ if base_record.flags().intersects(TypeFlags::NEVER) => Vec::new(),
             _ => vec![base],
         };
-        expected.push(bootstrap.undefined_type);
         expected.retain(|type_| *type_ != bootstrap.missing_type);
-        expected.sort_unstable();
-        expected.dedup();
+        self.insert_union_type(&mut expected, bootstrap.undefined_type)?;
         match expected.as_slice() {
             [single] if *single == resolved => {}
             _ => {
