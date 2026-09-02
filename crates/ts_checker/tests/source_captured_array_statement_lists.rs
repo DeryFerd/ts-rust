@@ -115,7 +115,7 @@ enum Element {
     String,
 }
 
-fn assert_element(context: &CanonicalCheckerContext<'_>, type_: TypeId, expected: &Element) {
+fn assert_element(context: &mut CanonicalCheckerContext<'_>, type_: TypeId, expected: &Element) {
     let bootstrap = context.store().intrinsic_bootstrap().unwrap();
     match expected {
         Element::Number => assert_eq!(type_, bootstrap.number_type),
@@ -129,9 +129,13 @@ fn assert_element(context: &CanonicalCheckerContext<'_>, type_: TypeId, expected
             let [signature] = callback.structured.signatures.as_deref().unwrap() else {
                 panic!("NotifyCallback must have one call signature")
             };
-            let signature = context.store().signature(*signature).unwrap();
+            let signature = *signature;
+            let void_type = bootstrap.void_type;
+            // Function returns stay lazy until the canonical query resolves them.
+            assert_eq!(context.get_return_type_of_signature(signature), Ok(void_type));
+            let signature = context.store().signature(signature).unwrap();
             assert!(signature.parameters().is_empty());
-            assert_eq!(signature.resolved_return_type(), Some(bootstrap.void_type));
+            assert_eq!(signature.resolved_return_type(), Some(void_type));
         }
     }
 }
@@ -386,7 +390,7 @@ fn check_source(
     let bindings = queues(&context, &parsed);
     assert_eq!(bindings.len(), elements.len());
     for (binding, element) in bindings.iter().zip(elements) {
-        assert_element(&context, binding.element, element);
+        assert_element(&mut context, binding.element, element);
     }
     for pair in bindings.windows(2) {
         assert_ne!(pair[0].owner, pair[1].owner);
