@@ -6250,7 +6250,14 @@ pub(super) fn source_return_function_type_owner(
         };
         if store.source_node_kind(parent) == Some(SyntaxKind::ParenthesizedType) {
             if store.source_direct_children(parent)?.as_slice() != [root]
-                || !store.source_direct_type_annotation_is_exact(parent, type_)
+                || store.type_node_links(parent).is_some_and(|links| {
+                    links != &super::TypeNodeLinks::default()
+                        && (links.outer_type_parameters.is_some()
+                            || links.resolved_type != Some(type_))
+                })
+                || store
+                    .symbol_node_links(parent)
+                    .is_some_and(|links| links != &super::SymbolNodeLinks::default())
             {
                 return None;
             }
