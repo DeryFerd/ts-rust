@@ -65,6 +65,7 @@ use super::{
     types::{ObjectFlags, TypeFlags},
     variables::{
         PlannedObjectBindingElement, plan_function_object_parameter_bindings,
+        plan_generic_function_object_parameter_bindings,
         plan_typed_arrow_object_parameter_bindings,
     },
 };
@@ -3751,29 +3752,35 @@ fn plan_source_callable_with_owner_shape(
     let array_sort_argument_arrow = implicit_any_arrow_shape
         && view.parameters.nodes.len() == 2
         && source_array_sort_argument_arrow_is_exact(store, host, declaration);
+    let object_parameter_default_arrow = implicit_any_arrow_shape
+        && source_object_parameter_default_arrow_is_exact(store, host, declaration)?;
     let prototype_assignment_function = implicit_any_arrow_shape
         && record.kind == SyntaxKind::FunctionExpression
         && source_prototype_assignment_function_is_exact(store, host, declaration)?;
     let ordinary_function_expression = record.kind == SyntaxKind::FunctionExpression
-        && view.modifiers.is_none()
         && view.type_parameters.is_none()
         && bound
             .source_facts()
             .is_some_and(|facts| !facts.is_javascript_file());
-    let expression_contextual_arrow = record.kind == SyntaxKind::ArrowFunction
-        && !is_async
-        && type_parameters.is_empty()
+    let expression_contextual_arrow = matches!(
+        record.kind,
+        SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression
+    ) && type_parameters.is_empty()
         && (source_returned_arrow_context_annotation(store, host, declaration)?.is_some()
             || source_member_assignment_arrow_target(store, host, declaration)?.is_some());
+    let promise_executor_arrow = implicit_any_arrow_shape
+        && view.parameters.nodes.len() <= 2
+        && source_promise_constructor_argument_arrow_is_exact(store, host, declaration)?;
     let direct_call_argument_arrow = implicit_any_arrow_shape
         && !direct_implicit_any_arrow
         && !array_implicit_any_arrow
         && !object_property_arrow
         && (source_direct_call_argument_arrow_is_exact(store, host, declaration)?
-            || source_promise_constructor_argument_arrow_is_exact(store, host, declaration)?)
+            || promise_executor_arrow)
         && (eligible_implicit_any_arrow
             || array_sort_argument_arrow
             || prototype_assignment_function
+            || promise_executor_arrow
             || source_direct_call_arrow_has_zero_parameter_target(store, host, declaration)?);
     let captured_assignment = if direct_call_argument_arrow {
         plan_source_captured_assignment_callback(store, host, declaration)?
@@ -3969,7 +3976,9 @@ fn plan_source_callable_with_owner_shape(
                 if (view.family == SourceCallableFamily::FunctionDeclaration
                     || record.kind == SyntaxKind::ArrowFunction && !is_async)
                     && body_mode == SourceCallableBodyMode::Present
-                    && type_parameters.is_empty()
+                    && (type_parameters.is_empty()
+                        || view.family == SourceCallableFamily::FunctionDeclaration
+                            && view.return_type.is_some())
                     && authenticated_function_object_parameter_bindings(
                         store,
                         host,
@@ -4162,6 +4171,7 @@ fn plan_source_callable_with_owner_shape(
                             })
                     })
                     || direct_call_argument_arrow
+                    || object_parameter_default_arrow
                     || direct_implicit_any_rest_arrow)
                     || body_mode.is_ambient() && !rest
                     || !type_parameters.is_empty()
@@ -4673,7 +4683,10 @@ fn plan_source_callable_with_owner_shape(
     match owner_shape {
         SourceCallableOwnerShape::Unique => {
             let contextual_source_arrow =
-                (object_property_arrow || direct_call_argument_arrow || object_literal_method)
+                (object_property_arrow
+                    || direct_call_argument_arrow
+                    || object_parameter_default_arrow
+                    || object_literal_method)
                     && store
                         .source_callable_type_for_owner(owner_symbol)
                         .and_then(|type_| store.source_callable_provenance(type_))
@@ -4681,7 +4694,7 @@ fn plan_source_callable_with_owner_shape(
                             provenance.declaration == declaration
                                 && provenance.owner_symbol == owner_symbol
                                 && provenance.contextual_target.is_some()
-                                && (direct_call_argument_arrow
+                                && ((direct_call_argument_arrow || object_parameter_default_arrow)
                                     && provenance.contextual_variable.is_none()
                                     || (object_property_arrow || object_literal_method)
                                         && provenance.contextual_variable.is_some_and(|anchor| {
@@ -4971,7 +4984,6 @@ pub(super) fn apply_function_expression_context(
 ) -> Result<bool, SourceCallableError> {
     let declaration = plan.declaration;
     if plan.family != SourceCallableFamily::ArrowFunction
-        || plan.is_async
         || !plan.type_parameters.is_empty()
         || plan.type_predicate.is_some()
         || plan
@@ -4985,8 +4997,9 @@ pub(super) fn apply_function_expression_context(
     {
         return Ok(false);
     }
+    let returned = source_returned_arrow_context_annotation(store, host, declaration)?.is_some();
     let anchor = match store.source_node_kind(declaration) {
-        Some(SyntaxKind::FunctionExpression) => {
+        Some(SyntaxKind::FunctionExpression) if !returned => {
             let Some((initializer, variable)) =
                 source_context_root(store, declaration, SyntaxKind::ParenthesizedExpression)
             else {
@@ -5016,8 +5029,8 @@ pub(super) fn apply_function_expression_context(
             }
             Some(anchor)
         }
-        Some(SyntaxKind::ArrowFunction)
-            if source_returned_arrow_context_annotation(store, host, declaration)?.is_some()
+        Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression)
+            if returned
                 || source_member_assignment_arrow_target(store, host, declaration)?.is_some() =>
         {
             None
@@ -5191,12 +5204,40 @@ fn stored_member_assignment_arrow_context(
     Some((property, type_))
 }
 
-/// Finds the declared callable return type without crossing a callable boundary.
+/// Reads the sole written annotation from its registered source owner.
+fn stored_callable_context_annotation(
+    store: &CanonicalTypeMapperStore,
+    owner: NodeRef,
+) -> Option<NodeRef> {
+    let annotations = store
+        .source_direct_children(owner)?
+        .into_iter()
+        .filter(|node| {
+            matches!(
+                store.source_node_kind(*node),
+                Some(
+                    SyntaxKind::FunctionType
+                        | SyntaxKind::ParenthesizedType
+                        | SyntaxKind::TypeReference
+                )
+            )
+        })
+        .collect::<Vec<_>>();
+    let [annotation] = annotations.as_slice() else {
+        return None;
+    };
+    Some(*annotation)
+}
+
+/// Finds the declared return annotation without crossing a callable boundary.
 fn stored_returned_arrow_annotation(
     store: &CanonicalTypeMapperStore,
     declaration: NodeRef,
 ) -> Option<(NodeRef, NodeRef)> {
-    if store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction) {
+    if !matches!(
+        store.source_node_kind(declaration),
+        Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression)
+    ) {
         return None;
     }
     let (expression, statement) =
@@ -5225,20 +5266,8 @@ fn stored_returned_arrow_annotation(
     {
         return None;
     }
-    let annotations = store
-        .source_direct_children(owner)?
-        .into_iter()
-        .filter(|node| {
-            matches!(
-                store.source_node_kind(*node),
-                Some(SyntaxKind::FunctionType | SyntaxKind::ParenthesizedType)
-            )
-        })
-        .collect::<Vec<_>>();
-    let [annotation] = annotations.as_slice() else {
-        return None;
-    };
-    let mut inner = *annotation;
+    let annotation = stored_callable_context_annotation(store, owner)?;
+    let mut inner = annotation;
     let mut visited = HashSet::new();
     while store.source_node_kind(inner) == Some(SyntaxKind::ParenthesizedType) {
         if !visited.insert(inner) {
@@ -5250,7 +5279,11 @@ fn stored_returned_arrow_annotation(
         };
         inner = *child;
     }
-    (store.source_node_kind(inner) == Some(SyntaxKind::FunctionType)).then_some((owner, *annotation))
+    matches!(
+        store.source_node_kind(inner),
+        Some(SyntaxKind::FunctionType | SyntaxKind::TypeReference)
+    )
+    .then_some((owner, annotation))
 }
 
 /// Proves the return expression and its containing callable before using its annotation.
@@ -5319,67 +5352,71 @@ fn stored_function_expression_context_target(
     variable: Option<SemanticSymbolId>,
     target: TypeId,
 ) -> Option<ValidatedSingleCallable> {
-    if !matches!(
-        validate_stored_function_type(store, target),
-        StoredFunctionTypeValidation::Valid(_)
-    ) {
-        return None;
-    }
-    let StoredSingleCallableValidation::Valid { callable, .. } =
-        validate_stored_single_callable(store, target)
+    let StoredSingleCallableValidation::Valid {
+        family: super::callables::CallableFamily::FunctionType,
+        callable,
+        ..
+    } = validate_stored_single_callable(store, target)
     else {
         return None;
     };
     let signature = store.signature(callable.signature)?;
-    let mut annotation = signature.declaration()?;
-    if !store.source_direct_type_annotation_is_exact(annotation, target) {
-        return None;
-    }
+    let annotation = match variable {
+        Some(variable) => {
+            let (_, expression_parent) =
+                source_context_root(store, declaration, SyntaxKind::ParenthesizedExpression)?;
+            if store.source_node_kind(declaration) != Some(SyntaxKind::FunctionExpression)
+                || !store.source_contextual_callable_anchor_is_exact(declaration, owner, variable)
+                || store.symbol(variable)?.value_declaration() != Some(expression_parent)
+                || store.source_node_kind(expression_parent)
+                    != Some(SyntaxKind::VariableDeclaration)
+            {
+                return None;
+            }
+            stored_callable_context_annotation(store, expression_parent)?
+        }
+        None => {
+            if store.source_declaration_symbol(declaration) != Some(owner) {
+                return None;
+            }
+            if let Some((_, annotation)) = stored_returned_arrow_annotation(store, declaration) {
+                annotation
+            } else {
+                let (property, property_type) =
+                    stored_member_assignment_arrow_context(store, declaration)?;
+                if property_type != target {
+                    return None;
+                }
+                stored_callable_context_annotation(store, property)?
+            }
+        }
+    };
+    let mut inner = annotation;
     let mut visited = HashSet::new();
-    let type_parent = loop {
+    while store.source_node_kind(inner) == Some(SyntaxKind::ParenthesizedType) {
         if visited.len() >= super::instantiate::InstantiationLimits::default().max_depth
-            || !visited.insert(annotation)
-        {
-            return None;
-        }
-        let SourceNodeParent::Parent(parent) = store.source_node_parent(annotation)? else {
-            return None;
-        };
-        if store.source_node_kind(parent) != Some(SyntaxKind::ParenthesizedType) {
-            break parent;
-        }
-        if store.source_direct_children(parent)?.as_slice() != [annotation]
-            || store.type_node_links(parent).is_some_and(|links| {
+            || !visited.insert(inner)
+            || store.type_node_links(inner).is_some_and(|links| {
                 links != &TypeNodeLinks::default()
                     && (links.outer_type_parameters.is_some()
                         || links.resolved_type != Some(target))
             })
             || store
-                .symbol_node_links(parent)
+                .symbol_node_links(inner)
                 .is_some_and(|links| links != &SymbolNodeLinks::default())
         {
             return None;
         }
-        annotation = parent;
-    };
-    let anchor_valid = match variable {
-        Some(variable) => {
-            let (_, expression_parent) =
-                source_context_root(store, declaration, SyntaxKind::ParenthesizedExpression)?;
-            store.source_node_kind(declaration) == Some(SyntaxKind::FunctionExpression)
-                && store.source_contextual_callable_anchor_is_exact(declaration, owner, variable)
-                && expression_parent == type_parent
-                && store.symbol(variable)?.value_declaration() == Some(type_parent)
-                && store.source_node_kind(type_parent) == Some(SyntaxKind::VariableDeclaration)
-        }
-        None => {
-            (stored_returned_arrow_annotation(store, declaration) == Some((type_parent, annotation))
-                || stored_member_assignment_arrow_context(store, declaration)
-                    == Some((type_parent, target)))
-                && store.source_declaration_symbol(declaration) == Some(owner)
-        }
-    };
-    (anchor_valid
+        let children = store.source_direct_children(inner)?;
+        let [child] = children.as_slice() else {
+            return None;
+        };
+        inner = *child;
+    }
+    (visited.len() < super::instantiate::InstantiationLimits::default().max_depth
+        && store.source_direct_type_annotation_is_exact(inner, target)
+        && (store.source_node_kind(inner) != Some(SyntaxKind::FunctionType)
+            || signature.declaration() == Some(inner))
         && signature.type_parameters().is_empty()
         && signature.this_parameter().is_none()
         && !signature.has_rest_parameter()
@@ -5407,7 +5444,6 @@ fn function_expression_context_is_exact(
     target.return_type == Some(context.return_type)
         && plan.type_parameters.is_empty()
         && plan.type_predicate.is_none()
-        && !plan.is_async
         && plan
             .parameters
             .iter()
@@ -5423,7 +5459,7 @@ fn function_expression_context_is_exact(
             })
 }
 
-/// Authenticates a returned or member-assigned arrow before storing its context.
+/// Authenticates a returned callable or member-assigned arrow before storing its context.
 pub(super) fn stored_expression_arrow_context_is_exact(
     store: &CanonicalTypeMapperStore,
     declaration: NodeRef,
@@ -5436,7 +5472,7 @@ pub(super) fn stored_expression_arrow_context_is_exact(
     store.get_merged_symbol(owner_symbol) == Some(owner_symbol)
         && owner.flags() == SymbolFlags::FUNCTION
         && owner.check_flags() == CheckFlags::NONE
-        && owner.name() == InternalSymbolName::Function.as_ref()
+        && source_expression_owner_name_is_exact(store, declaration, owner)
         && owner.declarations() == Some(&[declaration])
         && owner.value_declaration() == Some(declaration)
         && owner.members().is_none()
@@ -7036,7 +7072,10 @@ pub(super) fn source_promise_constructor_argument_arrow_is_exact(
     if record.kind != SyntaxKind::NewExpression
         || record.flags.0 != 0
         || expression.facts != 0
-        || expression.type_arguments.is_some()
+        || expression
+            .type_arguments
+            .as_ref()
+            .is_some_and(|arguments| arguments.nodes.len() != 1)
         || arguments.has_trailing_comma
         || arguments.nodes.as_slice() != [declaration.node]
     {
@@ -7045,13 +7084,6 @@ pub(super) fn source_promise_constructor_argument_arrow_is_exact(
     let constructor = NodeRef::new(construction.arena, construction.file, expression.expression);
     let constructor_record = preflight_node(store, host, constructor)?;
     let NodeData::Identifier(identifier) = &constructor_record.data else {
-        return Ok(false);
-    };
-    let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(construction) else {
-        return Ok(false);
-    };
-    let statement_record = preflight_node(store, host, statement)?;
-    let NodeData::ExpressionStatement(statement_data) = &statement_record.data else {
         return Ok(false);
     };
     let Some(bound) = host.bound_file(declaration) else {
@@ -7068,17 +7100,30 @@ pub(super) fn source_promise_constructor_argument_arrow_is_exact(
     else {
         return Ok(false);
     };
+    let (arena, bound) = host
+        .source(construction)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidSyntax(construction)))?;
+    let mut callback_host = host.name_resolver_host(store)?;
+    let mut resolver =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(DeclaredTypeError::from)?;
+    let resolved = resolver
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(constructor)),
+            &identifier.text,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?
+        .and_then(|symbol| store.get_merged_symbol(symbol));
     Ok(constructor_record.kind == SyntaxKind::Identifier
         && constructor_record.parent == Some(construction.node)
         && constructor_record.flags.0 == 0
         && identifier.flow_node.is_none()
         && identifier.text == "Promise"
-        && statement_record.kind == SyntaxKind::ExpressionStatement
-        && statement_record.flags.0 == 0
-        && statement_data.expression == construction.node
-        && statement_data.flow_node.is_none()
-        && store.source_node_parent(statement)
-            == Some(SourceNodeParent::Parent(bound.source_file()))
+        && resolved == Some(promise)
         && bound
             .source_facts()
             .is_some_and(|facts| !facts.is_declaration_file())
@@ -7189,6 +7234,13 @@ pub(super) fn authenticated_function_object_parameter_bindings(
     parameter: NodeRef,
 ) -> Option<Vec<PlannedObjectBindingElement>> {
     let (arena, bound) = host.source(declaration)?;
+    let queried_generic_function = host.node(declaration).is_some_and(|record| {
+        record.kind == SyntaxKind::FunctionDeclaration
+            && matches!(&record.data, NodeData::FunctionDeclaration(function)
+                if function.type_.is_some()
+                    && function.type_parameters.as_ref()
+                        .is_some_and(|parameters| !parameters.nodes.is_empty()))
+    });
     let bindings = if host.node(declaration)?.kind == SyntaxKind::ArrowFunction {
         plan_typed_arrow_object_parameter_bindings(arena, bound, store, declaration, parameter)
             .inspect_err(|error| {
@@ -7198,6 +7250,9 @@ pub(super) fn authenticated_function_object_parameter_bindings(
                     format_args!("{error:?}"),
                 );
             })
+            .ok()?
+    } else if queried_generic_function {
+        plan_generic_function_object_parameter_bindings(arena, bound, store, declaration, parameter)
             .ok()?
     } else {
         plan_function_object_parameter_bindings(arena, bound, store, declaration, parameter)
@@ -7210,6 +7265,11 @@ pub(super) fn authenticated_function_object_parameter_bindings(
             })
             .ok()?
     };
+    if queried_generic_function {
+        // The callable's type query proves the written parent with its real formals.
+        // Keep union and intersection parents intact until property lookup.
+        return Some(bindings);
+    }
     let NodeData::ParameterDeclaration(syntax) = &host.node(parameter)?.data else {
         return None;
     };
@@ -7227,6 +7287,63 @@ pub(super) fn authenticated_function_object_parameter_bindings(
         return None;
     }
     Some(bindings)
+}
+
+/// Proves the binding that supplies context to a generic parameter's default arrow.
+pub(super) fn source_object_parameter_default_arrow_is_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+) -> Result<bool, SourceCallableError> {
+    let record = preflight_node(store, host, declaration)?;
+    if record.kind != SyntaxKind::ArrowFunction {
+        return Ok(false);
+    }
+    let Some(binding) = record
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return Ok(false);
+    };
+    let binding_record = preflight_node(store, host, binding)?;
+    let NodeData::BindingElement(element) = &binding_record.data else {
+        return Ok(false);
+    };
+    if binding_record.kind != SyntaxKind::BindingElement
+        || element.initializer != Some(declaration.node)
+        || element.property_name.is_some()
+    {
+        return Ok(false);
+    }
+    let mut parent = binding;
+    for kind in [SyntaxKind::ObjectBindingPattern, SyntaxKind::Parameter] {
+        let Some(SourceNodeParent::Parent(next)) = store.source_node_parent(parent) else {
+            return Ok(false);
+        };
+        if store.source_node_kind(next) != Some(kind) {
+            return Ok(false);
+        }
+        parent = next;
+    }
+    let parameter = parent;
+    let Some(SourceNodeParent::Parent(function)) = store.source_node_parent(parameter) else {
+        return Ok(false);
+    };
+    let function_record = preflight_node(store, host, function)?;
+    if function_record.kind != SyntaxKind::FunctionDeclaration
+        || !matches!(&function_record.data, NodeData::FunctionDeclaration(function)
+            if function.type_.is_some()
+                && function.type_parameters.as_ref()
+                    .is_some_and(|parameters| !parameters.nodes.is_empty()))
+    {
+        return Ok(false);
+    }
+    Ok(authenticated_function_object_parameter_bindings(store, host, function, parameter)
+        .is_some_and(|bindings| {
+            bindings.iter().any(|planned| {
+                planned.element == binding && planned.initializer == Some(declaration)
+            })
+        }))
 }
 
 fn observe_object_parameter_plan_failure(
@@ -7977,6 +8094,149 @@ pub(super) fn source_direct_call_statement_container<TypePayload, MapperPayload>
         && owner.value_declaration() == Some(container)
         && store.source_symbol_declarations_match(symbol))
     .then_some(container)
+}
+
+#[allow(clippy::too_many_lines)] // Prove the source owner and its cached property context together.
+fn stored_object_parameter_default_arrow_is_exact(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    contextual_target: TypeId,
+) -> bool {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
+        || store.source_declaration_symbol(declaration) != Some(owner_symbol)
+        || store.source_direct_call_resolution_was_registered(declaration)
+    {
+        return false;
+    }
+    let Some(SourceNodeParent::Parent(binding)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let Some(children) = store.source_direct_children(binding) else {
+        return false;
+    };
+    let [name, initializer] = children.as_slice() else {
+        return false;
+    };
+    if store.source_node_kind(binding) != Some(SyntaxKind::BindingElement)
+        || *initializer != declaration
+        || store.source_node_kind(*name) != Some(SyntaxKind::Identifier)
+        || store.source_node_parent(*name) != Some(SourceNodeParent::Parent(binding))
+    {
+        return false;
+    }
+    let Some(symbol) = store.source_declaration_symbol(binding) else {
+        return false;
+    };
+    let Some(owner) = store.symbol(symbol) else {
+        return false;
+    };
+    if owner.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != store.source_identifier_text(*name)
+        || owner.declarations() != Some(&[binding])
+        || owner.value_declaration() != Some(binding)
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || !store.source_symbol_declarations_match(symbol)
+    {
+        return false;
+    }
+    let mut parent = binding;
+    let mut parameter = None;
+    for kind in [
+        SyntaxKind::ObjectBindingPattern,
+        SyntaxKind::Parameter,
+        SyntaxKind::FunctionDeclaration,
+    ] {
+        let Some(SourceNodeParent::Parent(next)) = store.source_node_parent(parent) else {
+            return false;
+        };
+        if store.source_node_kind(next) != Some(kind)
+            || store.source_direct_children(next).is_none_or(|children| {
+                children.iter().filter(|child| **child == parent).count() != 1
+            })
+        {
+            return false;
+        }
+        if kind == SyntaxKind::Parameter {
+            parameter = Some(next);
+        }
+        parent = next;
+    }
+    let Some(parameter_symbol) = parameter.and_then(|node| store.source_declaration_symbol(node))
+    else {
+        return false;
+    };
+    let Some(type_) = store.source_callable_type_for_declaration(parent) else {
+        return false;
+    };
+    let Some(provenance) = store.source_callable_provenance(type_) else {
+        return false;
+    };
+    if provenance.family != SourceCallableFamily::FunctionDeclaration
+        || provenance.declaration != parent
+        || !store
+            .signature(provenance.signature)
+            .is_some_and(|signature| {
+                !signature.type_parameters().is_empty()
+                    && signature.parameters().contains(&parameter_symbol)
+            })
+        || store
+            .function_signature_return_annotation(provenance.signature)
+            .is_none()
+        || !matches!(
+            validate_stored_source_callable(store, type_),
+            StoredSourceCallableValidation::Valid(_)
+        )
+    {
+        return false;
+    }
+    let Some(evidence) = store
+        .source_callable_type_query(provenance.signature)
+        .filter(|evidence| evidence.is_exact(store))
+    else {
+        return false;
+    };
+    let Some(annotation) = evidence
+        .callable()
+        .parameters
+        .iter()
+        .find(|planned| planned.symbol == parameter_symbol)
+        .and_then(|planned| planned.explicit_type_node())
+    else {
+        return false;
+    };
+    let Some(parent_type) = evidence.annotation_type(annotation) else {
+        return false;
+    };
+    let Some(name) = owner.name().as_utf8() else {
+        return false;
+    };
+    let Ok(Some(property)) = super::member_resolution::cached_source_union_property(
+        store,
+        parent_type,
+        name,
+        provenance.array_targets,
+    ) else {
+        return false;
+    };
+    let Ok(projection) = super::source::source_binding_non_undefined_projection(
+        store,
+        evidence.callable(),
+        property.type_id(),
+    ) else {
+        return false;
+    };
+    let Some(types) = projection else {
+        return property.type_id() == contextual_target;
+    };
+    store
+        .cached_literal_union_type_with_alias(&types, None, provenance.array_targets)
+        .is_ok_and(|type_| type_ == Some(contextual_target))
 }
 
 fn stored_direct_call_argument_arrow_is_exact(
@@ -11562,10 +11822,16 @@ fn validate_modifiers(
         [SyntaxKind::AsyncKeyword]
             if !is_declaration_file
                 && view.family == SourceCallableFamily::ArrowFunction
-                && view.parameters.nodes.is_empty()
                 && !view.parameters.has_trailing_comma
                 && view.type_parameters.is_none()
-                && view.return_type.is_none() =>
+                && view.return_type.is_none()
+                && (view.parameters.nodes.is_empty()
+                    || store.source_node_kind(declaration) == Some(SyntaxKind::FunctionExpression)
+                        && host.bound_file(declaration).is_some_and(|bound| {
+                            bound
+                                .source_facts()
+                                .is_some_and(|facts| !facts.is_javascript_file())
+                        })) =>
         {
             Ok(SourceCallableBodyMode::Present)
         }
@@ -13743,6 +14009,13 @@ fn publish_prepared_contextual_source_callable(
                 prepared.owner_symbol,
                 prepared.captured_assignment,
             )
+                || prepared.captured_assignment.is_none()
+                    && stored_object_parameter_default_arrow_is_exact(
+                        store,
+                        prepared.declaration,
+                        prepared.owner_symbol,
+                        prepared.contextual_target,
+                    )
         },
         |anchor| {
             store.source_contextual_callable_anchor_is_exact(
@@ -16106,7 +16379,10 @@ pub(super) fn validate_stored_source_callable(
                 )
                     || provenance.captured_assignment.is_none()
                         && (stored_returned_arrow_annotation(store, declaration).is_some()
-                            || stored_member_assignment_arrow_context(store, declaration).is_some())) =>
+                            || stored_member_assignment_arrow_context(store, declaration).is_some()
+                            || stored_object_parameter_default_arrow_is_exact(
+                                store, declaration, owner_symbol, target,
+                            ))) =>
         {
             Some((target, None))
         }
@@ -16489,6 +16765,10 @@ pub(super) fn validate_stored_source_callable(
                     owner_symbol,
                     provenance.captured_assignment,
                 )
+                    || provenance.captured_assignment.is_none()
+                        && stored_object_parameter_default_arrow_is_exact(
+                            store, declaration, owner_symbol, target,
+                        )
             },
             |anchor| {
                 store.source_contextual_callable_anchor_is_exact(declaration, owner_symbol, anchor)

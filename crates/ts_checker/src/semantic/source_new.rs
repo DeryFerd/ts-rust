@@ -351,6 +351,8 @@ struct SourceGlobalPromiseConstructorPlan {
     parameter_annotation: NodeRef,
     return_annotation: NodeRef,
     executor: NodeRef,
+    type_argument: Option<NodeRef>,
+    array_targets: Option<CanonicalArrayTargets>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -534,13 +536,32 @@ impl SourceDefaultNewPlan {
     pub(super) fn promise_executor_contextual_type(
         &self,
         store: &CanonicalTypeMapperStore,
-    ) -> Option<TypeId> {
+    ) -> Result<Option<TypeId>, SourceNewError> {
         let SourceNewTarget::GlobalPromise(global) = &self.target else {
-            return None;
+            return Ok(None);
         };
-        store
-            .type_node_links(global.parameter_annotation)
-            .and_then(|links| links.resolved_type)
+        let Some(checked) = resolved_global_promise_constructor(store, self, global)? else {
+            return Ok(None);
+        };
+        let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(self.node));
+        let executor = exact_type_cache(store, global.parameter_annotation)
+            .map_err(|()| invalid())?
+            .ok_or_else(invalid)?;
+        let formal = store
+            .declared_type_links(global.type_parameter)
+            .and_then(|links| links.declared_type)
+            .ok_or_else(invalid)?;
+        let instance = validate_direct_generic_reference(store, checked.instance_type)
+            .map_err(|_| invalid())?;
+        super::instantiate::cached_instantiation_with_vector(
+            store,
+            executor,
+            &[formal],
+            &instance.type_arguments,
+            global.array_targets,
+            None,
+        )
+        .map_err(|_| invalid())
     }
 
     fn arguments(&self) -> impl Iterator<Item = &SourceNewArgument> {
@@ -1274,7 +1295,8 @@ fn plan_direct_default_new_with_context(
         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
     }
     if !global_array
-        && (arguments.len() > 1 || new_expression.type_arguments.is_some() && !imported_class)
+        && (arguments.len() > 1
+            || new_expression.type_arguments.is_some() && !imported_class && !global_promise)
     {
         return Err(unsupported(if new_expression.type_arguments.is_some() {
             SourceNewUnsupported::TypeArguments(node)
@@ -1353,7 +1375,15 @@ fn plan_direct_default_new_with_context(
         {
             return Err(unsupported(SourceNewUnsupported::Arguments(node)));
         }
-        let global = plan_global_promise_constructor(store, host, constructor, symbol, executor)?;
+        let global = plan_global_promise_constructor(
+            store,
+            host,
+            node,
+            constructor,
+            symbol,
+            executor,
+            source_context.map(|(globals, _)| CanonicalArrayTargets::from_global_types(globals)),
+        )?;
         (SourceNewTarget::GlobalPromise(global), None)
     } else if symbol_record.flags() == SymbolFlags::CLASS
         && let Some(class) = super::classes::plan_source_constructor_overload_class(
@@ -2567,10 +2597,17 @@ fn date_constructor_parameter_type_has_no_void(
 fn plan_global_promise_constructor(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
     constructor: NodeRef,
     symbol: SemanticSymbolId,
     executor: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<SourceGlobalPromiseConstructorPlan, SourceNewError> {
+    let type_argument = match generic_source_class_type_argument_nodes(host, node, constructor)? {
+        None => None,
+        Some(arguments) if arguments.len() == 1 => arguments.first().copied(),
+        Some(_) => return Err(unsupported(SourceNewUnsupported::TypeArguments(node))),
+    };
     let reject = || {
         unsupported(SourceNewUnsupported::ConstructorClass {
             node: constructor,
@@ -2860,6 +2897,8 @@ fn plan_global_promise_constructor(
             parameter_annotation,
             return_annotation,
             executor,
+            type_argument,
+            array_targets,
         });
     }
 
@@ -4537,12 +4576,23 @@ fn preflight_direct_default_new_with_context(
             }
         }
         SourceNewTarget::GlobalPromise(expected) => {
+            if source_context.is_some_and(|(globals, _)| {
+                expected.array_targets.is_some_and(|targets| {
+                    targets != CanonicalArrayTargets::from_global_types(globals)
+                })
+            }) {
+                return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                )));
+            }
             let actual = plan_global_promise_constructor(
                 store,
                 host,
+                plan.node,
                 plan.constructor,
                 plan.resolved_symbol,
                 expected.executor,
+                expected.array_targets,
             )?;
             if actual != *expected
                 || plan.argument.is_some()
@@ -4670,14 +4720,14 @@ pub(super) fn prepare_direct_default_news(
                     materialize_imported_generic_constructor(store, host, plan, &class)?;
                 }
             }
-            SourceNewTarget::GlobalPromise(global)
-                if resolved_global_promise_constructor(store, plan, global)?.is_none() =>
-            {
+            SourceNewTarget::GlobalPromise(global) => {
                 materialize_global_promise_constructor(
                     store,
                     host,
                     global_types,
                     options,
+                    session,
+                    diagnostics,
                     plan,
                     global,
                 )?;
@@ -5309,9 +5359,26 @@ fn materialize_global_promise_constructor(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     plan: &SourceDefaultNewPlan,
     global: &SourceGlobalPromiseConstructorPlan,
 ) -> Result<(), SourceNewError> {
+    let argument_type = match global.type_argument {
+        Some(node) => CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_type_from_type_node(node)?,
+        None => store
+            .intrinsic_bootstrap()
+            .ok_or_else(|| invariant(SourceNewInvariant::InvalidConstructorCache(plan.constructor)))?
+            .unknown_type,
+    };
     if resolved_global_promise_constructor(store, plan, global)?.is_some() {
         return Ok(());
     }
@@ -5370,37 +5437,29 @@ fn materialize_global_promise_constructor(
     }
 
     let generic = execute_type_parameter(store, global.type_parameter);
-    let mut query_diagnostics = CanonicalCheckerDiagnostics::default();
     let (executor_type, return_type) = {
-        let mut query = CanonicalTypeQuery::new_with_global_types(
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,
             global_types,
             options,
-            &mut query_diagnostics,
+            session,
+            diagnostics,
         )?;
         (
             query.get_type_from_type_node(global.parameter_annotation)?,
             query.get_type_from_type_node(global.return_annotation)?,
         )
     };
-    if !query_diagnostics.is_empty() {
-        return Err(invalid());
-    }
     let expected_return =
         create_direct_generic_reference(store, promise_target, &[generic], ObjectFlags::NONE)
             .map_err(|_| invalid())?;
     if return_type != expected_return {
         return Err(invalid());
     }
-    let unknown = store
-        .intrinsic_bootstrap()
-        .ok_or_else(invalid)?
-        .unknown_type;
     let instance_type =
-        create_direct_generic_reference(store, promise_target, &[unknown], ObjectFlags::NONE)
+        create_direct_generic_reference(store, promise_target, &[argument_type], ObjectFlags::NONE)
             .map_err(|_| invalid())?;
-
     let base = if let Some(signature) =
         exact_signature_cache(store, global.declaration).map_err(|()| invalid())?
     {
@@ -5481,8 +5540,8 @@ fn materialize_global_promise_constructor(
         signature
     };
 
-    let key = type_list_key(&[unknown]);
-    match store.cached_signature(base, key, &[unknown]) {
+    let key = type_list_key(&[argument_type]);
+    match store.cached_signature(base, key, &[argument_type]) {
         CachedSignatureLookup::Hit(signature) => {
             if store
                 .signature(signature)
@@ -5494,14 +5553,14 @@ fn materialize_global_promise_constructor(
         }
         CachedSignatureLookup::Missing => {
             let mapper = store
-                .new_simple_type_mapper(generic, unknown)
+                .new_simple_type_mapper(generic, argument_type)
                 .ok_or_else(invalid)?;
             let signature = store
                 .instantiate_signature_ex(base, mapper, true)
                 .map_err(|_| invalid())?;
             if !store.try_reserve_cached_signatures(1)
                 || !store.set_signature_resolved_return_type(signature, Some(instance_type))
-                || !store.set_cached_signature(base, key, Box::new([unknown]), signature)
+                || !store.set_cached_signature(base, key, Box::new([argument_type]), signature)
             {
                 return Err(invalid());
             }
@@ -5510,6 +5569,15 @@ fn materialize_global_promise_constructor(
             return Err(invalid());
         }
     }
+    super::instantiate::instantiate_type_with_vector_and_session(
+        store,
+        executor_type,
+        &[generic],
+        &[argument_type],
+        global.array_targets,
+        session,
+    )
+    .map_err(|_| invalid())?;
 
     if resolved_global_promise_constructor(store, plan, global)?.is_none() {
         return Err(invalid());
@@ -8740,11 +8808,23 @@ fn resolved_global_promise_constructor(
             base,
         )));
     }
-    let unknown = store
-        .intrinsic_bootstrap()
-        .ok_or_else(invalid)?
-        .unknown_type;
-    let selected = match store.cached_signature(base, type_list_key(&[unknown]), &[unknown]) {
+    let argument_type = match global.type_argument {
+        Some(node) => {
+            let Some(type_) = super::object_members::cached_planned_type_identity(store, node) else {
+                return Ok(None);
+            };
+            if !store.source_direct_type_annotation_is_exact(node, type_) {
+                return Err(invalid());
+            }
+            type_
+        }
+        None => store.intrinsic_bootstrap().ok_or_else(invalid)?.unknown_type,
+    };
+    let selected = match store.cached_signature(
+        base,
+        type_list_key(&[argument_type]),
+        &[argument_type],
+    ) {
         CachedSignatureLookup::Hit(signature) => signature,
         CachedSignatureLookup::Missing => return Ok(None),
         CachedSignatureLookup::HashCollision(_) | CachedSignatureLookup::Invalid => {
@@ -8756,7 +8836,7 @@ fn resolved_global_promise_constructor(
     let instance =
         validate_direct_generic_reference(store, instance_type).map_err(|_| invalid())?;
     if instance.target != promise_target
-        || instance.type_arguments.as_slice() != [unknown]
+        || instance.type_arguments.as_slice() != [argument_type]
         || signature.flags() != SignatureFlags::CONSTRUCT
         || signature.declaration() != Some(global.declaration)
         || !signature.type_parameters().is_empty()
@@ -8767,6 +8847,19 @@ fn resolved_global_promise_constructor(
         return Err(invariant(SourceNewInvariant::InvalidConstructSignature(
             selected,
         )));
+    }
+    if super::instantiate::cached_instantiation_with_vector(
+        store,
+        executor,
+        &[generic],
+        &[argument_type],
+        global.array_targets,
+        None,
+    )
+    .map_err(|_| invalid())?
+    .is_none()
+    {
+        return Ok(None);
     }
 
     Ok(Some(CheckedSourceDefaultNew {

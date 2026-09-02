@@ -6389,6 +6389,9 @@ pub(super) fn source_callable_function_type_owner(
             type_ = containing;
             continue;
         }
+        if store.source_node_kind(owner) == Some(SyntaxKind::ConstructSignature) {
+            return source_constructor_callback_owner(store, owner, parameter?, type_);
+        }
         if parameter.is_some()
             || !matches!(
                 store.source_node_kind(owner),
@@ -6412,6 +6415,113 @@ pub(super) fn source_callable_function_type_owner(
             ))
         .then_some(signature);
     }
+}
+
+/// Proves a callback parameter on an actual generic interface constructor.
+fn source_constructor_callback_owner(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    parameter: NodeRef,
+    callback: TypeId,
+) -> Option<SignatureId> {
+    let signature = store
+        .signature_links(declaration)?
+        .resolved_signature
+        .signature()?;
+    let record = store.signature(signature)?;
+    let SourceNodeParent::Parent(parent) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    let owner = store.source_declaration_symbol(parent)?;
+    let owner = store.get_merged_symbol(owner)?;
+    let interface = store.symbol(owner)?;
+    let member = store.source_declaration_symbol(declaration)?;
+    let member = store.get_merged_symbol(member)?;
+    let constructor = store.symbol(member)?;
+    let parameter_symbol = store.source_declaration_symbol(parameter)?;
+    if store.source_node_kind(declaration) != Some(SyntaxKind::ConstructSignature)
+        || store.source_node_kind(parent) != Some(SyntaxKind::InterfaceDeclaration)
+        || !interface.flags().contains(SymbolFlags::INTERFACE)
+        || interface.check_flags() != CheckFlags::NONE
+        || !interface.declarations()?.contains(&parent)
+        || store
+            .source_direct_children(parent)?
+            .iter()
+            .any(|child| store.source_node_kind(*child) == Some(SyntaxKind::TypeParameter))
+        || store
+            .symbol_table(interface.members()?)?
+            .get(InternalSymbolName::New.as_ref())
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(member)
+        || constructor.flags() != SymbolFlags::SIGNATURE
+        || constructor.check_flags() != CheckFlags::NONE
+        || constructor
+            .parent()
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(owner)
+        || !constructor.declarations()?.contains(&declaration)
+        || record.declaration() != Some(declaration)
+        || record.flags() != SignatureFlags::CONSTRUCT
+        || record.type_parameters().is_empty()
+        || record.parameters() != [parameter_symbol]
+        || record.min_argument_count() != 1
+        || record.resolved_min_argument_count() != -1
+        || record.this_parameter().is_some()
+        || record.resolved_type_predicate().is_some()
+        || record.target().is_some()
+        || record.mapper().is_some()
+        || record.isolated_signature_type().is_some()
+        || record.composite().is_some()
+        || store.source_node_parent(parameter) != Some(SourceNodeParent::Parent(declaration))
+        || store
+            .source_child_with_kind(parameter, SyntaxKind::QuestionToken)
+            .is_some()
+        || store
+            .source_child_with_kind(parameter, SyntaxKind::DotDotDotToken)
+            .is_some()
+        || store.value_symbol_links(parameter_symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(callback),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        return None;
+    }
+    let children = store.source_direct_children(declaration)?;
+    let formals = children
+        .iter()
+        .copied()
+        .filter(|child| store.source_node_kind(*child) == Some(SyntaxKind::TypeParameter))
+        .collect::<Vec<_>>();
+    if formals.len() != record.type_parameters().len()
+        || children
+            .iter()
+            .copied()
+            .filter(|child| store.source_node_kind(*child) == Some(SyntaxKind::Parameter))
+            .collect::<Vec<_>>()
+            != [parameter]
+        || formals.iter().zip(record.type_parameters()).any(|(formal, type_)| {
+            store.source_node_parent(*formal) != Some(SourceNodeParent::Parent(declaration))
+                || store.source_declaration_symbol(*formal).is_none_or(|symbol| {
+                    cached_ordinary_type_parameter_owner(store, *type_) != Some(symbol)
+                        || store
+                            .symbol(symbol)
+                            .and_then(|record| record.declarations())
+                            != Some(std::slice::from_ref(formal))
+                })
+        })
+    {
+        return None;
+    }
+    let (return_node, allow_void) = store.function_signature_return_annotation(signature)?;
+    if allow_void
+        || store.source_node_parent(return_node) != Some(SourceNodeParent::Parent(declaration))
+        || !store
+            .source_direct_type_annotation_is_exact(return_node, record.resolved_return_type()?)
+    {
+        return None;
+    }
+    Some(signature)
 }
 
 /// Proves a callback annotation on a queried augmented-global overload.
@@ -6516,7 +6626,11 @@ fn source_callable_function_type_mapper_owner(
     {
         return None;
     }
-    if let Some(callable) = store.source_callable_type_for_signature(owner) {
+    if original.declaration().is_some_and(|declaration| {
+        store.source_node_kind(declaration) == Some(SyntaxKind::ConstructSignature)
+    }) {
+        Some(None)
+    } else if let Some(callable) = store.source_callable_type_for_signature(owner) {
         Some(store.source_callable_provenance(callable)?.array_targets)
     } else {
         let callable = store.source_overload_type_for_signature(owner)?;

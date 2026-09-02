@@ -6057,7 +6057,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?
                     .is_none()
                 {
-                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                    self.validate_source_object_intersection_union_constituent(
+                        type_,
+                        array_validation,
+                        visiting,
+                        array_visited,
+                        allowed_pending,
+                    )?;
                 }
                 self.validate_cached_array_capability_worker(
                     type_,
@@ -6119,6 +6125,87 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             _ => Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_)),
         }
+    }
+
+    /// Object intersections retain their canonical source and member-cache proofs in unions.
+    fn validate_source_object_intersection_union_constituent(
+        &self,
+        type_: TypeId,
+        array_validation: UnionArrayValidation<'_>,
+        visiting: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
+        allowed_pending: &HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let invalid = || LiteralTypeCacheError::InvalidCachedUnion(type_);
+        let record = self.type_payload(type_).ok_or_else(invalid)?;
+        let types = if record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED) {
+            self.validate_intersection_type_with_array_targets(type_, array_validation.targets())
+                .map_err(|_| invalid())?
+                .types
+        } else {
+            self.validate_deferred_intersection_type_with_array_targets(
+                type_,
+                array_validation.targets(),
+            )
+            .map_err(|_| invalid())?
+            .types
+        };
+        if !visiting.insert(type_) {
+            return Err(invalid());
+        }
+        let result = (|| {
+            for constituent in types {
+                let constituent_record = self.type_payload(constituent).ok_or_else(invalid)?;
+                let structured = constituent_record.data().structured().ok_or_else(invalid)?;
+                if constituent_record.flags() != TypeFlags::OBJECT
+                    || structured
+                        .signatures
+                        .as_ref()
+                        .is_some_and(|signatures| !signatures.is_empty())
+                    || structured
+                        .index_infos
+                        .as_ref()
+                        .is_some_and(|indexes| !indexes.is_empty())
+                    || super::object_aliases::source_property_object_projection(self, constituent)
+                        .map_err(|_| invalid())?
+                        .is_none()
+                        && !matches!(
+                            object_members::validate_resolved_declared_property_object(
+                                self,
+                                constituent,
+                            ),
+                            object_members::DeclaredPropertyObjectValidation::Valid(_)
+                        )
+                {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                }
+                self.validate_union_constituent_worker(
+                    constituent,
+                    array_validation,
+                    visiting,
+                    array_visited,
+                    allowed_pending,
+                )?;
+            }
+            if let Some(alias) = record.alias() {
+                for argument in self
+                    .type_alias(alias)
+                    .ok_or_else(invalid)?
+                    .type_arguments()
+                    .unwrap_or_default()
+                {
+                    self.validate_cached_array_capability_worker(
+                        *argument,
+                        array_validation,
+                        array_visited,
+                        allowed_pending,
+                    )?;
+                }
+            }
+            Ok(())
+        })();
+        visiting.remove(&type_);
+        result
     }
 
     fn is_cold_class_union_constituent(

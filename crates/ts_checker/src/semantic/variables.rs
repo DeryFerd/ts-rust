@@ -860,7 +860,18 @@ pub(super) fn plan_function_object_parameter_bindings(
     function: NodeRef,
     parameter: NodeRef,
 ) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
-    plan_callable_object_parameter_bindings(arena, bound, store, function, parameter, false)
+    plan_callable_object_parameter_bindings(arena, bound, store, function, parameter, false, false)
+}
+
+/// Proves generic function bindings whose annotations use the source type query.
+pub(super) fn plan_generic_function_object_parameter_bindings(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    function: NodeRef,
+    parameter: NodeRef,
+) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
+    plan_callable_object_parameter_bindings(arena, bound, store, function, parameter, false, true)
 }
 
 /// Proves written object parameters without changing the contextual arrow route.
@@ -871,7 +882,7 @@ pub(super) fn plan_typed_arrow_object_parameter_bindings(
     arrow: NodeRef,
     parameter: NodeRef,
 ) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
-    plan_callable_object_parameter_bindings(arena, bound, store, arrow, parameter, true)
+    plan_callable_object_parameter_bindings(arena, bound, store, arrow, parameter, true, false)
 }
 
 fn plan_callable_object_parameter_bindings(
@@ -881,6 +892,7 @@ fn plan_callable_object_parameter_bindings(
     function: NodeRef,
     parameter: NodeRef,
     typed_arrow: bool,
+    queried_generic_function: bool,
 ) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
     if bound.node_arena_id() != arena.id()
         || bound.node_arena_revision() != arena.revision()
@@ -898,7 +910,7 @@ fn plan_callable_object_parameter_bindings(
         || bound
             .source_facts()
             .is_none_or(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
-        || typed_arrow
+        || (typed_arrow || queried_generic_function)
             && bound
                 .source_facts()
                 .is_none_or(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
@@ -911,7 +923,16 @@ fn plan_callable_object_parameter_bindings(
         NodeData::FunctionDeclaration(data)
             if function_record.kind == SyntaxKind::FunctionDeclaration && !typed_arrow =>
         {
-            if data.type_parameters.is_some()
+            let generic_shape_valid = if queried_generic_function {
+                data.type_.is_some()
+                    && data
+                        .type_parameters
+                        .as_ref()
+                        .is_some_and(|parameters| !parameters.nodes.is_empty())
+            } else {
+                data.type_parameters.is_none()
+            };
+            if !generic_shape_valid
                 || data.asterisk_token.is_some()
                 || data.body.is_none()
             {
@@ -939,7 +960,8 @@ fn plan_callable_object_parameter_bindings(
             )
         }
         NodeData::ArrowFunction(data) if function_record.kind == SyntaxKind::ArrowFunction => {
-            if data.type_parameters.is_some()
+            if queried_generic_function
+                || data.type_parameters.is_some()
                 || data.modifiers.is_some()
                 || data.asterisk_token.is_some()
                 || !typed_arrow && data.type_.is_some()
@@ -1197,7 +1219,7 @@ fn plan_callable_object_parameter_bindings(
             .ok_or(VariableInvariant::InvalidBindingPattern(element))?;
         let name_record = binding_child_node(arena, store, name, element)?;
         if binding.dot_dot_dot_token.is_some()
-            || binding.initializer.is_some()
+            || binding.initializer.is_some() && !queried_generic_function
             || name_record.kind != SyntaxKind::Identifier
         {
             return Err(VariablePlanError::Unsupported(

@@ -4332,6 +4332,15 @@ struct PlannedArrowConstructorReturn {
 }
 
 #[allow(clippy::struct_excessive_bools)] // Checker options and source-state flags are independent.
+/// A value expression can use this scope only while its real callable body is planned.
+#[derive(Clone, Copy, Debug)]
+struct PlannedCallableBodyScope {
+    declaration: NodeRef,
+    body: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    is_async: bool,
+}
+
 struct SourcePlanner<'arena, 'semantic, 'sources> {
     arena: &'arena NodeArena,
     bound: &'arena BoundFile,
@@ -4389,6 +4398,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     /// Exact roots minted only by assignment and direct-call syntax owners.
     primitive_binary_position_roots: HashSet<NodeRef>,
     arrow_constructor_return: Option<PlannedArrowConstructorReturn>,
+    callable_body_scope: Option<PlannedCallableBodyScope>,
 }
 
 impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
@@ -4446,6 +4456,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             nullish_member_writes: HashSet::new(),
             primitive_binary_position_roots: HashSet::new(),
             arrow_constructor_return: None,
+            callable_body_scope: None,
         }
     }
 
@@ -4508,6 +4519,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             nullish_member_writes: HashSet::new(),
             primitive_binary_position_roots: HashSet::new(),
             arrow_constructor_return: None,
+            callable_body_scope: None,
         }
     }
 
@@ -15277,6 +15289,148 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         planned
     }
 
+    /// Enters an ordinary body after its parameters and restores its planning state.
+    fn with_callable_body_scope<T>(
+        &mut self,
+        callable: &SourceCallablePlan,
+        plan: impl FnOnce(&mut Self) -> Result<T, SourceCheckError>,
+    ) -> Result<T, SourceCheckError> {
+        let scope = self.plan_callable_body_scope(callable)?;
+        let previous_scope = std::mem::replace(&mut self.callable_body_scope, scope);
+        let prior_variables = self.prior_variables.clone();
+        let readable_variables = self.readable_variables.clone();
+        let uninitialized_variables = self.assignable_uninitialized_variables.clone();
+        let mutable_variables = self.assignable_mutable_variables.clone();
+        let ambient_variables = self.assignable_ambient_variables.clone();
+        let evolving_arrays = self.evolving_array_variables.clone();
+        let assigned_variables = self.assigned_variables.clone();
+        let hoisted_functions = self.hoisted_functions.clone();
+        let prior_enums = self.prior_enums.clone();
+        let member_writes = self.nullish_member_writes.clone();
+        let result = plan(self);
+        self.callable_body_scope = previous_scope;
+        self.prior_variables = prior_variables;
+        self.readable_variables = readable_variables;
+        self.assignable_uninitialized_variables = uninitialized_variables;
+        self.assignable_mutable_variables = mutable_variables;
+        self.assignable_ambient_variables = ambient_variables;
+        self.evolving_array_variables = evolving_arrays;
+        self.assigned_variables = assigned_variables;
+        self.hoisted_functions = hoisted_functions;
+        self.prior_enums = prior_enums;
+        self.nullish_member_writes = member_writes;
+        result
+    }
+
+    fn plan_callable_body_scope(
+        &self,
+        callable: &SourceCallablePlan,
+    ) -> Result<Option<PlannedCallableBodyScope>, SourceCheckError> {
+        let invalid = || Self::unsupported_function_body(callable);
+        if self
+            .bound
+            .source_facts()
+            .is_none_or(|facts| facts.is_javascript_file() || facts.is_declaration_file())
+            || callable.family == SourceCallableFamily::ObjectLiteralMethod
+        {
+            return Ok(None);
+        }
+        let record = self.node(callable.declaration)?;
+        let body = match &record.data {
+            NodeData::FunctionDeclaration(function)
+                if record.kind == SyntaxKind::FunctionDeclaration
+                    && callable.family == SourceCallableFamily::FunctionDeclaration
+                    && function.asterisk_token.is_none() =>
+            {
+                function.body
+            }
+            NodeData::FunctionExpression(function)
+                if record.kind == SyntaxKind::FunctionExpression
+                    && callable.family == SourceCallableFamily::ArrowFunction
+                    && function.asterisk_token.is_none() =>
+            {
+                Some(function.body)
+            }
+            NodeData::ArrowFunction(function)
+                if record.kind == SyntaxKind::ArrowFunction
+                    && callable.family == SourceCallableFamily::ArrowFunction
+                    && function.asterisk_token.is_none() =>
+            {
+                Some(function.body)
+            }
+            _ => return Err(invalid()),
+        };
+        let body_record = self.node(callable.body)?;
+        if callable.body_mode != SourceCallableBodyMode::Present
+            || body != Some(callable.body.node)
+            || body_record.parent != Some(callable.declaration.node)
+            || body_record.range.start < record.range.start
+            || body_record.range.end > record.range.end
+            || self.bound.node_arena_id() != self.arena.id()
+            || self.bound.node_arena_revision() != self.arena.revision()
+            || self.bound.symbol(callable.declaration) != Some(callable.owner_symbol)
+            || self.bound.container(callable.body) != Some(callable.declaration)
+            || self.bound.block_scope_container(callable.body) != Some(callable.declaration)
+            || self
+                .bound
+                .flow_graph()
+                .container_is_complete(callable.declaration)
+                != Some(true)
+        {
+            return Err(invalid());
+        }
+        Ok(Some(PlannedCallableBodyScope {
+            declaration: callable.declaration,
+            body: callable.body,
+            owner_symbol: callable.owner_symbol,
+            is_async: callable.is_async,
+        }))
+    }
+
+    fn callable_body_expression_is_exact(
+        &self,
+        expression: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let Some(scope) = self.callable_body_scope else {
+            return Ok(false);
+        };
+        if self.bound.symbol(scope.declaration) != Some(scope.owner_symbol)
+            || self.bound.container(expression) != Some(scope.declaration)
+        {
+            return Ok(false);
+        }
+        let mut current = expression;
+        let mut visited = HashSet::new();
+        while visited.insert(current) {
+            if current == scope.body {
+                return Ok(true);
+            }
+            let record = self.node(current)?;
+            let Some(parent) = record.parent.map(|node| self.reference(node)) else {
+                return Ok(false);
+            };
+            let parent_record = self.node(parent)?;
+            if parent == scope.declaration
+                || matches!(
+                    parent_record.kind,
+                    SyntaxKind::FunctionDeclaration
+                        | SyntaxKind::FunctionExpression
+                        | SyntaxKind::ArrowFunction
+                        | SyntaxKind::MethodDeclaration
+                        | SyntaxKind::Constructor
+                        | SyntaxKind::PropertyDeclaration
+                        | SyntaxKind::Parameter
+                )
+                || record.range.start < parent_record.range.start
+                || record.range.end > parent_record.range.end
+            {
+                return Ok(false);
+            }
+            current = parent;
+        }
+        Ok(false)
+    }
+
     fn plan_function_body(
         &mut self,
         callable: &SourceCallablePlan,
@@ -15294,27 +15448,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         let parameter_initializers = self.plan_parameter_initializers_and_enter_scope(callable)?;
-        let body_prior_variables = self.prior_variables.clone();
-        let body_readable_variables = self.readable_variables.clone();
-        let body_uninitialized_variables = self.assignable_uninitialized_variables.clone();
-        let body_assigned_variables = self.assigned_variables.clone();
-        let body_hoisted_functions = self.hoisted_functions.clone();
-        let body_prior_enums = self.prior_enums.clone();
-        let result = self
-            .plan_object_parameter_bindings(callable)
-            .and_then(|bindings| {
-                self.plan_function_body_contents(callable)
-                    .map(|body| (bindings, body))
-            });
-        // Statement planning may enter leading and branch-local scopes. Always
-        // restore the exact parameter-entry state, including on a typed
-        // unsupported boundary, before removing the parameters themselves.
-        self.prior_variables = body_prior_variables;
-        self.readable_variables = body_readable_variables;
-        self.assignable_uninitialized_variables = body_uninitialized_variables;
-        self.assigned_variables = body_assigned_variables;
-        self.hoisted_functions = body_hoisted_functions;
-        self.prior_enums = body_prior_enums;
+        let result = self.with_callable_body_scope(callable, |planner| {
+            let bindings = planner.plan_object_parameter_bindings(callable)?;
+            let body = planner.plan_function_body_contents(callable)?;
+            Ok((bindings, body))
+        });
         self.leave_callable_parameter_scope(callable)?;
         let (object_parameter_bindings, body) = result?;
         if callable.return_type.is_inferred()
@@ -15457,10 +15595,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         ));
                     }
                 }
+                let initializer = binding
+                    .initializer
+                    .map(|initializer| {
+                        self.primitive_binary_position_roots.insert(initializer);
+                        self.plan_expression(initializer)
+                    })
+                    .transpose()?;
                 elements.push(PlannedObjectVariableElement {
                     binding,
                     computed_key,
-                    initializer: None,
+                    initializer,
                 });
             }
             parameters.push(PlannedObjectParameterBindings {
@@ -17274,11 +17419,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 }
                 PlannedCallableStatement::Leaf(leaf) => {
                     points.extend(leaf.flow_point(&locals));
+                    // Awaited operands are checked as expressions, without a new binder CALL edge.
                     if let PlannedLinearFunctionStatement::Expression { expression, .. } = leaf
-                        && matches!(&expression.kind, PlannedExpressionKind::Call(call)
-                            if !matches!(call.callee.unparenthesized().kind, PlannedExpressionKind::Arrow(_)))
+                        && let PlannedExpressionKind::Call(call) = &expression.kind
+                        && !matches!(
+                            call.callee.unparenthesized().kind,
+                            PlannedExpressionKind::Arrow(_)
+                        )
+                        && self.bound.flow_graph().nodes().iter().any(|node| {
+                            node.flags.intersects(ts_ast::FlowFlags::CALL)
+                                && node.payload.as_ref()
+                                    == Some(&ts_ast::FlowNodePayload::Ast(call.node))
+                        })
                     {
-                        calls.push(expression.node);
+                        calls.push(call.node);
                     }
                     if let Some(mutation) = leaf.array_mutation(store, host)? {
                         if callable.family == SourceCallableFamily::ArrowFunction
@@ -20743,52 +20897,60 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         let parameter_initializers =
             self.plan_parameter_initializers_and_enter_scope(&source.callable)?;
-        let awaited_statement = match self.semantic {
-            Some((store, host)) => plan_async_arrow_await_statement(store, host, &source.callable)
-                .map_err(Self::arrow_plan_error)?,
-            None => None,
-        };
-        let expression_statement = awaited_statement
-            .map(|statement| {
-                self.plan_expression(statement.expression)
-                    .map(|expression| PlannedArrowExpressionStatement {
-                        expression,
-                        await_expression: Some(statement.await_expression),
-                        throw_expression: statement.throw_expression,
-                    })
-            })
-            .transpose();
-        let body = match source.body {
-            SourceArrowBodyPlan::EmptyBlock { block } => {
-                match self.function_empty_body_return_supported(source.callable.return_type) {
-                    Ok(true) => Ok(PlannedArrowBody::Empty),
-                    Ok(false) => Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Arrow(block),
-                    )),
-                    Err(error) => Err(error),
+        let checked_body = self.with_callable_body_scope(&source.callable, |planner| {
+            let awaited_statement = match planner.semantic {
+                Some((store, host)) => {
+                    plan_async_arrow_await_statement(store, host, &source.callable)
+                        .map_err(Self::arrow_plan_error)?
                 }
-            }
-            SourceArrowBodyPlan::ReturnExpression {
-                statement,
-                expression,
-                ..
-            } => self.plan_arrow_return_expression(statement, expression),
-            SourceArrowBodyPlan::ConciseExpression { expression } => {
-                self.plan_arrow_return_expression(expression, expression)
-            }
-            SourceArrowBodyPlan::LinearBlock { .. }
-            | SourceArrowBodyPlan::StatementBlock { .. }
-            | SourceArrowBodyPlan::ForOfBlock { .. } => {
-                unreachable!("statement bodies were planned above")
-            }
-        };
+                None => None,
+            };
+            let expression_statement = awaited_statement
+                .map(|statement| {
+                    planner
+                        .plan_expression(statement.expression)
+                        .map(|expression| PlannedArrowExpressionStatement {
+                            expression,
+                            await_expression: Some(statement.await_expression),
+                            throw_expression: statement.throw_expression,
+                        })
+                })
+                .transpose();
+            let body = match source.body {
+                SourceArrowBodyPlan::EmptyBlock { block } => {
+                    match planner.function_empty_body_return_supported(source.callable.return_type)
+                    {
+                        Ok(true) => Ok(PlannedArrowBody::Empty),
+                        Ok(false) => Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(block),
+                        )),
+                        Err(error) => Err(error),
+                    }
+                }
+                SourceArrowBodyPlan::ReturnExpression {
+                    statement,
+                    expression,
+                    ..
+                } => planner.plan_arrow_return_expression(statement, expression),
+                SourceArrowBodyPlan::ConciseExpression { expression } => {
+                    planner.plan_arrow_return_expression(expression, expression)
+                }
+                SourceArrowBodyPlan::LinearBlock { .. }
+                | SourceArrowBodyPlan::StatementBlock { .. }
+                | SourceArrowBodyPlan::ForOfBlock { .. } => {
+                    unreachable!("statement bodies were planned above")
+                }
+            };
+            Ok((expression_statement?, body?))
+        });
         self.leave_callable_parameter_scope(&source.callable)?;
+        let (expression_statement, body) = checked_body?;
         Ok(PlannedArrow {
             source,
             parameter_initializers,
-            expression_statement: expression_statement?,
+            expression_statement,
             linear_body: None,
-            body: body?,
+            body,
         })
     }
 
@@ -26011,6 +26173,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                     break;
                 }
+                NodeData::BindingElement(binding)
+                    if record.kind == SyntaxKind::BindingElement
+                        && binding.initializer == Some(argument.node)
+                        && argument == declaration
+                        && super::source_callables::source_object_parameter_default_arrow_is_exact(
+                            store, host, declaration,
+                        )
+                        .map_err(Self::callable_plan_error)? =>
+                {
+                    break;
+                }
                 NodeData::VariableDeclaration(variable)
                     if record.kind == SyntaxKind::VariableDeclaration
                         && variable.initializer == Some(argument.node) =>
@@ -26294,6 +26467,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 .map_err(Self::callable_plan_error)?
             || source_promise_constructor_argument_arrow_is_exact(store, host, declaration)
                 .map_err(Self::callable_plan_error)?;
+        let contextual_parameter_default_arrow =
+            super::source_callables::source_object_parameter_default_arrow_is_exact(
+                store, host, declaration,
+            )
+            .map_err(Self::callable_plan_error)?;
         if callable
             .parameters
             .iter()
@@ -26303,6 +26481,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && !contextual_object_property_arrow
             && !contextual_direct_call_arrow
             && !member_assignment_arrow
+            && !contextual_parameter_default_arrow
             && super::source_callables::source_returned_arrow_context_annotation(
                 store, host, declaration,
             )
@@ -26362,48 +26541,46 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             let parameter_initializers =
                 self.plan_parameter_initializers_and_enter_scope(&callable)?;
-            let body_prior_variables = self.prior_variables.clone();
-            let body_readable_variables = self.readable_variables.clone();
-            let expression_statement = expression_statement
-                .map(|(expression, await_expression, throw_expression)| {
-                    self.plan_expression(expression).map(|expression| {
-                        PlannedArrowExpressionStatement {
-                            expression,
-                            await_expression,
-                            throw_expression,
-                        }
+            let checked_body = self.with_callable_body_scope(&callable, |planner| {
+                let expression_statement = expression_statement
+                    .map(|(expression, await_expression, throw_expression)| {
+                        planner.plan_expression(expression).map(|expression| {
+                            PlannedArrowExpressionStatement {
+                                expression,
+                                await_expression,
+                                throw_expression,
+                            }
+                        })
                     })
-                })
-                .transpose();
-            let body = match body {
-                SourceArrowBodyPlan::EmptyBlock { block } => {
-                    match self.function_empty_body_return_supported(callable.return_type) {
-                        Ok(true) => Ok(PlannedArrowBody::Empty),
-                        Ok(false) => Err(SourceCheckError::Unsupported(
-                            UnsupportedSourceSyntax::Arrow(block),
-                        )),
-                        Err(error) => Err(error),
+                    .transpose();
+                let body = match body {
+                    SourceArrowBodyPlan::EmptyBlock { block } => {
+                        match planner.function_empty_body_return_supported(callable.return_type) {
+                            Ok(true) => Ok(PlannedArrowBody::Empty),
+                            Ok(false) => Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Arrow(block),
+                            )),
+                            Err(error) => Err(error),
+                        }
                     }
-                }
-                SourceArrowBodyPlan::ReturnExpression {
-                    statement,
-                    expression,
-                    ..
-                } => self.plan_arrow_return_expression(statement, expression),
-                SourceArrowBodyPlan::ConciseExpression { expression } => {
-                    self.plan_arrow_return_expression(expression, expression)
-                }
-                SourceArrowBodyPlan::LinearBlock { .. }
-                | SourceArrowBodyPlan::StatementBlock { .. }
-                | SourceArrowBodyPlan::ForOfBlock { .. } => {
-                    unreachable!("statement arrow bodies were planned above")
-                }
-            };
-            self.prior_variables = body_prior_variables;
-            self.readable_variables = body_readable_variables;
+                    SourceArrowBodyPlan::ReturnExpression {
+                        statement,
+                        expression,
+                        ..
+                    } => planner.plan_arrow_return_expression(statement, expression),
+                    SourceArrowBodyPlan::ConciseExpression { expression } => {
+                        planner.plan_arrow_return_expression(expression, expression)
+                    }
+                    SourceArrowBodyPlan::LinearBlock { .. }
+                    | SourceArrowBodyPlan::StatementBlock { .. }
+                    | SourceArrowBodyPlan::ForOfBlock { .. } => {
+                        unreachable!("statement arrow bodies were planned above")
+                    }
+                };
+                Ok((expression_statement?, body?))
+            });
             self.leave_callable_parameter_scope(&callable)?;
-            let expression_statement = expression_statement?;
-            let body = body?;
+            let (expression_statement, body) = checked_body?;
             if matches!(body, PlannedArrowBody::ReturnJsx { .. }) {
                 return Err(SourceCheckError::Unsupported(
                     UnsupportedSourceSyntax::Arrow(declaration),
@@ -26582,7 +26759,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         };
         if record.kind != SyntaxKind::FunctionExpression
             || record.flags.0 != 0
-            || function.modifiers.is_some()
+            || function.modifiers.is_some() && !ordinary_typescript
             || function.asterisk_token.is_some()
             || function.type_parameters.is_some()
             || !ordinary_typescript
@@ -26630,7 +26807,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             position = parent;
         };
-        if !self.is_direct_top_level_variable_initializer(position)? {
+        if !self.is_direct_top_level_variable_initializer(position)?
+            && !self.callable_body_expression_is_exact(position)?
+        {
             let parent_record = self.node(parent)?;
             match &parent_record.data {
                 NodeData::PropertyAssignment(property)
@@ -26744,29 +26923,28 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
         let statements = body.statements.nodes.clone();
         self.plan_callable_type_import_annotation_roots(&callable)?;
-        let statement_list =
-            if ordinary_typescript && self.is_direct_top_level_variable_initializer(position)? {
-                match statements.as_slice() {
-                    [] => None,
-                    [statement]
-                        if self.node(self.reference(*statement))?.kind
-                            == SyntaxKind::ReturnStatement =>
-                    {
-                        None
-                    }
-                    _ => match plan_source_callable_statement_list_syntax(
-                        self.arena, self.bound, store, &callable,
-                    ) {
-                        Ok(syntax) => Some(syntax),
-                        Err(SourceFunctionStatementsError::Unsupported(_)) => None,
-                        Err(error) => {
-                            return Err(Self::function_statements_plan_error(&callable, error));
-                        }
-                    },
+        let statement_list = if ordinary_typescript {
+            match statements.as_slice() {
+                [] => None,
+                [statement]
+                    if self.node(self.reference(*statement))?.kind
+                        == SyntaxKind::ReturnStatement =>
+                {
+                    None
                 }
-            } else {
-                None
-            };
+                _ => match plan_source_callable_statement_list_syntax(
+                    self.arena, self.bound, store, &callable,
+                ) {
+                    Ok(syntax) => Some(syntax),
+                    Err(SourceFunctionStatementsError::Unsupported(_)) => None,
+                    Err(error) => {
+                        return Err(Self::function_statements_plan_error(&callable, error));
+                    }
+                },
+            }
+        } else {
+            None
+        };
         let prior_variables = self.prior_variables.clone();
         let readable_variables = self.readable_variables.clone();
         let hoisted_functions = self.hoisted_functions.clone();
@@ -26781,116 +26959,120 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 self.plan_parameter_initializers_and_enter_scope(&callable)?;
             let mut loop_body = None;
             let mut prototype_this = None;
-            let body = match (statement_list, statements.as_slice()) {
-                (Some(syntax), _) => {
-                    let uninitialized = self.assignable_uninitialized_variables.clone();
-                    let assigned = self.assigned_variables.clone();
-                    let body = self.finish_callable_statement_list(syntax);
-                    self.assignable_uninitialized_variables = uninitialized;
-                    self.assigned_variables = assigned;
-                    PlannedArrowBody::StatementList(Box::new(body?))
-                }
-                (None, []) => {
-                    if !self.function_empty_body_return_supported(callable.return_type)? {
-                        return Err(unsupported());
-                    }
-                    PlannedArrowBody::Empty
-                }
-                (None, [statement])
-                    if prototype_assignment
-                        .as_ref()
-                        .is_some_and(|assignment| assignment.property_symbol.is_none())
-                        && self.node(self.reference(*statement))?.kind
-                            == SyntaxKind::ExpressionStatement =>
-                {
-                    let statement = self.reference(*statement);
-                    let statement_record = self.node(statement)?;
-                    let NodeData::ExpressionStatement(expression_statement) =
-                        &statement_record.data
-                    else {
-                        return Err(unsupported());
-                    };
-                    let this = self.reference(expression_statement.expression);
-                    let this_record = self.node(this)?;
-                    let NodeData::KeywordExpression(keyword) = &this_record.data else {
-                        return Err(unsupported());
-                    };
-                    if statement_record.flags.0 != 0
-                        || statement_record.parent != Some(block.node)
-                        || expression_statement.flow_node.is_some()
-                        || this_record.kind != SyntaxKind::ThisKeyword
-                        || this_record.flags.0 != 0
-                        || this_record.parent != Some(statement.node)
-                        || keyword.flow_node.is_some()
-                        || self.bound.container(this) != Some(declaration)
-                        || self.bound.this_container(this) != Some(declaration)
-                    {
-                        return Err(unsupported());
-                    }
-                    let any = store
-                        .intrinsic_bootstrap()
-                        .ok_or(SourceCheckError::LiteralCache(
-                            SourceLiteralCacheError::BootstrapUninitialized,
-                        ))?
-                        .any_type;
-                    preflight_source_expression_cache(store, this, any)?;
-                    prototype_this = Some(this);
-                    PlannedArrowBody::Empty
-                }
-                (None, [statement])
-                    if self.node(self.reference(*statement))?.kind
-                        == SyntaxKind::ReturnStatement =>
-                {
-                    let statement = self.reference(*statement);
-                    let statement_record = self.node(statement)?;
-                    let NodeData::ReturnStatement(return_statement) = &statement_record.data else {
-                        return Err(unsupported());
-                    };
-                    if statement_record.kind != SyntaxKind::ReturnStatement
-                        || statement_record.flags.0 != 0
-                        || statement_record.parent != Some(block.node)
-                        || return_statement.flow_node.is_some()
-                        || return_statement.facts != 0
-                    {
-                        return Err(unsupported());
-                    }
-                    match return_statement.expression {
-                        None => {
-                            if !self.function_empty_body_return_supported(callable.return_type)? {
-                                return Err(unsupported());
-                            }
-                            PlannedArrowBody::Empty
+            let body = self.with_callable_body_scope(&callable, |planner| {
+                Ok(match (statement_list, statements.as_slice()) {
+                    (Some(syntax), _) => PlannedArrowBody::StatementList(Box::new(
+                        planner.finish_callable_statement_list(syntax)?,
+                    )),
+                    (None, []) => {
+                        if !planner.function_empty_body_return_supported(callable.return_type)? {
+                            return Err(unsupported());
                         }
-                        Some(expression) => {
-                            let expression = self.reference(expression);
-                            if self.node(expression)?.parent != Some(statement.node) {
-                                return Err(unsupported());
+                        PlannedArrowBody::Empty
+                    }
+                    (None, [statement])
+                        if prototype_assignment
+                            .as_ref()
+                            .is_some_and(|assignment| assignment.property_symbol.is_none())
+                            && planner.node(planner.reference(*statement))?.kind
+                                == SyntaxKind::ExpressionStatement =>
+                    {
+                        let statement = planner.reference(*statement);
+                        let statement_record = planner.node(statement)?;
+                        let NodeData::ExpressionStatement(expression_statement) =
+                            &statement_record.data
+                        else {
+                            return Err(unsupported());
+                        };
+                        let this = planner.reference(expression_statement.expression);
+                        let this_record = planner.node(this)?;
+                        let NodeData::KeywordExpression(keyword) = &this_record.data else {
+                            return Err(unsupported());
+                        };
+                        if statement_record.flags.0 != 0
+                            || statement_record.parent != Some(block.node)
+                            || expression_statement.flow_node.is_some()
+                            || this_record.kind != SyntaxKind::ThisKeyword
+                            || this_record.flags.0 != 0
+                            || this_record.parent != Some(statement.node)
+                            || keyword.flow_node.is_some()
+                            || planner.bound.container(this) != Some(declaration)
+                            || planner.bound.this_container(this) != Some(declaration)
+                        {
+                            return Err(unsupported());
+                        }
+                        let any = store
+                            .intrinsic_bootstrap()
+                            .ok_or(SourceCheckError::LiteralCache(
+                                SourceLiteralCacheError::BootstrapUninitialized,
+                            ))?
+                            .any_type;
+                        preflight_source_expression_cache(store, this, any)?;
+                        prototype_this = Some(this);
+                        PlannedArrowBody::Empty
+                    }
+                    (None, [statement])
+                        if planner.node(planner.reference(*statement))?.kind
+                            == SyntaxKind::ReturnStatement =>
+                    {
+                        let statement = planner.reference(*statement);
+                        let statement_record = planner.node(statement)?;
+                        let NodeData::ReturnStatement(return_statement) = &statement_record.data
+                        else {
+                            return Err(unsupported());
+                        };
+                        if statement_record.kind != SyntaxKind::ReturnStatement
+                            || statement_record.flags.0 != 0
+                            || statement_record.parent != Some(block.node)
+                            || return_statement.flow_node.is_some()
+                            || return_statement.facts != 0
+                        {
+                            return Err(unsupported());
+                        }
+                        match return_statement.expression {
+                            None => {
+                                if !planner
+                                    .function_empty_body_return_supported(callable.return_type)?
+                                {
+                                    return Err(unsupported());
+                                }
+                                PlannedArrowBody::Empty
                             }
-                            self.plan_arrow_return_expression(statement, expression)?
+                            Some(expression) => {
+                                let expression = planner.reference(expression);
+                                if planner.node(expression)?.parent != Some(statement.node) {
+                                    return Err(unsupported());
+                                }
+                                planner.plan_arrow_return_expression(statement, expression)?
+                            }
                         }
                     }
-                }
-                (None, _) => {
-                    if named
-                        || !callable.parameters.is_empty()
-                        || !callable.return_type.is_inferred()
-                    {
-                        return Err(unsupported());
+                    (None, _) => {
+                        if named
+                            || !callable.parameters.is_empty()
+                            || !callable.return_type.is_inferred()
+                        {
+                            return Err(unsupported());
+                        }
+                        let syntax = plan_source_loop_function_statements_syntax(
+                            planner.arena,
+                            planner.bound,
+                            store,
+                            &callable,
+                        )
+                        .map_err(|error| match error {
+                            SourceFunctionStatementsError::Unsupported(_) => unsupported(),
+                            error => Self::function_statements_plan_error(&callable, error),
+                        })?;
+                        loop_body = Some(Box::new(
+                            planner.finish_loop_function_statements(&callable, syntax)?,
+                        ));
+                        PlannedArrowBody::Empty
                     }
-                    let syntax = plan_source_loop_function_statements_syntax(
-                        self.arena, self.bound, store, &callable,
-                    )
-                    .map_err(|error| match error {
-                        SourceFunctionStatementsError::Unsupported(_) => unsupported(),
-                        error => Self::function_statements_plan_error(&callable, error),
-                    })?;
-                    loop_body = Some(Box::new(
-                        self.finish_loop_function_statements(&callable, syntax)?,
-                    ));
-                    PlannedArrowBody::Empty
-                }
-            };
+                })
+            });
             self.leave_callable_parameter_scope(&callable)?;
+            let body = body?;
             Ok(PlannedArrowExpression {
                 callable: callable.clone(),
                 parameter_initializers,
@@ -28361,6 +28543,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 if !class_position
                     && !method_return
                     && !field_initializer
+                    && !self.callable_body_expression_is_exact(expression)?
                     && !self.is_top_level_constructor_expression(expression)?
                 {
                     return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
@@ -28684,7 +28867,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             current = parent;
         };
-        let is_async = if self.node(callable)?.kind == SyntaxKind::MethodDeclaration {
+        let is_async = if let Some(scope) = self.callable_body_scope
+            && scope.declaration == callable
+            && self.callable_body_expression_is_exact(expression)?
+        {
+            scope.is_async
+        } else if self.node(callable)?.kind == SyntaxKind::MethodDeclaration {
             let Some(body) = self
                 .class_body
                 .as_ref()
@@ -40986,6 +41174,7 @@ fn check_expression_type_with_capture_context(
                 if let Some(executor) = construction.promise_executor() {
                     let contextual = construction
                         .promise_executor_contextual_type(store)
+                        .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?
                         .ok_or(SourceCheckError::Call(construction.node()))?;
                     check_expression_type_with_capture_context(
                         store,
@@ -44230,7 +44419,14 @@ fn check_planned_arrow_argument(
         super::source_callables::source_member_assignment_arrow_target(store, host, expression)
             .map_err(SourcePlanner::callable_plan_error)?
             .is_some();
-    if (returned_arrow || member_assignment_arrow) && contextual_type.is_none() {
+    let parameter_default_arrow =
+        super::source_callables::source_object_parameter_default_arrow_is_exact(
+            store, host, expression,
+        )
+        .map_err(SourcePlanner::callable_plan_error)?;
+    if (returned_arrow || member_assignment_arrow || parameter_default_arrow)
+        && contextual_type.is_none()
+    {
         return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(
             expression,
         )));
@@ -44247,12 +44443,15 @@ fn check_planned_arrow_argument(
             || source_object_property_arrow_symbol(store, host, expression)
                 .map_err(SourcePlanner::callable_plan_error)?
                 .is_some()
+            || parameter_default_arrow
             || source_direct_call_argument_arrow_is_exact(store, host, expression)
+                .map_err(SourcePlanner::callable_plan_error)?
+            || source_promise_constructor_argument_arrow_is_exact(store, host, expression)
                 .map_err(SourcePlanner::callable_plan_error)?);
     if matches!(
         arrow.body,
         PlannedArrowBody::StatementList(_) | PlannedArrowBody::ForOf(_)
-    ) && (arrow.callable.is_async
+    ) && (arrow.callable.is_async && matches!(arrow.body, PlannedArrowBody::ForOf(_))
         || arrow.expression_statement.is_some()
         || arrow.linear_body.is_some()
         || arrow.loop_body.is_some()
@@ -44586,8 +44785,9 @@ fn check_planned_arrow_argument(
         .parameters
         .iter()
         .any(|parameter| parameter.is_implicit_any())
-        && (source_direct_call_argument_arrow_is_exact(store, host, expression)
-            .map_err(SourcePlanner::callable_plan_error)?
+        && (parameter_default_arrow
+            || source_direct_call_argument_arrow_is_exact(store, host, expression)
+                .map_err(SourcePlanner::callable_plan_error)?
             || source_promise_constructor_argument_arrow_is_exact(store, host, expression)
                 .map_err(SourcePlanner::callable_plan_error)?)
     {
@@ -44604,7 +44804,7 @@ fn check_planned_arrow_argument(
                         signature.type_parameters().is_empty() && !signature.has_rest_parameter()
                     })
         );
-        if !zero_parameter_target {
+        if !zero_parameter_target || parameter_default_arrow {
             return check_contextual_direct_call_arrow(
                 store,
                 host,
@@ -45506,15 +45706,25 @@ fn check_contextual_direct_call_arrow(
     contextual_type: TypeId,
     outer_capture: Option<SourceArrowCaptureContext<'_>>,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
-    let proof = super::source_callables::prepare_source_direct_call_resolution(
+    let proof = if super::source_callables::source_object_parameter_default_arrow_is_exact(
         store,
         host,
-        source,
         arrow.callable.declaration,
-        contextual_type,
-        current_flow_types,
     )
-    .map_err(SourcePlanner::callable_plan_error)?;
+    .map_err(SourcePlanner::callable_plan_error)?
+    {
+        None
+    } else {
+        super::source_callables::prepare_source_direct_call_resolution(
+            store,
+            host,
+            source,
+            arrow.callable.declaration,
+            contextual_type,
+            current_flow_types,
+        )
+        .map_err(SourcePlanner::callable_plan_error)?
+    };
     let introduced = proof
         .map(|proof| {
             store
@@ -45567,6 +45777,16 @@ fn check_contextual_direct_call_arrow_worker(
     if parameters.is_empty() {
         return Err(unsupported());
     }
+    let parameter_default_arrow =
+        super::source_callables::source_object_parameter_default_arrow_is_exact(
+            store,
+            host,
+            arrow.callable.declaration,
+        )
+        .map_err(SourcePlanner::callable_plan_error)?;
+    let promise_executor =
+        source_promise_constructor_argument_arrow_is_exact(store, host, arrow.callable.declaration)
+            .map_err(SourcePlanner::callable_plan_error)?;
     let filter_predicate = match arrow.callable.type_predicate {
         Some(predicate)
             if source_array_filter_predicate_arrow_is_exact(
@@ -45587,6 +45807,8 @@ fn check_contextual_direct_call_arrow_worker(
             || parameter.rest
             || parameter.initializer.is_some()
     }) || parameters.len() > 1
+        && !parameter_default_arrow
+        && !promise_executor
         && host
             .source(arrow.callable.declaration)
             .is_none_or(|(arena, _)| {
@@ -45616,24 +45838,22 @@ fn check_contextual_direct_call_arrow_worker(
     let Some(signature) = store.signature(target.signature) else {
         return Err(unsupported());
     };
-    let promise_executor =
-        source_promise_constructor_argument_arrow_is_exact(store, host, arrow.callable.declaration)
-            .map_err(SourcePlanner::callable_plan_error)?;
     let Some(first_parameter_type) = target.parameters.first().copied() else {
         return Err(unsupported());
     };
-    let array_parameter_type = if !promise_executor && parameters.len() == 1 {
-        super::source_calls::array_callback_contextual_parameter_type(
-            store,
-            host,
-            global_types,
-            arrow.callable.declaration,
-            contextual_type,
-            first_parameter_type,
-        )?
-    } else {
-        None
-    };
+    let array_parameter_type =
+        if !promise_executor && !parameter_default_arrow && parameters.len() == 1 {
+            super::source_calls::array_callback_contextual_parameter_type(
+                store,
+                host,
+                global_types,
+                arrow.callable.declaration,
+                contextual_type,
+                first_parameter_type,
+            )?
+        } else {
+            None
+        };
     if filter_predicate.is_some()
         && (array_parameter_type.is_none() || signature.resolved_type_predicate().is_none())
     {
@@ -45643,7 +45863,7 @@ fn check_contextual_direct_call_arrow_worker(
         || signature.has_rest_parameter()
         || target.rest_parameter.is_some()
         || if promise_executor {
-            parameters.len() != 1 || target.min_argument_count != 2 || target.parameters.len() != 2
+            parameters.len() > 2 || target.min_argument_count != 2 || target.parameters.len() != 2
         } else if parameters.len() == 1 {
             target.min_argument_count == 0
         } else {
@@ -51065,7 +51285,11 @@ fn check_callable_object_parameter_bindings(
             .zip(&planned.elements)
             .any(|(binding, element)| {
                 binding != &element.binding
-                    || element.initializer.is_some()
+                    || element
+                        .initializer
+                        .as_ref()
+                        .map(|initializer| initializer.node)
+                        != binding.initializer
                     || element.computed_key.as_ref().map(|key| key.node) != binding.computed_key
             })
     {
@@ -51073,6 +51297,7 @@ fn check_callable_object_parameter_bindings(
     }
 
     let mut binding_types = Vec::with_capacity(bindings.len());
+    let mut binding_flow_types = flow_types.clone();
     for element in &planned.elements {
         let binding = &element.binding;
         let computed_type = if let Some(key) = &element.computed_key {
@@ -51084,7 +51309,7 @@ fn check_callable_object_parameter_bindings(
                 options,
                 session,
                 diagnostics,
-                flow_types,
+                &binding_flow_types,
                 type_import_execution,
                 key,
                 None,
@@ -51094,7 +51319,7 @@ fn check_callable_object_parameter_bindings(
         } else {
             None
         };
-        let type_ = checked_object_parameter_binding_type(
+        let mut type_ = checked_object_parameter_binding_type(
             store,
             host,
             global_types,
@@ -51105,6 +51330,54 @@ fn check_callable_object_parameter_bindings(
             parent_type,
             computed_type,
         )?;
+        if let Some(default) = &element.initializer {
+            let contextual = source_binding_type_without_undefined(
+                store,
+                global_types,
+                session,
+                callable,
+                type_,
+            )?;
+            let checked = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                &binding_flow_types,
+                type_import_execution,
+                default,
+                Some(contextual),
+                deferred,
+            )?;
+            if !source_binding_default_fact(
+                store,
+                callable,
+                checked.result,
+                BindingDefaultFact::IsUndefined,
+            )? {
+                type_ = contextual;
+            }
+            check_assignment_to_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                &binding_flow_types,
+                type_import_execution,
+                deferred,
+                type_,
+                None,
+                default,
+                binding.name,
+                None,
+            )?;
+        }
         let expected = ValueSymbolLinks {
             resolved_type: Some(type_),
             ..ValueSymbolLinks::default()
@@ -51112,10 +51385,11 @@ fn check_callable_object_parameter_bindings(
         if store
             .value_symbol_links(binding.symbol)
             .is_some_and(|links| links != &ValueSymbolLinks::default() && links != &expected)
-            || flow_types.contains_key(&binding.symbol)
+            || binding_flow_types.contains_key(&binding.symbol)
         {
             return Err(invalid());
         }
+        binding_flow_types.insert(binding.symbol, type_);
         binding_types.push((binding.symbol, expected));
     }
 
@@ -51134,6 +51408,183 @@ fn check_callable_object_parameter_bindings(
         flow_types.insert(symbol, type_);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum BindingDefaultFact {
+    IsUndefined,
+    NotUndefined,
+}
+
+/// Uses the base constraint already proved by the enclosing source header query.
+fn source_binding_default_base_constraint(
+    store: &CanonicalTypeMapperStore,
+    callable: &SourceCallablePlan,
+    type_: TypeId,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let unavailable = || RelationUnavailable::UnsupportedStructuredType(type_);
+    let signature = store
+        .source_callable_type_for_declaration(callable.declaration)
+        .and_then(|type_| store.source_callable_provenance(type_))
+        .map(|provenance| provenance.signature)
+        .ok_or_else(unavailable)?;
+    let evidence = store
+        .source_callable_type_query(signature)
+        .filter(|evidence| evidence.matches_plan(callable) && evidence.is_exact(store))
+        .ok_or_else(unavailable)?;
+    let index = evidence
+        .type_parameters()
+        .iter()
+        .position(|parameter| parameter.provenance.type_parameter == type_)
+        .ok_or_else(unavailable)?;
+    let base = evidence.base_constraints()[index];
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    Ok((base != bootstrap.no_constraint_type && base != bootstrap.circular_constraint_type)
+        .then_some(base))
+}
+
+/// Projects the two native facts used by annotated binding defaults.
+fn source_binding_default_fact(
+    store: &CanonicalTypeMapperStore,
+    callable: &SourceCallablePlan,
+    type_: TypeId,
+    fact: BindingDefaultFact,
+) -> Result<bool, SourceCheckError> {
+    let mut pending = vec![type_];
+    let mut visited = HashSet::new();
+    while let Some(type_) = pending.pop() {
+        if !visited.insert(type_) {
+            continue;
+        }
+        let record = store
+            .type_payload(type_)
+            .ok_or(RelationUnavailable::Type(type_))?;
+        if let TypeData::Union(union) = record.data() {
+            pending.extend(union.union.types.iter().copied());
+            continue;
+        }
+        if matches!(record.data(), TypeData::TypeParameter(_)) {
+            match source_binding_default_base_constraint(store, callable, type_)? {
+                Some(base) => pending.push(base),
+                None if matches!(fact, BindingDefaultFact::NotUndefined) => return Ok(true),
+                None => {}
+            }
+            continue;
+        }
+        let flags = record.flags();
+        if flags.intersects(TypeFlags::INSTANTIABLE | TypeFlags::INTERSECTION) {
+            return Err(RelationUnavailable::UnsupportedStructuredType(type_).into());
+        }
+        let matches = match fact {
+            BindingDefaultFact::IsUndefined => flags.intersects(TypeFlags::UNDEFINED),
+            BindingDefaultFact::NotUndefined => {
+                !flags.intersects(TypeFlags::VOID_LIKE | TypeFlags::NEVER)
+            }
+        };
+        if matches {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Mirrors getNonUndefinedType while retaining unconstrained source formals.
+fn source_binding_type_without_undefined(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    callable: &SourceCallablePlan,
+    type_: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let Some(retained) = source_binding_non_undefined_projection(store, callable, type_)? else {
+        return Ok(type_);
+    };
+    store
+        .expression_union_type_with_global_types_and_session(
+            globals,
+            &retained,
+            UnionReduction::Literal,
+            session,
+        )
+        .map_err(Into::into)
+}
+
+/// Source execution and saved arrow contexts use the same constraint and fact proof.
+pub(super) fn source_binding_non_undefined_projection(
+    store: &CanonicalTypeMapperStore,
+    callable: &SourceCallablePlan,
+    type_: TypeId,
+) -> Result<Option<Vec<TypeId>>, SourceCheckError> {
+    if !store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?
+        .options
+        .strict_null_checks
+    {
+        return Ok(None);
+    }
+    let record = store
+        .type_payload(type_)
+        .ok_or(RelationUnavailable::Type(type_))?;
+    let types = match record.data() {
+        TypeData::Union(union) => union.union.types.clone(),
+        _ => vec![type_],
+    };
+    let mut constraints = Vec::with_capacity(types.len());
+    let mut map_constraints = false;
+    for &type_ in &types {
+        let record = store
+            .type_payload(type_)
+            .ok_or(RelationUnavailable::Type(type_))?;
+        let constraint = if matches!(record.data(), TypeData::TypeParameter(_)) {
+            source_binding_default_base_constraint(store, callable, type_)?
+        } else if record.flags().intersects(TypeFlags::INSTANTIABLE) {
+            return Err(RelationUnavailable::UnsupportedStructuredType(type_).into());
+        } else {
+            None
+        };
+        if let Some(base) = constraint {
+            map_constraints |= source_binding_default_fact(
+                store,
+                callable,
+                base,
+                BindingDefaultFact::IsUndefined,
+            )?;
+        }
+        constraints.push(constraint);
+    }
+    let mut retained = Vec::new();
+    let mut changed = false;
+    for (type_, constraint) in types.into_iter().zip(constraints) {
+        let mapped = if map_constraints {
+            constraint.unwrap_or(type_)
+        } else {
+            type_
+        };
+        changed |= mapped != type_;
+        let record = store
+            .type_payload(mapped)
+            .ok_or(RelationUnavailable::Type(mapped))?;
+        let candidates = match record.data() {
+            TypeData::Union(union) => union.union.types.as_slice(),
+            _ => std::slice::from_ref(&mapped),
+        };
+        for &candidate in candidates {
+            if source_binding_default_fact(
+                store,
+                callable,
+                candidate,
+                BindingDefaultFact::NotUndefined,
+            )? {
+                retained.push(candidate);
+            } else {
+                changed = true;
+            }
+        }
+    }
+    Ok(changed.then_some(retained))
 }
 
 #[allow(clippy::too_many_arguments)] // Functions and arrows use the same checked key and parent type.
@@ -57480,9 +57931,9 @@ fn check_planned_callable_statement_list_worker(
     {
         return Err(SourceCheckError::Arrow(callable.declaration));
     }
-    if contextual_return.is_some_and(|type_| {
-        contextual_parameters.is_none() || store.type_payload(type_).is_none()
-    }) {
+    if contextual_return
+        .is_some_and(|type_| contextual_parameters.is_none() || store.type_payload(type_).is_none())
+    {
         return Err(SourceCheckError::Arrow(callable.declaration));
     }
     let signature = if callable.return_type.is_inferred() && contextual_parameters.is_none() {
@@ -57539,7 +57990,7 @@ fn check_planned_callable_statement_list_worker(
                 trace_callable_flow_frame_error(host, callable.body, &error);
                 SourcePlanner::source_flow_plan_error(callable, error)
             })?;
-        let expected = callable
+        let declared_return = callable
             .return_type
             .type_node()
             .map(|annotation| {
@@ -57560,6 +58011,25 @@ fn check_planned_callable_statement_list_worker(
                         .copied(),
                 )?
                 .get_type_from_type_node(annotation)
+            })
+            .transpose()?;
+        let expected = declared_return
+            .map(|type_| {
+                if callable.is_async {
+                    source_awaited_expression_type(store, callable.declaration, type_)
+                } else {
+                    Ok(type_)
+                }
+            })
+            .transpose()?;
+        let contextual_return = contextual_return
+            .or_else(|| callable.contextual_function_expression_return())
+            .map(|type_| {
+                if callable.is_async {
+                    source_awaited_expression_type(store, callable.declaration, type_)
+                } else {
+                    Ok(type_)
+                }
             })
             .transpose()?;
         let declared_entries = match contextual_parameters {
@@ -57612,7 +58082,7 @@ fn check_planned_callable_statement_list_worker(
                     expected,
                 )?;
             }
-            Ok(expected)
+            declared_return.ok_or(SourceCheckError::Arrow(callable.declaration))
         } else if returned.values.is_empty()
             && !returned.has_bare_return
             && callable.family == SourceCallableFamily::ArrowFunction
@@ -57629,9 +58099,7 @@ fn check_planned_callable_statement_list_worker(
                 session,
                 &returned.values,
                 returned.has_bare_return,
-                returned
-                    .contextual_return
-                    .or_else(|| callable.contextual_function_expression_return()),
+                returned.contextual_return,
             )
             .map_err(|error| {
                 trace_callable_body_error(
@@ -57642,7 +58110,23 @@ fn check_planned_callable_statement_list_worker(
                 error
             })
         }
-    })();
+    })()
+    .and_then(|checked| {
+        if callable.return_type.is_inferred() {
+            source_callable_inferred_return_type(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                callable,
+                checked,
+            )
+        } else {
+            Ok(checked)
+        }
+    });
     let Some(signature) = signature else {
         return checked;
     };
@@ -58212,7 +58696,37 @@ fn check_callable_statement_nodes(
                     }
                     continue;
                 };
-                let actual = if let Some(target) = expected {
+                let actual = if let Some(target) = expected.filter(|_| callable.is_async) {
+                    let checked = check_expression_type_with_capture_context(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        snapshot.types(),
+                        type_import_execution,
+                        expression,
+                        Some(target),
+                        deferred,
+                        None,
+                        capture,
+                    )?;
+                    let actual = source_awaited_expression_type(store, *statement, checked.result)?;
+                    check_callable_statement_bare_return(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        *statement,
+                        actual,
+                        target,
+                    )?;
+                    actual
+                } else if let Some(target) = expected {
                     check_assignment_to_type_with_capture_context(
                         store,
                         host,
@@ -58265,7 +58779,11 @@ fn check_callable_statement_nodes(
                     snapshot.types(),
                 )?;
                 check_callable_statement_expression_effects(store, host, callable, expression)?;
-                returned.values.push(actual);
+                returned.values.push(if callable.is_async {
+                    source_awaited_expression_type(store, *statement, actual)?
+                } else {
+                    actual
+                });
             }
         }
     }
@@ -61708,16 +62226,51 @@ fn object_parameter_property_type(
     property_name: &str,
 ) -> Result<TypeId, SourceCheckError> {
     let key = ts_binder::EscapedNameRef::source(property_name);
-    let mut property = super::object_members::resolve_object_property_by_key_with_source(
-        store,
-        host,
-        global_types,
-        options,
-        receiver,
-        key,
-        session,
-        diagnostics,
-    )?;
+    let flags = store
+        .type_payload(receiver)
+        .ok_or(RelationUnavailable::Type(receiver))?
+        .flags();
+    let mut property = if flags == TypeFlags::UNION {
+        if let Some(property) = super::member_resolution::resolve_source_union_property(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            property_node,
+            receiver,
+            property_name,
+        )? {
+            return Ok(property.type_id());
+        }
+        None
+    } else if flags == TypeFlags::INTERSECTION {
+        let resolved = super::intersection_types::demand_source_intersection_members(
+            store, host, global_types, options, session, diagnostics, receiver,
+        )?;
+        if resolved != receiver {
+            return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
+        }
+        super::object_members::resolve_object_property_by_key(
+            store,
+            Some(global_types),
+            receiver,
+            key,
+            session,
+        )?
+    } else {
+        super::object_members::resolve_object_property_by_key_with_source(
+            store,
+            host,
+            global_types,
+            options,
+            receiver,
+            key,
+            session,
+            diagnostics,
+        )?
+    };
     if property.is_none() {
         let structured = store
             .type_payload(receiver)

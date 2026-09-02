@@ -6,7 +6,7 @@
 //! declarations before the final return. Expression checking, narrowing, and
 //! return inference stay in the source checker.
 //! The common statement list retains nested blocks and conditional early returns
-//! for synchronous nongeneric functions, arrows, and object methods. Its leaves
+//! for nongeneric functions, arrows, and object methods. Its leaves
 //! use these same local, expression, condition, and return syntax checks.
 
 use std::collections::HashSet;
@@ -5047,7 +5047,7 @@ pub(super) fn plan_source_joined_function_statements_syntax(
     .plan_joined()
 }
 
-/// Proves the common synchronous statement grammar without publishing state.
+/// Proves the common callable statement grammar without publishing state.
 pub(super) fn plan_source_callable_statement_list_syntax(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -5085,8 +5085,7 @@ impl SyntaxPlanner<'_> {
             return Err(SourceFunctionStatementsInvariant::BoundSourceMismatch(declaration).into());
         }
         let record = self.node(declaration)?;
-        if self.callable.is_async
-            || !self.callable.type_parameters.is_empty()
+        if !self.callable.type_parameters.is_empty()
             || self.callable.type_predicate.is_some()
             || self
                 .bound
@@ -5192,7 +5191,21 @@ impl SyntaxPlanner<'_> {
                     && function.type_
                         == self.callable.return_type.type_node().map(|node| node.node)
                     && function.type_parameters.is_none()
-                    && function.modifiers.is_none()
+                    && function.modifiers.as_ref().map_or(
+                        !self.callable.is_async,
+                        |modifiers| {
+                            self.callable.is_async
+                                && modifiers.flags.0 == 0
+                                && !modifiers.list.has_trailing_comma
+                                && matches!(modifiers.list.nodes.as_slice(), [modifier]
+                                if self.arena.get(*modifier).is_some_and(|node| {
+                                    node.kind == SyntaxKind::AsyncKeyword
+                                        && node.flags.0 == 0
+                                        && node.parent == Some(declaration.node)
+                                        && matches!(node.data, NodeData::Token(_))
+                                }))
+                        },
+                    )
                     && function.asterisk_token.is_none() =>
             {
                 if self.bound.symbol(declaration) != Some(self.callable.owner_symbol)
@@ -10054,6 +10067,9 @@ impl SyntaxPlanner<'_> {
                 } else {
                     self.validate_linear_assignment_expression(expression, callable)?;
                 }
+            }
+            _ if self.statement_scope.is_some() => {
+                // The owning statement proves placement. The source planner checks the value.
             }
             _ => {
                 return Err(self.unsupported(
