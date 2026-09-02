@@ -11474,6 +11474,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         let facts = self.source_node_facts.get(&declaration.arena)?;
         let mut computed = None;
         let mut optional_count = 0usize;
+        let mut readonly = false;
         for (index, facts) in facts.iter().enumerate() {
             let Some(facts) = facts else {
                 continue;
@@ -11493,6 +11494,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     ));
                 }
                 SyntaxKind::QuestionToken => optional_count = optional_count.checked_add(1)?,
+                SyntaxKind::ReadonlyKeyword if !method => {
+                    if readonly {
+                        return None;
+                    }
+                    readonly = true;
+                }
                 _ => {}
             }
         }
@@ -11500,6 +11507,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if optional_count != usize::from(optional) {
             return None;
         }
+        let expected_check_flags = CheckFlags::LATE
+            | if readonly {
+                CheckFlags::READONLY
+            } else {
+                CheckFlags::NONE
+            };
         let mut key_expression = None;
         for (index, facts) in facts.iter().enumerate() {
             let Some(facts) = facts else {
@@ -11560,7 +11573,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             let late_record = self.symbol(late)?;
             let value_links = self.value_symbol_links(late)?;
             if late_record.flags() != (original_flags | SymbolFlags::TRANSIENT)
-                || late_record.check_flags() != CheckFlags::LATE
+                || late_record.check_flags() != expected_check_flags
                 || late_record.name() != expected_name.as_ref()
                 || late_record.declarations() != Some(&[declaration])
                 || late_record.value_declaration() != Some(declaration)
@@ -11613,8 +11626,11 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         declarations.try_reserve_exact(1).ok()?;
         declarations.push(declaration);
 
-        let late =
-            self.alloc_transient_symbol(original_flags, canonical_name.clone(), CheckFlags::LATE);
+        let late = self.alloc_transient_symbol(
+            original_flags,
+            canonical_name.clone(),
+            expected_check_flags,
+        );
         assert!(self.set_symbol_declarations(late, Some(declarations), Some(declaration)));
         assert!(self.set_symbol_relationships(late, None, None, Some(owner), None));
         assert!(self.set_value_symbol_links(

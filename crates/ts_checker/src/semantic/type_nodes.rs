@@ -7554,7 +7554,7 @@ fn property_module_export_error(
     }
 }
 
-fn property_object_error(error: PropertyObjectError) -> DeclaredTypeError {
+pub(super) fn property_object_error(error: PropertyObjectError) -> DeclaredTypeError {
     match error {
         PropertyObjectError::InvalidTypeLiteral(node)
         | PropertyObjectError::InvalidObjectLiteral(node)
@@ -15864,6 +15864,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             .flags()
                             .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
                     });
+            let computed_properties = object_members::plan_full_interface_computed_properties(
+                self.store, self.host, &planned,
+            )
+            .map_err(property_object_error)?;
             for annotation in planned
                 .property_type_nodes()
                 .chain(
@@ -15872,6 +15876,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         .flat_map(|(key, value)| [key, value]),
                 )
                 .chain(planned.call_type_nodes())
+                .chain(
+                    computed_properties
+                        .iter()
+                        .map(|property| property.key.type_node),
+                )
             {
                 let previous = self.lazy_interface_values;
                 let previous_native_parameter = self.native_parameter_interface_values;
@@ -15925,6 +15934,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             for annotation in members.call_type_nodes() {
                 self.plan_type_node_in_context(annotation, None, false)?;
+            }
+            for property in object_members::plan_full_interface_computed_properties(
+                self.store, self.host, &members,
+            )
+            .map_err(property_object_error)?
+            {
+                self.plan_type_node_in_context(property.key.type_node, None, false)?;
             }
         }
         for argument in &base.type_arguments {
@@ -43390,6 +43406,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             plan,
             prepared,
         )?;
+        let computed_properties = object_members::plan_full_interface_computed_properties(
+            self.store, self.host, &members,
+        )
+        .map_err(property_object_error)?;
+        for property in &computed_properties {
+            self.execute_type_node(property.key.type_node, plan, prepared)?;
+        }
         for annotation in members.call_type_nodes() {
             self.execute_type_node(annotation, plan, prepared)?;
         }
@@ -43397,6 +43420,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .methods
             .iter()
             .any(|method| method.computed_key.is_some())
+            || !computed_properties.is_empty()
         {
             object_members::publish_full_interface_method_names(
                 self.store,
@@ -43485,6 +43509,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .ok_or(DeclaredTypeError::Unavailable(
                     DeclaredTypeUnavailable::MissingDeclarations(symbol),
                 ))?;
+        object_members::project_full_interface_computed_property_names(
+            self.store,
+            self.host,
+            &mut interface,
+        )
+        .map_err(property_object_error)?;
         let lazy_react_portal =
             object_members::authenticated_react_portal_interface(self.store, self.host, &interface)
                 .map_err(property_object_error)?;
@@ -43548,15 +43578,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             unreachable!("the active-interface check and insertion are adjacent")
         }
         let result = (|| {
+            let computed_properties = object_members::plan_full_interface_computed_properties(
+                self.store, self.host, &interface,
+            )
+            .map_err(property_object_error)?;
             if interface
                 .methods
                 .iter()
                 .any(|method| method.computed_key.is_some())
+                || !computed_properties.is_empty()
             {
                 for key in interface
                     .methods
                     .iter()
                     .filter_map(|method| method.computed_key)
+                    .chain(computed_properties.iter().map(|property| property.key))
                 {
                     self.execute_type_node(key.type_node, plan, prepared)?;
                 }

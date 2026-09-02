@@ -2589,7 +2589,7 @@ fn plan_body(
             matches!(
                 store.source_node_kind(NodeRef::new(body.arena, body.file, *statement)),
                 Some(
-                    SyntaxKind::IfStatement | SyntaxKind::Block
+                    SyntaxKind::IfStatement | SyntaxKind::Block | SyntaxKind::ForStatement
                         | SyntaxKind::TryStatement | SyntaxKind::ThrowStatement
                 )
             )

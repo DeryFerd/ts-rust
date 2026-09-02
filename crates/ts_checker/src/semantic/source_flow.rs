@@ -2482,6 +2482,43 @@ impl SourceFlowPlan {
         array_mutations: impl IntoIterator<Item = SourceFlowArrayMutation>,
         nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
     ) -> Result<Self, SourceFlowError> {
+        Self::preflight_statement_list_with_updates(
+            arena,
+            bound,
+            store,
+            host,
+            syntax,
+            points,
+            conditions,
+            logical_conditions,
+            assignments,
+            parameter_assignments,
+            calls,
+            captures,
+            array_mutations,
+            nullish_assignments,
+            std::iter::empty(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_statement_list_with_updates(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        syntax: &SourceCallableStatementListSyntax,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        logical_conditions: Vec<SourceTruthinessCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+        captures: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
+        array_mutations: impl IntoIterator<Item = SourceFlowArrayMutation>,
+        nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+        updates: impl IntoIterator<Item = SourceFlowUpdate>,
+    ) -> Result<Self, SourceFlowError> {
         validate_statement_list_source(arena, bound, store, host, syntax)?;
         let nullish_assignments = nullish_assignments.into_iter().collect::<Vec<_>>();
         let container = syntax.callable.declaration;
@@ -2499,6 +2536,28 @@ impl SourceFlowPlan {
             statement_list: Some(syntax.clone()),
             ..SourceFlowEffects::default()
         };
+        for update in updates {
+            validate_callable_update(arena, bound, store, host, syntax, update)?;
+            if effects.updates.insert(update.target, update).is_some()
+                || effects
+                    .assignment_declarations
+                    .insert(update.target, update.declaration)
+                    .is_some()
+            {
+                return Err(SourceFlowInvariant::DuplicateAssignment(update.target).into());
+            }
+            assignments.push(SourceFlowAssignment {
+                declaration: update.target,
+                symbol: update.symbol,
+            });
+        }
+        if syntax
+            .counted_for_loops()
+            .iter()
+            .any(|iteration| !effects.updates.contains_key(&iteration.update_target))
+        {
+            return Err(SourceFlowInvariant::InvalidUpdate(syntax.callable.declaration).into());
+        }
         for assignment in parameter_assignments {
             validate_parameter_assignment_in_list(
                 arena,
@@ -3909,7 +3968,7 @@ impl SourceFlowPlan {
         if self
             .statement_list
             .as_ref()
-            .is_some_and(SourceCallableStatementListSyntax::contains_for_of)
+            .is_some_and(|syntax| syntax.contains_for_of() || syntax.contains_counted_for())
         {
             self.validate_flow_paths(bound)?;
         }
@@ -3941,6 +4000,7 @@ impl SourceFlowPlan {
                     (declaration, state)
                 })
                 .collect(),
+            completed_callable_updates: HashSet::new(),
             call_effects: HashMap::new(),
             condition_values: HashMap::new(),
             in_conditions: HashMap::new(),
@@ -4181,6 +4241,7 @@ pub(super) struct SourceFlowFrame<'plan, 'graph> {
     base: SourceFlowSnapshot,
     declared_types: SourceFlowTypes,
     assignment_states: HashMap<NodeRef, SourceFlowAssignmentState>,
+    completed_callable_updates: HashSet<NodeRef>,
     call_effects: HashMap<NodeRef, SourceFlowCallEffect>,
     condition_values: HashMap<NodeRef, TypeId>,
     in_conditions: HashMap<NodeRef, CompletedInCondition>,
@@ -5328,11 +5389,11 @@ impl SourceFlowFrame<'_, '_> {
             })
     }
 
-    fn uses_callable_for_of_queries(&self) -> bool {
+    fn uses_callable_loop_queries(&self) -> bool {
         self.plan
             .statement_list
             .as_ref()
-            .is_some_and(SourceCallableStatementListSyntax::contains_for_of)
+            .is_some_and(|syntax| syntax.contains_for_of() || syntax.contains_counted_for())
     }
 
     fn callable_for_of_symbol_is_visible(
@@ -5479,7 +5540,7 @@ impl SourceFlowFrame<'_, '_> {
         }) || self.condition_values.insert(node, type_).is_some() {
             return Err(SourceFlowInvariant::UnknownCondition(node).into());
         }
-        if self.uses_callable_for_of_queries() {
+        if self.uses_callable_loop_queries() {
             self.memo.clear();
         }
         Ok(())
@@ -5673,7 +5734,7 @@ impl SourceFlowFrame<'_, '_> {
         globals: &CanonicalGlobalTypes,
         node: NodeRef,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
-        if self.uses_callable_for_of_queries() {
+        if self.uses_callable_loop_queries() {
             return self.snapshot_callable_for_of_at(store, globals, node);
         }
         let flow = self
@@ -5776,7 +5837,7 @@ impl SourceFlowFrame<'_, '_> {
                 if self.plan.nullish_assignments.contains_key(&declaration) {
                     self.memo.clear();
                 }
-                if self.uses_callable_for_of_queries() {
+                if self.uses_callable_loop_queries() {
                     self.memo.clear();
                 }
                 Ok(())
@@ -5787,6 +5848,48 @@ impl SourceFlowFrame<'_, '_> {
                 Err(SourceFlowInvariant::AssignmentAlreadyCompleted(declaration).into())
             }
         }
+    }
+
+    /// Updates use the retained antecedent type. Completion proves that the header was checked.
+    pub(super) fn complete_callable_update(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        expression: NodeRef,
+        update: SourceFlowUpdate,
+    ) -> Result<(), SourceFlowError> {
+        let invalid = || SourceFlowInvariant::InvalidUpdate(update.target);
+        let syntax = self.plan.statement_list.as_ref().ok_or_else(invalid)?;
+        let (arena, _) = host.source(self.plan.container).ok_or_else(invalid)?;
+        if validate_callable_update(arena, self.bound, store, host, syntax, update)? != expression
+            || self.plan.updates.get(&update.target) != Some(&update)
+            || self.plan.assignment_declarations.get(&update.target) != Some(&update.declaration)
+            || !matches!(
+                self.assignment_states.get(&update.target),
+                Some(SourceFlowAssignmentState::Update)
+            )
+            || [expression, update.target].into_iter().any(|node| {
+                store
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type)
+                    .is_none()
+            })
+        {
+            return Err(invalid().into());
+        }
+        if !self.completed_callable_updates.insert(update.target) {
+            return Err(SourceFlowInvariant::AssignmentAlreadyCompleted(update.target).into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_callable_updates(&self) -> Result<(), SourceFlowError> {
+        for target in self.plan.updates.keys() {
+            if !self.completed_callable_updates.contains(target) {
+                return Err(SourceFlowInvariant::InvalidUpdate(*target).into());
+            }
+        }
+        Ok(())
     }
 
     /// Compound writes widen the real antecedent, not the checked result type.
@@ -5961,7 +6064,7 @@ impl SourceFlowFrame<'_, '_> {
                     .assignments
                     .get(&declaration)
                     .ok_or(SourceFlowInvariant::UnknownAssignment(declaration))?;
-                if self.uses_callable_for_of_queries()
+                if self.uses_callable_loop_queries()
                     && self.reference == Some(assignment.symbol)
                     && source_flow_kind(flow, node.flags)? == SourceFlowKind::Assignment
                     && let Some(SourceFlowAssignmentState::Resolved(current_type)) =
@@ -6283,7 +6386,7 @@ impl SourceFlowFrame<'_, '_> {
         let mut current = self.resolve_flow(store, globals, antecedents[0], depth + 1)?;
         let declared = self
             .reference
-            .filter(|_| self.uses_callable_for_of_queries())
+            .filter(|_| self.uses_callable_loop_queries())
             .and_then(|symbol| {
                 self.declared_types
                     .get(&symbol)
@@ -6300,7 +6403,14 @@ impl SourceFlowFrame<'_, '_> {
 
         let result = (|| {
             for antecedent in &antecedents[1..] {
-                let next = if self.plan.region.is_some() && self.reference.is_some() {
+                let reference_loop = self.reference.is_some()
+                    && (self.plan.region.is_some()
+                        || self
+                            .plan
+                            .statement_list
+                            .as_ref()
+                            .is_some_and(SourceCallableStatementListSyntax::contains_counted_for));
+                let next = if reference_loop {
                     // The backedge can repeat the demand's prefix before reaching this loop.
                     let outer_visiting = std::mem::take(&mut self.visiting);
                     let result = self.resolve_flow(store, globals, *antecedent, depth + 1);
@@ -7692,6 +7802,19 @@ fn validate_source_reference(
     node: NodeRef,
     symbol: SemanticSymbolId,
 ) -> Result<(), SourceFlowError> {
+    validate_reference_in_container(arena, bound, store, host, bound.source_file(), node, symbol)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_reference_in_container(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    node: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<(), SourceFlowError> {
     let invalid = || SourceFlowInvariant::InvalidUpdate(node);
     let record = host.node(node).ok_or_else(invalid)?;
     let NodeData::Identifier(identifier) = &record.data else {
@@ -7701,7 +7824,7 @@ fn validate_source_reference(
         || record.flags.0 != 0
         || identifier.flow_node.is_some()
         || identifier.text.is_empty()
-        || bound.flow_container(node) != Some(bound.source_file())
+        || bound.flow_container(node) != Some(container)
         || store
             .symbol_node_links(node)
             .is_some_and(|links| links.resolved_symbol.is_some_and(|actual| actual != symbol))
@@ -7734,8 +7857,21 @@ fn validate_source_update(
     host: &DeclaredTypeHost<'_>,
     update: SourceFlowUpdate,
 ) -> Result<(), SourceFlowError> {
+    validate_update_in_container(arena, bound, store, host, bound.source_file(), update)
+}
+
+fn validate_update_in_container(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    update: SourceFlowUpdate,
+) -> Result<(), SourceFlowError> {
     let invalid = || SourceFlowInvariant::InvalidUpdate(update.target);
-    validate_source_reference(arena, bound, store, host, update.target, update.symbol)?;
+    validate_reference_in_container(
+        arena, bound, store, host, container, update.target, update.symbol,
+    )?;
     let declaration = host.node(update.declaration).ok_or_else(invalid)?;
     let NodeData::VariableDeclaration(variable) = &declaration.data else {
         return Err(invalid().into());
@@ -7790,6 +7926,60 @@ fn validate_source_update(
         return Err(invalid().into());
     }
     Ok(())
+}
+
+/// Header updates have a loop parent, not an expression-statement parent.
+fn validate_callable_update(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    syntax: &SourceCallableStatementListSyntax,
+    update: SourceFlowUpdate,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidUpdate(update.target);
+    let loops = syntax.counted_for_loops();
+    let iteration = loops
+        .iter()
+        .find(|iteration| iteration.update_target == update.target)
+        .ok_or_else(invalid)?;
+    let control = &iteration.control;
+    let initializer = iteration.initializer;
+    let incrementor = control.incrementor.ok_or_else(invalid)?;
+    let record = host.node(control.statement).ok_or_else(invalid)?;
+    let NodeData::ForStatement(statement) = &record.data else {
+        return Err(invalid().into());
+    };
+    let container = syntax.callable.declaration;
+    if record.kind != SyntaxKind::ForStatement
+        || record.flags.0 != 0
+        || statement.initializer != control.initializer.map(|node| node.node)
+        || statement.condition != control.condition.map(|node| node.node)
+        || statement.incrementor != Some(incrementor.node)
+        || statement.statement != control.body.node
+        || update.readonly
+        || initializer.binding != VariableBindingKind::Let
+        || initializer.declaration != update.declaration
+        || initializer.symbol != update.symbol
+        || initializer.initializer.is_none()
+        || host.node(incrementor).and_then(|node| node.parent) != Some(control.statement.node)
+        || host.node(update.target).and_then(|node| node.parent) != Some(incrementor.node)
+        || [
+            control.statement,
+            incrementor,
+            update.target,
+            update.declaration,
+        ]
+        .into_iter()
+        .any(|node| bound.container(node) != Some(container))
+        || [incrementor, update.target, update.declaration]
+            .into_iter()
+            .any(|node| bound.block_scope_container(node) != Some(control.statement))
+    {
+        return Err(invalid().into());
+    }
+    validate_update_in_container(arena, bound, store, host, container, update)?;
+    Ok(incrementor)
 }
 
 fn validate_source_statement_call(

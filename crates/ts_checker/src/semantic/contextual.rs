@@ -79,6 +79,10 @@ pub(super) enum PreparedExpression {
         contextual_type: Option<TypeId>,
         mutable_result: bool,
     },
+    ComputedPropertyValue {
+        contextual_type: Option<TypeId>,
+        readonly: bool,
+    },
 }
 
 /// Getter bodies are prepared only when source checking enters their own scope.
@@ -783,19 +787,33 @@ fn prepare_expression(
                         state.current_flow_types,
                     )?
                 };
-                prepared.push(PreparedObjectMember::Eager(prepare_expression(
-                    store,
-                    host,
-                    global_types,
-                    state,
-                    expression,
-                    property_context,
-                    if property.readonly {
-                        ExpressionLocation::Readonly
-                    } else {
-                        ExpressionLocation::Mutable
-                    },
-                )?));
+                let value = if computed_without_context
+                    && matches!(
+                        &expression.kind,
+                        PlannedExpressionKind::Binary(_) | PlannedExpressionKind::Call(_)
+                    )
+                {
+                    // Check these values through source checking after the computed-key pass.
+                    PreparedExpression::ComputedPropertyValue {
+                        contextual_type: property_context,
+                        readonly: property.readonly,
+                    }
+                } else {
+                    prepare_expression(
+                        store,
+                        host,
+                        global_types,
+                        state,
+                        expression,
+                        property_context,
+                        if property.readonly {
+                            ExpressionLocation::Readonly
+                        } else {
+                            ExpressionLocation::Mutable
+                        },
+                    )?
+                };
+                prepared.push(PreparedObjectMember::Eager(value));
             }
             PreparedExpression::Object(prepared)
         }

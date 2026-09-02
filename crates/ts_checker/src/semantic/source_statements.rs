@@ -517,6 +517,7 @@ pub(super) enum SourceCallableStatementSyntax {
     If(Box<SourceCallableIfSyntax>),
     Try(Box<SourceCallableTrySyntax>),
     ForOf(Box<SourceCallableForOfSyntax>),
+    For(Box<SourceCallableForSyntax>),
     Return {
         statement: NodeRef,
         expression: Option<NodeRef>,
@@ -561,6 +562,16 @@ pub(super) struct SourceCallableForOfSyntax {
     pub(super) header: SourceIterationHeaderSyntax,
     pub(super) statements: Vec<SourceCallableStatementSyntax>,
     pub(super) binding_flow: Option<FlowRef>,
+}
+
+/// A counted loop keeps its initializer and update tied to one lexical binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableForSyntax {
+    pub(super) control: SourceControlLoopSyntax,
+    pub(super) initializer: SourceLocalDeclarationSyntax,
+    pub(super) condition_entry: NodeRef,
+    pub(super) update_target: NodeRef,
+    pub(super) statements: Vec<SourceCallableStatementSyntax>,
 }
 
 impl SourceCallableStatementListSyntax {
@@ -622,6 +633,31 @@ impl SourceCallableStatementListSyntax {
             }
         }
         false
+    }
+
+    pub(super) fn counted_for_loops(&self) -> Vec<&SourceCallableForSyntax> {
+        let mut pending = self.statements.iter().collect::<Vec<_>>();
+        let mut loops = Vec::new();
+        while let Some(statement) = pending.pop() {
+            match statement {
+                SourceCallableStatementSyntax::For(iteration) => loops.push(iteration.as_ref()),
+                SourceCallableStatementSyntax::Block { statements, .. } => pending.extend(statements),
+                SourceCallableStatementSyntax::If(branch) => {
+                    pending.extend(&branch.then_statements);
+                    pending.extend(&branch.else_statements);
+                }
+                SourceCallableStatementSyntax::Try(tried) => {
+                    pending.extend(&tried.try_statements);
+                    pending.extend(&tried.catch_statements);
+                }
+                _ => {}
+            }
+        }
+        loops
+    }
+
+    pub(super) fn contains_counted_for(&self) -> bool {
+        !self.counted_for_loops().is_empty()
     }
 
     fn find_statement_scope(
@@ -691,6 +727,14 @@ impl SourceCallableStatementListSyntax {
                     }
                     iteration.header.control.statement
                 }
+                SourceCallableStatementSyntax::For(iteration) => {
+                    if include_branches && !require_for_of {
+                        pending.extend(iteration.statements.iter().map(|statement| {
+                            (statement, iteration.control.statement, false)
+                        }));
+                    }
+                    iteration.control.statement
+                }
                 SourceCallableStatementSyntax::Leaf(_) => return None,
             };
             if node == wanted && (!require_for_of || in_for_of) {
@@ -722,6 +766,9 @@ impl SourceCallableStatementListSyntax {
                     pending.extend(&tried.catch_statements);
                 }
                 SourceCallableStatementSyntax::ForOf(iteration) => {
+                    pending.extend(&iteration.statements)
+                }
+                SourceCallableStatementSyntax::For(iteration) => {
                     pending.extend(&iteration.statements)
                 }
                 _ => {}
@@ -5392,6 +5439,9 @@ impl SyntaxPlanner<'_> {
             SyntaxKind::ForOfStatement => SourceCallableStatementSyntax::ForOf(Box::new(
                 self.plan_callable_for_of(statement, parent, scope, depth)?,
             )),
+            SyntaxKind::ForStatement => SourceCallableStatementSyntax::For(Box::new(
+                self.plan_callable_for(statement, parent, scope, depth)?,
+            )),
             _ => {
                 return Err(self.unsupported(
                     statement,
@@ -5711,6 +5761,172 @@ impl SyntaxPlanner<'_> {
             statements,
             binding_flow,
         })
+    }
+
+    fn plan_callable_for(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        scope: NodeRef,
+        depth: usize,
+    ) -> Result<SourceCallableForSyntax, SourceFunctionStatementsError> {
+        let invalid = || unsupported_control_statement(statement, SyntaxKind::ForStatement);
+        let callable = self.callable.declaration;
+        self.validate_container(statement, callable)?;
+        self.validate_block_scope_container(statement, scope)?;
+        let control = plan_source_control_loop_syntax(self.arena, self.bound, statement, parent)?;
+        let condition = control.condition.ok_or_else(invalid)?;
+        let incrementor = control.incrementor.ok_or_else(invalid)?;
+        if control.kind != SourceControlLoopKind::For
+            || self.node(control.body)?.kind != SyntaxKind::Block
+        {
+            return Err(invalid());
+        }
+        let initializers = self.plan_classic_loop_initializers(&control, callable)?;
+        let [initializer] = initializers.as_slice() else {
+            return Err(invalid());
+        };
+        if initializer.binding != VariableBindingKind::Let || initializer.initializer.is_none() {
+            return Err(invalid());
+        }
+        self.validate_classic_loop_incrementor(incrementor, statement, callable, &initializers)?;
+        let update_target = match &self.node(incrementor)?.data {
+            NodeData::PrefixUnaryExpression(unary) => self.reference(unary.operand),
+            NodeData::PostfixUnaryExpression(unary) => self.reference(unary.operand),
+            _ => return Err(invalid()),
+        };
+        let update_entry = self.bound.flow_at(update_target).ok_or_else(invalid)?;
+        let graph = self.bound.flow_graph();
+        if self.bound.flow_container(update_target) != Some(callable)
+            || graph
+                .nodes()
+                .get(update_entry)
+                .is_none_or(|flow| flow.flags.contains(FlowFlags::UNREACHABLE))
+            || graph
+                .nodes()
+                .iter()
+                .filter(|flow| {
+                    joined_semantic_flow_flags(flow.flags) == FlowFlags::ASSIGNMENT.bits()
+                        && flow.payload == Some(FlowNodePayload::Ast(update_target))
+                        && flow.antecedent == Some(update_entry)
+                        && flow.antecedents.is_empty()
+                })
+                .count()
+                != 1
+        {
+            return Err(invalid());
+        }
+        self.validate_block_scope_container(condition, statement)?;
+        self.validate_callable_for_header_expression(
+            initializer.initializer.ok_or_else(invalid)?,
+            statement,
+            0,
+        )?;
+        let condition_entry = self
+            .validate_callable_for_header_expression(condition, statement, 0)?
+            .unwrap_or(statement);
+        let statements =
+            self.plan_callable_list(&[control.body.node], statement, statement, depth + 1)?;
+        let mut pending = statements.iter().collect::<Vec<_>>();
+        while let Some(child) = pending.pop() {
+            match child {
+                SourceCallableStatementSyntax::Block { statements, .. } => pending.extend(statements),
+                SourceCallableStatementSyntax::If(branch) => {
+                    pending.extend(&branch.then_statements);
+                    pending.extend(&branch.else_statements);
+                }
+                SourceCallableStatementSyntax::For(_)
+                | SourceCallableStatementSyntax::ForOf(_)
+                | SourceCallableStatementSyntax::Try(_) => return Err(invalid()),
+                _ => {}
+            }
+        }
+        Ok(SourceCallableForSyntax {
+            control,
+            initializer: *initializer,
+            condition_entry,
+            update_target,
+            statements,
+        })
+    }
+
+    /// Header effects need their own flow proof. Keep this path to reads and operators.
+    fn validate_callable_for_header_expression(
+        &self,
+        expression: NodeRef,
+        scope: NodeRef,
+        depth: usize,
+    ) -> Result<Option<NodeRef>, SourceFunctionStatementsError> {
+        let record = self.node(expression)?;
+        let invalid = || {
+            self.unsupported(
+                expression,
+                record.kind,
+                SourceFunctionStatementsRole::Condition,
+            )
+        };
+        if depth >= MAX_CALLABLE_STATEMENT_DEPTH {
+            return Err(invalid());
+        }
+        self.validate_container(expression, self.callable.declaration)?;
+        self.validate_block_scope_container(expression, scope)?;
+        let children = match &record.data {
+            NodeData::Identifier(_)
+            | NodeData::NumericLiteral(_)
+            | NodeData::StringLiteral(_)
+            | NodeData::BigIntLiteral(_)
+            | NodeData::KeywordExpression(_) => Vec::new(),
+            NodeData::PropertyAccessExpression(access) if access.question_dot_token.is_none() => {
+                vec![access.expression]
+            }
+            NodeData::ElementAccessExpression(access) if access.question_dot_token.is_none() => {
+                vec![access.expression, access.argument_expression]
+            }
+            NodeData::ParenthesizedExpression(parenthesized) => vec![parenthesized.expression],
+            NodeData::NonNullExpression(non_null) => vec![non_null.expression],
+            NodeData::BinaryExpression(binary)
+                if matches!(
+                    self.node(self.reference(binary.operator_token))?.kind,
+                    SyntaxKind::PlusToken
+                        | SyntaxKind::MinusToken
+                        | SyntaxKind::AsteriskToken
+                        | SyntaxKind::SlashToken
+                        | SyntaxKind::PercentToken
+                        | SyntaxKind::AsteriskAsteriskToken
+                        | SyntaxKind::LessThanToken
+                        | SyntaxKind::LessThanEqualsToken
+                        | SyntaxKind::GreaterThanToken
+                        | SyntaxKind::GreaterThanEqualsToken
+                        | SyntaxKind::EqualsEqualsToken
+                        | SyntaxKind::ExclamationEqualsToken
+                        | SyntaxKind::EqualsEqualsEqualsToken
+                        | SyntaxKind::ExclamationEqualsEqualsToken
+                ) =>
+            {
+                vec![binary.left, binary.right]
+            }
+            NodeData::PrefixUnaryExpression(unary)
+                if matches!(
+                    unary.operator,
+                    SyntaxKind::PlusToken
+                        | SyntaxKind::MinusToken
+                        | SyntaxKind::ExclamationToken
+                        | SyntaxKind::TildeToken
+                ) =>
+            {
+                vec![unary.operand]
+            }
+            _ => return Err(invalid()),
+        };
+        let mut entry = self.bound.flow_at(expression).map(|_| expression);
+        for child in children {
+            let child_entry =
+                self.validate_callable_for_header_expression(self.reference(child), scope, depth + 1)?;
+            if entry.is_none() {
+                entry = child_entry;
+            }
+        }
+        Ok(entry)
     }
 
     fn plan_void_switch(

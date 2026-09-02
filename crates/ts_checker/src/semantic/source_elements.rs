@@ -811,7 +811,7 @@ fn array_like_interface_members_are_cold(
     Ok(true)
 }
 
-fn array_binding_name_and_index(
+pub(super) fn array_binding_name_and_index(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     binding: NodeRef,

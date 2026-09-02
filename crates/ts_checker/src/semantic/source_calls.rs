@@ -4366,6 +4366,21 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
         | SyntaxKind::BigIntLiteral => true,
         SyntaxKind::MetaProperty => matches!(&record.data,
             NodeData::MetaProperty(meta) if meta.keyword_token == SyntaxKind::ImportKeyword),
+        SyntaxKind::NonNullExpression => {
+            let NodeData::NonNullExpression(non_null) = &record.data else {
+                return false;
+            };
+            if record.flags.0 != 0 {
+                return false;
+            }
+            let inner = NodeRef::new(node.arena, node.file, non_null.expression);
+            arena.get(inner.node).is_some_and(|inner_record| {
+                inner_record.parent == Some(node.node)
+                    && inner_record.range.start == record.range.start
+                    && inner_record.range.end < record.range.end
+                    && is_context_insensitive_primitive_binary_operand_syntax(arena, inner)
+            })
+        }
         SyntaxKind::ParenthesizedExpression => {
             let NodeData::ParenthesizedExpression(parenthesized) = &record.data else {
                 return false;
@@ -4887,7 +4902,13 @@ fn is_context_insensitive_element_syntax(arena: &NodeArena, node: NodeRef) -> bo
         )
         && index.parent == Some(node.node)
         && receiver.range.end <= index.range.start
-        && is_context_insensitive_element_index_syntax(arena, access.argument_expression)
+        && match index.kind {
+            SyntaxKind::BinaryExpression => is_context_insensitive_primitive_binary_syntax(
+                arena,
+                NodeRef::new(node.arena, node.file, access.argument_expression),
+            ),
+            _ => is_context_insensitive_element_index_syntax(arena, access.argument_expression),
+        }
 }
 
 fn is_context_insensitive_element_index_syntax(arena: &NodeArena, node: ts_ast::NodeId) -> bool {

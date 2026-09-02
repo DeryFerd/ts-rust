@@ -2133,7 +2133,9 @@ fn fixed_contextual_declared_call_owner(
 ) -> Option<TypeId> {
     let record = store.signature(signature)?;
     (store.source_node_kind(record.declaration()?) == Some(SyntaxKind::CallSignature)
-        && !record.type_parameters().is_empty())
+        && !record.type_parameters().is_empty()
+        && record.target().is_none()
+        && record.mapper().is_none())
     .then(|| store.declared_call_set_type_for_signature(signature))
     .flatten()
 }
