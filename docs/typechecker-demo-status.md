@@ -4,33 +4,36 @@ Updated 2026-09-02. No complete real-world project has passed in Rust yet.
 
 ## Current result
 
-The latest combined run passed 419 of 496 selected tests. All tests ran.
-The checker passed 157 of its 234 selected tests. Binder, parser and fixture
+The latest combined run passed 425 of 500 selected tests. All tests ran.
+The checker passed 163 of its 238 selected tests. Binder, parser and fixture
 tests account for the other 262 passes. This is a focused repair batch, not
 the full Rust or TypeScript test suite.
 
-On the unchanged set of 484 earlier tests, eleven failures now pass and no
-passing test regressed. The twelve new tests have four passes and eight
-failures. Both tuple-binding tests pass. Two of six counted-loop tests pass.
-All four computed-interface tests fail. The
-[independent result review](../target/wave202-pathe-demo-tests-10-result-review.md)
-is closed. The separate resource check is also closed.
+On the unchanged set of 496 earlier tests, four failures now pass and no
+passing test regressed. Both new parameterized-function tests pass. Both new
+Array property tests fail before checker construction. A reviewed diagnosis
+finds the wrong AST variant in their test helper. Its one-line correction
+keeps every TypeScript input and assertion unchanged. Later assertions remain
+unmeasured. The
+[independent result review](../target/wave202-pathe-demo-tests-11-result-review.md)
+is closed. The separate resource check is pending.
 
 Pathe is not demo-ready. Its latest project run attempted all nine original
 roots and completed none. Every root and the ordinary project attempt stopped
 with an unsupported operation. No internal checker error occurred in this run.
-The evidence reader passed and the independent result review is closed.
-The separate resource check is also closed.
+The evidence reader passed. The independent result review and separate
+resource check are pending for this newest project run.
 
 | Measurement | Result |
 | --- | --- |
-| [Combined tests 10](../target/wave202-pathe-demo-tests-10-result.md), `c9258a43` | All 496 ran. 419 pass, 77 fail. Eleven earlier failures fixed, no earlier pass lost. Main result review is closed. |
+| [Combined tests 11](../target/wave202-pathe-demo-tests-11-result.md), `2f8ae108` | All 500 ran. 425 pass, 75 fail. Four earlier failures fixed, no earlier pass lost. Main result review is closed. Resource review is pending. |
 | [Ordinary compiler build 10](../target/wave202-pathe-demo-bin-10-main-result.md), `c9258a43` | Build passed in 74.660 seconds. Main and separate resource reviews are closed. A build is not a project pass. |
-| [Pathe census 9](../target/wave202-pathe-demo-census-9-result.md), `27b71eed` | Zero of nine roots complete. All nine and the ordinary attempt are unsupported. The oracle stage took 23.104 seconds. Main and separate resource reviews are closed. |
-| [Previous combined tests 9](../target/wave202-pathe-demo-tests-9-result.md), `27b71eed` | 404 of 484 passed. Main and separate resource reviews are closed. This is the comparison set for Tests10. |
+| [Pathe census 10](../target/wave202-pathe-demo-census-10-result.md), `c9258a43` | Zero of nine roots complete. All nine and the ordinary attempt are unsupported. The oracle stage took 22.584 seconds. Independent main and resource reviews are pending. |
+| [Previous combined tests 10](../target/wave202-pathe-demo-tests-10-result.md), `c9258a43` | 419 of 496 passed. Main and separate resource reviews are closed. This is the comparison set for Tests11. |
 
-The project run used the older compiler. It does not measure the eleven fixes
-in the newer test run. The next Pathe run will use the new build.
+The project run used the older compiler. It does not measure the four fixes
+in the newer test run. The next compiler build will include the next reviewed
+source batch, `84f3a17a`.
 
 The current project evidence retains the same nine roots, all 277 loaded-file
 identities and all 13 explicit options. The
@@ -60,42 +63,41 @@ route to a complete demo. Neither Pathe nor UFO is a proved near-pass yet.
 
 ## Next work
 
-1. Check unchanged Pathe with `c9258a43`. Build and test results are available.
-   Their resource checks and the earlier census closure are complete. Prepare
-   and run the [next project measurement](../target/wave202-pathe-demo-census-10-plan.md).
-   Keep all failures visible. A diagnostic run does not require pretending
-   the 77 test failures passed.
-2. Run the closed `2f8ae108` repair batch with all 496 current tests and four
-   new tests. This 500-test selection adds Array property preparation,
-   Array-to-Iterable relations, loop expression preparation, generic method
-   parameters and parameterized function expressions. Its source capture and
-   independent capture review are closed. It has no test result yet.
-3. Combine the next eight reviewed changes without delaying those runs.
+1. Use the actual Pathe stopping points to order repairs. The latest run
+   still stops in arrows, function bodies, a binary expression, an import and
+   cold alias resolution. Check which pending changes address those exact
+   paths. Do not infer a cause from the outer error label.
+2. Build and test the closed `84f3a17a` source batch. Its selection retains all
+   500 current tests and adds ten. The stopped 510-test packet has passed
+   independent review. Source capture and execution remain separate steps.
+3. This batch combines eight reviewed changes.
    They cover typed arrows, loop-local reads, property error recovery,
    function-expression locals, type-only namespace queries and callable
    intersection properties. Two changes add failure observations for import
-   aliases and constructor providers. The changes are now in one candidate
-   worktree under source review. Its planned selection retains all 500 tests
-   and adds ten. This 510-test batch has no measured result.
+   aliases and constructor providers. Source review is closed. This batch has
+   no measured test or project result yet.
 4. The nullable-argument diagnostic, nested logical-assignment flow and public
-   AST-helper corrections now have reviewed source commits. Their next
-   integration plan retains all 510 tests and adds six. Four more repair
-   pairs work on computed-property writes, nullish diagnostic text, optional
-   top-level reads and the computed-member test setup. None has a new test
-   result yet. No pass is claimed from review alone.
+   AST-helper corrections are combined and reviewed at `76f3f352`. That
+   selection retains all 510 tests and adds six. More repair pairs cover
+   computed-property writes, nullish diagnostic text, optional top-level reads
+   and two test-helper defects. Fresh diagnoses cover counted-loop flow cycles
+   and default parameters. None has a new test result yet. Source review does
+   not establish a test pass.
 5. After dependency approval, measure unchanged UFO with the pinned Go and
    Rust compilers. Use its actual first failures to confirm or reject it as
    the second demo target.
 
-The eleven repaired older tests cover array iteration, callback owners and
-generic call-signature constraints, defaults, overloads and cache identity.
-Their exact names are in the Tests10 result.
+The four newly repaired older tests cover callable loop composition, iterable
+identity, loop scope and immediate function-call error preservation. Their
+exact names are in the Tests11 result. Tests10 previously fixed eleven older
+tests, including generic call-signature and Array iteration cases.
 
 Two saved diagnoses guide the remaining new failures.
 The [counted-loop diagnosis](../target/wave202-pathe-tests10-counted-for-diagnosis.md)
 shows that an outer BinaryExpression error can also describe a Logical or
-Element plan. Do not infer the AST kind from that label. Check the already
-prepared 500-test repair result before adding another repair or observation.
+Element plan. The newer saved run identifies flow-preflight cycle errors in
+three remaining counted-loop cases. The new diagnosis checks whether valid
+loop backedges are rejected. It must preserve errors for malformed flow graphs.
 
 The [computed-member diagnosis](../target/wave202-pathe-tests10-computed-members-diagnosis.md)
 finds an incomplete positive cache fixture and identifier-only assignment
@@ -111,9 +113,9 @@ Diagnosis, implementation, source review and saved-result review run in
 parallel. At most three Cargo lanes run, with the existing resource limits.
 Keep every old test and every new repair test in each combined selection.
 
-The latest batch fixes eleven old tests. The previous batch fixed four.
-That is a useful result, but it does not prove a higher fixes-per-hour rate
-or that worker count caused the gain. Complete project checks remain at zero.
+The latest batch fixes four old tests. The previous batch fixed eleven.
+These counts do not prove a higher fixes-per-hour rate or that worker count
+caused the gain. Complete project checks remain at zero.
 
 The [validation-workflow proposal](../target/wave202-pathe-validation-workflow-plan.md)
 targets a measured delay. In earlier saved runs, source capture preceded
@@ -123,9 +125,9 @@ Those gaps include review and approval work. They are not all idle time.
 
 The proposal uses one fixed reviewed program and an immutable input record
 instead of copying and reviewing large programs for each run. It must keep
-all input, output and resource checks. Independent plan review is complete.
-A separate worker has started the three-file implementation. No current run
-changes, no pilot is approved, and no time saving has been measured yet.
+all input, output and resource checks. The three-file implementation has
+passed independent source review. Offline checks and a pilot remain pending.
+No current run changes, and no time saving has been measured yet.
 
 ## Demo pass conditions
 
