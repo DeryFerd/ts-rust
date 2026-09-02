@@ -5107,9 +5107,37 @@ fn stored_function_expression_context_target(
         return None;
     };
     let signature = store.signature(callable.signature)?;
-    let annotation = signature.declaration()?;
-    let (annotation, type_parent) =
-        source_context_root(store, annotation, SyntaxKind::ParenthesizedType)?;
+    let mut annotation = signature.declaration()?;
+    if !store.source_direct_type_annotation_is_exact(annotation, target) {
+        return None;
+    }
+    let mut visited = HashSet::new();
+    let type_parent = loop {
+        if visited.len() >= super::instantiate::InstantiationLimits::default().max_depth
+            || !visited.insert(annotation)
+        {
+            return None;
+        }
+        let SourceNodeParent::Parent(parent) = store.source_node_parent(annotation)? else {
+            return None;
+        };
+        if store.source_node_kind(parent) != Some(SyntaxKind::ParenthesizedType) {
+            break parent;
+        }
+        if store.source_direct_children(parent)?.as_slice() != [annotation]
+            || store.type_node_links(parent).is_some_and(|links| {
+                links != &TypeNodeLinks::default()
+                    && (links.outer_type_parameters.is_some()
+                        || links.resolved_type != Some(target))
+            })
+            || store
+                .symbol_node_links(parent)
+                .is_some_and(|links| links != &SymbolNodeLinks::default())
+        {
+            return None;
+        }
+        annotation = parent;
+    };
     let anchor_valid = match variable {
         Some(variable) => {
             let (_, expression_parent) =
@@ -5126,7 +5154,6 @@ fn stored_function_expression_context_target(
         }
     };
     (anchor_valid
-        && store.source_direct_type_annotation_is_exact(annotation, target)
         && signature.type_parameters().is_empty()
         && signature.this_parameter().is_none()
         && !signature.has_rest_parameter()
