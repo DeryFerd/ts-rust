@@ -41150,6 +41150,75 @@ fn check_expression_type_with_capture_context(
                                 }
                             }
                             Err(error) => {
+                                if !store.relation_read_observation_is_active()
+                                    && construction.is_generic_library_constructor()
+                                    && let SourceNewError::Call {
+                                        error: super::calls::DirectCallError::Relation(
+                                            RelationUnavailable::UnsupportedStructuredType(type_),
+                                        ),
+                                        ..
+                                    } = &error
+                                {
+                                    for (stage, type_) in std::iter::once((
+                                        "generic_new_unavailable_type",
+                                        *type_,
+                                    ))
+                                    .chain(argument_types.first().copied().map(|argument| {
+                                        ("generic_new_unavailable_first_argument", argument)
+                                    })) {
+                                        let record = store.type_payload(type_);
+                                        let target = record.and_then(|record| match record.data() {
+                                            TypeData::Interface(interface) => {
+                                                interface.reference.object.target
+                                            }
+                                            TypeData::TypeReference(reference) => {
+                                                reference.object.target
+                                            }
+                                            _ => None,
+                                        });
+                                        for (role, observed) in [
+                                            ("type", Some(type_)),
+                                            ("target", target.filter(|target| *target != type_)),
+                                        ] {
+                                            let Some(observed) = observed else {
+                                                continue;
+                                            };
+                                            let record = store.type_payload(observed);
+                                            let owner = record.and_then(TypeRecord::symbol);
+                                            let symbol = owner.and_then(|owner| store.symbol(owner));
+                                            let declaration = symbol
+                                                .and_then(|symbol| symbol.declarations())
+                                                .and_then(|declarations| declarations.first())
+                                                .copied();
+                                            let member_state = record.and_then(|record| {
+                                                match record.data() {
+                                                    TypeData::Interface(interface) => Some((
+                                                        interface.base_types_resolved,
+                                                        interface.declared_members_resolved,
+                                                        record.object_flags().contains(
+                                                            ObjectFlags::MEMBERS_RESOLVED,
+                                                        ),
+                                                    )),
+                                                    _ => None,
+                                                }
+                                            });
+                                            observe_call_failure_detail(
+                                                stage,
+                                                format_args!(
+                                                    "expression={:?} role={role} type={observed:?} kind={:?} target={target:?} owner={owner:?} owner_flags={:?} object_flags={:?} member_state={member_state:?} name={:?} declaration={declaration:?} declaration_kind={:?} value_declaration={:?} argument_count={}",
+                                                    construction.node(),
+                                                    record.map(|record| record.data().kind()),
+                                                    symbol.map(|symbol| symbol.flags().bits()),
+                                                    record.map(|record| record.object_flags().bits()),
+                                                    symbol.map(|symbol| symbol.name()),
+                                                    declaration.and_then(|node| store.source_node_kind(node)),
+                                                    symbol.and_then(|symbol| symbol.value_declaration()),
+                                                    argument_types.len(),
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
                                 return Err(SourcePlanner::new_plan_error(
                                     construction.node(),
                                     error,
