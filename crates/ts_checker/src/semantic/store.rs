@@ -12248,10 +12248,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                         & !(SignatureFlags::HAS_LITERAL_TYPES | SignatureFlags::HAS_REST_PARAMETER)
                             .bits()
                         != 0
-                    || has_rest
-                        && (signature.parameters.is_empty()
-                            || !global_namespace
-                            || signature.query_evidence.is_some())
+                    || has_rest && (signature.parameters.is_empty() || !global_namespace)
                     || signature.min_argument_count < 0
                     || usize::try_from(signature.min_argument_count)
                         .map_or(true, |minimum| minimum > signature.parameters.len())
@@ -12297,16 +12294,28 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                 }
                 if let Some(evidence) = &signature.query_evidence {
                     let plan = evidence.callable();
-                    if group.implementation.is_none()
+                    if group.implementation.is_none() && !global_namespace
                         || plan.declaration != signature.declaration
                         || plan.owner_symbol != group.owner_symbol
                         || plan.array_targets != group.array_targets
                         || plan.flags != signature.flags
                         || !evidence.is_exact(self)
-                        || plan.type_parameters.len() != 1
-                        || plan.type_parameters.iter().any(|parameter| {
-                            parameter.constraint.is_some() || parameter.default_type.is_some()
-                        })
+                        || !global_namespace
+                            && (plan.type_parameters.len() != 1
+                                || plan.type_parameters.iter().any(|parameter| {
+                                    parameter.constraint.is_some()
+                                        || parameter.default_type.is_some()
+                                }))
+                        || global_namespace
+                            && (plan.type_parameters.is_empty()
+                                || plan.body_mode
+                                    != super::source_callables::SourceCallableBodyMode::AmbientDeclaration
+                                || plan.export_local.is_none()
+                                || self.source_global_callable_augmentation_local(
+                                    group.owner_symbol,
+                                    signature.declaration,
+                                )
+                                    != plan.export_local)
                         || plan.parameters.len() != signature.parameters.len()
                         || plan.return_type.annotation_identity()
                             != signature.return_annotation.map(|annotation| {
@@ -12383,6 +12392,16 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                                 parameter.base_type,
                                 group.array_targets,
                             )
+                            && !signature.query_evidence.as_ref().is_some_and(|evidence| {
+                                super::source_overloads::generic_global_overload_rest_parameter_is_exact(
+                                    self,
+                                    evidence,
+                                    parameter.declaration,
+                                    parameter.annotation,
+                                    parameter.base_type,
+                                    group.array_targets,
+                                )
+                            })
                     {
                         return None;
                     }

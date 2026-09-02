@@ -4,7 +4,8 @@
 //! parameters, fixed or optional parameters whose targets are naked type
 //! parameters, canonical nested Array/interface references, nonempty property
 //! aliases in explicit calls, or authenticated fixed primitives and callbacks,
-//! homogeneous Array rest parameters, and a
+//! homogeneous Array rest parameters, queried global Array-constrained rest
+//! formals, and a
 //! mapper-supported return. It owns
 //! declaration-order
 //! inference/default/constraint finalization, overload-failure projection, and
@@ -40,7 +41,10 @@ use super::{
     },
     calls::{
         DirectCallApplicability, DirectCallArgumentTarget, DirectCallError, DirectCallForm,
-        DirectCallReturnKind, get_min_argument_count_with_array_targets,
+        DirectCallReturnKind, cached_type_at_position_with_array_targets,
+        get_min_argument_count_with_array_targets, get_parameter_count_with_array_targets,
+        has_effective_rest_parameter_with_array_targets,
+        try_get_type_at_position_with_array_targets,
     },
     classes::{
         ClassError, CompletedSourceClassConstructors, SourceClassConstructorTypeParameter,
@@ -52,7 +56,8 @@ use super::{
         infer_call_type_parameter_candidates, infer_naked_type_parameter,
         infer_naked_type_parameter_candidates,
         infer_naked_type_parameter_candidates_with_array_targets,
-        infer_naked_type_parameter_variance_candidates, is_non_inferrable_inference_source,
+        infer_naked_type_parameter_variance_candidates, inference_candidate_literal_treatment,
+        is_non_inferrable_inference_source,
         validate_call_inference_candidate, validate_inference_leaf,
         validate_inference_leaf_with_array_targets,
     },
@@ -63,7 +68,7 @@ use super::{
     },
     instantiated_members::{
         generic_interface_call_signature_return, instantiated_interface_method_signature_return,
-        source_return_function_type_owner,
+        source_callable_function_type_owner, source_parameter_function_type_owner,
     },
     keyof_types::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
@@ -76,9 +81,12 @@ use super::{
         declared_interface_call_type_parameter_view, declared_method_type_parameter_view,
         declared_named_constructor_type_parameter_view, generic_named_constructor_interface_owner,
     },
-    reference_types::{DirectGenericReference, validate_direct_generic_reference},
+    reference_types::{
+        DirectGenericReference, validate_direct_generic_reference,
+        validate_nongeneric_interface_argument_origin,
+    },
     relation::RelationKind,
-    signatures::{ElementFlags, IndexFlags, SignatureFlags},
+    signatures::{ElementFlags, IndexFlags, SignatureFlags, TupleElementInfo},
     source_callables::{
         StoredSourceCallableValidation, constrained_string_rest_tuple_parameter,
         valid_fixed_generic_source_parameter_type, validate_stored_source_callable,
@@ -88,7 +96,7 @@ use super::{
         CachedSignatureLookup, SourceCallableFamily, SourceCallableReturnProvenance,
         SourceNodeParent,
     },
-    tuple_types::CanonicalTupleTypeRequest,
+    tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_nodes::SourceCallableTypeQueryEvidence,
     type_records::TypeData,
     types::{ObjectFlags, TypeFlags, VarianceFlags},
@@ -417,10 +425,17 @@ struct GenericCallSignatureShape {
     type_parameters: Vec<GenericCallTypeParameter>,
     parameter_templates: Vec<TypeId>,
     rest_element_template: Option<TypeId>,
+    rest_type_parameter: Option<TypeId>,
     minimum_argument_count: usize,
     return_type: TypeId,
     return_requires_exact_cache: bool,
     array_targets: Option<CanonicalArrayTargets>,
+}
+
+impl GenericCallSignatureShape {
+    fn has_rest_parameter(&self) -> bool {
+        self.rest_element_template.is_some() || self.rest_type_parameter.is_some()
+    }
 }
 
 /// The receiver provider has checked the original method and its composed mapper.
@@ -772,7 +787,7 @@ pub(super) fn prepare_generic_constructor_context_with_session(
         .ok_or_else(unsupported)?;
     if !shape.named_constructor
         || shape.class_constructor.is_some()
-        || shape.rest_element_template.is_some()
+        || shape.has_rest_parameter()
         || argument_count < shape.minimum_argument_count
         || argument_count > shape.parameter_templates.len()
     {
@@ -2357,7 +2372,7 @@ fn check_validated_generic_call_candidate(
 
     let maximum_arguments = shape.parameter_templates.len();
     if request.arguments.len() < shape.minimum_argument_count
-        || shape.rest_element_template.is_none() && request.arguments.len() > maximum_arguments
+        || !shape.has_rest_parameter() && request.arguments.len() > maximum_arguments
     {
         let applicability = if request.arguments.len() < shape.minimum_argument_count {
             GenericCallVectorApplicability::TooFewArguments {
@@ -2437,6 +2452,30 @@ fn check_validated_generic_call_candidate(
         });
     }
     reject_constructor_limit_recovery(&shape, session, limit_mark)?;
+
+    if let Some((minimum, maximum, has_rest)) =
+        mapped_generic_rest_arity(store, &shape, &selected_type_arguments)?
+        && (request.arguments.len() < minimum
+            || !has_rest && request.arguments.len() > maximum)
+    {
+        let applicability = if request.arguments.len() < minimum {
+            GenericCallVectorApplicability::TooFewArguments {
+                expected: minimum,
+                actual: request.arguments.len(),
+            }
+        } else {
+            GenericCallVectorApplicability::TooManyArguments {
+                expected: maximum,
+                actual: request.arguments.len(),
+            }
+        };
+        return Ok(GenericCallVectorCandidate {
+            callee: request.callee,
+            shape,
+            checked: None,
+            applicability,
+        });
+    }
 
     let sources = shape
         .type_parameters
@@ -3174,26 +3213,64 @@ fn validate_generic_call_signature_shape_worker(
             }
         }
     }
+    let mut rest_type_parameter = None;
     let rest_element_template = match callable.rest_parameter {
         None => None,
         Some(rest) => {
             let targets = array_targets.ok_or(GenericCallVectorUnsupported::RestSignature(
                 callable.signature,
             ))?;
-            let reference = store
-                .canonical_array_reference_with_targets(targets, rest)
-                .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
-                    signature: callable.signature,
-                    type_: rest,
-                    error,
-                })?
-                .ok_or(GenericCallVectorUnsupported::RestSignature(
-                    callable.signature,
-                ))?;
-            if reference.readonly || reference.array_literal {
-                return Err(GenericCallVectorUnsupported::RestSignature(callable.signature).into());
+            if let Some(parameter) = type_parameters
+                .iter()
+                .find(|parameter| parameter.type_ == rest)
+            {
+                let constraint =
+                    parameter
+                        .constraint
+                        .ok_or(GenericCallVectorUnsupported::RestSignature(
+                            callable.signature,
+                        ))?;
+                let Some(array) = store
+                    .canonical_array_reference_with_targets(targets, constraint)
+                    .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
+                        signature: callable.signature,
+                        type_: constraint,
+                        error,
+                    })?
+                else {
+                    return Err(
+                        GenericCallVectorUnsupported::RestSignature(callable.signature).into(),
+                    );
+                };
+                if !source_overload
+                    || query_evidence.is_none()
+                    || array.readonly
+                    || array.array_literal
+                {
+                    return Err(
+                        GenericCallVectorUnsupported::RestSignature(callable.signature).into(),
+                    );
+                }
+                rest_type_parameter = Some(rest);
+                None
+            } else {
+                let reference = store
+                    .canonical_array_reference_with_targets(targets, rest)
+                    .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
+                        signature: callable.signature,
+                        type_: rest,
+                        error,
+                    })?
+                    .ok_or(GenericCallVectorUnsupported::RestSignature(
+                        callable.signature,
+                    ))?;
+                if reference.readonly || reference.array_literal {
+                    return Err(
+                        GenericCallVectorUnsupported::RestSignature(callable.signature).into(),
+                    );
+                }
+                Some(reference.element_type)
             }
-            Some(reference.element_type)
         }
     };
     let mut parameter_templates = callable.parameters.clone();
@@ -3305,6 +3382,7 @@ fn validate_generic_call_signature_shape_worker(
         type_parameters,
         parameter_templates,
         rest_element_template,
+        rest_type_parameter,
         minimum_argument_count: generic_call_signature_minimum_argument_count(
             store,
             callable.signature,
@@ -3325,6 +3403,17 @@ fn validate_generic_parameter_template(
     active_types: &mut Vec<TypeId>,
 ) -> Result<bool, GenericCallVectorError> {
     if type_parameters.contains(&type_) {
+        return Ok(true);
+    }
+    if source_parameter_function_type_owner(store, type_) == Some(signature) {
+        validate_generic_mapper_type_worker(
+            store,
+            type_,
+            type_parameters,
+            array_targets,
+            signature,
+            active_types,
+        )?;
         return Ok(true);
     }
 
@@ -4354,7 +4443,7 @@ fn validate_generic_mapper_type_worker(
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(false),
         TypeData::TypeParameter(_) if type_parameters.contains(&type_) => Ok(false),
         TypeData::Object(_)
-            if source_return_function_type_owner(store, type_) == Some(signature) =>
+            if source_callable_function_type_owner(store, type_) == Some(signature) =>
         {
             if active_types.len() >= InstantiationLimits::default().max_depth
                 || active_types.contains(&type_)
@@ -4374,6 +4463,7 @@ fn validate_generic_mapper_type_worker(
             if !callback.type_parameters().is_empty()
                 || callback.this_parameter().is_some()
                 || callback.has_rest_parameter()
+                    && source_parameter_function_type_owner(store, type_) != Some(signature)
                 || callback.resolved_type_predicate().is_some()
             {
                 return Err(
@@ -4390,6 +4480,7 @@ fn validate_generic_mapper_type_worker(
                 .parameters
                 .iter()
                 .copied()
+                .chain(callable.rest_parameter)
                 .chain(callable.return_type)
                 .try_for_each(|edge| {
                     validate_generic_mapper_type_worker(
@@ -4473,6 +4564,14 @@ fn validate_generic_mapper_type_worker(
                 )?;
             }
             Ok(contains_keyof)
+        }
+        TypeData::Interface(interface)
+            if interface.reference.resolved_type_arguments.as_deref() == Some(&[]) =>
+        {
+            validate_nongeneric_interface_argument_origin(store, type_).map_err(|_| {
+                GenericCallVectorInvariant::InvalidInterfaceReference { signature, type_ }
+            })?;
+            Ok(false)
         }
         TypeData::TypeReference(_) | TypeData::Interface(_) => {
             if let Some(array_targets) = array_targets {
@@ -4769,7 +4868,7 @@ fn collect_generic_call_argument_inferences(
     let mut buckets = vec![Vec::new(); type_parameters.len()];
     let mut contravariant_buckets = vec![Vec::new(); type_parameters.len()];
     let fixed_parameter_count =
-        shape.parameter_templates.len() - usize::from(shape.rest_element_template.is_some());
+        shape.parameter_templates.len() - usize::from(shape.has_rest_parameter());
     for (index, argument) in arguments.iter().copied().enumerate() {
         let Some(parameter) = shape
             .parameter_templates
@@ -4806,6 +4905,81 @@ fn collect_generic_call_argument_inferences(
             &mut contravariant_buckets,
             shape.signature,
             shape.class_constructor.is_some() || shape.named_constructor,
+            &mut Vec::new(),
+            false,
+            session,
+        )?;
+    }
+
+    if let Some(rest) = shape.rest_type_parameter {
+        let constraint = shape
+            .type_parameters
+            .iter()
+            .find(|parameter| parameter.type_ == rest)
+            .and_then(|parameter| parameter.constraint)
+            .ok_or(GenericCallVectorInvariant::InvalidTypeParameter(rest))?;
+        let targets = shape
+            .array_targets
+            .ok_or(GenericCallVectorUnsupported::RestSignature(shape.signature))?;
+        let element = store
+            .canonical_array_reference_with_targets(targets, constraint)
+            .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
+                signature: shape.signature,
+                type_: constraint,
+                error,
+            })?
+            .ok_or(GenericCallVectorUnsupported::RestSignature(shape.signature))?
+            .element_type;
+        let treatment = if type_maybe_primitive(store, element) {
+            InferenceLiteralTreatment::Regularize
+        } else {
+            InferenceLiteralTreatment::Widen
+        };
+        let mut elements =
+            Vec::with_capacity(arguments.len().saturating_sub(fixed_parameter_count));
+        for argument in arguments.iter().copied().skip(fixed_parameter_count) {
+            elements.push(
+                inference_candidate_literal_treatment(
+                    store,
+                    argument,
+                    treatment,
+                    global_types,
+                    &mut Some(&mut |store, types, reduction| {
+                        if let Some(globals) = global_types {
+                            store.expression_union_type_with_global_types_and_session(
+                                globals, types, reduction, session,
+                            )
+                        } else {
+                            store.literal_union_type_with_alias_and_array_targets_and_session(
+                                types,
+                                None,
+                                shape.array_targets,
+                                session,
+                            )
+                        }
+                    }),
+                )
+                .map_err(NakedTypeCandidateError::from)?,
+            );
+        }
+        let infos = vec![TupleElementInfo::new(ElementFlags::REQUIRED, None); elements.len()];
+        let tuple = store
+            .create_canonical_tuple_type(
+                CanonicalTupleTypeRequest::new(&elements, &infos, false)
+                    .with_array_targets(targets),
+            )
+            .map_err(|error| generic_call_rest_tuple_error(shape.signature, error))?;
+        collect_generic_call_inferences_worker(
+            store,
+            shape.array_targets,
+            global_types,
+            tuple,
+            rest,
+            &type_parameters,
+            &mut buckets,
+            &mut contravariant_buckets,
+            shape.signature,
+            false,
             &mut Vec::new(),
             false,
             session,
@@ -5125,6 +5299,137 @@ struct GenericConstructorInferenceState {
     completed_pairs: Vec<(TypeId, TypeId, bool)>,
 }
 
+fn generic_call_rest_tuple_error(
+    signature: SignatureId,
+    error: TupleTypeError,
+) -> GenericCallVectorError {
+    match error {
+        TupleTypeError::BootstrapUninitialized => {
+            GenericCallVectorInvariant::MissingBootstrap.into()
+        }
+        TupleTypeError::Capacity => GenericCallVectorInvariant::Capacity(signature).into(),
+        TupleTypeError::UnsupportedElementFlags { .. }
+        | TupleTypeError::UnsupportedElementOrder { .. }
+        | TupleTypeError::ArrayRestCollapseUnavailable => {
+            GenericCallVectorUnsupported::RestSignature(signature).into()
+        }
+        _ => GenericCallVectorInvariant::CallableSignatureMismatch(signature).into(),
+    }
+}
+
+/// Builds the callback's real parameter tuple through the shared position queries.
+fn generic_callback_parameter_tuple(
+    store: &mut CanonicalTypeMapperStore,
+    callable: &ValidatedSingleCallable,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<TypeId, GenericCallVectorError> {
+    let signature =
+        store
+            .signature(callable.signature)
+            .ok_or(GenericCallVectorInvariant::InvalidSignature(
+                callable.signature,
+            ))?;
+    if !signature.type_parameters().is_empty()
+        || signature.this_parameter().is_some()
+        || signature.resolved_type_predicate().is_some()
+    {
+        return Err(GenericCallVectorUnsupported::ContextualSignature(callable.signature).into());
+    }
+    let declarations = signature
+        .parameters()
+        .iter()
+        .map(|symbol| {
+            store
+                .symbol(*symbol)
+                .and_then(|symbol| symbol.value_declaration())
+                .filter(|node| store.source_node_kind(*node) == Some(SyntaxKind::Parameter))
+        })
+        .collect::<Vec<_>>();
+    let error = |error| generic_rest_projection_error(callable.signature, error);
+    let count =
+        get_parameter_count_with_array_targets(store, array_targets, callable).map_err(error)?;
+    let has_rest = has_effective_rest_parameter_with_array_targets(store, array_targets, callable)
+        .map_err(error)?;
+    let minimum = get_min_argument_count_with_array_targets(
+        store,
+        array_targets,
+        callable,
+        MinArgumentCountFlags::NONE,
+    )
+    .map_err(error)?;
+    let mut types = Vec::with_capacity(count);
+    let mut infos = Vec::with_capacity(count);
+    for index in 0..count - usize::from(has_rest) {
+        types.push(
+            try_get_type_at_position_with_array_targets(store, array_targets, callable, index)
+                .map_err(error)?
+                .ok_or(GenericCallVectorInvariant::CallableSignatureMismatch(
+                    callable.signature,
+                ))?,
+        );
+        let declaration = if index < callable.parameters.len() {
+            declarations.get(index).copied().flatten()
+        } else if let Some(rest) = callable.rest_parameter {
+            store
+                .canonical_tuple_shape(rest)
+                .map_err(|error| generic_call_rest_tuple_error(callable.signature, error))?
+                .and_then(|tuple| {
+                    tuple
+                        .element_infos()
+                        .get(index - callable.parameters.len())
+                        .and_then(|info| info.labeled_declaration())
+                })
+        } else {
+            None
+        };
+        infos.push(TupleElementInfo::new(
+            if index < minimum {
+                ElementFlags::REQUIRED
+            } else {
+                ElementFlags::OPTIONAL
+            },
+            declaration,
+        ));
+    }
+    if has_rest {
+        let rest = callable.rest_parameter.ok_or(
+            GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature),
+        )?;
+        if let Some(tuple) = store
+            .canonical_tuple_shape(rest)
+            .map_err(|error| generic_call_rest_tuple_error(callable.signature, error))?
+        {
+            types.extend_from_slice(&tuple.element_types()[tuple.fixed_length()..]);
+            infos.extend_from_slice(&tuple.element_infos()[tuple.fixed_length()..]);
+        } else if let Some(targets) = array_targets
+            && let Some(array) = store
+                .canonical_array_reference_with_targets(targets, rest)
+                .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
+                    signature: callable.signature,
+                    type_: rest,
+                    error,
+                })?
+        {
+            if array.readonly || array.array_literal {
+                return Err(GenericCallVectorUnsupported::RestSignature(callable.signature).into());
+            }
+            types.push(array.element_type);
+            infos.push(TupleElementInfo::new(
+                ElementFlags::REST,
+                declarations.last().copied().flatten(),
+            ));
+        } else {
+            return Err(GenericCallVectorUnsupported::RestSignature(callable.signature).into());
+        }
+    }
+    let request = CanonicalTupleTypeRequest::new(&types, &infos, false);
+    store
+        .create_canonical_tuple_type(
+            array_targets.map_or(request, |targets| request.with_array_targets(targets)),
+        )
+        .map_err(|error| generic_call_rest_tuple_error(callable.signature, error))
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn collect_generic_call_inferences_pair(
     store: &mut CanonicalTypeMapperStore,
@@ -5186,6 +5491,72 @@ fn collect_generic_call_inferences_pair(
                 bucket.push(source);
             }
             return Ok(());
+        }
+
+        if source_parameter_function_type_owner(store, target) == Some(signature) {
+            let Some(targets) =
+                generic_constructor_inference_callables(store, target, array_targets)?
+            else {
+                return Err(GenericCallVectorInvariant::MalformedCallable(target).into());
+            };
+            let [callback] = targets.as_slice() else {
+                return Err(GenericCallVectorInvariant::MalformedCallable(target).into());
+            };
+            let rest = callback
+                .rest_parameter
+                .filter(|rest| type_parameters.contains(rest));
+            let void = store
+                .intrinsic_bootstrap()
+                .ok_or(GenericCallVectorInvariant::MissingBootstrap)?
+                .void_type;
+            let Some(rest) = rest else {
+                return Err(GenericCallVectorUnsupported::InferencePair {
+                    signature,
+                    source,
+                    target,
+                }
+                .into());
+            };
+            if !callback.parameters.is_empty() || callback.return_type != Some(void) {
+                return Err(GenericCallVectorUnsupported::InferencePair {
+                    signature,
+                    source,
+                    target,
+                }
+                .into());
+            }
+            let Some(sources) =
+                generic_constructor_inference_callables(store, source, array_targets)?
+            else {
+                return Ok(());
+            };
+            let Some(source_callback) = sources.last() else {
+                return Ok(());
+            };
+            let strict = store
+                .claimed_strict_function_types()
+                .ok_or(GenericCallVectorUnsupported::ContextualSignature(signature))?;
+            let tuple = generic_callback_parameter_tuple(store, source_callback, array_targets)?;
+            return collect_generic_call_inferences_pair(
+                store,
+                array_targets,
+                global_types,
+                tuple,
+                rest,
+                type_parameters,
+                buckets,
+                contravariant_buckets,
+                signature,
+                concrete_constructor,
+                active_targets,
+                if strict {
+                    !contravariant
+                } else {
+                    contravariant
+                },
+                session,
+                state,
+            );
         }
 
         if state.structural {
@@ -6127,6 +6498,85 @@ fn check_explicit_type_argument_constraints(
     Ok(None)
 }
 
+fn generic_rest_projection_error(
+    signature: SignatureId,
+    error: DirectCallError,
+) -> GenericCallVectorError {
+    match error {
+        DirectCallError::Unsupported(_) => {
+            GenericCallVectorUnsupported::RestSignature(signature).into()
+        }
+        DirectCallError::Invariant(_) => {
+            GenericCallVectorInvariant::CallableSignatureMismatch(signature).into()
+        }
+        DirectCallError::Relation(error) => GenericCallVectorError::Relation(error),
+    }
+}
+
+/// Uses the selected rest argument without demanding an omitted parameter cache.
+fn mapped_generic_rest_callable(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    signature: SignatureId,
+    arguments: &[TypeId],
+) -> Result<Option<ValidatedSingleCallable>, GenericCallVectorError> {
+    let Some(rest) = shape.rest_type_parameter else {
+        return Ok(None);
+    };
+    let invalid = || GenericCallVectorInvariant::CallableSignatureMismatch(shape.signature);
+    let index = shape
+        .type_parameters
+        .iter()
+        .position(|parameter| parameter.type_ == rest)
+        .ok_or_else(invalid)?;
+    let rest = arguments.get(index).copied().ok_or_else(invalid)?;
+    let owner = store
+        .source_overload_type_for_signature(shape.signature)
+        .ok_or_else(invalid)?;
+    let minimum = store
+        .signature(signature)
+        .and_then(|signature| usize::try_from(signature.min_argument_count()).ok())
+        .ok_or_else(invalid)?;
+    let (last, fixed) = shape.parameter_templates.split_last().ok_or_else(invalid)?;
+    if Some(*last) != shape.rest_type_parameter {
+        return Err(invalid().into());
+    }
+    Ok(Some(ValidatedSingleCallable {
+        owner,
+        signature,
+        parameters: fixed.to_vec(),
+        rest_parameter: Some(rest),
+        min_argument_count: minimum,
+        return_type: Some(shape.return_type),
+        strict_variance_exempt: false,
+    }))
+}
+
+fn mapped_generic_rest_arity(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    arguments: &[TypeId],
+) -> Result<Option<(usize, usize, bool)>, GenericCallVectorError> {
+    let Some(callable) = mapped_generic_rest_callable(store, shape, shape.signature, arguments)?
+    else {
+        return Ok(None);
+    };
+    let error = |error| generic_rest_projection_error(shape.signature, error);
+    let minimum = get_min_argument_count_with_array_targets(
+        store,
+        shape.array_targets,
+        &callable,
+        MinArgumentCountFlags::NONE,
+    )
+    .map_err(error)?;
+    let count = get_parameter_count_with_array_targets(store, shape.array_targets, &callable)
+        .map_err(error)?;
+    let has_rest =
+        has_effective_rest_parameter_with_array_targets(store, shape.array_targets, &callable)
+            .map_err(error)?;
+    Ok(Some((minimum, count - usize::from(has_rest), has_rest)))
+}
+
 fn check_generic_call_arguments(
     store: &mut CanonicalTypeMapperStore,
     arguments: &[TypeId],
@@ -6141,9 +6591,11 @@ fn check_generic_call_arguments(
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
 ) -> Result<Option<GenericCallVectorApplicability>, GenericCallVectorError> {
+    let mut rest_callable =
+        mapped_generic_rest_callable(store, shape, checked.signature, &checked.type_arguments)?;
     for (index, argument_type) in arguments.iter().copied().enumerate() {
         let fixed_parameter_count =
-            shape.parameter_templates.len() - usize::from(shape.rest_element_template.is_some());
+            shape.parameter_templates.len() - usize::from(shape.has_rest_parameter());
         let parameter_index = if index < fixed_parameter_count {
             index
         } else {
@@ -6158,7 +6610,18 @@ fn check_generic_call_arguments(
             parameter_index,
             session,
         )?;
-        let parameter_type = if index >= fixed_parameter_count {
+        let parameter_type = if let Some(callable) = rest_callable.as_mut() {
+            if index < fixed_parameter_count {
+                callable.parameters[index] = parameter_type;
+            } else {
+                callable.rest_parameter = Some(parameter_type);
+            }
+            try_get_type_at_position_with_array_targets(store, shape.array_targets, callable, index)
+                .map_err(|error| generic_rest_projection_error(shape.signature, error))?
+                .ok_or(GenericCallVectorInvariant::CallableSignatureMismatch(
+                    shape.signature,
+                ))?
+        } else if index >= fixed_parameter_count {
             let targets = shape
                 .array_targets
                 .ok_or(GenericCallVectorUnsupported::RestSignature(shape.signature))?;
@@ -6792,9 +7255,12 @@ fn validate_generic_call_vector_resolution(
             }
         }
         GenericCallVectorApplicability::TooFewArguments { expected, actual } => {
+            let expected_minimum = expected == shape.minimum_argument_count
+                || mapped_generic_rest_arity(store, shape, &selected.type_arguments)?
+                    .is_some_and(|(minimum, _, _)| expected == minimum);
             if !resolution.projection.recovery
                 || resolution.checked_instantiation.is_some()
-                || expected != shape.minimum_argument_count
+                || !expected_minimum
                 || actual >= expected
             {
                 return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
@@ -6804,10 +7270,16 @@ fn validate_generic_call_vector_resolution(
             }
         }
         GenericCallVectorApplicability::TooManyArguments { expected, actual } => {
+            let expected_maximum =
+                match mapped_generic_rest_arity(store, shape, &selected.type_arguments)? {
+                    Some((_, maximum, has_rest)) => !has_rest && expected == maximum,
+                    None => {
+                        !shape.has_rest_parameter() && expected == shape.parameter_templates.len()
+                    }
+                };
             if !resolution.projection.recovery
                 || resolution.checked_instantiation.is_some()
-                || shape.rest_element_template.is_some()
-                || expected != shape.parameter_templates.len()
+                || !expected_maximum
                 || actual <= expected
             {
                 return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
@@ -6850,10 +7322,32 @@ fn validate_generic_call_vector_resolution(
                 )
                 .into());
             };
-            let fixed_parameter_count = shape.parameter_templates.len()
-                - usize::from(shape.rest_element_template.is_some());
+            let fixed_parameter_count =
+                shape.parameter_templates.len() - usize::from(shape.has_rest_parameter());
             let expected_parameter = if index < fixed_parameter_count {
                 resolved_generic_call_vector_parameter(store, checked.signature, index)
+            } else if let Some(mut callable) = mapped_generic_rest_callable(
+                store,
+                shape,
+                checked.signature,
+                &checked.type_arguments,
+            )? {
+                if let Some(rest) = resolved_generic_call_vector_parameter(
+                    store,
+                    checked.signature,
+                    fixed_parameter_count,
+                ) {
+                    callable.rest_parameter = Some(rest);
+                    cached_type_at_position_with_array_targets(
+                        store,
+                        shape.array_targets,
+                        &callable,
+                        index,
+                    )
+                    .map_err(|error| generic_rest_projection_error(shape.signature, error))?
+                } else {
+                    None
+                }
             } else {
                 resolved_generic_call_vector_parameter(
                     store,
@@ -7092,7 +7586,7 @@ fn generic_call_type_instantiation_matches(
                 )
                 .is_ok_and(|cached| cached == Some(actual))
         }
-        TypeData::Object(_) if source_return_function_type_owner(store, template).is_some() => {
+        TypeData::Object(_) if source_callable_function_type_owner(store, template).is_some() => {
             !active_templates.contains(&template)
                 && cached_instantiation_with_vector(
                     store,
@@ -7114,6 +7608,12 @@ fn generic_call_type_instantiation_matches(
                 targets,
                 active_templates,
             )
+        }
+        TypeData::Interface(interface)
+            if interface.reference.resolved_type_arguments.as_deref() == Some(&[]) =>
+        {
+            template == actual
+                && validate_nongeneric_interface_argument_origin(store, template).is_ok()
         }
         TypeData::TypeReference(_) | TypeData::Interface(_) => {
             if active_templates.contains(&template) {

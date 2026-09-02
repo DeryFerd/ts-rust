@@ -3473,6 +3473,9 @@ fn plan_source_callable_with_owner_shape(
     let global_augmentation_local = global_namespace_overload
         .then(|| store.source_global_callable_augmentation_local(owner_symbol, declaration))
         .flatten();
+    let generic_global_overload = global_namespace_overload
+        && global_augmentation_local.is_some()
+        && !type_parameters.is_empty();
     if (bound.symbol(declaration) != Some(owner_symbol)
         && !(global_namespace_overload
             && bound
@@ -3569,7 +3572,10 @@ fn plan_source_callable_with_owner_shape(
             SourceCallableUnsupported::ExpandoProperties(declaration),
         ));
     }
-    if !type_parameters.is_empty() && owner.flags() != SymbolFlags::FUNCTION {
+    if !type_parameters.is_empty()
+        && owner.flags() != SymbolFlags::FUNCTION
+        && !generic_global_overload
+    {
         return Err(SourceCallableError::Unsupported(
             SourceCallableUnsupported::GenericSignature(declaration),
         ));
@@ -3947,7 +3953,7 @@ fn plan_source_callable_with_owner_shape(
                 )));
             }
             if matches!(owner_shape, SourceCallableOwnerShape::AmbientOverload(_))
-                && !(default_library_overload && data.type_.is_some())
+                && !((default_library_overload || generic_global_overload) && data.type_.is_some())
             {
                 return Err(SourceCallableError::Unsupported(
                     SourceCallableUnsupported::AmbientRestParameter(parameter),
@@ -4619,13 +4625,14 @@ fn plan_source_callable_with_owner_shape(
         SourceCallableOwnerShape::AmbientOverload(_) => {
             if plan.family != SourceCallableFamily::FunctionDeclaration
                 || plan.body_mode != SourceCallableBodyMode::AmbientDeclaration
-                || !plan.type_parameters.is_empty()
+                || !plan.type_parameters.is_empty() && !generic_global_overload
                 || plan.return_type.is_inferred()
                 || plan.export_local != global_augmentation_local
                 || plan.owner_parent.is_some()
                 || plan.parameters.iter().any(|parameter| {
                     parameter.rest
-                        && !(default_library_overload && parameter.explicit_type_node().is_some())
+                        && !((default_library_overload || generic_global_overload)
+                            && parameter.explicit_type_node().is_some())
                         || parameter.initializer.is_some()
                 })
             {

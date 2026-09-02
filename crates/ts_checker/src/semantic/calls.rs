@@ -1868,6 +1868,26 @@ fn rest_parameter_shape(
                 combined_flags: tuple.combined_flags(),
             });
         }
+        if let TypeData::TypeParameter(parameter) = record.data() {
+            let symbol = super::declared::cached_ordinary_type_parameter_owner(store, type_)
+                .ok_or_else(invalid)?;
+            let declaration = store
+                .symbol(symbol)
+                .and_then(|owner| owner.declarations())
+                .and_then(|declarations| match declarations {
+                    [declaration] => Some(*declaration),
+                    _ => None,
+                })
+                .ok_or_else(invalid)?;
+            let constraint = parameter.constraint.ok_or(
+                DirectCallUnsupported::RestSignature(signature),
+            )?;
+            let annotation = store.source_direct_type_annotation(declaration).ok_or_else(invalid)?;
+            if !store.source_direct_type_annotation_is_exact(annotation, constraint) {
+                return Err(invalid());
+            }
+            return rest_parameter_shape(store, array_targets, signature, constraint, active);
+        }
         if let Some(targets) = array_targets
             && let Some(array) = store
                 .canonical_array_reference_with_targets(targets, type_)
@@ -2239,6 +2259,40 @@ pub(super) fn try_get_type_at_position_with_array_targets(
     parameter_position_union(store, array_targets, callable.signature, &types)
 }
 
+/// Replays the same position projection without creating a union cache entry.
+pub(super) fn cached_type_at_position_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    callable: &ValidatedSingleCallable,
+    position: usize,
+) -> Result<Option<TypeId>, DirectCallError> {
+    validate_signature_parameters(store, callable)?;
+    let rest = callable_rest_shape(store, array_targets, callable)?;
+    let types = position_types(store, array_targets, callable, rest.as_ref(), position)?;
+    match types.as_slice() {
+        [] => Ok(None),
+        [single] => Ok(Some(*single)),
+        _ => store
+            .cached_literal_union_type_with_alias(&types, None, array_targets)
+            .map_err(|error| parameter_position_union_error(callable.signature, error)),
+    }
+}
+
+fn parameter_position_union_error(
+    signature: SignatureId,
+    error: LiteralTypeCacheError,
+) -> DirectCallError {
+    match error {
+        LiteralTypeCacheError::Capacity => {
+            DirectCallInvariant::ParameterProjectionCapacity(signature).into()
+        }
+        LiteralTypeCacheError::UnsupportedUnionConstituent(_) => {
+            DirectCallUnsupported::RestSignature(signature).into()
+        }
+        _ => DirectCallInvariant::InvalidParameterProjection(signature).into(),
+    }
+}
+
 fn parameter_position_union(
     store: &mut CanonicalTypeMapperStore,
     array_targets: Option<CanonicalArrayTargets>,
@@ -2251,15 +2305,9 @@ fn parameter_position_union(
         _ => {
             let result =
                 store.literal_union_type_with_alias_and_array_targets(types, None, array_targets);
-            result.map(Some).map_err(|error| match error {
-                LiteralTypeCacheError::Capacity => {
-                    DirectCallInvariant::ParameterProjectionCapacity(signature).into()
-                }
-                LiteralTypeCacheError::UnsupportedUnionConstituent(_) => {
-                    DirectCallUnsupported::RestSignature(signature).into()
-                }
-                _ => DirectCallInvariant::InvalidParameterProjection(signature).into(),
-            })
+            result
+                .map(Some)
+                .map_err(|error| parameter_position_union_error(signature, error))
         }
     }
 }

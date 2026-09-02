@@ -38,7 +38,7 @@ use super::{
         GenericInterfaceMemberError, cached_function_member_type,
         cached_generic_function_alias_instance, closed_declared_function_type,
         instantiate_function_member_type, instantiate_generic_function_alias,
-        instantiated_function_member_type_matches, source_return_function_type_owner,
+        instantiated_function_member_type_matches, source_callable_function_type_owner,
     },
     intersection_types::{
         DeferredIntersectionTypeProjection, IntersectionTypeCacheKey, IntersectionTypeError,
@@ -1847,7 +1847,7 @@ fn instantiate_type_with_alias_input_and_operand(
                     store.type_payload(type_).map(TypeRecord::data),
                     Some(TypeData::Conditional(_))
                 )
-                && source_return_function_type_owner(store, type_).is_none()
+                && source_callable_function_type_owner(store, type_).is_none()
             {
                 return Ok(());
             }
@@ -3708,11 +3708,11 @@ fn cached_instantiated_type_with_operand_worker(
             if mapping_invariant_object_type(store, template, array_targets)? {
                 return Ok(Some(template));
             }
-            if source_return_function_type_owner(store, template).is_some() {
+            if source_callable_function_type_owner(store, template).is_some() {
                 if alias_override.is_some() {
                     return Err(InstantiationError::UnsupportedType(template));
                 }
-                let Some(mapper) = source_return_function_mapper(store, template, mapping)? else {
+                let Some(mapper) = source_callable_function_mapper(store, template, mapping)? else {
                     return Ok(None);
                 };
                 return cached_function_member_type(store, template, mapper, array_targets)
@@ -4677,13 +4677,13 @@ fn recovered_property_alias_argument(
 }
 
 /// Uses the mapper already owned by the checked call, including vector cache reads.
-fn source_return_function_mapper(
+fn source_callable_function_mapper(
     store: &CanonicalTypeMapperStore,
     source: TypeId,
     mapping: InstantiationMapping<'_>,
 ) -> Result<Option<TypeMapperId>, InstantiationError> {
     let invalid = || InstantiationError::InvalidType(source);
-    let owner = source_return_function_type_owner(store, source).ok_or_else(invalid)?;
+    let owner = source_callable_function_type_owner(store, source).ok_or_else(invalid)?;
     let original = store.signature(owner).ok_or_else(invalid)?;
     let sources = original.type_parameters();
     let targets = match mapping {
@@ -4884,7 +4884,7 @@ fn instantiate_type_worker(
                     InstantiationWork::FunctionAlias(projection)
                 } else if mapping_invariant_object_type(store, type_, array_targets)? {
                     InstantiationWork::Identity
-                } else if source_return_function_type_owner(store, type_).is_some() {
+                } else if source_callable_function_type_owner(store, type_).is_some() {
                     if alias.is_some() {
                         return Err(InstantiationError::UnsupportedType(type_));
                     }
@@ -4993,7 +4993,7 @@ fn instantiate_type_worker(
             apply_mapping_with_source(store, type_, mapping, array_targets, session, source)
         }
         InstantiationWork::FunctionType => {
-            let mapper = source_return_function_mapper(store, type_, mapping)?
+            let mapper = source_callable_function_mapper(store, type_, mapping)?
                 .ok_or(InstantiationError::UnsupportedType(type_))?;
             instantiate_function_member_type(store, type_, mapper, array_targets, session)
                 .map_err(|error| function_member_instantiation_error(type_, error))

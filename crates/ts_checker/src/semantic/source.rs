@@ -62931,14 +62931,22 @@ fn materialize_source_overloads(
                     && let StoredSingleCallableValidation::Valid { callable, .. } =
                         validate_stored_single_callable(store, parameter_type)
                     && callable.return_type.is_none()
-                    && callable.parameters.len() == 1
-                    && callable.min_argument_count == 1
-                    && callable.rest_parameter.is_none()
+                    && (callable.parameters.len() == 1
+                        && callable.min_argument_count == 1
+                        && callable.rest_parameter.is_none()
+                        || query_evidence.as_ref().is_some_and(|evidence| {
+                            evidence.annotation_type(parameter.type_node) == Some(parameter_type)
+                                && store
+                                    .source_global_function_namespace_declarations(overload.owner_symbol)
+                                    .is_some_and(|declarations| {
+                                        declarations.contains(&declaration.declaration)
+                                    })
+                        }))
                     && store
                         .signature(callable.signature)
                         .is_some_and(|signature| {
                             signature.type_parameters().is_empty()
-                                && !signature.has_rest_parameter()
+                                && signature.this_parameter().is_none()
                         })
                 {
                     session.reset_query();

@@ -1271,7 +1271,10 @@ fn plan_variadic_type_parameter_rest_parameter(
         };
         let element = NodeRef::new(constraint.arena, constraint.file, array.element_type);
         let element_record = preflight_node(store, host, element)?;
-        if element_record.kind != SyntaxKind::UnknownKeyword {
+        if !matches!(
+            element_record.kind,
+            SyntaxKind::AnyKeyword | SyntaxKind::UnknownKeyword
+        ) {
             return Ok(None);
         }
         if constraint_record.kind != SyntaxKind::ArrayType
@@ -3669,7 +3672,10 @@ fn valid_stored_variadic_type_parameter_rest(
             };
             function_type_parameter_is_outer(store, function, *declaration)
                 && store.source_node_kind(constraint) == Some(SyntaxKind::ArrayType)
-                && store.source_node_kind(element) == Some(SyntaxKind::UnknownKeyword)
+                && matches!(
+                    store.source_node_kind(element),
+                    Some(SyntaxKind::AnyKeyword | SyntaxKind::UnknownKeyword)
+                )
                 && store.symbol_node_links(annotation)
                     == Some(&SymbolNodeLinks {
                         resolved_symbol: Some(symbol),
@@ -3735,8 +3741,16 @@ fn valid_variadic_type_parameter_constraint(
     ) else {
         return false;
     };
+    let Some(element) = store.source_direct_type_annotation(annotation) else {
+        return false;
+    };
     store.intrinsic_bootstrap().is_some_and(|bootstrap| {
-        array.element_type == bootstrap.unknown_type
+        let expected_element = match store.source_node_kind(element) {
+            Some(SyntaxKind::AnyKeyword) => bootstrap.any_type,
+            Some(SyntaxKind::UnknownKeyword) => bootstrap.unknown_type,
+            _ => return false,
+        };
+        array.element_type == expected_element
             && array.base_type == constraint
             && !array.readonly
             && !array.array_literal

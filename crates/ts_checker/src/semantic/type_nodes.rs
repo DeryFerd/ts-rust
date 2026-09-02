@@ -39494,6 +39494,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 declarations,
                 callable.array_targets,
             )
+        } else if let Some(declarations) = self
+            .store
+            .source_global_function_namespace_declarations(callable.owner_symbol)
+            && declarations.contains(&callable.declaration)
+        {
+            source_callables::plan_source_ambient_overload_declaration(
+                self.store,
+                self.host,
+                callable.declaration,
+                callable.owner_symbol,
+                &declarations,
+                callable.array_targets,
+            )
         } else {
             let group = self
                 .host

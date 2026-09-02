@@ -818,7 +818,7 @@ fn add_nullable_to_candidate(
     .map_err(Into::into)
 }
 
-fn inference_candidate_literal_treatment(
+pub(super) fn inference_candidate_literal_treatment(
     store: &mut CanonicalTypeMapperStore,
     candidate: TypeId,
     treatment: InferenceLiteralTreatment,
