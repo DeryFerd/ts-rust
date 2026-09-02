@@ -4338,7 +4338,6 @@ struct PlannedArrowConstructorReturn {
     expression: NodeRef,
 }
 
-#[allow(clippy::struct_excessive_bools)] // Checker options and source-state flags are independent.
 /// A value expression can use this scope only while its real callable body is planned.
 #[derive(Clone, Copy, Debug)]
 struct PlannedCallableBodyScope {
@@ -4348,6 +4347,7 @@ struct PlannedCallableBodyScope {
     is_async: bool,
 }
 
+#[allow(clippy::struct_excessive_bools)] // Checker options and source-state flags are independent.
 struct SourcePlanner<'arena, 'semantic, 'sources> {
     arena: &'arena NodeArena,
     bound: &'arena BoundFile,
@@ -41666,17 +41666,24 @@ fn check_expression_type_with_capture_context(
                 && context.flow.has_property_conditions()
                 && !context.flow.is_predicate_condition_call(call.node)
             {
-                context
-                    .flow
-                    .complete_non_effecting_call(
-                        store,
-                        host,
-                        global_types,
-                        call,
-                        callee.result,
-                        &checked,
-                    )
-                    .map_err(|error| class_body_flow_error(call.node, error))?;
+                let call_owner = host
+                    .bound_file(call.node)
+                    .and_then(|bound| bound.flow_container(call.node))
+                    .ok_or(SourceCheckError::Class(call.node))?;
+                // Deferred arrows use the class token, but keep their own call effects.
+                if call_owner == context.flow.body_declaration() {
+                    context
+                        .flow
+                        .complete_non_effecting_call(
+                            store,
+                            host,
+                            global_types,
+                            call,
+                            callee.result,
+                            &checked,
+                        )
+                        .map_err(|error| class_body_flow_error(call.node, error))?;
+                }
             }
             Ok(CheckedExpressionTypes::leaf(
                 checked.return_type,
@@ -44429,11 +44436,11 @@ fn check_planned_arrow_argument(
         })
         && store
             .source_object_literal_method_owner_is_exact(expression, arrow.callable.owner_symbol);
-    let returned_arrow = super::source_callables::source_returned_arrow_context_annotation(
+    let returned_annotation = super::source_callables::source_returned_arrow_context_annotation(
         store, host, expression,
     )
-    .map_err(SourcePlanner::callable_plan_error)?
-    .is_some();
+    .map_err(SourcePlanner::callable_plan_error)?;
+    let returned_arrow = returned_annotation.is_some();
     let member_assignment_arrow =
         super::source_callables::source_member_assignment_arrow_target(store, host, expression)
             .map_err(SourcePlanner::callable_plan_error)?
@@ -44986,6 +44993,16 @@ fn check_planned_arrow_argument(
             &mut linear_value_order,
             &mut captured_entry_types,
             outer_capture,
+            class_flow.as_deref_mut().filter(|context| {
+                host.node(expression)
+                    .is_some_and(|record| record.kind == SyntaxKind::ArrowFunction)
+                    && returned_annotation.is_some_and(|annotation| {
+                        host.node(annotation)
+                            .and_then(|record| record.parent)
+                            .map(|owner| NodeRef::new(annotation.arena, annotation.file, owner))
+                            == Some(context.flow.body_declaration())
+                    })
+            }),
         )?
     } else {
         flow_types
@@ -45621,6 +45638,7 @@ fn check_contextual_object_literal_method(
             &mut local_order,
             &mut captured_entries,
             outer_capture,
+            None,
         )?;
     }
     let return_type = if let PlannedArrowBody::StatementList(body) = &method.body {
@@ -55806,6 +55824,7 @@ fn check_inferred_linear_deferred_object_return(
         value_order,
         &mut entry_types,
         outer_capture,
+        None,
     )?;
     let capture = SourceArrowCaptureContext {
         declared_types: &entry_types,
@@ -55875,6 +55894,7 @@ fn check_planned_linear_function_statements(
         value_order,
         &mut captured_entry_types,
         None,
+        None,
     )
 }
 
@@ -55899,6 +55919,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
     value_order: &mut Vec<SemanticSymbolId>,
     captured_entry_types: &mut HashMap<SemanticSymbolId, TypeId>,
     outer_capture: Option<SourceArrowCaptureContext<'_>>,
+    mut class_flow: Option<&mut ClassBodyExecutionContext<'_, '_, '_>>,
 ) -> Result<HashMap<SemanticSymbolId, TypeId>, SourceCheckError> {
     add_arrow_object_parameter_entries(store, host, callable, captured_entry_types)?;
     let mut base_flow_types = base_flow_types;
@@ -56248,6 +56269,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
                                 value_order,
                                 &mut nested_capture_entries,
                                 arrow_capture,
+                                None,
                             )?;
                         (nested.return_expression.as_ref(), flow_types)
                     }
@@ -56433,7 +56455,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
                     expression,
                     None,
                     deferred,
-                    None,
+                    class_flow.as_deref_mut(),
                     arrow_capture,
                 )?;
                 complete_nullish_assignment_effects(
@@ -56506,7 +56528,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
             initializer,
             None,
             deferred,
-            None,
+            class_flow.as_deref_mut(),
             arrow_capture,
         )?;
         if staged_value_types.get(&local.symbol) != Some(&checked.result) {
@@ -67613,6 +67635,7 @@ fn materialize_contextual_source_arrow(
                 &mut staged,
                 &mut order,
                 &mut entries,
+                None,
                 None,
             )?;
             if !staged.is_empty() || !order.is_empty() {
@@ -81256,6 +81279,7 @@ fn check_source_plan(
                             &mut value_order,
                             &mut captured_entry_types,
                             Some(source_capture),
+                            None,
                         )?
                     } else {
                         body_flow_types

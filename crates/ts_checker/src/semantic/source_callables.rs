@@ -5229,6 +5229,61 @@ fn stored_callable_context_annotation(
     Some(*annotation)
 }
 
+/// Keeps a class method's return context tied to its real member and class owner.
+fn stored_class_method_context_owner_is_exact(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> bool {
+    let Some(SourceNodeParent::Parent(class)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let Some(method_symbol) = store
+        .source_declaration_symbol(declaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(class_symbol) = store
+        .source_declaration_symbol(class)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(method) = store.symbol(method_symbol) else {
+        return false;
+    };
+    let Some(owner) = store.symbol(class_symbol) else {
+        return false;
+    };
+    store.source_node_kind(declaration) == Some(SyntaxKind::MethodDeclaration)
+        && store.source_node_kind(class) == Some(SyntaxKind::ClassDeclaration)
+        && store.get_merged_symbol(method_symbol) == Some(method_symbol)
+        && store.get_merged_symbol(class_symbol) == Some(class_symbol)
+        && method.flags() == SymbolFlags::METHOD
+        && method.check_flags() == CheckFlags::NONE
+        && method
+            .declarations()
+            .is_some_and(|declarations| declarations.contains(&declaration))
+        && method.members().is_none()
+        && method.exports().is_none()
+        && method.export_symbol().is_none()
+        && store.get_parent_of_symbol(method_symbol) == Some(class_symbol)
+        && owner.flags().contains(SymbolFlags::CLASS)
+        && owner.value_declaration() == Some(class)
+        && store
+            .source_direct_children(class)
+            .is_some_and(|members| members.contains(&declaration))
+        && [owner.members(), owner.exports()]
+            .into_iter()
+            .flatten()
+            .any(|table| {
+                store
+                    .symbol_table(table)
+                    .and_then(|table| table.get(method.name()))
+                    == Some(method_symbol)
+            })
+}
+
 /// Finds the declared return annotation without crossing a callable boundary.
 fn stored_returned_arrow_annotation(
     store: &CanonicalTypeMapperStore,
@@ -5260,8 +5315,12 @@ fn stored_returned_arrow_annotation(
                 SyntaxKind::ArrowFunction
                     | SyntaxKind::FunctionExpression
                     | SyntaxKind::FunctionDeclaration
+                    | SyntaxKind::MethodDeclaration
             )
         )
+        || store.source_node_kind(owner) == Some(SyntaxKind::MethodDeclaration)
+            && (store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
+                || !stored_class_method_context_owner_is_exact(store, owner))
         || !store.source_direct_children(body)?.contains(&statement)
     {
         return None;
@@ -5305,6 +5364,13 @@ pub(super) fn source_returned_arrow_context_annotation(
         NodeData::ArrowFunction(function) => (Some(function.body), function.type_),
         NodeData::FunctionExpression(function) => (Some(function.body), function.type_),
         NodeData::FunctionDeclaration(function) => (function.body, function.type_),
+        NodeData::MethodDeclaration(method)
+            if owner_record.kind == SyntaxKind::MethodDeclaration
+                && method.asterisk_token.is_none()
+                && stored_class_method_context_owner_is_exact(store, owner) =>
+        {
+            (method.body, method.type_)
+        }
         _ => return Ok(None),
     };
     let Some(body) = body.map(|node| NodeRef::new(owner.arena, owner.file, node)) else {
@@ -5335,6 +5401,8 @@ pub(super) fn source_returned_arrow_context_annotation(
         && returned.flow_node.is_none()
         && returned.facts == 0
         && bound.symbol(owner).is_some()
+        && (owner_record.kind != SyntaxKind::MethodDeclaration
+            || bound.symbol(owner) == store.source_declaration_symbol(owner))
         && bound.symbol(declaration).is_some()
         && bound.symbol(declaration) == store.source_declaration_symbol(declaration)
         && bound.container(body) == Some(owner)

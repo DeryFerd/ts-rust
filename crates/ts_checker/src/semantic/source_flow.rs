@@ -4672,6 +4672,10 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         &self.access
     }
 
+    pub(super) const fn body_declaration(&self) -> NodeRef {
+        self.body.declaration
+    }
+
     pub(super) fn has_property_conditions(&self) -> bool {
         self.flow
             .plan
