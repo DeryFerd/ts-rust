@@ -41217,6 +41217,28 @@ fn check_expression_type_with_capture_context(
                     diagnostics,
                     contextual_type,
                 )?;
+                // Contextual preflight reads members without a source query session.
+                if super::object_aliases::source_property_object_projection(store, contextual_type)?
+                    .is_some()
+                {
+                    let members = super::instantiated_members::resolve_property_object_alias_members_with_array_targets(
+                        store,
+                        contextual_type,
+                        Some(CanonicalArrayTargets::from_global_types(global_types)),
+                    )?;
+                    for property in members.properties {
+                        super::instantiated_members::demand_property_object_alias_property(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            diagnostics,
+                            contextual_type,
+                            property,
+                        )?;
+                    }
+                }
                 if store
                     .type_payload(contextual_type)
                     .is_some_and(|record| matches!(record.data(), TypeData::Intersection(_)))

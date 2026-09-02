@@ -1912,52 +1912,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     /// unsupported source syntax, unavailable declared type or relation, type
     /// display boundary, or malformed literal cache.
     pub fn check_source_file(&mut self, file: FileId) -> Result<(), SourceCheckError> {
-        let result = self.check_source_file_with_classic_jsx_factories(file, None);
-        if let Err(SourceCheckError::RelationUnavailable(
-            super::RelationUnavailable::UnresolvedStructuredMembers(type_),
-        )) = &result
-        {
-            let state = self.store.type_payload(*type_).map(|record| {
-                let declaration = record
-                    .symbol()
-                    .and_then(|symbol| self.store.symbol(symbol))
-                    .and_then(|symbol| symbol.declarations())
-                    .and_then(|declarations| declarations.first().copied());
-                let signatures = record
-                    .data()
-                    .structured()
-                    .and_then(|structured| structured.signatures.as_ref())
-                    .map(|signatures| {
-                        signatures
-                            .iter()
-                            .take(4)
-                            .map(|id| {
-                                (
-                                    *id,
-                                    self.store.signature(*id).map(|signature| (
-                                        signature.declaration(),
-                                        signature.parameters().len(),
-                                        signature.resolved_return_type(),
-                                        signature.target(),
-                                        signature.mapper(),
-                                    )),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    });
-                (
-                    std::mem::discriminant(record.data()),
-                    record.flags(),
-                    record.object_flags(),
-                    record.symbol(),
-                    declaration,
-                    declaration.and_then(|node| self.store.source_node_kind(node)),
-                    signatures,
-                )
-            });
-            eprintln!("source.check-source-file file={file:?} error={result:?} state=(kind,flags,object_flags,owner,declaration,declaration_kind,signatures)={state:?}");
-        }
-        result
+        self.check_source_file_with_classic_jsx_factories(file, None)
     }
 
     fn check_source_file_with_classic_jsx_factories(
