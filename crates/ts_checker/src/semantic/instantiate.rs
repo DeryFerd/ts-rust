@@ -2329,6 +2329,10 @@ pub(super) fn validate_instantiated_function_callable(
     {
         return None;
     }
+    // Generic aliases keep their declaration-owned copy and mapper proof.
+    if generic_function_alias_projection(store, type_).is_ok_and(|alias| alias.is_some()) {
+        return None;
+    }
     let family = CallableFamily::FunctionType;
     let result = (|| {
         let target = object.target?;
@@ -2390,6 +2394,9 @@ pub(super) fn instantiated_function_signature_projection(
         }
     }
     let owner = owner?;
+    if generic_function_alias_projection(store, owner).is_ok_and(|alias| alias.is_some()) {
+        return None;
+    }
     Some((
         owner,
         (|| {
