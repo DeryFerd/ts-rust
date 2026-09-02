@@ -5230,35 +5230,26 @@ fn stored_callable_context_annotation(
 }
 
 /// Keeps a class method's return context tied to its real member and class owner.
-fn stored_class_method_context_owner_is_exact(
+fn stored_class_method_context_owner(
     store: &CanonicalTypeMapperStore,
     declaration: NodeRef,
-) -> bool {
-    let Some(SourceNodeParent::Parent(class)) = store.source_node_parent(declaration) else {
-        return false;
+) -> Option<(NodeRef, SemanticSymbolId)> {
+    let SourceNodeParent::Parent(class) = store.source_node_parent(declaration)? else {
+        return None;
     };
-    let Some(method_symbol) = store
+    let method_symbol = store
         .source_declaration_symbol(declaration)
-        .and_then(|symbol| store.get_merged_symbol(symbol))
-    else {
-        return false;
-    };
-    let Some(class_symbol) = store
-        .source_declaration_symbol(class)
-        .and_then(|symbol| store.get_merged_symbol(symbol))
-    else {
-        return false;
-    };
-    let Some(method) = store.symbol(method_symbol) else {
-        return false;
-    };
-    let Some(owner) = store.symbol(class_symbol) else {
-        return false;
-    };
-    store.source_node_kind(declaration) == Some(SyntaxKind::MethodDeclaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))?;
+    // Exported classes keep distinct local and exported declaration owners.
+    let class_symbol = store.get_parent_of_symbol(method_symbol)?;
+    let method = store.symbol(method_symbol)?;
+    let owner = store.symbol(class_symbol)?;
+    (store.source_node_kind(declaration) == Some(SyntaxKind::MethodDeclaration)
         && store.source_node_kind(class) == Some(SyntaxKind::ClassDeclaration)
         && store.get_merged_symbol(method_symbol) == Some(method_symbol)
         && store.get_merged_symbol(class_symbol) == Some(class_symbol)
+        && store.source_merged_symbol_declarations_match(class_symbol)
+        && store.source_declaration_belongs_to_symbol(class, class_symbol)
         && method.flags() == SymbolFlags::METHOD
         && method.check_flags() == CheckFlags::NONE
         && method
@@ -5281,7 +5272,8 @@ fn stored_class_method_context_owner_is_exact(
                     .symbol_table(table)
                     .and_then(|table| table.get(method.name()))
                     == Some(method_symbol)
-            })
+            }))
+    .then_some((class, class_symbol))
 }
 
 /// Finds the declared return annotation without crossing a callable boundary.
@@ -5320,7 +5312,7 @@ fn stored_returned_arrow_annotation(
         )
         || store.source_node_kind(owner) == Some(SyntaxKind::MethodDeclaration)
             && (store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
-                || !stored_class_method_context_owner_is_exact(store, owner))
+                || stored_class_method_context_owner(store, owner).is_none())
         || !store.source_direct_children(body)?.contains(&statement)
     {
         return None;
@@ -5366,9 +5358,14 @@ pub(super) fn source_returned_arrow_context_annotation(
         NodeData::FunctionDeclaration(function) => (function.body, function.type_),
         NodeData::MethodDeclaration(method)
             if owner_record.kind == SyntaxKind::MethodDeclaration
-                && method.asterisk_token.is_none()
-                && stored_class_method_context_owner_is_exact(store, owner) =>
+                && method.asterisk_token.is_none() =>
         {
+            let Some((class, symbol)) = stored_class_method_context_owner(store, owner) else {
+                return Ok(None);
+            };
+            if !host.symbol_matches(store, class, symbol) {
+                return Ok(None);
+            }
             (method.body, method.type_)
         }
         _ => return Ok(None),
