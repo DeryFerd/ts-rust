@@ -2879,6 +2879,8 @@ pub(super) fn plan_source_class_members_with_imports(
                                 | SyntaxKind::NewExpression
                                 | SyntaxKind::Identifier
                                 | SyntaxKind::NullKeyword
+                                | SyntaxKind::TrueKeyword
+                                | SyntaxKind::FalseKeyword
                                 | SyntaxKind::ObjectLiteralExpression
                                 | SyntaxKind::ArrayLiteralExpression
                         )
@@ -15766,6 +15768,21 @@ fn plan_property_with_body_mode(
                         && keyword.flow_node.is_none() =>
                 {
                     Some("null")
+                }
+                NodeData::KeywordExpression(keyword)
+                    if source_body
+                        && merged_auto_accessor.is_none()
+                        && matches!(
+                            initializer_record.kind,
+                            SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword
+                        )
+                        && keyword.flow_node.is_none() =>
+                {
+                    Some(if initializer_record.kind == SyntaxKind::TrueKeyword {
+                        "true"
+                    } else {
+                        "false"
+                    })
                 }
                 NodeData::AsExpression(_) if private || enum_const_assertion => None,
                 NodeData::PropertyAccessExpression(_)
