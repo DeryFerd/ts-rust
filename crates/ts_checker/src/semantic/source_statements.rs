@@ -5660,7 +5660,8 @@ impl SyntaxPlanner<'_> {
         let condition = match self.plan_condition(control.condition, self.callable.declaration) {
             Ok(condition) => Some(condition),
             Err(error @ SourceFunctionStatementsError::Unsupported(_))
-                if self.condition_requires_narrowing(control.condition)? =>
+                if self.condition_requires_narrowing(control.condition)?
+                    && !self.is_general_instanceof_condition(control.condition)? =>
             {
                 return Err(error);
             }
@@ -5682,6 +5683,46 @@ impl SyntaxPlanner<'_> {
             then_statements,
             else_statements,
         })
+    }
+
+    fn is_general_instanceof_condition(
+        &self,
+        condition: NodeRef,
+    ) -> Result<bool, SourceFunctionStatementsError> {
+        let mut current = condition;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current.node) {
+                return Err(SourceFunctionStatementsInvariant::CyclicCondition(condition).into());
+            }
+            let record = self.node(current)?;
+            match &record.data {
+                NodeData::ParenthesizedExpression(parenthesized)
+                    if record.kind == SyntaxKind::ParenthesizedExpression =>
+                {
+                    let inner = self.reference(parenthesized.expression);
+                    self.validate_parent(
+                        inner,
+                        Some(current.node),
+                        SourceFunctionStatementsRole::Condition,
+                    )?;
+                    self.validate_range(inner, current)?;
+                    current = inner;
+                }
+                NodeData::BinaryExpression(binary)
+                    if record.kind == SyntaxKind::BinaryExpression =>
+                {
+                    let operator = self.reference(binary.operator_token);
+                    self.validate_parent(
+                        operator,
+                        Some(current.node),
+                        SourceFunctionStatementsRole::Condition,
+                    )?;
+                    return Ok(self.node(operator)?.kind == SyntaxKind::InstanceOfKeyword);
+                }
+                _ => return Ok(false),
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)] // Keep the header, body scopes and first assignment together.

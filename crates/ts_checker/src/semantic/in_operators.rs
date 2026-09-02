@@ -16,7 +16,10 @@ use super::{
     CanonicalCheckerDiagnostic, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost,
     TypeId,
     bootstrap::UnionReduction,
-    classes::{ClassMembers, completed_source_class_members},
+    classes::{
+        ClassError, ClassMembers, completed_nongeneric_class_member_query,
+        completed_source_class_members, plan_nongeneric_class_member_query,
+    },
     formatter::{
         CanonicalTypeFormatFlags,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
@@ -45,9 +48,23 @@ pub(super) fn instanceof_class_members(
     let Some(symbol) = record.symbol() else {
         return Ok(None);
     };
-    let Some(members) =
+    let members = if store.source_class_provenance_for_symbol(symbol).is_some() {
         completed_source_class_members(store, host, symbol).map_err(|_| invalid())?
-    else {
+    } else {
+        if !store
+            .symbol(symbol)
+            .is_some_and(|record| record.flags().contains(SymbolFlags::CLASS))
+        {
+            return Ok(None);
+        }
+        let plan = match plan_nongeneric_class_member_query(store, host, symbol) {
+            Ok(plan) => plan,
+            Err(ClassError::Unsupported(_)) => return Ok(None),
+            Err(_) => return Err(invalid()),
+        };
+        completed_nongeneric_class_member_query(store, host, &plan).map_err(|_| invalid())?
+    };
+    let Some(members) = members else {
         return Ok(None);
     };
     let shells = members.shells();
@@ -60,7 +77,7 @@ pub(super) fn instanceof_class_members(
         // Applied generic class references need their own instance projection.
         return Ok(None);
     }
-    if constructor && members.static_properties() != [members.prototype()] {
+    if constructor && !members.static_properties().is_empty() {
         // A static member can supply Symbol.hasInstance. That needs call resolution.
         return Ok(None);
     }

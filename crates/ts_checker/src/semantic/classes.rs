@@ -32995,6 +32995,15 @@ pub(super) fn preflight_nongeneric_class_member_query(
     host: &DeclaredTypeHost<'_>,
     plan: &ClassMemberQueryPlan,
 ) -> Result<(), ClassError> {
+    completed_nongeneric_class_member_query(store, host, plan).map(drop)
+}
+
+/// Returns the checked member state without publishing a cold class query.
+pub(super) fn completed_nongeneric_class_member_query(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &ClassMemberQueryPlan,
+) -> Result<Option<ClassMembers>, ClassError> {
     let current = plan_nongeneric_class_member_query_with_type_context(
         store,
         host,
@@ -33006,12 +33015,12 @@ pub(super) fn preflight_nongeneric_class_member_query(
     }
     match plan {
         ClassMemberQueryPlan::Direct(plan) => {
-            validated_nongeneric_class_member_state(store, host, plan).map(drop)
+            validated_nongeneric_class_member_state(store, host, plan)
         }
         ClassMemberQueryPlan::Derived { class, base } => {
             let surfaces = prepare_derived_member_surfaces(store, class, base)?;
             let base_state = validated_nongeneric_class_member_state(store, host, base)?;
-            derived_class_member_state(store, class, base_state.as_ref(), &surfaces).map(drop)
+            derived_class_member_state(store, class, base_state.as_ref(), &surfaces)
         }
     }
 }
