@@ -154,13 +154,10 @@ fn value_type(checker: &CanonicalCheckerContext<'_>, owner: SemanticSymbolId) ->
 }
 
 fn call_signature(checker: &CanonicalCheckerContext<'_>, type_: TypeId) -> SignatureId {
-    let structured = checker
-        .store()
-        .type_payload(type_)
-        .unwrap()
-        .data()
-        .structured()
-        .unwrap();
+    let TypeData::Object(object) = checker.store().type_payload(type_).unwrap().data() else {
+        panic!("expected the callback's function object")
+    };
+    let structured = &object.structured;
     assert_eq!(structured.call_signature_count, 1);
     let [signature] = structured.signatures.as_deref().unwrap() else {
         panic!("the callback has one call signature")
