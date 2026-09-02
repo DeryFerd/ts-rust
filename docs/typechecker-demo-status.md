@@ -16,12 +16,14 @@ project acceptance. The last valid census also completed zero roots.
 
 | Measurement | Latest result |
 | --- | --- |
-| [Pathe census 8](../target/wave202-pathe-demo-census-8-result.md), `41599a0f` | Raw records show all nine roots attempted: zero complete, eight unsupported, one internal checker error. The ordinary attempt also fails. The measured oracle stage took 22.259 seconds. Evidence validation failed on trace JSON. The review of that failed result is closed. The separate resource check is pending. |
-| [Combined tests 8](../target/wave202-pathe-demo-tests-8-result.md), `50aa180a` | All four compile commands and all four test-list commands pass. All 474 tests ran: 393 pass, 81 fail, none unrun. The independent result review is closed. The separate resource check is pending. |
+| [Pathe census 8](../target/wave202-pathe-demo-census-8-result.md), `41599a0f` | Raw records show all nine roots attempted: zero complete, eight unsupported, one internal checker error. The ordinary attempt also fails. The measured oracle stage took 22.259 seconds. Evidence validation failed on trace JSON. The review of that failed result and the separate resource check are closed. |
+| [Combined tests 8](../target/wave202-pathe-demo-tests-8-result.md), `50aa180a` | All four compile commands and all four test-list commands pass. All 474 tests ran: 393 pass, 81 fail, none unrun. The independent result review and separate resource check are closed. |
 | [Ordinary compiler build 8](../target/wave202-pathe-demo-bin-8-main-result.md), `41599a0f` | Build passed in 77.182 seconds. The result review and separate resource check are closed. A build is not a TypeScript project pass. |
 | [Pathe census 6](../target/wave202-pathe-demo-census-6-result.md), `5f7ad5e3` | Last valid census. All nine original roots attempted: zero complete, eight unsupported, one internal checker error. All 277 loaded files parse. The ordinary project check also fails. |
 | [Focused condition tests](../target/wave202-pathe-logical-condition-registry-focus-5-result.md), `65612688` | Compile and listing passed. All eight tests ran. Seven pass, including the new condition test. The original Pathe normalizer still fails with `FunctionBody`. |
-| [Loop tests](../target/wave202-pathe-callable-counted-for-focus-1-result.md), `972e05d9` | Compile and listing passed. All 18 tests ran: six pass, twelve fail. Both counted-loop passes are rejection controls. All four positive counted-loop tests fail. The result review and separate resource check are closed. This code remains separate from the Pathe batch. |
+| [Loop observation tests](../target/wave202-pathe-loop-failure-observation-focus-2-result.md), `b95d23fb` | Compile and listing passed. All 18 tests ran: six pass, twelve fail. Every outcome matches the previous run. The independent result review and separate resource check are closed. The new traces locate six tuple-binding failures and three call-planning failures. |
+| [Object-method tests](../target/wave202-pathe-object-method-start-focus-1-result.md), `6d6125fb` | Compile and listing passed. All six tests ran and failed. Three now report unsupported interface declarations. Three report unsupported construct signatures during provider preparation. The result review and separate resource check are closed. |
+| [Generic-default tests](../target/wave202-pathe-generic-formal-readiness-focus-1-main-result.md), `36e21c4d` | Compilation failed with one Rust borrow error. All 11 tests are unrun. The result review is closed. The correction is committed separately as `130590cb`; it has no test result yet. |
 
 The earlier condition-focused result has a closed [independent review](../target/wave202-pathe-logical-condition-registry-focus-5-result-review.md).
 Its original seven tests still have six passes and one failure. The new eighth
@@ -62,21 +64,24 @@ Private test expectations stay unchanged.
 
 | Failure | Next action |
 | --- | --- |
-| Proxy handler in `src/index.ts` | Fix the proved object-method start mismatch. The binder retains the method node, but the checker expects no payload. Change only the authenticated family predicate and retain the exact start checks. Six existing public controls provide the first test target. The saved outer error does not prove this is the first inner failure. |
+| Proxy handler in `src/index.ts` | The object-method start repair is committed as `6d6125fb`. Its six public tests still fail, now with interface or construct-signature errors. Diagnose those measured errors next. The separate conditional-return tests also need authenticated method-return support. |
 | Import aliases in three test files | The new traces record missing alias links for `it` and `describe`. Check import preparation before source planning. Use the canonical resolver on demand, preserve unused-import and cycle behavior, and do not substitute fallback types. |
 | `new Set(...)` in `src/utils.ts` | The new trace stops at an unsupported computed member during named constructor planning, before generic argument inference. Authenticate that member and use the existing computed-key machinery. Do not skip the member or replace Set's declarations. |
-| Variable reference in `src/_path.ts` | The measured identifier is `isAbsolute` inside `normalize`'s function body. Its constant declaration is later in the file. Compare deferred-function preparation with Go while retaining real immediate use-before-declaration errors. |
-| Counted loop in `src/_glob.ts` | Diagnose the four failing positive counted-loop tests and eight failing retained loop controls. The outer errors do not identify the internal operation. Do not merge this source yet. |
-| `throw new Error(...)` in `test/glob.spec.ts` | Keep the committed constructor-position repair and its four tests. Tests8 still has five `Unsupported.New` cases. Compare their actual guards rather than assuming Error and Set fail for the same reason. |
+| Variable reference in `src/_path.ts` | The measured identifier is `isAbsolute` inside `normalize`'s function body. Its constant declaration is later in the file. The deferred-const repair is committed as `e72fc057`, with eight new tests. It has no runtime result yet. Immediate use-before-declaration checks remain intact. |
+| Counted loop in `src/_glob.ts` | The 18-test run still has six passes. Tuple selection is repaired in `a9bdf8b7`. Non-null call arguments and binary array indices are repaired in `e5c28dd2`. Both source reviews are closed, but neither repair has run. Combine them and retain all 18 old tests plus two new tuple tests. Three other failures remain separate. |
+| `throw new Error(...)` in `test/glob.spec.ts` | The named-constructor repair is committed and reviewed as `bd4d8e5e`. It uses the existing argument checker and adds two public tests. No runtime result is available. The numeric-argument diagnostic stays required. Set has a different cause. |
+| Generic call-signature defaults | The formal-readiness repair `36e21c4d` failed compilation. Its one-byte borrow correction is committed as `130590cb`. A fresh 11-test check is in preparation. No pass increase is established. |
+| Computed object properties | The no-context lookup repair is committed and reviewed as `2031276b`. It retains source-key validation and value checking. Its five-test packet is ready. Separate call and binary-expression errors remain outside this repair. |
 | Original normalizer | The original function still fails with `FunctionBody` in Tests8. Retain its original source and the passing condition control. A focused fixture is not a complete Pathe root. |
-| Census evidence reader | Classify the three bounded alias trace records separately from Cargo events. Preserve the failed original result and raw log. Full validation still needs authenticated source and graph identities. |
+| Census evidence reader | A new classifier separates the three bounded alias traces from Cargo events. Its source review is closed. Test verification and integration remain separate. Preserve the failed original result and raw log. A new census still needs authenticated source and graph identities. |
 
 The [474-test selection](../target/wave202-pathe-demo-tests-8-selection.canonical.tsv)
 retains all 465 old tests and adds nine. Tests8 ran every selected test. Keep this
-selection and its assertions when testing the next combined repair. Use focused
-public tests first for individual repairs. The counted-loop check uses a separate
-source commit and output directory. Its new failure-only trace commit is
-`b95d23fb`. Its immutable source review is closed. The next 18-test run is pending.
+selection and its assertions when testing the next combined repair. Include every
+new test from each repair in that same run. The counted-loop check uses a separate
+source commit and output directory. Its failure-only trace commit is
+`b95d23fb`. The 18-test run and independent result review are now complete.
+The traces identify repair paths, but did not change any test outcome.
 
 Use at most three Cargo lanes. Source workers use separate worktrees with one
 writer per file. Diagnosis, source review and result review can proceed in
@@ -85,8 +90,16 @@ checks close. Keep every test failure visible. These sources contain temporary
 traces. Final acceptance requires the unchanged corpus and an ordinary project
 check with those traces removed.
 
+The next [diagnostic integration](../target/wave202-pathe-next-demo-integration-plan.md)
+combines the reviewed method, generic-default, computed-property, Error-constructor
+and deferred-const repairs. Its planned selection is the existing 474 tests plus
+ten new tests. Confirm the actual count before execution. One combined run will
+test their interaction. Separate focused runs are not required for every input.
+No combined result is available yet.
+
 The [later counted-loop join plan](../target/wave202-pathe-counted-integration-plan.md)
-retains all 480 tests in 41 groups. The failed loop check blocks that join.
+retains all 480 tests in 41 groups. That old join remains blocked. Measure the
+repaired loops separately before deciding on a new diagnostic join.
 Counted loops inside object methods remain an untested combination.
 Measure progress by completed checks and retained diagnostics, not worker count
 or the number of commits.
