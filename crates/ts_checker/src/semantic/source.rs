@@ -49165,6 +49165,50 @@ pub(super) fn retry_source_generic_member_failure(
     let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
     match error {
         RelationUnavailable::UnresolvedStructuredMembers(type_) => {
+            let record = store.type_payload(type_);
+            let target = record.and_then(|record| match record.data() {
+                TypeData::TypeReference(reference) => reference.object.target,
+                _ => None,
+            });
+            let target_record = target.and_then(|target| store.type_payload(target));
+            let declaration = record
+                .and_then(|record| record.symbol())
+                .or_else(|| target_record.and_then(|record| record.symbol()))
+                .and_then(|owner| store.symbol(owner))
+                .and_then(|owner| owner.declarations())
+                .and_then(|declarations| declarations.first())
+                .copied();
+            let declaration_range = declaration
+                .and_then(|declaration| host.node(declaration))
+                .map(|node| (node.kind, node.range));
+            let argument = record.and_then(|record| match record.data() {
+                TypeData::TypeReference(reference) => reference
+                    .resolved_type_arguments
+                    .as_deref()
+                    .and_then(|arguments| arguments.first())
+                    .copied(),
+                _ => None,
+            });
+            eprintln!(
+                "copied-call member retry: strict={} repeated={} type={type_:?} state={:?} target={target:?} target_state={:?} argument={:?} declaration={declaration:?} range={declaration_range:?}",
+                options.intrinsic.strict_null_checks,
+                resolved_members.contains(&type_),
+                record.map(|record| (
+                    record.data().kind(),
+                    record.flags(),
+                    record.object_flags(),
+                )),
+                target_record.map(|record| (
+                    record.data().kind(),
+                    record.flags(),
+                    record.object_flags(),
+                )),
+                argument.and_then(|argument| {
+                    store
+                        .type_payload(argument)
+                        .map(|record| (argument, record.data().kind(), record.flags()))
+                }),
+            );
             if !resolved_members.insert(type_) {
                 return Err(error.into());
             }
@@ -49198,14 +49242,15 @@ pub(super) fn retry_source_generic_member_failure(
                 super::instantiated_members::resolve_property_object_alias_members_with_array_targets(
                     store, type_, array_targets,
                 )?;
-            } else if super::instantiated_members::resolve_members_with_array_targets_and_session(
-                store,
-                type_,
-                array_targets,
-                session,
-            )
-            .is_err()
+            } else if let Err(member_error) =
+                super::instantiated_members::resolve_members_with_array_targets_and_session(
+                    store,
+                    type_,
+                    array_targets,
+                    session,
+                )
             {
+                eprintln!("copied-call member failure: type={type_:?} error={member_error:?}");
                 return Err(error.into());
             }
         }
