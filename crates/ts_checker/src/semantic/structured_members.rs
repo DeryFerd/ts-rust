@@ -487,13 +487,27 @@ pub(super) fn distinct_later_interface_base_is_supported(
     let TypeData::Interface(interface) = record.data() else {
         return false;
     };
+    let reference_identity = validate_nongeneric_interface_argument_origin(store, type_).is_ok();
+    let identity_flags = ObjectFlags::INTERFACE
+        | if reference_identity {
+            ObjectFlags::REFERENCE
+        } else {
+            ObjectFlags::NONE
+        };
+    let object_flags = if reference_identity {
+        record.object_flags()
+            & !(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES)
+    } else {
+        record.object_flags()
+    };
     let structured = &interface.reference.object.structured;
     store.get_merged_symbol(symbol) == Some(symbol)
         && store
             .declared_type_links(symbol)
             .is_some_and(|links| links.declared_type == Some(type_))
         && record.flags() == TypeFlags::OBJECT
-        && record.object_flags() == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
+        && object_flags == identity_flags | ObjectFlags::MEMBERS_RESOLVED
         && record.symbol() == Some(symbol)
         && record.alias().is_none()
         && store.symbol(symbol).is_some_and(|owner| {
@@ -501,14 +515,7 @@ pub(super) fn distinct_later_interface_base_is_supported(
                 || authenticated_nongeneric_global_interface_owner(store, symbol))
                 && owner.members() == interface.declared_members
         })
-        && interface.all_type_parameters.is_none()
-        && interface.outer_type_parameter_count == 0
-        && interface.this_type.is_none()
-        && interface.reference.object.target.is_none()
-        && interface.reference.object.mapper.is_none()
-        && interface.reference.object.instantiations == TypeCacheState::Unallocated
-        && interface.reference.node.is_none()
-        && interface.reference.resolved_type_arguments.is_none()
+        && (valid_thisless_interface_identity(interface) || reference_identity)
         && interface.base_types_resolved
         && interface.declared_members_resolved
         && interface.resolved_base_constructor_type.is_none()

@@ -14231,47 +14231,11 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                 && base_symbol != first_symbol
                 && base_type != type_
                 && base_type != first_type
-                && self.get_merged_symbol(base_symbol) == Some(base_symbol)
-                && self
-                    .declared_type_links(base_symbol)
-                    .is_some_and(|links| links.declared_type == Some(base_type))
-                && self.type_payload(base_type).is_some_and(|record| {
-                    let TypeData::Interface(interface) = record.data() else {
-                        return false;
-                    };
-                    let structured = &interface.reference.object.structured;
-                    record.flags() == TypeFlags::OBJECT
-                        && record.object_flags()
-                            == super::types::ObjectFlags::INTERFACE
-                                | super::types::ObjectFlags::MEMBERS_RESOLVED
-                        && record.symbol() == Some(base_symbol)
-                        && record.alias().is_none()
-                        && self.symbol(base_symbol).is_some_and(|symbol| {
-                            (symbol.flags() == SymbolFlags::INTERFACE
-                                || super::object_members::authenticated_nongeneric_global_interface_owner(
-                                    self,
-                                    base_symbol,
-                                ))
-                                && symbol.members() == interface.declared_members
-                        })
-                        && interface.all_type_parameters.is_none()
-                        && interface.outer_type_parameter_count == 0
-                        && interface.this_type.is_none()
-                        && interface.reference.object.target.is_none()
-                        && interface.reference.object.mapper.is_none()
-                        && interface.reference.object.instantiations == TypeCacheState::Unallocated
-                        && interface.reference.node.is_none()
-                        && interface.reference.resolved_type_arguments.is_none()
-                        && interface.base_types_resolved
-                        && interface.declared_members_resolved
-                        && interface.resolved_base_constructor_type.is_none()
-                        && interface.declared_call_signatures.is_none()
-                        && interface.declared_construct_signatures.is_none()
-                        && interface.declared_index_infos.is_none()
-                        && structured.signatures.is_none()
-                        && structured.call_signature_count == 0
-                        && structured.index_infos.is_none()
-                });
+                && super::structured_members::distinct_later_interface_base_is_supported(
+                    self,
+                    base_symbol,
+                    base_type,
+                );
             if !distinct_base_is_exact || !distinct_types.insert(base_type) {
                 return false;
             }
