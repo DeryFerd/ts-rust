@@ -8368,6 +8368,24 @@ impl<'store> RelaterSession<'store> {
                 Err(RelationUnavailable::UnsupportedProperty(symbol))
             };
         }
+        if matches!(origin, ObjectPropertyOrigin::Declared)
+            && record.name().is_late_bound()
+        {
+            let valid = record
+                .value_declaration()
+                .and_then(|declaration| self.store.source_declaration_symbol(declaration))
+                .and_then(|source| {
+                    super::object_members::declared_late_property_name_type(
+                        self.store, source, symbol,
+                    )
+                })
+                .is_some();
+            return if valid {
+                Ok(record)
+            } else {
+                Err(RelationUnavailable::UnsupportedProperty(symbol))
+            };
+        }
         let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
         let allowed_checks = CheckFlags::READONLY.bits();
         if !record.flags().contains(SymbolFlags::PROPERTY)
