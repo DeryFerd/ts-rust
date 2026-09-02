@@ -702,6 +702,15 @@ pub(super) struct SourceClassPropertyTruthinessCondition {
     pub(super) negated: bool,
 }
 
+/// A direct own-field comparison with the canonical global undefined value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassPropertyEqualityCondition {
+    pub(super) expression: NodeRef,
+    pub(super) access: NodeRef,
+    pub(super) value: NodeRef,
+    pub(super) comparison: SourceTypeofComparison,
+}
+
 /// One JavaScript `typeof` result admitted by the bounded source-flow slice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceTypeofTag {
@@ -759,6 +768,7 @@ pub(super) enum SourceFlowCondition {
     Nullish(SourceNullishCondition),
     Truthiness(SourceTruthinessCondition),
     ClassPropertyTruthiness(SourceClassPropertyTruthinessCondition),
+    ClassPropertyEquality(SourceClassPropertyEqualityCondition),
     Typeof(SourceTypeofCondition),
     Equality(SourceEqualityCondition),
     In(SourceInCondition),
@@ -772,6 +782,7 @@ impl SourceFlowCondition {
             Self::Nullish(condition) => condition.expression,
             Self::Truthiness(condition) => condition.expression,
             Self::ClassPropertyTruthiness(condition) => condition.expression,
+            Self::ClassPropertyEquality(condition) => condition.expression,
             Self::Typeof(condition) => condition.expression,
             Self::Equality(condition) => condition.expression,
             Self::In(condition) | Self::InstanceOf(condition) => condition.expression,
@@ -780,13 +791,23 @@ impl SourceFlowCondition {
 
     const fn symbol(self) -> Option<SemanticSymbolId> {
         Some(match self {
-            Self::Unchanged(_) | Self::ClassPropertyTruthiness(_) => return None,
+            Self::Unchanged(_)
+            | Self::ClassPropertyTruthiness(_)
+            | Self::ClassPropertyEquality(_) => return None,
             Self::Nullish(condition) => return condition.symbol,
             Self::Truthiness(condition) => condition.symbol,
             Self::Typeof(condition) => condition.symbol,
             Self::Equality(condition) => condition.symbol,
             Self::In(condition) | Self::InstanceOf(condition) => condition.symbol,
         })
+    }
+
+    pub(super) const fn class_property_access(self) -> Option<NodeRef> {
+        match self {
+            Self::ClassPropertyTruthiness(condition) => Some(condition.access),
+            Self::ClassPropertyEquality(condition) => Some(condition.access),
+            _ => None,
+        }
     }
 }
 
@@ -1987,6 +2008,38 @@ impl ClassPropertyFlowTypes<'_> {
             .map_err(|error| SourceFlowError::Narrowing { condition, error })
     }
 
+    fn narrow_equality(
+        &mut self,
+        flow: FlowRef,
+        flags: FlowFlags,
+        type_: TypeId,
+        value: TypeId,
+        require_match: bool,
+    ) -> Result<TypeId, SourceFlowError> {
+        let Self::Read {
+            store,
+            globals: Some(globals),
+            session: Some(session),
+        } = self
+        else {
+            return Err(SourceFlowUnsupported::FlowKind { flow, flags }.into());
+        };
+        narrow_by_equality_worker(
+            store,
+            globals,
+            type_,
+            value,
+            true,
+            require_match,
+            None,
+            Some(session),
+        )
+        .map_err(|error| match error {
+            SourceEqualityNarrowingError::Union(error) => SourceFlowError::Join { flow, error },
+            error => SourceFlowInvariant::EqualityNarrowing(error).into(),
+        })
+    }
+
     fn join(
         &mut self,
         flow: FlowRef,
@@ -3067,10 +3120,10 @@ impl SourceFlowPlan {
             .unwrap_or(body.declaration);
         let conditions = conditions.into_iter().collect::<Vec<_>>();
         for condition in &conditions {
-            if let SourceFlowCondition::ClassPropertyTruthiness(condition) = condition {
-                validate_class_property_condition(store, host, bound, body, *condition)?;
-                if !points.contains(&condition.access) {
-                    return Err(SourceFlowInvariant::MissingFlowPoint(condition.access).into());
+            if let Some(access) = condition.class_property_access() {
+                validate_class_property_flow_condition(store, host, bound, body, *condition)?;
+                if !points.contains(&access) {
+                    return Err(SourceFlowInvariant::MissingFlowPoint(access).into());
                 }
             }
         }
@@ -3691,8 +3744,7 @@ impl SourceFlowPlan {
         for condition in conditions {
             let expression = condition.expression();
             validate_bound_node(bound, graph, expression)?;
-            if matches!(condition, SourceFlowCondition::ClassPropertyTruthiness(_))
-                && effects.class_body.is_none()
+            if condition.class_property_access().is_some() && effects.class_body.is_none()
             {
                 return Err(SourceFlowInvariant::InvalidClassProperty(expression).into());
             }
@@ -4437,7 +4489,7 @@ pub(super) struct ClassInitializationFrame<'plan, 'graph> {
 
 #[derive(Clone)]
 struct CompletedClassPropertyCondition {
-    condition: SourceClassPropertyTruthinessCondition,
+    condition: SourceFlowCondition,
     source: ClassPropertyTruthinessSource,
     member: ClassMemberSource,
     access: ClassBodyAccessToken,
@@ -4513,7 +4565,14 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
             .plan
             .conditions
             .values()
-            .any(|condition| matches!(condition, SourceFlowCondition::ClassPropertyTruthiness(_)))
+            .any(|condition| condition.class_property_access().is_some())
+    }
+
+    pub(super) fn has_property_equality_condition(&self, expression: NodeRef) -> bool {
+        matches!(
+            self.flow.plan.conditions.get(&expression),
+            Some(SourceFlowCondition::ClassPropertyEquality(_))
+        )
     }
 
     /// Records the ordinary read after the source checker accepts its condition.
@@ -4525,18 +4584,69 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         raw: TypeId,
         result: TypeId,
     ) -> Result<(), SourceFlowError> {
-        let invalid = || SourceFlowInvariant::InvalidClassProperty(condition.access);
-        if raw != result || self.property_conditions.contains_key(&condition.expression) {
+        self.complete_class_property_condition(
+            store,
+            host,
+            SourceFlowCondition::ClassPropertyTruthiness(condition),
+            raw,
+            result,
+        )
+    }
+
+    pub(super) fn complete_property_equality_condition(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        condition: SourceClassPropertyEqualityCondition,
+        raw: TypeId,
+        result: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        self.complete_class_property_condition(
+            store,
+            host,
+            SourceFlowCondition::ClassPropertyEquality(condition),
+            raw,
+            result,
+        )
+    }
+
+    fn complete_class_property_condition(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        condition: SourceFlowCondition,
+        raw: TypeId,
+        result: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        let expression = condition.expression();
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(expression);
+        let access = condition.class_property_access().ok_or_else(invalid)?;
+        if raw != result || self.property_conditions.contains_key(&expression) {
             return Err(invalid().into());
         }
-        let (source, edges) =
-            validate_class_property_condition(store, host, self.flow.bound, self.body, condition)?;
+        let (source, edges) = validate_class_property_flow_condition(
+            store, host, self.flow.bound, self.body, condition,
+        )?;
+        let type_ = if matches!(condition, SourceFlowCondition::ClassPropertyEquality(_)) {
+            if store
+                .intrinsic_bootstrap()
+                .is_none_or(|bootstrap| raw != bootstrap.boolean_type)
+            {
+                return Err(invalid().into());
+            }
+            store
+                .type_node_links(access)
+                .and_then(|links| links.resolved_type)
+                .ok_or_else(invalid)?
+        } else {
+            raw
+        };
         let member = class_member_source(store, host, source.member).map_err(|_| invalid())?;
         let flow = self
             .flow
             .plan
             .points
-            .get(&condition.access)
+            .get(&access)
             .copied()
             .ok_or_else(invalid)?;
         let completed = CompletedClassPropertyCondition {
@@ -4546,11 +4656,11 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
             access: self.access.clone(),
             flow,
             edges,
-            type_: raw,
+            type_,
         };
         self.validate_property_condition(store, host, &completed)?;
         self.property_conditions
-            .insert(condition.expression, completed);
+            .insert(expression, completed);
         Ok(())
     }
 
@@ -4561,17 +4671,19 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         completed: &CompletedClassPropertyCondition,
     ) -> Result<(), SourceFlowError> {
         let condition = completed.condition;
-        let invalid = || SourceFlowInvariant::InvalidClassProperty(condition.access);
+        let expression = condition.expression();
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(expression);
+        let access = condition.class_property_access().ok_or_else(invalid)?;
         let identities = class_body_identities(store, host, &self.access).map_err(|_| invalid())?;
         let receiver_symbol = store
             .type_payload(identities.this_type)
             .and_then(TypeRecord::symbol)
             .ok_or_else(invalid)?;
-        let (source, edges) =
-            validate_class_property_condition(store, host, self.flow.bound, self.body, condition)?;
+        let (source, edges) = validate_class_property_flow_condition(
+            store, host, self.flow.bound, self.body, condition,
+        )?;
         if completed.access != self.access
-            || self.flow.plan.conditions.get(&condition.expression)
-                != Some(&SourceFlowCondition::ClassPropertyTruthiness(condition))
+            || self.flow.plan.conditions.get(&expression) != Some(&condition)
             || source != completed.source
             || edges != completed.edges
             || class_member_source(store, host, completed.source.member).map_err(|_| invalid())?
@@ -4580,16 +4692,16 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
             || completed.member.declaration != completed.source.declaration
             || completed.member.side != ClassPropertySide::Instance
             || !matches!(completed.member.origin, ClassMemberOrigin::Field { .. })
-            || self.flow.plan.points.get(&condition.access) != Some(&completed.flow)
-            || self.flow.bound.flow_at(condition.access) != Some(completed.flow)
-            || self.flow.bound.flow_container(condition.access) != Some(self.body.declaration)
+            || self.flow.plan.points.get(&access) != Some(&completed.flow)
+            || self.flow.bound.flow_at(access) != Some(completed.flow)
+            || self.flow.bound.flow_container(access) != Some(self.body.declaration)
             || store.type_payload(completed.type_).is_none()
-            || store.type_node_links(condition.access)
+            || store.type_node_links(access)
                 != Some(&TypeNodeLinks {
                     resolved_type: Some(completed.type_),
                     ..TypeNodeLinks::default()
                 })
-            || store.symbol_node_links(condition.access)
+            || store.symbol_node_links(access)
                 != Some(&SymbolNodeLinks {
                     resolved_symbol: Some(completed.member.symbol),
                 })
@@ -4604,6 +4716,22 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                 })
         {
             return Err(invalid().into());
+        }
+        if let SourceFlowCondition::ClassPropertyEquality(condition) = condition {
+            let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+            if store.type_node_links(expression)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(bootstrap.boolean_type),
+                    ..TypeNodeLinks::default()
+                })
+                || store.type_node_links(condition.value)
+                    != Some(&TypeNodeLinks {
+                        resolved_type: Some(bootstrap.undefined_widening_type),
+                        ..TypeNodeLinks::default()
+                    })
+            {
+                return Err(invalid().into());
+            }
         }
         Ok(())
     }
@@ -5377,6 +5505,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                     condition,
                     SourceFlowCondition::Truthiness(_)
                         | SourceFlowCondition::ClassPropertyTruthiness(_)
+                        | SourceFlowCondition::ClassPropertyEquality(_)
                 ) {
                     return Err(SourceFlowUnsupported::FlowKind {
                         flow,
@@ -5392,7 +5521,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                     visiting,
                     depth + 1,
                 )?;
-                if let SourceFlowCondition::ClassPropertyTruthiness(condition) = condition {
+                if let Some(access) = condition.class_property_access() {
                     let completed = self
                         .property_conditions
                         .get(&expression)
@@ -5401,7 +5530,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                     let edge = usize::from(kind == SourceFlowKind::FalseCondition);
                     if completed.edges[edge] != flow {
                         return Err(
-                            SourceFlowInvariant::InvalidClassProperty(condition.access).into()
+                            SourceFlowInvariant::InvalidClassProperty(access).into()
                         );
                     }
                     let reference = ClassPropertyFlowReference {
@@ -5415,23 +5544,44 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                         && let Some(current) = state.type_
                     {
                         if current != completed.type_ {
-                            return Err(SourceFlowInvariant::InvalidClassProperty(
-                                condition.access,
-                            )
-                            .into());
+                            return Err(SourceFlowInvariant::InvalidClassProperty(access).into());
                         }
-                        let truthy = (kind == SourceFlowKind::TrueCondition) != condition.negated;
-                        state.type_ = Some(types.narrow(
-                            flow,
-                            node.flags,
-                            expression,
-                            current,
-                            if truthy {
-                                TruthinessAssumption::Truthy
-                            } else {
-                                TruthinessAssumption::Falsy
-                            },
-                        )?);
+                        state.type_ = Some(match condition {
+                            SourceFlowCondition::ClassPropertyTruthiness(condition) => {
+                                let truthy =
+                                    (kind == SourceFlowKind::TrueCondition) != condition.negated;
+                                types.narrow(
+                                    flow,
+                                    node.flags,
+                                    expression,
+                                    current,
+                                    if truthy {
+                                        TruthinessAssumption::Truthy
+                                    } else {
+                                        TruthinessAssumption::Falsy
+                                    },
+                                )?
+                            }
+                            SourceFlowCondition::ClassPropertyEquality(condition) => {
+                                let value = types
+                                    .store()
+                                    .type_node_links(condition.value)
+                                    .and_then(|links| links.resolved_type)
+                                    .ok_or(SourceFlowInvariant::InvalidClassProperty(access))?;
+                                types.narrow_equality(
+                                    flow,
+                                    node.flags,
+                                    current,
+                                    value,
+                                    (kind == SourceFlowKind::TrueCondition)
+                                        == matches!(
+                                            condition.comparison,
+                                            SourceTypeofComparison::Equal
+                                        ),
+                                )?
+                            }
+                            _ => unreachable!("the condition has a class property access"),
+                        });
                     }
                 }
                 Ok(state)
@@ -6385,7 +6535,8 @@ impl SourceFlowFrame<'_, '_> {
                 };
                 let narrowed = match condition {
                     SourceFlowCondition::Unchanged(_)
-                    | SourceFlowCondition::ClassPropertyTruthiness(_) => unreachable!(),
+                    | SourceFlowCondition::ClassPropertyTruthiness(_)
+                    | SourceFlowCondition::ClassPropertyEquality(_) => unreachable!(),
                     SourceFlowCondition::Nullish(_) => {
                         let null = store
                             .intrinsic_bootstrap()
@@ -7089,6 +7240,29 @@ pub(super) fn narrow_by_equality(
     require_match: bool,
     discriminant: Option<&str>,
 ) -> Result<TypeId, SourceEqualityNarrowingError> {
+    narrow_by_equality_worker(
+        store,
+        globals,
+        input,
+        value,
+        strict,
+        require_match,
+        discriminant,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Class reads keep the existing source caller's session.
+fn narrow_by_equality_worker(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    input: TypeId,
+    value: TypeId,
+    strict: bool,
+    require_match: bool,
+    discriminant: Option<&str>,
+    mut session: Option<&mut InstantiationSession>,
+) -> Result<TypeId, SourceEqualityNarrowingError> {
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or(SourceEqualityNarrowingError::MissingBootstrap)?;
@@ -7146,17 +7320,24 @@ pub(super) fn narrow_by_equality(
                 .map_err(SourceEqualityNarrowingError::Relation)?
                 .ok_or(SourceEqualityNarrowingError::UnsupportedType(*leaf))?;
             let property_type = if property.optional && strict_null_checks {
-                store
-                    .expression_union_type_with_global_types(
+                match session.as_deref_mut() {
+                    Some(session) => store.expression_union_type_with_global_types_and_session(
                         globals,
                         &[property.type_, undefined],
                         UnionReduction::Literal,
-                    )
-                    .map_err(SourceEqualityNarrowingError::Union)?
+                        session,
+                    ),
+                    None => store.expression_union_type_with_global_types(
+                        globals,
+                        &[property.type_, undefined],
+                        UnionReduction::Literal,
+                    ),
+                }
+                .map_err(SourceEqualityNarrowingError::Union)?
             } else {
                 property.type_
             };
-            let narrowed = narrow_by_equality(
+            let narrowed = narrow_by_equality_worker(
                 store,
                 globals,
                 property_type,
@@ -7164,6 +7345,7 @@ pub(super) fn narrow_by_equality(
                 strict,
                 require_match,
                 None,
+                session.as_deref_mut(),
             )?;
             if narrowed != never {
                 retained.push(*leaf);
@@ -7271,9 +7453,20 @@ pub(super) fn narrow_by_equality(
     match retained.as_slice() {
         [] => Ok(never),
         [only] => Ok(*only),
-        _ => store
-            .expression_union_type_with_global_types(globals, &retained, UnionReduction::Literal)
-            .map_err(SourceEqualityNarrowingError::Union),
+        _ => match session {
+            Some(session) => store.expression_union_type_with_global_types_and_session(
+                globals,
+                &retained,
+                UnionReduction::Literal,
+                session,
+            ),
+            None => store.expression_union_type_with_global_types(
+                globals,
+                &retained,
+                UnionReduction::Literal,
+            ),
+        }
+        .map_err(SourceEqualityNarrowingError::Union),
     }
 }
 
@@ -10285,6 +10478,128 @@ fn class_flow_source_node<'host>(
     Ok(record)
 }
 
+fn validate_class_property_flow_condition(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &BoundFile,
+    body: &ClassBodyPlan,
+    condition: SourceFlowCondition,
+) -> Result<(ClassPropertyTruthinessSource, [FlowRef; 2]), SourceFlowError> {
+    match condition {
+        SourceFlowCondition::ClassPropertyTruthiness(condition) => {
+            validate_class_property_condition(store, host, bound, body, condition)
+        }
+        SourceFlowCondition::ClassPropertyEquality(condition) => {
+            validate_class_property_equality_condition(store, host, bound, body, condition)
+        }
+        _ => Err(SourceFlowInvariant::InvalidClassProperty(condition.expression()).into()),
+    }
+}
+
+/// Equality keeps the ordinary field proof and resolves undefined at its written location.
+pub(super) fn validate_class_property_equality_condition(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &BoundFile,
+    body: &ClassBodyPlan,
+    condition: SourceClassPropertyEqualityCondition,
+) -> Result<(ClassPropertyTruthinessSource, [FlowRef; 2]), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidClassProperty(condition.access);
+    let (arena, binding) = host.source(condition.expression).ok_or_else(invalid)?;
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || binding.source_file() != bound.source_file()
+        || !condition.access.is_for(arena.id(), bound.file_id())
+        || !condition.value.is_for(arena.id(), bound.file_id())
+    {
+        return Err(invalid().into());
+    }
+    let root = class_flow_source_node(store, host, condition.expression)?;
+    let NodeData::BinaryExpression(binary) = &root.data else {
+        return Err(invalid().into());
+    };
+    let operator = NodeRef::new(
+        condition.expression.arena,
+        condition.expression.file,
+        binary.operator_token,
+    );
+    let operator_record = class_flow_source_node(store, host, operator)?;
+    let expected_operator = match condition.comparison {
+        SourceTypeofComparison::Equal => SyntaxKind::EqualsEqualsEqualsToken,
+        SourceTypeofComparison::NotEqual => SyntaxKind::ExclamationEqualsEqualsToken,
+    };
+    let operands_match = [binary.left, binary.right] == [condition.access.node, condition.value.node]
+        || [binary.left, binary.right] == [condition.value.node, condition.access.node];
+    let access = class_flow_source_node(store, host, condition.access)?;
+    let value = class_flow_source_node(store, host, condition.value)?;
+    let (left, right) = if binary.left == condition.access.node {
+        (access, value)
+    } else {
+        (value, access)
+    };
+    if root.kind != SyntaxKind::BinaryExpression
+        || root.flags.0 != 0
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.modifiers.is_some()
+        || binary.facts != 0
+        || !operands_match
+        || access.parent != Some(condition.expression.node)
+        || value.parent != Some(condition.expression.node)
+        || value.kind != SyntaxKind::Identifier
+        || value.flags.0 != 0
+        || !matches!(&value.data, NodeData::Identifier(identifier)
+            if identifier.text == "undefined" && identifier.flow_node.is_none())
+        || operator_record.parent != Some(condition.expression.node)
+        || operator_record.kind != expected_operator
+        || operator_record.flags.0 != 0
+        || !matches!(operator_record.data, NodeData::Token(_))
+        || left.range.start < root.range.start
+        || left.range.end > operator_record.range.start
+        || operator_record.range.end > right.range.start
+        || right.range.end > root.range.end
+    {
+        return Err(invalid().into());
+    }
+    let statement = NodeRef::new(
+        condition.expression.arena,
+        condition.expression.file,
+        root.parent.ok_or_else(invalid)?,
+    );
+    let statement_record = class_flow_source_node(store, host, statement)?;
+    if statement_record.kind != SyntaxKind::IfStatement
+        || statement_record.flags.0 != 0
+        || !matches!(&statement_record.data, NodeData::IfStatement(branch)
+            if branch.expression == condition.expression.node && branch.facts == 0 && branch.flow_node.is_none())
+        || !source_node_is_descendant_of(arena, statement, body.body.node)
+    {
+        return Err(invalid().into());
+    }
+    let undefined = store
+        .intrinsic_bootstrap()
+        .ok_or_else(invalid)?
+        .undefined_symbol;
+    let mut callbacks = host.name_resolver_host(store).map_err(|_| invalid())?;
+    let resolved = CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callbacks)
+        .map_err(|_| invalid())?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(condition.value)),
+            "undefined",
+            SymbolFlags::VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(|_| invalid())?;
+    if resolved.and_then(|symbol| store.get_merged_symbol(symbol)) != Some(undefined) {
+        return Err(invalid().into());
+    }
+    let source = plan_class_property_truthiness(store, host, body, condition.access)
+        .map_err(|_| invalid())?;
+    let edges = class_property_condition_edges(bound, condition.expression, condition.access)?;
+    Ok((source, edges))
+}
+
 fn validate_class_property_condition(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -10352,15 +10667,25 @@ fn validate_class_property_condition(
     }
     let source = plan_class_property_truthiness(store, host, body, condition.access)
         .map_err(|_| invalid())?;
-    let entry = bound.flow_at(condition.access).ok_or_else(invalid)?;
+    let edges = class_property_condition_edges(bound, condition.expression, condition.access)?;
+    Ok((source, edges))
+}
+
+fn class_property_condition_edges(
+    bound: &BoundFile,
+    expression: NodeRef,
+    access: NodeRef,
+) -> Result<[FlowRef; 2], SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidClassProperty(access);
+    let entry = bound.flow_at(access).ok_or_else(invalid)?;
     let mut edges = 0;
     let mut edge_flows = [None, None];
     for (index, row) in bound.flow_graph().nodes().iter().enumerate() {
-        if row.payload != Some(FlowNodePayload::Ast(condition.expression)) {
+        if row.payload != Some(FlowNodePayload::Ast(expression)) {
             continue;
         }
         let flow = FlowRef::new(
-            arena.id(),
+            bound.node_arena_id(),
             bound.file_id(),
             FlowNodeId(u32::try_from(index).map_err(|_| invalid())?),
         );
@@ -10377,19 +10702,16 @@ fn validate_class_property_condition(
     }
     if edges != BOTH_CONDITION_EDGES {
         return Err(SourceFlowInvariant::MissingConditionEdge {
-            condition: condition.expression,
+            condition: expression,
             true_edge: edges & TRUE_CONDITION_EDGE != 0,
             false_edge: edges & FALSE_CONDITION_EDGE != 0,
         }
         .into());
     }
-    Ok((
-        source,
-        [
-            edge_flows[0].ok_or_else(invalid)?,
-            edge_flows[1].ok_or_else(invalid)?,
-        ],
-    ))
+    Ok([
+        edge_flows[0].ok_or_else(invalid)?,
+        edge_flows[1].ok_or_else(invalid)?,
+    ])
 }
 
 fn validate_class_body_call(

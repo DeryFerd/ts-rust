@@ -195,7 +195,8 @@ use super::{
     },
     primitive_operators::{
         PrimitiveBigIntExponentiationTarget, PrimitiveBinaryError, PrimitiveBinaryRecovery,
-        PrimitiveBinaryRequest, PrimitiveBinaryUnsupported, check_primitive_binary,
+        PrimitiveBinaryRequest, PrimitiveBinaryUnsupported,
+        check_nullish_union_equality_with_session, check_primitive_binary,
         check_primitive_binary_with_session, compound_assignment_binary_operator,
     },
     reference_types::validate_direct_generic_reference,
@@ -12077,9 +12078,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 &mut local_assignments,
                 &mut calls,
             )?;
-            if conditions.iter().any(|condition| {
-                matches!(condition, SourceFlowCondition::ClassPropertyTruthiness(_))
-            }) {
+            if conditions
+                .iter()
+                .any(|condition| condition.class_property_access().is_some())
+            {
                 preflight_class_property_condition_reads(&statements)?;
             }
             for (_, initializer) in &parameter_initializers {
@@ -12193,6 +12195,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     negations.push(condition_node);
                     condition_node = operand;
                 }
+                self.primitive_binary_position_roots.insert(condition_node);
                 let condition = self.plan_expression(condition_node)?;
                 self.preflight_class_body_expression(&condition)?;
                 let negated = negations.len() % 2 == 1;
@@ -12222,6 +12225,53 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 negated,
                             },
                         )
+                    }
+                    PlannedExpressionKind::Binary(binary)
+                        if negations.is_empty()
+                            && condition.node == root
+                            && binary.node == root
+                            && binary.prefix.is_empty()
+                            && binary.shorthand_assignment.is_none() =>
+                    {
+                        let (property, value) = match (&binary.left.kind, &binary.right.kind) {
+                            (
+                                PlannedExpressionKind::Property(property),
+                                PlannedExpressionKind::GlobalUndefined,
+                            ) => (property, binary.right.node),
+                            (
+                                PlannedExpressionKind::GlobalUndefined,
+                                PlannedExpressionKind::Property(property),
+                            ) => (property, binary.left.node),
+                            _ => {
+                                return Err(SourceCheckError::Unsupported(
+                                    UnsupportedSourceSyntax::Class(root),
+                                ));
+                            }
+                        };
+                        let comparison = match binary.operator {
+                            SyntaxKind::EqualsEqualsEqualsToken => SourceTypeofComparison::Equal,
+                            SyntaxKind::ExclamationEqualsEqualsToken => {
+                                SourceTypeofComparison::NotEqual
+                            }
+                            _ => {
+                                return Err(SourceCheckError::Unsupported(
+                                    UnsupportedSourceSyntax::Class(root),
+                                ));
+                            }
+                        };
+                        let condition =
+                            super::source_flow::SourceClassPropertyEqualityCondition {
+                                expression: root,
+                                access: property.node,
+                                value,
+                                comparison,
+                            };
+                        let (store, host) = self.semantic.ok_or(SourceCheckError::Class(root))?;
+                        super::source_flow::validate_class_property_equality_condition(
+                            store, host, self.bound, body, condition,
+                        )
+                        .map_err(|error| class_body_flow_error(root, error))?;
+                        SourceFlowCondition::ClassPropertyEquality(condition)
                     }
                     _ => {
                         return Err(SourceCheckError::Unsupported(
@@ -40218,25 +40268,40 @@ fn check_expression_type_with_capture_context(
                     if options.no_error_truncation {
                         display_flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
                     }
-                    let resolution = check_primitive_binary_with_session(
-                        store,
-                        host,
-                        global_types,
-                        options.strict_function_types,
-                        display_flags,
-                        session,
-                        PrimitiveBinaryRequest {
-                            expression: node,
-                            left: left_node,
-                            operator,
-                            right: right_expression.node,
-                            left_type: left.result,
-                            right_type: right.result,
-                            left_recovery,
-                            right_recovery,
-                            bigint_exponentiation_target: bigint_exponentiation_target(options),
-                        },
-                    )
+                    let request = PrimitiveBinaryRequest {
+                        expression: node,
+                        left: left_node,
+                        operator,
+                        right: right_expression.node,
+                        left_type: left.result,
+                        right_type: right.result,
+                        left_recovery,
+                        right_recovery,
+                        bigint_exponentiation_target: bigint_exponentiation_target(options),
+                    };
+                    let resolution = if class_flow.as_deref().is_some_and(|context| {
+                        context.flow.has_property_equality_condition(node)
+                    }) {
+                        check_nullish_union_equality_with_session(
+                            store,
+                            host,
+                            global_types,
+                            options.strict_function_types,
+                            display_flags,
+                            session,
+                            request,
+                        )
+                    } else {
+                        check_primitive_binary_with_session(
+                            store,
+                            host,
+                            global_types,
+                            options.strict_function_types,
+                            display_flags,
+                            session,
+                            request,
+                        )
+                    }
                     .map_err(|error| primitive_binary_check_error(host, node, &error))?;
                     for mut diagnostic in resolution.diagnostics {
                         if diagnostic.diagnostic.code() == 2447 {
@@ -42899,9 +42964,13 @@ fn check_class_statements(
                 returns,
             )?,
             PlannedClassStatement::If(branch) => {
+                let point = branch
+                    .flow
+                    .class_property_access()
+                    .unwrap_or(branch.condition.unparenthesized().node);
                 let snapshot = context
                     .flow
-                    .snapshot_at(store, global_types, branch.condition.unparenthesized().node)
+                    .snapshot_at(store, global_types, point)
                     .map_err(|error| class_body_flow_error(branch.flow.expression(), error))?;
                 let checked = check_expression_type_with_class_context(
                     store,
@@ -42922,7 +42991,8 @@ fn check_class_statements(
                     SourceFlowCondition::Truthiness(condition) => {
                         snapshot.type_of(condition.symbol) == Some(checked.raw)
                     }
-                    SourceFlowCondition::ClassPropertyTruthiness(_) => true,
+                    SourceFlowCondition::ClassPropertyTruthiness(_)
+                    | SourceFlowCondition::ClassPropertyEquality(_) => true,
                     _ => false,
                 };
                 if !snapshot_matches {
@@ -42959,6 +43029,18 @@ fn check_class_statements(
                     context
                         .flow
                         .complete_property_condition(
+                            store,
+                            host,
+                            condition,
+                            checked.raw,
+                            checked.result,
+                        )
+                        .map_err(|error| class_body_flow_error(condition.expression, error))?;
+                }
+                if let SourceFlowCondition::ClassPropertyEquality(condition) = branch.flow {
+                    context
+                        .flow
+                        .complete_property_equality_condition(
                             store,
                             host,
                             condition,

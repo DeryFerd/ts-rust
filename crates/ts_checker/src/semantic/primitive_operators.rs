@@ -7,7 +7,10 @@
 //! operator-specific diagnostics and recovery types. Source integration publishes
 //! expression links after the complete result and diagnostic batch are staged.
 //! The caller-aware entry also compares authenticated object operands for
-//! equality. Other operators retain the scalar boundary.
+//! equality. Checked nullish conditions also accept validated unions. Other
+//! operators retain the scalar boundary.
+
+use std::collections::HashSet;
 
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::SymbolFlags;
@@ -384,6 +387,109 @@ pub(super) fn check_primitive_binary_with_session(
         request.right_type,
         request.right_recovery,
     )?;
+    check_equality_with_session(
+        store,
+        host,
+        global_types,
+        strict_function_types,
+        display_flags,
+        session,
+        request,
+        [left_base, right_base],
+    )
+}
+
+/// Uses the ordinary equality checker after validating a nullish union operand.
+pub(super) fn check_nullish_union_equality_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    display_flags: CanonicalTypeFormatFlags,
+    session: &mut InstantiationSession,
+    request: PrimitiveBinaryRequest,
+) -> Result<PrimitiveBinaryResolution, PrimitiveBinaryError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
+    let nullish = [
+        bootstrap.null_type,
+        bootstrap.null_widening_type,
+        bootstrap.undefined_type,
+        bootstrap.undefined_widening_type,
+    ];
+    if !matches!(
+        PrimitiveBinaryOperator::from_syntax(request.operator)?,
+        PrimitiveBinaryOperator::Equality(_)
+    ) || (!nullish.contains(&request.left_type) && !nullish.contains(&request.right_type))
+    {
+        return check_primitive_binary_with_session(
+            store,
+            host,
+            global_types,
+            strict_function_types,
+            display_flags,
+            session,
+            request,
+        );
+    }
+    let left_base = if nullish.contains(&request.right_type) {
+        nullish_equality_binary_operand(
+            store,
+            global_types,
+            request.left,
+            request.left_type,
+            request.left_recovery,
+        )?
+    } else {
+        equality_binary_operand(
+            store,
+            global_types,
+            request.left,
+            request.left_type,
+            request.left_recovery,
+        )?
+    };
+    let right_base = if nullish.contains(&request.left_type) {
+        nullish_equality_binary_operand(
+            store,
+            global_types,
+            request.right,
+            request.right_type,
+            request.right_recovery,
+        )?
+    } else {
+        equality_binary_operand(
+            store,
+            global_types,
+            request.right,
+            request.right_type,
+            request.right_recovery,
+        )?
+    };
+    check_equality_with_session(
+        store,
+        host,
+        global_types,
+        strict_function_types,
+        display_flags,
+        session,
+        request,
+        [left_base, right_base],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_equality_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    display_flags: CanonicalTypeFormatFlags,
+    session: &mut InstantiationSession,
+    request: PrimitiveBinaryRequest,
+    [left_base, right_base]: [TypeId; 2],
+) -> Result<PrimitiveBinaryResolution, PrimitiveBinaryError> {
     let boolean = store
         .intrinsic_bootstrap()
         .map(|bootstrap| bootstrap.boolean_type)
@@ -506,6 +612,38 @@ fn equality_binary_operand(
         })?;
     }
     Ok(base)
+}
+
+fn nullish_equality_binary_operand(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    node: NodeRef,
+    type_: TypeId,
+    recovery: Option<PrimitiveBinaryRecovery>,
+) -> Result<TypeId, PrimitiveBinaryError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(PrimitiveBinaryInvariant::InvalidType(type_))?;
+    if recovery.is_some() || !matches!(record.data(), TypeData::Union(_)) {
+        return equality_binary_operand(store, global_types, node, type_, recovery);
+    }
+    store.validate_union_constituent_with_global_types(global_types, type_)?;
+    let mut pending = vec![type_];
+    let mut checked = HashSet::new();
+    while let Some(part) = pending.pop() {
+        if !checked.insert(part) {
+            continue;
+        }
+        let part_record = store
+            .type_payload(part)
+            .ok_or(PrimitiveBinaryInvariant::InvalidType(part))?;
+        if let TypeData::Union(union) = part_record.data() {
+            pending.extend(union.union.types.iter().copied());
+        } else {
+            equality_binary_operand(store, global_types, node, part, None)?;
+        }
+    }
+    Ok(type_)
 }
 
 fn equality_types_are_comparable_with_session(
