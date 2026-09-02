@@ -2876,6 +2876,7 @@ pub(super) fn plan_source_class_members_with_imports(
                         Some(
                             SyntaxKind::PropertyAccessExpression
                                 | SyntaxKind::ArrowFunction
+                                | SyntaxKind::NewExpression
                                 | SyntaxKind::Identifier
                                 | SyntaxKind::NullKeyword
                                 | SyntaxKind::ObjectLiteralExpression
@@ -15765,7 +15766,9 @@ fn plan_property_with_body_mode(
                     Some("null")
                 }
                 NodeData::AsExpression(_) if private || enum_const_assertion => None,
-                NodeData::PropertyAccessExpression(_) | NodeData::ArrowFunction(_)
+                NodeData::PropertyAccessExpression(_)
+                | NodeData::ArrowFunction(_)
+                | NodeData::NewExpression(_)
                     if source_body && merged_auto_accessor.is_none() =>
                 {
                     None
@@ -15926,7 +15929,9 @@ fn plan_property_with_body_mode(
                         }),
                     )
                 }
-                NodeData::PropertyAccessExpression(_) | NodeData::ArrowFunction(_)
+                NodeData::PropertyAccessExpression(_)
+                | NodeData::ArrowFunction(_)
+                | NodeData::NewExpression(_)
                     if source_body && merged_auto_accessor.is_none() =>
                 {
                     (None, None, None, None)

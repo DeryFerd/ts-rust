@@ -10679,6 +10679,45 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }))
     }
 
+    fn is_direct_class_field_constructor_expression(
+        &self,
+        expression: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let Some(body) = self.class_body.as_ref().filter(|body| {
+            matches!(body.kind, ClassBodyKind::PropertyInitializer { .. })
+                && body.body == expression
+        }) else {
+            return Ok(false);
+        };
+        let Some((store, host)) = self.semantic else {
+            return Ok(false);
+        };
+        let Some(class) = self.source_body_classes.get(&body.class_symbol) else {
+            return Ok(false);
+        };
+        let record = self.node(expression)?;
+        let NodeData::NewExpression(construction) = &record.data else {
+            return Ok(false);
+        };
+        let declaration = self.node(body.declaration)?;
+        let NodeData::PropertyDeclaration(property) = &declaration.data else {
+            return Ok(false);
+        };
+        let constructor = self.reference(construction.expression);
+        Ok(class.declaration() == body.class_declaration
+            && class.symbol() == body.class_symbol
+            && class.bodies().contains(body)
+            && declaration.kind == SyntaxKind::PropertyDeclaration
+            && declaration.parent == Some(body.class_declaration.node)
+            && property.initializer == Some(expression.node)
+            && record.parent == Some(body.declaration.node)
+            && self.bound.contains(expression)
+            && self.bound.contains(constructor)
+            && self.bound.flow_at(constructor).is_some()
+            && super::classes::source_class_plan_is_current(store, host, class)
+                .map_err(|error| Self::class_plan_error(body.class_declaration, error))?)
+    }
+
     fn is_class_body_constructor_expression(
         &self,
         expression: NodeRef,
@@ -27871,8 +27910,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             SyntaxKind::NewExpression => {
                 let class_position = self.is_class_body_constructor_expression(expression)?;
                 let method_return = self.is_direct_class_method_constructor_return(expression)?;
+                let field_initializer =
+                    self.is_direct_class_field_constructor_expression(expression)?;
                 if !class_position
                     && !method_return
+                    && !field_initializer
                     && !self.is_top_level_constructor_expression(expression)?
                 {
                     return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
@@ -32707,6 +32749,20 @@ fn class_expression_nodes(
                     .checked_expression_arguments()
                     .ok_or(SourceCheckError::Call(construction.node()))?;
                 pending.extend(arguments.iter().rev());
+            }
+            PlannedExpressionKind::New(construction) => {
+                if construction.expression_argument_nodes().is_some() {
+                    let arguments = construction
+                        .checked_expression_arguments()
+                        .ok_or(SourceCheckError::Class(expression.node))?;
+                    pending.extend(arguments.iter().rev());
+                }
+                if construction.promise_executor_node().is_some() {
+                    let executor = construction
+                        .promise_executor()
+                        .ok_or(SourceCheckError::Class(expression.node))?;
+                    pending.push(executor);
+                }
             }
             PlannedExpressionKind::Array(elements) => pending.extend(elements.iter().rev()),
             PlannedExpressionKind::Object { properties, .. } => {
