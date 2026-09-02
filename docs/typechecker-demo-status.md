@@ -7,8 +7,8 @@ Updated 2026-09-02. No complete real-world project has passed in Rust yet.
 Query core and Hono are the primary targets again. New Pathe-only work,
 runner redesign and the UFO dependency task are paused.
 
-The fresh compiler is `ece9344d`. These results measure the combined repair
-branch, not an accepted merge into the primary branch.
+The last complete pair of project censuses used `ece9344d`. These results
+measure a repair branch, not an accepted merge into the primary branch.
 
 | Project | August 31 | September 2 |
 | --- | --- | --- |
@@ -24,20 +24,45 @@ The full [current results](../target/wave202-query-hono-current-results.md)
 link the raw reports and logs. Query's census took 38 seconds. Hono's took
 333 seconds. The runs reused the existing compiler.
 
+The first Hono repair is now tested. All 15 constructor tests pass, including
+two new optional-alias controls. The unchanged project clears that annotation
+failure and next stops at the constructor's `super(...)` call. This does not
+change the complete-census counts above or establish a full project pass.
+
+The combined repair test run at `6769d988` compiled and ran all 28 selected
+tests. It passed 17 and failed 11. The 15 constructor controls still pass.
+
+| Test group | Passed | Failed |
+| --- | ---: | ---: |
+| Constructor and optional-argument controls | 15 | 0 |
+| Constructor field initializers | 1 | 2 |
+| Contextual object-property parameters | 1 | 3 |
+| Captured array writes | 0 | 3 |
+| Generic signature commas and defaults | 0 | 3 |
+
+The [complete test log](../target/wave202-query-hono-combined-tests-1.log)
+includes every failure. These new repairs are not accepted yet. The new tests
+remain unchanged while workers fix the next rejected operations.
+
 The current repairs follow measured project failures:
 
 1. Query's ordinary check stops at a parameter in `timeoutManager.ts`.
-   Trace its contextual parameter type through the existing checker.
+   Its parameter repair still fails three focused arrow-body tests.
 2. The shared `Subscribable` class blocks eight Query source checks.
    Its measured failure is the `new Set<TListener>()` field initializer.
-   A source worker and a test worker own this repair in a separate worktree.
+   Field admission works for a user constructor. Generic `Set` preparation
+   and invalid constructor-argument diagnostics still fail focused tests.
 3. Query's new internal error is `InvalidArrayMutation` at
-   `queue.push(callback)` in `notifyManager.ts`. Repair its real guard.
-4. Hono's ordinary check stops at `HTTPException`. The trace identifies
-   `options?: HTTPExceptionOptions` in its constructor. Reuse the source-class
-   annotation path and preserve the optional union type.
-5. Query also rejects the inferred imported `isServer` variable. Use the
-   normal initializer type query, with its existing cache and cycle checks.
+   `queue.push(callback)` in `notifyManager.ts`. Its capture repair still
+   fails the outer-function checks in all three focused tests.
+4. Hono now stops at `super(options?.message, { cause: options?.cause })`.
+   The call-argument syntax check rejects the optional property read.
+5. Hono's generic call signatures need optional-parameter support. Separate
+   tests found lost parser comma metadata and missing method type-parameter
+   default diagnostics. Keep these separate from measured project progress.
+6. Query also rejects the inferred imported `isServer` variable. The current
+   annotation-only query cannot infer it. Reuse the source dependency and
+   variable-checking paths, with their cache and cycle checks.
 
 Each repair must preserve the original projects, options and dependencies.
 Run focused type and diagnostic tests, then rerun the affected project.
