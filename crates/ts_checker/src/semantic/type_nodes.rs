@@ -23681,13 +23681,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && !record_heritage
             && !cached_intersection_source
             && !cached_mapped_lookup_source
+            && exact_import.is_none()
             && !self.source_type_consumes_interface_defaults(node, &mut HashSet::new())?
             && !union_constituent
             && !self.lazy_interface_values
             && !self.native_parameter_interface_values
             && !self.source_callable_alias_planning
             && self.intersection_planning_depth == 0
-            && exact_import.is_none()
             && property_import.is_none()
             && alias_body_import.is_none()
             && class_annotation_import.is_none()
