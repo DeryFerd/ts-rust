@@ -31221,6 +31221,60 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             .declared_type_links(earlier)
                             .and_then(|links| links.declared_type),
                     )
+                } else if source == DirectGenericDefaultSource::Interface {
+                    let target = self.store.symbol(earlier).ok_or_else(&unsupported)?;
+                    let flags = target.flags();
+                    if earlier == symbol
+                        || !flags.contains(SymbolFlags::INTERFACE)
+                        || flags.intersects(SymbolFlags::CLASS | SymbolFlags::TYPE_ALIAS)
+                        || malformed_alias_merge(flags)
+                        || preflight_class_or_interface_reference(
+                            self.store, self.host, earlier, flags,
+                        )? != 0
+                    {
+                        return Err(unsupported());
+                    }
+                    // A top-level interface cannot capture an outer formal.
+                    let mut has_interface = false;
+                    for &declaration in target.declarations().ok_or_else(&unsupported)? {
+                        let declaration_record =
+                            preflight_node(self.store, self.host, declaration)?;
+                        if let NodeData::InterfaceDeclaration(interface) =
+                            &declaration_record.data
+                        {
+                            let bound =
+                                self.host.bound_file(declaration).ok_or_else(&unsupported)?;
+                            if declaration_record.kind != SyntaxKind::InterfaceDeclaration
+                                || declaration_record.parent != Some(bound.source_file().node)
+                                || interface.type_parameters.is_some()
+                                || !self.host.symbol_matches(self.store, declaration, earlier)
+                            {
+                                return Err(unsupported());
+                            }
+                            has_interface = true;
+                        }
+                    }
+                    if !has_interface {
+                        return Err(unsupported());
+                    }
+                    let expected = cached_interface_type(self.store, earlier)?;
+                    if let Some(expected) = expected {
+                        let Some(TypeData::Interface(interface)) =
+                            self.store.type_payload(expected).map(TypeRecord::data)
+                        else {
+                            return Err(invalid());
+                        };
+                        if interface.outer_type_parameter_count != 0
+                            || interface
+                                .reference
+                                .resolved_type_arguments
+                                .as_ref()
+                                .is_some_and(|arguments| !arguments.is_empty())
+                        {
+                            return Err(invalid());
+                        }
+                    }
+                    (None, expected)
                 } else if source == DirectGenericDefaultSource::ReactInterface
                     && identifier.text == "ComponentState"
                 {
