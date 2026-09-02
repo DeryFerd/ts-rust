@@ -327,6 +327,7 @@ pub(super) fn plan_function_identifier_read(
             valid_source_function_declaration_owner_shape(store, routed.target, *declaration)
         });
     if record.flags() != SymbolFlags::FUNCTION && merged_declaration.is_none() {
+        observe_rejected_function_owner(store, host, node, routed.target);
         return Err(SourceFunctionPlanError::Unsupported(
             SourceFunctionUnsupported::NonFunctionSymbol {
                 node,
@@ -548,6 +549,65 @@ fn route_value_symbol(
         target: merged,
         export_local: export_local.then_some(resolved),
     })
+}
+
+// Temporary failure metadata. Remove this observer before acceptance runs.
+fn observe_rejected_function_owner(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    caller: NodeRef,
+    symbol: SemanticSymbolId,
+) {
+    use std::io::Write as _;
+
+    let Some(owner) = store.symbol(symbol) else {
+        return;
+    };
+    let declarations = owner.declarations().unwrap_or_default();
+    let emitted = declarations.len().min(16);
+    let mut output = std::io::stderr().lock();
+    let _ = writeln!(
+        output,
+        "merged_function_rejected caller={caller:?} owner={symbol:?} flags={} value={:?} declarations_present={} declarations_total={} declarations_emitted={emitted} declarations_truncated={}",
+        owner.flags().bits(),
+        owner.value_declaration(),
+        owner.declarations().is_some(),
+        declarations.len(),
+        declarations.len() - emitted,
+    );
+    for (index, &declaration) in declarations.iter().take(16).enumerate() {
+        let node = host.node(declaration);
+        let parent = node
+            .and_then(|node| node.parent)
+            .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent));
+        let parent_node = parent.and_then(|parent| host.node(parent));
+        let grandparent = parent_node
+            .and_then(|node| node.parent)
+            .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent));
+        let grandparent_node = grandparent.and_then(|parent| host.node(parent));
+        let module_keywords = [node, parent_node, grandparent_node].map(|node| {
+            node.and_then(|node| match &node.data {
+                ts_ast::NodeData::ModuleDeclaration(module) => Some(module.keyword),
+                _ => None,
+            })
+        });
+        let bound = host.bound_file(declaration);
+        let facts = bound.and_then(BoundFile::source_facts);
+        let raw_owner = bound.and_then(|bound| bound.symbol(declaration));
+        let merged_owner = raw_owner.and_then(|raw| store.get_merged_symbol(raw));
+        let _ = writeln!(
+            output,
+            "merged_function_declaration caller={caller:?} owner={symbol:?} index={index} declaration={declaration:?} kind={:?} parent={parent:?} parent_kind={:?} grandparent={grandparent:?} grandparent_kind={:?} module_keywords={module_keywords:?} declaration_file={:?} default_library={:?} javascript={:?} external_module={:?} common_js={:?} raw_owner={raw_owner:?} merged_owner={merged_owner:?}",
+            node.map(|node| node.kind),
+            parent_node.map(|node| node.kind),
+            grandparent_node.map(|node| node.kind),
+            facts.map(|facts| facts.is_declaration_file()),
+            facts.map(|facts| facts.is_default_library()),
+            facts.map(|facts| facts.is_javascript_file()),
+            facts.map(|facts| facts.is_external_module()),
+            facts.map(|facts| facts.is_common_js_module()),
+        );
+    }
 }
 
 fn validate_function_target(
