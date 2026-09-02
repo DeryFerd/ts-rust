@@ -1297,7 +1297,7 @@ struct SourceIndexOnlyDisplay {
     readonly: bool,
 }
 
-struct SourceComputedObjectDisplay {
+struct SourceObjectDisplay {
     properties: Vec<StructuralPropertyDisplay>,
     indexes: Vec<SourceIndexOnlyDisplay>,
 }
@@ -1325,6 +1325,25 @@ fn display_object_type(
     // A removed owner does not erase the retained source namespace identity.
     super::source_imports::validated_source_file_namespace_owner(store, type_id)
         .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+    if let Some(object) =
+        validated_source_indexed_rest_display(store, host, global_types, type_id, record)?
+    {
+        if !visiting.insert(type_id) {
+            return Err(TypeDisplayUnavailable::CyclicType(type_id));
+        }
+        let result = display_source_object(
+            store,
+            host,
+            global_types,
+            type_id,
+            &object,
+            flags,
+            state,
+            visiting,
+        );
+        visiting.remove(&type_id);
+        return result;
+    }
     if store
         .intrinsic_bootstrap()
         .is_some_and(|bootstrap| type_id == bootstrap.empty_type_literal_type)
@@ -1674,7 +1693,7 @@ fn display_object_type(
         if !visiting.insert(type_id) {
             return Err(TypeDisplayUnavailable::CyclicType(type_id));
         }
-        let result = display_source_computed_object(
+        let result = display_source_object(
             store,
             host,
             global_types,
@@ -1734,6 +1753,90 @@ fn display_object_type(
     result
 }
 
+/// Keeps the copied properties and index declarations from a proven source rest type.
+fn validated_source_indexed_rest_display(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+    record: &TypeRecord,
+) -> Result<Option<SourceObjectDisplay>, TypeDisplayUnavailable> {
+    let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
+    if !super::source_object_rest::validate(store, type_id).map_err(|_| invalid())? {
+        return Ok(None);
+    }
+    let structured = record.data().structured().ok_or_else(invalid)?;
+    let index_infos = structured.index_infos.as_deref().unwrap_or_default();
+    if index_infos.is_empty() {
+        return Ok(None);
+    }
+    let properties = structured
+        .properties
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|property| {
+            validated_property(
+                store,
+                host,
+                global_types,
+                type_id,
+                StructuralObjectProof::Synthetic,
+                *property,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut indexes = Vec::with_capacity(index_infos.len());
+    for index in index_infos {
+        let info = store.index_info(*index).ok_or_else(invalid)?;
+        let parameter_name = match info.declaration() {
+            None => "x".to_owned(),
+            Some(declaration) => {
+                let host = host.ok_or(TypeDisplayUnavailable::UnsupportedType {
+                    type_id,
+                    kind: record.data().kind(),
+                })?;
+                let node = host.node(declaration).ok_or_else(invalid)?;
+                let NodeData::IndexSignatureDeclaration(index) = &node.data else {
+                    return Err(invalid());
+                };
+                let [parameter] = index.parameters.nodes.as_slice() else {
+                    return Err(invalid());
+                };
+                let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+                let parameter_node = host.node(parameter).ok_or_else(invalid)?;
+                let NodeData::ParameterDeclaration(parameter_data) = &parameter_node.data else {
+                    return Err(invalid());
+                };
+                let name = NodeRef::new(declaration.arena, declaration.file, parameter_data.name);
+                let name_node = host.node(name).ok_or_else(invalid)?;
+                let NodeData::Identifier(name) = &name_node.data else {
+                    return Err(invalid());
+                };
+                if node.kind != SyntaxKind::IndexSignature
+                    || parameter_node.kind != SyntaxKind::Parameter
+                    || parameter_node.parent != Some(declaration.node)
+                    || name_node.kind != SyntaxKind::Identifier
+                    || name_node.parent != Some(parameter.node)
+                {
+                    return Err(invalid());
+                }
+                name.text.clone()
+            }
+        };
+        indexes.push(SourceIndexOnlyDisplay {
+            parameter_name,
+            key_type: info.key_type(),
+            value_type: info.value_type(),
+            readonly: info.is_readonly(),
+        });
+    }
+    Ok(Some(SourceObjectDisplay {
+        properties,
+        indexes,
+    }))
+}
+
 /// Reads only objects authenticated by the computed-name publisher and its derived caches.
 fn validated_source_computed_object_display(
     store: &CanonicalTypeMapperStore,
@@ -1741,7 +1844,7 @@ fn validated_source_computed_object_display(
     global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     record: &TypeRecord,
-) -> Result<Option<SourceComputedObjectDisplay>, TypeDisplayUnavailable> {
+) -> Result<Option<SourceObjectDisplay>, TypeDisplayUnavailable> {
     let TypeData::Object(object) = record.data() else {
         return Ok(None);
     };
@@ -1812,7 +1915,7 @@ fn validated_source_computed_object_display(
             readonly: info.is_readonly(),
         });
     }
-    Ok(Some(SourceComputedObjectDisplay {
+    Ok(Some(SourceObjectDisplay {
         properties,
         indexes,
     }))
@@ -1884,12 +1987,12 @@ fn source_computed_index_value_is_scalar(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn display_source_computed_object(
+fn display_source_object(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
     global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
-    object: &SourceComputedObjectDisplay,
+    object: &SourceObjectDisplay,
     flags: CanonicalTypeFormatFlags,
     state: &mut DisplayState,
     visiting: &mut HashSet<TypeId>,
