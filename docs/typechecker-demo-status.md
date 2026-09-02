@@ -13,7 +13,9 @@ the full Rust or TypeScript test suite.
 All 474 earlier tests remain. Four earlier failures now pass and no earlier
 pass failed. The ten new tests have seven passes and three failures. Both
 named-constructor tests pass. Five of eight deferred-const tests pass.
-Their separate diagnosis is complete. Source repairs are in progress.
+Their separate diagnosis is complete. The parameterized function-expression
+repair is committed and source-reviewed. The explicitly typed arrow repair
+is in final source review. Neither repair has a new test result.
 
 The ordinary compiler build passed and its result review is closed. The
 separate loop repair passed 14 of 20 tests, with six existing failures fixed
@@ -28,7 +30,7 @@ project acceptance. The last valid census also completed zero roots.
 | Measurement | Latest result |
 | --- | --- |
 | [Pathe census 8](../target/wave202-pathe-demo-census-8-result.md), `41599a0f` | Raw records show all nine roots attempted: zero complete, eight unsupported, one internal checker error. The ordinary attempt also fails. The measured oracle stage took 22.259 seconds. Evidence validation failed on trace JSON. The review of that failed result and the separate resource check are closed. |
-| [Combined tests 9](../target/wave202-pathe-demo-tests-9-result.md), `27b71eed` | All four compile commands and all four test-list commands pass. All 484 tests ran: 404 pass, 80 fail, none unrun. The independent result review is closed and the separate resource check is pending. The earlier Tests8 result remains 393/474. |
+| [Combined tests 9](../target/wave202-pathe-demo-tests-9-result.md), `27b71eed` | All four compile commands and all four test-list commands pass. All 484 tests ran: 404 pass, 80 fail, none unrun. The independent result review and separate resource check are closed. The earlier Tests8 result remains 393/474. |
 | [Ordinary compiler build 9](../target/wave202-pathe-demo-bin-9-main-result.md), `27b71eed` | Build passed in 78.975 seconds. The result review and separate resource check are closed. A build is not a TypeScript project pass. |
 | [Pathe census 6](../target/wave202-pathe-demo-census-6-result.md), `5f7ad5e3` | Last valid census. All nine original roots attempted: zero complete, eight unsupported, one internal checker error. All 277 loaded files parse. The ordinary project check also fails. |
 | [Focused condition tests](../target/wave202-pathe-logical-condition-registry-focus-5-result.md), `65612688` | Compile and listing passed. All eight tests ran. Seven pass, including the new condition test. The original Pathe normalizer still fails with `FunctionBody`. |
@@ -82,13 +84,13 @@ a missing checker step. Private test expectations stay unchanged.
 | Proxy handler in `src/index.ts` | The object-method start repair is committed as `6d6125fb`. Its six public tests still fail, now with interface or construct-signature errors. The separate conditional-return repair is committed and source-reviewed as `1724e7e`. It has no test result yet and is not in the current combined candidate. |
 | Import aliases in three test files | The new traces record missing alias links for `it` and `describe`. Check import preparation before source planning. Use the canonical resolver on demand, preserve unused-import and cycle behavior, and do not substitute fallback types. |
 | `new Set(...)` in `src/utils.ts` | The trace stops at an unsupported computed member during named constructor planning, before generic argument inference. Computed-interface preparation is committed and source-reviewed as `ad359016`, with four new public tests. No runtime result is available. This repair is not in the current combined candidate. |
-| Variable reference in `src/_path.ts` | The measured identifier is `isAbsolute` inside `normalize`'s function body. Its constant declaration is later in the file. The deferred-const repair `e72fc057` passes five of eight new tests. The [followup diagnosis](../target/wave202-pathe-deferred-const-followup.md) identifies one wrong test-helper return and two source admission gaps. Explicitly typed arrows and parameterized function calls now have separate repair workers. Keep all original TS inputs and assertions. |
-| Counted loop in `src/_glob.ts` | The combined tuple-selection and call-argument repairs in `a299834b` pass twelve of the original 18 tests, up from six. Both new tuple tests also pass. Six failures remain. The binary-index repair `4b2f6c7d` and ForOf flow-query repair `8e5f70de` are now committed and source-reviewed, but unrun. The remaining scalar guard needs demand-driven Array property typing. |
+| Variable reference in `src/_path.ts` | The measured identifier is `isAbsolute` inside `normalize`'s function body. Its constant declaration is later in the file. The deferred-const repair `e72fc057` passes five of eight new tests. The [followup diagnosis](../target/wave202-pathe-deferred-const-followup.md) identifies one wrong test-helper return and two source admission gaps. The parameterized function-expression repair is committed as `24f02b24`. The typed-arrow repair is in final review. Both retain the original TS inputs and assertions. Neither has a new test result. |
+| Counted loop in `src/_glob.ts` | The combined tuple-selection and call-argument repairs in `a299834b` pass twelve of the original 18 tests, up from six. Both new tuple tests also pass. Six failures remain. Binary-index repair `4b2f6c7d`, ForOf flow-query repair `8e5f70de` and Array property repair `57152815` are committed and source-reviewed. They have no new test result. |
 | `throw new Error(...)` in `test/glob.spec.ts` | Both public tests for the named-constructor repair `bd4d8e5e` pass in the combined build, including the numeric-argument diagnostic. A fresh Pathe run must show its effect on the actual project. Set has a different cause. |
 | Generic call-signature defaults | The corrected source `130590cb` passes seven of eleven unchanged tests. Two Tests8 failures now pass. The remaining copied-signature query repair is committed and source-reviewed as `12645582`. It uses the existing canonical query and preserves its validators. This new commit has not run. |
 | Computed object properties | The five-test run at `2031276b` failed all five tests. Binary and call value checking is now committed and source-reviewed as `5817ce00`. It keeps key checks first. Separate failure-only cache observation is committed as `a63b3f51`. Neither new commit has run. No cache guard was removed. |
 | Original normalizer | The original function still fails with `FunctionBody` in Tests8. Failure-only observation is committed and source-reviewed as `ae476350`. It has not run. Retain the original source and passing condition control. A focused fixture is not a complete Pathe root. |
-| Census evidence reader | The classifier's source review and six named tests are closed and passing. The new Census9 evidence program has passed static review and remains disabled. It preserves all log records and hashes the actual loaded bytes. The old invalid result stays unchanged. A fresh census still needs the new build and run records. |
+| Census evidence reader | The classifier's source review and six named tests are closed and passing. The Census9 evidence program preserves all log records and hashes the actual loaded bytes. Its build and test prerequisites are closed. Final binding and activation reviews now lead directly to the next project run. The old invalid result stays unchanged. |
 
 The [474-test selection](../target/wave202-pathe-demo-tests-8-selection.canonical.tsv)
 retains all 465 old tests and adds nine. Tests8 ran every selected test. Keep this
@@ -116,16 +118,24 @@ workers and output directories. Separate focused runs are not required for
 every input. Set, the new Proxy repair, loops and aliases are excluded from
 this frozen candidate. They must not delay its next Pathe measurement.
 
-The [next combined repair plan](../target/wave202-pathe-next-repair-union-plan.md)
-keeps all 484 tests and adds twelve, for 496 tests in 45 groups. One writer and
-one independent reviewer are combining the closed Set, Proxy, computed-value,
-generic-signature and loop changes, with the failure-only records. Build and
-test preparation proceed separately. This new candidate has no runtime result.
+The [next combined repair](../target/wave202-pathe-repair-union-2-handoff.md)
+is committed as `c9258a43`. Source, staged and immutable reviews are closed.
+It keeps all 484 tests and adds twelve, for 496 tests in 45 groups. It combines
+the Set, Proxy, computed-value, generic-signature and loop changes, with the
+failure-only records. Build and test preparation proceed separately under
+their reviewed run contracts. This new candidate has no runtime result.
 It replaces the older blocked 480-test join proposal. New Array property,
 Array-to-Iterable, alias and loop followups stay outside this fixed batch.
 Counted loops inside object methods remain an untested combination.
 Measure progress by completed checks and retained diagnostics, not worker count
 or the number of commits.
+
+Later source-reviewed repairs include Array-to-Iterable member preparation
+`eb8239db`, Array property reads `57152815`, generic method parameter types
+`95ef2a11` and parameterized function expressions `24f02b24`. They are not part
+of the fixed 496-test batch. A separate combined-source plan will retain that
+batch and add their four new tests. This preparation does not delay the
+current project, build or test runs.
 
 ## Demo pass conditions
 
