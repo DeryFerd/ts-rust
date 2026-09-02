@@ -594,6 +594,13 @@ pub enum SourceCheckError {
     MissingDiagnostic(u32),
 }
 
+pub(super) fn source_union_property_error(
+    node: NodeRef,
+    error: super::member_resolution::UnionPropertyError,
+) -> SourceCheckError {
+    SourcePlanner::property_plan_error(node, SourcePropertyError::Union { node, error })
+}
+
 #[derive(Clone, Copy)]
 enum LoopFailureSource<'a, 'sources> {
     Bound {

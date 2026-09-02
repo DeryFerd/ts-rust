@@ -443,16 +443,16 @@ pub(super) fn resolve_source_union_property(
     union: TypeId,
     name: &str,
 ) -> Result<Option<ResolvedUnionProperty>, SourceCheckError> {
-    let error = |error| super::source_properties::SourcePropertyError::Union { node, error };
+    let error = |error| super::source::source_union_property_error(node, error);
     let targets = CanonicalArrayTargets::from_global_types(global_types);
     let record = store
         .type_payload(union)
         .ok_or_else(|| error(UnionPropertyError::InvalidUnion(union)))?;
     let TypeData::Union(data) = record.data() else {
-        return Err(error(UnionPropertyError::UnsupportedUnion(union)).into());
+        return Err(error(UnionPropertyError::UnsupportedUnion(union)));
     };
     if data.union.types.len() != 2 {
-        return Err(error(UnionPropertyError::UnsupportedUnion(union)).into());
+        return Err(error(UnionPropertyError::UnsupportedUnion(union)));
     }
     let constituents = data.union.types.clone();
     let alias = record
@@ -482,7 +482,7 @@ pub(super) fn resolve_source_union_property(
                 constituent,
             )?;
             if resolved != constituent {
-                return Err(error(UnionPropertyError::InvalidUnion(union)).into());
+                return Err(error(UnionPropertyError::InvalidUnion(union)));
             }
         }
     }
@@ -496,7 +496,7 @@ pub(super) fn resolve_source_union_property(
     .map_err(error)?;
     store
         .resolve_union_property_plan(&plan, Some(global_types), Some(session))
-        .map_err(|cause| error(cause).into())
+        .map_err(error)
 }
 
 fn plan_union_property(
