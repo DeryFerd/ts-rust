@@ -2398,6 +2398,10 @@ impl SourcePropertyPlan {
         self.name_node
     }
 
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
     pub(super) fn is_call_callee_for(&self, call: NodeRef, name: NodeRef) -> bool {
         self.name_node == name && self.position == SourcePropertyPosition::CallCallee(call)
     }

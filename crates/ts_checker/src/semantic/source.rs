@@ -39184,7 +39184,7 @@ fn check_expression_type_with_capture_context(
                 })
                 .and_then(|owner| store.symbol(owner).and_then(|record| record.exports()))
                 .and_then(|exports| store.symbol_table(exports))
-                .and_then(|exports| exports.get_source(&property.name))
+                .and_then(|exports| exports.get_source(property.name()))
                 .and_then(|member| store.get_merged_symbol(member))
                 .filter(|member| {
                     store.symbol(*member).is_some_and(|record| {
