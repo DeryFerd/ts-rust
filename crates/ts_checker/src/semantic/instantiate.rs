@@ -3612,6 +3612,12 @@ fn instantiated_member_type_matches_worker(
                 .map(|expected| expected == Some(actual))
         }
         TypeData::Object(_) if store.type_has_function_type_provenance(template) => {
+            // Member copies keep their source-owner proof even when the same
+            // function shape is also supported by the general instantiator.
+            let general_function_copy = actual == template
+                || store.type_payload(actual).is_some_and(|record| {
+                    record.object_flags().contains(ObjectFlags::INSTANTIATED)
+                });
             if generic_function_alias_projection(store, template)
                 .map_err(|error| closed_mapping_identity_error(template, error))?
                 .is_some()
@@ -3634,7 +3640,9 @@ fn instantiated_member_type_matches_worker(
                     mapper,
                     array_targets,
                 ))
-            } else if function_instantiation_shape(store, template).is_ok() {
+            } else if general_function_copy
+                && function_instantiation_shape(store, template).is_ok()
+            {
                 cached_function_instantiation(
                     store,
                     template,
