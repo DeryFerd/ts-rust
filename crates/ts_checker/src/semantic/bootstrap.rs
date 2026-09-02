@@ -2697,12 +2697,83 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
+        let mut stage = "entry";
+        let result = self.validate_cached_array_capability_observed_step(
+            type_,
+            array_validation,
+            visited,
+            allowed_pending,
+            &mut stage,
+        );
+        if matches!(&result, Err(LiteralTypeCacheError::InvalidCachedUnion(failed)) if *failed == type_)
+        {
+            self.trace_cached_array_validation_failure(type_, stage);
+        }
+        result
+    }
+
+    /// Temporary failure-only trace. Do not repeat a child's error at ancestor types.
+    fn trace_cached_array_validation_failure(&self, type_: TypeId, stage: &str) {
+        use std::io::Write;
+
+        let record = self.type_payload(type_);
+        let (kind, target, arguments, constituents) = match record.map(TypeRecord::data) {
+            Some(TypeData::TypeReference(reference)) => (
+                "reference",
+                reference.object.target,
+                reference
+                    .resolved_type_arguments
+                    .as_deref()
+                    .unwrap_or_default(),
+                &[][..],
+            ),
+            Some(TypeData::Union(union)) => ("union", None, &[][..], union.union.types.as_slice()),
+            Some(TypeData::Interface(_)) => ("interface", None, &[][..], &[][..]),
+            Some(TypeData::Object(_)) => ("object", None, &[][..], &[][..]),
+            Some(TypeData::TypeParameter(_)) => ("parameter", None, &[][..], &[][..]),
+            Some(_) => ("other", None, &[][..], &[][..]),
+            None => ("missing", None, &[][..], &[][..]),
+        };
+        let symbol = record.and_then(TypeRecord::symbol);
+        let owner = symbol.and_then(|symbol| self.symbol(symbol));
+        let declaration = owner.and_then(|owner| owner.declarations()?.first()).copied();
+        let mut bytes = [0u8; 1024];
+        let length = {
+            let mut output = &mut bytes[..1023];
+            let _ = write!(
+                output,
+                "ts-rust-array-cache stage={stage} kind={kind} type={type_:?} flags={:?} object_flags={:?} owner_name={:?} symbol={symbol:?} owner_flags={:?} declaration={declaration:?} declaration_kind={:?} target={target:?} argument_count={} arguments={:?} constituent_count={} constituents={:?}",
+                record.map(TypeRecord::flags),
+                record.map(TypeRecord::object_flags),
+                owner.and_then(|owner| owner.name().as_utf8()),
+                owner.map(|owner| owner.flags()),
+                declaration.and_then(|declaration| self.source_node_kind(declaration)),
+                arguments.len(),
+                &arguments[..arguments.len().min(3)],
+                constituents.len(),
+                &constituents[..constituents.len().min(4)],
+            );
+            1023 - output.len()
+        };
+        bytes[length] = b'\n';
+        let _ = std::io::stderr().lock().write_all(&bytes[..=length]);
+    }
+
+    fn validate_cached_array_capability_observed_step(
+        &self,
+        type_: TypeId,
+        array_validation: UnionArrayValidation<'_>,
+        visited: &mut CachedArrayWalk<'_>,
+        allowed_pending: &HashSet<TypeId>,
+        stage: &mut &'static str,
+    ) -> Result<(), LiteralTypeCacheError> {
         if !visited.visited.insert(type_) {
             return Ok(());
         }
         let Some(record) = self.type_payload(type_) else {
             return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
         };
+        *stage = "class_annotation_scope";
         if let Some(targets) = super::classes::source_class_annotation_scope_targets(self, type_) {
             return if array_validation.targets() == Some(targets) {
                 Ok(())
@@ -2710,6 +2781,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
             };
         }
+        *stage = "class_edges";
         if let Some(edges) = super::classes::class_instance_type_edges(self, type_)
             .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?
         {
@@ -2723,6 +2795,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             return Ok(());
         }
+        *stage = "source_interface_edges";
         if let Some(source_interfaces) = visited.source_interfaces
             && let Some(edges) = source_interfaces(type_)?
         {
@@ -2736,6 +2809,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             return Ok(());
         }
+        *stage = "tuple_or_reference";
         match record.data() {
             TypeData::Tuple(_) => self.validate_supported_canonical_tuple(
                 type_,
@@ -2770,6 +2844,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
             }
             TypeData::Union(data) => {
+                *stage = "union_metadata";
                 self.validate_union_structure(type_)?;
                 for constituent in &data.union.types {
                     self.validate_cached_array_capability_worker(
@@ -2792,6 +2867,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Ok(())
             }
             TypeData::Intersection(_) => {
+                *stage = "intersection_metadata";
                 if self
                     .primitive_empty_intersection_type(type_)
                     .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?
@@ -2810,6 +2886,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Ok(())
             }
             TypeData::Object(_) | TypeData::Interface(_) => {
+                *stage = "interface_condition_edges";
                 if let Some(edges) = self.source_interface_condition_identity_edges(
                     type_,
                     array_validation,
@@ -2826,6 +2903,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     return Ok(());
                 }
+                *stage = "native_interface_edges";
                 if let TypeData::Interface(interface) = record.data()
                     && let Some(edges) = self.native_global_heritage_interface_edges(
                         type_,
@@ -2846,6 +2924,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     return Ok(());
                 }
+                *stage = "object_getter_edges";
                 if let Some(edges) = object_members::object_literal_getter_object_edges(
                     self,
                     type_,
@@ -2867,6 +2946,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     return Ok(());
                 }
+                *stage = "object_alias_edges";
                 if let Some(edges) =
                     self.property_object_alias_type_edges(type_, array_validation.targets())?
                 {
@@ -2921,6 +3001,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         if object.structured.signatures.is_some()
                             || object.structured.call_signature_count != 0
                 );
+                *stage = "stored_callable_set";
                 match validate_stored_callable_set(self, type_) {
                     StoredCallableSetValidation::Valid { edges, .. } => {
                         for edge in edges {
@@ -2948,6 +3029,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     StoredCallableSetValidation::NotCallable => {}
                 }
+                *stage = "interface_heritage_edges";
                 if let TypeData::Interface(interface) = record.data()
                     && self.direct_interface_heritage_provenance(type_).is_some()
                 {
@@ -3028,6 +3110,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         }
                     }
                 }
+                *stage = "declared_property_graph";
                 match object_members::validate_resolved_declared_property_type_graph(self, type_) {
                     object_members::DeclaredPropertyTypeGraphValidation::Traversable(
                         property_types,
