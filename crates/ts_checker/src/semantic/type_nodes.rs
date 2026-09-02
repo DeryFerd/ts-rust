@@ -42749,6 +42749,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 continue;
             };
             let default_type = self.execute_type_node(default_node, plan, prepared)?;
+            self.publish_type_alias_parameter_default(symbol, *parameter, default_type)?;
             if parameter.constraint.is_some() {
                 let type_parameter = execute_type_parameter(self.store, parameter.symbol);
                 if cached_ordinary_type_parameter_owner(self.store, type_parameter)
@@ -42786,6 +42787,61 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     graph.as_ref(),
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    /// Stores the declaration's default before argument substitution.
+    fn publish_type_alias_parameter_default(
+        &mut self,
+        alias: SemanticSymbolId,
+        parameter: PlannedTypeParameter,
+        default_type: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(alias));
+        let declaration = type_alias_declaration(self.store, alias).ok_or_else(invalid)?;
+        let default_node = parameter.default_type.ok_or_else(invalid)?;
+        let annotations = self
+            .store
+            .source_alias_type_parameter_annotations(parameter.declaration)
+            .ok_or_else(invalid)?;
+        if annotations.constraint != parameter.constraint
+            || annotations.default_type != Some(default_node)
+            || self.store.source_declaration_symbol(parameter.declaration) != Some(parameter.symbol)
+            || self.store.source_node_parent(parameter.declaration)
+                != Some(SourceNodeParent::Parent(declaration))
+            || self.store.source_node_parent(default_node)
+                != Some(SourceNodeParent::Parent(parameter.declaration))
+        {
+            return Err(invalid());
+        }
+        let type_parameter = execute_type_parameter(self.store, parameter.symbol);
+        if cached_ordinary_type_parameter_owner(self.store, type_parameter) != Some(parameter.symbol)
+        {
+            return Err(invalid());
+        }
+        let Some(TypeData::TypeParameter(data)) = self
+            .store
+            .type_payload(type_parameter)
+            .map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        let constraint = data.constraint;
+        let target = data.target;
+        let mapper = data.mapper;
+        let current = data.resolved_default_type;
+        if current.is_some_and(|current| current != default_type)
+            || current.is_none()
+                && !self.store.set_type_parameter_resolution(
+                    type_parameter,
+                    constraint,
+                    target,
+                    mapper,
+                    Some(default_type),
+                )
+        {
+            return Err(invalid());
         }
         Ok(())
     }
@@ -51046,6 +51102,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             if let Some(recovered) = self.source_query_recovery_since(source_limit_mark)? {
                 return Ok(recovered);
             }
+            self.publish_type_alias_parameter_default(symbol, *parameter, default_type)?;
             let default_type = if let Some(operand) = plan.source_alias_operands.get(&default_node)
             {
                 self.instantiate_source_alias_operand(
