@@ -4,108 +4,95 @@ Updated 2026-09-02. Neither Query nor Hono has passed a full Rust type check.
 
 ## Latest Query and Hono checkpoint
 
-Completed project checks have stalled. The latest runs did not add a completed
-root. Some failures changed, but that does not make the demo ready.
+Project completion has stalled. The latest complete candidate also lost one
+previously completed Hono root. It is not ready for a demo.
 
 | Project | Completed isolated roots | Unsupported | Internal errors | Original policy skip |
 | --- | ---: | ---: | ---: | ---: |
 | Query core | 1 of 23 | 22 | 0 | 0 |
-| Hono | 32 of 188 | 151 | 4 | 1 |
+| Hono | 31 of 188 | 143 | 13 | 1 |
 
+These runs use `c1d1950c52f00bfadf07f008650033d71a4a5502`.
 An isolated root is one original project entry file checked on its own.
-These counts do not prove a full project pass or diagnostic parity.
-Both runs kept the original roots, loaded files, options and libraries.
-Neither run had load diagnostics.
+The counts do not prove a full project pass or diagnostic parity. Both runs
+kept the original roots, loaded files, options and libraries. Both had zero
+load diagnostics.
 
-Both latest project runs use `1be4b3e0d4baa35ba70ea165e4b05428eed2420e`.
+[Query census 13](../target/wave202-query-combined-census-13-result.md)
+has no new completed root. Eight roots now get past the earlier shared call
+and stop at the returned arrow in `subscribable.ts`. The ordinary check
+remains unsupported.
 
-[Query census 11](../target/wave202-query-combined-census-11-result.md)
-still stops at an unsupported identifier in `timeoutManager.ts` during the
-ordinary check. Query 10 got past the earlier Node timer overload.
-In Query 11, three isolated roots now report unavailable alias resolution
-instead of the previous call failure. No additional root completes.
-The new errors have no supported typed-node location.
+[Hono census 13](../target/wave202-hono-combined-census-13-result.md)
+dropped from 32 complete roots to 31. `adapter/aws-lambda/types.ts` now
+fails on its generic callback parameter. Internal errors rose from 4 to 13.
+The new shared errors occur in ConnInfo imports and JWT interface heritage.
+All original root attempts completed. Both project processes are closed.
 
-[Hono census 11](../target/wave202-hono-combined-census-11-result.md)
-also has no new completed root. One unsupported error became an internal error.
-The ordinary check and `http-exception.ts` now stop at
-`DeclarationSymbolMismatch` in an interface in Node's `url.d.ts`.
-All other 187 root outcomes match Hono 10. This is not a result to count as a win.
+### What the tests prove
 
-Both project processes and their services are closed.
+[Combined tests 22](../target/wave202-query-hono-combined-tests-22-result.md)
+compiled all 50 targets and ran 144 tests: 112 passed and 32 failed.
 
-### Verified test progress
+Three existing named-reexport tests improved. Six previously passing tests
+changed unexpectedly. Source review identified five checker regressions:
+two contextual-parameter tests and three generic-lambda tests. The sixth
+expects an unsupported result for an explicit-`this` declaration that now
+has valid support. Its same-TypeScript test correction is kept separate.
 
-[Combined tests 20](../target/wave202-query-hono-combined-tests-20-result.md)
-compiled all 44 targets and ran all 127 tests. It passed 109 and failed 18.
+Three constructor tests also pass after a test-helper correction. That is
+not a checker gain. Ten additions to this combined test set pass two and
+fail eight. Four are the same Bind tests already measured separately.
 
-- All 122 earlier tests have unchanged outcomes: 106 passed and 16 failed.
-- Five new tests pass three and fail two.
-- The three ambient-import tests pass. Both class-predicate tests fail.
+The next two combined attempts did not run tests:
 
-This batch fixed no existing test. The preceding batch fixed two existing
-tests, for abstract private-field narrowing and numeric default calls.
-New passing tests must stay separate from fixes to earlier failures.
+- [Tests 23](../target/wave202-query-hono-combined-tests-23-result.md)
+  failed compilation because a new error path used a missing conversion.
+- [Tests 24](../target/wave202-query-hono-combined-tests-24-result.md)
+  failed compilation because the new Promise test called a private method.
 
-Several negative tests still stop before their expected native diagnostic.
-They are failures, not evidence of correct error checking.
+All 152 selected tests remain unrun for those attempts. Query 14 and Hono 14
+were not launched. These build fixes cannot be counted as typechecker gains.
 
-Tests 18 failed to compile because its new helper used two nonexistent AST
-variants. All 122 tests were unrun. Fixing that helper is not a checker gain.
+[Bind tests 25](../target/wave202-query-class-method-bind-tests-25-result.md)
+still pass one of four on the older isolated branch. Further Bind diagnosis
+will use the combined candidate, which includes the newer tuple and
+function-cache changes. The same four tests are in the combined test set.
 
-[Bind tests 20](../target/wave202-query-class-method-bind-tests-20-result.md)
-passed one of four unchanged tests. Both the strict-option and bad-argument
-tests now get through source checking and fail at a later public library
-query. Prefix inference also remains unsupported. The bind feature is not
-yet passing. Its process and service are closed.
+### Why progress slowed
 
-### Why work slowed
+The new general function instantiator claimed valid generic-alias and
+property-function copies before their existing readers could validate them.
+This broke already working paths. The repairs must preserve each copy's
+source declaration, mapper, parameter types and cache checks.
 
-Several checker paths accept a feature at one stage and reject it at the next.
-For example, the expression planner rejects local `new Set(...)` and
-`new Promise<T>(...)` before constructor selection because their variable
-statements belong to a function block instead of the source file.
-
-Returned async function expressions have separate restrictions in source
-planning, contextual typing, statement checking and return publication.
-Changing only the first restriction leaves the same real code unsupported.
-
-Some type queries also demand too much work. A declared-interface identity
-query currently checks all members. The pinned Go checker keeps those member
-checks lazy. Other cache checks reject valid state produced by earlier queries.
-These defects need consistent changes to the producer and its consumers.
-
-The work units now cover complete behavior across these stages. Each has one
-source writer and one paired test writer or reviewer in a separate worktree.
-
-| Active work unit | Direct reason |
-| --- | --- |
-| Shared ordinary callable body planning | Local constructors and returned named async handlers |
-| Generic bind and variadic inference | Eight Query roots still stop at the shared bind call |
-| Named re-export resolution | Eight Hono adapter roots stop at the imported callable type |
-| Imported augmentation heritage | Hono context extensions cannot resolve imported bases |
-| Generic destructured defaults | Query's streamed-query parameter needs its real union context |
-| Object constructor defaults | QueryClient's empty-object default enters a Date-only path |
-| Generic member cache consistency | Valid earlier property reads fail later member publication |
-
-The bind work also needs integration into the combined project candidate.
-Its separate test progress has not yet reached the Query project run.
-The required commit sequence is mapped. A separate integration worker now
-owns that work, with one reviewer. Root retains runtime and acceptance decisions.
+Other features still stop in different checking stages. The shared Query
+arrow needs both its class-method return context and the real lexical
+`this` during body checking. Fixing only its syntax admission is not enough.
+Code reviews and commits have outpaced successful combined runs.
 
 ### Next checkpoint
 
-Tests 20, Query 11, Hono 11 and Bind 20 are all closed.
-Their results above are the current measurements.
+The next candidate has reviewed fixes for both function-cache regressions.
+It also includes the callable-body, generic-default, Promise and Set-cache
+work. Its existing tests must run before any gain is claimed.
 
-The next candidate needs the existing bind fixes and the newly reviewed
-constructor-default, lazy interface-identity and generic member-cache fixes.
-The new Hono declaration mismatch and class-predicate flow failures have
-specific diagnosis owners. Do not count reviewed commits as passing tests.
+The direct project priorities are:
 
-No checker repair batch is accepted on primary yet. Acceptance still requires
+1. Restore the five checker tests and the lost Hono root.
+2. Finish the returned class-method arrow shared by eight Query roots.
+3. Fix the ConnInfo import-cache checks and preserve the real unsupported
+   cause in JWT heritage. Generic alias heritage support is a separate repair.
+4. Measure generic defaults, local constructors and returned async Hono
+   handlers against real types and native error controls.
+
+Generic `implements` support for Hono routers is reviewed but not measured.
+Query's `WithRequired` and Hono's `Omit` heritage remain under repair.
+Each feature has one source writer and one paired reviewer in its own worktree.
+
+No checker repair batch is accepted on primary. Acceptance still requires
 the unchanged corpus comparison, broader checks and removal of temporary
-traces. A full demo must finish the ordinary project check with the original
+traces. A demo must finish the ordinary project check with the original
 config and libraries, then match the pinned Go checker's diagnostics.
 
 ## Earlier Query and Hono checkpoint
