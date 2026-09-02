@@ -45,9 +45,10 @@ imported JWT context, returned class callbacks and cache replay still fail.
 Checker-library run 3 ran the same 5,437 tests as run 2. It passed 5,069 and
 failed 368, with no ignored or filtered tests. All 366 old failures remain, and
 two old passes now fail. Their complete snapshots differ only in map display
-order. Both maps keep the same keys and values. The cause of the order change
-and the snapshot contract still need checking. No lost type information is
-visible in those two failures.
+order. Both maps keep the same keys and values. Production review confirms
+that both fields use unordered HashMaps with unsorted Debug output. The cause
+of the order change and the snapshot contract still need checking. No lost
+type information is visible in those two failures.
 
 A [comparison with the accepted checkpoint](../target/wave202-query-hono-library2-accepted-name-comparison.md)
 also found that 225 of run 2's failures had the same names passing before.
@@ -69,13 +70,16 @@ closed. Their results are recorded above.
 
 Run 40 also failed compilation before any tests ran. Two call-signature uses
 had not been updated after the receiver-predicate change made a symbol optional.
-All 179 tests remain unrun. The two-use repair is prepared for the next run.
+All 179 tests remain unrun. The two-use repair passed review and is committed.
+Run 41 is released on the repaired source at
+`6e7ceab343667c503a623638a82c17565b972e3f`. It keeps all 64 targets and 179 tests.
+No result is available yet.
 
 Each source repair has one writer, one reviewer and an isolated worktree.
-One separate pair now combines ready changes while the runtime owners run
-the tests. Root releases the runs and checks their results. Thirteen reviewed
-fixes are combined and have passed the final combined source review. The build
-repair must pass before their 64 targets and 179 tests can run.
+One separate pair combined the ready changes and reviewed the complete result.
+Runtime owners now check that source. Root releases the runs and checks their
+results. Thirteen reviewed fixes are combined. The repaired build must pass
+before their 64 targets and 179 tests can run.
 
 The next candidate adds async callback identity, Node timer bases, generic
 defaults, JWT annotations, receiver predicates and array destructuring inside
@@ -91,6 +95,9 @@ that all seven roots pass.
 Query is the next demo target. Run its original census after the combined test
 build passes. For Hono, first measure the repeated planning work and record the
 exact ownership-error origin. The saved logs do not yet prove either cause.
+One pair is adding those bounded observations in a separate worktree. Another
+pair checks zero-argument class-call conditions in Query's focus and online
+managers, including `if (!this.hasListeners())`.
 
 No repair batch is accepted on primary. The unchanged corpus, broader tests
 and removal of temporary error traces still apply.
