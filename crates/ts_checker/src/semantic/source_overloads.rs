@@ -117,7 +117,8 @@ impl SourceNamespaceAmbientOverloadPlan {
 #[derive(Clone, Debug)]
 pub(super) struct ResolvedSourceOverloadSignature {
     pub(super) query_evidence: Option<Arc<SourceCallableTypeQueryEvidence>>,
-    pub(super) parameter_types: Vec<TypeId>,
+    /// Base types and optional fresh default literal identities, in source order.
+    pub(super) parameter_types: Vec<(TypeId, Option<TypeId>)>,
     pub(super) return_type: TypeId,
 }
 
@@ -891,7 +892,15 @@ fn plan_source_overload_group(
     }
     if !global_namespace
         && plans.iter().any(|plan| !plan.type_parameters.is_empty())
-        && plans.iter().any(|plan| plan.type_parameters.len() != 1)
+        && plans.iter().any(|plan| {
+            plan.type_parameters.len() != 1
+                && !(plan.type_parameters.is_empty()
+                    && implementation.is_some_and(|implementation| {
+                        implementation.declaration == plan.declaration
+                            && implementation.body == plan.body
+                            && plan.body_mode == SourceCallableBodyMode::Present
+                    }))
+        })
     {
         return Err(SourceOverloadError::Unsupported(first));
     }
@@ -996,7 +1005,7 @@ pub(super) fn prepare_source_overload_publication(
         .declarations
         .iter()
         .flat_map(|declaration| &declaration.parameters)
-        .filter(|parameter| parameter.optional)
+        .filter(|parameter| parameter.optional || parameter.has_string_default_type())
         .count();
     let mut prepared_types = store.prepare_type_query_types_with_global_types(
         &[],
@@ -1058,11 +1067,35 @@ pub(super) fn prepare_source_overload_publication(
                 }
             };
         let mut parameters = Vec::with_capacity(declaration.parameters.len());
-        for (parameter, base_type) in declaration.parameters.iter().zip(&resolved.parameter_types) {
+        for (parameter, (base_type, fresh)) in
+            declaration.parameters.iter().zip(&resolved.parameter_types)
+        {
             let (annotation, annotation_null_literal_identity) = parameter.annotation_identity();
-            if cached_annotation_identity(store, annotation, annotation_null_literal_identity)
-                != Some(*base_type)
-            {
+            let default_parameter = fresh.map(|fresh| (*parameter, fresh));
+            let type_is_exact = match default_parameter {
+                Some((parameter, fresh)) => {
+                    declaration.type_parameters.is_empty()
+                        && plan.implementation.is_some_and(|implementation| {
+                            implementation.declaration == declaration.declaration
+                                && implementation.body == declaration.body
+                        })
+                        && parameter.default_type_is_exact(
+                            store,
+                            declaration.declaration,
+                            *base_type,
+                            fresh,
+                        )
+                }
+                None => {
+                    !parameter.has_string_default_type()
+                        && cached_annotation_identity(
+                            store,
+                            annotation,
+                            annotation_null_literal_identity,
+                        ) == Some(*base_type)
+                }
+            };
+            if !type_is_exact {
                 return Err(SourceOverloadError::Invariant(
                     SourceOverloadInvariant::Cache(annotation),
                 ));
@@ -1090,7 +1123,8 @@ pub(super) fn prepare_source_overload_publication(
             {
                 return Err(SourceOverloadError::Unsupported(parameter.declaration));
             }
-            let call_type = if strict && parameter.optional {
+            let optional = parameter.optional || default_parameter.is_some();
+            let call_type = if strict && optional {
                 store.literal_union_type_prepared_with_global_types(
                     global_types,
                     &[*base_type, undefined],
@@ -1100,13 +1134,13 @@ pub(super) fn prepare_source_overload_publication(
             } else {
                 *base_type
             };
-            if (parameter.optional
+            if (optional
                 && if strict {
                     !valid_optional_type(store, plan.array_targets, *base_type, call_type)
                 } else {
                     call_type != *base_type
                 })
-                || (!parameter.optional && call_type != *base_type)
+                || (!optional && call_type != *base_type)
             {
                 return Err(SourceOverloadError::Invariant(
                     SourceOverloadInvariant::Cache(parameter.declaration),
@@ -1119,7 +1153,8 @@ pub(super) fn prepare_source_overload_publication(
                 annotation_null_literal_identity,
                 base_type: *base_type,
                 call_type,
-                optional: parameter.optional,
+                optional,
+                default_parameter,
             });
         }
         signatures.push(PreparedSourceOverloadSignature {
@@ -1495,7 +1530,9 @@ fn source_overload_state(
                 || stored.symbol != parameter.symbol
                 || stored.annotation != annotation
                 || stored.annotation_null_literal_identity != null_literal_identity
-                || stored.optional != parameter.optional
+                || stored.optional != (parameter.optional || parameter.has_string_default_type())
+                || stored.default_parameter.map(|(parameter, _)| parameter)
+                    != parameter.has_string_default_type().then_some(*parameter)
             {
                 return Err(SourceOverloadError::Invariant(
                     SourceOverloadInvariant::Cache(parameter.declaration),
@@ -1548,7 +1585,10 @@ fn prepared_matches_plan(
                                 && annotation == prepared.annotation
                                 && null_literal_identity
                                     == prepared.annotation_null_literal_identity
-                                && plan.optional == prepared.optional
+                                && (plan.optional || plan.has_string_default_type())
+                                    == prepared.optional
+                                && prepared.default_parameter.map(|(parameter, _)| parameter)
+                                    == plan.has_string_default_type().then_some(*plan)
                         })
                     && match prepared.return_annotation {
                         Some(_) => {
@@ -1874,6 +1914,7 @@ pub(super) fn validate_stored_source_overload(
             for (parameter, planned) in row.parameters.iter().zip(&plan.parameters) {
                 if parameter.declaration != planned.declaration
                     || parameter.symbol != planned.symbol
+                    || parameter.default_parameter.is_some()
                     || parameter.optional != planned.optional
                     || planned.optional && row_export_local.is_none()
                     || planned.rest && !global_namespace
@@ -1898,6 +1939,33 @@ pub(super) fn validate_stored_source_overload(
             let Some(symbol) = store.symbol(parameter.symbol) else {
                 return StoredSourceOverloadValidation::Malformed;
             };
+            let type_is_exact = match parameter.default_parameter {
+                Some((planned, fresh)) => {
+                    parameter.optional
+                        && row.type_parameters.is_empty()
+                        && provenance.implementation.is_some_and(|implementation| {
+                            implementation.declaration == row.declaration
+                        })
+                        && planned.declaration == parameter.declaration
+                        && planned.symbol == parameter.symbol
+                        && planned.annotation_identity()
+                            == (
+                                parameter.annotation,
+                                parameter.annotation_null_literal_identity,
+                            )
+                        && planned.default_type_is_exact(
+                            store,
+                            row.declaration,
+                            parameter.base_type,
+                            fresh,
+                        )
+                }
+                None => cached_annotation_identity(
+                    store,
+                    parameter.annotation,
+                    parameter.annotation_null_literal_identity,
+                ) == Some(parameter.base_type),
+            };
             if !unique_parameters.insert(parameter.symbol)
                 || symbol.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
                 || symbol.check_flags() != CheckFlags::NONE
@@ -1911,14 +1979,14 @@ pub(super) fn validate_stored_source_overload(
                 || store.source_node_kind(parameter.declaration) != Some(SyntaxKind::Parameter)
                 || store.source_node_parent(parameter.declaration)
                     != Some(SourceNodeParent::Parent(row.declaration))
-                || cached_annotation_identity(
-                    store,
-                    parameter.annotation,
-                    parameter.annotation_null_literal_identity,
-                ) != Some(parameter.base_type)
+                || !type_is_exact
                 || store.value_symbol_links(parameter.symbol)
                     != Some(&ValueSymbolLinks {
-                        resolved_type: Some(parameter.call_type),
+                        resolved_type: Some(if parameter.default_parameter.is_some() {
+                            parameter.base_type
+                        } else {
+                            parameter.call_type
+                        }),
                         ..ValueSymbolLinks::default()
                     })
                 || parameter.optional
@@ -1966,6 +2034,9 @@ pub(super) fn validate_stored_source_overload(
                 return StoredSourceOverloadValidation::Malformed;
             }
             optional_seen |= parameter.optional;
+            if let Some((_, fresh)) = parameter.default_parameter {
+                edges.push(fresh);
+            }
             edges.push(parameter.base_type);
             if parameter.call_type != parameter.base_type {
                 edges.push(parameter.call_type);

@@ -40667,7 +40667,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
 
         let mut base_types = Vec::with_capacity(callable.parameter_count());
         for parameter in callable.all_parameters() {
-            if let Some(type_) = string_default_types.get(&parameter.symbol) {
+            if let Some((type_, _)) = string_default_types.get(&parameter.symbol) {
                 base_types.push(*type_);
                 continue;
             }
@@ -40734,10 +40734,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     }
 
     /// Infers real default expressions before the callable shell is published.
-    fn source_callable_string_default_types(
+    pub(super) fn source_callable_string_default_types(
         &mut self,
         callable: &SourceCallablePlan,
-    ) -> Result<BTreeMap<SemanticSymbolId, TypeId>, DeclaredTypeError> {
+    ) -> Result<BTreeMap<SemanticSymbolId, (TypeId, TypeId)>, DeclaredTypeError> {
         let mut defaults = Vec::new();
         for parameter in callable.all_parameters() {
             if let Some(value) = parameter
@@ -40792,7 +40792,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     ))
                 })?;
             if parameter.base_type(self.store) != Some(type_)
-                || types.insert(parameter.symbol, type_).is_some()
+                || types.insert(parameter.symbol, (type_, fresh)).is_some()
             {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::InvalidFunctionType(callable.declaration),

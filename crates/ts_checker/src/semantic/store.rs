@@ -74,7 +74,7 @@ use super::{
         TypePredicateArena, TypePredicateKind,
     },
     source_callables::{
-        SourceCallableAliasAnnotation, SourceCallableAliasSnapshot,
+        SourceCallableAliasAnnotation, SourceCallableAliasSnapshot, SourceCallableParameterPlan,
         SourceCallableTypeParameterSyntaxProof, SourceDirectCallResolution,
         source_generic_index_map_syntax,
         source_type_parameter_default_is_assignable, valid_source_generic_index_map,
@@ -589,6 +589,7 @@ pub(super) struct SourceOverloadParameterProvenance {
     pub(super) base_type: TypeId,
     pub(super) call_type: TypeId,
     pub(super) optional: bool,
+    pub(super) default_parameter: Option<(SourceCallableParameterPlan, TypeId)>,
 }
 
 /// One declaration-order signature row owned by a source overload group.
@@ -630,6 +631,7 @@ pub(super) struct PreparedSourceOverloadParameter {
     pub(super) base_type: TypeId,
     pub(super) call_type: TypeId,
     pub(super) optional: bool,
+    pub(super) default_parameter: Option<(SourceCallableParameterPlan, TypeId)>,
 }
 
 /// Fully resolved signature row staged before overload publication.
@@ -12459,6 +12461,30 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                 for (index, parameter) in signature.parameters.iter().enumerate() {
                     let rest = has_rest && index + 1 == signature.parameters.len();
                     let symbol = self.symbol(parameter.symbol)?;
+                    if let Some((planned, fresh)) = parameter.default_parameter {
+                        if !parameter.optional
+                            || index < usize::try_from(signature.min_argument_count).ok()?
+                            || signature.query_evidence.is_some()
+                            || group.implementation.is_none_or(|implementation| {
+                                implementation.declaration != signature.declaration
+                            })
+                            || planned.declaration != parameter.declaration
+                            || planned.symbol != parameter.symbol
+                            || planned.annotation_identity()
+                                != (
+                                    parameter.annotation,
+                                    parameter.annotation_null_literal_identity,
+                                )
+                            || !planned.default_type_is_exact(
+                                self,
+                                signature.declaration,
+                                parameter.base_type,
+                                fresh,
+                            )
+                        {
+                            return None;
+                        }
+                    }
                     if !parameter_declarations.insert(parameter.declaration)
                         || !parameter_symbols.insert(parameter.symbol)
                         || self.source_node_kind(parameter.declaration)
@@ -12609,6 +12635,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                                 base_type: parameter.base_type,
                                 call_type: parameter.call_type,
                                 optional: parameter.optional,
+                                default_parameter: parameter.default_parameter,
                             })
                             .collect(),
                         return_annotation: signature.return_annotation,
@@ -12728,7 +12755,11 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                     assert!(self.set_value_symbol_links(
                         parameter.symbol,
                         ValueSymbolLinks {
-                            resolved_type: Some(parameter.call_type),
+                            resolved_type: Some(if parameter.default_parameter.is_some() {
+                                parameter.base_type
+                            } else {
+                                parameter.call_type
+                            }),
                             ..ValueSymbolLinks::default()
                         },
                     ));

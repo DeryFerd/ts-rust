@@ -63152,8 +63152,25 @@ fn materialize_source_overloads(
             .get_source_overload_type_query(declaration);
             merge_retry_diagnostics(diagnostics, generic_diagnostics);
             let query_evidence = query_evidence?;
+            session.reset_query();
+            let mut default_diagnostics = CanonicalCheckerDiagnostics::default();
+            let default_types = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                &mut default_diagnostics,
+            )?
+            .source_callable_string_default_types(declaration);
+            merge_retry_diagnostics(diagnostics, default_diagnostics);
+            let default_types = default_types?;
             let mut parameter_types = Vec::with_capacity(declaration.parameters.len());
             for parameter in &declaration.parameters {
+                if let Some((base_type, fresh)) = default_types.get(&parameter.symbol) {
+                    parameter_types.push((*base_type, Some(*fresh)));
+                    continue;
+                }
                 session.reset_query();
                 let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
                 let result = CanonicalTypeQuery::new_with_global_types_and_session(
@@ -63204,7 +63221,7 @@ fn materialize_source_overloads(
                     merge_retry_diagnostics(diagnostics, callback_diagnostics);
                     return_type?;
                 }
-                parameter_types.push(parameter_type);
+                parameter_types.push((parameter_type, None));
             }
             let return_type = if let Some(return_node) = declaration.return_type.type_node() {
                 session.reset_query();

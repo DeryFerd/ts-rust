@@ -163,6 +163,39 @@ impl SourceCallableParameterPlan {
         self.string_default.is_some()
     }
 
+    /// Rechecks a retained default origin and its canonical fresh initializer type.
+    pub(super) fn default_type_is_exact(
+        self,
+        store: &CanonicalTypeMapperStore,
+        function: NodeRef,
+        base_type: TypeId,
+        fresh: TypeId,
+    ) -> bool {
+        let Some(origin) = self.string_default else {
+            return false;
+        };
+        origin.function == function
+            && self.base_type(store) == Some(base_type)
+            && store.type_payload(fresh).is_some_and(|record| {
+                let flags = match store.source_node_kind(origin.initializer) {
+                    Some(SyntaxKind::StringLiteral) => TypeFlags::STRING_LITERAL,
+                    Some(SyntaxKind::NumericLiteral) => TypeFlags::NUMBER_LITERAL,
+                    _ => return false,
+                };
+                record.flags() == flags
+                    && matches!(record.data(), TypeData::Literal(literal)
+                        if literal.fresh_type == Some(fresh) && literal.regular_type != fresh)
+            })
+            && store.validate_union_constituent(fresh).is_ok()
+            && store.type_node_links(origin.initializer).is_none_or(|links| {
+                links == &TypeNodeLinks::default()
+                    || links == &TypeNodeLinks {
+                        resolved_type: Some(fresh),
+                        ..TypeNodeLinks::default()
+                    }
+            })
+    }
+
     /// Rechecks the written initializer without publishing an expression type.
     pub(super) fn string_default_value(
         self,
