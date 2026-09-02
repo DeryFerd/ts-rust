@@ -7467,6 +7467,67 @@ fn type_node_unavailable(reason: TypeNodeUnavailable) -> DeclaredTypeError {
     DeclaredTypeError::TypeNodeUnavailable(reason)
 }
 
+fn trace_alias_instantiation_failure(
+    store: &CanonicalTypeMapperStore,
+    stage: &str,
+    alias: SemanticSymbolId,
+    type_: Option<TypeId>,
+    error: &dyn std::fmt::Debug,
+) {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+
+    struct TraceBuffer {
+        bytes: [u8; 1024],
+        len: usize,
+    }
+    impl std::fmt::Write for TraceBuffer {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let mut count = text.len().min(self.bytes.len() - 1 - self.len);
+            while !text.is_char_boundary(count) {
+                count -= 1;
+            }
+            self.bytes[self.len..self.len + count].copy_from_slice(&text.as_bytes()[..count]);
+            self.len += count;
+            if count == text.len() {
+                Ok(())
+            } else {
+                Err(std::fmt::Error)
+            }
+        }
+    }
+
+    let mut trace = TraceBuffer {
+        bytes: [0; 1024],
+        len: 0,
+    };
+    let symbol = store.symbol(alias);
+    let type_record = type_.and_then(|type_| store.type_payload(type_));
+    let kind = type_record.map(|record| match record.data() {
+        TypeData::Conditional(_) => "conditional",
+        TypeData::Mapped(_) => "mapped",
+        TypeData::TypeReference(_) => "reference",
+        TypeData::Interface(_) => "interface",
+        TypeData::TypeParameter(_) => "parameter",
+        TypeData::Union(_) => "union",
+        TypeData::Intersection(_) => "intersection",
+        _ => "other",
+    });
+    let _ = write!(
+        trace,
+        "ALIAS_INSTANTIATION_FAILURE stage={stage} alias={alias:?} name={:?} declaration={:?} type={type_:?} kind={kind:?} flags={:?} object_flags={:?} error={error:?}",
+        symbol.and_then(|symbol| symbol.name().as_utf8()),
+        symbol
+            .and_then(|symbol| symbol.declarations())
+            .and_then(|nodes| nodes.first()),
+        type_record.map(TypeRecord::flags),
+        type_record.map(TypeRecord::object_flags),
+    );
+    trace.bytes[trace.len] = b'\n';
+    trace.len += 1;
+    let _ = std::io::stderr().lock().write_all(&trace.bytes[..trace.len]);
+}
+
 /// Proves a qualified query's real namespace import and direct function export.
 fn source_namespace_type_query_member(
     store: &CanonicalTypeMapperStore,
@@ -42742,7 +42803,24 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 declaration.arena,
                 declaration.file,
                 alias.type_,
-            ))?;
+            ))
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::GenericAliasInstantiationUnsupported { .. }
+                    )
+                ) {
+                    trace_alias_instantiation_failure(
+                        self.store,
+                        "declaration_children",
+                        symbol,
+                        None,
+                        &error,
+                    );
+                }
+                error
+            })?;
         }
         let type_ = self.get_declared_type_of_symbol_worker(symbol, true)?;
         let projection = super::object_aliases::property_object_alias_projection(self.store, type_)
@@ -53649,7 +53727,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 &mut session,
             )
         };
-        result.map_err(|_| {
+        result.map_err(|error| {
+            trace_alias_instantiation_failure(
+                self.store,
+                "dependent_alias",
+                alias,
+                Some(type_),
+                &error,
+            );
             type_node_unavailable(TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
                 alias,
                 declared_type: type_,
