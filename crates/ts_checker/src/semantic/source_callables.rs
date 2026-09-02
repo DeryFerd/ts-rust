@@ -5188,7 +5188,10 @@ fn stored_member_assignment_arrow_context(
             })
         || !record.flags().contains(SymbolFlags::PROPERTY)
         || store.get_parent_of_symbol(member) != Some(owner)
-        || store.source_node_kind(property) != Some(SyntaxKind::PropertySignature)
+        || !matches!(
+            store.source_node_kind(property),
+            Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+        )
         || store.source_declaration_symbol(property) != Some(member)
         || store.symbol_table(store.symbol(owner)?.members()?)?.get_source(name) != Some(member)
         || structured.members.is_some_and(|members| {
