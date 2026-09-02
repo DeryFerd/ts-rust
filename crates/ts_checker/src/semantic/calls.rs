@@ -1475,7 +1475,7 @@ fn recover_direct_call_overload(
                     .and_then(|owner| store.symbol(owner))
                     .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
         });
-    if request.form != DirectCallForm::Call
+    if !matches!(request.form, DirectCallForm::Call | DirectCallForm::New)
         || class_method
             && super::classes::source_class_method_overloads(store, request.callee)
                 .ok()
