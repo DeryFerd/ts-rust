@@ -3033,7 +3033,12 @@ fn validate_generic_call_signature_shape_worker(
         if has_rest_parameter {
             return Err(GenericCallVectorUnsupported::RestSignature(callable.signature).into());
         }
-        if minimum_argument_count != fixed_parameter_count {
+        if minimum_argument_count != fixed_parameter_count
+            && signature
+                .declaration()
+                .and_then(|declaration| store.source_node_kind(declaration))
+                != Some(SyntaxKind::CallSignature)
+        {
             return Err(
                 GenericCallVectorUnsupported::NonRequiredParameter(callable.signature).into(),
             );
