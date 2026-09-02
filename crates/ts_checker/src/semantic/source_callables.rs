@@ -13360,24 +13360,32 @@ fn publish_prepared_contextual_source_callable(
         matches!(
             validate_stored_function_type(store, prepared.contextual_target),
             StoredFunctionTypeValidation::Valid(_)
-        ) || prepared.variable_symbol.is_some_and(|anchor| {
-            authenticated_contextual_declared_call_target(
-                store,
-                prepared.declaration,
-                prepared.owner_symbol,
-                anchor,
-                prepared.contextual_target,
+        ) || property_anchor
+            && matches!(
+                validate_stored_single_callable(store, prepared.contextual_target),
+                StoredSingleCallableValidation::Valid {
+                    family: CallableFamily::FunctionType,
+                    ..
+                }
             )
-            .is_some_and(|target| {
-                target.parameters.len() == parameter_count
-                    && target.min_argument_count == parameter_count
-                    && target
-                        .parameters
-                        .iter()
-                        .zip(prepared.parameters)
-                        .all(|(expected, actual)| *expected == actual.type_)
+            || prepared.variable_symbol.is_some_and(|anchor| {
+                authenticated_contextual_declared_call_target(
+                    store,
+                    prepared.declaration,
+                    prepared.owner_symbol,
+                    anchor,
+                    prepared.contextual_target,
+                )
+                .is_some_and(|target| {
+                    target.parameters.len() == parameter_count
+                        && target.min_argument_count == parameter_count
+                        && target
+                            .parameters
+                            .iter()
+                            .zip(prepared.parameters)
+                            .all(|(expected, actual)| *expected == actual.type_)
+                })
             })
-        })
     };
     let parameters_valid = prepared
         .parameters
@@ -16140,19 +16148,32 @@ pub(super) fn validate_stored_source_callable(
                 matches!(
                     validate_stored_function_type(store, target),
                     StoredFunctionTypeValidation::Valid(_)
-                ) || variable.is_some_and(|anchor| {
-                    authenticated_contextual_declared_call_target(
-                        store,
-                        declaration,
-                        owner_symbol,
-                        anchor,
-                        target,
-                    )
-                    .is_some_and(|target| {
-                        expected_parameter_types == Some(target.parameters.as_slice())
-                            && target.min_argument_count == target.parameters.len()
+                ) || anchor_valid
+                    && variable.is_some_and(|anchor| {
+                        store
+                            .symbol(anchor)
+                            .is_some_and(|symbol| symbol.flags() == SymbolFlags::PROPERTY)
                     })
-                })
+                    && matches!(
+                        validate_stored_single_callable(store, target),
+                        StoredSingleCallableValidation::Valid {
+                            family: CallableFamily::FunctionType,
+                            ..
+                        }
+                    )
+                    || variable.is_some_and(|anchor| {
+                        authenticated_contextual_declared_call_target(
+                            store,
+                            declaration,
+                            owner_symbol,
+                            anchor,
+                            target,
+                        )
+                        .is_some_and(|target| {
+                            expected_parameter_types == Some(target.parameters.as_slice())
+                                && target.min_argument_count == target.parameters.len()
+                        })
+                    })
             };
         let rest_valid = if signature_record
             .flags()

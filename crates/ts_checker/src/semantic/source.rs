@@ -44518,7 +44518,6 @@ fn check_contextual_object_property_arrow(
         || !arrow.callable.return_type.is_inferred()
         || arrow.callable.flags != super::signatures::SignatureFlags::NONE
         || usize::try_from(arrow.callable.min_argument_count).ok() != Some(parameters.len())
-        || !store.type_has_function_type_provenance(contextual_type)
         || !store.source_contextual_callable_anchor_is_exact(
             arrow.callable.declaration,
             arrow.callable.owner_symbol,
@@ -44528,7 +44527,9 @@ fn check_contextual_object_property_arrow(
         return Err(unsupported());
     }
     let StoredSingleCallableValidation::Valid {
-        callable: target, ..
+        family: CallableFamily::FunctionType,
+        callable: target,
+        ..
     } = validate_stored_single_callable(store, contextual_type)
     else {
         return Err(unsupported());
