@@ -98,6 +98,8 @@ use super::{
     store::SourceNodeParent,
     type_nodes::{
         CanonicalJsDocImportTypeTarget, CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget,
+        OrdinaryImportAliasChain, ordinary_import_alias_chain,
+        validate_ordinary_import_alias_links,
     },
     type_records::{TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -1058,6 +1060,7 @@ pub(super) struct SourceAliasBodyTypeImportPlan {
     arguments: Vec<NodeRef>,
     module_specifier: NodeRef,
     expected: ResolvedSourceTypeImportBinding,
+    alias_chain: Option<OrdinaryImportAliasChain>,
 }
 
 /// One query's import plan and fresh lexical lookup, including a non-import result.
@@ -1163,8 +1166,8 @@ impl SourceAliasBodyTypeImportPlan {
     }
 }
 
-/// Finds a type alias RHS through type-node parents only. This never enters a
-/// callable body, another declaration, or a type-parameter constraint.
+/// Finds a type alias RHS through type nodes and function-type annotations.
+/// This never enters a callable body or a type-parameter constraint.
 pub(super) fn plan_source_alias_body_type_import(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1209,6 +1212,31 @@ pub(super) fn probe_source_alias_body_type_import(
         {
             return Ok(probe);
         }
+        if record.kind == SyntaxKind::Parameter
+            && record
+                .parent
+                .and_then(|owner| arena.get(owner))
+                .is_none_or(|owner| owner.kind != SyntaxKind::FunctionType)
+        {
+            return Ok(probe);
+        }
+        let signature_edge = match &record.data {
+            NodeData::ParameterDeclaration(parameter) if record.kind == SyntaxKind::Parameter => {
+                parameter.type_ == Some(current.node)
+            }
+            NodeData::FunctionTypeNode(function) if record.kind == SyntaxKind::FunctionType => {
+                function.type_ == Some(current.node)
+                    || child.kind == SyntaxKind::Parameter
+                        && function
+                            .parameters
+                            .nodes
+                            .iter()
+                            .filter(|node| **node == current.node)
+                            .count()
+                            == 1
+            }
+            _ => true,
+        };
         if store.source_node_parent(current) != Some(SourceNodeParent::Parent(parent))
             || store.source_node_kind(current) != Some(child.kind)
             || store.source_direct_children(parent).is_none_or(|children| {
@@ -1216,6 +1244,8 @@ pub(super) fn probe_source_alias_body_type_import(
             })
             || !range_contains(record, child)
             || !visited.insert(parent)
+            || !signature_edge
+            || !alias_body_import_signature_edge_is_exact(store, current, parent)
         {
             return Err(invalid());
         }
@@ -1249,7 +1279,7 @@ pub(super) fn probe_source_alias_body_type_import(
     else {
         return Ok(probe);
     };
-    let expected = plan_named_type_import_target(store, host, &import, &binding)?;
+    let (expected, alias_chain) = plan_named_type_import_target(store, host, &import, &binding)?;
     if expected.target_declaration.file == reference.file {
         return Err(unsupported(SourceImportUnsupported::SameSourceTarget {
             binding: binding.declaration,
@@ -1274,6 +1304,7 @@ pub(super) fn probe_source_alias_body_type_import(
         arguments,
         module_specifier: import.module_specifier,
         expected,
+        alias_chain,
     };
     validate_source_type_import_reference_source(store, host, &plan.expected, reference)?;
     plan.validate_current(store)?;
@@ -1534,7 +1565,31 @@ fn alias_body_import_parent_kind(kind: SyntaxKind) -> bool {
             | SyntaxKind::NamedTupleMember
             | SyntaxKind::OptionalType
             | SyntaxKind::RestType
+            | SyntaxKind::FunctionType
+            | SyntaxKind::Parameter
     )
+}
+
+fn alias_body_import_signature_edge_is_exact(
+    store: &CanonicalTypeMapperStore,
+    child: NodeRef,
+    parent: NodeRef,
+) -> bool {
+    match store.source_node_kind(parent) {
+        Some(SyntaxKind::Parameter) => {
+            store.source_direct_type_annotation(parent) == Some(child)
+                && matches!(
+                    store.source_node_parent(parent),
+                    Some(SourceNodeParent::Parent(owner))
+                        if store.source_node_kind(owner) == Some(SyntaxKind::FunctionType)
+                )
+        }
+        Some(SyntaxKind::FunctionType) => {
+            store.source_node_kind(child) == Some(SyntaxKind::Parameter)
+                || store.source_direct_type_annotation(parent) == Some(child)
+        }
+        _ => true,
+    }
 }
 
 /// Only the normal import producer publishes alias links, after every query
@@ -1629,6 +1684,7 @@ fn validate_alias_body_import_owner(
             || store
                 .source_direct_children(parent)
                 .is_none_or(|children| children.iter().filter(|child| **child == node).count() != 1)
+            || !alias_body_import_signature_edge_is_exact(store, node, parent)
         {
             return Err(invalid());
         }
@@ -1648,7 +1704,13 @@ fn validate_alias_body_import_owner(
     {
         return Err(invalid());
     }
-    validate_named_type_import_owner(store, reference, plan.module_specifier, &plan.expected)
+    validate_named_type_import_owner(
+        store,
+        reference,
+        plan.module_specifier,
+        &plan.expected,
+        plan.alias_chain.as_ref(),
+    )
 }
 
 fn validate_named_type_import_owner(
@@ -1656,6 +1718,7 @@ fn validate_named_type_import_owner(
     reference: NodeRef,
     module_specifier: NodeRef,
     expected: &ResolvedSourceTypeImportBinding,
+    alias_chain: Option<&OrdinaryImportAliasChain>,
 ) -> Result<(), SourceImportError> {
     let invalid = || invariant(SourceImportInvariant::InvalidNode(reference));
     let binding = &expected.binding;
@@ -1673,10 +1736,10 @@ fn validate_named_type_import_owner(
         || store.source_node_parent(binding.local_name)
             != Some(SourceNodeParent::Parent(binding.declaration))
         || store.source_identifier_text(binding.local_name) != Some(binding.local_text.as_str())
-        || expected.immediate_target_symbol != expected.target_symbol
     {
         return Err(invalid());
     }
+    validate_named_type_import_alias_chain(store, reference, expected, alias_chain, false)?;
     let mut import = binding.declaration;
     for kind in [
         SyntaxKind::NamedImports,
@@ -1744,7 +1807,12 @@ fn validate_alias_body_import_caches(
     {
         return Err(invalid());
     }
-    validate_named_type_import_caches(store, reference, &plan.expected)
+    validate_named_type_import_caches(
+        store,
+        reference,
+        &plan.expected,
+        plan.alias_chain.as_ref(),
+    )
 }
 
 fn validate_named_type_import_identifier_cache(
@@ -1774,6 +1842,7 @@ fn validate_named_type_import_caches(
     store: &CanonicalTypeMapperStore,
     reference: NodeRef,
     expected: &ResolvedSourceTypeImportBinding,
+    alias_chain: Option<&OrdinaryImportAliasChain>,
 ) -> Result<bool, SourceImportError> {
     let invalid = || invariant(SourceImportInvariant::InvalidTypeReferenceCache(reference));
     let alias = expected.binding.alias_symbol;
@@ -1819,7 +1888,30 @@ fn validate_named_type_import_caches(
     }) {
         return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
     }
+    validate_named_type_import_alias_chain(store, reference, expected, alias_chain, ready)?;
     Ok(ready)
+}
+
+/// A retained indirection keeps the same source-proved chain and warm-hop checks.
+fn validate_named_type_import_alias_chain(
+    store: &CanonicalTypeMapperStore,
+    reference: NodeRef,
+    expected: &ResolvedSourceTypeImportBinding,
+    chain: Option<&OrdinaryImportAliasChain>,
+    resolved: bool,
+) -> Result<(), SourceImportError> {
+    let immediate = expected.immediate_target_symbol;
+    let target = expected.target_symbol;
+    match chain {
+        None if immediate == target => Ok(()),
+        Some(chain) if immediate != target && chain.matches_targets(immediate, target) => {
+            validate_ordinary_import_alias_links(store, reference, chain, resolved)?;
+            Ok(())
+        }
+        _ => Err(invariant(SourceImportInvariant::InvalidAliasLinks(
+            expected.binding.alias_symbol,
+        ))),
+    }
 }
 
 /// The source and manifest prove this original property's imported annotation.
@@ -1831,6 +1923,7 @@ pub(super) struct SourcePropertyTypeImportPlan {
     property: PlannedProperty,
     module_specifier: NodeRef,
     expected: ResolvedSourceTypeImportBinding,
+    alias_chain: Option<OrdinaryImportAliasChain>,
 }
 
 impl SourcePropertyTypeImportPlan {
@@ -1909,6 +2002,7 @@ pub(super) struct SourceClassAnnotationTypeImportPlan {
     arguments: Vec<NodeRef>,
     module_specifier: NodeRef,
     expected: ResolvedSourceTypeImportBinding,
+    alias_chain: Option<OrdinaryImportAliasChain>,
 }
 
 impl SourceClassAnnotationTypeImportPlan {
@@ -2024,8 +2118,14 @@ impl SourceClassAnnotationTypeImportPlan {
             self.reference(),
             self.module_specifier,
             &self.expected,
+            self.alias_chain.as_ref(),
         )?;
-        validate_named_type_import_caches(store, self.reference(), &self.expected)
+        validate_named_type_import_caches(
+            store,
+            self.reference(),
+            &self.expected,
+            self.alias_chain.as_ref(),
+        )
     }
 }
 
@@ -2132,7 +2232,7 @@ pub(super) fn plan_source_class_annotation_type_import(
     else {
         return Ok(None);
     };
-    let expected = plan_named_type_import_target(store, host, &import, &binding)?;
+    let (expected, alias_chain) = plan_named_type_import_target(store, host, &import, &binding)?;
     if expected.target_declaration.file == reference.file {
         return Err(unsupported(SourceImportUnsupported::SameSourceTarget {
             binding: binding.declaration,
@@ -2157,6 +2257,7 @@ pub(super) fn plan_source_class_annotation_type_import(
             }),
         module_specifier: import.module_specifier,
         expected,
+        alias_chain,
     };
     validate_source_type_import_reference_source(store, host, &plan.expected, reference)?;
     plan.validate_current(store)?;
@@ -4991,7 +5092,7 @@ pub(super) fn plan_source_property_type_import(
         .filter(|_| properties.next().is_none())
         .cloned()
         .ok_or_else(invalid)?;
-    let expected = plan_named_type_import_target(store, host, &import, &binding)?;
+    let (expected, alias_chain) = plan_named_type_import_target(store, host, &import, &binding)?;
     let target_declaration = expected.target_declaration;
     let target_record = host
         .node(target_declaration)
@@ -5026,6 +5127,7 @@ pub(super) fn plan_source_property_type_import(
         property,
         module_specifier: import.module_specifier,
         expected,
+        alias_chain,
     };
     validate_source_type_import_reference_source(store, host, &plan.expected, annotation)?;
     validate_source_property_type_import_retained(store, &plan)?;
@@ -5432,7 +5534,7 @@ pub(super) fn plan_source_interface_heritage_type_import(
         return Err(invalid());
     }
 
-    let expected = plan_named_type_import_target(store, host, &import, &binding)?;
+    let (expected, alias_chain) = plan_named_type_import_target(store, host, &import, &binding)?;
     if store
         .symbol(expected.target_symbol)
         .map(|symbol| symbol.flags())
@@ -5442,8 +5544,14 @@ pub(super) fn plan_source_interface_heritage_type_import(
             expected.target_declaration,
         )));
     }
-    validate_named_type_import_owner(store, reference, import.module_specifier, &expected)?;
-    validate_named_type_import_caches(store, reference, &expected)?;
+    validate_named_type_import_owner(
+        store,
+        reference,
+        import.module_specifier,
+        &expected,
+        alias_chain.as_ref(),
+    )?;
+    validate_named_type_import_caches(store, reference, &expected, alias_chain.as_ref())?;
     // Heritage execution records the base on the interface, not as a type-node query.
     if store
         .symbol_node_links(reference)
@@ -5470,7 +5578,7 @@ pub(super) fn plan_source_named_type_import_target(
     else {
         return Ok(None);
     };
-    let resolved = plan_named_type_import_target(store, host, &import, &binding)?;
+    let (resolved, _) = plan_named_type_import_target(store, host, &import, &binding)?;
     validate_source_type_import_reference_source(store, host, &resolved, reference)?;
     Ok(Some(resolved))
 }
@@ -5599,7 +5707,13 @@ fn plan_named_type_import_target(
     host: &DeclaredTypeHost<'_>,
     import: &SourceImportPlan,
     binding: &SourceImportBindingPlan,
-) -> Result<ResolvedSourceTypeImportBinding, SourceImportError> {
+) -> Result<
+    (
+        ResolvedSourceTypeImportBinding,
+        Option<OrdinaryImportAliasChain>,
+    ),
+    SourceImportError,
+> {
     let alias = binding.alias_symbol;
     let manifest = host.module_resolutions().ok_or_else(|| {
         source_property_import_alias_error(
@@ -5642,7 +5756,7 @@ fn plan_named_type_import_target(
     let module = aliases
         .direct_source_module(store, binding.declaration, resolved, true)
         .map_err(|reason| source_property_import_alias_error(alias, reason))?;
-    let target = super::module_exports::get_module_export_by_name(
+    let immediate_target = super::module_exports::get_module_export_by_name(
         store,
         host,
         &aliases,
@@ -5659,13 +5773,24 @@ fn plan_named_type_import_target(
             },
         )
     })?;
+    let alias_chain = store
+        .symbol(immediate_target)
+        .is_some_and(|symbol| symbol.flags() == SymbolFlags::ALIAS)
+        .then(|| ordinary_import_alias_chain(store, host, binding.declaration, immediate_target))
+        .transpose()?;
+    let target = alias_chain
+        .as_ref()
+        .map_or(immediate_target, OrdinaryImportAliasChain::target);
     let target_declaration = plan_direct_exported_type_target(store, host, alias, target)?;
-    Ok(ResolvedSourceTypeImportBinding {
-        binding: binding.clone(),
-        immediate_target_symbol: target,
-        target_symbol: target,
-        target_declaration,
-    })
+    Ok((
+        ResolvedSourceTypeImportBinding {
+            binding: binding.clone(),
+            immediate_target_symbol: immediate_target,
+            target_symbol: target,
+            target_declaration,
+        },
+        alias_chain,
+    ))
 }
 
 /// Publishes a cold alias only after the caller has validated every participating plan.
@@ -5825,10 +5950,16 @@ fn validate_source_property_type_import_retained(
         || store.source_identifier_text(binding.local_name) != Some(binding.local_text.as_str())
         || !store.source_declaration_belongs_to_symbol(binding.declaration, binding.alias_symbol)
         || !store.source_symbol_declarations_match(binding.alias_symbol)
-        || plan.immediate_target() != plan.target_symbol()
     {
         return Err(invalid());
     }
+    validate_named_type_import_alias_chain(
+        store,
+        annotation,
+        &plan.expected,
+        plan.alias_chain.as_ref(),
+        false,
+    )?;
     let mut import = binding.declaration;
     for kind in [
         SyntaxKind::NamedImports,
@@ -5997,6 +6128,13 @@ fn validate_source_property_type_import_caches(
             plan.alias_symbol(),
         )));
     }
+    validate_named_type_import_alias_chain(
+        store,
+        annotation,
+        &plan.expected,
+        plan.alias_chain.as_ref(),
+        ready,
+    )?;
     Ok(ready)
 }
 

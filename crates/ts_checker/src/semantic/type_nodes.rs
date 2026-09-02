@@ -5841,9 +5841,27 @@ struct OrdinaryImportAliasStep {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct OrdinaryImportAliasChain {
+pub(super) struct OrdinaryImportAliasChain {
     steps: Vec<OrdinaryImportAliasStep>,
     target: SemanticSymbolId,
+}
+
+impl OrdinaryImportAliasChain {
+    pub(super) const fn target(&self) -> SemanticSymbolId {
+        self.target
+    }
+
+    pub(super) fn matches_targets(
+        &self,
+        immediate: SemanticSymbolId,
+        target: SemanticSymbolId,
+    ) -> bool {
+        self.target == target
+            && self
+                .steps
+                .first()
+                .is_some_and(|step| step.source.alias() == immediate)
+    }
 }
 
 /// Source syntax planning can use the same cold import proof as type queries.
@@ -5856,7 +5874,7 @@ pub(super) fn plan_ordinary_import_alias_target(
     Ok(ordinary_import_alias_chain(store, host, node, raw)?.target)
 }
 
-fn ordinary_import_alias_chain(
+pub(super) fn ordinary_import_alias_chain(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
@@ -5916,7 +5934,7 @@ fn ordinary_import_alias_chain(
     Ok(chain)
 }
 
-fn validate_ordinary_import_alias_links(
+pub(super) fn validate_ordinary_import_alias_links(
     store: &CanonicalTypeMapperStore,
     node: NodeRef,
     chain: &OrdinaryImportAliasChain,
