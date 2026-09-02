@@ -510,7 +510,7 @@ fn bad_binding_default_keeps_the_property_type_and_native_error() {
     assert_eq!(diagnostic.range_override, None);
     assert_eq!(
         diagnostic.diagnostic.render().unwrap(),
-        "Type 'number' is not assignable to type '\"append\" | \"replace\" | \"reset\"'.",
+        "Type '1' is not assignable to type '\"append\" | \"replace\" | \"reset\"'.",
     );
     assert!(diagnostic.related_information.is_empty());
     replay(&mut checker, &parsed, &queries);
