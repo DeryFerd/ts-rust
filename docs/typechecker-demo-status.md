@@ -4,91 +4,105 @@ Updated 2026-09-02. Neither Query nor Hono has passed a full Rust type check.
 
 ## Latest Query and Hono checkpoint
 
-Project completion has stalled. We recovered the lost Hono root, but neither
-project has gained another completed root. The latest candidate is not ready
-for a full-project demo.
+Project completion has stalled. Neither project has gained another completed
+root since the earlier Hono recovery. Neither is ready for a full-project demo.
 
 | Project | Completed isolated roots | Unsupported | Internal errors | Original policy skip |
 | --- | ---: | ---: | ---: | ---: |
-| Query core | 1 of 23 | 22 | 0 | 0 |
-| Hono | 32 of 188 | 150 | 5 | 1 |
+| Query core | 1 of 23 | 14 | 8 | 0 |
+| Hono | 32 of 188 | 149 | 6 | 1 |
 
-These runs use `71793fc3046b1930f35a438e3a30c148acd1889e`.
-An isolated root is one original project entry file checked on its own.
-The counts do not prove a full project pass or diagnostic parity. Both runs
-kept the original roots, loaded files, options and libraries. Both had zero
-load diagnostics.
+Query uses `108b0fa8ba94bdd06eebd8196bef8be4283fdd8b`.
+Hono uses `3ae5ab3d8956e7c329e68762243c7995dbc30779`.
+An isolated root is one original project entry file checked on its own. These
+counts do not prove a full project pass or matching diagnostics. Both runs kept
+the original roots, loaded files, options and libraries. Both had zero load
+diagnostics.
 
-[Query census 15](../target/wave202-query-combined-census-15-result.md)
-has no new completed root. Only `retryer.ts` changed its first error since
-census 14. It now stops on an identifier read after getting past the earlier
-function-body check. The ordinary project check remains unsupported.
+[Query census 17](../target/wave202-query-combined-census-17-result.md)
+matches census 16 exactly. Eight roots stop at `this.subscribe.bind(this)` in
+`subscribable.ts`. They now report internal call failures after the earlier
+arrow check was fixed. This is not a completion gain. The ordinary check fails.
 
-[Hono census 15](../target/wave202-hono-combined-census-15-result.md)
-keeps all 32 roots that completed in census 14. That includes the recovered
-`adapter/aws-lambda/types.ts` root. Six import-cache failures now report their
-earlier unsupported features instead of internal errors. Three JWT roots
-still have an internal interface-declaration error. The ordinary project
-check still stops in `http-exception.ts`. All original root attempts finished.
-All three measured processes and their services are closed.
+[Hono census 18](../target/wave202-hono-combined-census-18-result.md)
+keeps all 32 completed roots and adds none. The prepared-router failure now
+reaches an unsupported tuple in `router/reg-exp-router/matcher.ts`. The six
+remaining internal errors are unchanged. The ordinary check still rejects a
+union type in `http-exception.ts`. Its saved failure now names `URLSearchParams`
+after the `FormData` repair. All original root attempts finished. These measured
+processes and their exact services are closed.
 
 ### What the tests prove
 
-[Combined tests 26](../target/wave202-query-hono-combined-tests-26-result.md)
-compiled all 55 targets and ran 157 tests: 118 passed and 39 failed.
-All 152 byte-unchanged tests kept their previous outcomes. There were no new
-passes and no regressions. Both separately corrected augmentation tests and
-all three new generic `implements` tests failed.
+[Combined tests 29](../target/wave202-query-hono-combined-tests-29-result.md)
+compiled all 57 targets and ran 165 tests: 123 passed and 42 failed. Two existing
+Set tests now pass. All other outcomes match tests 28. No previous pass was lost
+between these two runs.
 
-[Tests 25](../target/wave202-query-hono-combined-tests-25-result.md) had already
-recovered the five checker regressions in contextual parameters and generic
-lambdas. Test-helper and obsolete-expectation corrections remain separate
-from checker gains. Earlier attempts 23 and 24 failed compilation and ran
-no tests.
+[Tests 28](../target/wave202-query-hono-combined-tests-28-result.md)
+passed 121 of the same 165 tests. It fixed two failures in the prior 157-test
+set: a bound-call argument diagnostic and an `ArrayBuffer` type check. No pass
+was lost in that repeated set. Three new alias tests and three added older
+controls still fail. The known obsolete unsupported expectation is separate.
 
-Two Set tests now finish source checking and validate the real generic
-constructor types. They fail later when they print a type. A separate local
-Set test still fails during inference. The Promise tests get past the capture
-planner but stop at constructor preparation. Neither change is a full test
-pass. Bind remains one pass and three failures.
+[Combined tests 30](../target/wave202-query-hono-combined-tests-30-result.md)
+also compiled all 57 targets and ran all 165 tests. It passed 123 and failed 42.
+Every outcome matches tests 29. No failed test recovered and no pass was lost.
+
+This is four genuine existing-test gains across tests 28 through 30,
+not four new project passes. Bind is now two passes and two failures. Returned
+class arrows, generic defaults, Promise executors and local Set inference still
+fail. Test-helper changes and obsolete-expectation corrections are not checker
+gains. Attempt 27 failed compilation and ran no tests.
 
 ### Why progress slowed
 
-The function-instantiation work broke existing paths. Those regressions cost
-a repair round. We also fixed early checks before measuring the operations
-that follow them. A changed first error often exposed another missing operation.
+Function instantiation, imported types and cache validation are shared blockers.
+Some earlier changes broke working paths and required repairs. Other fixes
+cleared an early check but exposed another missing operation in the same file.
 
-For example, the shared Query arrow has valid lexical context, but its owner
-check assumed that one class declaration had one symbol. An exported class
-has distinct local and exported symbols. That rejected the arrow before its
-body could be checked. The next candidate uses the authenticated method's
-actual class owner and keeps the binder checks.
+For example, the shared Query arrow now passes its exported-class owner check.
+The same source still fails when it instantiates the bound method. Changing the
+first error did not complete any of the eight affected roots.
 
 Code reviews and commits have outpaced successful combined runs. Completed
 project roots and unchanged test passes remain the progress measures.
 
 ### Next checkpoint
 
-Candidate `d8f132db833b1a805b60f426f54dfcd6bfc09394` contains the
-returned-arrow owner fix, generic alias inheritance for the
-`WithRequired` and `Omit` forms, an intersection traversal fix for generic
-defaults, and the real `ArrayBuffer` computed-property cache fix.
+The [11-test focused run](../target/wave202-query-bind-defaults-focused-tests-1-result.md)
+on `02ba211da` finished with two passes and nine failures, unchanged from tests 29.
+It separated the shared conditional-type failure from the pending function
+returns in variadic Bind. The non-strict Bind test now reaches an incorrect
+receiver diagnostic. Generic defaults reach a separate property-owner check.
 
-Tests 27 on the preceding candidate `4f785623` failed compilation because
-the alias code missed a Rust import.
-All 165 tests remain unrun. Query 16 and Hono 16 were not launched. The
-separate reviewed commit `088875ab0` fixes that import. It is not a checker gain.
+Tests 30 and Hono census 18 are closed on
+`3ae5ab3d8956e7c329e68762243c7995dbc30779`. The new code did not add a passing
+test or a completed project root. It did identify the next failing operations:
 
-Tests 28 is running with the same 57 targets and 165 tests. These include all 157
-prior tests unchanged, three alias additions, and five existing affected
-controls. One control still expects a valid generic alias base to be
-unsupported. That obsolete expectation is retained and reported separately.
-Both project runs will use the same source and their original configurations.
+- Query's shared Bind call rejects the unresolved return of the written
+  `() => void` type. It must use the normal return-type query.
+- Prefix and variadic Bind now query both pending returns, then stop in
+  generic argument inference.
+- The positive Promise test reaches a raw constraint-cache assertion. The
+  negative test still stops on a real library type. Neither is counted as fixed.
+- Hono's ordinary check now stops at `URLSearchParams` in its union check.
 
-The candidate also includes the reviewed Promise return preparation,
-generic `implements` import resolution, and Bind query-state repairs. The Set
-repair is in review. A separate implements follow-up adds the missing cold
-type-only class query. Each repair has one source writer and one reviewer.
+Separate pairs handle shared Query Bind, variadic inference, Promise, generic
+alias inheritance and Hono's ordinary union check. Each pair uses its own
+worktree, one source writer and one reviewer. Reviewed non-strict Function and
+generic-default repairs are in the next integration candidate. It also has
+the shared Query lazy-return fix and temporary metadata for Hono's
+`TextDecoder` cache failure.
+
+Tests 31 is running the same 165 tests on `1e55d3da779ec5a604c28cb88159ca5007b35cea`.
+Query 18 and Hono 19 are being prepared on that same source. They will use the
+original configs after test compilation succeeds. No new results are available.
+
+The next useful result is an unchanged failing test that passes, followed by
+an affected project root that completes. More reviews, commits or changed
+first errors do not meet that checkpoint. Project inputs, library files,
+compiler options and existing tests remain fixed.
 
 No checker repair batch is accepted on primary. Acceptance still requires
 the unchanged corpus comparison, broader checks and removal of temporary
