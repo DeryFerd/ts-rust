@@ -1837,15 +1837,10 @@ pub(super) fn validate_stored_source_overload(
             };
             let plan = evidence.callable();
             let (body, body_mode, row_export_local) = if global_namespace {
-                let Some(local) =
-                    store.source_global_callable_augmentation_local(owner_symbol, row.declaration)
-                else {
-                    return StoredSourceOverloadValidation::Malformed;
-                };
                 (
                     row.declaration,
                     SourceCallableBodyMode::AmbientDeclaration,
-                    Some(local),
+                    store.source_global_callable_augmentation_local(owner_symbol, row.declaration),
                 )
             } else if let Some(implementation) = provenance.implementation {
                 if row.declaration == implementation.declaration {
@@ -1913,7 +1908,7 @@ pub(super) fn validate_stored_source_overload(
                     || parameter.symbol != planned.symbol
                     || parameter.default_parameter.is_some()
                     || parameter.optional != planned.optional
-                    || planned.optional && row_export_local.is_none()
+                    || planned.optional && row_export_local.is_none() && !global_namespace
                     || planned.rest && !global_namespace
                     || planned.initializer.is_some()
                     || planned.explicit_type_node().is_none()
