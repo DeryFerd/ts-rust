@@ -2265,7 +2265,7 @@ mod tests {
         assert!(union_data(store, union).union.types[0] > union_data(store, union).union.types[1]);
         for type_ in [later, earlier] {
             assert_eq!(
-                classify_union_constituent(store, union, type_),
+                classify_union_constituent(store, union, type_, None),
                 Ok(UnionMemberMode::Declared)
             );
         }

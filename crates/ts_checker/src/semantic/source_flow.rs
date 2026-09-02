@@ -15694,6 +15694,7 @@ mod tests {
             region: None,
             updates: HashMap::new(),
             nullish_assignments: HashMap::new(),
+            member_assignments: HashMap::new(),
             nullish_calls: HashMap::new(),
         };
         let without_payload = FlowNode::new(FlowFlags::START);

@@ -16626,6 +16626,8 @@ mod tests {
             relation,
             globals: RelationGlobalTypes {
                 array_targets: CanonicalArrayTargets::for_test(array, readonly_array),
+                function_type: empty_object,
+                callable_function_type: empty_object,
                 string_wrapper: empty_object,
                 number_wrapper: empty_object,
                 boolean_wrapper: empty_object,
@@ -25601,6 +25603,8 @@ mod tests {
         let readonly_array = alloc_canonical_array_target(&mut store, "ReadonlyArray");
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(array.target, readonly_array.target),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -25701,6 +25705,8 @@ mod tests {
         let array = alloc_canonical_array_target(&mut store, "Array");
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -25750,6 +25756,8 @@ mod tests {
         let array = alloc_canonical_array_target(&mut store, "Array");
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -26093,6 +26101,8 @@ mod tests {
         let array = alloc_canonical_array_target(&mut fixture.store, "Array");
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -27487,6 +27497,8 @@ mod tests {
         let mismatching_target = alloc_property_object(&mut store, vec![missing_id]);
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(empty_generic, empty_generic),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper,
             boolean_wrapper: empty_object,
@@ -28275,7 +28287,7 @@ mod tests {
         ] {
             let mut fixture = function_relation_fixture(declaration);
             let wrapper = query_declared_interface(&mut fixture, name);
-            let (source, number, empty_generic) = {
+            let (source, number, empty_object, empty_generic) = {
                 let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
                 (
                     match name {
@@ -28285,6 +28297,7 @@ mod tests {
                         _ => unreachable!("only primitive wrapper interfaces are covered"),
                     },
                     bootstrap.number_type,
+                    bootstrap.empty_object_type,
                     bootstrap.empty_generic_type,
                 )
             };
@@ -28292,6 +28305,8 @@ mod tests {
             let target = alloc_property_object(&mut fixture.store, vec![required]);
             let global_types = RelationGlobalTypes {
                 array_targets: CanonicalArrayTargets::for_test(empty_generic, empty_generic),
+                function_type: empty_object,
+                callable_function_type: empty_object,
                 string_wrapper: wrapper,
                 number_wrapper: wrapper,
                 boolean_wrapper: wrapper,
@@ -28322,14 +28337,20 @@ mod tests {
             let object = source
                 .contains("interface Object")
                 .then(|| query_declared_interface(&mut fixture, "Object"));
-            let (number, empty_generic) = {
+            let (number, empty_object, empty_generic) = {
                 let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
-                (bootstrap.number_type, bootstrap.empty_generic_type)
+                (
+                    bootstrap.number_type,
+                    bootstrap.empty_object_type,
+                    bootstrap.empty_generic_type,
+                )
             };
             let required = alloc_typed_property(&mut fixture.store, "id", number, false);
             let target = alloc_property_object(&mut fixture.store, vec![required]);
             let global_types = RelationGlobalTypes {
                 array_targets: CanonicalArrayTargets::for_test(empty_generic, empty_generic),
+                function_type: empty_object,
+                callable_function_type: empty_object,
                 string_wrapper: wrapper,
                 number_wrapper: wrapper,
                 boolean_wrapper: wrapper,
@@ -28369,14 +28390,20 @@ mod tests {
             "interface Extra { id: number } interface Number extends Extra {}",
         );
         let wrapper = query_declared_interface(&mut fixture, "Number");
-        let (number, empty_generic) = {
+        let (number, empty_object, empty_generic) = {
             let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
-            (bootstrap.number_type, bootstrap.empty_generic_type)
+            (
+                bootstrap.number_type,
+                bootstrap.empty_object_type,
+                bootstrap.empty_generic_type,
+            )
         };
         let required = alloc_typed_property(&mut fixture.store, "id", number, false);
         let target = alloc_property_object(&mut fixture.store, vec![required]);
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(empty_generic, empty_generic),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: wrapper,
             number_wrapper: wrapper,
             boolean_wrapper: wrapper,
@@ -29425,6 +29452,8 @@ mod tests {
         let readonly_array = alloc_canonical_array_target(&mut store, "ReadonlyArray");
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(array.target, readonly_array.target),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -30022,6 +30051,8 @@ mod tests {
         let array = alloc_canonical_array_target(&mut store, "Array");
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -30058,6 +30089,8 @@ mod tests {
         let array = alloc_canonical_array_target(&mut store, "Array");
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -30393,6 +30426,8 @@ mod tests {
         let array = alloc_canonical_array_target(&mut store, "Array");
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -30535,6 +30570,8 @@ mod tests {
         let array = alloc_canonical_array_target(&mut store, "Array");
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -30624,6 +30661,8 @@ mod tests {
         let array = alloc_canonical_array_target(&mut store, "Array");
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -30746,6 +30785,8 @@ mod tests {
         let array = alloc_canonical_array_target(&mut store, "Array");
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -30837,6 +30878,8 @@ mod tests {
         let array = alloc_canonical_array_target(&mut store, "Array");
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -30892,6 +30935,8 @@ mod tests {
         let array = alloc_canonical_array_target(&mut store, "Array");
         let global_types = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -30917,6 +30962,8 @@ mod tests {
         let fallback_target = alloc_reference(&mut store, empty_generic, vec![string]);
         let fallback_globals = RelationGlobalTypes {
             array_targets: CanonicalArrayTargets::for_test(empty_generic, empty_generic),
+            function_type: empty_object,
+            callable_function_type: empty_object,
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,

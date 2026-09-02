@@ -95665,6 +95665,14 @@ mod tests {
                 owner,
                 array_targets,
             )
+            .map(|plan| {
+                plan.map(|plan| match plan {
+                    PlannedGlobalSourceCallable::Single(plan) => plan,
+                    PlannedGlobalSourceCallable::Namespace(_) => {
+                        panic!("parseInt must retain its single callable plan")
+                    }
+                })
+            })
         };
         let cold = observable_state(&context, file);
         let plan = plan_with_targets(&context, Some(targets)).unwrap().unwrap();
@@ -141202,6 +141210,7 @@ class Foo2 {
             flow: frame,
             state: &mut state,
             property_diagnostics: &mut property_diagnostics,
+            is_async: false,
         };
         let before = observable_state(&context, file);
         let pending = execution.flow.property_read(

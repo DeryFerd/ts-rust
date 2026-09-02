@@ -16302,13 +16302,15 @@ mod tests {
         let resolve = |context: &mut CanonicalCheckerContext<'_>,
                        session: &mut InstantiationSession,
                        saved| {
-            resolve_source_call_once(
+            let mut diagnostics = context.diagnostics().clone();
+            let result = resolve_source_call_once(
                 context.store_mut_for_test(),
                 &host,
                 &globals,
                 options,
                 Some(saved),
                 session,
+                &mut diagnostics,
                 SourceCallResolutionRequest {
                     form: DirectCallForm::Call,
                     callee_type: callee,
@@ -16316,25 +16318,18 @@ mod tests {
                     explicit_type_arguments: None,
                     receiver: None,
                 },
-            )
+            );
+            assert_eq!(&diagnostics, context.diagnostics());
+            result
         };
         let warm = call_publication_state(&context, first);
         for _ in 0..2 {
-            let ResolvedSourceCall::Vector(resolution) =
+            let ResolvedSourceCall::Vector(_, signature, return_type) =
                 resolve(&mut context, &mut session, signatures[0]).unwrap()
             else {
                 panic!("the source declaration must use generic resolution")
             };
-            assert_eq!(
-                materialize_generic_source_call_selection(
-                    context.store_mut_for_test(),
-                    &mut session,
-                    first,
-                    &resolution,
-                    Some(signatures[0]),
-                ),
-                Ok((signatures[0], returned)),
-            );
+            assert_eq!((signature, return_type), (signatures[0], returned));
             assert_eq!(call_publication_state(&context, first), warm);
             assert!(session.query_count() >= caller_count);
             assert!(session.total_count() >= caller_total);
@@ -16375,21 +16370,12 @@ mod tests {
                 .store_mut_for_test()
                 .set_signature_target_and_mapper(signatures[0], Some(original), Some(mapper),)
         );
-        let ResolvedSourceCall::Vector(resolution) =
+        let ResolvedSourceCall::Vector(_, signature, return_type) =
             resolve(&mut context, &mut session, signatures[0]).unwrap()
         else {
             panic!("restored provenance must retain the generic route")
         };
-        assert_eq!(
-            materialize_generic_source_call_selection(
-                context.store_mut_for_test(),
-                &mut session,
-                first,
-                &resolution,
-                Some(signatures[0]),
-            ),
-            Ok((signatures[0], returned)),
-        );
+        assert_eq!((signature, return_type), (signatures[0], returned));
         assert_eq!(call_publication_state(&context, first), warm);
         assert!(session.query_count() >= caller_count);
         assert!(session.total_count() >= caller_total);

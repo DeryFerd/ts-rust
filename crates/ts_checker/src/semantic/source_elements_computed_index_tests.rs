@@ -180,6 +180,7 @@ fn computed_index_proof_precedes_absent_indexes_for_any_element_reads() {
         )
     };
     let before = snapshot(&context);
+    let options = context.options();
     let resolve = |store: &mut CanonicalTypeMapperStore| {
         resolve_object_element::<SourceElementError, _>(
             store,
@@ -190,6 +191,8 @@ fn computed_index_proof_precedes_absent_indexes_for_any_element_reads() {
             &index,
             any,
             error,
+            options,
+            false,
             &mut |_, _, _| panic!("an Any index has no named property lookup"),
         )
     };
