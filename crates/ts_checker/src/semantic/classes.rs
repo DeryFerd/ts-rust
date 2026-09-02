@@ -128,8 +128,9 @@ pub(super) use query::{
 
 use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
-    CanonicalNameResolver, CanonicalNameResolverHost, CanonicalResolutionLocation, CheckFlags,
-    EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
+    CanonicalNameResolutionError, CanonicalNameResolver, CanonicalNameResolverHost,
+    CanonicalResolutionLocation, CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId,
+    SymbolFlags, SymbolTableId,
     semantic::{PreparedSymbolTable, Symbol},
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
@@ -17482,7 +17483,7 @@ fn plan_class_implementations(
             .source(expression)
             .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(expression)))?;
         let mut callback_host = host.name_resolver_host(store)?;
-        let raw =
+        let resolved =
             CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
                 .map_err(|_| invariant(ClassInvariant::InvalidHeritage(expression)))?
                 .resolve(
@@ -17492,9 +17493,17 @@ fn plan_class_implementations(
                     None,
                     false,
                     false,
-                )
-                .map_err(|_| unsupported(ClassUnsupported::Heritage(expression)))?
-                .ok_or_else(|| unsupported(ClassUnsupported::Heritage(expression)))?;
+                );
+        let raw = match resolved {
+            Ok(Some(symbol)) => symbol,
+            Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias))
+                if source_types =>
+            {
+                // The ordinary import proof below resolves this cold alias.
+                alias
+            }
+            _ => return Err(unsupported(ClassUnsupported::Heritage(expression))),
+        };
         let mut symbol = store
             .get_merged_symbol(raw)
             .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(expression)))?;

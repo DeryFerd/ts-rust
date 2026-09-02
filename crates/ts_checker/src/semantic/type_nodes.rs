@@ -669,7 +669,7 @@ fn plan_source_class_implementation_import(
     }
     let (arena, bound) = host.source(node).ok_or_else(&invalid)?;
     let mut callback_host = host.name_resolver_host(store)?;
-    let raw = CanonicalNameResolver::new(
+    let resolved = CanonicalNameResolver::new(
         arena,
         bound,
         store.symbol_store(),
@@ -682,8 +682,17 @@ fn plan_source_class_implementation_import(
         None,
         false,
         false,
-    )?
-    .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::MissingTypeReference(node)))?;
+    );
+    let raw = match resolved {
+        Ok(Some(symbol))
+        | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(symbol)) => symbol,
+        Ok(None) => {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::MissingTypeReference(node),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
     if store
         .symbol(raw)
         .is_none_or(|symbol| symbol.flags() != SymbolFlags::ALIAS)
