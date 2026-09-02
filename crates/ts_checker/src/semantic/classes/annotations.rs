@@ -9,7 +9,8 @@ use super::{
     preflight_class_or_interface_reference, preflight_source_class_annotation,
     source_class_binding, source_class_plan_is_current, source_class_type_owner_declaration,
     source_class_type_parameter_plans, validate_class_heritage_members,
-    validate_source_class_header, validate_source_class_stored_header,
+    validate_direct_generic_reference, validate_source_class_header,
+    validate_source_class_stored_header,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -882,8 +883,15 @@ pub(in crate::semantic) fn class_instance_type_edges(
         return Ok(None);
     };
     let invalid = || invariant(ClassInvariant::InvalidInstanceMembers(owner));
-    let TypeData::Interface(interface) = store.type_payload(instance).ok_or_else(invalid)?.data()
-    else {
+    let record = store.type_payload(instance).ok_or_else(invalid)?;
+    if matches!(record.data(), TypeData::TypeReference(_)) {
+        let reference = validate_direct_generic_reference(store, instance).map_err(|_| invalid())?;
+        let mut edges = Vec::with_capacity(reference.type_arguments.len() + 1);
+        edges.push(reference.target);
+        edges.extend(reference.type_arguments);
+        return Ok(Some(edges));
+    }
+    let TypeData::Interface(interface) = record.data() else {
         return Err(invalid());
     };
     let structured = &interface.reference.object.structured;
