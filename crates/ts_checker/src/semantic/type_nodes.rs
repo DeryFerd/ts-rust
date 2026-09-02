@@ -12491,6 +12491,38 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if !flags.contains(SymbolFlags::INTERFACE) || flags.contains(SymbolFlags::CLASS) {
             return Ok(None);
         }
+        if self
+            .store
+            .source_interface_heritage_header(cached)
+            .is_some()
+            && self
+                .store
+                .direct_interface_heritage_provenance(cached)
+                .is_some()
+            && interface
+                .reference
+                .object
+                .structured
+                .signatures
+                .as_ref()
+                .is_none_or(|signatures| signatures.is_empty())
+            && interface.reference.object.structured.call_signature_count == 0
+            && let Some(context) = self.source_context.as_ref()
+        {
+            if self.array_targets
+                != Some(CanonicalArrayTargets::from_global_types(&context.globals))
+            {
+                return Err(invalid());
+            }
+            return self
+                .store
+                .validated_interface_heritage_array_edges(
+                    cached,
+                    self.array_targets,
+                    Some(&context.heritage()),
+                )
+                .map(Some);
+        }
         if object_members::authenticated_default_library_interface_owner(self.store, owner)
             || symbol
                 .declarations()
@@ -38191,6 +38223,86 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(())
     }
 
+    fn prepare_cached_source_interface_aliases(
+        &mut self,
+        node: NodeRef,
+        receiver: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        if self.global_types.is_none()
+            || self.instantiation_session.is_none()
+            || self
+                .store
+                .direct_interface_heritage_provenance(receiver)
+                .is_none()
+        {
+            return Ok(());
+        }
+        let Some(header) = self
+            .store
+            .source_interface_heritage_header(receiver)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let arrays = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types);
+        let NodeData::TypeReferenceNode(reference) =
+            &preflight_node(self.store, self.host, node)?.data
+        else {
+            return Ok(());
+        };
+        let planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            arrays,
+            self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
+        );
+        if reference
+            .type_arguments
+            .as_ref()
+            .is_some_and(|arguments| !arguments.nodes.is_empty())
+            || planner.resolve_uncached_type_reference_symbol(node)? != header.owner_symbol()
+        {
+            return Ok(());
+        }
+        if cached_interface_type(self.store, header.owner_symbol())? != Some(receiver) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        super::interface_heritage::validate_source_interface_heritage_header(
+            self.store, receiver, &header, arrays,
+        )?;
+        for base in super::interface_heritage::effective_source_interface_heritage_bases(
+            self.store, &header, arrays,
+        )? {
+            let Some(alias) = base.alias() else {
+                continue;
+            };
+            let context = self.source_query_context()?;
+            if matches!(
+                super::interface_heritage::source_interface_alias_base_state(
+                    self.store,
+                    alias,
+                    arrays,
+                    Some(&context.heritage()),
+                )?,
+                super::interface_heritage::SourceInterfaceAliasBaseState::Pending { .. }
+            ) {
+                self.prepare_source_interface_heritage(SourceInterfaceHeritageRequest::Alias {
+                    receiver,
+                    alias: alias.symbol(),
+                    root: alias.root(),
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn prepare_source_condition_type(
         &mut self,
         raw_type: TypeId,
@@ -39246,6 +39358,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidFunctionType(node),
             ));
+        }
+        if let Some(cached) = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+        {
+            self.prepare_cached_source_interface_aliases(node, cached)?;
         }
         let mut planner = TypeQueryPlanner::new(
             self.store,
@@ -49343,9 +49462,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         plan: &TypeQueryPlan,
     ) -> Option<NodeRef> {
         loop {
-            if plan.intersections.get(&node).is_some_and(|intersection| {
-                intersection.ordinary_properties || intersection.numeric_parameter
-            }) {
+            if plan
+                .intersections
+                .get(&node)
+                .is_some_and(|intersection| intersection.deferred)
+            {
                 return Some(node);
             }
             let NodeData::ParenthesizedTypeNode(parenthesized) = &self.host.node(node)?.data else {
@@ -52516,10 +52637,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .numeric_parameter_intersection_projection(declared_type)
             .map_err(|error| intersection_type_error(error, metadata.type_node))?
             .is_some();
+        let deferred_intersection = matches!(
+            self.store.type_payload(declared_type).map(TypeRecord::data),
+            Some(TypeData::Intersection(_))
+        ) && self
+            .direct_deferred_intersection_plan_node(metadata.type_node, plan)
+            .is_some();
         let property_limit_mark = if property_object_alias
             || function_alias
             || ordinary_intersection
             || numeric_intersection
+            || deferred_intersection
         {
             self.instantiation_session
                 .as_deref()
@@ -52876,6 +53004,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             || function_alias
             || ordinary_intersection
             || numeric_intersection
+            || deferred_intersection
             || matches!(
                 self.store.type_payload(declared_type).map(TypeRecord::data),
                 Some(TypeData::Union(_))
@@ -53491,7 +53620,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             )?;
             intersection_receipt = receipt;
             result
-        } else if numeric_intersection || function_alias {
+        } else if numeric_intersection || deferred_intersection || function_alias {
             self.instantiate_dependent_alias_type(
                 symbol,
                 declared_type,
@@ -53558,7 +53687,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if (literal_method_alias
             || property_object_alias
             || function_alias
-            || (ordinary_intersection || numeric_intersection)
+            || (ordinary_intersection || numeric_intersection || deferred_intersection)
                 && property_limit_mark.is_some_and(|mark| {
                     self.instantiation_session
                         .as_deref()
@@ -53587,7 +53716,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return Ok(instantiation);
         }
 
-        if ordinary_intersection
+        if (ordinary_intersection || deferred_intersection)
             && intersection_receipt.is_none()
             && super::instantiate::cached_instantiation_with_vector(
                 self.store,

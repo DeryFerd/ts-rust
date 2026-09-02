@@ -66,8 +66,8 @@ use super::{
     signatures::{IndexFlags, SignatureFlags, TypePredicateKind},
     store::{PlainInterfaceHeritageFacts, SemanticStore, SourceNodeParent},
     structured_members::{
-        InterfaceHeritageMembersValidation, inherited_generic_property_reference,
-        valid_declared_member_table, validate_interface_heritage_members_with_array_targets,
+        InterfaceHeritageMembersValidation, valid_declared_member_table,
+        validate_interface_heritage_members_with_array_targets,
     },
     tuple_types::PreparedCanonicalTupleType,
     type_records::{
@@ -3137,85 +3137,22 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     StoredCallableSetValidation::NotCallable => {}
                 }
-                if let TypeData::Interface(interface) = record.data()
+                if matches!(record.data(), TypeData::Interface(_))
                     && self.direct_interface_heritage_provenance(type_).is_some()
                 {
-                    match validate_interface_heritage_members_with_array_targets(
-                        self,
+                    for edge in self.validated_interface_heritage_array_edges(
                         type_,
                         array_validation.targets(),
-                    ) {
-                        InterfaceHeritageMembersValidation::Valid => {
-                            for property in interface
-                                .reference
-                                .object
-                                .structured
-                                .properties
-                                .as_deref()
-                                .unwrap_or_default()
-                            {
-                                let links = self
-                                    .value_symbol_links(*property)
-                                    .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
-                                if let Some(target) = links.target {
-                                    let reference = inherited_generic_property_reference(
-                                        self,
-                                        type_,
-                                        *property,
-                                        array_validation.targets(),
-                                    )
-                                    .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
-                                    let template = self
-                                        .value_symbol_links(target)
-                                        .and_then(|links| links.resolved_type)
-                                        .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
-                                    // The proxy can stay lazy, but its template and substitutions cannot be skipped.
-                                    for edge in [template, reference] {
-                                        self.validate_cached_array_capability_worker(
-                                            edge,
-                                            array_validation,
-                                            visited,
-                                            allowed_pending,
-                                        )?;
-                                    }
-                                } else if links.resolved_type.is_none() {
-                                    return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
-                                }
-                                if let Some(property_type) = links.resolved_type {
-                                    self.validate_cached_array_capability_worker(
-                                        property_type,
-                                        array_validation,
-                                        visited,
-                                        allowed_pending,
-                                    )?;
-                                }
-                            }
-                            for index in interface
-                                .reference
-                                .object
-                                .structured
-                                .index_infos
-                                .as_deref()
-                                .unwrap_or_default()
-                            {
-                                let value_type = self
-                                    .index_info(*index)
-                                    .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?
-                                    .value_type();
-                                self.validate_cached_array_capability_worker(
-                                    value_type,
-                                    array_validation,
-                                    visited,
-                                    allowed_pending,
-                                )?;
-                            }
-                            return Ok(());
-                        }
-                        InterfaceHeritageMembersValidation::Malformed
-                        | InterfaceHeritageMembersValidation::NotHeritage => {
-                            return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
-                        }
+                        None,
+                    )? {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            visited,
+                            allowed_pending,
+                        )?;
                     }
+                    return Ok(());
                 }
                 match object_members::validate_resolved_declared_property_type_graph(self, type_) {
                     object_members::DeclaredPropertyTypeGraphValidation::Traversable(
@@ -3245,6 +3182,57 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             _ => Ok(()),
         }
+    }
+
+    pub(super) fn validated_interface_heritage_array_edges(
+        &self,
+        type_: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+        query: Option<&super::interface_heritage::SourceInterfaceHeritageQueryContext<'_>>,
+    ) -> Result<Vec<TypeId>, LiteralTypeCacheError> {
+        let invalid = || LiteralTypeCacheError::InvalidCachedUnion(type_);
+        let Some(TypeData::Interface(interface)) = self.type_payload(type_).map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        if self.direct_interface_heritage_provenance(type_).is_none()
+            || super::structured_members::validate_interface_heritage_members_with_query_context(
+                self,
+                type_,
+                array_targets,
+                query,
+            ) != InterfaceHeritageMembersValidation::Valid
+        {
+            return Err(invalid());
+        }
+        let structured = &interface.reference.object.structured;
+        let mut edges = Vec::new();
+        for property in structured.properties.as_deref().unwrap_or_default() {
+            let links = self.value_symbol_links(*property).ok_or_else(invalid)?;
+            if let Some(target) = links.target {
+                let reference = super::structured_members::inherited_generic_property_reference_with_query_context(
+                    self,
+                    type_,
+                    *property,
+                    array_targets,
+                    query,
+                )
+                .ok_or_else(invalid)?;
+                let template = self
+                    .value_symbol_links(target)
+                    .and_then(|links| links.resolved_type)
+                    .ok_or_else(invalid)?;
+                // A lazy proxy still needs its template and substitutions checked.
+                edges.extend([template, reference]);
+            } else if links.resolved_type.is_none() {
+                return Err(invalid());
+            }
+            edges.extend(links.resolved_type);
+        }
+        for index in structured.index_infos.as_deref().unwrap_or_default() {
+            edges.push(self.index_info(*index).ok_or_else(invalid)?.value_type());
+        }
+        Ok(edges)
     }
 
     /// The full-member proof owns only source property and method declarations.
