@@ -5662,7 +5662,7 @@ fn validate_declared_call_set_member_edges_worker(
             || failure.rejects("member.reserved_name", !late_property && record.name().is_reserved_member_name())
             || failure.rejects("member.private_name", record.name().is_private_identifier())
             || failure.rejects("member.late_name", !late_property && record.name().is_late_bound())
-            || failure.rejects("member.name_encoding", record.name().as_utf8().is_none())
+            || failure.rejects("member.name_encoding", !late_property && record.name().as_utf8().is_none())
             || failure.rejects("member.value_declaration", record.value_declaration() != Some(declaration))
             || failure.rejects("member.parent", store.get_parent_of_symbol(*property) != Some(owner))
             || failure.rejects("member.members", record.members().is_some())
