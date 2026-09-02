@@ -1871,6 +1871,10 @@ impl SourceClassProvenance {
     pub(super) const fn instance_type(&self) -> TypeId {
         self.prepared.instance_type
     }
+
+    pub(super) fn imported_base(&self) -> Option<&SourceClassImportPlan> {
+        self.prepared.plan.imported_base()
+    }
 }
 
 /// The real class and source-local value identities of an executable class.

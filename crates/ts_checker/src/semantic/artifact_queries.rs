@@ -4141,8 +4141,7 @@ impl CanonicalCheckerContext<'_> {
         self.validate_artifact_type(node, type_).map(Some)
     }
 
-    /// A class base name denotes its instance here, even when checking the
-    /// extends expression retained the constructor value at that same node.
+    /// Keeps the declared base separate from an imported constructor expression.
     fn class_heritage_artifact_target(
         &self,
         node: NodeRef,
@@ -4208,9 +4207,36 @@ impl CanonicalCheckerContext<'_> {
         {
             return Err(CanonicalArtifactQueryError::InvalidType { node, type_: base });
         }
+        let source = self.store().source_class_provenance(owner_type);
+        let (type_, reference_symbol) = if let Some(imported) =
+            source.and_then(super::classes::SourceClassProvenance::imported_base)
+        {
+            let host = self.declared_type_host()?;
+            let value = imported
+                .completed_value(self.store(), &host, self.global_types(), self.options())
+                .map_err(|error| {
+                    CanonicalArtifactQueryError::SourceCheck(
+                        super::source::source_class_import_error(node, &error),
+                    )
+                })?
+                .ok_or(CanonicalArtifactQueryError::MissingType {
+                    node,
+                    kind: record.kind,
+                })?;
+            if imported.demand.read.node != node
+                || imported.owner.symbol != symbol
+                || value.members.shells().instance_type() != base
+                || value.members.shells().value_type() != provenance.base_value_type
+            {
+                return Err(CanonicalArtifactQueryError::InvalidType { node, type_: base });
+            }
+            (provenance.base_value_type, imported.demand.read.resolved_symbol)
+        } else {
+            (base, symbol)
+        };
         // The source-body producer retains the value expression. The older
         // declaration producer retains the base type or leaves the name cold.
-        let expected_cache = if self.store().source_class_provenance(owner_type).is_some() {
+        let expected_cache = if source.is_some() {
             provenance.base_value_type
         } else {
             base
@@ -4232,15 +4258,15 @@ impl CanonicalCheckerContext<'_> {
             .store()
             .symbol_node_links(node)
             .and_then(|links| links.resolved_symbol)
-            && self.merged_artifact_symbol(node, cached)? != symbol
+            && self.merged_artifact_symbol(node, cached)? != reference_symbol
         {
             return Err(CanonicalArtifactQueryError::InvalidSymbol {
                 node,
                 symbol: cached,
             });
         }
-        self.validate_artifact_type(node, base)?;
-        Ok(Some((base, symbol)))
+        self.validate_artifact_type(node, type_)?;
+        Ok(Some((type_, reference_symbol)))
     }
 
     /// Reads the existing class receiver proof. This does not check a body again
