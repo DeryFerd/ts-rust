@@ -327,6 +327,7 @@ pub(super) fn plan_function_identifier_read(
             valid_source_function_declaration_owner_shape(store, routed.target, *declaration)
         });
     if record.flags() != SymbolFlags::FUNCTION && merged_declaration.is_none() {
+        observe_non_function_identifier(store, host, node, name, routed);
         return Err(SourceFunctionPlanError::Unsupported(
             SourceFunctionUnsupported::NonFunctionSymbol {
                 node,
@@ -424,6 +425,100 @@ pub(super) fn plan_function_identifier_read(
         resolved_symbol: routed.resolved,
         value_symbol: routed.target,
     })
+}
+
+/// Records stored owner metadata only after the identifier route has failed.
+fn observe_non_function_identifier(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    name: &str,
+    routed: RoutedValueSymbol,
+) {
+    use std::io::Write as _;
+
+    if store.relation_read_observation_is_active() {
+        return;
+    }
+    let Some(owner) = store.symbol(routed.target) else {
+        return;
+    };
+    let describe_declaration = |declaration: NodeRef| {
+        (
+            declaration,
+            host.node(declaration).map(|record| (record.kind, record.range)),
+            host.bound_file(declaration)
+                .and_then(|bound| bound.symbol(declaration)),
+        )
+    };
+    let declarations = owner.declarations();
+    let declaration_rows: [_; 3] = std::array::from_fn(|index| {
+        declarations
+            .and_then(|declarations| declarations.get(index))
+            .copied()
+            .map(describe_declaration)
+    });
+    let links = store.value_symbol_links(routed.target);
+    let source_owner = links.and_then(|links| links.target).and_then(|symbol| {
+        store.symbol(symbol).map(|record| {
+            (
+                symbol,
+                record.flags(),
+                record.check_flags(),
+                record.value_declaration().map(describe_declaration),
+            )
+        })
+    });
+    let type_state = links.and_then(|links| links.resolved_type).and_then(|type_| {
+        store.type_payload(type_).map(|record| {
+            (
+                type_,
+                record.data().kind(),
+                record.flags(),
+                record.object_flags(),
+                record.symbol(),
+                record.data().structured().map(|data| {
+                    (
+                        data.members,
+                        data.properties.as_ref().map(Vec::len),
+                        data.signatures.as_ref().map(Vec::len),
+                        data.call_signature_count,
+                        data.index_infos.as_ref().map(Vec::len),
+                    )
+                }),
+            )
+        })
+    });
+    let owner_name = owner.name().as_bytes();
+    let mut buffer = [0_u8; 4096];
+    let mut output = &mut buffer[..4000];
+    let truncated = write!(
+        output,
+        "non_function_identifier node={node:?} syntax={:?} name_bytes={:?} name_len={} route={routed:?} owner_name_bytes={:?} owner_name_len={} flags={:?} checks={:?} parent={:?} export={:?} owner_tables={:?} node_links={:?} declaration_count={:?} declarations_truncated={} declaration_node_syntax_binder={declaration_rows:?} value_declaration={:?} value_links={links:?} source_owner={source_owner:?} type_kind_flags_owner_members={type_state:?}",
+        host.node(node).map(|record| (record.kind, record.range)),
+        &name.as_bytes()[..name.len().min(64)],
+        name.len(),
+        &owner_name[..owner_name.len().min(64)],
+        owner_name.len(),
+        owner.flags(),
+        owner.check_flags(),
+        owner.parent(),
+        owner.export_symbol(),
+        (owner.members(), owner.exports()),
+        store.symbol_node_links(node),
+        declarations.map(<[_]>::len),
+        declarations.is_some_and(|declarations| declarations.len() > declaration_rows.len()),
+        owner.value_declaration().map(describe_declaration),
+    )
+    .is_err();
+    let used = 4000 - output.len();
+    let suffix = if truncated {
+        b" record_truncated=1\n"
+    } else {
+        b" record_truncated=0\n"
+    };
+    buffer[used..used + suffix.len()].copy_from_slice(suffix);
+    let _ = std::io::stderr().write_all(&buffer[..used + suffix.len()]);
 }
 
 fn validate_function_read_declaration_symbol(
