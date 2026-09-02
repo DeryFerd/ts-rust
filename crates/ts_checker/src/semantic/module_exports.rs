@@ -176,8 +176,19 @@ fn validate_source_module(
             );
         }
         if exports.iter().any(|(_, symbol)| {
-            store.get_merged_symbol(symbol) != Some(symbol)
-                || !store.source_merged_symbol_declarations_match(symbol)
+            let Some(canonical) = store.get_merged_symbol(symbol) else {
+                return true;
+            };
+            let Some(current) = store.symbol(canonical) else {
+                return true;
+            };
+            !store.source_merged_symbol_declarations_match(canonical)
+                || canonical != symbol
+                    && (!store.source_raw_symbol_declarations_match(symbol)
+                        || current.check_flags() != CheckFlags::NONE
+                        || store
+                            .symbol(symbol)
+                            .is_none_or(|original| original.name() != current.name()))
         }) {
             return Err(invalid());
         }

@@ -1902,7 +1902,15 @@ fn plan_direct_interface_heritage_inner(
                 )
             })
             .transpose()
-            .map_err(|_| DirectInterfaceHeritageError::Invalid)?
+            .map_err(|error| match error {
+                super::source_imports::SourceImportError::Unsupported(_) => {
+                    DirectInterfaceHeritageError::Unsupported {
+                        node,
+                        kind: node_record.kind,
+                    }
+                }
+                _ => DirectInterfaceHeritageError::Invalid,
+            })?
             .flatten()
         {
             Some(imported)

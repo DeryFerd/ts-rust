@@ -12466,7 +12466,17 @@ pub(super) fn declared_type_declaration_parent(
     {
         return Err(());
     }
-    Ok(Some(source_symbol))
+    let parent = store.get_parent_of_symbol(symbol);
+    if parent != Some(source_symbol)
+        && super::source_imports::source_merged_augmentation_interface_declaration(
+            store, host, symbol,
+        )
+        .map_err(|_| ())?
+            != Some(declaration)
+    {
+        return Err(());
+    }
+    Ok(parent)
 }
 
 fn declared_namespace_type_parent(

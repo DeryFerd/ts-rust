@@ -5501,22 +5501,22 @@ pub(super) fn namespace_heritage_type_import_binding(
     Ok(plan_named_type_import_binding(store, &host, name, &identifier.text, alias)?.is_some())
 }
 
-fn source_augmentation_interface_owner(
+fn source_augmentation_interface_module(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
     owner: SemanticSymbolId,
-) -> Result<bool, SourceImportError> {
+) -> Result<Option<(SemanticSymbolId, SemanticSymbolId)>, SourceImportError> {
     let invalid = || invariant(SourceImportInvariant::InvalidNode(declaration));
     let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
     let record = checked_node(arena, bound, store, declaration)?;
     let Some(parent) = record.parent else {
-        return Ok(false);
+        return Ok(None);
     };
     let block = NodeRef::new(declaration.arena, declaration.file, parent);
     let block_record = checked_node(arena, bound, store, block)?;
     let NodeData::ModuleBlock(body) = &block_record.data else {
-        return Ok(false);
+        return Ok(None);
     };
     let augmentation = block_record
         .parent
@@ -5551,10 +5551,8 @@ fn source_augmentation_interface_owner(
     {
         return Err(invalid());
     }
-    let module_symbol = bound
-        .symbol(augmentation)
-        .and_then(|symbol| store.get_merged_symbol(symbol))
-        .ok_or_else(invalid)?;
+    let raw_module = bound.symbol(augmentation).ok_or_else(invalid)?;
+    let module_symbol = store.get_merged_symbol(raw_module).ok_or_else(invalid)?;
     source_file_namespace_declaration(store, host, module_symbol)?;
     let owner_record = store.symbol(owner).ok_or_else(invalid)?;
     if store
@@ -5567,7 +5565,7 @@ fn source_augmentation_interface_owner(
     {
         return Err(invalid());
     }
-    Ok(true)
+    Ok(Some((raw_module, module_symbol)))
 }
 
 pub(super) fn plan_source_interface_heritage_type_import(
@@ -5659,7 +5657,8 @@ pub(super) fn plan_source_interface_heritage_import(
     let NodeData::InterfaceDeclaration(interface) = &declaration_record.data else {
         return Err(invalid());
     };
-    let augmentation = source_augmentation_interface_owner(store, host, declaration, owner)?;
+    let augmentation =
+        source_augmentation_interface_module(store, host, declaration, owner)?.is_some();
     if record.kind != SyntaxKind::ExpressionWithTypeArguments
         || record.flags.0 != 0
         || base.facts != 0
@@ -8961,6 +8960,48 @@ fn validate_planned_import_read(
     Ok(())
 }
 
+fn source_augmentation_replaces_original_export(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    module: SemanticSymbolId,
+    member: SemanticSymbolId,
+) -> Result<bool, SourceImportError> {
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetSymbol(module));
+    let source = source_file_namespace_declaration(store, host, module)?;
+    let (_, bound) = host.source(source).ok_or_else(invalid)?;
+    let raw_module = bound.symbol(source).ok_or_else(invalid)?;
+    if store.get_merged_symbol(raw_module) != Some(module)
+        || !store.source_raw_symbol_declarations_match(raw_module)
+        || !store.source_symbol_export_table_matches(raw_module)
+    {
+        return Err(invalid());
+    }
+    let exports = store
+        .symbol(raw_module)
+        .and_then(|record| record.exports())
+        .ok_or_else(invalid)?;
+    super::source_namespaces::validate_module_export_table(
+        store,
+        host,
+        module,
+        &[source],
+        Some(exports),
+    )
+    .map_err(|_| invalid())?;
+    let exports = store.symbol_table(exports).ok_or_else(invalid)?;
+    let member = store.symbol(member).ok_or_else(invalid)?;
+    if exports.get(member.name()).is_some() {
+        Ok(true)
+    } else if exports
+        .get(InternalSymbolName::ExportStar.as_ref())
+        .is_some()
+    {
+        Ok(false)
+    } else {
+        Err(invalid())
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 /// Proves the original exported interface and every merged augmentation declaration.
 pub(super) fn source_merged_augmentation_interface_declaration(
@@ -8984,6 +9025,9 @@ pub(super) fn source_merged_augmentation_interface_declaration(
     {
         return Err(invalid());
     }
+    let mut parent_module = None;
+    let mut augmentations = HashSet::new();
+    let mut modules = HashSet::new();
     for (index, &declaration) in declarations.iter().enumerate() {
         let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
         let record = checked_node(arena, bound, store, declaration)?;
@@ -9023,7 +9067,6 @@ pub(super) fn source_merged_augmentation_interface_declaration(
                     interface.modifiers.as_ref(),
                 )?
                 || source_file_namespace_declaration(store, host, module)? != source
-                || store.get_parent_of_symbol(target) != Some(module)
                 || store
                     .symbol(module)
                     .and_then(|record| record.exports())
@@ -9034,9 +9077,25 @@ pub(super) fn source_merged_augmentation_interface_declaration(
             {
                 return Err(invalid());
             }
-        } else if !source_augmentation_interface_owner(store, host, declaration, target)? {
-            return Err(invalid());
+            parent_module = Some(module);
+        } else {
+            let Some((augmentation, module)) =
+                source_augmentation_interface_module(store, host, declaration, target)?
+            else {
+                return Err(invalid());
+            };
+            // Each raw augmentation merges its whole export table only once.
+            if augmentations.insert(augmentation)
+                && (!modules.insert(module)
+                    || source_augmentation_replaces_original_export(store, host, module, target)?)
+            {
+                parent_module = Some(module);
+            }
         }
+    }
+    // A first star insertion keeps the prior parent. An existing export changes it.
+    if store.get_parent_of_symbol(target) != parent_module {
+        return Err(invalid());
     }
     Ok(Some(declarations[0]))
 }
