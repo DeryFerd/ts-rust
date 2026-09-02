@@ -17719,6 +17719,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         expression,
                     },
                 ) => {
+                    if callable.family == SourceCallableFamily::ArrowFunction
+                        && let Some((store, host)) = self.semantic
+                        && super::source_flow::source_member_assignment_proof(
+                            store, host, *expression,
+                        )
+                        .map_err(|error| Self::source_flow_plan_error(callable, error))?
+                        .is_some()
+                    {
+                        if self.bound.container(*expression) != Some(callable.declaration) {
+                            return Err(Self::unsupported_function_body(callable));
+                        }
+                        self.primitive_binary_position_roots.insert(*expression);
+                        statements.push(PlannedCallableStatement::Leaf(
+                            PlannedLinearFunctionStatement::Expression {
+                                statement: *statement,
+                                expression: Box::new(self.plan_expression(*expression)?),
+                            },
+                        ));
+                        continue;
+                    }
                     if let Some(assignment) = self.plan_linear_parameter_compound_assignment(
                         callable,
                         *statement,
