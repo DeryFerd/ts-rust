@@ -16988,6 +16988,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let mut calls = Vec::new();
         let mut parameters = Vec::new();
         let mut captures = Vec::new();
+        let mut captured_array_mutations = Vec::new();
         let mut mutations = Vec::new();
         let mut catch_initializers = Vec::new();
         let mut iteration_assignments = Vec::new();
@@ -17024,7 +17025,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     {
                         calls.push(expression.node);
                     }
-                    mutations.extend(leaf.array_mutation(store, host)?);
+                    if let Some(mutation) = leaf.array_mutation(store, host)? {
+                        if callable.family == SourceCallableFamily::ArrowFunction
+                            && self.bound.container(mutation.declaration)
+                                != Some(callable.declaration)
+                        {
+                            let local = plan_source_captured_local(
+                                store,
+                                host,
+                                callable.declaration,
+                                mutation.receiver,
+                                mutation.symbol,
+                            )
+                            .map_err(|error| Self::source_flow_plan_error(callable, error))?
+                            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+                            captured_array_mutations
+                                .push(SourceFlowCapturedArrayMutation { mutation, local });
+                        } else {
+                            mutations.push(mutation);
+                        }
+                    }
                     match leaf {
                         PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
                             parameters.push(assignment.flow);
@@ -17189,6 +17209,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             parameters,
             calls,
             captures,
+            captured_array_mutations,
             mutations,
             nullish,
             updates,

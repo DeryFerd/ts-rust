@@ -2629,6 +2629,7 @@ impl SourceFlowPlan {
             parameter_assignments,
             calls,
             captures,
+            std::iter::empty(),
             array_mutations,
             nullish_assignments,
             std::iter::empty(),
@@ -2649,6 +2650,7 @@ impl SourceFlowPlan {
         parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
         calls: impl IntoIterator<Item = NodeRef>,
         captures: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
+        captured_array_mutations: impl IntoIterator<Item = SourceFlowCapturedArrayMutation>,
         array_mutations: impl IntoIterator<Item = SourceFlowArrayMutation>,
         nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
         updates: impl IntoIterator<Item = SourceFlowUpdate>,
@@ -2714,8 +2716,15 @@ impl SourceFlowPlan {
                 symbol: assignment.symbol,
             });
         }
-        for capture in captures {
-            let origin = SourceCapturedFlowOrigin::Assignment(capture);
+        for origin in captures
+            .into_iter()
+            .map(SourceCapturedFlowOrigin::Assignment)
+            .chain(
+                captured_array_mutations
+                    .into_iter()
+                    .map(SourceCapturedFlowOrigin::ArrayMutation),
+            )
+        {
             validate_captured_flow_origin(
                 arena,
                 bound,
@@ -2742,10 +2751,11 @@ impl SourceFlowPlan {
         }
         for mutation in array_mutations {
             validate_array_mutation_in_list(arena, bound, container, mutation, Some(syntax))?;
-            if effects
-                .assignment_declarations
-                .insert(mutation.call, mutation.declaration)
-                .is_some()
+            if effects.captured_origins.contains_key(&mutation.call)
+                || effects
+                    .assignment_declarations
+                    .insert(mutation.call, mutation.declaration)
+                    .is_some()
             {
                 return Err(SourceFlowInvariant::DuplicateAssignment(mutation.call).into());
             }
@@ -2768,6 +2778,15 @@ impl SourceFlowPlan {
             };
             if effects.calls.insert(call, statement).is_some() {
                 return Err(SourceFlowInvariant::DuplicateCall(call).into());
+            }
+        }
+        for origin in effects.captured_origins.values() {
+            if let SourceCapturedFlowOrigin::ArrayMutation(mutation) = origin
+                && !effects.calls.contains_key(&mutation.mutation.call)
+            {
+                return Err(
+                    SourceFlowInvariant::InvalidArrayMutation(mutation.mutation.call).into(),
+                );
             }
         }
         prepare_nullish_assignments(
