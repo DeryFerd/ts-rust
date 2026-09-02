@@ -12551,6 +12551,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 &self.plan.pending_function_proofs,
                 Some(&|type_| self.cold_source_interface_cache_edges(type_)),
             )
+            .inspect_err(|error| {
+                if let LiteralTypeCacheError::InvalidCachedUnion(failed) = error {
+                    self.store.trace_cached_union_failure(
+                        "type_query.array_capability",
+                        *failed,
+                        error,
+                    );
+                }
+            })
     }
 
     /// Source-owned interface caches retain their published member and annotation edges.

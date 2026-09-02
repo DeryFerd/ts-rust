@@ -3128,8 +3128,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     } if allowed_pending.contains(&type_) => {
                         return Ok(());
                     }
-                    StoredCallableSetValidation::Malformed { .. }
-                    | StoredCallableSetValidation::Pending { .. } => {
+                    validation @ (StoredCallableSetValidation::Malformed { .. }
+                    | StoredCallableSetValidation::Pending { .. }) => {
+                        self.trace_cached_union_failure(
+                            "array_capability.callable",
+                            type_,
+                            &validation,
+                        );
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
                     StoredCallableSetValidation::NotCallable if unsupported_callable => {
@@ -5627,7 +5632,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         );
         if matches!(
             &result,
-            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(failed)) if *failed == type_
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(failed)
+                | LiteralTypeCacheError::InvalidCachedUnion(failed)) if *failed == type_
         ) {
             self.trace_cached_union_failure(stage, type_, &result);
         }
@@ -5846,8 +5852,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     } if allowed_pending.contains(&type_) => {
                         return Ok(());
                     }
-                    StoredCallableSetValidation::Malformed { .. }
-                    | StoredCallableSetValidation::Pending { .. } => {
+                    validation @ (StoredCallableSetValidation::Malformed { .. }
+                    | StoredCallableSetValidation::Pending { .. }) => {
+                        self.trace_cached_union_failure(
+                            "union_constituent.object_callable",
+                            type_,
+                            &validation,
+                        );
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
                     StoredCallableSetValidation::NotCallable
