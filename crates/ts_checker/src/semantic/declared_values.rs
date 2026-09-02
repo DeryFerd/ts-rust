@@ -1241,6 +1241,25 @@ fn preflight_source_property_object_rhs(
                 intersection = true;
                 current = parent;
             }
+            NodeData::UnionTypeNode(parts)
+                if intersection
+                    && parent_node.kind == SyntaxKind::UnionType
+                    && parts
+                        .types
+                        .nodes
+                        .iter()
+                        .filter(|&&child| child == current.node)
+                        .count()
+                        == 1 =>
+            {
+                for &child in &parts.types.nodes {
+                    let child = NodeRef::new(parent.arena, parent.file, child);
+                    if preflight_node(store, host, child)?.parent != Some(parent.node) {
+                        return Err(invalid());
+                    }
+                }
+                current = parent;
+            }
             NodeData::TypeAliasDeclaration(alias)
                 if intersection
                     && parent_node.kind == SyntaxKind::TypeAliasDeclaration
