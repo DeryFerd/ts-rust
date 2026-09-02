@@ -5097,6 +5097,22 @@ pub(super) fn plan_source_interface_heritage_type_import(
     Ok(Some(expected.target_symbol))
 }
 
+/// Reads a named type import's real target without publishing alias or type links.
+pub(super) fn plan_source_named_type_import_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    reference: NodeRef,
+) -> Result<Option<ResolvedSourceTypeImportBinding>, SourceImportError> {
+    let Some((import, binding)) =
+        plan_named_type_import_at_reference(store, host, reference, &mut None)?
+    else {
+        return Ok(None);
+    };
+    let resolved = plan_named_type_import_target(store, host, &import, &binding)?;
+    validate_source_type_import_reference_source(store, host, &resolved, reference)?;
+    Ok(Some(resolved))
+}
+
 /// Finds the actual named type import through lexical binding, before publication.
 #[allow(clippy::too_many_lines)]
 fn plan_named_type_import_at_reference(

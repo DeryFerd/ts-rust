@@ -24240,8 +24240,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     SourceSyntaxRole::VariableInitializer,
                 ));
             };
-            let contextual = variable.type_.is_some();
-            let (variable_symbol, planned) = if contextual {
+            let contextual_type = variable.type_.map(|node| self.reference(node));
+            let (variable_symbol, planned) = if let Some(annotation) = contextual_type {
+                self.plan_type_import_annotation_root(annotation)?;
                 let arrow =
                     plan_contextual_source_arrow(store, host, declaration, self.array_targets)
                         .map_err(Self::contextual_arrow_plan_error)?;
@@ -65380,6 +65381,7 @@ fn resolve_contextual_callable_target(
     options: CanonicalCheckerOptions,
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
+    type_import_capabilities: &[CanonicalTypeReferenceAliasTarget],
     arrow: &SourceContextualArrowPlan,
 ) -> Result<(TypeId, ValidatedSingleCallable), SourceCheckError> {
     let mut target_diagnostics = CanonicalCheckerDiagnostics::default();
@@ -65391,6 +65393,7 @@ fn resolve_contextual_callable_target(
         session,
         &mut target_diagnostics,
     )?
+    .with_type_reference_alias_targets(type_import_capabilities.iter().copied())?
     .get_type_from_type_node(arrow.contextual_type.type_node);
     merge_retry_diagnostics(diagnostics, target_diagnostics);
     let target = target?;
@@ -65990,6 +65993,9 @@ fn materialize_contextual_source_arrow(
         options,
         session,
         diagnostics,
+        type_import_capabilities
+            .get(&plan.contextual_type.type_node)
+            .map_or([].as_slice(), Vec::as_slice),
         plan,
     )?;
     preflight_contextual_source_publication(store, plan, Some(target))?;
@@ -76265,6 +76271,13 @@ fn check_source_plan(
             options,
             session,
             &mut type_import_preflight_diagnostics,
+        )?
+        .with_type_reference_alias_targets(
+            type_import_capabilities
+                .get(&arrow.source.contextual_type.type_node)
+                .map_or([].as_slice(), Vec::as_slice)
+                .iter()
+                .copied(),
         )?
         .preflight_type_from_type_node(arrow.source.contextual_type.type_node)?;
         if let Some(callable) = store.source_callable_type_for_owner(arrow.source.owner_symbol) {

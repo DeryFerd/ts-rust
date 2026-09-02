@@ -824,28 +824,39 @@ fn contextual_function_type_syntax(
                     SourceContextualArrowInvariant::InvalidVariableType(name),
                 ));
             }
-            let (arena, bound) = host.source(node).ok_or_else(|| {
-                contextual_invariant(SourceContextualArrowInvariant::InvalidVariableType(node))
-            })?;
-            let mut callback_host = host.name_resolver_host(store)?;
-            let mut resolver =
-                CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
-                    .map_err(DeclaredTypeError::from)?;
-            let symbol = match resolver.resolve(
-                Some(CanonicalResolutionLocation::Bound(name)),
-                &identifier.text,
-                SymbolFlags::TYPE,
-                None,
-                true,
-                false,
-            ) {
-                Ok(Some(symbol)) => symbol,
-                Ok(None) | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => {
-                    return Err(contextual_unsupported(
-                        SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
-                    ));
+            let imported =
+                super::source_imports::plan_source_named_type_import_target(store, host, node)
+                    .map_err(|error| super::type_nodes::property_type_import_error(node, error))?;
+            let symbol = if let Some(imported) = imported {
+                imported.target_symbol
+            } else {
+                let (arena, bound) = host.source(node).ok_or_else(|| {
+                    contextual_invariant(SourceContextualArrowInvariant::InvalidVariableType(node))
+                })?;
+                let mut callback_host = host.name_resolver_host(store)?;
+                let mut resolver = CanonicalNameResolver::new(
+                    arena,
+                    bound,
+                    store.symbol_store(),
+                    &mut callback_host,
+                )
+                .map_err(DeclaredTypeError::from)?;
+                match resolver.resolve(
+                    Some(CanonicalResolutionLocation::Bound(name)),
+                    &identifier.text,
+                    SymbolFlags::TYPE,
+                    None,
+                    true,
+                    false,
+                ) {
+                    Ok(Some(symbol)) => symbol,
+                    Ok(None) | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => {
+                        return Err(contextual_unsupported(
+                            SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
+                        ));
+                    }
+                    Err(error) => return Err(DeclaredTypeError::from(error).into()),
                 }
-                Err(error) => return Err(DeclaredTypeError::from(error).into()),
             };
             let Some(symbol) = store.get_merged_symbol(symbol) else {
                 return Err(contextual_invariant(

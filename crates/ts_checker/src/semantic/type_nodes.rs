@@ -7659,7 +7659,10 @@ fn source_class_type_query_error(
     }
 }
 
-fn property_type_import_error(node: NodeRef, error: SourceImportError) -> DeclaredTypeError {
+pub(super) fn property_type_import_error(
+    node: NodeRef,
+    error: SourceImportError,
+) -> DeclaredTypeError {
     use super::variables::VariablePlanError;
 
     match error {
