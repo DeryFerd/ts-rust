@@ -12430,6 +12430,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         .map_err(|error| class_body_flow_error(root, error))?;
                         SourceFlowCondition::ClassPropertyEquality(condition)
                     }
+                    PlannedExpressionKind::Call(call) if call.arguments.is_empty() => {
+                        let Some((_, access)) = zero_argument_class_condition_target(&condition)
+                        else {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Class(root),
+                            ));
+                        };
+                        if access.class_symbol() != body.class_symbol
+                            || access.class_declaration() != body.class_declaration
+                            || access.body_declaration() != body.declaration
+                        {
+                            return Err(SourceCheckError::Class(root));
+                        }
+                        SourceFlowCondition::Unchanged(root)
+                    }
                     PlannedExpressionKind::Call(call) => {
                         let [argument] = call.arguments.as_slice() else {
                             return Err(SourceCheckError::Unsupported(
@@ -33949,6 +33964,27 @@ fn preflight_class_property_condition_reads(
     Ok(())
 }
 
+/// Uses the class callee's existing flow point before checking the call.
+fn zero_argument_class_condition_target(
+    expression: &PlannedExpression,
+) -> Option<(&SourcePropertyPlan, ClassAccessContext)> {
+    let PlannedExpressionKind::Call(call) = &expression.unparenthesized().kind else {
+        return None;
+    };
+    if !call.arguments.is_empty() {
+        return None;
+    }
+    let PlannedExpressionKind::Property(property) = &call.callee.unparenthesized().kind else {
+        return None;
+    };
+    let PlannedExpressionKind::ClassReceiver(access) =
+        &property.receiver.unparenthesized().kind
+    else {
+        return None;
+    };
+    Some((property.as_ref(), *access))
+}
+
 fn collect_class_expression_flow(
     expression: &PlannedExpression,
     points: &mut Vec<NodeRef>,
@@ -43718,9 +43754,12 @@ fn check_class_statements(
                 returns,
             )?,
             PlannedClassStatement::If(branch) => {
+                let zero_argument_target =
+                    zero_argument_class_condition_target(&branch.condition);
                 let point = branch
                     .flow
                     .class_property_access()
+                    .or_else(|| zero_argument_target.map(|(property, _)| property.node))
                     .unwrap_or(branch.condition.unparenthesized().node);
                 let snapshot = context
                     .flow
@@ -43742,6 +43781,7 @@ fn check_class_statements(
                     Some(&mut *context),
                 )?;
                 let snapshot_matches = match branch.flow {
+                    SourceFlowCondition::Unchanged(_) => zero_argument_target.is_some(),
                     SourceFlowCondition::Truthiness(condition) => {
                         snapshot.type_of(condition.symbol) == Some(checked.raw)
                     }
