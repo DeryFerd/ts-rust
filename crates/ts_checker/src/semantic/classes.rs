@@ -11514,7 +11514,8 @@ fn plan_constructor_parameter_with_body_mode(
                         Some(SyntaxKind::NumericLiteral | SyntaxKind::StringLiteral)
                     )
                 }))
-        && !optional
+        && (!optional
+            || property_readonly.is_none() && type_record.kind == SyntaxKind::TypeReference)
         && decorator.is_none();
     let annotated = !matches!(type_record.data, NodeData::KeywordTypeNode(_))
         && class_reference.is_none()
@@ -11721,7 +11722,7 @@ fn plan_constructor_parameter_with_body_mode(
                 symbol,
                 type_node,
                 type_: ClassBodyParameterType::Annotation(type_node),
-                optional: false,
+                optional,
                 initializer,
                 decorator: None,
                 property,

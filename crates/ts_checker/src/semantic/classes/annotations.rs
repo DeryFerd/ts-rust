@@ -924,6 +924,29 @@ pub(super) fn validate_source_annotation_value_cache(
         owner,
     )?
     .cached_type(store, host, Some(&context.global_types))?;
+    let expected =
+        if let Some(SourceClassAnnotationRole::ConstructorParameter { parameter, .. }) =
+            source_class_annotation_role(store, host, owner, annotation)?
+            && host.node(parameter).is_some_and(|record| {
+                matches!(&record.data, NodeData::ParameterDeclaration(data)
+                if data.question_token.is_some())
+            })
+        {
+            expected
+                .map(|annotation_type| {
+                    super::optional_constructor_parameter_type_with_context(
+                        store,
+                        annotation_type,
+                        true,
+                        parameter,
+                        Some(context),
+                    )
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            expected
+        };
     if store.value_symbol_links(symbol).is_some_and(|links| {
         links != &ValueSymbolLinks::default()
             && expected.is_none_or(|type_| {
