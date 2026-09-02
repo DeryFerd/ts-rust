@@ -34154,7 +34154,6 @@ fn preflight_inferred_function_return_dependencies(
             }
             PlannedExpressionKind::Arrow(arrow) => {
                 if arrow.callable.family != SourceCallableFamily::ArrowFunction
-                    || arrow.callable.parameters.is_empty()
                     || !arrow.callable.type_parameters.is_empty()
                     || !arrow.parameter_initializers.is_empty()
                     || arrow.expression_statement.is_some()
@@ -34163,15 +34162,28 @@ fn preflight_inferred_function_return_dependencies(
                     return false;
                 }
                 if matches!(arrow.body, PlannedArrowBody::Empty) {
-                    return arrow.callable.parameters.iter().all(|parameter| {
-                        parameter.explicit_type_node().is_some()
-                            && parameter.initializer.is_none()
-                            && !parameter.optional
-                            && !parameter.rest
-                    });
+                    return !arrow.callable.parameters.is_empty()
+                        && arrow.callable.parameters.iter().all(|parameter| {
+                            parameter.explicit_type_node().is_some()
+                                && parameter.initializer.is_none()
+                                && !parameter.optional
+                                && !parameter.rest
+                        });
                 }
                 if let PlannedArrowBody::StatementList(body) = &arrow.body {
+                    let contextual_parameters = arrow
+                        .callable
+                        .parameters
+                        .iter()
+                        .any(|parameter| parameter.is_implicit_any())
+                        && source_direct_call_argument_arrow_is_exact(
+                            functions.store,
+                            functions.host,
+                            arrow.callable.declaration,
+                        )
+                        .is_ok_and(|exact| exact);
                     if arrow.callable.declaration != expression.node
+                        || body.syntax.callable != arrow.callable
                         || arrow.callable.body_mode != SourceCallableBodyMode::Present
                         || arrow.callable.is_async
                         || arrow.loop_body.is_some()
@@ -34181,7 +34193,8 @@ fn preflight_inferred_function_return_dependencies(
                                 && matches!(record.data, NodeData::ArrowFunction(_))
                         })
                         || !arrow.callable.parameters.iter().all(|parameter| {
-                            parameter.explicit_type_node().is_some()
+                            (parameter.explicit_type_node().is_some()
+                                || contextual_parameters && parameter.is_implicit_any())
                                 && parameter.initializer.is_none()
                                 && !parameter.optional
                                 && !parameter.rest
@@ -34192,6 +34205,17 @@ fn preflight_inferred_function_return_dependencies(
                     // Captured symbols remain visible without exposing child locals to the parent.
                     let mut body_locals = locals.clone();
                     body_locals.extend(parameters.iter().map(|parameter| parameter.symbol));
+                    if contextual_parameters {
+                        // Call context supplies these parameter types before body checking.
+                        body_locals.extend(
+                            arrow
+                                .callable
+                                .parameters
+                                .iter()
+                                .filter(|parameter| parameter.is_implicit_any())
+                                .map(|parameter| parameter.symbol),
+                        );
+                    }
                     return statement_list_is_closed(
                         body,
                         &body.statements,
