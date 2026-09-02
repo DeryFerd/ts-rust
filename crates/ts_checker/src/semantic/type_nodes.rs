@@ -42824,6 +42824,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 }
             }
         }
+        // A declared identity does not demand the interface's member annotations.
+        // Source declaration checking keeps the full planner below.
+        if !check_source_declaration
+            && flags.contains(SymbolFlags::INTERFACE)
+            && !flags.contains(SymbolFlags::CLASS)
+        {
+            return get_declared_class_interface_or_type_parameter(
+                self.store, self.host, symbol, flags,
+            )?
+            .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery));
+        }
         let mut planner = TypeQueryPlanner::new(
             self.store,
             self.host,
