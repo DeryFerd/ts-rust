@@ -23496,7 +23496,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 } else {
                     PlannedTypeReferenceArity::NotGeneric
                 }
-            } else if exact_import.is_some() && type_arguments.len() != local_count {
+            } else if exact_import.is_some()
+                && flags != SymbolFlags::CLASS
+                && type_arguments.len() != local_count
+            {
                 PlannedTypeReferenceArity::InvalidGeneric {
                     minimum: local_count,
                     maximum: local_count,
@@ -23869,6 +23872,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         };
         if let Some(existing) = self.plan.references.insert(node, planned.clone()) {
             assert_eq!(existing, planned, "one type-reference node has one plan");
+        }
+        if flags == SymbolFlags::CLASS
+            && planned.import_alias.is_some()
+            && let Some(cached) = cached_type
+        {
+            self.validate_cached_class_or_interface_reference(symbol, node, symbol, cached)?;
         }
         if cached_pending_function && let Some(cached) = cached_type {
             self.validate_cached_array_capability(cached)
@@ -29916,19 +29925,31 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Err(invalid());
         }
         if !declaration.is_for(node.arena, node.file)
-            && !self
-                .type_reference_alias_targets
-                .get(&node)
-                .is_some_and(|target| target.reference == node && target.target == symbol)
             && (facts.is_external_or_common_js_module()
                 || owner
                     .name()
                     .as_utf8()
                     .is_none_or(|name| !self.global_symbol_has_name(symbol, name)))
         {
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol },
-            ));
+            let imported = if let Some(target) = self.type_reference_alias_targets.get(&node) {
+                target.reference == node && target.target == symbol
+            } else if let Some(body) =
+                source_imports::plan_source_alias_body_type_import(self.store, self.host, node)
+                    .map_err(|error| property_type_import_error(node, error))?
+            {
+                body.target_symbol() == symbol
+            } else {
+                source_imports::plan_source_class_annotation_type_import(
+                    self.store, self.host, node,
+                )
+                .map_err(|error| property_type_import_error(node, error))?
+                .is_some_and(|class| class.target_symbol() == symbol)
+            };
+            if !imported {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol },
+                ));
+            }
         }
         let parameters =
             super::classes::source_class_type_parameter_plans(self.store, self.host, symbol)
@@ -31858,7 +31879,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .ok_or_else(&invalid)?;
         if target != capability.target
             || immediate_target != capability.immediate_target
-            || (target_flags != SymbolFlags::TYPE_ALIAS && target_flags != SymbolFlags::INTERFACE)
+            || (target_flags != SymbolFlags::TYPE_ALIAS
+                && target_flags != SymbolFlags::INTERFACE
+                && target_flags != SymbolFlags::CLASS)
             || (immediate_target != target && immediate_flags != SymbolFlags::ALIAS)
             || alias_links.immediate_target != Some(immediate_target)
             || alias_links.alias_target != super::AliasTargetState::Resolved(target)
@@ -31866,6 +31889,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 && !authenticated_default_import_interface_return(
                     self.store, self.host, capability, target,
                 ))
+        {
+            return Err(invalid());
+        }
+        if target_flags == SymbolFlags::CLASS
+            && super::classes::source_class_import_owner(self.store, self.host, target)
+                .map_err(|error| source_class_type_query_error(error, node, target))?
+                .is_none()
         {
             return Err(invalid());
         }

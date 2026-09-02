@@ -1628,9 +1628,10 @@ fn validate_named_type_import_owner(
     }
     let target = store.symbol(expected.target_symbol).ok_or_else(invalid)?;
     let declaration = expected.target_declaration;
-    let kind = match target.flags() {
-        SymbolFlags::TYPE_ALIAS => SyntaxKind::TypeAliasDeclaration,
-        SymbolFlags::INTERFACE => SyntaxKind::InterfaceDeclaration,
+    let (kind, value_declaration) = match target.flags() {
+        SymbolFlags::TYPE_ALIAS => (SyntaxKind::TypeAliasDeclaration, None),
+        SymbolFlags::INTERFACE => (SyntaxKind::InterfaceDeclaration, None),
+        SymbolFlags::CLASS => (SyntaxKind::ClassDeclaration, Some(declaration)),
         _ => return Err(invalid()),
     };
     let target_name = store
@@ -1639,7 +1640,7 @@ fn validate_named_type_import_owner(
     if declaration.file == reference.file
         || target.declarations() != Some(&[declaration])
         || target.check_flags() != CheckFlags::NONE
-        || target.value_declaration().is_some()
+        || target.value_declaration() != value_declaration
         || store.get_merged_symbol(expected.target_symbol) != Some(expected.target_symbol)
         || store.source_node_kind(declaration) != Some(kind)
         || !store.source_declaration_belongs_to_symbol(declaration, expected.target_symbol)
@@ -6082,6 +6083,29 @@ fn validate_source_type_import_reference_source(
     reference: NodeRef,
 ) -> Result<(), SourceImportError> {
     let binding = &resolved.binding;
+    let source_class = store
+        .symbol(resolved.target_symbol)
+        .is_some_and(|target| target.flags() == SymbolFlags::CLASS);
+    if source_class {
+        let owner = source_class_import_owner(store, host, resolved.target_symbol)
+            .map_err(|error| {
+                imported_ambient_class_error(
+                    resolved.target_symbol,
+                    resolved.target_declaration,
+                    error,
+                )
+            })?
+            .ok_or_else(|| {
+                invariant(SourceImportInvariant::InvalidTargetSymbol(
+                    resolved.target_symbol,
+                ))
+            })?;
+        if owner.declaration != resolved.target_declaration {
+            return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(
+                resolved.target_symbol,
+            )));
+        }
+    }
     let (arena, bound) = host
         .source(reference)
         .ok_or_else(|| invariant(SourceImportInvariant::InvalidNode(reference)))?;
@@ -6187,7 +6211,7 @@ fn validate_source_type_import_reference_source(
             SymbolFlags::TYPE_ALIAS => store
                 .type_alias_links(resolved.target_symbol)
                 .and_then(|links| links.declared_type),
-            SymbolFlags::INTERFACE => store
+            SymbolFlags::INTERFACE | SymbolFlags::CLASS => store
                 .declared_type_links(resolved.target_symbol)
                 .and_then(|links| links.declared_type),
             _ => {
@@ -6205,8 +6229,11 @@ fn validate_source_type_import_reference_source(
                 reference,
             )));
         }
+        // Class instances use the normal reference planner's warm check. It
+        // validates their real formals and defaults with the caller's query context.
         if let Some(cached) = links.resolved_type
             && reference_data.type_arguments.is_none()
+            && !source_class
         {
             validate_omitted_type_import_reference_cache(
                 store,
