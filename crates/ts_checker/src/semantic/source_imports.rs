@@ -66,7 +66,7 @@ use super::{
         CanonicalAliasResolutionError, CanonicalAliasResolutionEvent, CanonicalAliasResolver,
         CanonicalAliasTargetHost, CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
     },
-    alias_provider::AmbientImportMethodSource,
+    alias_provider::{AmbientImportMethodSource, OrdinaryImportTypeSourceError},
     array_types::CanonicalArrayTargets,
     classes::{
         ClassMemberQueryPlan, SourceClassImportOwner, SourceClassImportValue,
@@ -227,14 +227,22 @@ pub(super) struct SourceClassImportDemand {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceClassImportHopTarget {
+    Module {
+        module_specifier: NodeRef,
+        resolved_module: CanonicalResolvedModule,
+    },
+    LocalExport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceClassImportHop {
     alias: SemanticSymbolId,
     immediate: SemanticSymbolId,
     declaration: NodeRef,
-    module_specifier: NodeRef,
     imported_text: String,
-    resolved_module: CanonicalResolvedModule,
     module: SemanticSymbolId,
+    target: SourceClassImportHopTarget,
     revision: ts_ast::NodeArenaRevision,
 }
 
@@ -494,6 +502,68 @@ fn source_class_import_hop(
             return Err(invalid());
         }
     }
+    if let NodeData::ExportSpecifier(specifier) = &node.data
+        && let NodeData::ExportDeclaration(export) =
+            &checked_node(arena, bound, store, parent)?.data
+        && export.module_specifier.is_none()
+    {
+        let manifest = host.module_resolutions().ok_or_else(|| {
+            source_property_import_alias_error(
+                alias,
+                CanonicalAliasTargetUnavailable::ModuleResolutionCapabilityUnavailable(
+                    declaration,
+                ),
+            )
+        })?;
+        let aliases = host
+            .alias_target_host(store, manifest)
+            .map_err(|error| source_property_import_module_error(alias, error.into()))?;
+        let hop = aliases
+            .ordinary_import_alias_hop(store, host, alias)
+            .map_err(|error| match error {
+                OrdinaryImportTypeSourceError::Target(reason) => {
+                    source_property_import_alias_error(alias, reason)
+                }
+                OrdinaryImportTypeSourceError::Exports(error) => {
+                    source_property_import_module_error(alias, error)
+                }
+                OrdinaryImportTypeSourceError::NonLiteralArgument(node)
+                | OrdinaryImportTypeSourceError::UnsupportedSyntax(node) => {
+                    unsupported(SourceImportUnsupported::ExportBinding(node))
+                }
+            })?;
+        if hop.alias() != alias
+            || hop.declaration() != declaration
+            || hop.immediate_target() != immediate
+        {
+            return Err(invalid());
+        }
+        if hop.syntactic_type_only().is_some() {
+            return Err(unsupported(SourceImportUnsupported::TypeOnlyAlias(alias)));
+        }
+        let imported_name = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            specifier.property_name.unwrap_or(specifier.name),
+        );
+        let imported_text = exact_identifier(
+            arena,
+            bound,
+            store,
+            imported_name,
+            declaration,
+            SourceImportUnsupported::NonIdentifierExportName(imported_name),
+        )?;
+        return Ok(SourceClassImportHop {
+            alias,
+            immediate,
+            declaration,
+            imported_text,
+            module: bound.symbol(bound.source_file()).ok_or_else(invalid)?,
+            target: SourceClassImportHopTarget::LocalExport,
+            revision: arena.revision(),
+        });
+    }
     let (module_specifier, imported_text) = if node.kind == SyntaxKind::ExportSpecifier {
         let export = plan_top_level_named_reexport(arena, bound, store, parent)?;
         let binding = export
@@ -565,10 +635,12 @@ fn source_class_import_hop(
         alias,
         immediate,
         declaration,
-        module_specifier,
         imported_text,
-        resolved_module,
         module,
+        target: SourceClassImportHopTarget::Module {
+            module_specifier,
+            resolved_module,
+        },
         revision: arena.revision(),
     })
 }

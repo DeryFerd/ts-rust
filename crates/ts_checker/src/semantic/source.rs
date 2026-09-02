@@ -21951,24 +21951,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 })
                         })
                 });
-            let prior_class_symbol = (local_record.flags() == SymbolFlags::EXPORT_VALUE)
-                .then_some(local_record.export_symbol())
-                .flatten()
-                .filter(|symbol| {
-                    self.planned_classes.contains(symbol)
-                        && store.symbol(*symbol).is_some_and(|class| {
-                            class.flags() == SymbolFlags::CLASS
-                                && class.value_declaration().is_some_and(|declaration| {
-                                    declaration.is_for(self.arena.id(), self.bound.file_id())
-                                        && self.node(declaration).is_ok_and(|record| {
-                                            record.kind == SyntaxKind::ClassDeclaration
-                                                && record.parent
-                                                    == Some(self.source.node_ref().node)
-                                                && record.range.end <= statement_node.range.start
-                                        })
-                                })
-                        })
-                });
+            let prior_class_symbol = match local_record.flags() {
+                SymbolFlags::CLASS => Some(local_symbol),
+                SymbolFlags::EXPORT_VALUE => local_record.export_symbol(),
+                _ => None,
+            }
+            .filter(|symbol| {
+                self.planned_classes.contains(symbol)
+                    && store.symbol(*symbol).is_some_and(|class| {
+                        class.flags() == SymbolFlags::CLASS
+                            && class.value_declaration().is_some_and(|declaration| {
+                                declaration.is_for(self.arena.id(), self.bound.file_id())
+                                    && self.node(declaration).is_ok_and(|record| {
+                                        record.kind == SyntaxKind::ClassDeclaration
+                                            && record.parent == Some(self.source.node_ref().node)
+                                            && record.range.end <= statement_node.range.start
+                                    })
+                            })
+                    })
+            });
             let is_prior_namespace = local_record.flags().intersects(SymbolFlags::MODULE)
                 && local_record
                     .flags()

@@ -1873,11 +1873,12 @@ impl SourceClassProvenance {
     }
 }
 
-/// The real exported and source-local identities of an executable class.
+/// The real class and source-local value identities of an executable class.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceClassImportOwner {
     pub(super) declaration: NodeRef,
     pub(super) symbol: SemanticSymbolId,
+    /// A separate export local, or the class itself for a local named export.
     pub(super) export_local: SemanticSymbolId,
     pub(super) source: super::SourceFileRef,
     pub(super) module: SemanticSymbolId,
@@ -1892,7 +1893,7 @@ pub(super) struct SourceClassImportValue {
     type_context: ClassTypeQueryContext,
 }
 
-/// Proves the exported declaration without treating its header as a checked body.
+/// Proves the source declaration without treating its header as a checked body.
 pub(super) fn source_class_import_owner(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1985,9 +1986,28 @@ pub(super) fn source_class_import_owner(
         name,
         class.modifiers.as_ref(),
     )?;
-    let Some(export_local) = local.filter(|_| !ambient) else {
+    if ambient {
         return Ok(None);
-    };
+    }
+    let export_local = local.unwrap_or(symbol);
+    if bound
+        .locals(source)
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(&identifier.text))
+        != Some(export_local)
+    {
+        return Err(invalid());
+    }
+    let module = bound.symbol(source).ok_or_else(invalid)?;
+    if store.get_merged_symbol(module) != Some(module)
+        || store
+            .symbol(module)
+            .is_none_or(|module| module.flags() != SymbolFlags::VALUE_MODULE)
+        || !store.source_symbol_declarations_match(module)
+        || !store.source_declaration_belongs_to_symbol(source, module)
+    {
+        return Err(invalid());
+    }
     let source = super::SourceFileRef::new(store.id(), source);
     if !store.contains_source_file(source) {
         return Err(invalid());
@@ -1997,7 +2017,7 @@ pub(super) fn source_class_import_owner(
         symbol,
         export_local,
         source,
-        module: owner.parent().ok_or_else(invalid)?,
+        module,
     }))
 }
 
@@ -2035,7 +2055,13 @@ fn completed_source_class_import_value_in_context(
     let array_targets = CanonicalArrayTargets::from_global_types(global_types);
     if provenance.prepared.plan.array_targets != Some(array_targets)
         || provenance.prepared.plan.type_query_context.as_ref() != Some(type_context)
-        || provenance.prepared.plan.header.export_local != Some(owner.export_local)
+        || provenance
+            .prepared
+            .plan
+            .header
+            .export_local
+            .unwrap_or(owner.symbol)
+            != owner.export_local
     {
         return Err(invalid());
     }
