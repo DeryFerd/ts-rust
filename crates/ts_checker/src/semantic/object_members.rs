@@ -3986,6 +3986,7 @@ pub(super) struct PlannedInterfaceMethod {
     pub symbol: SemanticSymbolId,
     pub computed_key: Option<PlannedComputedMemberKey>,
     pub type_parameters: Vec<PlannedInterfaceMethodTypeParameter>,
+    pub this_parameter: Option<PlannedCallParameter>,
     pub parameters: Vec<PlannedCallParameter>,
     locals: Option<SymbolTableId>,
     binding_parameters: Vec<PlannedMethodBindingParameter>,
@@ -3993,6 +3994,13 @@ pub(super) struct PlannedInterfaceMethod {
     pub flags: SignatureFlags,
     optional: bool,
     minimum_argument_count: usize,
+}
+
+impl PlannedInterfaceMethod {
+    /// Includes `this` when checking source order and all parameter links.
+    pub(super) fn source_parameters(&self) -> impl Iterator<Item = &PlannedCallParameter> {
+        self.this_parameter.iter().chain(&self.parameters)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4298,8 +4306,7 @@ impl PropertyObjectPlan {
                     )
                     .chain(
                         method
-                            .parameters
-                            .iter()
+                            .source_parameters()
                             .map(|parameter| parameter.type_node),
                     )
                     .chain(std::iter::once(method.return_type))
@@ -8963,6 +8970,7 @@ fn authenticated_global_math_random_interface(
         .is_some_and(|facts| facts.is_declaration_file() && facts.is_default_library());
 
     method.type_parameters.is_empty()
+        && method.this_parameter.is_none()
         && method.parameters.is_empty()
         && method.flags == SignatureFlags::NONE
         && method.minimum_argument_count == 0
@@ -9126,6 +9134,7 @@ fn authenticated_global_builtin_interface(
     };
 
     method.type_parameters.is_empty()
+        && method.this_parameter.is_none()
         && method.parameters.len() == parameter_count
         && (owner_name != "Number"
             || method.parameters.first().is_some_and(|parameter| {
@@ -9143,6 +9152,7 @@ fn authenticated_global_builtin_interface(
         && return_type.parent == Some(method.declaration.node)
         && plan.methods.iter().all(|method| {
             method.type_parameters.is_empty()
+                && method.this_parameter.is_none()
                 && host
                     .bound_file(method.declaration)
                     .and_then(ts_binder::BoundFile::source_facts)
@@ -9950,6 +9960,7 @@ fn matching_planned_interface_method_contract(
         .all(|(first_method, second_method)| {
             first_method.flags == second_method.flags
                 && first_method.type_parameters.len() == second_method.type_parameters.len()
+                && first_method.this_parameter.is_some() == second_method.this_parameter.is_some()
                 && first_method.parameters.len() == second_method.parameters.len()
                 && equivalent_merged_property_annotations(
                     store,
@@ -9958,9 +9969,8 @@ fn matching_planned_interface_method_contract(
                     second_method.return_type,
                 )
                 && first_method
-                    .parameters
-                    .iter()
-                    .zip(&second_method.parameters)
+                    .source_parameters()
+                    .zip(second_method.source_parameters())
                     .all(|(first_parameter, second_parameter)| {
                         equivalent_merged_property_annotations(
                             store,
@@ -14996,6 +15006,7 @@ pub(super) fn plan_interface_method(
     parameters
         .try_reserve_exact(method.parameters.nodes.len())
         .map_err(|_| PropertyObjectError::Capacity(declaration))?;
+    let mut this_parameter = None;
     let mut flags = SignatureFlags::NONE;
     let mut previous_end = method.parameters.range.start;
     let mut minimum_argument_count = 0usize;
@@ -15036,6 +15047,22 @@ pub(super) fn plan_interface_method(
         {
             flags |= SignatureFlags::HAS_LITERAL_TYPES;
         }
+        let symbol = store.symbol(planned.symbol).ok_or_else(unsupported)?;
+        if binding.is_none()
+            && locals.and_then(|locals| locals.get(symbol.name())) != Some(planned.symbol)
+            || parameters
+                .iter()
+                .any(|parameter: &PlannedCallParameter| parameter.symbol == planned.symbol)
+        {
+            return Err(unsupported());
+        }
+        if symbol.name().as_utf8() == Some("this") {
+            if index != 0 || rest || optional || binding.is_some() {
+                return Err(unsupported());
+            }
+            this_parameter = Some(planned);
+            continue;
+        }
         if rest && (optional || index + 1 != method.parameters.nodes.len())
             || !rest && !optional && optional_parameter_seen
         {
@@ -15047,15 +15074,6 @@ pub(super) fn plan_interface_method(
             optional_parameter_seen = true;
         } else {
             minimum_argument_count += 1;
-        }
-        let symbol = store.symbol(planned.symbol).ok_or_else(unsupported)?;
-        if binding.is_none()
-            && locals.and_then(|locals| locals.get(symbol.name())) != Some(planned.symbol)
-            || parameters
-                .iter()
-                .any(|parameter: &PlannedCallParameter| parameter.symbol == planned.symbol)
-        {
-            return Err(unsupported());
         }
         if let Some(binding) = binding {
             binding_parameters.push(binding);
@@ -15071,6 +15089,7 @@ pub(super) fn plan_interface_method(
         symbol,
         computed_key,
         type_parameters,
+        this_parameter,
         parameters,
         locals: local_table,
         binding_parameters,
@@ -15870,7 +15889,7 @@ pub(super) fn interface_method_value_state(
                 || store
                     .signature_links(method.declaration)
                     .is_some_and(|links| links != &SignatureLinks::default())
-                || method.parameters.iter().any(|parameter| {
+                || method.source_parameters().any(|parameter| {
                     store
                         .value_symbol_links(parameter.symbol)
                         .is_some_and(|links| links != &ValueSymbolLinks::default())
@@ -15938,7 +15957,7 @@ pub(super) fn interface_method_value_state(
         store
             .signature_links(method.declaration)
             .is_some_and(|links| links != &SignatureLinks::default())
-            || method.parameters.iter().any(|parameter| {
+            || method.source_parameters().any(|parameter| {
                 store
                     .value_symbol_links(parameter.symbol)
                     .is_some_and(|links| links != &ValueSymbolLinks::default())
@@ -16878,10 +16897,28 @@ fn plan_method_binding_parameter(
     })
 }
 
+fn valid_method_this_parameter_source(
+    store: &CanonicalTypeMapperStore,
+    method: &PlannedInterfaceMethod,
+) -> bool {
+    store.declared_method_this_parameter_source(method.declaration)
+        == Some(
+            method
+                .this_parameter
+                .map(|parameter| (parameter.symbol, parameter.type_node)),
+        )
+        && method
+            .this_parameter
+            .is_none_or(|parameter| !parameter.optional && !parameter.implicit_any_rest)
+}
+
 fn valid_method_parameter_locals(
     store: &CanonicalTypeMapperStore,
     method: &PlannedInterfaceMethod,
 ) -> bool {
+    if !valid_method_this_parameter_source(store, method) {
+        return false;
+    }
     let mut expected = method
         .type_parameters
         .iter()
@@ -16889,7 +16926,7 @@ fn valid_method_parameter_locals(
         .collect::<Vec<_>>();
     let mut anonymous = HashSet::new();
     for binding in &method.binding_parameters {
-        let Some(parameter) = method.parameters.get(binding.index) else {
+        let Some(parameter) = method.source_parameters().nth(binding.index) else {
             return false;
         };
         let Some(record) = store.symbol(binding.symbol) else {
@@ -16948,8 +16985,7 @@ fn valid_method_parameter_locals(
     }
     expected.extend(
         method
-            .parameters
-            .iter()
+            .source_parameters()
             .filter(|parameter| !anonymous.contains(&parameter.symbol))
             .map(|parameter| parameter.symbol),
     );
@@ -17033,7 +17069,7 @@ fn plan_interface_method_parameter(
             if name_record.kind == SyntaxKind::Identifier
                 && identifier.flow_node.is_none()
                 && !identifier.text.is_empty()
-                && identifier.text != "this" =>
+                && (identifier.text != "this" || index == 0) =>
         {
             identifier.text.clone()
         }
@@ -22507,7 +22543,7 @@ fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyOb
                     store
                         .signature_links(method.declaration)
                         .is_none_or(|links| links == &SignatureLinks::default())
-                        && method.parameters.iter().all(|parameter| {
+                        && method.source_parameters().all(|parameter| {
                             store
                                 .value_symbol_links(parameter.symbol)
                                 .is_none_or(|links| links == &ValueSymbolLinks::default())
@@ -23555,7 +23591,8 @@ fn validate_interface_method_callable(
             || callable.flags() != method.flags
             || callable.declaration() != Some(method.declaration)
             || callable.type_parameters() != type_parameters.as_slice()
-            || callable.this_parameter().is_some()
+            || callable.this_parameter() != method.this_parameter.map(|parameter| parameter.symbol)
+            || store.declared_method_this_parameter_type(callable).is_none()
             || callable.parameters().len() != method.parameters.len()
             || usize::try_from(callable.min_argument_count()).ok()
                 != Some(method.minimum_argument_count)
@@ -23606,7 +23643,7 @@ fn validate_interface_method_callable(
     Some(())
 }
 
-fn method_parameter_value_type_matches(
+pub(super) fn method_parameter_value_type_matches(
     store: &CanonicalTypeMapperStore,
     parameter: &PlannedCallParameter,
     type_: TypeId,
@@ -23909,6 +23946,7 @@ fn publish_interface_method_values_worker(
         name_type: Option<TypeId>,
         indexes: Vec<usize>,
         type_parameters: Vec<Vec<TypeId>>,
+        this_parameters: Vec<Option<(SemanticSymbolId, TypeId)>>,
         parameter_symbols: Vec<Vec<SemanticSymbolId>>,
         parameter_types: Vec<Vec<TypeId>>,
         signatures: Vec<SignatureId>,
@@ -24002,6 +24040,19 @@ fn publish_interface_method_values_worker(
         }
         let type_parameters = resolved_interface_method_type_parameters(store, method)
             .ok_or_else(|| invalid_cache(plan, owner_type))?;
+        let this_parameter = method
+            .this_parameter
+            .map(|parameter| {
+                let type_ = cached_annotation_identity(
+                    store,
+                    parameter.identity_node,
+                    parameter.null_literal_identity,
+                )
+                .filter(|type_| method_parameter_value_type_matches(store, &parameter, *type_))
+                .ok_or_else(|| invalid_cache(plan, owner_type))?;
+                Ok::<_, PropertyObjectError>((parameter.symbol, type_))
+            })
+            .transpose()?;
         published.push(placeholder);
         let group_index = if let Some(group) = method_groups.get(&method.symbol).copied() {
             group
@@ -24013,6 +24064,7 @@ fn publish_interface_method_values_worker(
                 name_type: None,
                 indexes: Vec::new(),
                 type_parameters: Vec::new(),
+                this_parameters: Vec::new(),
                 parameter_symbols: Vec::new(),
                 parameter_types: Vec::new(),
                 signatures: Vec::new(),
@@ -24027,6 +24079,10 @@ fn publish_interface_method_values_worker(
             .map_err(|_| PropertyObjectError::Capacity(plan.node))?;
         group
             .type_parameters
+            .try_reserve(1)
+            .map_err(|_| PropertyObjectError::Capacity(plan.node))?;
+        group
+            .this_parameters
             .try_reserve(1)
             .map_err(|_| PropertyObjectError::Capacity(plan.node))?;
         group
@@ -24049,6 +24105,7 @@ fn publish_interface_method_values_worker(
         parameter_types.extend_from_slice(&resolved_signature.parameter_types);
         group.indexes.push(index);
         group.type_parameters.push(type_parameters);
+        group.this_parameters.push(this_parameter);
         group.parameter_symbols.push(parameter_symbols);
         group.parameter_types.push(parameter_types);
     }
@@ -24146,7 +24203,7 @@ fn publish_interface_method_values_worker(
             if store
                 .signature_links(method.declaration)
                 .is_some_and(|links| links != &SignatureLinks::default())
-                || method.parameters.iter().any(|parameter| {
+                || method.source_parameters().any(|parameter| {
                     store
                         .value_symbol_links(parameter.symbol)
                         .is_some_and(|links| links != &ValueSymbolLinks::default())
@@ -24162,8 +24219,7 @@ fn publish_interface_method_values_worker(
             missing_value_links = missing_value_links
                 .checked_add(
                     method
-                        .parameters
-                        .iter()
+                        .source_parameters()
                         .filter(|parameter| store.value_symbol_links(parameter.symbol).is_none())
                         .count(),
                 )
@@ -24275,13 +24331,15 @@ fn publish_interface_method_values_worker(
         let callable_type = store
             .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(group.symbol))
             .expect("the interface method transaction reserved its callable object");
-        for (((index, type_parameters), parameter_symbols), parameter_types) in group
+        for (parameters, parameter_types) in group
             .indexes
             .iter()
             .zip(group.type_parameters)
+            .zip(group.this_parameters)
             .zip(group.parameter_symbols)
             .zip(group.parameter_types)
         {
+            let (((index, type_parameters), this_parameter), parameter_symbols) = parameters;
             let method = &plan.methods[*index];
             let resolved_signature = &resolved[*index];
             let minimum = i32::try_from(method.minimum_argument_count)
@@ -24291,7 +24349,7 @@ fn publish_interface_method_values_worker(
                     method.flags,
                     Some(method.declaration),
                     type_parameters,
-                    None,
+                    this_parameter.map(|(symbol, _)| symbol),
                     parameter_symbols,
                     Some(resolved_signature.return_type),
                     None,
@@ -24306,6 +24364,15 @@ fn publish_interface_method_values_worker(
                     ..SignatureLinks::default()
                 },
             ));
+            if let Some((symbol, type_)) = this_parameter {
+                assert!(store.set_value_symbol_links(
+                    symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..ValueSymbolLinks::default()
+                    },
+                ));
+            }
             for (parameter, parameter_type) in method.parameters.iter().zip(&parameter_types) {
                 assert!(store.set_value_symbol_links(
                     parameter.symbol,

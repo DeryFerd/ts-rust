@@ -2351,7 +2351,6 @@ pub(super) fn validate_stored_declared_method_callable_set(
                 || signature.declaration() != Some(*declaration)
                 || signature.flags() & !allowed_flags != SignatureFlags::NONE
                 || !valid_declared_method_type_parameters(store, signature, *declaration)
-                || signature.this_parameter().is_some()
                 || signature.resolved_min_argument_count() != -1
                 || signature.resolved_type_predicate().is_some()
                 || signature.target().is_some()
@@ -2367,6 +2366,7 @@ pub(super) fn validate_stored_declared_method_callable_set(
             {
                 return None;
             }
+            let this_type = store.declared_method_this_parameter_type(signature)?;
             let return_type = callable.return_type?;
             let annotation = store.source_direct_type_annotation(*declaration)?;
             if validated_method_annotation_type(store, annotation) != Some(return_type) {
@@ -2381,6 +2381,7 @@ pub(super) fn validate_stored_declared_method_callable_set(
                 edges.extend(data.constraint);
                 edges.extend(data.resolved_default_type);
             }
+            edges.extend(this_type);
             edges.extend(callable.parameters.iter().copied());
             edges.extend(callable.rest_parameter);
             edges.push(return_type);

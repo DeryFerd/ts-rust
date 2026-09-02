@@ -16063,7 +16063,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     self.plan_type_node(annotation)?;
                 }
             }
-            for parameter in &method.parameters {
+            for parameter in method.source_parameters() {
                 self.plan_type_node(parameter.type_node)?;
             }
             if method.return_type != root {
@@ -16282,8 +16282,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 })
                 .flat_map(|method| {
                     method
-                        .parameters
-                        .iter()
+                        .source_parameters()
                         .map(|parameter| parameter.type_node)
                 })
                 .collect::<HashSet<_>>();
@@ -38972,20 +38971,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             )?;
             let mut resolved = Vec::with_capacity(method.methods.len());
             for overload in &method.methods {
-                let mut parameter_types = Vec::with_capacity(overload.parameters.len());
-                for parameter in &overload.parameters {
-                    parameter_types.push(self.execute_type_node(
-                        parameter.type_node,
-                        &plan,
-                        &mut prepared,
-                    )?);
-                }
-                let return_type =
-                    self.execute_type_node(overload.return_type, &plan, &mut prepared)?;
-                resolved.push(object_members::ResolvedCallSignatureTypes {
-                    parameter_types,
-                    return_type,
-                });
+                resolved.push(self.execute_declared_method_annotations(
+                    overload,
+                    &plan,
+                    &mut prepared,
+                )?);
             }
             self.flush_pending_function_parameters(&plan, &mut prepared)?;
             let values = object_members::publish_interface_method_values_prepared(
@@ -39070,6 +39060,31 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             session,
             &mut source,
         )
+    }
+
+    fn execute_declared_method_annotations(
+        &mut self,
+        method: &object_members::PlannedInterfaceMethod,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<object_members::ResolvedCallSignatureTypes, DeclaredTypeError> {
+        if let Some(parameter) = &method.this_parameter {
+            let type_ = self.execute_type_node(parameter.type_node, plan, prepared)?;
+            if !object_members::method_parameter_value_type_matches(self.store, parameter, type_) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(parameter.type_node),
+                ));
+            }
+        }
+        let mut parameter_types = Vec::with_capacity(method.parameters.len());
+        for parameter in &method.parameters {
+            parameter_types.push(self.execute_type_node(parameter.type_node, plan, prepared)?);
+        }
+        let return_type = self.execute_type_node(method.return_type, plan, prepared)?;
+        Ok(object_members::ResolvedCallSignatureTypes {
+            parameter_types,
+            return_type,
+        })
     }
 
     fn execute_interface_method_type_parameters(
@@ -44667,19 +44682,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
             let mut method_types = Vec::with_capacity(interface.methods.len());
             for method in &interface.methods {
-                let mut parameter_types = Vec::with_capacity(method.parameters.len());
-                for parameter in &method.parameters {
-                    parameter_types.push(self.execute_type_node(
-                        parameter.type_node,
-                        plan,
-                        prepared,
-                    )?);
-                }
-                let return_type = self.execute_type_node(method.return_type, plan, prepared)?;
-                method_types.push(object_members::ResolvedCallSignatureTypes {
-                    parameter_types,
-                    return_type,
-                });
+                method_types.push(
+                    self.execute_declared_method_annotations(method, plan, prepared)?,
+                );
             }
             object_members::prepare_interface_call_optional_parameters(
                 self.store,
@@ -48406,19 +48411,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
         let mut method_types = Vec::with_capacity(literal.methods.len());
         for method in &literal.methods {
-            let mut parameter_types = Vec::with_capacity(method.parameters.len());
-            for parameter in &method.parameters {
-                parameter_types.push(self.execute_type_node(
-                    parameter.type_node,
-                    plan,
-                    prepared,
-                )?);
-            }
-            let return_type = self.execute_type_node(method.return_type, plan, prepared)?;
-            method_types.push(object_members::ResolvedCallSignatureTypes {
-                parameter_types,
-                return_type,
-            });
+            method_types.push(self.execute_declared_method_annotations(method, plan, prepared)?);
         }
         if !state.is_resolved() {
             call_types = object_members::prepare_type_literal_construct_parameter_types(

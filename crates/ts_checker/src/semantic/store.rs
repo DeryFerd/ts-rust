@@ -6614,6 +6614,82 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.declared_method_linked_type(requested, method_symbol)
     }
 
+    /// The outer `None` rejects malformed source. The inner `None` means no `this` parameter.
+    pub(super) fn declared_method_this_parameter_source(
+        &self,
+        declaration: NodeRef,
+    ) -> Option<Option<(SemanticSymbolId, NodeRef)>> {
+        if self.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature) {
+            return None;
+        }
+        let children = self.source_direct_children(declaration)?;
+        let Some(parameter) = children
+            .into_iter()
+            .filter(|child| self.source_node_kind(*child) == Some(SyntaxKind::Parameter))
+            .min_by_key(|child| self.source_node_start(*child))
+        else {
+            return Some(None);
+        };
+        let Some(name) = self.source_child_with_kind(parameter, SyntaxKind::Identifier) else {
+            return Some(None);
+        };
+        if self.source_identifier_text(name) != Some("this") {
+            return Some(None);
+        }
+        let annotation = self.source_direct_type_annotation(parameter)?;
+        let symbol = self.source_declaration_symbol(parameter)?;
+        let record = self.symbol(symbol)?;
+        let children = self.source_direct_children(parameter)?;
+        if children.len() != 2
+            || !children.contains(&name)
+            || !children.contains(&annotation)
+            || self.source_node_parent(parameter) != Some(SourceNodeParent::Parent(declaration))
+            || record.name().as_utf8() != Some("this")
+            || record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || record.check_flags() != CheckFlags::NONE
+            || record.declarations() != Some(&[parameter])
+            || record.value_declaration() != Some(parameter)
+            || record.parent().is_some()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || self.get_merged_symbol(symbol) != Some(symbol)
+        {
+            return None;
+        }
+        Some(Some((symbol, annotation)))
+    }
+
+    /// Checks the separate signature slot against its real source symbol and type links.
+    pub(super) fn declared_method_this_parameter_type(
+        &self,
+        signature: &Signature,
+    ) -> Option<Option<TypeId>> {
+        let source = self.declared_method_this_parameter_source(signature.declaration()?)?;
+        let (symbol, annotation) = match (source, signature.this_parameter()) {
+            (None, None) => return Some(None),
+            (Some((symbol, annotation)), Some(actual))
+                if symbol == actual && !signature.parameters().contains(&symbol) =>
+            {
+                (symbol, annotation)
+            }
+            _ => return None,
+        };
+        let links = self.value_symbol_links(symbol)?;
+        let type_ = links.resolved_type?;
+        if links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+            || self.types.get(type_).is_none()
+            || !self.source_direct_type_annotation_is_exact(annotation, type_)
+        {
+            return None;
+        }
+        Some(Some(type_))
+    }
+
     fn valid_declared_method_type_parameters(
         &self,
         signature: &Signature,
@@ -6716,7 +6792,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 || signature.declaration() != Some(*method_declaration)
                 || signature.flags() & !allowed_flags != SignatureFlags::NONE
                 || !self.valid_declared_method_type_parameters(signature, *method_declaration)
-                || signature.this_parameter().is_some()
+                || self.declared_method_this_parameter_type(signature).is_none()
                 || signature.resolved_min_argument_count() != -1
                 || signature.resolved_type_predicate().is_some()
                 || signature.target().is_some()
@@ -6737,6 +6813,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             parameter_declarations.retain(|parameter| {
                 self.source_node_kind(*parameter) == Some(SyntaxKind::Parameter)
             });
+            if signature.this_parameter().is_some() {
+                parameter_declarations.remove(0);
+            }
             if parameter_declarations.len() != signature.parameters().len() {
                 return None;
             }
