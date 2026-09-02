@@ -18949,7 +18949,7 @@ fn validate_plain_class_type_parameters(
         .and_then(Symbol::members)
         .and_then(|members| store.symbol_table(members))
         .ok_or_else(reject)?;
-    if parameters.has_trailing_comma || parameters.nodes.is_empty() || parameters.nodes.len() > 4 {
+    if parameters.nodes.is_empty() || parameters.nodes.len() > 4 {
         return Err(reject());
     }
 

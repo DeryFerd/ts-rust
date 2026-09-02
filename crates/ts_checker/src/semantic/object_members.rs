@@ -11164,7 +11164,6 @@ pub(super) fn plan_generic_interface_identity(
             || record.kind != SyntaxKind::InterfaceDeclaration
             || record.flags.0 != 0
             || parameters.nodes.is_empty()
-            || parameters.has_trailing_comma
             || !host.symbol_matches(store, declaration, symbol)
             || owner.name().as_utf8() != Some(identifier.text.as_str())
             || owner.parent().is_some() != parent.is_some()
@@ -14877,9 +14876,7 @@ fn plan_selected_interface_method_overloads(
             || interface.members.has_trailing_comma
             || interface.members.range.start < record.range.start
             || interface.members.range.end != record.range.end
-            || type_parameters.is_some_and(|parameters| {
-                parameters.nodes.is_empty() || parameters.has_trailing_comma
-            })
+            || type_parameters.is_some_and(|parameters| parameters.nodes.is_empty())
         {
             return Err(invalid());
         }

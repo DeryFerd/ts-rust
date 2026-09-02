@@ -77252,6 +77252,29 @@ pub(super) fn check_source_file(
                     }
                 }
                 for method in &interface.methods {
+                    if method
+                        .type_parameters
+                        .iter()
+                        .any(|parameter| parameter.default_type.is_some())
+                    {
+                        session.reset_query();
+                        let mut method_diagnostics = CanonicalCheckerDiagnostics::default();
+                        let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            &mut method_diagnostics,
+                        )
+                        .and_then(|mut query| {
+                            query.check_source_interface_method_type_parameter_defaults(
+                                &interface, method,
+                            )
+                        });
+                        merge_retry_diagnostics(diagnostics, method_diagnostics);
+                        result?;
+                    }
                     for parameter in &method.parameters {
                         session.reset_query();
                         let mut parameter_diagnostics = CanonicalCheckerDiagnostics::default();

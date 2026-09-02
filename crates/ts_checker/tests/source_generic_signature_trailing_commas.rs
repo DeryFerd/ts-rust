@@ -230,3 +230,69 @@ fn trailing_comma_keeps_invalid_default_diagnostics() {
         assert!(context.store().type_resolution_is_empty());
     }
 }
+
+#[test]
+fn trailing_comma_keeps_class_interface_function_and_alias_queries() {
+    for comma in ["", ","] {
+        let source = format!(
+            "declare class Ambient<T{comma}> {{}}\n\
+             class Plain<T{comma}> {{}}\n\
+             interface Holder<T{comma}> {{ run(value: T): T; }}\n\
+             interface Merged<T = string{comma}> {{ first: T; }}\n\
+             interface Merged<T = string{comma}> {{ second: T; }}\n\
+             type Maybe<T{comma}> = T | undefined;\n\
+             type AmbientString = Ambient<string>;\n\
+             type PlainString = Plain<string>;\n\
+             type MergedDefault = Merged;\n\
+             type MaybeString = Maybe<string>;\n\
+             function identity<T{comma}>(value: T): T {{ return value; }}\n\
+             declare const holder: Holder<string>;\n\
+             const method = holder.run('ok');\n\
+             const functionResult = identity<string>('ok');\n"
+        );
+        let parsed = parse_source_file(&source);
+        let mut context = context(&parsed);
+        context.check_source_file(FILE).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let calls = nodes(&parsed, SyntaxKind::CallExpression);
+        assert_eq!(calls.len(), 2);
+        let results = calls
+            .iter()
+            .map(|&call| context.get_type_at_location(call).unwrap())
+            .collect::<Vec<_>>();
+        for &result in &results {
+            assert_eq!(context.type_to_string(result).unwrap(), "string");
+        }
+        let aliases = nodes(&parsed, SyntaxKind::TypeAliasDeclaration);
+        let declared = aliases
+            .iter()
+            .map(|&alias| {
+                let owner = symbol(&context, alias);
+                (owner, context.get_declared_type_of_symbol(owner).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.diagnostics().clone(),
+        );
+        context.recheck_source_file(FILE).unwrap();
+        for (owner, expected) in declared {
+            assert_eq!(context.get_declared_type_of_symbol(owner), Ok(expected));
+        }
+        for (&call, expected) in calls.iter().zip(results) {
+            assert_eq!(context.get_type_at_location(call), Ok(expected));
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.diagnostics().clone()
+            ),
+            warm
+        );
+        assert!(context.store().type_resolution_is_empty());
+    }
+}

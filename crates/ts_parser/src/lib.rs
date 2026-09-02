@@ -3045,6 +3045,7 @@ impl<'a> Parser<'a> {
         }
         let start = self.consume().range.start;
         let mut parameters = Vec::new();
+        let mut has_trailing_comma = false;
         while self.current.kind != SyntaxKind::GreaterThanToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
@@ -3123,6 +3124,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.bump();
+            has_trailing_comma = self.current.kind == SyntaxKind::GreaterThanToken;
         }
         let end = if self.current.kind == SyntaxKind::GreaterThanToken {
             self.consume().range.end
@@ -3133,7 +3135,7 @@ impl<'a> Parser<'a> {
         Some(NodeList {
             range: TextRange::new(start, end),
             nodes: parameters,
-            has_trailing_comma: false,
+            has_trailing_comma,
         })
     }
 

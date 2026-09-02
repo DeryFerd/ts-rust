@@ -14857,7 +14857,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || record.parent != Some(declaration.node)
             || alias_data.type_ != node.node
             || parameters.nodes.len() != plan.type_parameters.len()
-            || parameters.has_trailing_comma
             || union.types.nodes.len() < 2
             || union.types.has_trailing_comma
             || self.store.get_merged_symbol(alias) != Some(alias)
@@ -29109,9 +29108,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let mut previous_parameters = Vec::new();
         let mut minimum_type_arguments = 0;
         let mut previous_parameter_end = parameters.range.start;
-        if (source_class || react_interface_defaults) && parameters.has_trailing_comma {
-            return Err(unsupported());
-        }
         for (index, parameter) in parameters.nodes.iter().enumerate() {
             let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
             let parameter_node = preflight_node(self.store, self.host, parameter)?;
@@ -29397,7 +29393,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .ok_or_else(&unsupported)?;
             if parameters.nodes.len() != local_count
                 || parameters.nodes.is_empty()
-                || parameters.has_trailing_comma
                 || parameters.range.start < name_record.range.end
                 || parameters.range.end > interface.members.range.start
             {
@@ -39407,9 +39402,45 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         interface: &PropertyObjectPlan,
         call: &object_members::PlannedCallSignature,
     ) -> Result<(), DeclaredTypeError> {
+        if !interface.call_signatures.contains(call) || call.is_construct() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(call.declaration),
+            ));
+        }
+        self.check_source_interface_signature_type_parameter_defaults(
+            interface,
+            call.declaration,
+            &call.type_parameters,
+        )
+    }
+
+    /// Checks a real method's written defaults with the same relation as call signatures.
+    pub(super) fn check_source_interface_method_type_parameter_defaults(
+        &mut self,
+        interface: &PropertyObjectPlan,
+        method: &object_members::PlannedInterfaceMethod,
+    ) -> Result<(), DeclaredTypeError> {
+        if !interface.methods.contains(method) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(method.declaration),
+            ));
+        }
+        self.check_source_interface_signature_type_parameter_defaults(
+            interface,
+            method.declaration,
+            &method.type_parameters,
+        )
+    }
+
+    fn check_source_interface_signature_type_parameter_defaults(
+        &mut self,
+        interface: &PropertyObjectPlan,
+        declaration: NodeRef,
+        parameters: &[object_members::PlannedInterfaceMethodTypeParameter],
+    ) -> Result<(), DeclaredTypeError> {
         let invalid =
-            || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(call.declaration));
-        self.require_type_reference_alias_root_capability(call.declaration)?;
+            || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(declaration));
+        self.require_type_reference_alias_root_capability(declaration)?;
         if !self.pending_function_parameters.is_empty() || self.instantiation_session.is_none() {
             return Err(invalid());
         }
@@ -39419,7 +39450,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .map(CanonicalArrayTargets::from_global_types)
             .ok_or_else(invalid)?;
         let mut checked = HashSet::new();
-        for parameter in &call.type_parameters {
+        for parameter in parameters {
             preflight_type_parameter_symbol(self.store, self.host, parameter.symbol, &mut checked)?;
         }
         let mut planner = TypeQueryPlanner::new(
@@ -39434,7 +39465,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         planner.source_context = Some(self.source_query_context()?);
         planner.source_heritage_identity = true;
         planner.replay_cached_annotations = true;
-        for parameter in &call.type_parameters {
+        for parameter in parameters {
             for annotation in [parameter.constraint, parameter.default_type]
                 .into_iter()
                 .flatten()
@@ -39451,18 +39482,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
         let result = (|| {
             self.execute_declared_signature_type_parameters(
-                call.type_parameters.iter(),
+                parameters.iter(),
                 &plan,
                 &mut prepared,
             )?;
-            self.prepare_source_interface_no_constraints(interface, call, &plan)?;
+            self.prepare_source_interface_no_constraints(interface, declaration, &plan)?;
             let formals = object_members::resolved_declared_signature_type_parameters(
                 self.store,
-                call.declaration,
-                &call.type_parameters,
+                declaration,
+                parameters,
             )
             .ok_or_else(invalid)?;
-            for (parameter, type_) in call.type_parameters.iter().zip(formals) {
+            for (parameter, type_) in parameters.iter().zip(formals) {
                 let Some(default_node) = parameter.default_type else {
                     continue;
                 };
@@ -39479,23 +39510,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         self.complete_type_query(result, &plan, &mut prepared)
     }
 
-    /// Complete absent outer bounds only when this call's annotations use those formals.
+    /// Complete absent outer bounds only when this signature's annotations use those formals.
     #[allow(clippy::too_many_lines)] // Source ownership and cold/warm formal state share one proof.
     fn prepare_source_interface_no_constraints(
         &mut self,
         interface: &PropertyObjectPlan,
-        call: &object_members::PlannedCallSignature,
+        declaration: NodeRef,
         plan: &TypeQueryPlan,
     ) -> Result<(), DeclaredTypeError> {
         let invalid =
-            || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(call.declaration));
+            || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(declaration));
         if interface.declarations.as_slice() != [interface.node]
-            || !interface.call_signatures.contains(call)
-            || call.is_construct()
-            || !call
-                .declaration
-                .is_for(interface.node.arena, interface.node.file)
-            || preflight_node(self.store, self.host, call.declaration)?.parent
+            || !declaration.is_for(interface.node.arena, interface.node.file)
+            || preflight_node(self.store, self.host, declaration)?.parent
                 != Some(interface.node.node)
             || object_members::plan_generic_interface(self.store, self.host, interface.symbol)
                 .map_err(property_object_error)?
