@@ -4985,8 +4985,7 @@ pub(super) fn generic_declared_call_signature_edges(
         .map(|signature| {
             let record = store.signature(*signature)?;
             let declaration = record.declaration()?;
-            (!record.has_rest_parameter()
-                && record.resolved_type_predicate().is_none()
+            (record.resolved_type_predicate().is_none()
                 && store.source_declaration_belongs_to_symbol(declaration, symbol)
                 && (record.type_parameters().is_empty()
                     || declared_interface_call_type_parameter_view(store, record, declaration)
@@ -11470,6 +11469,7 @@ pub(super) fn plan_generic_interface(
 
 /// The enclosing interface supplies one mapper for its ordered call signatures.
 /// The signature copier gives each call's own formals a separate mapper.
+/// Rest annotations keep the same source validation as other declared calls.
 /// Constructors and inherited calls remain unsupported.
 fn supported_generic_interface_calls(plan: &PropertyObjectPlan) -> bool {
     plan.kind == PropertyObjectKind::Interface
@@ -11480,10 +11480,7 @@ fn supported_generic_interface_calls(plan: &PropertyObjectPlan) -> bool {
         && plan.indexes.is_empty()
         && !plan.call_signatures.is_empty()
         && plan.call_signatures.iter().all(|call| {
-            call.type_predicate.is_none()
-                && !call.implicit_any_return
-                && !call.is_construct()
-                && !call.flags.contains(SignatureFlags::HAS_REST_PARAMETER)
+            call.type_predicate.is_none() && !call.implicit_any_return && !call.is_construct()
         })
 }
 

@@ -2985,6 +2985,7 @@ pub(super) fn validate_generic_interface_callable(
             .ok()?;
         for callable in &call_signatures {
             edges.extend_from_slice(&callable.parameters);
+            edges.extend(callable.rest_parameter);
             edges.extend(callable.return_type);
         }
         Some(StoredCallableSetValidation::Valid {
@@ -9868,16 +9869,24 @@ fn generic_interface_call_projections(
     for (&signature, &original) in signatures.iter().zip(&shape.call_signatures) {
         let source = store.signature(original).ok_or_else(invalid)?;
         let actual = store.signature(signature).ok_or_else(invalid)?;
-        let parameters = store
+        let mut parameters = store
             .callable_signature_parameter_types(original)
             .ok_or_else(invalid)?
             .to_vec();
+        if parameters.len() != source.parameters().len() {
+            return Err(invalid());
+        }
+        let rest_parameter = if source.has_rest_parameter() {
+            Some(parameters.pop().ok_or_else(invalid)?)
+        } else {
+            None
+        };
         let source_return = source.resolved_return_type().ok_or_else(invalid)?;
         let template = ValidatedSingleCallable {
             owner: shape.target,
             signature: original,
             parameters,
-            rest_parameter: None,
+            rest_parameter,
             min_argument_count: usize::try_from(source.min_argument_count())
                 .map_err(|_| invalid())?,
             return_type: Some(source_return),
@@ -9929,7 +9938,7 @@ fn generic_interface_call_projections(
         {
             return Err(invalid());
         }
-        let parameters = validated_instantiated_method_parameter_types(
+        let mut parameters = validated_instantiated_method_parameter_types(
             store,
             signature,
             &template,
@@ -9937,6 +9946,11 @@ fn generic_interface_call_projections(
             array_targets,
         )
         .ok_or_else(invalid)?;
+        let rest_parameter = if actual.has_rest_parameter() {
+            Some(parameters.pop().ok_or_else(invalid)?)
+        } else {
+            None
+        };
         if store
             .callable_signature_parameter_types(signature)
             .is_some()
@@ -9947,6 +9961,7 @@ fn generic_interface_call_projections(
             owner: shape.reference,
             signature,
             parameters,
+            rest_parameter,
             return_type: Some(return_type),
             ..template
         });
