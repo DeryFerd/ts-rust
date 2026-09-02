@@ -3634,7 +3634,10 @@ fn full_interface_computed_property_expression(
     let SourceNodeParent::Parent(owner) = store.source_node_parent(property.declaration)? else {
         return None;
     };
-    if store.source_node_kind(owner) != Some(SyntaxKind::InterfaceDeclaration) {
+    if !matches!(
+        store.source_node_kind(owner),
+        Some(SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral)
+    ) {
         return None;
     }
     let children = store.source_direct_children(property.name_node)?;
@@ -3667,6 +3670,21 @@ fn full_interface_computed_property_source(
     else {
         return None;
     };
+    let valid_owner = match store.source_node_kind(owner_declaration) {
+        Some(SyntaxKind::InterfaceDeclaration) => {
+            owner_record.flags().contains(SymbolFlags::INTERFACE)
+        }
+        Some(SyntaxKind::TypeLiteral) => {
+            owner_record.flags() == SymbolFlags::TYPE_LITERAL
+                && owner_record.name() == InternalSymbolName::Type.as_ref()
+                && owner_record.declarations() == Some(&[owner_declaration][..])
+                && owner_record.value_declaration().is_none()
+                && owner_record.parent().is_none()
+                && owner_record.exports().is_none()
+                && owner_record.export_symbol().is_none()
+        }
+        _ => false,
+    };
     let children = store.source_direct_children(property.declaration)?;
     let optional_count = children
         .iter()
@@ -3691,7 +3709,7 @@ fn full_interface_computed_property_source(
         || early.exports().is_some()
         || early.export_symbol().is_some()
         || store.get_merged_symbol(source) != Some(source)
-        || !owner_record.flags().contains(SymbolFlags::INTERFACE)
+        || !valid_owner
         || owner_record.check_flags() != CheckFlags::NONE
         || owner_record.members().is_some() != raw_members.is_some()
         || owner_record
@@ -12454,7 +12472,10 @@ fn plan_members(
     } else {
         0
     };
-    let interface_computed_count = if kind == PropertyObjectKind::Interface {
+    let interface_computed_count = if matches!(
+        kind,
+        PropertyObjectKind::Interface | PropertyObjectKind::TypeLiteral
+    ) {
         member_entries
             .iter()
             .filter(|(_, member)| {
@@ -12986,11 +13007,13 @@ fn plan_members(
                         source_computed_property = true;
                         String::new()
                     }
-                    _ if kind == PropertyObjectKind::Interface
-                        && matches!(
-                            member_record.kind,
-                            SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature
-                        ) =>
+                    _ if matches!(
+                        kind,
+                        PropertyObjectKind::Interface | PropertyObjectKind::TypeLiteral
+                    ) && matches!(
+                        member_record.kind,
+                        SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature
+                    ) =>
                     {
                         plan_computed_member_key(store, host, name).map_err(|error| {
                             full_interface_computed_key_error(&provisional, error)
@@ -15676,7 +15699,10 @@ pub(super) fn plan_full_interface_computed_properties(
     plan: &PropertyObjectPlan,
 ) -> Result<Vec<PlannedFullInterfaceComputedProperty>, PropertyObjectError> {
     let mut computed = Vec::new();
-    if plan.kind != PropertyObjectKind::Interface {
+    if !matches!(
+        plan.kind,
+        PropertyObjectKind::Interface | PropertyObjectKind::TypeLiteral
+    ) {
         return Ok(computed);
     }
     let mut sources = HashSet::new();
@@ -20530,6 +20556,19 @@ fn validate_declared_property_owner(
         return Malformed;
     }
     let declaration = declarations[0];
+    let members_match = owner_record.members() == members
+        || proof == DeclaredPropertyObjectProof::TypeLiteral
+            && members.is_some_and(|members| {
+                store.members_and_exports_links(owner).and_then(|links| {
+                    links.table(super::links::MembersOrExportsResolutionKind::ResolvedMembers)
+                }) == Some(members)
+                    && valid_partial_member_name_table(
+                        store,
+                        owner,
+                        owner_record.members(),
+                        members,
+                    )
+            });
     if store.get_merged_symbol(owner) != Some(owner)
         || owner_record.flags() != expected_flags
             && (proof != DeclaredPropertyObjectProof::Interface
@@ -20537,7 +20576,7 @@ fn validate_declared_property_owner(
         || owner_record.check_flags() != CheckFlags::NONE
         || !valid_name
         || owner_record.value_declaration().is_some()
-        || owner_record.members() != members
+        || !members_match
         || store.source_node_kind(declaration) != Some(expected_kind)
     {
         return Malformed;
@@ -20813,15 +20852,40 @@ fn validate_declared_property_members(
         let position = (owner_index, declaration);
         let accessor = property_record.flags().intersects(SymbolFlags::ACCESSOR);
         let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::ACCESSOR;
-        if !property_record.flags().contains(SymbolFlags::PROPERTY) && !accessor
-            || property_record.flags().without(allowed_flags) != SymbolFlags::NONE
-            || property_record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
-            || accessor && property_record.check_flags() != CheckFlags::NONE
-            || accessor && !owner_record.flags().contains(SymbolFlags::INTERFACE)
-            || property_record.name().is_reserved_member_name()
-            || property_record.name().is_private_identifier()
-            || property_record.name().is_late_bound()
-            || property_record.name().as_utf8().is_none()
+        let late = owner_record.flags() == SymbolFlags::TYPE_LITERAL
+            && property_record.name().is_late_bound();
+        let valid_shape = if late {
+            let Some(name_node) =
+                store.source_child_with_kind(declaration, SyntaxKind::ComputedPropertyName)
+            else {
+                return false;
+            };
+            let Some(type_node) = store.source_direct_type_annotation(declaration) else {
+                return false;
+            };
+            let planned = PlannedProperty {
+                declaration,
+                symbol: *property,
+                name_node,
+                type_node,
+                optional: property_record.flags().contains(SymbolFlags::OPTIONAL),
+                readonly: property_record.check_flags().contains(CheckFlags::READONLY),
+                name: property_record.name().to_owned(),
+            };
+            property_record.flags().contains(SymbolFlags::PROPERTY)
+                && late_interface_property_name_type(store, &planned).is_some()
+        } else {
+            (property_record.flags().contains(SymbolFlags::PROPERTY) || accessor)
+                && property_record.flags().without(allowed_flags) == SymbolFlags::NONE
+                && property_record.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
+                && (!accessor || property_record.check_flags() == CheckFlags::NONE)
+                && (!accessor || owner_record.flags().contains(SymbolFlags::INTERFACE))
+                && !property_record.name().is_reserved_member_name()
+                && !property_record.name().is_private_identifier()
+                && !property_record.name().is_late_bound()
+                && property_record.name().as_utf8().is_some()
+        };
+        if !valid_shape
             || property_record.value_declaration() != Some(declaration)
             || store.get_parent_of_symbol(*property) != Some(owner)
             || property_record.members().is_some()
@@ -20864,6 +20928,7 @@ fn validate_declared_property_members(
             != &(ValueSymbolLinks {
                 resolved_type: Some(property_type),
                 write_type: links.write_type,
+                name_type: if late { links.name_type } else { None },
                 ..ValueSymbolLinks::default()
             })
             || links.write_type.is_some_and(|write_type| {
@@ -20877,6 +20942,19 @@ fn validate_declared_property_members(
             return false;
         }
         previous_position = Some(position);
+    }
+    if owner_record.flags() == SymbolFlags::TYPE_LITERAL
+        && owner_record.members() != structured.members
+        && store
+            .source_direct_children(owner_declaration)
+            .is_none_or(|children| {
+                children.len() != seen_declarations.len()
+                    || children
+                        .iter()
+                        .any(|child| !seen_declarations.contains(child))
+            })
+    {
+        return false;
     }
     table.is_none_or(|table| {
         table.iter().all(|(name, property)| {
@@ -21934,8 +22012,10 @@ fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyOb
                             .is_none_or(|links| links == &ValueSymbolLinks::default())
                     });
         }
-        if plan.kind == PropertyObjectKind::Interface
-            && full_interface_computed_property_expression(store, property).is_some()
+        if matches!(
+            plan.kind,
+            PropertyObjectKind::Interface | PropertyObjectKind::TypeLiteral
+        ) && full_interface_computed_property_expression(store, property).is_some()
         {
             let Some((source, owner)) = full_interface_computed_property_source(store, property)
             else {

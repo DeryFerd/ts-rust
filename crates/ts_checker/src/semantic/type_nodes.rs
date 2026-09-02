@@ -13143,6 +13143,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             false
         };
         let result = (|| {
+            for property in object_members::plan_full_interface_computed_properties(
+                self.store, self.host, &planned,
+            )
+            .map_err(property_object_error)?
+            {
+                self.plan_type_node_in_context(property.key.type_node, None, false)?;
+            }
             for property in planned.property_type_nodes() {
                 self.plan_type_node_in_context(property, None, false)?;
             }
@@ -48032,6 +48039,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             plan.type_literals.get(&node).cloned().ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidLiteralType(node))
             })?;
+        object_members::project_full_interface_computed_property_names(
+            self.store,
+            self.host,
+            &mut literal,
+        )
+        .map_err(property_object_error)?;
         if let Some(header) = plan.inline_property_objects.get(&node) {
             for (_, parameter) in &header.parameters {
                 execute_type_parameter(self.store, *parameter);
@@ -48047,11 +48060,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         {
             return Ok(state.type_id());
         }
-        if literal
-            .methods
-            .iter()
-            .any(|method| method.computed_key.is_some())
+        let computed_properties = object_members::plan_full_interface_computed_properties(
+            self.store, self.host, &literal,
+        )
+        .map_err(property_object_error)?;
+        if !computed_properties.is_empty()
+            || literal
+                .methods
+                .iter()
+                .any(|method| method.computed_key.is_some())
         {
+            for property in &computed_properties {
+                self.execute_type_node(property.key.type_node, plan, prepared)?;
+            }
             for key in literal
                 .methods
                 .iter()
