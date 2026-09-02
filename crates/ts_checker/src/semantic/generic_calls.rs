@@ -1358,13 +1358,30 @@ pub(super) fn generic_call_signature_minimum_argument_count(
     signature: SignatureId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<usize, GenericCallVectorError> {
-    if let Some(callee) = generic_method_signature_callee(store, signature, array_targets)?
-        .or_else(|| store.source_overload_type_for_signature(signature))
-        .or(
-            completed_source_class_constructor_signature_owner(store, signature, array_targets)
-                .map_err(|_| GenericCallVectorInvariant::CallableSignatureMismatch(signature))?,
+    let callee = if let Some(callee) = store.declared_call_set_type_for_signature(signature)
+        && store
+            .signature(signature)
+            .and_then(|signature| signature.declaration())
+            .and_then(|declaration| store.source_node_kind(declaration))
+            == Some(SyntaxKind::ConstructSignature)
+        && generic_named_constructor_candidates(store, callee, array_targets)?.is_some_and(
+            |constructors| {
+                constructors
+                    .iter()
+                    .any(|candidate| candidate.signature == signature)
+            },
         )
     {
+        Some(callee)
+    } else {
+        generic_method_signature_callee(store, signature, array_targets)?
+            .or_else(|| store.source_overload_type_for_signature(signature))
+            .or(
+                completed_source_class_constructor_signature_owner(store, signature, array_targets)
+                    .map_err(|_| GenericCallVectorInvariant::CallableSignatureMismatch(signature))?,
+            )
+    };
+    if let Some(callee) = callee {
         let callable = generic_call_signature_candidate(store, callee, signature, array_targets)?;
         return get_min_argument_count_with_array_targets(
             store,
