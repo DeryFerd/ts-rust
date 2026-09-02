@@ -7,11 +7,11 @@
 //! unique-symbol, anonymous primitive-union, and exact resolved nongeneric
 //! declared-property-object candidates, validated derived object literals,
 //! authenticated template-literal patterns, unconstrained source class formals,
-//! fixed tuples, and canonical Array/ReadonlyArray references when the caller
-//! retains the authoritative global targets.
-//! Declared objects, class formals, and tuples are admitted only as root candidates
-//! or nested array/tuple elements, not as union constituents. Derived object
-//! literals are also admitted as union constituents. The branch preserves
+//! source class this types, fixed tuples, and canonical Array/ReadonlyArray
+//! references when the caller retains the authoritative global targets.
+//! Declared objects, class formals, class this types, and tuples are admitted only
+//! as root candidates or nested array/tuple elements, not as union constituents.
+//! Derived object literals are also admitted as union constituents. The branch preserves
 //! candidates that do not require widening, including fresh literals.
 //! Authenticated internal placeholders are skipped so binding patterns cannot
 //! become the only source of a public type argument.
@@ -31,7 +31,7 @@ use super::{
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
     callables::CallableFamily,
-    classes::source_class_unconstrained_type_parameter,
+    classes::{source_class_this_type_owner, source_class_unconstrained_type_parameter},
     derived_types::{DerivedObjectLiteralValidation, DerivedTypeError},
     instantiate::canonical_anonymous_union,
     mapper::CanonicalTypeMapperStore,
@@ -1019,9 +1019,10 @@ fn validate_inference_candidate(
     }
     if allow_declared_object
         && matches!(record.data(), TypeData::TypeParameter(_))
-        && source_class_unconstrained_type_parameter(store, candidate)
+        && (source_class_unconstrained_type_parameter(store, candidate)
+            || source_class_this_type_owner(store, candidate).is_some())
     {
-        // Keep the class formal itself, not its no-constraint sentinel.
+        // Keep the class formal or this type, not its constraint.
         return Ok(());
     }
     if let TypeData::TemplateLiteral(template) = record.data() {
