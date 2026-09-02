@@ -283,11 +283,11 @@ fn merged_owner(fixture: &Fixture, checker: &CanonicalCheckerContext<'_>) -> Sem
         record.declarations(),
         Some([original, augmentations[0], augmentations[1]].as_slice()),
     );
+    let root = symbol(checker, fixture.source_node(ROOT));
     assert_eq!(
         checker.store().get_parent_of_symbol(owner),
-        Some(symbol(checker, fixture.source_node(CONTEXT))),
+        Some(root),
     );
-    let root = symbol(checker, fixture.source_node(ROOT));
     for index in [AUGMENTATION, ADDITIONAL_AUGMENTATION] {
         let module = fixture.declaration(index, SyntaxKind::ModuleDeclaration, "../..");
         assert_eq!(symbol(checker, module), root);
