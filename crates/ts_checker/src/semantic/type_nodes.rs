@@ -44709,9 +44709,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 plan.generic_member_plans
                     .values()
                     .try_fold(count, |count, interface| {
-                        count.checked_add(object_members::optional_interface_call_union_operations(
-                            interface,
-                        )?)
+                        count
+                            .checked_add(object_members::optional_method_union_operations(
+                                interface,
+                            )?)?
+                            .checked_add(object_members::optional_interface_call_union_operations(
+                                interface,
+                            )?)
                     })
             })
             .and_then(|count| count.checked_add(tuple_preflight.length_union_operations()))
@@ -45534,11 +45538,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.global_types.as_ref(),
         )
         .map_err(property_object_error)?;
-        object_members::publish_generic_interface_declared_members(
+        object_members::publish_generic_interface_declared_members_prepared(
             self.store,
             &members,
             target,
             &property_types,
+            prepared,
+            self.global_types.as_ref(),
         )
         .map_err(property_object_error)?;
         Ok(())

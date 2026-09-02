@@ -25893,6 +25893,24 @@ pub(super) fn publish_generic_interface_declared_members(
     )
 }
 
+pub(super) fn publish_generic_interface_declared_members_prepared(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    target: TypeId,
+    property_types: &[TypeId],
+    preparation: &mut PreparedTypeQueryTypes,
+    globals: Option<&CanonicalGlobalTypes>,
+) -> Result<TypeId, PropertyObjectError> {
+    publish_generic_interface_declared_members_worker(
+        store,
+        plan,
+        target,
+        property_types,
+        Some((preparation, globals)),
+        globals.map(CanonicalArrayTargets::from_global_types),
+    )
+}
+
 pub(super) fn publish_generic_interface_declared_members_with_global_types(
     store: &mut CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,
