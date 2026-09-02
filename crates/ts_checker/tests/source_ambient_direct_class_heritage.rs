@@ -5,7 +5,7 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeError, DeclaredTypeUnavailable,
-    TypeData, TypeNodeUnavailable,
+    TypeData,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -108,21 +108,6 @@ fn ambient_class_heritage_reaches_the_class_member_boundary() {
         SymbolFlags::ALIAS
     );
 
-    let NodeData::InterfaceDeclaration(interface) =
-        &parsed.arena.get(derived_node.node).unwrap().data
-    else {
-        unreachable!()
-    };
-    let clause = interface.heritage_clauses.as_ref().unwrap().nodes[0];
-    let NodeData::HeritageClause(clause) = &parsed.arena.get(clause).unwrap().data else {
-        unreachable!()
-    };
-    let NodeData::ExpressionWithTypeArguments(base) =
-        &parsed.arena.get(clause.types.nodes[0]).unwrap().data
-    else {
-        unreachable!()
-    };
-    let expression = NodeRef::new(derived_node.arena, FILE, base.expression);
     let declared = checker
         .store()
         .declared_type_links(derived)
@@ -134,17 +119,13 @@ fn ambient_class_heritage_reaches_the_class_member_boundary() {
         panic!("global initialization must retain the interface identity")
     };
     let this = identity.this_type.unwrap();
-    let expected = DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::UnsupportedSyntax {
-        node: expression,
-        kind: SyntaxKind::Identifier,
-    });
 
-    // The identity is valid. Full member checking still rejects the class base.
-    assert_eq!(checker.get_declared_type_of_symbol(derived), Err(expected));
+    // The identity query leaves base types and members unresolved.
+    assert_eq!(checker.get_declared_type_of_symbol(derived), Ok(declared));
     let stable = counts(&checker);
     let diagnostics = checker.diagnostics().clone();
     for _ in 0..2 {
-        assert_eq!(checker.get_declared_type_of_symbol(derived), Err(expected));
+        assert_eq!(checker.get_declared_type_of_symbol(derived), Ok(declared));
         assert_eq!(counts(&checker), stable);
         assert_eq!(checker.diagnostics(), &diagnostics);
         assert_eq!(
