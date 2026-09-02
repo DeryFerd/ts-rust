@@ -96,6 +96,7 @@ use super::{
         instantiated_function_member_signature_return,
         instantiated_interface_method_signature_return,
         interface_method_signature_return_for_query_with_source,
+        prepare_interface_method_signature_return_for_query,
     },
     interface_heritage::{
         DirectInterfaceBaseKind, DirectInterfaceBasePlan, DirectInterfaceHeritagePlan,
@@ -41309,21 +41310,51 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .and_then(|callable| callable.return_type)
                 .ok_or_else(invalid_method);
         }
-        let method_source_context = if self.global_types.is_some() {
-            Some(self.source_query_context()?)
+        let method = if self.global_types.is_some() {
+            if !self.resolving_instantiated_signatures.insert(signature) {
+                return Err(invalid_method());
+            }
+            let result = (|| {
+                let context = self.source_query_context()?;
+                let globals = context.globals.clone();
+                let mut source = SourceTypeQueryAdapter {
+                    context,
+                    diagnostics: self.diagnostics,
+                };
+                let mut fallback = InstantiationSession::new(InstantiationLimits::default());
+                let session = self
+                    .instantiation_session
+                    .as_deref_mut()
+                    .unwrap_or(&mut fallback);
+                let result = prepare_interface_method_signature_return_for_query(
+                    self.store,
+                    signature,
+                    &globals,
+                    session,
+                    &mut source,
+                );
+                self.global_this_members = source.context.members;
+                self.completed_source_conditionals = source.context.completed;
+                self.new_source_conditionals.extend(source.context.produced);
+                self.completed_global_values = source.context.values;
+                self.source_branch_recoveries = source.context.recoveries;
+                self.source_conditional_recoveries = source.context.semantic_results;
+                self.completed_source_returns = source.context.returns;
+                result.map_err(|_| invalid_method())
+            })();
+            let removed = self.resolving_instantiated_signatures.remove(&signature);
+            debug_assert!(removed, "active return preparation remains registered");
+            result?
         } else {
-            None
+            interface_method_signature_return_for_query_with_source(
+                self.store,
+                signature,
+                array_targets,
+                None,
+            )
+            .map_err(|_| invalid_method())?
         };
-        if let Some(method) = interface_method_signature_return_for_query_with_source(
-            self.store,
-            signature,
-            array_targets,
-            method_source_context
-                .as_ref()
-                .map(|source| (&source.globals, source as &dyn ConditionalBranchSource)),
-        )
-        .map_err(|_| invalid_method())?
-        {
+        if let Some(method) = method {
             self.reject_type_reference_alias_capabilities()?;
             let source_return = if preflight_node(self.store, self.host, method.declaration)?.kind
                 == SyntaxKind::MethodDeclaration

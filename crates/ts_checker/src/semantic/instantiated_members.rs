@@ -5019,7 +5019,48 @@ pub(super) fn interface_method_signature_return_for_query_with_source(
     array_targets: Option<CanonicalArrayTargets>,
     source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
-    let mut preflight = None;
+    let preflight =
+        generic_method_return_query_target(store, signature, array_targets).map(|target| {
+            let result =
+                super::generic_calls::preflight_generic_call_signature_return_target_with_source(
+                    store,
+                    array_targets,
+                    signature,
+                    source,
+                );
+            (target, result)
+        });
+    finish_interface_method_return_query(
+        store,
+        signature,
+        array_targets,
+        preflight,
+        source.is_some(),
+    )
+}
+
+pub(super) fn prepare_interface_method_signature_return_for_query(
+    store: &mut CanonicalTypeMapperStore,
+    signature: SignatureId,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    let arrays = Some(CanonicalArrayTargets::from_global_types(globals));
+    let preflight = generic_method_return_query_target(store, signature, arrays).map(|target| {
+        let result = super::generic_calls::prepare_generic_call_signature_return_with_source(
+            store, globals, signature, session, source,
+        );
+        (target, result)
+    });
+    finish_interface_method_return_query(store, signature, arrays, preflight, true)
+}
+
+fn generic_method_return_query_target(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<SignatureId> {
     if store
         .published_interface_method_type_for_signature(signature)
         .is_none()
@@ -5037,18 +5078,27 @@ pub(super) fn interface_method_signature_return_for_query_with_source(
             )
             .is_some())
     {
-        let result =
-            super::generic_calls::preflight_generic_call_signature_return_target_with_source(
-                store,
-                array_targets,
-                signature,
-                source,
-            );
-        let call_shell = result.as_ref().is_ok_and(|source| *source == target);
-        preflight = Some((target, result));
-        if call_shell {
-            return Ok(None);
-        }
+        Some(target)
+    } else {
+        None
+    }
+}
+
+fn finish_interface_method_return_query(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+    preflight: Option<(
+        SignatureId,
+        Result<SignatureId, super::generic_calls::GenericCallVectorError>,
+    )>,
+    source_aware: bool,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    if preflight
+        .as_ref()
+        .is_some_and(|(target, result)| result.as_ref().is_ok_and(|source| source == target))
+    {
+        return Ok(None);
     }
     instantiated_interface_method_signature_return(store, signature, array_targets)
         .inspect_err(|error| {
@@ -5062,7 +5112,7 @@ pub(super) fn interface_method_signature_return_for_query_with_source(
                 "method_return_dispatch",
                 format_args!(
                     "signature={signature:?} source_aware={} preflight={preflight:?} fallback_error={error:?} metadata={metadata:?} observation_active=false",
-                    source.is_some(),
+                    source_aware,
                 ),
             );
         })

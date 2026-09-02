@@ -2162,6 +2162,72 @@ pub(super) fn preflight_generic_call_signature_return_target(
     )
 }
 
+/// Rebuild query-local proofs for an existing signature before a public return read.
+pub(super) fn prepare_generic_call_signature_return_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    signature: SignatureId,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<SignatureId, GenericCallVectorError> {
+    let record = store.signature(signature).ok_or(
+        GenericCallVectorInvariant::InvalidCachedInstantiation {
+            target: signature,
+            signature,
+        },
+    )?;
+    let target = record
+        .target()
+        .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation {
+            target: signature,
+            signature,
+        })?;
+    let invalid = || GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature };
+    let mapper = record.mapper().ok_or_else(invalid)?;
+    let arrays = Some(CanonicalArrayTargets::from_global_types(globals));
+    let callable = generic_call_return_candidate(store, target, signature, arrays)?;
+    if callable.signature != target
+        || callable.return_type.is_none() && record.resolved_return_type().is_some()
+    {
+        return Err(invalid().into());
+    }
+    let shape = generic_call_return_shape(store, &callable, arrays, true)?;
+    let sources = shape
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.type_)
+        .collect::<Vec<_>>();
+    let arguments = sources
+        .iter()
+        .map(|parameter| store.map_type(mapper, *parameter).ok_or_else(invalid))
+        .collect::<Result<Vec<_>, _>>()?;
+    if store.type_mapper_has_exact_endpoints(mapper, &sources, &arguments) != Some(true)
+        || !fixed_contextual_return_cache_is_exact(store, target, &arguments, signature)
+    {
+        return Err(invalid().into());
+    }
+    let checked = store
+        .cached_signatures_contain(signature)
+        .ok_or_else(invalid)?;
+    if checked
+        && !matches!(
+            store.cached_signature(target, type_list_key(&arguments), &arguments),
+            CachedSignatureLookup::Hit(cached) if cached == signature
+        )
+    {
+        return Err(invalid().into());
+    }
+    prepare_generic_call_signature_source_replay(
+        store, &shape, &sources, &arguments, signature, checked, globals, session, source,
+    )?;
+    preflight_generic_call_signature_return_target_with_source(
+        store,
+        arrays,
+        signature,
+        Some((globals, source)),
+    )
+}
+
 pub(super) fn preflight_generic_call_signature_return_target_with_source(
     store: &CanonicalTypeMapperStore,
     array_targets: Option<CanonicalArrayTargets>,
