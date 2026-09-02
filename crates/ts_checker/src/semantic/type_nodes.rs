@@ -607,6 +607,15 @@ fn source_class_implementation_owner(
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
 ) -> Result<Option<SemanticSymbolId>, DeclaredTypeError> {
+    source_class_heritage_owner(store, host, node, SyntaxKind::ImplementsKeyword)
+}
+
+fn source_class_heritage_owner(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    token: SyntaxKind,
+) -> Result<Option<SemanticSymbolId>, DeclaredTypeError> {
     let record = preflight_node(store, host, node)?;
     if record.kind != SyntaxKind::ExpressionWithTypeArguments {
         return Ok(None);
@@ -621,7 +630,7 @@ fn source_class_implementation_owner(
     let NodeData::HeritageClause(heritage) = &clause_record.data else {
         return Ok(None);
     };
-    if heritage.token != SyntaxKind::ImplementsKeyword {
+    if heritage.token != token {
         return Ok(None);
     }
     let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
@@ -645,6 +654,20 @@ pub(super) fn plan_source_class_implementation_import(
     node: NodeRef,
 ) -> Result<Option<OrdinaryImportAliasChain>, DeclaredTypeError> {
     if source_class_implementation_owner(store, host, node)?.is_none() {
+        return Ok(None);
+    }
+    plan_source_class_heritage_import(store, host, node)
+}
+
+/// Keeps the import chain for the actual class heritage role.
+fn plan_source_class_heritage_import(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Option<OrdinaryImportAliasChain>, DeclaredTypeError> {
+    let extends =
+        source_class_heritage_owner(store, host, node, SyntaxKind::ExtendsKeyword)?.is_some();
+    if !extends && source_class_implementation_owner(store, host, node)?.is_none() {
         return Ok(None);
     }
     let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
@@ -700,7 +723,21 @@ pub(super) fn plan_source_class_implementation_import(
     {
         return Ok(None);
     }
-    ordinary_import_alias_chain(store, host, node, raw).map(Some)
+    let chain = ordinary_import_alias_chain(store, host, node, raw)?;
+    if extends
+        && (chain.steps.iter().any(|step| step.type_only.is_some())
+            || store
+                .symbol(chain.target())
+                .is_none_or(|symbol| symbol.flags() != SymbolFlags::CLASS))
+    {
+        return Err(type_node_unavailable(
+            TypeNodeUnavailable::UnsupportedReferenceTarget {
+                node,
+                symbol: chain.target(),
+            },
+        ));
+    }
+    Ok(Some(chain))
 }
 
 /// The heritage node retains its own role and complete direct-reference plan.
@@ -3580,7 +3617,7 @@ impl TypeQueryPlan {
             .references
             .get(&node)
             .and_then(|reference| reference.implementation_import.as_ref())
-            && plan_source_class_implementation_import(store, host, node)?.as_ref() != Some(import)
+            && plan_source_class_heritage_import(store, host, node)?.as_ref() != Some(import)
         {
             return Err(invalid());
         }
@@ -23761,8 +23798,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             source_imports::plan_source_class_annotation_type_import(self.store, self.host, node)
                 .map_err(|error| property_type_import_error(node, error))?
         };
-        let implementation_import = if source_class_implementation {
-            plan_source_class_implementation_import(self.store, self.host, node)?
+        let implementation_import = if source_class_heritage {
+            plan_source_class_heritage_import(self.store, self.host, node)?
         } else {
             None
         };
@@ -30894,7 +30931,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         {
             let imported = if self.source_class_heritage == Some(node)
                 && let Some(import) =
-                    plan_source_class_implementation_import(self.store, self.host, node)?
+                    plan_source_class_heritage_import(self.store, self.host, node)?
             {
                 import.target() == symbol
             } else if let Some(target) = self.type_reference_alias_targets.get(&node) {
@@ -33793,7 +33830,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         if self.source_class_heritage == Some(node)
             && let Some(import) =
-                plan_source_class_implementation_import(self.store, self.host, node)?
+                plan_source_class_heritage_import(self.store, self.host, node)?
         {
             if self.plan.references.get(&node).is_some_and(|reference| {
                 reference.implementation_import.as_ref() != Some(&import)
@@ -44964,7 +45001,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .map_err(|error| property_type_import_error(node, error))?;
             }
             if let Some(import) = &reference.implementation_import {
-                if plan_source_class_implementation_import(self.store, self.host, node)?.as_ref()
+                if plan_source_class_heritage_import(self.store, self.host, node)?.as_ref()
                     != Some(import)
                     || reference.symbol != import.target()
                     || reference.import_alias

@@ -100,12 +100,12 @@
 //! existing optional read and write rules.
 //! Written method returns use the class annotation query and keep their real signatures.
 //! Generic source bodies retain their real class formals, defaults, constraints,
-//! and instance annotation roots. One local applied base keeps its origin and
-//! applied identities separate for inherited members and `super` calls.
+//! and instance annotation roots. One local or imported applied base keeps its
+//! origin and applied identities separate for inherited members and `super` calls.
 //! Completed source classes expose their real constructor candidates for generic
 //! construction. Named executable class imports retain their completed provider
-//! and lexical alias. Imported applied bases and imported construction remain
-//! unsupported.
+//! and lexical alias. Imported applied bases retain their provider and written
+//! type-argument proof. Imported construction remains unsupported.
 //! Other heritage expressions and unsupported annotation shapes remain later stages.
 
 use std::collections::{HashMap, HashSet};
@@ -17108,13 +17108,17 @@ fn plan_direct_class_base_with_source_types(
             .resolved_type_arguments
             .as_deref()
             .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(expression)))?;
-        if base.type_arguments.is_some() || !formals.is_empty() {
+        let applied = base.type_arguments.is_some() || !formals.is_empty();
+        if applied && !source_types {
             return Err(unsupported(ClassUnsupported::Heritage(node)));
         }
         for (reference, expected) in [
             (expression, value.members.shells().value_type()),
             (node, value.members.shells().instance_type()),
         ] {
+            if applied && reference == node {
+                continue;
+            }
             if store.type_node_links(reference).is_some_and(|links| {
                 links != &TypeNodeLinks::default()
                     && links
@@ -17125,6 +17129,16 @@ fn plan_direct_class_base_with_source_types(
             }) {
                 return Err(invariant(ClassInvariant::InvalidHeritage(expression)));
             }
+        }
+        if applied {
+            preflight_source_class_heritage_type(
+                store,
+                host,
+                &context.global_types,
+                context.options,
+                node,
+                owner,
+            )?;
         }
         imported.owner.symbol
     } else {
@@ -17213,7 +17227,7 @@ fn plan_direct_class_base_with_source_types(
             constructor_value: None,
             type_arguments: Vec::new(),
             source_type_arguments: Some(nodes),
-            imported: None,
+            imported: imported.cloned().map(Box::new),
         });
     }
     let mut type_arguments = Vec::new();
