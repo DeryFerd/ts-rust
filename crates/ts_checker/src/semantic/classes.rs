@@ -709,6 +709,63 @@ pub(super) fn plan_source_single_constructor_class(
     Ok(Some(plan))
 }
 
+/// Abstract classes with a default constructor retain full source method bodies.
+pub(super) fn plan_source_abstract_default_constructor_class(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    type_context: Option<&ClassTypeQueryContext>,
+) -> Result<Option<SourceClassPlan>, ClassError> {
+    let header = match plan_class_declaration_header(store, host, symbol, true) {
+        Ok(header) => header,
+        Err(ClassError::Unsupported(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !header.abstract_class
+        || header.ambient
+        || header.base.is_some()
+        || header.null_base.is_some()
+    {
+        return Ok(None);
+    }
+    let NodeData::ClassDeclaration(class) =
+        &preflight_node(store, host, header.declaration)?.data
+    else {
+        return Err(invariant(ClassInvariant::InvalidDeclaration(
+            header.declaration,
+        )));
+    };
+    if class.type_parameters.is_some()
+        || class.members.nodes.iter().any(|member| {
+            host.node(NodeRef::new(
+                header.declaration.arena,
+                header.declaration.file,
+                *member,
+            ))
+            .is_some_and(|record| record.kind == SyntaxKind::Constructor)
+        })
+    {
+        return Ok(None);
+    }
+    if store.source_class_provenance_for_symbol(symbol).is_none() {
+        match plan_nongeneric_class_member_query_with_type_context(
+            store,
+            host,
+            symbol,
+            type_context,
+        ) {
+            Ok(_) => return Ok(None),
+            Err(ClassError::Unsupported(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let plan = plan_source_class_members_with_type_context(store, host, symbol, type_context)?;
+    if !plan.is_abstract() || !plan.has_own_default_constructor() {
+        return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
+    }
+    Ok(Some(plan))
+}
+
 // The legacy single-parameter constructor plan cannot own local declarations.
 pub(super) fn source_class_needs_early_constructor_plan(
     arena: &NodeArena,
@@ -5001,7 +5058,13 @@ pub(super) fn prepare_source_class_constructor_header(
         )?;
         // Constructor projection also replays the source annotations. Keep it
         // inside the owner scope while initialized fields are still pending.
-        if plan.has_constructor_overloads() {
+        if plan.is_abstract() && plan.has_own_default_constructor() {
+            let provenance = store
+                .source_class_provenance_for_symbol(plan.symbol())
+                .ok_or_else(|| invariant(ClassInvariant::InvalidPlan(plan.declaration())))?;
+            validate_source_class_header(store, host, provenance)?;
+            Some(provenance.members.clone())
+        } else if plan.has_constructor_overloads() {
             source_class_constructor_overloads(store, host, plan.symbol())?
                 .map(|constructors| constructors.members)
         } else {
@@ -15824,7 +15887,10 @@ fn plan_property_with_body_mode(
     }
     if private
         && (merged_auto_accessor.is_some()
-            || property.postfix_token.is_some()
+            || property.postfix_token.is_some_and(|token| {
+                host.node(NodeRef::new(member.arena, member.file, token))
+                    .is_none_or(|token| token.kind != SyntaxKind::QuestionToken)
+            })
             || property.modifiers.as_ref().is_some_and(|modifiers| {
                 modifiers.list.nodes.iter().any(|modifier| {
                     host.node(NodeRef::new(member.arena, member.file, *modifier))
@@ -34291,7 +34357,7 @@ fn exact_stored_property(
         None
     };
     if private_name.is_some()
-        && (flags != SymbolFlags::PROPERTY
+        && (flags.without(SymbolFlags::OPTIONAL) != SymbolFlags::PROPERTY
             || !matches!(check_flags, CheckFlags::NONE | CheckFlags::READONLY)
             || store.symbol(owner).is_none_or(|owner| {
                 [owner.members(), owner.exports()]

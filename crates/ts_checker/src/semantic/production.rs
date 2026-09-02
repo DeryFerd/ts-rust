@@ -1669,6 +1669,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     /// dependency or derived shell.
     /// Source-body constructors retain their real headers without checking
     /// field initializers or bodies.
+    /// Abstract classes with a default constructor can retain source method
+    /// bodies for the later source check through the same header path.
     ///
     /// # Errors
     ///
@@ -1750,6 +1752,24 @@ impl<'arena> CanonicalCheckerContext<'arena> {
                     symbol,
                     Some(&type_context),
                 )? {
+                    return super::classes::prepare_source_class_constructor_header(
+                        store,
+                        &host,
+                        global_types,
+                        *options,
+                        instantiation_session,
+                        diagnostics,
+                        &plan,
+                    );
+                }
+                if let Some(plan) =
+                    super::classes::plan_source_abstract_default_constructor_class(
+                        store,
+                        &host,
+                        symbol,
+                        Some(&type_context),
+                    )?
+                {
                     return super::classes::prepare_source_class_constructor_header(
                         store,
                         &host,
