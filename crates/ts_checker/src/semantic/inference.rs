@@ -6,12 +6,12 @@
 //! contravariant candidate. The bounded Rust branch accepts primitive, literal,
 //! unique-symbol, anonymous primitive-union, and exact resolved nongeneric
 //! declared-property-object candidates, validated derived object literals,
-//! authenticated template-literal patterns, fixed tuples, and
-//! canonical Array/ReadonlyArray references when the caller retains the
-//! authoritative global targets.
-//! Declared objects and tuples are admitted only as root candidates or nested
-//! array/tuple elements, not as union constituents. Derived object literals
-//! are also admitted as union constituents. The branch preserves
+//! authenticated template-literal patterns, unconstrained source class formals,
+//! fixed tuples, and canonical Array/ReadonlyArray references when the caller
+//! retains the authoritative global targets.
+//! Declared objects, class formals, and tuples are admitted only as root candidates
+//! or nested array/tuple elements, not as union constituents. Derived object
+//! literals are also admitted as union constituents. The branch preserves
 //! candidates that do not require widening, including fresh literals.
 //! Authenticated internal placeholders are skipped so binding patterns cannot
 //! become the only source of a public type argument.
@@ -31,6 +31,7 @@ use super::{
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
     callables::CallableFamily,
+    classes::source_class_unconstrained_type_parameter,
     derived_types::{DerivedObjectLiteralValidation, DerivedTypeError},
     instantiate::canonical_anonymous_union,
     mapper::CanonicalTypeMapperStore,
@@ -1015,6 +1016,13 @@ fn validate_inference_candidate(
             .intersects(ObjectFlags::REQUIRES_WIDENING)
     {
         return Err(NakedTypeInferenceError::RequiresWidening(candidate));
+    }
+    if allow_declared_object
+        && matches!(record.data(), TypeData::TypeParameter(_))
+        && source_class_unconstrained_type_parameter(store, candidate)
+    {
+        // Keep the class formal itself, not its no-constraint sentinel.
+        return Ok(());
     }
     if let TypeData::TemplateLiteral(template) = record.data() {
         if record.flags() != TypeFlags::TEMPLATE_LITERAL
