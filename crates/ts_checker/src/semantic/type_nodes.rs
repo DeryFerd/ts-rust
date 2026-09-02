@@ -12122,10 +12122,44 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 &self.plan.pending_function_proofs,
             )?;
         if let Some(alias) = expected_alias {
-            let arguments = self
+            let published_arguments = self
                 .store
                 .type_alias_links(alias)
-                .and_then(|links| links.type_parameters.as_deref())
+                .and_then(|links| links.type_parameters.as_deref());
+            // An RHS query can cache the union before the alias publishes its formals.
+            let planned_arguments = if let Some(metadata) = self.plan.aliases.get(&alias) {
+                let mut arguments = Vec::new();
+                arguments
+                    .try_reserve(metadata.type_parameters.len())
+                    .map_err(|_| LiteralTypeCacheError::Capacity)?;
+                for parameter in &metadata.type_parameters {
+                    let argument = self
+                        .store
+                        .declared_type_links(parameter.symbol)
+                        .and_then(|links| links.declared_type)
+                        .filter(|type_| {
+                            cached_ordinary_type_parameter_owner(self.store, *type_)
+                                == Some(parameter.symbol)
+                        })
+                        .ok_or_else(|| {
+                            self.store
+                                .invalid_cached_union_at(cached, "union_identity.planned_formal")
+                        })?;
+                    arguments.push(argument);
+                }
+                Some(arguments)
+            } else {
+                None
+            };
+            if let Some(planned) = planned_arguments.as_deref()
+                && published_arguments.is_some_and(|published| published != planned)
+            {
+                return Err(self
+                    .store
+                    .invalid_cached_union_at(cached, "union_identity.published_formals"));
+            }
+            let arguments = published_arguments
+                .or(planned_arguments.as_deref())
                 .unwrap_or_default();
             self.store
                 .validate_union_alias_identity(cached, alias, arguments)?;
