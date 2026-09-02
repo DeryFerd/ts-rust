@@ -17,6 +17,7 @@
 //! function-expando writes reuse their previously declared outer property.
 //! JavaScript object expandos retain the initializer's real assignment exports.
 //! Same-file own class fields retain their source receiver and assignment position.
+//! Ordinary element writes reuse the assignment proof and the source element checker.
 //! Name lookup follows the pinned lexical resolver and checker export/merge routing.
 //! Valid syntax outside that closure is a typed unsupported result; malformed AST,
 //! binder, or semantic-store provenance is an invariant failure.
@@ -38,6 +39,15 @@ use super::{
 
 const NODE_FLAG_LET: u32 = 1 << 0;
 const NODE_FLAG_CONST: u32 = 1 << 1;
+
+/// The real nodes shared by identifier and element assignment planning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AssignmentSyntaxPlan {
+    pub(super) expression: NodeRef,
+    pub(super) left: NodeRef,
+    pub(super) operator: SyntaxKind,
+    pub(super) right: NodeRef,
+}
 
 /// The source nodes needed by assignment contextual typing and execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -346,6 +356,32 @@ pub(super) fn plan_simple_assignment(
         &HashSet::new(),
         statement,
     )
+}
+
+/// Selects ordinary element writes without changing identifier assignment rules.
+pub(super) fn plan_element_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    statement: NodeRef,
+) -> Result<Option<AssignmentSyntaxPlan>, AssignmentPlanError> {
+    let planner = AssignmentPlanner {
+        arena,
+        bound,
+        store,
+        host,
+        ambient_targets: &HashSet::new(),
+        uninitialized_targets: &HashSet::new(),
+        mutable_targets: &HashSet::new(),
+    };
+    let syntax = planner.plan_syntax(statement)?;
+    Ok((syntax.operator == SyntaxKind::EqualsToken
+        && matches!(
+            planner.node(syntax.left)?.data,
+            NodeData::ElementAccessExpression(_)
+        ))
+    .then_some(syntax))
 }
 
 /// Selects class writes before the ordinary identifier-assignment boundary.
@@ -3787,7 +3823,7 @@ impl AssignmentPlanner<'_, '_> {
         }))
     }
 
-    fn plan(&self, statement: NodeRef) -> Result<SimpleAssignmentPlan, AssignmentPlanError> {
+    fn plan_syntax(&self, statement: NodeRef) -> Result<AssignmentSyntaxPlan, AssignmentPlanError> {
         self.preflight_program()?;
         let statement_node = self.node(statement)?;
         let NodeData::ExpressionStatement(statement_data) = &statement_node.data else {
@@ -3861,6 +3897,21 @@ impl AssignmentPlanner<'_, '_> {
             ));
         }
 
+        Ok(AssignmentSyntaxPlan {
+            expression,
+            left,
+            operator: operator_node.kind,
+            right,
+        })
+    }
+
+    fn plan(&self, statement: NodeRef) -> Result<SimpleAssignmentPlan, AssignmentPlanError> {
+        let AssignmentSyntaxPlan {
+            expression,
+            left,
+            operator,
+            right,
+        } = self.plan_syntax(statement)?;
         let left_node = self.node(left)?;
         let NodeData::Identifier(identifier) = &left_node.data else {
             return Err(Self::unsupported(
@@ -3997,7 +4048,7 @@ impl AssignmentPlanner<'_, '_> {
         Ok(SimpleAssignmentPlan {
             expression,
             left,
-            operator: operator_node.kind,
+            operator,
             right,
             target_symbol: target,
             target_type_node,

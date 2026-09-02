@@ -7,7 +7,10 @@ use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeMapperStore, DeclaredTypeLinks,
     GenericInterfaceMemberError, IntrinsicBootstrapOptions, SignatureId, TypeData, TypeId,
     ValueSymbolLinks,
-    links::{LateBoundLinks, SymbolNodeLinks, TypeNodeLinks},
+    links::{
+        LateBoundLinks, MembersAndExportsLinks, MembersOrExportsResolutionKind, SymbolNodeLinks,
+        TypeNodeLinks,
+    },
     type_records::CacheHashKey,
     types::ObjectFlags,
 };
@@ -1307,6 +1310,18 @@ interface Other {}
     assert_eq!(counts(&store), before);
     assert!(store.set_interface_base_resolution(target, true, None, None));
     assert!(store.set_interface_declared_members(target, true, Some(members), None, None, None));
+    let raw_members = store.symbol(owner).unwrap().members().unwrap();
+    let resolved_members = store.clone_symbol_table(raw_members).unwrap();
+    for (name, property) in names.iter().zip(late) {
+        assert_eq!(
+            store.insert_symbol(resolved_members, name.clone(), property),
+            Some(None)
+        );
+    }
+    let mut resolved_links = MembersAndExportsLinks::default();
+    resolved_links.tables[MembersOrExportsResolutionKind::ResolvedMembers as usize] =
+        Some(resolved_members);
+    assert!(store.set_members_and_exports_links(owner, resolved_links));
     store
         .resolve_generic_interface_members(target, None)
         .unwrap();

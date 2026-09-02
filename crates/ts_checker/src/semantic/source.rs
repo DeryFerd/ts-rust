@@ -244,6 +244,7 @@ use super::{
         CheckedSourceElement, SourceElementError, SourceElementPlan, SourceElementUnsupported,
         check_array_binding_element, check_computed_binding_element,
         check_direct_source_element_with_source, check_direct_source_element_write,
+        check_direct_source_element_write_with_source,
         finish_direct_source_element_plan, is_array_like_type, numeric_index_type,
         plan_direct_source_element_syntax, plan_direct_source_element_write_syntax,
     },
@@ -3712,6 +3713,13 @@ struct PlannedAssignment {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedElementAssignment {
+    expression: NodeRef,
+    element: SourceElementPlan,
+    right: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
 struct PlannedOwnClassPropertyAssignment {
     target: OwnClassPropertyWritePlan,
     receiver: PlannedExpression,
@@ -4067,6 +4075,7 @@ enum PlannedStatement {
     ArrayVariable(Box<PlannedArrayVariable>),
     ObjectVariable(Box<PlannedObjectVariable>),
     Assignment(PlannedAssignment),
+    ElementAssignment(Box<PlannedElementAssignment>),
     OwnClassPropertyAssignment(Box<PlannedOwnClassPropertyAssignment>),
     EvolvingArrayAssignment(Box<PlannedEvolvingArrayAssignment>),
     CommonJsAssignment(PlannedCommonJsAssignment),
@@ -6599,6 +6608,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 right,
                             },
                         )));
+                        continue;
+                    }
+                    if let Some(assignment) = self.plan_top_level_element_assignment(statement)? {
+                        statements.push(PlannedStatement::ElementAssignment(Box::new(assignment)));
                         continue;
                     }
                     let assignment = if self.assignable_ambient_variables.is_empty()
@@ -9782,6 +9795,43 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Err(SourceCheckError::Element(expression));
         }
         Ok(Some(planned))
+    }
+
+    fn plan_top_level_element_assignment(
+        &mut self,
+        statement: NodeRef,
+    ) -> Result<Option<PlannedElementAssignment>, SourceCheckError> {
+        let Some((store, host)) = self.semantic else {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Element(statement),
+            ));
+        };
+        let Some(assignment) = super::assignment::plan_element_assignment(
+            self.arena, self.bound, store, host, statement,
+        )
+        .map_err(Self::assignment_plan_error)?
+        else {
+            return Ok(None);
+        };
+        let syntax = plan_direct_source_element_write_syntax(
+            self.arena,
+            store,
+            assignment.left,
+            assignment.expression,
+        )
+        .map_err(|error| Self::element_plan_error(assignment.left, error))?;
+        let receiver = self.plan_expression(syntax.receiver())?;
+        let index = self.plan_expression(syntax.index())?;
+        let element = finish_direct_source_element_plan(syntax, receiver, index)
+            .map_err(|error| Self::element_plan_error(assignment.left, error))?;
+        self.primitive_binary_position_roots
+            .insert(assignment.right);
+        let right = self.plan_expression(assignment.right)?;
+        Ok(Some(PlannedElementAssignment {
+            expression: assignment.expression,
+            element,
+            right,
+        }))
     }
 
     fn plan_top_level_evolving_array_assignment(
@@ -36391,6 +36441,94 @@ fn uninitialized_local_read_annotation(
     })
 }
 
+fn uninitialized_source_file_read_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: &PlannedExpression,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let PlannedExpressionKind::Identifier(read) = &expression.kind else {
+        return Ok(None);
+    };
+    if !expression.used_before_assignment || read.kind != PlannedIdentifierReadKind::Variable {
+        return Ok(None);
+    }
+    let invalid =
+        || SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(read.value_symbol));
+    let (arena, bound) = host.source(expression.node).ok_or_else(invalid)?;
+    let symbol = store.symbol(read.value_symbol).ok_or_else(invalid)?;
+    let declaration = symbol.value_declaration().ok_or_else(invalid)?;
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || !declaration.is_for(arena.id(), bound.file_id())
+        || !bound.contains(declaration)
+    {
+        return Err(invalid());
+    }
+    if bound.container(declaration).ok_or_else(invalid)? != bound.source_file() {
+        return Ok(None);
+    }
+    let NodeData::VariableDeclaration(variable) = &host.node(declaration).ok_or_else(invalid)?.data
+    else {
+        return Err(invalid());
+    };
+    if variable.initializer.is_some() {
+        return Ok(None);
+    }
+    let Some(mut annotation) = variable
+        .type_
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return Ok(None);
+    };
+    if !host.symbol_matches(store, declaration, read.value_symbol)
+        || !symbol
+            .declarations()
+            .is_some_and(|declarations| declarations.contains(&declaration))
+    {
+        return Err(invalid());
+    }
+    let mut annotation_parent = declaration.node;
+    let annotation_node = loop {
+        let node = host.node(annotation).ok_or_else(invalid)?;
+        if node.parent != Some(annotation_parent) {
+            return Err(invalid());
+        }
+        let NodeData::ParenthesizedTypeNode(parenthesized) = &node.data else {
+            break node;
+        };
+        annotation_parent = annotation.node;
+        annotation = NodeRef::new(declaration.arena, declaration.file, parenthesized.type_);
+    };
+    let keyword = if annotation_node.kind.is_keyword_type() {
+        Some(annotation_node.kind)
+    } else if let NodeData::LiteralTypeNode(literal) = &annotation_node.data {
+        let literal = NodeRef::new(annotation.arena, annotation.file, literal.literal);
+        let literal_node = host.node(literal).ok_or_else(invalid)?;
+        if literal_node.parent != Some(annotation.node)
+            || literal_node.range != annotation_node.range
+        {
+            return Err(invalid());
+        }
+        (literal_node.kind == SyntaxKind::NullKeyword
+            && matches!(literal_node.data, NodeData::KeywordExpression(_)))
+        .then_some(SyntaxKind::NullKeyword)
+    } else {
+        None
+    };
+    if let Some(keyword) = keyword {
+        return Ok(Some(super::type_nodes::canonical_keyword_type(
+            store, keyword,
+        )?));
+    }
+    store
+        .type_node_links(annotation)
+        .and_then(|links| links.resolved_type)
+        .map(Some)
+        .ok_or(SourceCheckError::Variable(
+            VariableInvariant::MissingStagedValueType(read.value_symbol),
+        ))
+}
+
 // A recovered read uses its declared type. The binder condition still uses its flow type.
 fn checked_identifier_flow_type(
     store: &CanonicalTypeMapperStore,
@@ -36548,6 +36686,11 @@ fn emit_uninitialized_variable_read_diagnostics(
                     })
                 );
             if permits_uninitialized {
+                return Ok(());
+            }
+            if let Some(declared) = uninitialized_source_file_read_type(store, host, expression)?
+                && type_permits_uninitialized_read(store, declared)?
+            {
                 return Ok(());
             }
             let node = host
@@ -46722,6 +46865,88 @@ struct CheckedAssignment {
     assigned_type: TypeId,
 }
 
+#[allow(clippy::too_many_arguments)] // Retains the source checker session and exact child plans.
+fn check_planned_element_assignment(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    assignment: &PlannedElementAssignment,
+) -> Result<(), SourceCheckError> {
+    let receiver = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        flow_types,
+        type_import_execution,
+        &assignment.element.receiver,
+        None,
+        deferred,
+    )?;
+    let index = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        flow_types,
+        type_import_execution,
+        &assignment.element.index,
+        None,
+        deferred,
+    )?;
+    let checked = check_direct_source_element_write_with_source::<SourceElementReadError>(
+        store,
+        host,
+        global_types,
+        options,
+        &assignment.element,
+        receiver.result,
+        index.result,
+        session,
+        diagnostics,
+    )
+    .map_err(|error| match error {
+        SourceElementReadError::Element(error) => {
+            SourcePlanner::element_plan_error(assignment.element.node, error)
+        }
+        SourceElementReadError::Source(error) => error,
+    })?;
+    if let Some(diagnostic) = checked.diagnostic {
+        merge_retry_diagnostic(diagnostics, diagnostic);
+    }
+    check_assignment_to_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        flow_types,
+        type_import_execution,
+        deferred,
+        checked.type_,
+        None,
+        &assignment.right,
+        assignment.element.node,
+        Some(assignment.expression),
+    )?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Keeps the source execution capabilities explicit.
 fn check_planned_assignment(
     store: &mut CanonicalTypeMapperStore,
@@ -47106,21 +47331,37 @@ fn check_assignment_with_expression_type(
         let unconstrained_jsdoc_type_parameter =
             is_unconstrained_jsdoc_callable_type_parameter(store, host, target);
         for mut diagnostic in staged {
-            if class_assignment
-                && diagnostic.node == Some(fallback_node)
-                && diagnostic.diagnostic.code() == 2322
-            {
-                elaborate_class_assignment_diagnostic(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    diagnostics,
-                    source_type,
-                    target,
-                    &mut diagnostic,
-                )?;
+            if diagnostic.node == Some(fallback_node) && diagnostic.diagnostic.code() == 2322 {
+                let display_target = assignment_error_target(store, source_type, target)?;
+                if display_target != target {
+                    let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+                    if options.no_error_truncation {
+                        flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+                    }
+                    let names =
+                        get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                            store,
+                            host,
+                            global_types,
+                            source_type,
+                            display_target,
+                            flags,
+                        )?;
+                    diagnostic.diagnostic.arguments = vec![names.source, names.target];
+                }
+                if class_assignment {
+                    elaborate_class_assignment_diagnostic(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        source_type,
+                        target,
+                        &mut diagnostic,
+                    )?;
+                }
             }
             if diagnostic.diagnostic.code() == 2322
                 && diagnostic.diagnostic.details.is_empty()
@@ -47160,7 +47401,7 @@ fn check_assignment_with_expression_type(
     ))
 }
 
-fn class_assignment_error_target(
+fn assignment_error_target(
     store: &CanonicalTypeMapperStore,
     source: TypeId,
     target: TypeId,
@@ -47201,8 +47442,8 @@ fn class_assignment_error_target(
     Ok(target)
 }
 
-// Keep the shared assignment record. Only its error display follows the
-// relation's nullable-target reduction and first rejected union member.
+// Keep the shared assignment record. Class errors include the first rejected
+// union member with the relation's nullable-target display reduction.
 #[allow(clippy::too_many_arguments)] // Uses the assignment's actual types and caller session.
 fn elaborate_class_assignment_diagnostic(
     store: &mut CanonicalTypeMapperStore,
@@ -47218,18 +47459,6 @@ fn elaborate_class_assignment_diagnostic(
     let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
     if options.no_error_truncation {
         flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
-    }
-    let display_target = class_assignment_error_target(store, source, target)?;
-    if display_target != target {
-        let names = get_type_names_for_assignability_error_with_host_global_types_and_flags(
-            store,
-            host,
-            global_types,
-            source,
-            display_target,
-            flags,
-        )?;
-        diagnostic.diagnostic.arguments = vec![names.source, names.target];
     }
     if !diagnostic.diagnostic.details.is_empty() {
         return Ok(());
@@ -47254,7 +47483,7 @@ fn elaborate_class_assignment_diagnostic(
         )? {
             continue;
         }
-        let member_target = class_assignment_error_target(store, member, target)?;
+        let member_target = assignment_error_target(store, member, target)?;
         let names = get_type_names_for_assignability_error_with_host_global_types_and_flags(
             store,
             host,
@@ -79976,6 +80205,21 @@ pub(super) fn check_source_file(
                     checked,
                 )?;
                 current_flow_types.insert(assignment.target_symbol, current_flow_type);
+            }
+            PlannedStatement::ElementAssignment(assignment) => {
+                check_planned_element_assignment(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &type_import_execution,
+                    &mut deferred,
+                    &assignment,
+                )?;
             }
             PlannedStatement::EvolvingArrayAssignment(assignment) => {
                 let evolving = *evolving_array_types.get(&assignment.target_symbol).ok_or(

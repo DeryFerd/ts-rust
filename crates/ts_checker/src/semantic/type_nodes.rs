@@ -54401,29 +54401,35 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     }
 
     fn keyword_type(&self, kind: SyntaxKind) -> Result<TypeId, DeclaredTypeError> {
-        let bootstrap = self
-            .store
-            .intrinsic_bootstrap()
-            .ok_or(DeclaredTypeError::Unavailable(
-                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
-            ))?;
-        Ok(match kind {
-            SyntaxKind::AnyKeyword => bootstrap.any_type,
-            SyntaxKind::UnknownKeyword => bootstrap.unknown_type,
-            SyntaxKind::StringKeyword => bootstrap.string_type,
-            SyntaxKind::NumberKeyword => bootstrap.number_type,
-            SyntaxKind::BigIntKeyword => bootstrap.bigint_type,
-            SyntaxKind::BooleanKeyword => bootstrap.boolean_type,
-            SyntaxKind::SymbolKeyword => bootstrap.es_symbol_type,
-            SyntaxKind::VoidKeyword => bootstrap.void_type,
-            SyntaxKind::UndefinedKeyword => bootstrap.undefined_type,
-            SyntaxKind::NullKeyword => bootstrap.null_type,
-            SyntaxKind::NeverKeyword => bootstrap.never_type,
-            SyntaxKind::ObjectKeyword => bootstrap.non_primitive_type,
-            SyntaxKind::IntrinsicKeyword => bootstrap.intrinsic_marker_type,
-            _ => unreachable!("keyword_type is called only for supported keyword nodes"),
-        })
+        canonical_keyword_type(self.store, kind)
     }
+}
+
+pub(super) fn canonical_keyword_type(
+    store: &CanonicalTypeMapperStore,
+    kind: SyntaxKind,
+) -> Result<TypeId, DeclaredTypeError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(DeclaredTypeError::Unavailable(
+            DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+        ))?;
+    Ok(match kind {
+        SyntaxKind::AnyKeyword => bootstrap.any_type,
+        SyntaxKind::UnknownKeyword => bootstrap.unknown_type,
+        SyntaxKind::StringKeyword => bootstrap.string_type,
+        SyntaxKind::NumberKeyword => bootstrap.number_type,
+        SyntaxKind::BigIntKeyword => bootstrap.bigint_type,
+        SyntaxKind::BooleanKeyword => bootstrap.boolean_type,
+        SyntaxKind::SymbolKeyword => bootstrap.es_symbol_type,
+        SyntaxKind::VoidKeyword => bootstrap.void_type,
+        SyntaxKind::UndefinedKeyword => bootstrap.undefined_type,
+        SyntaxKind::NullKeyword => bootstrap.null_type,
+        SyntaxKind::NeverKeyword => bootstrap.never_type,
+        SyntaxKind::ObjectKeyword => bootstrap.non_primitive_type,
+        SyntaxKind::IntrinsicKeyword => bootstrap.intrinsic_marker_type,
+        _ => unreachable!("keyword_type is called only for supported keyword nodes"),
+    })
 }
 
 #[cfg(test)]

@@ -160,7 +160,7 @@ fn property(parsed: &ParseResult, file: FileId, owner: &str, name: &str) -> Node
         })
         .flat_map(|interface| interface.members.nodes.iter().copied())
         .filter_map(|id| {
-            let NodeData::PropertySignatureDeclaration(property) =
+            let NodeData::PropertyDeclaration(property) =
                 &parsed.arena.get(id).unwrap().data
             else {
                 return None;
