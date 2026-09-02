@@ -12758,6 +12758,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
     fn new_plan_error(expression: NodeRef, error: SourceNewError) -> SourceCheckError {
         let node = error.node().unwrap_or(expression);
+        eprintln!("source_new_plan_failure expression={expression:?} node={node:?} error={error:?}");
         match error {
             SourceNewError::Unsupported(reason) => {
                 let boundary = match reason {
