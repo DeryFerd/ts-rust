@@ -39884,7 +39884,7 @@ fn check_expression_type_with_capture_context(
                     )));
                 }
             }
-            if let Some(arguments) = construction.checked_expression_arguments() {
+            let checked = if let Some(arguments) = construction.checked_expression_arguments() {
                 let mut argument_types = Vec::with_capacity(arguments.len());
                 let mut constructor_context = None;
                 let mut library_arguments = (construction.is_library_constructor() && !generic)
@@ -40217,55 +40217,53 @@ fn check_expression_type_with_capture_context(
                 for diagnostic in call_diagnostics {
                     merge_retry_diagnostic(diagnostics, diagnostic);
                 }
-                return Ok(CheckedExpressionTypes::leaf(
-                    checked.instance_type,
-                    checked.instance_type,
-                ));
-            }
-            if let Some(executor) = construction.promise_executor() {
-                let contextual = construction
-                    .promise_executor_contextual_type(store)
-                    .ok_or(SourceCheckError::Call(construction.node()))?;
-                check_expression_type_with_capture_context(
-                    store,
-                    host,
-                    global_types,
-                    source,
-                    options,
-                    session,
-                    diagnostics,
-                    current_flow_types,
-                    type_import_execution,
-                    executor,
-                    Some(contextual),
-                    deferred,
-                    class_flow.as_deref_mut(),
-                    arrow_capture,
-                )?;
-            }
-            let overloaded = super::source_new::check_source_constructor_overload_new(
-                store,
-                host,
-                global_types,
-                options.strict_function_types,
-                construction,
-                session,
-            )
-            .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
-            let checked = if let Some(overloaded) = overloaded {
-                emit_source_constructor_overload_diagnostic(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    diagnostics,
-                    construction,
-                    &overloaded,
-                )?;
-                overloaded.checked
+                checked
             } else {
-                check_direct_default_new(store, host, construction)
-                    .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?
+                if let Some(executor) = construction.promise_executor() {
+                    let contextual = construction
+                        .promise_executor_contextual_type(store)
+                        .ok_or(SourceCheckError::Call(construction.node()))?;
+                    check_expression_type_with_capture_context(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        current_flow_types,
+                        type_import_execution,
+                        executor,
+                        Some(contextual),
+                        deferred,
+                        class_flow.as_deref_mut(),
+                        arrow_capture,
+                    )?;
+                }
+                let overloaded = super::source_new::check_source_constructor_overload_new(
+                    store,
+                    host,
+                    global_types,
+                    options.strict_function_types,
+                    construction,
+                    session,
+                )
+                .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+                if let Some(overloaded) = overloaded {
+                    emit_source_constructor_overload_diagnostic(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        diagnostics,
+                        construction,
+                        &overloaded,
+                    )?;
+                    overloaded.checked
+                } else {
+                    check_direct_default_new(store, host, construction)
+                        .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?
+                }
             };
             if store
                 .symbol_node_links(construction.constructor())

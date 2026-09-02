@@ -1,9 +1,10 @@
 //! Exact source integration for admitted class and declared constructions.
 //!
 //! This includes `new Model()`, `new Model`, literal overload arguments, and
-//! checked expression arguments for an explicit source constructor or an
-//! authenticated default-library construct value. Generic source classes and
-//! named library constructors use the common Construct selector and inference.
+//! checked expression arguments for a direct local constructor, an explicit
+//! source constructor, or an authenticated default-library construct value.
+//! Generic source classes and named library constructors use the common
+//! Construct selector and inference.
 //! It follows pinned TypeScript-Go `checkCallExpression`,
 //! `getResolvedSignature`, `resolveNewExpression`, and `resolveCall`.
 //! An admitted constructor belongs to one preceding local class, an imported
@@ -1499,18 +1500,39 @@ fn plan_direct_default_new_with_context(
             &target,
             SourceNewTarget::Class(class) if class.constructor_minimum_argument_count() == 0
         );
-    if !matches!(
-        &target,
-        SourceNewTarget::ImportedClass(_)
-            | SourceNewTarget::ConstructorOverloads(_)
-            | SourceNewTarget::SourceClass(_)
-    ) && (argument.is_some() != parameter.is_some() && !omitted_defaulted_class_parameter
-        || argument
-            .as_ref()
-            .zip(parameter)
-            .is_some_and(|(argument, parameter)| {
-                !argument_matches_parameter(store, argument, parameter)
-            }))
+    let checked_class_arguments = source_context.is_some()
+        && !early_preparation
+        && parameter.is_some()
+        && additional_arguments.is_empty()
+        && argument.as_ref().is_some_and(|argument| {
+            matches!(
+                &argument.value,
+                SourceNewArgumentValue::String(_)
+                    | SourceNewArgumentValue::Number(_)
+                    | SourceNewArgumentValue::Boolean(_)
+            )
+        })
+        && matches!(
+            &target,
+            SourceNewTarget::Class(class)
+                if class.direct_plan().is_some()
+                    && !class.is_abstract()
+                    && class.constructor_visibility() == ClassConstructorVisibility::Public
+        );
+    if !checked_class_arguments
+        && !matches!(
+            &target,
+            SourceNewTarget::ImportedClass(_)
+                | SourceNewTarget::ConstructorOverloads(_)
+                | SourceNewTarget::SourceClass(_)
+        )
+        && (argument.is_some() != parameter.is_some() && !omitted_defaulted_class_parameter
+            || argument
+                .as_ref()
+                .zip(parameter)
+                .is_some_and(|(argument, parameter)| {
+                    !argument_matches_parameter(store, argument, parameter)
+                }))
     {
         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
     }
@@ -1522,11 +1544,19 @@ fn plan_direct_default_new_with_context(
         target,
         early_preparation,
         type_arguments,
-        argument,
+        argument: if checked_class_arguments {
+            None
+        } else {
+            argument
+        },
         additional_arguments,
         parameter,
         executor: None,
-        expression_arguments,
+        expression_arguments: if checked_class_arguments {
+            Some(expression_argument_plan())
+        } else {
+            expression_arguments
+        },
     };
     preflight_default_new_cache_with_context(store, host, &plan, source_context)?;
     Ok(plan)
@@ -4288,6 +4318,7 @@ fn preflight_direct_default_new_with_context(
     if !plan.is_generic_source_class()
         && plan.expression_arguments.is_some()
         && !matches!(&plan.target, SourceNewTarget::SourceClass(class) if class.has_checked_constructor_arguments())
+        && !matches!(&plan.target, SourceNewTarget::Class(_))
         && !(plan.is_library_constructor() && source_context.is_some())
     {
         return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
@@ -4345,6 +4376,9 @@ fn preflight_direct_default_new_with_context(
                 return Err(invariant(SourceNewInvariant::InvalidClassPlan(
                     class.declaration(),
                 )));
+            }
+            if plan.expression_arguments.is_some() {
+                preflight_direct_class_expression_arguments(host, plan, class)?;
             }
         }
         SourceNewTarget::ImportedClass(binding) => {
@@ -6898,6 +6932,52 @@ fn publish_source_generic_library_new(
     )
 }
 
+fn preflight_direct_class_expression_arguments(
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    class: &ClassMemberQueryPlan,
+) -> Result<(), SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(plan.node));
+    if class.direct_plan().is_none()
+        || class.is_abstract()
+        || class.constructor_visibility() != ClassConstructorVisibility::Public
+        || plan.early_preparation
+        || plan.parameter.is_none()
+        || plan.argument.is_some()
+        || !plan.additional_arguments.is_empty()
+        || !plan.type_arguments.is_empty()
+        || plan.executor.is_some()
+    {
+        return Err(invalid());
+    }
+    let Some(arguments) = &plan.expression_arguments else {
+        return Err(invalid());
+    };
+    let [argument] = arguments.nodes.as_slice() else {
+        return Err(invalid());
+    };
+    let record = host.node(*argument).ok_or_else(invalid)?;
+    let literal = match &record.data {
+        NodeData::StringLiteral(value) => {
+            record.kind == SyntaxKind::StringLiteral && value.token_flags.0 == 0
+        }
+        NodeData::NumericLiteral(value) => {
+            record.kind == SyntaxKind::NumericLiteral && value.token_flags.0 == 0
+        }
+        NodeData::KeywordExpression(value) => {
+            matches!(
+                record.kind,
+                SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword
+            ) && value.flow_node.is_none()
+        }
+        _ => false,
+    };
+    if !literal {
+        return Err(invalid());
+    }
+    preflight_source_class_expression_arguments(host, plan)
+}
+
 fn preflight_source_class_expression_arguments(
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
@@ -7466,11 +7546,6 @@ pub(super) fn check_source_class_expression_new(
     argument_types: &[TypeId],
 ) -> Result<(CheckedSourceDefaultNew, super::calls::DirectCallResolution), SourceNewError> {
     preflight_direct_default_new(store, host, plan)?;
-    let SourceNewTarget::SourceClass(class) = &plan.target else {
-        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
-            plan.node,
-        )));
-    };
     if plan
         .checked_expression_arguments()
         .is_none_or(|arguments| arguments.len() != argument_types.len())
@@ -7479,18 +7554,92 @@ pub(super) fn check_source_class_expression_new(
             plan.node,
         )));
     }
-    let selected =
-        resolved_source_class_constructor(store, host, plan, class)?.ok_or_else(|| {
-            invariant(SourceNewInvariant::InvalidConstructorCache(
-                plan.constructor,
-            ))
-        })?;
-    let candidates = super::classes::source_class_expression_constructor_candidates(
-        store,
-        host,
-        class.symbol(),
-    )?
-    .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(class.declaration())))?;
+    let (selected, candidates) = match &plan.target {
+        SourceNewTarget::SourceClass(class) => {
+            let selected =
+                resolved_source_class_constructor(store, host, plan, class)?.ok_or_else(|| {
+                    invariant(SourceNewInvariant::InvalidConstructorCache(
+                        plan.constructor,
+                    ))
+                })?;
+            let candidates = super::classes::source_class_expression_constructor_candidates(
+                store,
+                host,
+                class.symbol(),
+            )?
+            .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(class.declaration())))?;
+            (selected, candidates)
+        }
+        SourceNewTarget::Class(class) => {
+            let invalid = || invariant(SourceNewInvariant::InvalidClassPlan(class.declaration()));
+            let members = execute_nongeneric_class_member_query(store, host, class)?;
+            let selected = CheckedSourceDefaultNew {
+                value_type: members.shells().value_type(),
+                instance_type: members.shells().instance_type(),
+                signature: members.default_construct_signature(),
+            };
+            validate_selected_default_signature(
+                store,
+                host,
+                plan,
+                class,
+                selected.value_type,
+                selected.instance_type,
+                selected.signature,
+            )?;
+            let StoredCallableSetValidation::Valid {
+                family,
+                projection,
+                ..
+            } = validate_stored_callable_set(store, selected.value_type)
+            else {
+                return Err(invalid());
+            };
+            if family != CallableFamily::DeclaredCallSignatures
+                || projection.owner != selected.value_type
+                || !projection.call_signatures.is_empty()
+                || projection.construct_signatures.as_ref()
+                    != std::slice::from_ref(&selected.signature)
+            {
+                return Err(invalid());
+            }
+            let signature = store.signature(selected.signature).ok_or_else(invalid)?;
+            let parameters = signature
+                .parameters()
+                .iter()
+                .map(|&parameter| {
+                    let links = store.value_symbol_links(parameter).ok_or_else(invalid)?;
+                    let type_ = links.resolved_type.ok_or_else(invalid)?;
+                    if links
+                        != &(ValueSymbolLinks {
+                            resolved_type: Some(type_),
+                            ..ValueSymbolLinks::default()
+                        })
+                        || store.type_payload(type_).is_none()
+                    {
+                        return Err(invalid());
+                    }
+                    Ok(type_)
+                })
+                .collect::<Result<Vec<_>, SourceNewError>>()?;
+            let callable = ValidatedSingleCallable {
+                owner: selected.value_type,
+                signature: selected.signature,
+                parameters,
+                rest_parameter: None,
+                min_argument_count: usize::try_from(signature.min_argument_count())
+                    .map_err(|_| invalid())?,
+                return_type: signature.resolved_return_type(),
+                strict_variance_exempt: true,
+            };
+            (selected, vec![callable])
+        }
+        _ => {
+            return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                plan.node,
+            )));
+        }
+    };
     if candidates
         .first()
         .is_none_or(|callable| callable.signature != selected.signature)
