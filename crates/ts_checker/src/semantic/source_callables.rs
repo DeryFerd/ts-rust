@@ -3562,7 +3562,11 @@ fn plan_source_callable_with_owner_shape(
     let array_implicit_any_arrow = eligible_implicit_any_arrow
         && !direct_implicit_any_arrow
         && is_ambiguous_union_array_source_arrow(store, host, declaration)?;
-    let object_property_arrow = eligible_implicit_any_arrow
+    let object_property_arrow = (eligible_implicit_any_arrow
+        || implicit_any_arrow_shape
+            && bound
+                .source_facts()
+                .is_some_and(|facts| !facts.is_javascript_file()))
         && !direct_implicit_any_arrow
         && !array_implicit_any_arrow
         && source_object_property_arrow_symbol(store, host, declaration)?.is_some();
@@ -3954,7 +3958,6 @@ fn plan_source_callable_with_owner_shape(
                         && view.parameters.range.start < parameter_record.range.start
                         && view.parameters.range.end > parameter_record.range.end
                     || object_property_arrow
-                        && view.parameters.nodes.as_slice() == [parameter.node]
                     || local_context.is_some_and(|context| {
                         context.declaration == declaration
                             && context.owner_symbol == owner_symbol

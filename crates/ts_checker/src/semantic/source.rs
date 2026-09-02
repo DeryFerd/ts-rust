@@ -44114,20 +44114,21 @@ fn check_contextual_object_property_arrow(
     let unsupported = || {
         SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(arrow.callable.declaration))
     };
-    let [parameter] = arrow.callable.parameters.as_slice() else {
-        return Err(unsupported());
-    };
-    if !parameter.is_implicit_any()
-        || parameter.optional
-        || parameter.rest
-        || parameter.initializer.is_some()
+    let parameters = arrow.callable.parameters.as_slice();
+    if parameters.is_empty()
+        || parameters.iter().any(|parameter| {
+            !parameter.is_implicit_any() && parameter.explicit_type_node().is_none()
+                || parameter.optional
+                || parameter.rest
+                || parameter.initializer.is_some()
+        })
         || !arrow.parameter_initializers.is_empty()
         || arrow.expression_statement.is_some()
         || arrow.linear_body.is_some()
         || !arrow.callable.type_parameters.is_empty()
         || !arrow.callable.return_type.is_inferred()
         || arrow.callable.flags != super::signatures::SignatureFlags::NONE
-        || arrow.callable.min_argument_count != 1
+        || usize::try_from(arrow.callable.min_argument_count).ok() != Some(parameters.len())
         || !store.type_has_function_type_provenance(contextual_type)
         || !store.source_contextual_callable_anchor_is_exact(
             arrow.callable.declaration,
@@ -44146,16 +44147,13 @@ fn check_contextual_object_property_arrow(
     let Some(signature) = store.signature(target.signature) else {
         return Err(unsupported());
     };
-    let [parameter_type] = target.parameters.as_slice() else {
-        return Err(unsupported());
-    };
     if !signature.type_parameters().is_empty()
         || signature.has_rest_parameter()
         || target.rest_parameter.is_some()
+        || target.parameters.len() != parameters.len()
     {
         return Err(unsupported());
     }
-    let parameter_type = *parameter_type;
     let PlannedArrowBody::Return {
         expression: body, ..
     } = &arrow.body
@@ -44164,13 +44162,45 @@ fn check_contextual_object_property_arrow(
     };
 
     let mut flow_types = current_flow_types.clone();
-    if flow_types
-        .insert(parameter.symbol, parameter_type)
-        .is_some()
-    {
-        return Err(SourceCheckError::Variable(
-            VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
-        ));
+    let mut prepared_parameters = Vec::with_capacity(parameters.len());
+    for (parameter, contextual_parameter_type) in parameters.iter().zip(&target.parameters) {
+        let parameter_type = if let Some(annotation) = parameter.explicit_type_node() {
+            let mut type_diagnostics = CanonicalCheckerDiagnostics::default();
+            let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                &mut type_diagnostics,
+            )?
+            .with_type_reference_alias_targets(
+                type_import_execution
+                    .annotation_capabilities
+                    .get(&annotation)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            )?
+            .get_type_from_type_node(annotation);
+            merge_retry_diagnostics(diagnostics, type_diagnostics);
+            type_?
+        } else {
+            *contextual_parameter_type
+        };
+        if flow_types
+            .insert(parameter.symbol, parameter_type)
+            .is_some()
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
+            ));
+        }
+        prepared_parameters.push(ContextualSourceCallableParameter {
+            declaration: parameter.declaration,
+            symbol: parameter.symbol,
+            type_: parameter_type,
+        });
     }
     let checked = check_expression_type_with_capture_context(
         store,
@@ -44192,11 +44222,23 @@ fn check_contextual_object_property_arrow(
         Ok(checked) => checked,
         Err(SourceCheckError::RelationUnavailable(
             RelationUnavailable::UnsupportedStructuredType(receiver_type),
-        )) if receiver_type == parameter_type
-            && store
-                .intrinsic_bootstrap()
-                .is_some_and(|bootstrap| receiver_type == bootstrap.string_type) =>
+        )) if store
+            .intrinsic_bootstrap()
+            .is_some_and(|bootstrap| receiver_type == bootstrap.string_type) =>
         {
+            let parameter = prepared_parameters
+                .iter()
+                .find(|parameter| {
+                    parameter.type_ == receiver_type
+                        && matches!(&body.kind, PlannedExpressionKind::Property(property)
+                            if matches!(&property.receiver.kind,
+                                PlannedExpressionKind::Identifier(receiver)
+                                    if receiver.kind == PlannedIdentifierReadKind::Variable
+                                        && receiver.value_symbol == parameter.symbol))
+                })
+                .ok_or(SourceCheckError::RelationUnavailable(
+                    RelationUnavailable::UnsupportedStructuredType(receiver_type),
+                ))?;
             recover_contextual_string_property(
                 store,
                 host,
@@ -44218,11 +44260,7 @@ fn check_contextual_object_property_arrow(
             owner_symbol: arrow.callable.owner_symbol,
             variable_symbol: property,
             contextual_target: contextual_type,
-            parameters: vec![ContextualSourceCallableParameter {
-                declaration: parameter.declaration,
-                symbol: parameter.symbol,
-                type_: parameter_type,
-            }],
+            parameters: prepared_parameters,
             flags: arrow.callable.flags,
             min_argument_count: arrow.callable.min_argument_count,
             return_type,
