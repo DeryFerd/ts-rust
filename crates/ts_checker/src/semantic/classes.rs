@@ -4306,32 +4306,35 @@ pub(super) fn source_class_this_type_owner(
     .then_some(symbol)
 }
 
+/// Returns an original class formal after validating its stored source header.
+pub(super) fn source_class_type_parameter_plan(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<&SourceClassTypeParameterPlan> {
+    let symbol = cached_ordinary_type_parameter_owner(store, type_)?;
+    let owner = store.get_parent_of_symbol(symbol)?;
+    let provenance = store.source_class_provenance_for_symbol(owner)?;
+    if provenance.symbol() != owner
+        || validate_source_class_stored_header(store, provenance).is_err()
+    {
+        return None;
+    }
+    provenance
+        .prepared
+        .plan
+        .type_parameters
+        .iter()
+        .find(|parameter| parameter.symbol == symbol)
+}
+
 /// An unconstrained class formal remains arbitrary while its body is checked.
 pub(super) fn source_class_unconstrained_type_parameter(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> bool {
-    let Some(symbol) = cached_ordinary_type_parameter_owner(store, type_) else {
-        return false;
-    };
-    let Some(owner) = store.get_parent_of_symbol(symbol) else {
-        return false;
-    };
-    let Some(provenance) = store.source_class_provenance_for_symbol(owner) else {
-        return false;
-    };
-    provenance.symbol() == owner
-        && validate_source_class_stored_header(store, provenance).is_ok()
-        && provenance
-            .prepared
-            .plan
-            .type_parameters
-            .iter()
-            .any(|parameter| {
-                parameter.symbol == symbol
-                    && parameter.constraint.is_none()
-                    && parameter.default_type.is_none()
-            })
+    source_class_type_parameter_plan(store, type_).is_some_and(|parameter| {
+        parameter.constraint.is_none() && parameter.default_type.is_none()
+    })
 }
 
 fn completed_source_class_header_is_valid(

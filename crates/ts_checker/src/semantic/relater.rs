@@ -1437,8 +1437,9 @@ fn source_parameter_query_evidence(
     }
 }
 
-/// After simple relations, a concrete scalar and an unconstrained source parameter
-/// cannot be assigned in either direction. The signature proof excludes recovery.
+/// A concrete scalar cannot be assigned to an original class formal.
+/// Only unconstrained formals also reject assignment to a scalar.
+/// Source query proofs exclude recovery after simple relations have run.
 fn authenticated_scalar_source_parameter_nonmatch(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     source: TypeId,
@@ -1475,7 +1476,9 @@ fn authenticated_scalar_source_parameter_nonmatch(
     let Some(symbol) = cached_ordinary_type_parameter_owner(store, parameter) else {
         return Ok(false);
     };
-    if super::classes::source_class_unconstrained_type_parameter(store, parameter) {
+    if super::classes::source_class_type_parameter_plan(store, parameter).is_some_and(|plan| {
+        parameter == target || plan.constraint.is_none() && plan.default_type.is_none()
+    }) {
         let bootstrap = store
             .intrinsic_bootstrap()
             .ok_or(RelationUnavailable::MissingBootstrap)?;
