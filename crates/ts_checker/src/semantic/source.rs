@@ -64,8 +64,10 @@
 //! Proved library constructor values can be used in class locals and returns.
 //! Option-gated unused-local, unused-parameter, and unused-import diagnostics
 //! run after complete source value and reference publication.
-//! The complete source tree and complete supported-statement plan are validated
-//! before semantic execution begins. Execution may retain safe canonical memo
+//! Whole-file checks validate the complete source tree and statement plan before
+//! execution. Imported const demands validate only their declarations and required
+//! dependencies, then use the same execution and value publication. They do not
+//! complete the provider file. Execution may retain safe canonical memo
 //! caches while discovering a type-dependent capability boundary.
 //! Unsupported syntax is therefore
 //! a typed boundary, never a request to fall back to the legacy checker or to
@@ -4499,6 +4501,140 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         self.source_class_imports = imports;
         self.source_class_import_demand = Some(demand);
         self
+    }
+
+    fn plan_demanded_variable(
+        &mut self,
+        declaration: NodeRef,
+    ) -> Result<PlannedVariable, SourceCheckError> {
+        let record = self.node(declaration)?;
+        let list =
+            record
+                .parent
+                .map(|node| self.reference(node))
+                .ok_or(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::MissingVariableInitializer(declaration),
+                ))?;
+        let list_record = self.node(list)?;
+        let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
+            return Err(self.unsupported(
+                list,
+                list_record.kind,
+                SourceSyntaxRole::VariableDeclarationList,
+            ));
+        };
+        if list_record.kind != SyntaxKind::VariableDeclarationList
+            || list_record.flags.0 != NODE_FLAG_CONST
+            || list_data.facts != 0
+            || list_data.declarations.range != list_record.range
+            || list_data.declarations.has_trailing_comma
+            || list_data
+                .declarations
+                .nodes
+                .iter()
+                .filter(|node| **node == declaration.node)
+                .count()
+                != 1
+        {
+            return Err(self.unsupported(
+                list,
+                list_record.kind,
+                SourceSyntaxRole::VariableDeclarationList,
+            ));
+        }
+        let statement = list_record.parent.map(|node| self.reference(node)).ok_or(
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::MissingVariableInitializer(
+                declaration,
+            )),
+        )?;
+        let statement_record = self.node(statement)?;
+        let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+            return Err(self.unsupported(
+                statement,
+                statement_record.kind,
+                SourceSyntaxRole::VariableStatement,
+            ));
+        };
+        if statement_record.kind != SyntaxKind::VariableStatement
+            || statement_record.parent != Some(self.source.node_ref().node)
+            || statement_record.flags.0 != 0
+            || statement_data.declaration_list != list.node
+            || statement_data.flow_node.is_some()
+            || statement_data.facts != 0
+        {
+            return Err(self.unsupported(
+                statement,
+                statement_record.kind,
+                SourceSyntaxRole::VariableStatement,
+            ));
+        }
+        let exported = self
+            .validate_variable_modifiers(
+                statement,
+                statement_record.range,
+                list.node,
+                statement_data.modifiers.as_ref(),
+            )?
+            .is_some();
+        let source_record = self.node(self.source.node_ref())?;
+        let NodeData::SourceFile(source_data) = &source_record.data else {
+            return Err(self.unsupported(
+                self.source.node_ref(),
+                source_record.kind,
+                SourceSyntaxRole::SourceFile,
+            ));
+        };
+        if source_data
+            .statements
+            .nodes
+            .iter()
+            .filter(|node| **node == statement.node)
+            .count()
+            != 1
+        {
+            return Err(self.unsupported(
+                statement,
+                statement_record.kind,
+                SourceSyntaxRole::VariableStatement,
+            ));
+        }
+        self.plan_variable_declaration(list, declaration, VariableBindingKind::Const, exported)
+    }
+
+    fn finish_demanded_variables(
+        mut self,
+        variables: Vec<PlannedVariable>,
+        value_imports: Vec<SourceImportPlan>,
+    ) -> Result<SourceCheckPlan, SourceCheckError> {
+        self.validate_type_import_reference_boundaries()?;
+        Ok(SourceCheckPlan {
+            statements: vec![PlannedStatement::Variables(variables)],
+            value_imports,
+            type_imports: Vec::new(),
+            local_named_exports: Vec::new(),
+            named_reexports: Vec::new(),
+            import_reads: self.import_reads,
+            type_import_references: self.type_import_references,
+            type_import_value_uses: self.type_import_value_uses,
+            ambient_variables: Vec::new(),
+            cross_file_global_reads: self.cross_file_global_reads,
+            ambient_class_reads: self.ambient_class_reads,
+            ambient_namespace_reads: self.ambient_namespace_reads,
+            overloads: Vec::new(),
+            functions: Vec::new(),
+            arrows: Vec::new(),
+            nested_arrow_callables: self.nested_arrow_callables,
+            contextual_arrows: Vec::new(),
+            identifier_reads: self.identifier_reads,
+            default_news: self.default_news,
+            javascript_jsdoc: None,
+            uses_global_this: self.uses_global_this,
+            uses_arguments: self.uses_arguments,
+            strings: self.strings,
+            numbers: self.numbers,
+            bigints: self.bigints,
+            bigint_literals: self.bigint_literals,
+        })
     }
 
     fn finish(mut self) -> Result<SourceCheckPlan, SourceCheckError> {
@@ -74573,6 +74709,242 @@ pub(super) fn source_class_import_error(
     SourcePlanner::import_plan_error(node, error)
 }
 
+fn demanded_value_import_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    source: SourceFileRef,
+    symbol: SemanticSymbolId,
+) -> Result<NodeRef, SourceCheckError> {
+    let invalid = || SourceCheckError::Import(source.node_ref());
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
+    let Some([declaration]) = record.declarations() else {
+        return Err(invalid());
+    };
+    if record.flags() != SymbolFlags::ALIAS {
+        return Err(invalid());
+    }
+    let mut node = *declaration;
+    let mut visited = HashSet::new();
+    while visited.insert(node) {
+        if !node.is_for(source.node_ref().arena, source.file()) {
+            return Err(invalid());
+        }
+        let record = host.node(node).ok_or_else(invalid)?;
+        if matches!(
+            record.kind,
+            SyntaxKind::ImportDeclaration | SyntaxKind::ImportEqualsDeclaration
+        ) && record.parent == Some(source.node_ref().node)
+        {
+            return Ok(node);
+        }
+        node = record
+            .parent
+            .map(|parent| NodeRef::new(node.arena, node.file, parent))
+            .ok_or_else(invalid)?;
+    }
+    Err(invalid())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_imported_variable_initializer(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    source: SourceFileRef,
+    host: &DeclaredTypeHost<'_>,
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    declaration: NodeRef,
+) -> Result<SourceCheckPlan, SourceCheckError> {
+    let mut declarations = vec![declaration];
+    let mut import_declarations = Vec::<NodeRef>::new();
+    'retry: loop {
+        let mut planner = SourcePlanner::new_semantic_with_global_types(
+            arena,
+            bound,
+            source,
+            store,
+            host,
+            global_types,
+            options,
+        );
+        let mut value_imports = Vec::new();
+        for &import_declaration in &import_declarations {
+            let import =
+                if planner.node(import_declaration)?.kind == SyntaxKind::ImportEqualsDeclaration {
+                    plan_top_level_import_equals(arena, bound, store, import_declaration)
+                } else {
+                    plan_top_level_named_value_import(arena, bound, store, import_declaration)
+                }
+                .map_err(|error| SourcePlanner::import_plan_error(import_declaration, &error))?;
+            for binding in &import.bindings {
+                if planner
+                    .value_import_bindings
+                    .insert(binding.alias_symbol, binding.clone())
+                    .is_some()
+                {
+                    return Err(SourceCheckError::Import(binding.declaration));
+                }
+            }
+            value_imports.push(import);
+        }
+        let mut variables = Vec::new();
+        for (index, &current) in declarations.iter().enumerate() {
+            match planner.plan_demanded_variable(current) {
+                Ok(variable) => variables.push(variable),
+                Err(
+                    error @ SourceCheckError::Unsupported(UnsupportedSourceSyntax::Variable(
+                        VariableUnsupported::IdentifierNotPrior {
+                            symbol,
+                            declaration: dependency,
+                            ..
+                        },
+                    )),
+                ) => {
+                    if declarations.contains(&dependency)
+                        || !dependency.is_for(source.node_ref().arena, source.file())
+                        || bound.symbol(dependency) != Some(symbol)
+                        || host.node(dependency).is_none_or(|record| {
+                            host.node(current)
+                                .is_none_or(|current| record.range.end > current.range.start)
+                        })
+                    {
+                        return Err(error);
+                    }
+                    declarations.insert(index, dependency);
+                    continue 'retry;
+                }
+                Err(
+                    error @ SourceCheckError::Unsupported(UnsupportedSourceSyntax::Variable(
+                        VariableUnsupported::AliasSymbol { symbol, .. },
+                    )),
+                ) => {
+                    let import = demanded_value_import_declaration(store, host, source, symbol)?;
+                    if import_declarations.contains(&import) {
+                        return Err(error);
+                    }
+                    import_declarations.push(import);
+                    import_declarations
+                        .sort_by_key(|node| host.node(*node).map(|record| record.range.start));
+                    continue 'retry;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        return planner.finish_demanded_variables(variables, value_imports);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_imported_variable_initializer(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<(), SourceCheckError> {
+    let invalid = || SourceCheckError::Variable(VariableInvariant::InvalidValueLinks(symbol));
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let source = SourceFileRef::new(store.id(), bound.source_file());
+    if !store.contains_source_file(source)
+        || store
+            .symbol(symbol)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            != Some(declaration)
+    {
+        return Err(invalid());
+    }
+    let NodeData::VariableDeclaration(variable) = &host.node(declaration).ok_or_else(invalid)?.data
+    else {
+        return Err(invalid());
+    };
+    let initializer = variable
+        .initializer
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(invalid)?;
+    if let Some(cached) = store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type)
+    {
+        let expression_type = store
+            .type_node_links(initializer)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(invalid)?;
+        preflight_source_expression_cache(store, initializer, expression_type)?;
+        let expected = inferred_variable_type(
+            store,
+            global_types,
+            VariableBindingKind::Const,
+            expression_type,
+        )?;
+        if expected != cached {
+            return Err(invalid());
+        }
+        return Ok(());
+    }
+    let checkpoint = store.checkpoint_type_resolution();
+    let result = (|| {
+        if !store
+            .push_type_resolution(
+                TypeResolutionTarget::Symbol(symbol),
+                TypeSystemPropertyName::Type,
+            )
+            .map_err(|_| invalid())?
+        {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Import(declaration),
+            ));
+        }
+        let plan = plan_imported_variable_initializer(
+            arena,
+            bound,
+            source,
+            host,
+            store,
+            global_types,
+            options,
+            declaration,
+        )?;
+        let manifest = host.module_resolutions().ok_or_else(invalid)?;
+        let mut aliases = host
+            .alias_target_host(store, manifest)
+            .map_err(|_| invalid())?;
+        check_source_plan(
+            arena,
+            bound,
+            source,
+            host,
+            &mut aliases,
+            global_types,
+            store,
+            options,
+            None,
+            session,
+            diagnostics,
+            &RefCell::new(None),
+            plan,
+            Some(declaration),
+        )
+    })();
+    match result {
+        Ok(()) => store
+            .commit_type_resolution_checkpoint(checkpoint)
+            .map_err(|checkpoint| {
+                let _ = store.rollback_type_resolution_checkpoint(checkpoint);
+                invalid()
+            }),
+        Err(error) => {
+            store
+                .rollback_type_resolution_checkpoint(checkpoint)
+                .map_err(|_| invalid())?;
+            Err(error)
+        }
+    }
+}
+
 /// Checks one already-retained source into context-owned private staging.
 #[allow(clippy::too_many_arguments)] // Mirrors the context-owned source execution boundary.
 pub(super) fn check_source_file(
@@ -74665,6 +75037,41 @@ pub(super) fn check_source_file(
             }
         },
     )?;
+    check_source_plan(
+        arena,
+        bound,
+        source,
+        host,
+        alias_host,
+        global_types,
+        store,
+        options,
+        classic_jsx_factories,
+        session,
+        diagnostics,
+        source_class_import_demand,
+        plan,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_source_plan(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    source: SourceFileRef,
+    host: &DeclaredTypeHost<'_>,
+    alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
+    global_types: &CanonicalGlobalTypes,
+    store: &mut CanonicalTypeMapperStore,
+    options: CanonicalCheckerOptions,
+    classic_jsx_factories: Option<(&str, &str)>,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    source_class_import_demand: &RefCell<Option<SourceClassImportDemand>>,
+    plan: SourceCheckPlan,
+    selected_variable: Option<NodeRef>,
+) -> Result<(), SourceCheckError> {
     let SourceCheckPlan {
         statements,
         value_imports,
@@ -76414,6 +76821,22 @@ pub(super) fn check_source_file(
             options,
             resolved,
         )?;
+        if let Some(declaration) = super::source_imports::plan_source_import_variable_initializer(
+            store, host, global_types, resolved, read,
+        )
+        .map_err(|error| SourcePlanner::import_plan_error(read.node, &error))?
+        {
+            check_imported_variable_initializer(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                declaration,
+                resolved.target_symbol,
+            )?;
+        }
         session.reset_query();
         let prepared = prepare_source_import_value_with_type_import_capabilities(
             store,
@@ -83677,6 +84100,13 @@ pub(super) fn check_source_file(
             ));
         }
     }
+    if let Some(declaration) = selected_variable
+        && store.pop_type_resolution() != Some(true)
+    {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Import(declaration),
+        ));
+    }
     publish_staged_variable_state(
         store,
         source.node_ref(),
@@ -83686,22 +84116,24 @@ pub(super) fn check_source_file(
         &identifier_reads,
     )?;
 
-    check_external_module_exports(store, host, alias_host, diagnostics, source.node_ref())?;
-    issue_class_name_diagnostics(arena, bound, diagnostics)?;
-    issue_unused_source_diagnostics(
-        arena,
-        bound,
-        source,
-        store,
-        options,
-        classic_jsx_factories,
-        &identifier_reads,
-        &type_import_references,
-        &local_named_exports,
-        &value_imports,
-        &type_imports,
-        diagnostics,
-    )?;
+    if selected_variable.is_none() {
+        check_external_module_exports(store, host, alias_host, diagnostics, source.node_ref())?;
+        issue_class_name_diagnostics(arena, bound, diagnostics)?;
+        issue_unused_source_diagnostics(
+            arena,
+            bound,
+            source,
+            store,
+            options,
+            classic_jsx_factories,
+            &identifier_reads,
+            &type_import_references,
+            &local_named_exports,
+            &value_imports,
+            &type_imports,
+            diagnostics,
+        )?;
+    }
 
     Ok(())
 }

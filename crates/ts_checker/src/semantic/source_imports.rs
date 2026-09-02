@@ -16,7 +16,8 @@
 //! `CommonJS` variables and named assignments, explicit and implicit ambient
 //! `export const` declarations in retained declaration files, annotated
 //! `FunctionDeclaration`s, source-proven ambient interface methods, regular and
-//! const enums, already-published inferred
+//! const enums, source-inferred constants checked by the caller's declaration
+//! demand, already-published inferred
 //! or const-asserted object constants, recursive package namespaces,
 //! cross-file namespace constants, and narrowly authenticated cold async-arrow
 //! object constants. Direct default imports also accept synchronous TypeScript
@@ -2147,6 +2148,10 @@ enum PreparedSourceImportTarget {
         type_node: NodeRef,
         type_links: Option<TypeNodeLinks>,
     },
+    InferredConst {
+        initializer: NodeRef,
+        expression_type: TypeId,
+    },
     DeclarationNumericConst {
         initializer: NodeRef,
         literal: String,
@@ -2501,6 +2506,10 @@ enum PlannedSourceImportValueTarget {
     AnnotatedConst {
         declaration: NodeRef,
         type_node: NodeRef,
+    },
+    InferredConst {
+        declaration: NodeRef,
+        initializer: NodeRef,
     },
     DeclarationNumericConst {
         declaration: NodeRef,
@@ -6841,6 +6850,108 @@ pub(super) fn prepare_source_import_value(
     )
 }
 
+/// Selects one authenticated source initializer without checking its provider file.
+pub(super) fn plan_source_import_variable_initializer(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    resolved: &ResolvedSourceImportBinding,
+    read: &PlannedSourceImportRead,
+) -> Result<Option<NodeRef>, SourceImportError> {
+    let target = resolved.target_symbol;
+    let Some(declaration) = store.symbol(target).and_then(|record| {
+        if record.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE {
+            record.value_declaration()
+        } else {
+            None
+        }
+    }) else {
+        return Ok(None);
+    };
+    if !host
+        .bound_file(declaration)
+        .and_then(BoundFile::source_facts)
+        .is_some_and(|facts| {
+            facts.is_external_module()
+                && !facts.is_javascript_file()
+                && !facts.is_common_js_module()
+                && !facts.is_declaration_file()
+        })
+    {
+        return Ok(None);
+    }
+    let Some(NodeData::VariableDeclaration(variable)) =
+        host.node(declaration).map(|record| &record.data)
+    else {
+        return Ok(None);
+    };
+    let Some(initializer) = variable.initializer else {
+        return Ok(None);
+    };
+    let initializer = NodeRef::new(declaration.arena, declaration.file, initializer);
+    if variable.type_.is_some()
+        || host.node(initializer).is_none_or(|record| {
+            matches!(
+                record.kind,
+                SyntaxKind::Identifier
+                    | SyntaxKind::ObjectLiteralExpression
+                    | SyntaxKind::AsExpression
+                    | SyntaxKind::TypeAssertionExpression
+            )
+        })
+    {
+        return Ok(None);
+    }
+    validate_planned_import_read(store, host, resolved, read)?;
+    let alias = resolved.binding.alias_symbol;
+    let links = store
+        .alias_symbol_links(alias)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasLinks(alias)))?;
+    if links.immediate_target != Some(resolved.immediate_target_symbol)
+        || links.alias_target != AliasTargetState::Resolved(target)
+        || links.type_only_declaration.is_some()
+    {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
+    }
+    preflight_alias_value_links(store, alias)?;
+    preflight_import_target_value_links(store, target)?;
+    if store
+        .value_symbol_links(alias)
+        .and_then(|links| links.resolved_type)
+        .is_some_and(|cached| {
+            store
+                .value_symbol_links(target)
+                .and_then(|links| links.resolved_type)
+                != Some(cached)
+        })
+    {
+        return Err(invariant(SourceImportInvariant::InvalidAliasValueLinks(
+            alias,
+        )));
+    }
+    let planned = plan_direct_typescript_const_target(
+        store,
+        host,
+        global_types,
+        alias,
+        target,
+        None,
+        &resolved.namespace_aliases.borrow(),
+    )?;
+    match planned {
+        PlannedSourceImportValueTarget::InferredConst { declaration, .. } => {
+            if declaration.file == resolved.binding.declaration.file {
+                return Err(unsupported(SourceImportUnsupported::SameSourceTarget {
+                    binding: resolved.binding.declaration,
+                    target: declaration,
+                }));
+            }
+            Ok(Some(declaration))
+        }
+        _ => Ok(None),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_source_import_value_with_type_import_capabilities(
     store: &mut CanonicalTypeMapperStore,
@@ -6982,6 +7093,7 @@ pub(super) fn prepare_source_import_value_with_type_import_capabilities(
     };
     let target_declaration = match &planned_target {
         PlannedSourceImportValueTarget::AnnotatedConst { declaration, .. }
+        | PlannedSourceImportValueTarget::InferredConst { declaration, .. }
         | PlannedSourceImportValueTarget::DeclarationNumericConst { declaration, .. }
         | PlannedSourceImportValueTarget::DeclarationBooleanConst { declaration, .. }
         | PlannedSourceImportValueTarget::ConstEnum { declaration }
@@ -7022,6 +7134,20 @@ pub(super) fn prepare_source_import_value_with_type_import_capabilities(
         }));
     }
     let (type_, prepared_target) = match planned_target {
+        PlannedSourceImportValueTarget::InferredConst {
+            declaration,
+            initializer,
+        } => {
+            let (type_, expression_type) =
+                inferred_const_value(store, global_types, target, declaration, initializer)?;
+            (
+                type_,
+                PreparedSourceImportTarget::InferredConst {
+                    initializer,
+                    expression_type,
+                },
+            )
+        }
         PlannedSourceImportValueTarget::AnnotatedConst { type_node, .. } => {
             let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
                 store,
@@ -11402,6 +11528,11 @@ fn materialize_imported_module_member(
     expected_type: Option<TypeId>,
 ) -> Result<(TypeId, Option<Box<PreparedSourceImportNestedNamespace>>), SourceImportError> {
     let resolved = match target {
+        PlannedSourceImportValueTarget::InferredConst { declaration, .. } => {
+            return Err(unsupported(SourceImportUnsupported::MissingTargetAnnotation(
+                declaration,
+            )));
+        }
         PlannedSourceImportValueTarget::AnnotatedConst { type_node, .. } => (
             CanonicalTypeQuery::new_with_global_types_and_session(
                 store,
@@ -11570,6 +11701,11 @@ fn preflight_imported_module_namespace_members(
 ) -> Result<(), SourceImportError> {
     for member in members {
         match &member.target {
+            PlannedSourceImportValueTarget::InferredConst { declaration, .. } => {
+                return Err(unsupported(SourceImportUnsupported::MissingTargetAnnotation(
+                    *declaration,
+                )));
+            }
             PlannedSourceImportValueTarget::AnnotatedConst { type_node, .. } => {
                 CanonicalTypeQuery::new_with_global_types_and_session(
                     store,
@@ -12832,6 +12968,15 @@ fn plan_direct_typescript_const_target(
             );
         }
         let NodeData::ObjectLiteralExpression(object) = &expression_record.data else {
+            if namespace_module.is_none()
+                && expression_record.parent == Some(declaration.node)
+                && expression_record.flags.0 == 0
+            {
+                return Ok(PlannedSourceImportValueTarget::InferredConst {
+                    declaration,
+                    initializer: expression,
+                });
+            }
             return Err(unsupported(
                 SourceImportUnsupported::MissingTargetAnnotation(declaration),
             ));
@@ -13926,6 +14071,40 @@ fn published_const_asserted_object_is_exact(
     }
 }
 
+fn inferred_const_value(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    target: SemanticSymbolId,
+    declaration: NodeRef,
+    initializer: NodeRef,
+) -> Result<(TypeId, TypeId), SourceImportError> {
+    let missing = || {
+        unsupported(SourceImportUnsupported::MissingTargetAnnotation(
+            declaration,
+        ))
+    };
+    let links = store.type_node_links(initializer).ok_or_else(missing)?;
+    let expression_type = links.resolved_type.ok_or_else(missing)?;
+    let type_ = store
+        .value_symbol_links(target)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(missing)?;
+    if links
+        != &(TypeNodeLinks {
+            resolved_type: Some(expression_type),
+            ..TypeNodeLinks::default()
+        })
+        || store.type_payload(expression_type).is_none()
+        || store.type_payload(type_).is_none()
+        || store.source_node_parent(initializer) != Some(SourceNodeParent::Parent(declaration))
+        || expression_type != type_
+            && !published_object_const_type_is_exact(store, global_types, expression_type, type_)
+    {
+        return Err(invariant(SourceImportInvariant::InvalidTargetLinks(target)));
+    }
+    Ok((type_, expression_type))
+}
+
 fn published_object_const_type_is_exact(
     store: &CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
@@ -14167,6 +14346,32 @@ fn validate_prepared_import_value(
             ))
         })?;
     let target_valid = match &prepared.target {
+        PreparedSourceImportTarget::InferredConst {
+            initializer,
+            expression_type,
+        } => source.is_some_and(|(host, globals)| {
+            matches!(
+                plan_direct_typescript_const_target(
+                    store,
+                    host,
+                    globals,
+                    prepared.binding.alias_symbol,
+                    prepared.target_symbol,
+                    None,
+                    &[],
+                ),
+                Ok(PlannedSourceImportValueTarget::InferredConst {
+                    declaration,
+                    initializer: current,
+                }) if declaration == prepared.target_declaration && current == *initializer
+            ) && inferred_const_value(
+                store,
+                globals,
+                prepared.target_symbol,
+                prepared.target_declaration,
+                *initializer,
+            ) == Ok((prepared.type_, *expression_type))
+        }),
         PreparedSourceImportTarget::AnnotatedConst {
             type_node,
             type_links,
