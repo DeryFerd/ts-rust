@@ -4505,11 +4505,7 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
             let NodeData::PropertyAccessExpression(access) = &record.data else {
                 return false;
             };
-            if record.flags.0 != 0
-                || access.flow_node.is_some()
-                || access.question_dot_token.is_some()
-                || access.facts != 0
-            {
+            if record.flags.0 != 0 || access.flow_node.is_some() || access.facts != 0 {
                 return false;
             }
             let Some(receiver) = arena.get(access.expression) else {
@@ -4518,6 +4514,22 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
             let Some(name) = arena.get(access.name) else {
                 return false;
             };
+            if let Some(token) = access.question_dot_token {
+                let Some(token) = arena.get(token) else {
+                    return false;
+                };
+                if name.kind != SyntaxKind::Identifier
+                    || receiver.kind == SyntaxKind::SuperKeyword
+                    || token.kind != SyntaxKind::QuestionDotToken
+                    || token.parent != Some(node.node)
+                    || token.flags.0 != 0
+                    || !matches!(token.data, NodeData::Token(_))
+                    || token.range.start < receiver.range.end
+                    || token.range.end > name.range.start
+                {
+                    return false;
+                }
+            }
             receiver.parent == Some(node.node)
                 && receiver.flags.0 == 0
                 && (matches!(
